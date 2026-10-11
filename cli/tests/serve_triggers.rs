@@ -657,10 +657,17 @@ async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
     // between the two) is fired by the next poll instead of wedging the edge.
     let mut drain = watcher(vec![0]);
     assert!(!drain.poll(&restarted).await.unwrap(), "drained: re-arm");
-    let lost = restarted.history().trigger_edge_rise("drain").await.unwrap();
+    let lost = restarted
+        .history()
+        .trigger_edge_rise("drain")
+        .await
+        .unwrap();
     assert!(lost.is_some());
     let mut fresh = watcher(vec![9, 9]);
-    assert!(!fresh.poll(&restarted).await.unwrap(), "re-fire of the lost edge");
+    assert!(
+        !fresh.poll(&restarted).await.unwrap(),
+        "re-fire of the lost edge"
+    );
     wait_for_runs(&restarted, 4).await;
     assert!(!fresh.poll(&restarted).await.unwrap(), "fired once");
     let page = restarted
@@ -1059,7 +1066,10 @@ async fn an_object_whose_reference_is_briefly_unreadable_is_retried() {
     let err = watcher.poll(&state).await.unwrap_err();
     assert!(!err.contains("skipped"), "{err}");
     std::fs::write(&pointer, out.to_str().unwrap()).unwrap();
-    assert!(watcher.poll(&state).await.unwrap(), "the object fires once readable");
+    assert!(
+        watcher.poll(&state).await.unwrap(),
+        "the object fires once readable"
+    );
     wait_for_runs(&state, 1).await;
     assert!(out.exists());
     assert!(!watcher.poll(&state).await.unwrap(), "nothing left to fire");

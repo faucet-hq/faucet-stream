@@ -251,7 +251,10 @@ async fn server_inputs_and_system_trees_are_out_of_reach_as_references_and_as_da
         )
     };
     for source in [
-        format!("{{ type: csv, config: {{ path: \"${{file:{}}}\" }} }}", auth_path.display()),
+        format!(
+            "{{ type: csv, config: {{ path: \"${{file:{}}}\" }} }}",
+            auth_path.display()
+        ),
         "{ type: csv, config: { path: \"${env:FAUCET_SERVE_HISTORY}\" } }".to_string(),
         "{ type: csv, config: { path: \"${env:FAUCET_VAULT_PREVIOUS_KEYS}\" } }".to_string(),
     ] {
@@ -262,8 +265,14 @@ async fn server_inputs_and_system_trees_are_out_of_reach_as_references_and_as_da
         assert!(message(&err).contains("server's own credentials"), "{err}");
     }
     for source in [
-        format!("{{ type: csv, config: {{ path: \"{}\" }} }}", auth_path.display()),
-        format!("{{ type: csv, config: {{ path: \"{}/*.yaml\" }} }}", dir.path().display()),
+        format!(
+            "{{ type: csv, config: {{ path: \"{}\" }} }}",
+            auth_path.display()
+        ),
+        format!(
+            "{{ type: csv, config: {{ path: \"{}/*.yaml\" }} }}",
+            dir.path().display()
+        ),
         "{ type: file, config: { path: /proc/self/environ, format: raw_text } }".to_string(),
     ] {
         let (code, err) = api

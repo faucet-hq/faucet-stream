@@ -440,7 +440,9 @@ mod tests {
         assert!(!is_deterministic(&ServeError::Unavailable("x".into())));
         assert!(!is_deterministic(&ServeError::Internal("x".into())));
         assert!(!FireOutcome::Failed("x".into()).committed());
-        assert!(FireOutcome::Error(format!("{EDGE_KEY_USED} for a different run")).edge_already_fired());
+        assert!(
+            FireOutcome::Error(format!("{EDGE_KEY_USED} for a different run")).edge_already_fired()
+        );
         assert!(!FireOutcome::Error("other".into()).edge_already_fired());
         assert!(!FireOutcome::Coalesced.edge_already_fired());
     }

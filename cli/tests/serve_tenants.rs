@@ -371,7 +371,11 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert!(r.to_string().contains("allow_untested"), "{r}");
 
     // A tenant's callback stays off the server's own host and network (#862 M-002).
-    for url in ["http://127.0.0.1:9/x", "http://10.0.0.5/x", "http://[::1]/x"] {
+    for url in [
+        "http://127.0.0.1:9/x",
+        "http://10.0.0.5/x",
+        "http://[::1]/x",
+    ] {
         let (code, r) = api
             .post(
                 "op-tok",

@@ -632,7 +632,9 @@ mod tests {
             "{keys:?}"
         );
         let drift_only = rule("pd", vec![EventKind::ProfileDrift], slack());
-        assert!(stateless_resolve_keys(&drift_only, &NotifyEvent::run_success("p", "r", 1)).is_empty());
+        assert!(
+            stateless_resolve_keys(&drift_only, &NotifyEvent::run_success("p", "r", 1)).is_empty()
+        );
     }
 
     #[tokio::test]

@@ -1545,7 +1545,10 @@ mod tests {
         let via_row = "version: 1\npipeline:\n  sources: { x: { type: csv, config: { path: in.csv } } }\n  sink: { type: stdout, config: {} }\nmatrix:\n  - id: r\n    source: { ref: x, config: { path: /proc/self/environ } }\n";
         for tool in ["validate_config", "preview"] {
             let out = call_tool(&c, tool, &json!({"config": via_row})).await;
-            assert!(out.to_string().contains("/proc/self/environ"), "{tool}: {out}");
+            assert!(
+                out.to_string().contains("/proc/self/environ"),
+                "{tool}: {out}"
+            );
         }
     }
 

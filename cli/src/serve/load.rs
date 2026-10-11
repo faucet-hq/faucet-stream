@@ -1045,7 +1045,11 @@ schedule:
             "${gcp-sm:projects/p/secrets/load-test/versions/1}",
         ]));
         assert_eq!(refs.len(), 5, "{refs:?}");
-        for name in ["FAUCET_SERVE_HISTORY", "FAUCET_VAULT_PREVIOUS_KEYS", "FAUCET_SNAPSHOT_KEY"] {
+        for name in [
+            "FAUCET_SERVE_HISTORY",
+            "FAUCET_VAULT_PREVIOUS_KEYS",
+            "FAUCET_SNAPSHOT_KEY",
+        ] {
             assert!(env_is_protected(name), "{name}");
         }
     }
@@ -1053,7 +1057,10 @@ schedule:
     #[test]
     fn sqlite_urls_name_their_file() {
         assert_eq!(sqlite_path("sqlite:/var/h.db"), Some("/var/h.db"));
-        assert_eq!(sqlite_path("sqlite:///var/h.db?mode=rwc"), Some("/var/h.db"));
+        assert_eq!(
+            sqlite_path("sqlite:///var/h.db?mode=rwc"),
+            Some("/var/h.db")
+        );
         assert_eq!(sqlite_path("sqlite::memory:"), None);
         assert_eq!(sqlite_path("postgres://x"), None);
         let dir = tempfile::tempdir().unwrap();
@@ -1080,16 +1087,30 @@ schedule:
         assert!(data_path_is_protected("/dev/stdin"));
         assert!(!data_path_is_protected("/dev/null"));
         assert!(data_path_is_protected(&auth.display().to_string()));
-        assert!(data_path_is_protected(&format!("{d}/data/../etc/auth.yaml")));
-        assert!(data_path_is_protected(&format!("{d}/etc")), "a directory holding one");
+        assert!(data_path_is_protected(&format!(
+            "{d}/data/../etc/auth.yaml"
+        )));
+        assert!(
+            data_path_is_protected(&format!("{d}/etc")),
+            "a directory holding one"
+        );
         assert!(data_path_is_protected(&format!("{d}/etc/*.yaml")));
-        assert!(data_path_is_protected(&format!("{d}/*")), "a glob that recurses into it");
-        assert!(data_path_is_protected(&format!("{d}/data/*/../../etc/auth.yaml")));
-        assert!(data_path_is_protected(&format!("{d}/etc/${{now.date}}.yaml")));
+        assert!(
+            data_path_is_protected(&format!("{d}/*")),
+            "a glob that recurses into it"
+        );
+        assert!(data_path_is_protected(&format!(
+            "{d}/data/*/../../etc/auth.yaml"
+        )));
+        assert!(data_path_is_protected(&format!(
+            "{d}/etc/${{now.date}}.yaml"
+        )));
         assert!(!data_path_is_protected(&format!("{d}/data/in.csv")));
         assert!(!data_path_is_protected(&format!("{d}/data/*.csv")));
         assert!(!data_path_is_protected(&format!("{d}/etc/*.csv")));
-        assert!(!data_path_is_protected(&format!("{d}/data/dt=${{now.date}}/x.jsonl")));
+        assert!(!data_path_is_protected(&format!(
+            "{d}/data/dt=${{now.date}}/x.jsonl"
+        )));
 
         assert_eq!(local_path("sqlite:/x.db"), Some("/x.db"));
         assert_eq!(local_path("file:///x"), Some("/x"));
@@ -1170,7 +1191,10 @@ schedule:
             reference: "kv/x".into(),
             source: "503".into(),
         };
-        assert!(matches!(resolution_error(fetch), ServeError::Unavailable(_)));
+        assert!(matches!(
+            resolution_error(fetch),
+            ServeError::Unavailable(_)
+        ));
         let auth = CliError::SecretAuthFailed {
             scheme: "vault".into(),
             hint: "token expired".into(),
@@ -1180,7 +1204,10 @@ schedule:
             var: "X".into(),
             location: "a".into(),
         };
-        assert!(matches!(resolution_error(missing), ServeError::BadConfig(_)));
+        assert!(matches!(
+            resolution_error(missing),
+            ServeError::BadConfig(_)
+        ));
         let absent = CliError::SecretNotFound {
             scheme: "vault".into(),
             reference: "kv/x".into(),

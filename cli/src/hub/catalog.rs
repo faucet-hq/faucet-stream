@@ -1290,7 +1290,11 @@ per_stream:
         assert!(cat.source("acme").is_some());
         assert!(cat.source("future").is_none());
         assert_eq!(cat.incompatible.len(), 1);
-        assert!(cat.incompatible[0].1.contains("requires faucet"), "{:?}", cat.incompatible);
+        assert!(
+            cat.incompatible[0].1.contains("requires faucet"),
+            "{:?}",
+            cat.incompatible
+        );
         let err = Catalog::load_strict(dir.path()).unwrap_err().to_string();
         assert!(err.contains("future.yaml"), "{err}");
     }

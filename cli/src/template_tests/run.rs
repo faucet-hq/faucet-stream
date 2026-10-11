@@ -106,8 +106,17 @@ pub async fn run_bundle(
         || shared.iter().any(|s| {
             !s.suite.suite.is_empty() || s.suite.fixtures.iter().any(|f| f.pipeline.is_none())
         });
-    if !exercised && !(bundle.fixtures.is_empty() && shared.is_empty()) {
-        match run_suite(&super::bundle::structural_suite(), target, filter, None, "implicit:").await {
+    let nothing_to_run = bundle.fixtures.is_empty() && shared.is_empty();
+    if !exercised && !nothing_to_run {
+        match run_suite(
+            &super::bundle::structural_suite(),
+            target,
+            filter,
+            None,
+            "implicit:",
+        )
+        .await
+        {
             Ok(part) => collect(&mut out, part, "implicit"),
             Err(e) => errors.push(format!("implicit structural case: {e}")),
         }
@@ -287,7 +296,10 @@ fixtures:
             overlay: None,
         };
         let out = run_bundle(&bundle, &broken, &[], None).await;
-        assert!(!out.passed(), "a template that does not load fails: {out:#?}");
+        assert!(
+            !out.passed(),
+            "a template that does not load fails: {out:#?}"
+        );
 
         let through: TestBundle = serde_yaml::from_str(
             "fixtures:\n  - name: t\n    input: [{ \"id\": 1 }]\n    expect: { records_written: 1 }\n",

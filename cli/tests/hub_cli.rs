@@ -838,7 +838,14 @@ async fn a_faucet_hq_owner_on_another_hub_is_not_trusted() {
     )
     .unwrap();
     let base = [
-        "validate", "--source", "crm", "--sink", "files", "--hub", &hub, "--no-env-file",
+        "validate",
+        "--source",
+        "crm",
+        "--sink",
+        "files",
+        "--hub",
+        &hub,
+        "--no-env-file",
     ];
     let err = run(&base).await.unwrap_err().to_string();
     assert!(
@@ -862,8 +869,13 @@ async fn a_template_for_a_newer_faucet_does_not_break_hub_list() {
     )
     .unwrap();
     run(&["hub", "list", "--hub", &hub]).await.expect("list");
-    run(&["hub", "matrix", "--hub", &hub]).await.expect("matrix");
-    let err = run(&["hub", "lint", "--hub", &hub]).await.unwrap_err().to_string();
+    run(&["hub", "matrix", "--hub", &hub])
+        .await
+        .expect("matrix");
+    let err = run(&["hub", "lint", "--hub", &hub])
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("future.yaml"), "{err}");
 }
 

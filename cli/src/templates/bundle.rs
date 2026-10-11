@@ -187,9 +187,6 @@ async fn run_version_traced(
     Ok(Some((rec, outcome, companions)))
 }
 
-/// The case a deployment's structural bundle runs: compose with its source
-/// and sink and check the result validates and expands.
-
 /// The resolved companions of a registered subject.
 struct Companions {
     source: Option<(String, u32)>,

@@ -2043,10 +2043,17 @@ async fn release_shard_is_owner_fenced_and_requeues() {
     assert_eq!(a.claim_shards(1).await.unwrap().len(), 1);
     assert!(!b.release_shard("r", "0").await.unwrap(), "not b's shard");
     assert!(a.release_shard("r", "0").await.unwrap());
-    assert!(!a.release_shard("r", "0").await.unwrap(), "no longer running");
+    assert!(
+        !a.release_shard("r", "0").await.unwrap(),
+        "no longer running"
+    );
     let progress = a.shard_progress("r").await.unwrap();
     assert_eq!((progress.pending, progress.running), (1, 0));
-    assert_eq!(b.claim_shards(1).await.unwrap().len(), 1, "a peer resumes it");
+    assert_eq!(
+        b.claim_shards(1).await.unwrap().len(),
+        1,
+        "a peer resumes it"
+    );
 }
 
 /// #862 M-004: a history that cannot be opened at startup is reconnected

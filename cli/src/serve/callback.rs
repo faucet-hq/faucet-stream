@@ -235,9 +235,7 @@ const METADATA_IPS: &[std::net::IpAddr] = &[
 /// another known metadata address, including an IPv4-mapped IPv6 form.
 fn is_link_local_ip(ip: std::net::IpAddr) -> bool {
     let ip = match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(ip, std::net::IpAddr::V4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
         v4 => v4,
     };
     if METADATA_IPS.contains(&ip) {
@@ -258,9 +256,7 @@ fn is_internal_ip(ip: std::net::IpAddr) -> bool {
         return true;
     }
     let ip = match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(ip, std::net::IpAddr::V4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
         v4 => v4,
     };
     match ip {
@@ -499,13 +495,19 @@ mod tests {
             .await
             .unwrap();
         assert!(literal.is_empty(), "an IP literal needs no pinning");
-        let err = checked_addrs(&reqwest::Url::parse("http://169.254.169.254/").unwrap(), false)
-            .await
-            .unwrap_err();
+        let err = checked_addrs(
+            &reqwest::Url::parse("http://169.254.169.254/").unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("link-local"), "{err}");
-        let err = checked_addrs(&reqwest::Url::parse("http://no-such-host.invalid/").unwrap(), false)
-            .await
-            .unwrap_err();
+        let err = checked_addrs(
+            &reqwest::Url::parse("http://no-such-host.invalid/").unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("resolving"), "{err}");
     }
 
@@ -540,9 +542,16 @@ mod tests {
         ] {
             let err = spec(u).validate_for(&[], true).expect_err(u);
             assert!(err.contains("loopback / private"), "{u}: {err}");
-            assert!(spec(u).validate(&[]).is_ok(), "{u} stays allowed for operators");
+            assert!(
+                spec(u).validate(&[]).is_ok(),
+                "{u} stays allowed for operators"
+            );
         }
-        assert!(spec("https://caller.example/hook").validate_for(&[], true).is_ok());
+        assert!(
+            spec("https://caller.example/hook")
+                .validate_for(&[], true)
+                .is_ok()
+        );
         assert!(spec("http://8.8.8.8/x").validate_for(&[], true).is_ok());
         let allow = vec!["10.1.2.3".to_string()];
         assert!(spec("http://10.1.2.3/x").validate_for(&allow, true).is_ok());

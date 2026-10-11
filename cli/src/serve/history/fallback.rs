@@ -170,10 +170,7 @@ impl FallbackHistory {
 /// times with a short backoff. Any other failure is returned at once.
 macro_rules! primary {
     ($self:ident, $primary:ident => $pcall:expr) => {{
-        let $primary = $self
-            .primary
-            .get()
-            .expect("primary checked by the caller");
+        let $primary = $self.primary.get().expect("primary checked by the caller");
         let mut attempt = 1u32;
         loop {
             match $pcall.await {
@@ -958,7 +955,10 @@ mod tests {
         );
         assert!(!healthy.try_recover().await, "not degraded");
         let first = healthy.trigger_edge_rise("q").await.unwrap().unwrap();
-        assert_eq!(healthy.trigger_edge_current("q").await.unwrap(), Some(first));
+        assert_eq!(
+            healthy.trigger_edge_current("q").await.unwrap(),
+            Some(first)
+        );
         healthy.trigger_edge_retract("q", first).await.unwrap();
         assert_eq!(healthy.trigger_edge_current("q").await.unwrap(), None);
         assert_eq!(healthy.trigger_edge_current("never").await.unwrap(), None);
@@ -987,7 +987,8 @@ mod tests {
             Box::pin(async move {
                 a.fetch_add(1, Ordering::SeqCst);
                 if u.load(Ordering::SeqCst) {
-                    Ok(Box::new(MemoryHistory::new(Duration::from_secs(60))) as Box<dyn RunHistory>)
+                    Ok(Box::new(MemoryHistory::new(Duration::from_secs(60)))
+                        as Box<dyn RunHistory>)
                 } else {
                     Err(HistoryError::Backend("connection refused".into()))
                 }
@@ -1004,9 +1005,18 @@ mod tests {
                 .await,
             Err(HistoryError::Degraded(_))
         ));
-        let run = RunRecord::queued("r1".into(), None, Default::default(), None, chrono::Utc::now());
+        let run = RunRecord::queued(
+            "r1".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
         fb.upsert(&run).await.unwrap();
-        assert!(fb.get("r1").await.unwrap().is_some(), "runs keep going in memory");
+        assert!(
+            fb.get("r1").await.unwrap().is_some(),
+            "runs keep going in memory"
+        );
 
         assert!(!fb.try_recover().await, "still down");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);

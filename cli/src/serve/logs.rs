@@ -695,7 +695,12 @@ mod tests {
             run_id: &str,
             n: u64,
         ) -> Result<(), crate::serve::history::HistoryError> {
-            *self.dropped.lock().unwrap().entry(run_id.into()).or_default() += n;
+            *self
+                .dropped
+                .lock()
+                .unwrap()
+                .entry(run_id.into())
+                .or_default() += n;
             Ok(())
         }
         fn degraded(&self) -> bool {

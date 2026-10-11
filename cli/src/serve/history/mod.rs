@@ -1969,7 +1969,9 @@ fn into_history<H: RunHistory + 'static>(
                  store and reconnecting (templates, tenants, change requests and idempotency \
                  answer 503 until it is reached)"
             );
-            Arc::new(fallback::FallbackHistory::connecting(connector, idem, label))
+            Arc::new(fallback::FallbackHistory::connecting(
+                connector, idem, label,
+            ))
         }
     }
 }
