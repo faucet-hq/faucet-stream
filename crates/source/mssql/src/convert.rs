@@ -31,9 +31,26 @@ pub fn row_to_json(row: &Row) -> Result<Value, FaucetError> {
                 None => decode_temporal(row, i, data)?,
             },
         };
-        map.insert(names[i].clone(), value);
+        if map.insert(names[i].clone(), value).is_some() {
+            return Err(duplicate_column(&names[i]));
+        }
     }
     Ok(Value::Object(map))
+}
+
+/// Two result columns share a name — a join's `id`, or two unaliased
+/// expressions, which SQL Server names `""` — and the later would silently
+/// replace the earlier in the record (#862 M-043).
+fn duplicate_column(name: &str) -> FaucetError {
+    let shown = if name.is_empty() {
+        "an empty name (unaliased expressions)".to_string()
+    } else {
+        format!("{name:?}")
+    };
+    FaucetError::Source(format!(
+        "MSSQL query returns two columns named {shown}; alias them \
+         (`SELECT a.id AS a_id, b.id AS b_id …`, `COUNT(*) AS n`) so neither is lost"
+    ))
 }
 
 /// A `MONEY` / `SMALLMONEY` value as an exact 4-decimal string. The driver
@@ -151,6 +168,15 @@ pub(crate) fn numeric_to_string(n: Numeric) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn duplicate_column_names_the_column_or_the_empty_name() {
+        let named = super::duplicate_column("id").to_string();
+        assert!(named.contains("two columns named \"id\""), "{named}");
+        let empty = super::duplicate_column("").to_string();
+        assert!(empty.contains("an empty name"), "{empty}");
+    }
+
     #[test]
     fn money_renders_exact_decimal_text() {
         assert_eq!(super::money_text(12.3456), "12.3456");

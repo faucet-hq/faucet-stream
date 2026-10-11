@@ -255,6 +255,8 @@ Discovery reads catalog metadata only — it never scans table data.
 | BINARY / VARBINARY / IMAGE | base64 string |
 | SQL NULL | `null` |
 
+Each record is keyed by column name, so a query returning two columns with the same name — a join's `id`, or two unaliased expressions (SQL Server names both `""`) — fails with a `FaucetError::Source` asking you to alias them, instead of one silently replacing the other.
+
 ## Config loading & schema
 
 Load from YAML/JSON or environment. Inspect the full JSON Schema with:
