@@ -431,6 +431,37 @@ fn reload_on_change_csv_picks_up_edits_between_pages() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// #862 M-014: a relative reference path still reloads once the connection
+/// is sandboxed.
+#[test]
+fn reload_on_change_follows_a_relative_path_under_the_sandbox() {
+    let name = format!("faucet_sql_reload_rel_{}.csv", std::process::id());
+    let abs = std::env::current_dir().unwrap().join(&name);
+    std::fs::write(&abs, "code,country\nUS,Before\n").unwrap();
+    let s = stage(SqlTransformConfig {
+        query: "SELECT b.id, c.country FROM batch b LEFT JOIN refs c ON b.code = c.code".into(),
+        relations: vec![RelationSpec {
+            name: "refs".into(),
+            source: RelationSource::Csv {
+                path: format!("./{name}"),
+                has_header: true,
+            },
+            reload_on_change: true,
+        }],
+        memory_limit: None,
+        threads: None,
+    });
+    let page = |id: i64| {
+        apply_stages_to_page(vec![json!({"id": id, "code": "US"})], std::slice::from_ref(&s))
+    };
+    assert_eq!(page(1).unwrap()[0]["country"], json!("Before"));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&abs, "code,country\nUS,After\n").unwrap();
+    let after = page(2);
+    let _ = std::fs::remove_file(&abs);
+    assert_eq!(after.unwrap()[0]["country"], json!("After"));
+}
+
 /// Same as above for a JSONL relation — exercises the non-CSV reload branch.
 #[test]
 fn reload_on_change_jsonl_picks_up_edits_between_pages() {
