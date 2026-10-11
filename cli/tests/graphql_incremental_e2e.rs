@@ -68,7 +68,11 @@ fn read_ids(path: &std::path::Path) -> Vec<u64> {
 fn stored_bookmarks(dir: &std::path::Path) -> Vec<Value> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).unwrap() {
-        let text = std::fs::read_to_string(e.unwrap().path()).unwrap();
+        let path = e.unwrap().path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
         if v.get("owner") == Some(&json!("graphql")) {
             out.push(v["data"].clone());
