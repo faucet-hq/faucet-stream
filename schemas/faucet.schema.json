@@ -14685,7 +14685,7 @@
                       "default": null
                     },
                     "max_pages": {
-                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept — a record-derived or window\nbookmark would skip the unread pages, so none is written.",
+                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept. An incremental or windowed\npass the cap cuts short fails the run instead — its record-derived or\nwindow bookmark would skip the unread pages, and keeping none would\nre-read the same pages forever — unless `assume_ordered` is set.",
                       "type": [
                         "integer",
                         "null",
@@ -14694,6 +14694,13 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": null
+                    },
+                    "assume_ordered": {
+                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Ignored for windowed passes and with `persist_cursor`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
                     },
                     "request_delay": {
                       "description": "Fixed delay between page requests, in seconds — a politeness knob for\nAPIs that rate-limit by request frequency. Applied *in addition* to any\n`Retry-After` honoured by the retry path.",

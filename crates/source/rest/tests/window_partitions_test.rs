@@ -123,7 +123,7 @@ impl Respond for PagedFirst {
 }
 
 #[tokio::test]
-async fn a_partition_cut_short_by_max_pages_withholds_the_consolidated_bookmark() {
+async fn a_partition_cut_short_by_max_pages_fails_without_a_bookmark() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/p/\d+$"))
@@ -145,10 +145,22 @@ async fn a_partition_cut_short_by_max_pages_withholds_the_consolidated_bookmark(
         .collect();
     let stream = RestStream::new(cfg).unwrap();
 
-    let (records, bookmark) = drain(&stream).await;
-    assert_eq!(records.len(), 2);
-    assert_eq!(
-        bookmark, None,
-        "partition 0 has unread pages, so the other partition's high-water mark must not persist"
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    let mut bookmarks = Vec::new();
+    let mut failed = false;
+    while let Some(page) = pages.next().await {
+        match page {
+            Ok(p) => bookmarks.extend(p.bookmark),
+            Err(e) => {
+                assert!(e.to_string().contains("max_pages"), "{e}");
+                failed = true;
+            }
+        }
+    }
+    assert!(
+        failed && bookmarks.is_empty(),
+        "partition 0 has unread pages: no high-water mark may persist, and the stall must not \
+         be silent"
     );
 }

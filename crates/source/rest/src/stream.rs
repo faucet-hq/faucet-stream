@@ -1312,18 +1312,6 @@ impl RestStream {
                     .or_else(|| self.config.start_replication_value.clone())
             };
 
-            if self.config.max_pages.is_some()
-                && !self.config.persist_cursor
-                && (self.config.window.is_some()
-                    || (self.config.replication_method == ReplicationMethod::Incremental
-                        && self.config.replication_key.is_some()))
-            {
-                tracing::warn!(
-                    "max_pages is set on an incremental or windowed feed: a pass the cap cuts \
-                     short persists no bookmark, so the next run starts from the same point. \
-                     Raise or remove max_pages for the sweep to make progress."
-                );
-            }
 
             // #527: build the pass plan. Without a `window:` block this is a
             // single "unbounded" pass with the classic record-derived bookmark.
@@ -1607,8 +1595,16 @@ impl RestStream {
                 // and a windowed sweep stops here rather than letting a later
                 // window's end skip past the rest of this one.
                 let pass_bookmark = pass_bookmark_after(
-                    self.config.persist_cursor,
-                    truncated,
+                    TruncatedPass {
+                        persist_cursor: self.config.persist_cursor,
+                        truncated,
+                        windowed,
+                        incremental: self.config.replication_method
+                            == ReplicationMethod::Incremental
+                            && self.config.replication_key.is_some(),
+                        assume_ordered: self.config.assume_ordered,
+                        max_pages: self.config.max_pages.unwrap_or_default(),
+                    },
                     if self.config.persist_cursor {
                         running_cursor.clone()
                     } else if windowed {
@@ -1616,7 +1612,7 @@ impl RestStream {
                     } else {
                         running_max.clone()
                     },
-                );
+                )?;
                 if !bookmark_emitted && pass_bookmark.is_some() {
                     yield faucet_core::StreamPage {
                         records: Vec::new(),
@@ -3013,19 +3009,44 @@ fn records_path_resolves(body: &Value, path: &str) -> bool {
 /// bookmarks in [`Source::stream_pages`] (#535). Numbers compare numerically,
 /// strings lexicographically (the usual timestamp/id bookmark shapes); any
 /// other or heterogeneous pair prefers the newer value.
-/// The bookmark a pass may persist once its page loop has ended. A pass that
-/// `max_pages` cut short keeps only a cursor bookmark, which names the next
-/// unread page; a record-derived or window bookmark would skip it.
-fn pass_bookmark_after(
+/// How a pass's page loop ended, for [`pass_bookmark_after`].
+#[derive(Debug, Clone, Copy, Default)]
+struct TruncatedPass {
     persist_cursor: bool,
     truncated: bool,
+    windowed: bool,
+    incremental: bool,
+    assume_ordered: bool,
+    max_pages: usize,
+}
+
+/// The bookmark a pass may persist once its page loop has ended. A pass that
+/// `max_pages` cut short keeps only a cursor bookmark, which names the next
+/// unread page. An incremental or windowed pass cut short fails instead: its
+/// record-derived or window bookmark would skip the unread pages, and keeping
+/// none would re-read the same pages every run while each run looked green
+/// (#862 M-079) — unless the feed is declared `assume_ordered`, whose largest
+/// key read is a safe resume point.
+fn pass_bookmark_after(
+    pass: TruncatedPass,
     bookmark: Option<Value>,
-) -> Option<Value> {
-    if truncated && !persist_cursor {
-        None
-    } else {
-        bookmark
+) -> Result<Option<Value>, FaucetError> {
+    if !pass.truncated || pass.persist_cursor {
+        return Ok(bookmark);
     }
+    if pass.incremental && pass.assume_ordered && !pass.windowed {
+        return Ok(bookmark);
+    }
+    if pass.incremental || pass.windowed {
+        return Err(FaucetError::Source(format!(
+            "rest: max_pages ({}) cut an incremental pass short, so its bookmark cannot \
+             advance and every run would re-read the same pages. Raise or remove \
+             max_pages, set persist_cursor, or set assume_ordered when the feed is \
+             sorted by the replication key",
+            pass.max_pages
+        )));
+    }
+    Ok(None)
 }
 
 fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
@@ -3875,6 +3896,45 @@ impl RestStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_truncated_incremental_pass_fails_unless_ordered() {
+        let bm = Some(json!(5));
+        let cut = TruncatedPass {
+            truncated: true,
+            incremental: true,
+            max_pages: 3,
+            ..TruncatedPass::default()
+        };
+        let err = pass_bookmark_after(cut, bm.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_pages (3)"), "{err}");
+        let ordered = TruncatedPass {
+            assume_ordered: true,
+            ..cut
+        };
+        assert_eq!(pass_bookmark_after(ordered, bm.clone()).unwrap(), bm);
+        let windowed = TruncatedPass {
+            windowed: true,
+            ..ordered
+        };
+        assert!(pass_bookmark_after(windowed, bm.clone()).is_err());
+        let cursor = TruncatedPass {
+            persist_cursor: true,
+            ..windowed
+        };
+        assert_eq!(pass_bookmark_after(cursor, bm.clone()).unwrap(), bm);
+        let full = TruncatedPass {
+            truncated: true,
+            ..TruncatedPass::default()
+        };
+        assert_eq!(pass_bookmark_after(full, bm.clone()).unwrap(), None);
+        assert_eq!(
+            pass_bookmark_after(TruncatedPass::default(), bm.clone()).unwrap(),
+            bm
+        );
+    }
 
     #[test]
     fn path_placeholders_are_percent_encoded() {
