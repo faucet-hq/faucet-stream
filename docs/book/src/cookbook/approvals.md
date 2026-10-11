@@ -162,7 +162,10 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
 - `template_register` / `template_launch`: those kinds must come through
   `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
   assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run
-  `/v1/templates/sync` answer `409`, as do the MCP `register_template` /
+  `/v1/templates/sync` answer `409`. Under `template_launch` so do deleting a
+  version that was ever launched (or the whole template, once launched) and
+  retiring or reviving a version, since both move what an unpinned request
+  resolves to. So do the MCP `register_template` /
   `launch_template` / `rollback_template` tools. `--templates-sync` registers
   and launches on its own schedule, so it cannot be combined with either kind.
 

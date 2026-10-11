@@ -481,6 +481,7 @@ async fn approval_gates_the_template_lifecycle_and_keeps_secrets_out_of_requests
             "/v1/templates",
             json!({"config": body, "id": "gated", "launch": true}),
         ),
+        ("/v1/templates/gated/versions/1/deprecate", json!({})),
     ] {
         let (code, err) = api.post("admin-tok", route, payload).await;
         assert_eq!(code, 409, "{route}: {err}");
