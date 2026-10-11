@@ -611,7 +611,10 @@ mod scope_key_tests {
         let digest = legacy.rsplit_once("__h:").unwrap().1;
         assert_eq!(digest.len(), 16);
         assert_ne!(legacy, scope_key(&long, 64));
-        assert_eq!(legacy_scope_key("é".repeat(40).as_str(), 30).unwrap().len(), 4 + 16 + 10);
+        assert_eq!(
+            legacy_scope_key("é".repeat(40).as_str(), 30).unwrap().len(),
+            4 + 16 + 10
+        );
     }
 
     #[test]

@@ -501,8 +501,16 @@ mod tests {
         let rolled = format!("{}/f.jsonl", dir.path().display());
         assert_eq!(expand_location(&rolled).unwrap(), vec![part]);
         let missing = format!("{}/g.jsonl", dir.path().display());
-        assert!(expand_location(&missing).unwrap_err().to_string().contains("g.jsonl"));
-        assert_eq!(rolled_over_glob("d/.h.jsonl").as_deref(), Some("d/.h-*.jsonl"));
+        assert!(
+            expand_location(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("g.jsonl")
+        );
+        assert_eq!(
+            rolled_over_glob("d/.h.jsonl").as_deref(),
+            Some("d/.h-*.jsonl")
+        );
         assert_eq!(rolled_over_glob("d/noext").as_deref(), Some("d/noext-*"));
     }
 

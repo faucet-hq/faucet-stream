@@ -1815,7 +1815,10 @@ fn plan_exactly_once(
         }
     }
 
-    if positions.iter().all(|(_, bm, seq)| bm.is_none() && *seq == 0) {
+    if positions
+        .iter()
+        .all(|(_, bm, seq)| bm.is_none() && *seq == 0)
+    {
         return Ok(ResumePlan {
             start: None,
             sinks: own(&|_| None),
@@ -4165,8 +4168,14 @@ mod graph_safety_tests {
             bookmark: bm,
         };
         let cov = |bm| covered_page(&Pair, &page(bm), &through);
-        assert_eq!(cov(Some(json!({ "x": 4, "y": 5 }))), PageCoverage::Committed);
-        assert_eq!(cov(Some(json!({ "x": 9, "y": 3 }))), PageCoverage::Straddles);
+        assert_eq!(
+            cov(Some(json!({ "x": 4, "y": 5 }))),
+            PageCoverage::Committed
+        );
+        assert_eq!(
+            cov(Some(json!({ "x": 9, "y": 3 }))),
+            PageCoverage::Straddles
+        );
         assert_eq!(cov(Some(json!({ "x": 9, "y": 5 }))), PageCoverage::Past);
         assert_eq!(cov(None), PageCoverage::Straddles);
     }

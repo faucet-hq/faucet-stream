@@ -452,7 +452,10 @@ fn reload_on_change_follows_a_relative_path_under_the_sandbox() {
         threads: None,
     });
     let page = |id: i64| {
-        apply_stages_to_page(vec![json!({"id": id, "code": "US"})], std::slice::from_ref(&s))
+        apply_stages_to_page(
+            vec![json!({"id": id, "code": "US"})],
+            std::slice::from_ref(&s),
+        )
     };
     assert_eq!(page(1).unwrap()[0]["country"], json!("Before"));
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -677,7 +680,10 @@ fn the_absence_marker_stays_out_of_the_output() {
 
     let out = run(
         "SELECT * FROM batch",
-        vec![json!({"id": 1, "__faucet_absent": "mine"}), json!({"id": 2, "v": 1})],
+        vec![
+            json!({"id": 1, "__faucet_absent": "mine"}),
+            json!({"id": 2, "v": 1}),
+        ],
     );
     assert_eq!(out[0]["__faucet_absent"], json!("mine"));
 }

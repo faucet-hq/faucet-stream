@@ -132,8 +132,7 @@ impl Source for TransformingSource {
         ctx: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let (records, bookmark) = self.inner.fetch_with_context_incremental(ctx).await?;
-        let transformed =
-            instrumented_apply_stages(records, &self.stages, &self.labels)?;
+        let transformed = instrumented_apply_stages(records, &self.stages, &self.labels)?;
         Ok((transformed, bookmark))
     }
 

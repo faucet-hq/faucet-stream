@@ -386,7 +386,12 @@ async fn a_bookmark_under_a_padded_chunk_id_moves_to_the_current_key() {
         .iter()
         .find(|n| n.id.ends_with("::partition::3"))
         .expect("chunk 3");
-    assert_eq!(chunk.legacy_state_ids.len(), 1, "{:?}", chunk.legacy_state_ids);
+    assert_eq!(
+        chunk.legacy_state_ids.len(),
+        1,
+        "{:?}",
+        chunk.legacy_state_ids
+    );
     assert!(chunk.legacy_state_ids[0].ends_with("::partition::03"));
     assert!(
         nodes
@@ -402,7 +407,9 @@ async fn a_bookmark_under_a_padded_chunk_id_moves_to_the_current_key() {
 
     // A first run writes whatever bookmark the source keeps; park it under
     // the legacy key, as an older release would have left it.
-    let first = run_expanded(nodes.clone(), opts("p", Some(4))).await.expect("run");
+    let first = run_expanded(nodes.clone(), opts("p", Some(4)))
+        .await
+        .expect("run");
     assert!(!first.had_failures());
     let parked = store
         .get(&current)
@@ -414,6 +421,13 @@ async fn a_bookmark_under_a_padded_chunk_id_moves_to_the_current_key() {
 
     let summary = run_expanded(nodes, opts("p", Some(4))).await.expect("run");
     assert!(!summary.had_failures());
-    assert_eq!(store.get(&legacy).await.unwrap(), None, "the legacy key is retired");
-    assert!(store.get(&current).await.unwrap().is_some(), "its state moved over");
+    assert_eq!(
+        store.get(&legacy).await.unwrap(),
+        None,
+        "the legacy key is retired"
+    );
+    assert!(
+        store.get(&current).await.unwrap().is_some(),
+        "its state moved over"
+    );
 }

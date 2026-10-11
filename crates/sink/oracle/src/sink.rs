@@ -23,8 +23,8 @@ use crate::plan::{
     create_table_sql, delete_sql, dictionary_binds, drop_table_sql, drops_unknown, fold_names,
     fold_page, ignoring, insert_sql, insertable_names, merge_sql, no_columns_error,
     overwrite_swap_sql, pick_table, prepare_rows, relax_null_sql, rename_sql, schema_from_columns,
-    staging_fixups_sql, token_delete_sql, token_merge_sql, token_select_sql, token_table, token_table_ddl,
-    upsert_groups, widen_column_sql,
+    staging_fixups_sql, token_delete_sql, token_merge_sql, token_select_sql, token_table,
+    token_table_ddl, upsert_groups, widen_column_sql,
 };
 
 /// Oracle Database sink.

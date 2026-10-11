@@ -1847,7 +1847,9 @@ fn child_state_keys(prefix: &str, row: &str, parent_key: &str) -> (String, Vec<S
     let current = build_state_key(
         prefix,
         row,
-        Some(&crate::discovery_matrix::state_key_component(parent_key, true)),
+        Some(&crate::discovery_matrix::state_key_component(
+            parent_key, true,
+        )),
     );
     let verbatim = build_state_key(prefix, row, Some(parent_key));
     let legacy = (verbatim != current && faucet_core::state::validate_state_key(&verbatim).is_ok())
@@ -7454,7 +7456,11 @@ matrix:
         assert_eq!(store.get("p::old").await.unwrap(), None);
         store.put("p::old", &json!(2)).await.unwrap();
         adopt_legacy_state(&store, "p::a", &["p::old".into()]).await;
-        assert_eq!(store.get("p::a").await.unwrap(), Some(json!(1)), "a current key wins");
+        assert_eq!(
+            store.get("p::a").await.unwrap(),
+            Some(json!(1)),
+            "a current key wins"
+        );
         assert_eq!(store.get("p::old").await.unwrap(), Some(json!(2)));
     }
 

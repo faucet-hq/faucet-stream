@@ -172,7 +172,12 @@ mod tests {
 
     #[test]
     fn phone_loose_keeps_the_broad_matcher() {
-        for v in ["4155552671", "14155552671", "020 7946 0958", "+44 20 7946 0958"] {
+        for v in [
+            "4155552671",
+            "14155552671",
+            "020 7946 0958",
+            "+44 20 7946 0958",
+        ] {
             assert!(detects(Detector::PhoneLoose, v), "{v}");
         }
         assert!(!detects(Detector::Phone, "4155552671"));
@@ -182,7 +187,10 @@ mod tests {
             Detector::PhoneLoose,
             &serde_json::json!(4155552671u64)
         ));
-        assert!(!detects_value(Detector::Phone, &serde_json::json!(4155552671u64)));
+        assert!(!detects_value(
+            Detector::Phone,
+            &serde_json::json!(4155552671u64)
+        ));
         assert_eq!(Detector::PhoneLoose.to_string(), "phone_loose");
         let d: Detector = serde_json::from_value(serde_json::json!("phone_loose")).unwrap();
         assert_eq!(d, Detector::PhoneLoose);

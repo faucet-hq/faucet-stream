@@ -375,11 +375,12 @@ pub fn purge(location: &str) -> CliResult<PurgeOutcome> {
         }
         let tmp = file.with_file_name(format!(
             "{}.faucet-purge",
-            file.file_name().and_then(|n| n.to_str()).unwrap_or("dlq.jsonl")
+            file.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("dlq.jsonl")
         ));
-        std::fs::write(&tmp, &kept).map_err(|e| {
-            CliError::Internal(format!("writing '{}': {e}", tmp.display()))
-        })?;
+        std::fs::write(&tmp, &kept)
+            .map_err(|e| CliError::Internal(format!("writing '{}': {e}", tmp.display())))?;
         if stamp(file)? != before {
             let _ = std::fs::remove_file(&tmp);
             return Err(CliError::Config(format!(
@@ -388,9 +389,8 @@ pub fn purge(location: &str) -> CliResult<PurgeOutcome> {
                 file.display()
             )));
         }
-        std::fs::rename(&tmp, file).map_err(|e| {
-            CliError::Internal(format!("replacing '{}': {e}", file.display()))
-        })?;
+        std::fs::rename(&tmp, file)
+            .map_err(|e| CliError::Internal(format!("replacing '{}': {e}", file.display())))?;
         let sidecar = reader::discard_sidecar(file);
         if let Err(e) = std::fs::remove_file(&sidecar)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -443,10 +443,18 @@ mod tests {
         let file = dir.path().join("dlq.jsonl");
         std::fs::write(&file, "secret-1\nkeep\nsecret-2\n").unwrap();
         let sidecar = reader::discard_sidecar(&file);
-        assert_eq!(purge(file.to_str().unwrap()).unwrap().purged, 0, "nothing discarded yet");
+        assert_eq!(
+            purge(file.to_str().unwrap()).unwrap().purged,
+            0,
+            "nothing discarded yet"
+        );
         std::fs::write(
             &sidecar,
-            format!("{}\n{}\n", reader::line_id("secret-1"), reader::line_id("secret-2")),
+            format!(
+                "{}\n{}\n",
+                reader::line_id("secret-1"),
+                reader::line_id("secret-2")
+            ),
         )
         .unwrap();
         let out = purge(file.to_str().unwrap()).unwrap();

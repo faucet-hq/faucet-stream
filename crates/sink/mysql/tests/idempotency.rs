@@ -396,7 +396,11 @@ async fn a_watermark_under_the_legacy_scope_key_is_read_and_retired() {
     sink.write_batch_idempotent(&[json!({"n": 5})], &scope, &format_token(5))
         .await
         .expect("idempotent write");
-    assert_eq!(stored_token(&url, &legacy).await, None, "legacy row retired");
+    assert_eq!(
+        stored_token(&url, &legacy).await,
+        None,
+        "legacy row retired"
+    );
     assert_eq!(
         sink.last_committed_token(&scope).await.unwrap(),
         Some(format_token(5))

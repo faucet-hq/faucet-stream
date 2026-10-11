@@ -90,7 +90,10 @@ impl CompiledMasking {
                 rules.push(compiled);
             }
         }
-        if rules.iter().any(|r| r.value_detector == Some(Detector::Phone)) {
+        if rules
+            .iter()
+            .any(|r| r.value_detector == Some(Detector::Phone))
+        {
             warn_phone_narrowed();
         }
         let needs_paths = rules
@@ -199,7 +202,9 @@ mod tests {
 
     #[test]
     fn a_phone_rule_compiles_and_warns_once() {
-        let s = spec(json!({"rules": [{"match": {"value_detector": "phone"}, "action": {"type": "hash"}}]}));
+        let s = spec(
+            json!({"rules": [{"match": {"value_detector": "phone"}, "action": {"type": "hash"}}]}),
+        );
         assert_eq!(CompiledMasking::compile(&s).unwrap().rule_count(), 1);
         assert_eq!(CompiledMasking::compile(&s).unwrap().rule_count(), 1);
     }

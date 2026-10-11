@@ -245,7 +245,11 @@ mod tests {
         assert_eq!(position_le(&a, &bm(&[(0, 5), (1, 7)])), Some(true));
         assert_eq!(position_le(&a, &bm(&[(0, 9), (1, 3)])), Some(false));
         assert_eq!(position_le(&bm(&[(0, 9), (1, 3)]), &a), Some(false));
-        assert_eq!(position_le(&a, &bm(&[(0, 5)])), None, "different partitions");
+        assert_eq!(
+            position_le(&a, &bm(&[(0, 5)])),
+            None,
+            "different partitions"
+        );
         assert_eq!(position_le(&a, &bm(&[(0, 5), (2, 5)])), None);
         assert_eq!(position_le(&a, &json!("x")), None);
     }
@@ -266,7 +270,11 @@ mod tests {
         let rec = |p: i64, o: i64| json!({ "topic": "t", "partition": p, "offset": o });
         assert_eq!(record_covered(&rec(0, 4), &at), Some(true));
         assert_eq!(record_covered(&rec(0, 5), &at), Some(false));
-        assert_eq!(record_covered(&rec(2, 0), &at), Some(false), "partition never read");
+        assert_eq!(
+            record_covered(&rec(2, 0), &at),
+            Some(false),
+            "partition never read"
+        );
         assert_eq!(record_covered(&json!({ "value": 1 }), &at), None);
         assert_eq!(record_covered(&rec(0, 4), &json!(null)), None);
     }

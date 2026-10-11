@@ -667,16 +667,24 @@ mod tests {
     #[tokio::test]
     async fn a_lease_taken_by_another_run_marks_this_one_lost() {
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
-        let g = acquire_every(Arc::clone(&store), "p::r", "run-1", Duration::from_millis(2))
-            .await
-            .unwrap();
+        let g = acquire_every(
+            Arc::clone(&store),
+            "p::r",
+            "run-1",
+            Duration::from_millis(2),
+        )
+        .await
+        .unwrap();
         let lost = g.lost();
         assert!(!lost.is_cancelled());
         let other = acquire(Arc::clone(&store), "p::r", "run-2").await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), lost.cancelled())
             .await
             .expect("the run learns it lost the lease");
-        assert_eq!(read(store.as_ref(), "p::r").await.unwrap().unwrap().run_id, "run-2");
+        assert_eq!(
+            read(store.as_ref(), "p::r").await.unwrap().unwrap().run_id,
+            "run-2"
+        );
         g.release().await;
         other.release().await;
     }

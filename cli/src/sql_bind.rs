@@ -145,13 +145,7 @@ pub fn plan(query: &str, is_fanout: impl Fn(&str) -> bool) -> Result<BindPlan, S
     Ok(BindPlan { query: out, params })
 }
 
-fn push_param(
-    out: &mut String,
-    params: &mut Vec<BindParam>,
-    id: &str,
-    path: &str,
-    quoted: bool,
-) {
+fn push_param(out: &mut String, params: &mut Vec<BindParam>, id: &str, path: &str, quoted: bool) {
     let key = format!("{BIND_KEY_PREFIX}{}", params.len());
     out.push('{');
     out.push_str(&key);

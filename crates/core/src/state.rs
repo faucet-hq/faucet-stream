@@ -1124,7 +1124,9 @@ mod tests {
                 .map(|(i, s)| {
                     let (s, key) = (std::sync::Arc::clone(s), key.clone());
                     tokio::spawn(async move {
-                        s.compare_and_put(&key, None, &json!({"by": i})).await.unwrap()
+                        s.compare_and_put(&key, None, &json!({"by": i}))
+                            .await
+                            .unwrap()
                     })
                 })
                 .collect();
@@ -1144,7 +1146,12 @@ mod tests {
         let store = FileStateStore::new(dir.path());
         std::fs::write(dir.path().join("lease.json.lock"), b"").unwrap();
         let started = tokio::time::Instant::now();
-        assert!(store.compare_and_put("lease", None, &json!(1)).await.unwrap());
+        assert!(
+            store
+                .compare_and_put("lease", None, &json!(1))
+                .await
+                .unwrap()
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(
             store

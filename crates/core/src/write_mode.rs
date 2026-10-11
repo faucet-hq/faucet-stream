@@ -441,7 +441,10 @@ mod tests {
             exact.upserts,
             vec![json!({"id": 7, "v": "c"}), json!({"id": "7", "v": "b"})]
         );
-        assert_eq!(plan_writes(&page, &spec).upserts, vec![json!({"id": 7, "v": "c"})]);
+        assert_eq!(
+            plan_writes(&page, &spec).upserts,
+            vec![json!({"id": 7, "v": "c"})]
+        );
     }
 
     /// An object inserted in reverse-sorted key order (#817).

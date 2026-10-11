@@ -174,9 +174,7 @@ pub fn canonical_key(tuple: &crate::write_mode::KeyTuple) -> crate::write_mode::
             .map(|(k, v)| {
                 let v = match v {
                     serde_json::Value::Null => serde_json::Value::Null,
-                    other => {
-                        serde_json::Value::String(crate::write_mode::key_scalar_text(other))
-                    }
+                    other => serde_json::Value::String(crate::write_mode::key_scalar_text(other)),
                 };
                 (k.clone(), v)
             })
