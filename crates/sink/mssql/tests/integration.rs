@@ -378,3 +378,73 @@ async fn concurrent_first_writes_create_the_table_once() {
     }
     assert_eq!(count(&pool, "dbo.race").await, N as i32);
 }
+
+/// #862 M-044 / M-045 / M-046.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_862_unmatched_fields_widening_and_nested_text() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+
+    // M-044: fields match columns ignoring case; a record matching none fails.
+    exec(&pool, "CREATE TABLE dbo.ev (UserID INT NULL, kind NVARCHAR(10) NULL)").await;
+    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.ev")).await.expect("sink");
+    sink.write_batch(&[json!({"userid": 1, "KIND": "a"})])
+        .await
+        .expect("case-folded write");
+    let err = sink
+        .write_batch(&[json!({"user_id": 2})])
+        .await
+        .expect_err("no matching column");
+    assert!(err.to_string().contains("no field matching"), "{err}");
+    let out = sink
+        .write_batch_partial(&[json!({"userid": 3}), json!({"nope": 1})])
+        .await
+        .expect("partial");
+    assert!(out[0].is_ok() && out[1].is_err());
+    assert_eq!(count(&pool, "dbo.ev").await, 2);
+
+    // M-045: integer -> number widens to an exact DECIMAL and keeps NOT NULL.
+    exec(
+        &pool,
+        "CREATE TABLE dbo.w (id BIGINT NOT NULL, v BIGINT NOT NULL); \
+         INSERT INTO dbo.w VALUES (1, 9007199254740993)",
+    )
+    .await;
+    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.w")).await.expect("sink");
+    sink.evolve_schema(&faucet_core::SchemaEvolution {
+        widenings: vec![faucet_core::ColumnChange {
+            name: "v".into(),
+            from: Some(json!({"type": "integer"})),
+            to: json!({"type": "number"}),
+        }],
+        ..Default::default()
+    })
+    .await
+    .expect("widen");
+    let mut conn = pool.get().await.expect("checkout");
+    let r = conn
+        .query(
+            "SELECT CAST(v AS NVARCHAR(60)) AS v, \
+             CAST(COLUMNPROPERTY(OBJECT_ID('dbo.w'), 'v', 'AllowsNull') AS INT) AS n \
+             FROM dbo.w",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(r[0].get::<&str, _>("v"), Some("9007199254740993.0000000000"));
+    assert_eq!(r[0].get::<i32, _>("n"), Some(0));
+    drop(conn);
+
+    // M-046: a nested field in an NVARCHAR(MAX) column is not drift.
+    exec(&pool, "CREATE TABLE dbo.docs (id INT NULL, meta NVARCHAR(MAX) NULL)").await;
+    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.docs")).await.expect("sink");
+    let dest = sink.current_schema().await.expect("schema").expect("some");
+    let page = faucet_core::schema::infer_schema(&[json!({"id": 1, "meta": {"a": 1}})]);
+    let diff = faucet_core::drift::diff_schema(&dest, &page, true);
+    assert!(diff.incompatible.is_empty(), "{diff:?}");
+}
