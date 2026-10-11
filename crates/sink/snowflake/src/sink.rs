@@ -53,6 +53,26 @@ pub struct SnowflakeSink {
 /// escaping.
 pub const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
+/// Snowflake's recommended ceiling for one request's SQL text, literals
+/// included. A larger statement is truncated in query history (so it cannot
+/// be retried from there) and some deployments reject it with HTTP 413.
+pub const RECOMMENDED_STATEMENT_BYTES: usize = 1024 * 1024;
+
+/// Warn when an inlined multi-statement request exceeds
+/// [`RECOMMENDED_STATEMENT_BYTES`]; returns whether it did (#862 M-063).
+fn warn_if_oversized_statement(sql: &str) -> bool {
+    if sql.len() <= RECOMMENDED_STATEMENT_BYTES {
+        return false;
+    }
+    tracing::warn!(
+        bytes = sql.len(),
+        limit = RECOMMENDED_STATEMENT_BYTES,
+        "snowflake: an inlined transaction exceeds Snowflake's 1 MB recommended statement size; \
+         lower the source's batch_size if the request is rejected"
+    );
+    true
+}
+
 /// What the sink knows about the target's columns.
 #[derive(Debug, Default)]
 struct TableColumns {
@@ -123,6 +143,7 @@ impl SnowflakeSink {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| (done, e))?;
                 let sql = format!("BEGIN;\n{};\nCOMMIT;", inserts.join(";\n"));
+                warn_if_oversized_statement(&sql);
                 let parameters =
                     json!({ "MULTI_STATEMENT_COUNT": (inserts.len() + 2).to_string() });
                 self.execute_statement(&sql, None, Some(parameters))
@@ -1004,6 +1025,7 @@ impl faucet_core::Sink for SnowflakeSink {
             (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT + inserts.len())
         };
 
+        warn_if_oversized_statement(&sql);
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
         self.execute_statement(&sql, None, Some(parameters)).await?;
 
@@ -1259,6 +1281,14 @@ mod tests {
         assert!(err.to_string().contains("both map to column ID"), "{err}");
         let (sql, _) = sink.build_insert(&[json!({"id": 1})]).unwrap();
         assert!(sql.contains("(\"ID\") SELECT value:\"ID\"::string"), "{sql}");
+    }
+
+    #[test]
+    fn oversized_inline_statements_are_flagged() {
+        assert!(!warn_if_oversized_statement("BEGIN; COMMIT;"));
+        assert!(warn_if_oversized_statement(
+            &"x".repeat(RECOMMENDED_STATEMENT_BYTES + 1)
+        ));
     }
 
     #[test]
