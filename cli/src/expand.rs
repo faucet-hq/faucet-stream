@@ -1584,6 +1584,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    if cfg.shard.as_ref().is_some_and(|s| s.count >= 2) {
+        check_sharded_file_sinks(&out)?;
+    }
     for warning in out.iter().filter_map(rewritten_file_warning) {
         tracing::warn!("{warning}");
     }
@@ -1820,6 +1823,24 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
 /// Covers the local `file` / `jsonl` / `csv` / `parquet` sinks and the
 /// object-store and SFTP sinks given a fixed `path` / `file_name`
 /// ([`crate::registry::sink_shared_destination`]).
+/// `shard:` runs every shard of a row at once with the same sink config, so a
+/// file or object destination would be written by several writers that
+/// clobber each other's scratch files and published objects (#862 M-096).
+fn check_sharded_file_sinks(nodes: &[ExpandedNode]) -> CliResult<()> {
+    for n in nodes.iter().filter(|n| !matches!(n.role, NodeRole::Discovery { .. })) {
+        if let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
+        {
+            return Err(CliError::Config(format!(
+                "row '{}': `shard:` runs several shards of this row at once, all writing the {} \
+                 sink destination '{dest}' — they would overwrite each other's files. Write to a \
+                 database or keyed sink, or remove `shard:`",
+                n.id, n.sink.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
     let mut seen: HashMap<String, &str> = HashMap::new();
     // Discovery rows carry their source as a placeholder sink and write nothing
@@ -4227,6 +4248,25 @@ pipeline:
                 faucet_core::EffectivelyOnceMechanism::KeyedUpsert
             )
         );
+    }
+
+    /// #862 M-096: shards run at once with one sink config, so a file or
+    /// object destination is refused under `shard:`.
+    #[test]
+    fn sharded_rows_may_not_share_a_file_destination() {
+        let run = |sink: &str| {
+            let yaml = format!(
+                "version: 1\nshard: {{ count: 2 }}\npipeline:\n  source: {{ type: sqlite, config: \
+                 {{ database_url: \"sqlite:/tmp/s.db\", query: \"SELECT 1\", shard: {{ key: id }} }} }}\n  \
+                 sink: {sink}\n"
+            );
+            expand(&parse_with_extension(&yaml, "yaml").unwrap())
+        };
+        let err = run(r#"{ type: file, config: { path: /tmp/m096/out.jsonl } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`shard:`") && err.contains("out.jsonl"), "{err}");
+        assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
     }
 
     /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered

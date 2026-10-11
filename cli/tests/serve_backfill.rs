@@ -342,5 +342,16 @@ pipeline:
         .unwrap();
     assert_eq!(resp.status(), 400, "{}", resp.text().await.unwrap());
 
+    // Several windows into one fixed file destination → 400 (#862 M-096).
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(&json!({ "config": scoped, "from": "2026-06-01", "to": "2026-06-03", "window": "1d" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("out.jsonl"), "{body}");
+
     server.abort();
 }

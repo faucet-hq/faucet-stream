@@ -534,6 +534,16 @@ pub async fn run_backfill(
     }
 
     // ── Execute ──────────────────────────────────────────────────────────────
+    if opts.concurrency > 1
+        && todo.len() > 1
+        && let Some(dest) = super::spec::shared_unit_destination(&root)
+    {
+        return Err(CliError::Config(super::spec::shared_destination_error(
+            &root.id,
+            &root.sink.kind,
+            &dest,
+        )));
+    }
     let cancel = match &opts.cancel {
         Some(token) => token.child_token(),
         None => {
@@ -928,6 +938,26 @@ pipeline:
             msg.contains("--from-bookmark"),
             "suggests alternative: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_units_may_not_share_a_file_destination() {
+        let cfg = parse_cfg(SCOPED);
+        let mut opts = base_opts(time_range(
+            "2026-06-01",
+            "2026-06-03",
+            Some(crate::backfill::plan::WindowStep::Days(1)),
+        ));
+        opts.dry_run = false;
+        let err = run_backfill(&cfg, opts).await.unwrap_err().to_string();
+        assert!(
+            err.contains("out.jsonl") && err.contains("--concurrency 1"),
+            "{err}"
+        );
+        let scoped_sink = SCOPED.replace("./out.jsonl", "\"./out-${backfill.unit}.jsonl\"");
+        let row = parse_cfg(&scoped_sink);
+        let nodes = crate::expand::expand(&row).unwrap();
+        assert_eq!(super::super::spec::shared_unit_destination(&nodes[0]), None);
     }
 
     #[tokio::test]
