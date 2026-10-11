@@ -163,6 +163,22 @@ async fn a_failed_background_upload_of_earlier_records_poisons_the_writer() {
     assert!(e.contains("lost"), "{e}");
 }
 
+/// #862 M-095: an earlier file's failed upload reaped by a later roll in the
+/// same call still poisons the writer.
+#[tokio::test]
+async fn an_earlier_upload_failure_reaped_by_a_later_roll_poisons_the_writer() {
+    let mem = Arc::new(Mem::default());
+    let mut s = jsonl();
+    s.max_records_per_file = Some(3);
+    let w = remote(&mem, Some("o/"), s, 4);
+    w.write_rows(&rows(1)).await.unwrap();
+    *mem.fail_key.lock().unwrap() = Some("pre/o/part-00001.jsonl".into());
+    assert!(w.write_rows(&rows(7)).await.is_err());
+    *mem.fail_key.lock().unwrap() = None;
+    let e = w.write_rows(&rows(1)).await.unwrap_err().to_string();
+    assert!(e.contains("lost"), "{e}");
+}
+
 /// #783 H1: without `path` every name is unique to the run, so the end of
 /// the run lists nothing.
 #[tokio::test]
@@ -1101,6 +1117,26 @@ mod in_place {
         )
         .unwrap();
         assert_eq!(text.lines().count(), 6);
+    }
+
+    /// #862 M-088: a compressed file is renamed into place on every flush,
+    /// never appended to, so a crash cannot leave a torn member in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_compressed_file_is_replaced_not_appended_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "o.jsonl.zst",
+            WriteSettings::new(FileFormat::JsonLines, Compression::Zstd),
+        );
+        let out = dir.path().join("o.jsonl.zst");
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        let first = inode(&out);
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        assert_ne!(inode(&out), first, "renamed into place, not extended");
     }
 
     #[tokio::test]

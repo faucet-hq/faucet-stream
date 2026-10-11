@@ -1736,9 +1736,10 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
 /// A local file sink writing one unnumbered file in a format that can only be
 /// rewritten whole to continue it, under a source that bookmarks — so the
 /// pipeline flushes — every page: each flush rewrites the file, so the run's
-/// time and I/O grow with the square of its size (#789 FILE-19). JSON Lines
-/// and raw text extend in place unless the whole file is sealed (encrypted
-/// and compressed). The sink warns again, per file, when it happens.
+/// time and I/O grow with the square of its size (#789 FILE-19). Uncompressed
+/// JSON Lines and raw text extend in place; a compressed file is rewritten so a
+/// crash never leaves a torn member in it (#862 M-088). The sink warns again,
+/// per file, when it happens.
 fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
     if matches!(n.role, NodeRole::Discovery { .. })
         || !source_flushes_every_page(&n.source.kind, &n.source.config)
@@ -1784,13 +1785,13 @@ fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
             .any(|ext| path.to_ascii_lowercase().ends_with(ext)),
         other => other != "none",
     };
-    let sealed_whole = cfg.get("encryption").is_some_and(|v| !v.is_null()) && compressed;
-    if line && !sealed_whole {
+    if line && !compressed {
         return None;
     }
     Some(format!(
         "row '{}': the {} source bookmarks every page, so the {} sink flushes '{path}' once per \
-         page and must rewrite it whole each time (its format can not be appended to) — the \
+         page and must rewrite it whole each time (a compressed or non-line file can not be \
+         appended to in place) — the \
          run's time and I/O grow with the square of the file's size; add `{{part}}` to the path \
          or set max_records_per_file / max_bytes_per_file",
         n.id, n.source.kind, n.sink.kind
@@ -4250,7 +4251,6 @@ pipeline:
 
         for quiet in [
             r#"{ type: file, config: { path: /tmp/f19/out.jsonl } }"#,
-            r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#,
             r#"{ type: file, config: { path: "/tmp/f19/out-{part}.csv" } }"#,
             r#"{ type: file, config: { path: /tmp/f19/out.csv, max_records_per_file: 1000 } }"#,
             r#"{ type: file, config: { path: /tmp/f19/dir/, format: csv } }"#,
@@ -4279,6 +4279,14 @@ pipeline:
             )
             .is_some(),
             "a compressed line file sealed whole is rewritten"
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#
+            )
+            .is_some(),
+            "a compressed line file is rewritten, never appended to in place"
         );
         assert_eq!(
             warn(
