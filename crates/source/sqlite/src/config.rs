@@ -38,6 +38,13 @@ pub struct SqliteSourceConfig {
     /// worker to reach the same database file (e.g. a shared volume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<ShardConfig>,
+
+    /// Confine the query to the opened database: every connection refuses
+    /// `ATTACH` (and `VACUUM INTO`, which attaches its target). Extension
+    /// loading is always off. Defaults to `false`. `faucet serve` forces it
+    /// on for every config it did not load from its own triggers file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox: bool,
 }
 
 /// Primary-key range sharding settings for the SQLite source.
@@ -76,7 +83,14 @@ impl SqliteSourceConfig {
             max_connections: 10,
             batch_size: DEFAULT_BATCH_SIZE,
             shard: None,
+            sandbox: false,
         }
+    }
+
+    /// Confine the query to the opened database (see [`Self::sandbox`]).
+    pub fn with_sandbox(mut self, sandbox: bool) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Set the maximum number of connections in the pool.

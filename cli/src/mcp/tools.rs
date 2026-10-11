@@ -633,7 +633,11 @@ fn parse_config_with(
             .and_then(|()| crate::serve::load::refuse_server_secrets(&doc))
             .map_err(|e| e.api_error().error.message)?;
     }
-    PipelineConfig::from_value(doc).map_err(|e| e.to_string())
+    let mut cfg = PipelineConfig::from_value(doc).map_err(|e| e.to_string())?;
+    if screen.is_some_and(crate::serve::load::BodyOrigin::confines_sql) {
+        crate::serve::load::confine_sql(&mut cfg);
+    }
+    Ok(cfg)
 }
 
 /// Refuse a caller-supplied config whose expanded rows point a local-file
@@ -728,8 +732,14 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
             .map_err(|e| e.to_string());
     }
 
-    let nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
+    let mut nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
     screen_paths(ctx, &cfg, &nodes)?;
+    if ctx
+        .submitted
+        .is_some_and(crate::serve::load::BodyOrigin::confines_sql)
+    {
+        crate::serve::load::confine_sql_nodes(&mut nodes);
+    }
     let first_root = nodes
         .iter()
         .find(|n| matches!(n.role, crate::expand::NodeRole::Root))

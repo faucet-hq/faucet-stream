@@ -92,6 +92,31 @@ pub struct SubmitRequest {
     /// registered template, the triggers file), never accepted from a client.
     #[serde(skip)]
     pub trusted_config: bool,
+    /// Set in-process when the config text came from a file on the server
+    /// (the triggers file), never accepted from a client: its SQL connectors
+    /// keep host access (#862 H-04). Implies `trusted_config`.
+    #[serde(skip)]
+    pub server_file: bool,
+}
+
+impl SubmitRequest {
+    /// How the server loads this request's config.
+    fn origin(&self, state: &ServerState) -> BodyOrigin {
+        if self.server_file {
+            BodyOrigin::ServerFile
+        } else {
+            state.origin(self.trusted_config)
+        }
+    }
+}
+
+/// How a stored run's config is re-loaded on claim / resume / rollback.
+pub fn stored_origin(rec: &RunRecord) -> BodyOrigin {
+    if rec.host_access {
+        BodyOrigin::ServerFile
+    } else {
+        BodyOrigin::Trusted
+    }
 }
 
 /// What a gated submission produced (#703).
@@ -413,7 +438,7 @@ fn resume_claimed(
             format,
             rec.tenant.as_deref(),
             rec.selection.as_ref(),
-            BodyOrigin::Trusted,
+            stored_origin(&rec),
         )
         .await
         {
@@ -616,7 +641,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             format,
             run.tenant.as_deref(),
             run.selection.as_ref(),
-            BodyOrigin::Trusted,
+            stored_origin(&run),
         )
         .await
         {
@@ -1077,7 +1102,7 @@ pub async fn submit(
         format,
         actor.tenant.as_deref(),
         req.selection.as_ref(),
-        state.origin(req.trusted_config),
+        req.origin(&state),
     )
     .await?;
     policy_gate(&state, &actor, &loaded).await?;
@@ -1192,6 +1217,7 @@ pub async fn submit(
     rec.callback = req.callback.clone();
     rec.tenant = actor.tenant.clone();
     rec.selection = req.selection.clone();
+    rec.host_access = req.server_file;
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -2556,6 +2582,7 @@ mod tests {
             approved_change: None,
             selection: None,
             trusted_config: false,
+            server_file: false,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -2645,6 +2672,7 @@ mod tests {
             approved_change: None,
             selection: None,
             trusted_config: false,
+            server_file: false,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -2865,6 +2893,7 @@ mod tests {
             approved_change: None,
             selection: None,
             trusted_config: false,
+            server_file: false,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(

@@ -57,6 +57,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         callback: None,
         tenant: None,
         selection: None,
+        host_access: false,
     }
 }
 

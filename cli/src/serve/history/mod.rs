@@ -187,6 +187,10 @@ pub struct RunRecord {
     /// column; defaulted for records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The run's config came from a file on the server (the triggers file),
+    /// so a claim or resume keeps its SQL connectors' host access (#862 H-04).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_access: bool,
 }
 
 impl RunRecord {
@@ -222,6 +226,7 @@ impl RunRecord {
             callback: None,
             tenant: None,
             selection: None,
+            host_access: false,
         }
     }
 }

@@ -445,7 +445,7 @@ pub async fn rollback_run(
         (None, Some(stored)) => (
             stored.to_string(),
             rec.config_format.unwrap_or_default(),
-            crate::serve::load::BodyOrigin::Trusted,
+            crate::serve::runner::stored_origin(&rec),
         ),
         (None, None) => {
             return Err(ServeError::Unprocessable {

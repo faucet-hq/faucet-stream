@@ -29,6 +29,13 @@ pub struct DuckdbSourceConfig {
     /// emitted in a single page. Useful for small lookup tables.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Confine the query to the opened database: no file or network access
+    /// (`read_text`, `read_csv`, `ATTACH`, `COPY`, httpfs), no extension
+    /// install/autoload, and the configuration locked so the query cannot
+    /// `SET` it back. Defaults to `false`. `faucet serve` forces it on for
+    /// every config it did not load from its own triggers file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox: bool,
 }
 
 fn default_batch_size() -> usize {
@@ -43,7 +50,14 @@ impl DuckdbSourceConfig {
             query: query.into(),
             read_only: false,
             batch_size: DEFAULT_BATCH_SIZE,
+            sandbox: false,
         }
+    }
+
+    /// Confine the query to the opened database (see [`Self::sandbox`]).
+    pub fn with_sandbox(mut self, sandbox: bool) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Set the per-page row count for

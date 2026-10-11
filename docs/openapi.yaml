@@ -2878,6 +2878,7 @@ components:
         records_written: { type: integer }
         tenant: { type: string, description: "The tenant this run was started for (#709); absent for an ordinary run." }
         selection: { $ref: "#/components/schemas/RowSelection" }
+        host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }

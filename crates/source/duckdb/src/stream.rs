@@ -47,7 +47,40 @@ fn open(config: &DuckdbSourceConfig) -> Result<Connection, FaucetError> {
     } else {
         Connection::open_with_flags(path, flags)
     };
-    conn.map_err(|e| FaucetError::Config(format!("DuckDB open failed ({path}): {e}")))
+    let conn =
+        conn.map_err(|e| FaucetError::Config(format!("DuckDB open failed ({path}): {e}")))?;
+    if config.sandbox {
+        sandbox(&conn)?;
+    }
+    Ok(conn)
+}
+
+/// Lock the database instance down to its own storage (#862 H-04).
+fn sandbox(conn: &Connection) -> Result<(), FaucetError> {
+    let setting = |name: &str| -> Result<bool, FaucetError> {
+        conn.query_row(
+            &format!("SELECT current_setting('{name}')::BOOLEAN"),
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| FaucetError::Config(format!("duckdb sandbox: reading {name}: {e}")))
+    };
+    if setting("lock_configuration")? {
+        return if setting("enable_external_access")? {
+            Err(FaucetError::Config(
+                "duckdb sandbox: the database's configuration is locked with external access \
+                 enabled"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    conn.execute_batch(
+        "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; \
+         SET enable_external_access=false; SET lock_configuration=true;",
+    )
+    .map_err(|e| FaucetError::Config(format!("duckdb sandbox: {e}")))
 }
 
 impl DuckdbSource {
@@ -729,5 +762,102 @@ mod tests {
         assert_eq!(plan.duck_types, vec!["INTEGER", "VARCHAR"]);
         let plain = plan_from_description("SELECT 1 AS a;", &cols[..1]).unwrap();
         assert_eq!(plain.sql, "SELECT 1 AS a");
+    }
+
+    fn secret_file(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "top-secret").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn an_unsandboxed_query_reads_local_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret_file(&dir);
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            format!("SELECT content FROM read_text('{file}')"),
+        ))
+        .await
+        .unwrap();
+        let records = source.fetch_all().await.unwrap();
+        assert_eq!(records[0]["content"], "top-secret");
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_query_cannot_reach_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret_file(&dir);
+        let other = dir
+            .path()
+            .join("other.duckdb")
+            .to_string_lossy()
+            .into_owned();
+        for query in [
+            format!("SELECT content FROM read_text('{file}')"),
+            format!("SELECT * FROM read_csv('{file}')"),
+            format!("ATTACH '{other}' AS o"),
+            "SET enable_external_access=true".to_string(),
+            "SET lock_configuration=false".to_string(),
+        ] {
+            let source = DuckdbSource::new(
+                DuckdbSourceConfig::new(":memory:", query.clone()).with_sandbox(true),
+            )
+            .await
+            .unwrap();
+            let err = source.fetch_all().await.unwrap_err().to_string();
+            assert!(!err.contains("top-secret"), "{query}: {err}");
+            assert!(
+                err.contains("disabled") || err.contains("lock") || err.contains("Permission"),
+                "{query}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_source_still_reads_its_own_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir
+            .path()
+            .join("data.duckdb")
+            .to_string_lossy()
+            .into_owned();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1), (2);")
+                .unwrap();
+        }
+        let source = DuckdbSource::new(
+            DuckdbSourceConfig::new(&db, "SELECT id FROM t ORDER BY id")
+                .read_only(true)
+                .with_sandbox(true),
+        )
+        .await
+        .unwrap();
+        let records = source.fetch_all().await.unwrap();
+        assert_eq!(records, vec![json!({"id": 1}), json!({"id": 2})]);
+    }
+
+    #[test]
+    fn sandboxing_a_locked_instance_is_a_no_op_or_a_typed_refusal() {
+        let conn = Connection::open_in_memory().unwrap();
+        sandbox(&conn).unwrap();
+        sandbox(&conn).unwrap();
+        let open = Connection::open_in_memory().unwrap();
+        open.execute_batch("SET lock_configuration=true;").unwrap();
+        assert!(matches!(sandbox(&open), Err(FaucetError::Config(m)) if m.contains("locked")));
+    }
+
+    #[test]
+    fn the_sandbox_flag_round_trips_and_defaults_off() {
+        let c: DuckdbSourceConfig =
+            serde_json::from_value(json!({"database": ":memory:", "query": "SELECT 1"})).unwrap();
+        assert!(!c.sandbox);
+        assert!(serde_json::to_value(&c).unwrap().get("sandbox").is_none());
+        let c: DuckdbSourceConfig = serde_json::from_value(
+            json!({"database": ":memory:", "query": "SELECT 1", "sandbox": true}),
+        )
+        .unwrap();
+        assert!(c.sandbox);
     }
 }

@@ -47,6 +47,14 @@ pub struct DuckdbSinkConfig {
     /// pre-exist and fail fast when it is missing.
     #[serde(default = "default_create_table")]
     pub create_table: bool,
+    /// Confine the connection to the target database: no file or network
+    /// access, no extension install/autoload, and the configuration locked.
+    /// The setting applies to the whole database instance, which sinks on the
+    /// same file in one process share. Defaults to `false`. `faucet serve`
+    /// forces it on for every config it did not load from its own triggers
+    /// file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox: bool,
 }
 
 fn default_batch_size() -> usize {
@@ -66,7 +74,14 @@ impl DuckdbSinkConfig {
             column_mapping: DuckdbColumnMapping::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             create_table: default_create_table(),
+            sandbox: false,
         }
+    }
+
+    /// Confine the connection to the target database (see [`Self::sandbox`]).
+    pub fn with_sandbox(mut self, sandbox: bool) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Opt out of auto-creating a missing target table (#580).

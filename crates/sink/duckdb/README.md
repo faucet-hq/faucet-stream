@@ -27,6 +27,7 @@ page is written.
 | `table_name` | string | — | Target table, optionally `schema.table` or `catalog.schema.table`. |
 | `column_mapping` | enum | `{json: {column: "data"}}` | `json` stores each record as one JSON text column; `auto_map` maps top-level keys onto matching columns. |
 | `batch_size` | integer | `1000` | Rows per multi-row INSERT. `0` = one INSERT for the whole slice. |
+| `sandbox` | bool | `false` | No file or network access, no extension install or autoload, configuration locked. The setting holds for the whole database instance, which sinks on one file in one process share. `faucet serve` forces it on for every config except those in its own `--triggers` file. |
 
 ## Example
 
