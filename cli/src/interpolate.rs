@@ -998,10 +998,7 @@ mod tests {
             interpolate_record_path("/items/${p.id}/sub", &ctx).unwrap(),
             "/items/a%2Fb%3Fc%23d%20e/sub"
         );
-        assert_eq!(
-            interpolate_record_path("/n/${p.n}", &ctx).unwrap(),
-            "/n/5"
-        );
+        assert_eq!(interpolate_record_path("/n/${p.n}", &ctx).unwrap(), "/n/5");
         assert_eq!(
             interpolate_record_path("${p.href}", &ctx).unwrap(),
             "/v1/items/7?x=1"

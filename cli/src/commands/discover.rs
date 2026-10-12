@@ -811,7 +811,10 @@ mod tests {
             legacy_row_ids(&before),
             vec![Some("public_orders".to_string())]
         );
-        assert_eq!(legacy_row_ids(&[ds("orders", "table", json!({}))]), vec![None]);
+        assert_eq!(
+            legacy_row_ids(&[ds("orders", "table", json!({}))]),
+            vec![None]
+        );
         let legacy_after = legacy_row_ids(&after);
         assert!(legacy_after.iter().all(Option::is_none), "{legacy_after:?}");
         let rendered = render_discovered_config(

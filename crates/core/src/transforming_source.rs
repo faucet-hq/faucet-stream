@@ -333,9 +333,7 @@ impl Source for TransformingSource {
     }
 
     fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
-
         self.inner.set_cancel(cancel)
-
     }
 }
 

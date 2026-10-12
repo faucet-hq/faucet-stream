@@ -482,7 +482,11 @@ matrix:
     assert!(!summary.had_failures());
     assert_eq!(store.get("p::public_orders").await.unwrap(), None);
     assert!(
-        store.get("p::public_orders-1a2b3c4d").await.unwrap().is_some(),
+        store
+            .get("p::public_orders-1a2b3c4d")
+            .await
+            .unwrap()
+            .is_some(),
         "the bookmark moved to the row's current key"
     );
 
@@ -503,6 +507,9 @@ matrix:
             .iter()
             .any(|old| old.starts_with("public_orders::partition::"))),
         "{:?}",
-        nodes.iter().map(|n| &n.legacy_state_ids).collect::<Vec<_>>()
+        nodes
+            .iter()
+            .map(|n| &n.legacy_state_ids)
+            .collect::<Vec<_>>()
     );
 }

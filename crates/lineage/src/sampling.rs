@@ -521,9 +521,7 @@ impl Source for SamplingSource {
     }
 
     fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-
         self.inner.set_cancel(cancel)
-
     }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await

@@ -322,9 +322,7 @@ impl faucet_core::Source for BoundedSource {
     }
 
     fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-
         self.inner.set_cancel(cancel)
-
     }
 }
 

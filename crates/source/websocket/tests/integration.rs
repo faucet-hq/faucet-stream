@@ -681,10 +681,9 @@ async fn a_cancelled_run_writes_the_buffered_tail() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         token.cancel();
     };
-    let (result, ()) = tokio::time::timeout(
-        Duration::from_secs(10),
-        async { tokio::join!(pipeline.run(), cancel_later) },
-    )
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(pipeline.run(), cancel_later)
+    })
     .await
     .expect("a cancelled run ends promptly");
     assert_eq!(result.unwrap().records_written, 3);

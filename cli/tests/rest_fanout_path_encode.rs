@@ -128,7 +128,10 @@ matrix:
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(delivered, "the webhook must listen on the percent-encoded path");
+    assert!(
+        delivered,
+        "the webhook must listen on the percent-encoded path"
+    );
     let summary = run.await.unwrap().unwrap();
     assert!(!summary.had_failures(), "{summary:?}");
 }

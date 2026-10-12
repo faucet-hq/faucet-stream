@@ -1317,9 +1317,12 @@ async fn check_overwrite_plan(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> 
     if !nodes.iter().any(crate::destination::is_overwrite) {
         return Ok(());
     }
-    let ids =
-        crate::destination::Identities::resolve(nodes, &opts.auth, crate::destination::is_overwrite)
-            .await;
+    let ids = crate::destination::Identities::resolve(
+        nodes,
+        &opts.auth,
+        crate::destination::is_overwrite,
+    )
+    .await;
     crate::destination::check_overwrite_levels_with(&ids, nodes)
 }
 
@@ -3977,9 +3980,7 @@ impl Source for StateKeyOverride {
     }
 
     fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-
         self.inner.set_cancel(cancel)
-
     }
     fn state_key(&self) -> Option<String> {
         Some(self.key.clone())
@@ -7510,7 +7511,9 @@ matrix:
             product_ctx: None,
             legacy_state_keys: Vec::new(),
         };
-        let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts).await.unwrap();
+        let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts)
+            .await
+            .unwrap();
         assert_eq!(groups.len(), 1, "one table ⇒ one staging ⇒ one group");
         assert_eq!(groups[0].members, 2);
         assert_eq!(task_group.len(), 2);
@@ -7520,7 +7523,9 @@ matrix:
         let mut c = a.clone();
         c.id = "c3".into();
         c.sink.config["busy_timeout_secs"] = json!(9);
-        let (groups, _) = plan_overwrite_groups(&[mk(&a), mk(&c)], &opts).await.unwrap();
+        let (groups, _) = plan_overwrite_groups(&[mk(&a), mk(&c)], &opts)
+            .await
+            .unwrap();
         assert_eq!(groups.len(), 1, "the sink reports one destination");
         assert_eq!(groups[0].members, 2);
     }

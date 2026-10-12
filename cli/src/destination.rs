@@ -91,8 +91,7 @@ impl Identities {
         let (Some(ka), Some(kb)) = (self.key(a), self.key(b)) else {
             return false;
         };
-        ka == kb
-            || matches!((self.0.get(&a.id), self.0.get(&b.id)), (Some(x), Some(y)) if x == y)
+        ka == kb || matches!((self.0.get(&a.id), self.0.get(&b.id)), (Some(x), Some(y)) if x == y)
     }
 
     /// Ask the sinks where they write. Only nodes that could share a
@@ -548,15 +547,29 @@ mod tests {
             .await
             .unwrap();
 
-        let plain = node("plain", NodeRole::Root, &[], json!({"database_url": db, "table_name": "t", "column_mapping": "auto_map"}));
-        let other = node("other", NodeRole::Root, &[], json!({"database_url": db, "table_name": "t", "column_mapping": "auto_map", "busy_timeout_secs": 1}));
+        let plain = node(
+            "plain",
+            NodeRole::Root,
+            &[],
+            json!({"database_url": db, "table_name": "t", "column_mapping": "auto_map"}),
+        );
+        let other = node(
+            "other",
+            NodeRole::Root,
+            &[],
+            json!({"database_url": db, "table_name": "t", "column_mapping": "auto_map", "busy_timeout_secs": 1}),
+        );
         let e = check_owns_destination_resolved(&plain, &[plain.clone(), other.clone()], &auth)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("'other'"), "{e}");
 
-        assert!(reported_identity("sqlite", &json!({"nope": 1}), &auth).await.is_none());
+        assert!(
+            reported_identity("sqlite", &json!({"nope": 1}), &auth)
+                .await
+                .is_none()
+        );
         assert!(uri_identity("x", "x://unknown").is_none());
         assert!(uri_identity("x", " ").is_none());
         assert_eq!(

@@ -294,8 +294,9 @@ impl faucet_core::Source for BufferingFeed {
         _batch_size: usize,
     ) -> std::pin::Pin<
         Box<
-            dyn faucet_core::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>>
-                + Send
+            dyn faucet_core::Stream<
+                    Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>,
+                > + Send
                 + 'a,
         >,
     > {
@@ -330,7 +331,10 @@ async fn a_source_that_drains_on_cancel_has_its_tail_written_then_flushed() {
         .await
         .expect("a cancelled run stops cleanly");
 
-    assert_eq!(result.records_written, 2, "the buffered tail must be written");
+    assert_eq!(
+        result.records_written, 2,
+        "the buffered tail must be written"
+    );
     let events = log.events();
     let write = events
         .iter()

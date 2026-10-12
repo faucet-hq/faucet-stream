@@ -149,9 +149,7 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
     }
 
     fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
-
         self.inner.set_cancel(cancel)
-
     }
 
     fn state_key(&self) -> Option<String> {

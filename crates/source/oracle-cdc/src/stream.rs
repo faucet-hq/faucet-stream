@@ -26,9 +26,9 @@ use crate::logs::{LogFile, oldest_available_scn, plan_log_files};
 use crate::miner::{Assembler, LogRow, Miner, TableMeta, to_envelope};
 use crate::sql::{
     ADD_LOGFILE_SQL, ARCHIVED_LOGS_SQL, CONTAINER_SQL, CURRENT_SCN_SQL, DatabaseLogging,
-    END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL,
-    PDB_INCARNATION_SQL, POSITION_SQL, RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, THREADS_SQL, columns_sql,
-    contents_sql, flush_sql, flush_table_ddl, in_pdb, log_groups_sql, logging_report,
+    END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, PDB_INCARNATION_SQL,
+    POSITION_SQL, RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, THREADS_SQL,
+    columns_sql, contents_sql, flush_sql, flush_table_ddl, in_pdb, log_groups_sql, logging_report,
     needs_logfiles,
 };
 use crate::state::Position;

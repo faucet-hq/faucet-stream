@@ -383,7 +383,9 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
     .await;
     let mut lob_cfg = cfg(&conn);
     lob_cfg.tables = vec!["FAUCET.CDC_L".into()];
-    let lob_src = OracleCdcSource::new(lob_cfg.clone()).await.expect("lob source");
+    let lob_src = OracleCdcSource::new(lob_cfg.clone())
+        .await
+        .expect("lob source");
 
     // A CLOB written in several pieces, with a supplementary-plane character
     // straddling no boundary and UTF-16 offsets after it, comes back whole.
@@ -423,7 +425,9 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
     )
     .await;
     lob_src.apply_start_bookmark(anchor.clone()).await.unwrap();
-    let err = drain_err(&lob_src).await.expect("a partial LOB write fails");
+    let err = drain_err(&lob_src)
+        .await
+        .expect("a partial LOB write fails");
     assert!(err.contains("partial LOB write"), "{err}");
     let mut skip_cfg = lob_cfg.clone();
     skip_cfg.on_unsupported = faucet_source_oracle_cdc::OnUnsupported::Skip;
