@@ -716,6 +716,13 @@ pub struct MatrixRow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 
+    /// Row ids an earlier release stored this row's state under. While the
+    /// row has no state of its own, its first run moves the bookmark from the
+    /// first of these that holds one. `faucet discover` writes it when a
+    /// dataset's row id changed (#862 L-040).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_state_ids: Vec<String>,
+
     /// Split this row into N independent invocations over a chunked range
     /// (#479), each scoped by `${partition.*}` tokens substituted into the
     /// connector configs. Inherits the top-level `partition:` block when unset.

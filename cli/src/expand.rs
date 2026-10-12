@@ -363,6 +363,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             sla: None,
             profiling: None,
             tags: Vec::new(),
+            legacy_state_ids: Vec::new(),
             partition: None,
             discover: None,
             for_each: Vec::new(),
@@ -391,6 +392,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
         if !seen.insert(id.clone()) {
             return Err(CliError::DuplicateRowId { id });
+        }
+        if let Some(old) = row.legacy_state_ids.iter().find(|old| !is_row_id(old)) {
+            return Err(CliError::Config(format!(
+                "matrix row '{id}': legacy_state_ids entry '{old}' is not a row id (letters, \
+                 digits, `_` and `-`)"
+            )));
         }
         ids.push(id);
     }
@@ -1559,7 +1566,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             tags,
             deferred_refs: deferred,
             source_override: None,
-            legacy_state_ids: Vec::new(),
+            legacy_state_ids: row.legacy_state_ids.clone(),
             cleanup_scope,
             metadata_columns: effective_metadata_columns(cfg),
             #[cfg(feature = "catalog")]
@@ -1579,6 +1586,11 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 n.id = format!("{}::partition::{}", base.id, chunk.id);
                 n.legacy_state_ids = legacy_partition_id(&base.id, &chunk.id, width)
                     .into_iter()
+                    .chain(
+                        base.legacy_state_ids
+                            .iter()
+                            .map(|old| format!("{old}::partition::{}", chunk.id)),
+                    )
                     .collect();
                 crate::partition::substitute(&mut n.source.config, chunk)
                     .map_err(|e| CliError::Config(format!("row '{}': {e}", ids[i])))?;

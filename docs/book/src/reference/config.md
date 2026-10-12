@@ -415,6 +415,15 @@ Semantics:
 - Ordering works identically under `faucet run`, `schedule`, and `serve` —
   they all execute the same expanded plan.
 
+### `legacy_state_ids` — carry state across a row-id change
+
+A row's id is part of its state key, so renaming a row would start it from
+scratch. `legacy_state_ids: [old_id, …]` lists ids the row's state was stored
+under before; while the row has no state of its own, its first run moves the
+bookmark from the first of them that holds one (a partition chunk looks under
+`old_id::partition::<chunk>`). `faucet discover` and runtime fan-out write it
+when a dataset's id changed (see [Discover](../cookbook/discover.md)).
+
 ### `fan_out:` / `for_each:` — discovery-driven fan-out (#501)
 
 > Spelled `discover:` before #654; the old key is still accepted. It was

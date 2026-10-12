@@ -43,41 +43,49 @@ untouched, and secrets are **echoed as their raw references** (`${env:…}`,
 matrix:
   # public.orders (table, ~1204 rows)
   #   columns: id integer, note string?, total number
-  - id: public_orders
+  - id: public_orders-1f58f903
+    legacy_state_ids: [public_orders]
     source:
       config:
         query: SELECT * FROM "public"."orders"
     sink:
       config:
-        path: ./out.public_orders.jsonl
+        path: ./out.public_orders-1f58f903.jsonl
   # sales.leads (table, ~87 rows)
   #   columns: id integer, active boolean?
-  - id: sales_leads
+  - id: sales_leads-befd6242
+    legacy_state_ids: [sales_leads]
     source:
       config:
         query: SELECT * FROM "sales"."leads"
     sink:
       config:
-        path: ./out.sales_leads.jsonl
+        path: ./out.sales_leads-befd6242.jsonl
 ```
 
 Each row deep-merges a per-dataset **config patch** over the connection config;
 introspected column schemas and row estimates appear as comments (`?` marks a
 nullable column).
 
-The row id is also the row's state key, so it depends only on the dataset's
-name: the name with every other character run collapsed to `_`
-(`public.orders` → `public_orders`). When that is ambiguous — two datasets
-sanitize to the same id (unless one is literally named that), the result is a
-reserved id like `window`, or the name has no ASCII letters or digits — the id
-gets a stable `-<hash>` of the full name (`a.b` beside `a_b` → `a_b-1c2d3e4f`).
+The row id is also the row's state key, so it depends only on the dataset
+itself — never on which other datasets a listing returns. A name that is
+already a valid row id (letters, digits, `_`, `-`) and not reserved is used as
+is (`orders` → `orders`); any other name is collapsed to `_` runs and gets a
+stable `-<hash>` of the full name (`public.orders` → `public_orders-1f58f903`),
+so a later dataset that sanitizes alike (`public/orders`) cannot rename it.
+
+Releases before this rule kept a sanitized name plain while no other dataset
+shared it (`public.orders` → `public_orders`). Where that old id differs, the
+row lists it under `legacy_state_ids`: while the row has no state of its own,
+its first run moves the bookmark stored under the old id to the new one. The
+same happens for rows that runtime fan-out (`fan_out: true`) generates.
 
 When the sink writes one fixed file — a `file` / `jsonl` / `csv` / single-file
 `parquet` path, or an `s3` / `gcs` / `azure-blob` sink with a fixed `path`
 (`sftp`: `file_name`) — every row would overwrite the others, and `faucet run`
 refuses rows that share a destination. So each row gets its own: the row id
 goes into the file name before its first extension (`./out.jsonl` →
-`./out.public_orders.jsonl`, `part-{part}.parquet` → `part-{part}.orders.parquet`),
+`./out.public_orders-1f58f903.jsonl`, `part-{part}.parquet` → `part-{part}.orders.parquet`),
 or becomes a subdirectory of a directory path (`exports/` → `exports/orders/`).
 A sink that already gives every row its own name (an appending `jsonl` / `csv`,
 a remote sink without `path`, a table-per-dataset `sink_patch`) is left as is.
