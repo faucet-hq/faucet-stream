@@ -37,6 +37,13 @@ function summaryLine(c) {
   if (c.kind === "template_launch") {
     return `launch ${escapeHtml(s.template || "?")} v${s.target_version ?? "?"}${s.stable_before != null ? ` (stable is v${s.stable_before})` : " (nothing launched yet)"}`;
   }
+  if (c.kind === "template_delete") {
+    const what = s.delete === "all" ? "every version of" : `v${escapeHtml(String(s.delete ?? "?"))} of`;
+    return `delete ${what} ${escapeHtml(s.template || "?")}`;
+  }
+  if (c.kind === "template_deprecate") {
+    return `${s.action === "revive" ? "revive" : "retire"} ${escapeHtml(s.template || "?")} v${s.target_version ?? "?"}`;
+  }
   return "";
 }
 

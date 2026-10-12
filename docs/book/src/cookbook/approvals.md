@@ -44,6 +44,8 @@ curl -X POST http://127.0.0.1:8080/v1/changes \
 | `run` | a `POST /v1/runs` body | the run, as the requester, with the budget merged in |
 | `template_register` | a `POST /v1/templates` body | the registration (and launch, when the body asks) |
 | `template_launch` | `{ "id": "...", "version": 3 }` (version optional, default `newest`) | the launch |
+| `template_delete` | `{ "id": "...", "version": 3 }` (no `version` = every version) | the delete |
+| `template_deprecate` | `{ "id": "...", "version": 3, "reason": "...", "undo": false }` | retiring (or with `undo`, reviving) the version |
 
 The response is the stored request: `status: pending`, the plan (one
 [`faucet plan`](../reference/cli.md#plan) report per root row — source, sink,
@@ -163,11 +165,15 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
   `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
   assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run
   `/v1/templates/sync` answer `409`. Under `template_launch` so do deleting a
-  version that was ever launched (or the whole template, once launched) and
-  retiring or reviving a version, since both move what an unpinned request
-  resolves to. So do the MCP `register_template` /
-  `launch_template` / `rollback_template` tools. `--templates-sync` registers
-  and launches on its own schedule, so it cannot be combined with either kind.
+  version that was ever launched, the `newest` version or a version a channel
+  points at (or the whole template), and retiring or reviving a version,
+  since each moves what a request resolves to: propose those as
+  `template_delete` / `template_deprecate` changes instead. They take the
+  `template_launch` approval rule unless a rule names them, and can also be
+  gated on their own (`--require-approval template_delete`). So do the MCP `register_template` /
+  `launch_template` / `rollback_template` tools. `--templates-sync` registers,
+  launches and retires versions on its own schedule, so it cannot be combined
+  with `template_register`, `template_launch` or `template_deprecate`.
 
 A template trigger that waits for approval stores the template body with its
 `${env:}` / `${file:}` / secret references still unresolved — they resolve

@@ -155,6 +155,19 @@ impl Api {
         let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
         (status, v)
     }
+    async fn delete(&self, token: &str, path: &str) -> (u16, Value) {
+        let r = self
+            .client
+            .delete(format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap();
+        let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        (status, v)
+    }
     async fn wait_run(&self, run_id: &str) -> Value {
         for _ in 0..400 {
             let (_, rec) = self.get("admin-tok", &format!("/v1/runs/{run_id}")).await;
@@ -808,4 +821,131 @@ async fn change_requested_notifications_resolve_env_references() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     hook.verify().await;
+}
+
+/// Review of #868 (cli F6, F7): under `--require-approval template_launch` a
+/// delete or a version retirement that moves what callers resolve to is
+/// refused directly but stays possible through an approved `template_delete` /
+/// `template_deprecate` change request, which takes the launch approval rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn gated_deletes_and_retirements_run_through_change_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let port = free_port();
+    spawn_server(port, dir.path(), vec!["template_launch".into()]).await;
+    let api = Api {
+        base: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::new(),
+    };
+    let tpl = format!(
+        "kind: pipeline\n{}{SMOKE}",
+        csv_config(&input, &dir.path().join("o.jsonl"), "tpl-d")
+    );
+    for _ in 0..2 {
+        let (code, r) = api
+            .post(
+                "admin-tok",
+                "/v1/templates",
+                json!({ "config": tpl, "id": "tpl-d" }),
+            )
+            .await;
+        assert_eq!(code, 201, "{r}");
+    }
+
+    let (code, err) = api
+        .delete("admin-tok", "/v1/templates/tpl-d?version=2")
+        .await;
+    assert_eq!(code, 409, "deleting `newest` is gated: {err}");
+    assert!(err.to_string().contains("template_delete"), "{err}");
+    let (code, err) = api
+        .post(
+            "admin-tok",
+            "/v1/templates/tpl-d/versions/1/deprecate",
+            json!({ "reason": "bad" }),
+        )
+        .await;
+    assert_eq!(code, 409, "{err}");
+    assert!(err.to_string().contains("template_deprecate"), "{err}");
+
+    let approve = |id: String| {
+        let api = &api;
+        async move {
+            let (code, c) = api
+                .post("admin-tok", &format!("/v1/changes/{id}/approve"), json!({}))
+                .await;
+            assert_eq!(code, 200, "{c}");
+            c
+        }
+    };
+    let (code, change) = api
+        .post(
+            "bob-tok",
+            "/v1/changes",
+            json!({ "kind": "template_delete", "payload": { "id": "tpl-d", "version": "newest" }, "reason": "drop v2" }),
+        )
+        .await;
+    assert_eq!(code, 201, "{change}");
+    assert_eq!(change["plan"]["summary"]["delete"], 2);
+    let id = change["id"].as_str().unwrap().to_string();
+    let (code, err) = api
+        .post("dave-tok", &format!("/v1/changes/{id}/approve"), json!({}))
+        .await;
+    assert_eq!(
+        code, 403,
+        "the launch rule (admins) governs a delete: {err}"
+    );
+    let done = approve(id).await;
+    assert_eq!(done["status"], "executed", "{done}");
+    assert_eq!(done["template"]["version"], 2);
+    let (_, t) = api
+        .get("viewer-tok", "/v1/templates/tpl-d?version=newest")
+        .await;
+    assert_eq!(t["newest"], 1, "{t}");
+
+    let (code, change) = api
+        .post(
+            "bob-tok",
+            "/v1/changes",
+            json!({ "kind": "template_deprecate", "payload": { "id": "tpl-d", "version": 1, "reason": "bad" } }),
+        )
+        .await;
+    assert_eq!(code, 201, "{change}");
+    assert_eq!(change["plan"]["summary"]["action"], "retire");
+    let done = approve(change["id"].as_str().unwrap().to_string()).await;
+    assert_eq!(done["status"], "executed", "{done}");
+    let (_, t) = api.get("viewer-tok", "/v1/templates/tpl-d?version=1").await;
+    assert_eq!(t["deprecated_versions"][0]["version"], 1, "{t}");
+
+    let (code, err) = api
+        .post(
+            "bob-tok",
+            "/v1/changes",
+            json!({ "kind": "template_deprecate", "payload": { "id": "tpl-d", "version": 9 } }),
+        )
+        .await;
+    assert_eq!(code, 422, "{err}");
+    let (code, _) = api
+        .post(
+            "bob-tok",
+            "/v1/changes",
+            json!({ "kind": "template_delete", "payload": { "id": "ghost" } }),
+        )
+        .await;
+    assert_eq!(code, 404);
+
+    let (code, change) = api
+        .post(
+            "bob-tok",
+            "/v1/changes",
+            json!({ "kind": "template_delete", "payload": { "id": "tpl-d" } }),
+        )
+        .await;
+    assert_eq!(code, 201, "{change}");
+    assert_eq!(change["plan"]["summary"]["delete"], "all");
+    let done = approve(change["id"].as_str().unwrap().to_string()).await;
+    assert_eq!(done["status"], "executed", "{done}");
+    assert!(done["template"].is_null(), "{done}");
+    let (code, _) = api.get("viewer-tok", "/v1/templates/tpl-d?version=1").await;
+    assert_eq!(code, 404);
 }

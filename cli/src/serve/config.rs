@@ -239,12 +239,13 @@ impl ServeConfig {
                     k,
                     crate::serve::changes::ChangeKind::TemplateRegister
                         | crate::serve::changes::ChangeKind::TemplateLaunch
+                        | crate::serve::changes::ChangeKind::TemplateDeprecate
                 )
             })
         {
             return Err(CliError::Serve(format!(
-                "--templates-sync registers and launches templates on its own schedule, which \
-                 would bypass --require-approval {kind}; drop one of the two"
+                "--templates-sync registers, launches and retires templates on its own \
+                 schedule, which would bypass --require-approval {kind}; drop one of the two"
             )));
         }
         if args.approval_expiry_secs == 0 {

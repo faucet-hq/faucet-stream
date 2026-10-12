@@ -2237,9 +2237,10 @@ pub struct ServeArgs {
     /// Require an approved change request (#703) before these kinds of
     /// actions happen: `run` (`POST /v1/runs` and template triggers answer
     /// with a pending change request instead of a run; backfills are
-    /// refused), `template_register`, `template_launch`. Repeatable or
-    /// comma-separated. Who may approve is the `approvals:` block of
-    /// `--auth-config`.
+    /// refused), `template_register`, `template_launch`, `template_delete`,
+    /// `template_deprecate` (the last two are also gated by
+    /// `template_launch`). Repeatable or comma-separated. Who may approve is
+    /// the `approvals:` block of `--auth-config`.
     #[arg(long = "require-approval", value_name = "KIND")]
     pub require_approval: Vec<String>,
     /// How long a pending change request stays approvable (seconds) when the
