@@ -495,7 +495,13 @@ async fn mysql_review_862_regressions() {
         .await
         .unwrap();
     assert!(out[0].is_ok());
-    assert!(out[1].as_ref().unwrap_err().to_string().contains("not base64"));
+    assert!(
+        out[1]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("not base64")
+    );
     let upsert = MysqlSink::new(
         config(&url, "tok", WriteMode::Upsert, &["id"])
             .with_binary_encoding(faucet_sink_mysql::BinaryEncoding::Base64),

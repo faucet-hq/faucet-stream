@@ -330,17 +330,25 @@ fn sql_tokens(sql: &str) -> Vec<(SqlToken<'_>, usize)> {
         } else if c == b'$'
             && let Some(len) = sql[i + 1..]
                 .find('$')
-                .filter(|&n| sql[i + 1..i + 1 + n].bytes().all(|t| t.is_ascii_alphanumeric() || t == b'_'))
+                .filter(|&n| {
+                    sql[i + 1..i + 1 + n]
+                        .bytes()
+                        .all(|t| t.is_ascii_alphanumeric() || t == b'_')
+                })
                 .filter(|&n| n == 0 || !b[i + 1].is_ascii_digit())
         {
             let tag = &sql[i..i + len + 2];
             let start = i;
             let body = i + tag.len();
-            i = sql[body..].find(tag).map_or(b.len(), |n| body + n + tag.len());
+            i = sql[body..]
+                .find(tag)
+                .map_or(b.len(), |n| body + n + tag.len());
             out.push((SqlToken::Word(&sql[start..i]), i));
         } else if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 {
             let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80 || b[i] == b'$') {
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80 || b[i] == b'$')
+            {
                 i += 1;
             }
             out.push((SqlToken::Word(&sql[start..i]), i));

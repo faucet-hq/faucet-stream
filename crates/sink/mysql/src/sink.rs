@@ -2443,7 +2443,10 @@ mod tests {
             local: false,
             ..fk.clone()
         };
-        assert!(!elsewhere.references("cat"), "a same-named table in another database");
+        assert!(
+            !elsewhere.references("cat"),
+            "a same-named table in another database"
+        );
         assert!(!fk.references("dog"));
     }
 

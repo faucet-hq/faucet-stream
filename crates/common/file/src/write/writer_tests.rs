@@ -636,7 +636,10 @@ async fn a_float_widening_that_would_round_integers_is_refused() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("2^53"), "an incoming big integer is not rounded either: {e}");
+    assert!(
+        e.contains("2^53"),
+        "an incoming big integer is not rounded either: {e}"
+    );
 
     let w = local(
         dir.path(),

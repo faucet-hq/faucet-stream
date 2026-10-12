@@ -4190,8 +4190,14 @@ mod graph_safety_tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("position fields") && err.contains("'ahead'"), "{err}");
-        assert!(ahead.rows.lock().unwrap().is_empty(), "nothing was written twice");
+        assert!(
+            err.contains("position fields") && err.contains("'ahead'"),
+            "{err}"
+        );
+        assert!(
+            ahead.rows.lock().unwrap().is_empty(),
+            "nothing was written twice"
+        );
     }
 
     #[test]

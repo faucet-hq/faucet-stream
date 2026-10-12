@@ -523,8 +523,16 @@ async fn a_number_matching_value_detector_takes_the_row_path() {
             "`{column}` keeps one JSON type on every page: {got:?}"
         );
     }
-    assert_eq!(got[0]["acct"], json!("12345"), "a non-card value keeps its digits");
-    assert_ne!(got[1]["acct"], json!("4111111111111111"), "the card number is masked");
+    assert_eq!(
+        got[0]["acct"],
+        json!("12345"),
+        "a non-card value keeps its digits"
+    );
+    assert_ne!(
+        got[1]["acct"],
+        json!("4111111111111111"),
+        "the card number is masked"
+    );
 }
 
 /// A non-quarantining quality policy (`abort`) must run *on* the columnar path

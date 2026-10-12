@@ -1952,10 +1952,19 @@ mod tests {
         let int = serde_json::json!({"type": "integer"});
         let nullable = serde_json::json!({"type": ["number", "null"]});
         let number = serde_json::json!({"type": "number"});
-        assert_eq!(widened_nullability(Some(&int), &nullable, Some(false)), Some(true));
-        assert_eq!(widened_nullability(Some(&int), &number, Some(false)), Some(false));
+        assert_eq!(
+            widened_nullability(Some(&int), &nullable, Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            widened_nullability(Some(&int), &number, Some(false)),
+            Some(false)
+        );
         assert_eq!(widened_nullability(None, &nullable, None), None);
-        assert_eq!(widened_nullability(Some(&nullable), &nullable, Some(true)), Some(true));
+        assert_eq!(
+            widened_nullability(Some(&nullable), &nullable, Some(true)),
+            Some(true)
+        );
     }
 
     #[test]

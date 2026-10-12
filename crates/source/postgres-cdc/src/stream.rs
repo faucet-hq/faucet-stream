@@ -128,10 +128,9 @@ impl PostgresCdcSource {
         control: &mut Option<sqlx::PgConnection>,
     ) -> Result<HashMap<u32, String>, FaucetError> {
         let (mut known, missing) = {
-            let cache = self
-                .partition_roots
-                .lock()
-                .map_err(|_| FaucetError::Source("postgres-cdc: partition cache poisoned".into()))?;
+            let cache = self.partition_roots.lock().map_err(|_| {
+                FaucetError::Source("postgres-cdc: partition cache poisoned".into())
+            })?;
             cached_roots(&cache, oids)
         };
         if missing.is_empty() {

@@ -529,9 +529,7 @@ fn may_remove_fields(t: &TransformSpec, fields: &[&str]) -> bool {
         match v {
             Value::String(s) => s == field || s.starts_with(&format!("{field}.")),
             Value::Array(items) => items.iter().any(|i| mentions(i, field)),
-            Value::Object(map) => map
-                .iter()
-                .any(|(k, v)| k == field || mentions(v, field)),
+            Value::Object(map) => map.iter().any(|(k, v)| k == field || mentions(v, field)),
             _ => false,
         }
     }
@@ -2692,7 +2690,10 @@ pipeline:
             let err = validate_topology_spec(&eo_kafka_graph(t, append))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("node 'x'") && err.contains("`offset`"), "{t}: {err}");
+            assert!(
+                err.contains("node 'x'") && err.contains("`offset`"),
+                "{t}: {err}"
+            );
         }
         for t in [
             "{ type: select, config: { fields: [topic, partition, offset, value] } }",
@@ -2732,7 +2733,9 @@ pipeline:
             config: serde_json::json!({ "field": "lsn.x", "value": 1 }),
         };
         assert!(may_remove_fields(&set, &["lsn"]));
-        assert!(!keyed_sink(&serde_json::json!({ "write_mode": "upsert", "key": [] })));
+        assert!(!keyed_sink(
+            &serde_json::json!({ "write_mode": "upsert", "key": [] })
+        ));
     }
 
     #[test]

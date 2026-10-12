@@ -524,7 +524,18 @@ mod tests {
             .iter()
             .map(|r| r["v"].clone())
             .collect();
-        assert_eq!(v, vec![json!(2), json!(3), json!(5), json!(6), json!(7), json!(8), json!(9)]);
+        assert_eq!(
+            v,
+            vec![
+                json!(2),
+                json!(3),
+                json!(5),
+                json!(6),
+                json!(7),
+                json!(8),
+                json!(9)
+            ]
+        );
     }
 
     /// An object inserted in reverse-sorted key order (#817).

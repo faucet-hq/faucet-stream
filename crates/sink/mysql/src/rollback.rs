@@ -500,7 +500,9 @@ impl MysqlSink {
         let prev = quote_ident_mysql(&self.previous_table_name());
         let old = quote_ident_mysql(&self.old_table_name());
         let col = &opts.run_id_column;
-        let columns = self.columns_of(&mut **conn, &self.config.table_name).await?;
+        let columns = self
+            .columns_of(&mut **conn, &self.config.table_name)
+            .await?;
         // The kept table is the image before the *latest* overwrite; if the
         // target no longer holds this run's rows, a later run replaced them.
         let conflicts: i64 = if columns.iter().any(|c| c == col) {

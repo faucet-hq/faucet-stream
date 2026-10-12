@@ -1554,9 +1554,10 @@ impl PostgresSink {
 
         let table_ref =
             qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        let mut conn = self.pool.acquire().await.map_err(|e| {
-            FaucetError::Sink(format!("PostgreSQL connection acquire failed: {e}"))
-        })?;
+        let mut conn =
+            self.pool.acquire().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL connection acquire failed: {e}"))
+            })?;
         let columns = self.discover_columns(&mut conn, &table_ref).await?;
         drop(conn);
         let (mut outcomes, writable, positions) =

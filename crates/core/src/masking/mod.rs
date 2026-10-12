@@ -442,7 +442,10 @@ mod tests {
             page1.records[0],
             json!({"acct": "12345", "amount": "-1.5", "n": {"x": "7"}, "ok": true, "z": null})
         );
-        assert!(page1.hits.is_empty(), "a coerced number is not a masking hit");
+        assert!(
+            page1.hits.is_empty(),
+            "a coerced number is not a masking hit"
+        );
         let masked = page2.records[0]["acct"].as_str().unwrap();
         assert_eq!(masked.len(), 64, "the card is hashed, still a string");
 

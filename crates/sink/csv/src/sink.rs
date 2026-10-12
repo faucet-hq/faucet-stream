@@ -830,7 +830,12 @@ mod tests {
         );
         assert!(failure.into_error().to_string().contains("io"));
         assert!(truncate_to(&dir.path().join("missing.csv"), 0).is_err());
-        let failure = repair(&config, state_over(&path), FaucetError::Sink("io".into()), None);
+        let failure = repair(
+            &config,
+            state_over(&path),
+            FaucetError::Sink("io".into()),
+            None,
+        );
         assert!(matches!(failure, Failure::Lost(_)), "{failure:?}");
     }
 

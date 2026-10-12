@@ -565,11 +565,8 @@ mod tests {
 
     #[test]
     fn project_refuses_to_round_a_large_integer_into_a_float() {
-        let float: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "n",
-            DataType::Float64,
-            true,
-        )]));
+        let float: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, true)]));
         for (ty, value) in [
             (DataType::Int64, json!(-9_007_199_254_740_993_i64)),
             (DataType::UInt64, json!(18_000_000_000_000_000_000_u64)),

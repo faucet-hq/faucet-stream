@@ -416,7 +416,13 @@ async fn review_862_regressions() {
         .await
         .unwrap();
     assert!(out[0].is_ok());
-    assert!(out[1].as_ref().unwrap_err().to_string().contains("not base64"));
+    assert!(
+        out[1]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("not base64")
+    );
     let mut copy = strict();
     copy.write_method = PostgresWriteMethod::Copy;
     let out = PostgresSink::new(copy)
@@ -431,7 +437,11 @@ async fn review_862_regressions() {
     let out = PostgresSink::new(upsert)
         .await
         .unwrap()
-        .write_batch_partial(&[json!({"id": 5, "t": "nope!"}), json!({"id": 6, "t": "AQI="}), json!({"t": "AQI="})])
+        .write_batch_partial(&[
+            json!({"id": 5, "t": "nope!"}),
+            json!({"id": 6, "t": "AQI="}),
+            json!({"t": "AQI="}),
+        ])
         .await
         .unwrap();
     assert!(out[0].is_err() && out[1].is_ok());
