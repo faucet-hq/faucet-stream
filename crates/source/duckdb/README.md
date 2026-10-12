@@ -43,6 +43,11 @@ the result size and the first page arrives before the query finishes. (A
 statement that cannot be wrapped in a subquery — `PRAGMA`, `SHOW`, … — is read
 as a materialized result.)
 
+The source learns each column's type with `DESCRIBE`; when that cannot plan the
+query (bound `${parent.*}` parameters, for instance) it reads the types of the
+first row with `typeof()` instead, and when neither works it logs a warning and
+the text casts below are skipped — cast such columns to `VARCHAR` yourself.
+
 | DuckDB type | JSON |
 |-------------|------|
 | integer types, `UBIGINT` | number |
