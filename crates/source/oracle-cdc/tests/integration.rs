@@ -376,7 +376,8 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
         &[
             "CREATE TABLE CDC_L (ID NUMBER PRIMARY KEY, NOTE CLOB)",
             "ALTER TABLE CDC_L ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
-            "INSERT INTO CDC_L (ID, NOTE) VALUES (2, 'base')",
+            "DECLARE c CLOB; BEGIN c := RPAD('b', 5000, 'b'); \
+             INSERT INTO CDC_L (ID, NOTE) VALUES (2, c); END;",
             "CREATE TABLE CDC_X (ID NUMBER PRIMARY KEY, X XMLTYPE) \
              XMLTYPE COLUMN X STORE AS BINARY XML",
             "ALTER TABLE CDC_X ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
@@ -390,8 +391,8 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
         .await
         .expect("lob source");
 
-    // A CLOB written in several pieces, with a supplementary-plane character
-    // straddling no boundary and UTF-16 offsets after it, comes back whole.
+    // A CLOB LogMiner logs in several pieces, one holding a supplementary-plane
+    // character (the later pieces' offsets count it once), comes back whole.
     let anchor = lob_src.capture_resume_position().await.unwrap().unwrap();
     common::exec(
         &conn,
@@ -417,7 +418,9 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
     assert!(bookmark["resetlogs_scn"].as_u64().is_some(), "{bookmark}");
 
     // An append to a CLOB whose value predates the window cannot be
-    // reassembled: it fails by default and is dropped under `skip`.
+    // reassembled: it fails by default and is dropped under `skip`. The value
+    // is stored out of row, so only the appended piece is logged (an in-row
+    // value is logged whole and reads as a plain update).
     let anchor = lob_src.capture_resume_position().await.unwrap().unwrap();
     common::exec(
         &conn,
@@ -438,7 +441,7 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
     skipping.apply_start_bookmark(anchor).await.unwrap();
     let (records, _, _) = drain(&skipping).await;
     assert!(
-        records.iter().all(|r| r["after"]["NOTE"] != "base more"),
+        records.iter().all(|r| r["after"]["ID"] != 2),
         "a reassembled guess never surfaces: {records:#?}"
     );
 

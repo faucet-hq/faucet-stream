@@ -10,6 +10,8 @@
 //!   buf_c := 'aaa'; dbms_lob.write(loc_c, 3, 1, buf_c); END;
 //! ```
 
+use std::collections::HashMap;
+
 use faucet_common_oracle::hex_to_bytes;
 
 /// A literal from redo text, before typing against the column.
@@ -543,17 +545,24 @@ pub fn parse_lob_change(sql: &str) -> Result<LobChange, String> {
     })
 }
 
-/// Whether `change` rewrites the whole value: contiguous writes from offset 1
-/// and no trim, so the result does not depend on the value it replaced. An
-/// in-place overwrite of a longer value's prefix logs the same pieces and is
+/// Whether the changes a transaction made to one LOB rewrite the whole value:
+/// writes covering it from offset 1 without a gap, in any logged order, and no
+/// trim, so the result does not depend on the value it replaced. An in-place
+/// overwrite of a longer value's prefix logs the same pieces and is
 /// indistinguishable here (documented in the README).
-pub fn is_full_rewrite(change: &LobChange) -> bool {
-    if change.trim.is_some() || change.writes.is_empty() {
+pub fn is_full_rewrite_all(changes: &[LobChange]) -> bool {
+    if changes.iter().any(|c| c.trim.is_some()) {
         return false;
     }
+    let writes: Vec<&LobPiece> = changes.iter().flat_map(|c| &c.writes).collect();
+    if writes.is_empty() {
+        return false;
+    }
+    let mut pieces: Vec<_> = unit_offsets(&writes).into_iter().zip(writes).collect();
+    pieces.sort_by_key(|(offset, _)| *offset);
     let mut end = 1u64;
-    for w in &change.writes {
-        if w.offset > end {
+    for (offset, w) in pieces {
+        if offset > end {
             return false;
         }
         let len = match &w.data {
@@ -561,58 +570,87 @@ pub fn is_full_rewrite(change: &LobChange) -> bool {
             Resolved::Text(t) => t.encode_utf16().count(),
             _ => 0,
         } as u64;
-        end = end.max(w.offset + len);
+        end = end.max(offset + len);
     }
     true
 }
 
-/// Apply LOB pieces to a column's current value. CLOB offsets and lengths are
-/// UTF-16 code units, as Oracle counts them.
-pub fn apply_lob(current: &Resolved, change: &LobChange) -> Resolved {
+/// Each write's offset in UTF-16 code units. A caller's `dbms_lob.write` and
+/// `trim` are logged in UTF-16 units, but when LogMiner splits one write into
+/// pieces, each piece after the first starts at the previous piece's offset
+/// plus its *character* count, so a supplementary-plane character shifts every
+/// later piece of the chain back by one unit.
+fn unit_offsets(writes: &[&LobPiece]) -> Vec<u64> {
+    let mut order: Vec<usize> = (0..writes.len()).collect();
+    order.sort_by_key(|&i| writes[i].offset);
+    let mut shift_at_end: HashMap<u64, u64> = HashMap::new();
+    let mut offsets = vec![0; writes.len()];
+    for i in order {
+        let w = writes[i];
+        let shift = shift_at_end.get(&w.offset).copied().unwrap_or(0);
+        offsets[i] = w.offset + shift;
+        if let Resolved::Text(t) = &w.data {
+            let chars = t.chars().count() as u64;
+            let units = t.encode_utf16().count() as u64;
+            shift_at_end.insert(w.offset + chars, shift + units - chars);
+        }
+    }
+    offsets
+}
+
+/// Apply every change a transaction made to one LOB to its current value, in
+/// logged order (each change's writes, then its trim). CLOB positions are
+/// UTF-16 code units, as Oracle counts them, resolved over all the changes
+/// together since the pieces of one write can arrive in any order (see
+/// [`unit_offsets`]).
+pub fn apply_lob_all(current: &Resolved, changes: &[LobChange]) -> Resolved {
+    let writes: Vec<&LobPiece> = changes.iter().flat_map(|c| &c.writes).collect();
     let binary = matches!(current, Resolved::Bytes(_))
-        || change
-            .writes
-            .iter()
-            .any(|w| matches!(w.data, Resolved::Bytes(_)));
+        || writes.iter().any(|w| matches!(w.data, Resolved::Bytes(_)));
     if binary {
         let mut bytes = match current {
             Resolved::Bytes(b) => b.clone(),
             _ => Vec::new(),
         };
-        for w in &change.writes {
-            let data = match &w.data {
-                Resolved::Bytes(b) => b.clone(),
-                Resolved::Text(t) => t.as_bytes().to_vec(),
-                _ => Vec::new(),
-            };
-            let at = (w.offset - 1) as usize;
-            if bytes.len() < at + data.len() {
-                bytes.resize(at + data.len(), 0);
+        for change in changes {
+            for w in &change.writes {
+                let data = match &w.data {
+                    Resolved::Bytes(b) => b.clone(),
+                    Resolved::Text(t) => t.as_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                let at = (w.offset - 1) as usize;
+                if bytes.len() < at + data.len() {
+                    bytes.resize(at + data.len(), 0);
+                }
+                bytes[at..at + data.len()].copy_from_slice(&data);
             }
-            bytes[at..at + data.len()].copy_from_slice(&data);
-        }
-        if let Some(n) = change.trim {
-            bytes.truncate(n as usize);
+            if let Some(n) = change.trim {
+                bytes.truncate(n as usize);
+            }
         }
         return Resolved::Bytes(bytes);
     }
+    let mut offsets = unit_offsets(&writes).into_iter();
     let mut units: Vec<u16> = match current {
         Resolved::Text(t) => t.encode_utf16().collect(),
         _ => Vec::new(),
     };
-    for w in &change.writes {
-        let data: Vec<u16> = match &w.data {
-            Resolved::Text(t) => t.encode_utf16().collect(),
-            _ => Vec::new(),
-        };
-        let at = (w.offset - 1) as usize;
-        if units.len() < at + data.len() {
-            units.resize(at + data.len(), u16::from(b' '));
+    for change in changes {
+        for (w, offset) in change.writes.iter().zip(offsets.by_ref()) {
+            let data: Vec<u16> = match &w.data {
+                Resolved::Text(t) => t.encode_utf16().collect(),
+                _ => Vec::new(),
+            };
+            let at = (offset - 1) as usize;
+            if units.len() < at + data.len() {
+                units.resize(at + data.len(), u16::from(b' '));
+            }
+            units[at..at + data.len()].copy_from_slice(&data);
         }
-        units[at..at + data.len()].copy_from_slice(&data);
-    }
-    if let Some(n) = change.trim {
-        units.truncate(n as usize);
+        if let Some(n) = change.trim {
+            units.truncate(n as usize);
+        }
     }
     Resolved::Text(String::from_utf16_lossy(&units))
 }
@@ -624,6 +662,14 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_full_rewrite(change: &LobChange) -> bool {
+        is_full_rewrite_all(std::slice::from_ref(change))
+    }
+
+    fn apply_lob(current: &Resolved, change: &LobChange) -> Resolved {
+        apply_lob_all(current, std::slice::from_ref(change))
+    }
 
     fn t(s: &str) -> Resolved {
         Resolved::Text(s.into())
@@ -785,6 +831,74 @@ mod tests {
         // An emoji is two UTF-16 units, so the write at 4 lands after it.
         let c = mk(vec![piece(4, "x")], None);
         assert_eq!(apply_lob(&t("a😀b"), &c), t("a😀x"));
+    }
+
+    /// Piece layouts as Oracle 23 LogMiner logs them (#862 L-058).
+    #[test]
+    fn chained_pieces_advance_by_characters() {
+        let piece = |offset, s: String| LobPiece {
+            offset,
+            data: Resolved::Text(s),
+        };
+        let mk = |writes, trim| LobChange {
+            owner: "A".into(),
+            table: "T".into(),
+            column: "C".into(),
+            conditions: vec![],
+            writes,
+            trim,
+        };
+        let r = |c: &str, n| c.repeat(n);
+        // An inserted value of 4000 x, an emoji and 3000 y: pieces logged out
+        // of order, each after the emoji's piece one unit early.
+        let insert = mk(
+            vec![
+                piece(3067, format!("{}😀{}", r("x", 934), r("y", 28))),
+                piece(1023, r("x", 1022)),
+                piece(1, r("x", 1022)),
+                piece(2045, r("x", 1022)),
+                piece(5052, r("y", 1022)),
+                piece(6074, r("y", 928)),
+                piece(4030, r("y", 1022)),
+            ],
+            None,
+        );
+        let value = format!("{}😀{}", r("x", 4000), r("y", 3000));
+        assert!(is_full_rewrite(&insert));
+        assert_eq!(
+            apply_lob(&Resolved::Null, &insert),
+            Resolved::Text(value.clone())
+        );
+
+        // A caller's write is in UTF-16 units; its chain starts there.
+        let write = mk(
+            vec![
+                piece(1032, format!("{}😀{}", r("a", 478), r("b", 542))),
+                piece(10, r("a", 1022)),
+                piece(2053, r("b", 458)),
+            ],
+            None,
+        );
+        let expected = format!(
+            "{}{}😀{}{}",
+            r("x", 9),
+            r("a", 1500),
+            r("b", 1000),
+            &value[9 + 2502..]
+        );
+        assert!(!is_full_rewrite(&write));
+        assert_eq!(
+            apply_lob(&Resolved::Text(value.clone()), &write),
+            Resolved::Text(expected)
+        );
+
+        // A lone caller write and trim after the emoji stay in UTF-16 units.
+        let patch = mk(vec![piece(4004, "ZQ".into())], Some(5000));
+        let Resolved::Text(out) = apply_lob(&Resolved::Text(value), &patch) else {
+            panic!("text")
+        };
+        assert_eq!(out.encode_utf16().count(), 5000);
+        assert_eq!(&out[3997..4009], "xxx😀yZQyy");
     }
 
     #[test]

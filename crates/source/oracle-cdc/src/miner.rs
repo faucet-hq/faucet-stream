@@ -15,7 +15,8 @@ use serde_json::{Map, Value, json};
 
 use crate::config::OnUnsupported;
 use crate::redo::{
-    DmlKind, Image, LobChange, Resolved, apply_lob, is_full_rewrite, parse_dml, parse_lob_change,
+    DmlKind, Image, LobChange, Resolved, apply_lob_all, is_full_rewrite_all, parse_dml,
+    parse_lob_change,
 };
 
 /// `V$LOGMNR_CONTENTS.OPERATION_CODE` values the miner acts on.
@@ -180,11 +181,28 @@ struct Piece {
     kind: PieceKind,
 }
 
+/// The LOB changes a transaction made to one column of one event, applied
+/// together when the transaction next needs that row: LogMiner logs one write
+/// as several rows, in no guaranteed order.
+#[derive(Debug)]
+struct PendingLob {
+    event_id: u64,
+    column: String,
+    /// The value the changes apply to; `None` when it predates the window.
+    base: Option<Resolved>,
+    /// The event was created for these changes alone.
+    synthesized: bool,
+    changes: Vec<LobChange>,
+    /// The first row, for error context.
+    row: LogRow,
+}
+
 #[derive(Debug, Default)]
 struct Txn {
     first_scn: u64,
     events: Vec<Event>,
     pieces: Vec<Piece>,
+    lobs: Vec<PendingLob>,
 }
 
 impl Txn {
@@ -329,12 +347,15 @@ impl Miner {
                 self.txn(&row.xid, row.scn);
                 Ok(None)
             }
-            op::COMMIT => Ok(self.open.remove(&row.xid).map(|t| Committed {
-                xid: row.xid.clone(),
-                commit_scn: row.scn,
-                timestamp: row.timestamp.clone(),
-                events: t.events,
-            })),
+            op::COMMIT => {
+                self.settle_lobs(&row.xid)?;
+                Ok(self.open.remove(&row.xid).map(|t| Committed {
+                    xid: row.xid.clone(),
+                    commit_scn: row.scn,
+                    timestamp: row.timestamp.clone(),
+                    events: t.events,
+                }))
+            }
             op::ROLLBACK => {
                 self.open.remove(&row.xid);
                 Ok(None)
@@ -373,13 +394,7 @@ impl Miner {
             }
             op::LOB_WRITE | op::LOB_TRIM => match parse_lob_change(&row.redo) {
                 Ok(change) if !is_mismatch(row) => {
-                    if !self.lob(row, change) {
-                        return self.unsupported(
-                            row,
-                            "a partial LOB write (append, offset write or trim) on a LOB whose \
-                             current value is not in this transaction",
-                        );
-                    }
+                    self.lob(row, change);
                     self.check_staged(&row.xid)?;
                     Ok(None)
                 }
@@ -402,6 +417,7 @@ impl Miner {
     }
 
     fn dml(&mut self, row: &LogRow) -> Result<Option<Committed>, FaucetError> {
+        self.settle_lobs(&row.xid)?;
         if row.rollback {
             let original = match row.op {
                 op::DELETE => DmlKind::Insert,
@@ -484,13 +500,13 @@ impl Miner {
         Ok(None)
     }
 
-    /// Fold a LOB change into the transaction. Returns `false`, changing
-    /// nothing, when the change is partial and the value it modifies is not
-    /// known here — synthesising it would emit a padded or truncated LOB.
-    fn lob(&mut self, row: &LogRow, change: LobChange) -> bool {
+    /// Stage a LOB change on the row it targets; [`Self::settle_lobs`] applies
+    /// it. A change to a row not otherwise in the transaction becomes an
+    /// update of that row.
+    fn lob(&mut self, row: &LogRow, change: LobChange) {
         let id = self.id();
         let txn = self.txn(&row.xid, row.scn);
-        let target = txn.events.iter_mut().rev().find(|e| {
+        let target = txn.events.iter().rev().find(|e| {
             matches!(e.op, EventOp::Insert | EventOp::Update)
                 && e.owner == change.owner
                 && e.table == change.table
@@ -498,39 +514,82 @@ impl Miner {
                     .as_ref()
                     .is_some_and(|a| matches(a, &change.conditions))
         });
-        match target {
+        let (event_id, base, synthesized) = match target {
             Some(e) => {
-                let after = e.after.get_or_insert_with(Vec::new);
-                let current = after
-                    .iter()
-                    .find(|(c, _)| c == &change.column)
+                if let Some(p) = txn
+                    .lobs
+                    .iter_mut()
+                    .find(|p| p.event_id == e.id && p.column == change.column)
+                {
+                    p.changes.push(change);
+                    return;
+                }
+                let base = e
+                    .after
+                    .as_ref()
+                    .and_then(|a| a.iter().find(|(c, _)| c == &change.column))
                     .map(|(_, v)| v.clone());
-                let current = match current {
-                    Some(v) => v,
-                    None if is_full_rewrite(&change) => Resolved::Null,
-                    None => return false,
-                };
-                overlay(
-                    after,
-                    &vec![(change.column.clone(), apply_lob(&current, &change))],
-                );
+                (e.id, base, false)
             }
-            None if !is_full_rewrite(&change) => return false,
             None => {
-                let mut after = change.conditions.clone();
-                overlay(
-                    &mut after,
-                    &vec![(change.column.clone(), apply_lob(&Resolved::Null, &change))],
-                );
                 txn.events.push(Event {
                     op: EventOp::Update,
                     before: Some(change.conditions.clone()),
-                    after: Some(after),
+                    after: Some(change.conditions.clone()),
                     ..base_event(id, &change.owner, &change.table, None, row.scn)
                 });
+                (id, None, true)
+            }
+        };
+        txn.lobs.push(PendingLob {
+            event_id,
+            column: change.column.clone(),
+            base,
+            synthesized,
+            changes: vec![change],
+            row: row.clone(),
+        });
+    }
+
+    /// Apply a transaction's staged LOB changes. A change whose base value is
+    /// not known here is applied only when the changes together rewrite the
+    /// whole value; otherwise it goes through `on_unsupported`, since
+    /// synthesising it would emit a padded or truncated LOB.
+    fn settle_lobs(&mut self, xid: &str) -> Result<(), FaucetError> {
+        let Some(pending) = self.open.get_mut(xid).map(|t| std::mem::take(&mut t.lobs)) else {
+            return Ok(());
+        };
+        for p in pending {
+            let base = match p.base {
+                Some(b) => b,
+                None if is_full_rewrite_all(&p.changes) => Resolved::Null,
+                None => {
+                    self.unsupported(
+                        &p.row,
+                        "a partial LOB write (append, offset write or trim) on a LOB whose \
+                         current value is not in this transaction",
+                    )?;
+                    if p.synthesized
+                        && let Some(t) = self.open.get_mut(xid)
+                    {
+                        t.events.retain(|e| e.id != p.event_id);
+                    }
+                    continue;
+                }
+            };
+            let value = apply_lob_all(&base, &p.changes);
+            if let Some(e) = self
+                .open
+                .get_mut(xid)
+                .and_then(|t| t.events.iter_mut().find(|e| e.id == p.event_id))
+            {
+                overlay(
+                    e.after.get_or_insert_with(Vec::new),
+                    &vec![(p.column, value)],
+                );
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -972,6 +1031,65 @@ mod tests {
         assert_eq!(upd["before"], json!({"ID": 9}));
     }
 
+    /// LogMiner logs one CLOB write as several rows, out of offset order, and
+    /// advances each piece after a supplementary-plane character by its
+    /// character count (#862 L-058).
+    #[test]
+    fn lob_pieces_settle_together_in_any_order() {
+        let piece = |id: &str, buf: &str, off: u64| {
+            format!(
+                "DECLARE loc_c CLOB; BEGIN select \"NOTE\" into loc_c from \"APP\".\"T\" where \"ID\" = '{id}' for update; buf_c := '{buf}'; dbms_lob.write(loc_c, {}, {off}, buf_c); END;",
+                buf.chars().count()
+            )
+        };
+        let meta: TableMeta = HashMap::from([(
+            ("APP".into(), "T".into()),
+            HashMap::from([
+                ("ID".to_string(), TypeFamily::Integer),
+                ("NOTE".to_string(), TypeFamily::Clob),
+            ]),
+        )]);
+        let mut m = miner();
+        let mut ins = row(
+            1,
+            op::INSERT,
+            "X",
+            r#"insert into "APP"."T"("ID","NOTE") values ('1',EMPTY_CLOB())"#,
+        );
+        ins.row_id = Some("AAAAAAAAAAAAAAAAAA".into());
+        m.apply(&ins).unwrap();
+        for (scn, buf, off) in [(2, "c😀d", 3), (3, "ef", 6), (4, "ab", 1)] {
+            m.apply(&row(scn, op::LOB_WRITE, "X", &piece("1", buf, off)))
+                .unwrap();
+        }
+        // A row not otherwise in the transaction, rewritten out of order.
+        for (scn, buf, off) in [(5, "yz", 3), (6, "wx", 1)] {
+            m.apply(&row(scn, op::LOB_WRITE, "X", &piece("2", buf, off)))
+                .unwrap();
+        }
+        // A later update of row 1 sees the settled value and folds onto it.
+        m.apply(&row(
+            7,
+            op::UPDATE,
+            "X",
+            r#"update "APP"."T" set "V" = 'v' where "ID" = '1'"#,
+        ))
+        .unwrap();
+        m.apply(&row(8, op::LOB_WRITE, "X", &piece("1", "!", 9)))
+            .unwrap();
+        let c = m
+            .apply(&row(9, op::COMMIT, "X", "commit"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.events.len(), 2);
+        let first = to_envelope(&c.events[0], &c, &meta);
+        assert_eq!(first["after"]["NOTE"], "abc😀def!");
+        assert_eq!(first["after"]["V"], "v");
+        let second = to_envelope(&c.events[1], &c, &meta);
+        assert_eq!(second["op"], "u");
+        assert_eq!(second["after"], json!({"ID": 2, "NOTE": "wxyz"}));
+    }
+
     #[test]
     fn binary_xmltype_rows_go_through_on_unsupported() {
         for code in [op::XML_DOC_BEGIN, op::XML_DOC_WRITE, op::XML_DOC_END] {
@@ -985,10 +1103,24 @@ mod tests {
     #[test]
     fn a_partial_lob_write_without_a_known_value_is_unsupported() {
         let append = "DECLARE loc_c CLOB; BEGIN select \"NOTE\" into loc_c from \"APP\".\"T\" where \"ID\" = '9' for update; buf_c := 'zz'; dbms_lob.write(loc_c, 2, 5, buf_c); END;";
-        let err = miner()
-            .apply(&row(1, op::LOB_WRITE, "X", append))
-            .unwrap_err();
+        // Decided when the transaction is settled: a later row may complete it.
+        let mut m = miner();
+        assert!(
+            m.apply(&row(1, op::LOB_WRITE, "X", append))
+                .unwrap()
+                .is_none()
+        );
+        let err = m.apply(&row(2, op::COMMIT, "X", "commit")).unwrap_err();
         assert!(err.to_string().contains("partial LOB write"), "{err}");
+        assert!(err.to_string().contains("SCN 1"), "{err}");
+
+        let mut dropped = Miner::new(OnUnsupported::Skip, None);
+        dropped.apply(&row(1, op::LOB_WRITE, "X", append)).unwrap();
+        let c = dropped
+            .apply(&row(2, op::COMMIT, "X", "commit"))
+            .unwrap()
+            .unwrap();
+        assert!(c.events.is_empty(), "the synthesised update is dropped");
 
         let mut skip = Miner::new(OnUnsupported::Skip, None);
         skip.apply(&row(
