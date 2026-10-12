@@ -113,6 +113,7 @@ fn mask_node(node: &mut Value, path: &str, m: &CompiledMasking, hits: &mut Vec<M
                 }
             }
         }
+        Value::Number(n) if m.stringify_numbers => *node = Value::String(n.to_string()),
         _ => {}
     }
 }
@@ -321,8 +322,9 @@ mod tests {
         );
         assert_eq!(
             out.records[0],
-            json!({"ts": 1717200000000u64, "amount": 4155552671u64, "flag": true,
-                   "tel": "***", "cc": "***"})
+            json!({"ts": "1717200000000", "amount": "4155552671", "flag": true,
+                   "tel": "***", "cc": "***"}),
+            "numbers are not phones (kept, as strings because a card rule can match numbers)"
         );
     }
 
@@ -423,6 +425,35 @@ mod tests {
             &m,
         );
         assert_eq!(out.records[0], json!({"address": "***", "id": 1}));
+    }
+
+    #[test]
+    fn a_number_matching_detector_writes_every_number_as_a_string() {
+        let m = compile(json!({
+            "key": "k",
+            "rules": [{ "match": { "value_detector": "credit_card" }, "action": { "type": "hash" } }]
+        }));
+        let page1 = apply_masking(
+            vec![json!({"acct": 12345, "amount": -1.5, "n": {"x": 7}, "ok": true, "z": null})],
+            &m,
+        );
+        let page2 = apply_masking(vec![json!({"acct": 4111111111111111u64})], &m);
+        assert_eq!(
+            page1.records[0],
+            json!({"acct": "12345", "amount": "-1.5", "n": {"x": "7"}, "ok": true, "z": null})
+        );
+        assert!(
+            page1.hits.is_empty(),
+            "a coerced number is not a masking hit"
+        );
+        let masked = page2.records[0]["acct"].as_str().unwrap();
+        assert_eq!(masked.len(), 64, "the card is hashed, still a string");
+
+        let plain = compile(json!({
+            "rules": [{ "match": { "value_detector": "email" }, "action": { "type": "redact" } }]
+        }));
+        let out = apply_masking(vec![json!({"acct": 12345})], &plain);
+        assert_eq!(out.records[0]["acct"], json!(12345));
     }
 
     #[test]

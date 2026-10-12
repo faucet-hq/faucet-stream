@@ -335,16 +335,59 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// An exclusive OS lock (`flock` / `LockFileEx`) on a lock file, released
 /// when dropped or when the holding process dies.
 ///
-/// The file itself is never removed: deleting it while another writer has it
-/// open would let a third writer lock a fresh file at the same path, and a
-/// crashed writer's lock is released by the OS, so no staleness rule is needed
-/// (#862 M-009).
+/// A crashed writer's lock is released by the OS, so no staleness rule is
+/// needed (#862 M-009). On Unix `delete` unlinks the lock file while holding
+/// it; a waiter that then wins the lock on the unlinked file sees that the path
+/// no longer names it and locks the path afresh, so two holders never share a
+/// path.
 struct LockFile {
     _file: std::fs::File,
 }
 
-async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
-    let file = tokio::fs::OpenOptions::new()
+impl LockFile {
+    /// Remove the lock file while holding it (Unix only; Windows keeps it,
+    /// because an open file cannot be unlinked there).
+    fn remove(&self, path: &Path) -> Result<(), FaucetError> {
+        if cfg!(unix) {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(FaucetError::State(format!(
+                        "failed to delete state lock {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `path` still names the file `file` has open.
+#[cfg(unix)]
+fn names_open_file(file: &std::fs::File, path: &Path) -> Result<bool, FaucetError> {
+    use std::os::unix::fs::MetadataExt;
+    let open = file
+        .metadata()
+        .map_err(|e| FaucetError::State(format!("failed to stat state lock: {e}")))?;
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.dev() == open.dev() && m.ino() == open.ino()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(FaucetError::State(format!(
+            "failed to stat state lock {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn names_open_file(_file: &std::fs::File, _path: &Path) -> Result<bool, FaucetError> {
+    Ok(true)
+}
+
+async fn open_lock_file(path: &Path) -> Result<std::fs::File, FaucetError> {
+    Ok(tokio::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
@@ -357,11 +400,20 @@ async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
             ))
         })?
         .into_std()
-        .await;
+        .await)
+}
+
+async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
     let started = tokio::time::Instant::now();
+    let mut file = open_lock_file(path).await?;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(LockFile { _file: file }),
+            Ok(()) => {
+                if names_open_file(&file, path)? {
+                    return Ok(LockFile { _file: file });
+                }
+                file = open_lock_file(path).await?;
+            }
             Err(std::fs::TryLockError::WouldBlock) => {
                 if started.elapsed() > LOCK_WAIT {
                     return Err(FaucetError::State(format!(
@@ -639,6 +691,10 @@ impl FileStateStore {
             .join(format!("{}.{}.{}.json.tmp", safe_filename(key), token, seq))
     }
 
+    fn lock_path(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{}.json.lock", safe_filename(key)))
+    }
+
     async fn ensure_root(&self) -> Result<(), FaucetError> {
         tokio::fs::create_dir_all(&self.root).await.map_err(|e| {
             FaucetError::State(format!(
@@ -895,6 +951,12 @@ impl StateStore for FileStateStore {
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         validate_state_key(key)?;
         self.migrate_legacy_names().await?;
+        let lock_path = self.lock_path(key);
+        let held = if tokio::fs::try_exists(&self.root).await.unwrap_or(false) {
+            Some(acquire_lock_file(&lock_path).await?)
+        } else {
+            None
+        };
         let mut paths = vec![self.entry_path(key)];
         paths.extend(self.key_sidecar(key));
         for path in paths {
@@ -908,6 +970,9 @@ impl StateStore for FileStateStore {
                     )));
                 }
             }
+        }
+        if let Some(held) = held {
+            held.remove(&lock_path)?;
         }
         Ok(())
     }
@@ -927,8 +992,7 @@ impl StateStore for FileStateStore {
     ) -> Result<bool, FaucetError> {
         validate_state_key(key)?;
         self.ensure_root().await?;
-        let lock = self.root.join(format!("{}.json.lock", safe_filename(key)));
-        let _held = acquire_lock_file(&lock).await?;
+        let _held = acquire_lock_file(&self.lock_path(key)).await?;
         if self.get(key).await?.as_ref() != expected {
             return Ok(false);
         }
@@ -1167,6 +1231,47 @@ mod tests {
             "the lock is released after each compare-and-put"
         );
         assert_eq!(store.list("").await.unwrap(), vec!["lease".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_delete_removes_the_lock_file_and_the_key_stays_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(dir.path());
+        assert!(store.compare_and_put("k", None, &json!(1)).await.unwrap());
+        assert!(dir.path().join("k.json.lock").exists());
+        store.delete("k").await.unwrap();
+        assert!(!dir.path().join("k.json.lock").exists());
+        assert!(store.get("k").await.unwrap().is_none());
+        assert!(store.compare_and_put("k", None, &json!(2)).await.unwrap());
+        assert_eq!(store.get("k").await.unwrap(), Some(json!(2)));
+        FileStateStore::new(dir.path().join("never-created"))
+            .delete("k")
+            .await
+            .unwrap();
+    }
+
+    /// A waiter that wins the lock on a file `delete` unlinked must not keep
+    /// it: a third writer could lock a fresh file at the same path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lock_won_on_an_unlinked_file_is_retaken_on_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.json.lock");
+        let holder = std::fs::File::create(&path).unwrap();
+        holder.lock().unwrap();
+        let waiter = tokio::spawn({
+            let path = path.clone();
+            async move { acquire_lock_file(&path).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::fs::remove_file(&path).unwrap();
+        drop(holder);
+        let held = waiter.await.unwrap().unwrap();
+        let open = held._file.metadata().unwrap();
+        let on_disk = std::fs::metadata(&path).unwrap();
+        assert_eq!((open.dev(), open.ino()), (on_disk.dev(), on_disk.ino()));
     }
 
     #[tokio::test(start_paused = true)]

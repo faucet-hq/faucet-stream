@@ -25,28 +25,41 @@ pub(crate) fn no_matching_column_message(
     )
 }
 
-/// Split a page into per-row outcomes and the records to write: a record that
-/// matches no column fails on its own row instead of failing the page.
-pub(crate) fn split_unmatched(
+/// Split a page into per-row outcomes, the records to write, and each written
+/// record's position in `records`. A record whose `bytea` value
+/// `binary_encoding` refuses — or, with `require_match`, that matches no
+/// column — fails on its own row instead of failing the page.
+pub(crate) fn split_writable(
     records: &[Value],
     columns: &[(String, String)],
-) -> (Vec<faucet_core::RowOutcome>, Vec<Value>) {
+    binary: BinaryEncoding,
+    require_match: bool,
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
     let mut outcomes = Vec::with_capacity(records.len());
     let mut writable = Vec::with_capacity(records.len());
+    let mut positions = Vec::with_capacity(records.len());
     for (idx, record) in records.iter().enumerate() {
-        match record.as_object() {
-            Some(obj) if !columns.iter().any(|(c, _)| obj.contains_key(c)) => {
-                outcomes.push(Err(FaucetError::Sink(no_matching_column_message(
-                    idx, obj, columns,
-                ))));
+        let failure = match record.as_object() {
+            Some(obj) if require_match && !columns.iter().any(|(c, _)| obj.contains_key(c)) => {
+                Some(no_matching_column_message(idx, obj, columns))
             }
-            _ => {
+            Some(obj) => columns.iter().find_map(|(col, udt)| {
+                pg_bind_text_with(obj.get(col), udt, binary)
+                    .err()
+                    .map(|e| format!("row {idx}: column {col}: {e}"))
+            }),
+            None => None,
+        };
+        match failure {
+            Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
+            None => {
                 outcomes.push(Ok(()));
                 writable.push(record.clone());
+                positions.push(idx);
             }
         }
     }
-    (outcomes, writable)
+    (outcomes, writable, positions)
 }
 
 /// Render a JSON value as the text to bind for a PostgreSQL column whose
@@ -1533,21 +1546,31 @@ impl PostgresSink {
             })?;
             let columns = self.discover_columns(&mut conn, &table_ref).await?;
             drop(conn);
-            let (outcomes, writable) = split_unmatched(records, &columns);
+            let (outcomes, writable, _) =
+                split_writable(records, &columns, self.config.binary_encoding, true);
             self.write_batch_unbounded(&writable).await?;
             return Ok(outcomes);
         }
 
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+        let table_ref =
+            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
+        let mut conn =
+            self.pool.acquire().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL connection acquire failed: {e}"))
+            })?;
+        let columns = self.discover_columns(&mut conn, &table_ref).await?;
+        drop(conn);
+        let (mut outcomes, writable, positions) =
+            split_writable(records, &columns, self.config.binary_encoding, false);
+        let plan = faucet_core::plan_writes(&writable, &self.config.write);
         self.apply_plans_standalone(&faucet_core::plan_writes_ordered(
-            records,
+            &writable,
             &self.config.write,
         ))
         .await?;
 
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
-            outcomes[*idx] = Err(FaucetError::Sink(format!(
+            outcomes[positions[*idx]] = Err(FaucetError::Sink(format!(
                 "postgres {}: {msg}",
                 self.config.write.write_mode.as_str()
             )));
@@ -2105,7 +2128,7 @@ mod tests {
         ColumnRoles, PostgresSinkConfig, ReferencingKey, build_add_column_sql,
         build_alter_type_sql, build_create_table_sql, build_drop_not_null_sql, clear_statements,
         derived_table_name, on_conflict_clause, pg_bind_text, pg_udt_to_json_schema,
-        qualified_table_ref, split_unmatched, widened_keyword,
+        qualified_table_ref, split_writable, widened_keyword,
     };
     use super::{
         FaucetError, bootstrap_lock_key, bounded, is_concurrent_ddl, is_concurrent_ddl_code,
@@ -2152,8 +2175,12 @@ mod tests {
     #[test]
     fn unmatched_records_become_row_failures() {
         let cols = vec![("id".to_string(), "int4".to_string())];
-        let (outcomes, writable) =
-            split_unmatched(&[json!({"id": 1}), json!({"ID": 2}), json!([1])], &cols);
+        let (outcomes, writable, _) = split_writable(
+            &[json!({"id": 1}), json!({"ID": 2}), json!([1])],
+            &cols,
+            super::BinaryEncoding::Auto,
+            true,
+        );
         assert!(outcomes[0].is_ok());
         let err = outcomes[1].as_ref().unwrap_err().to_string();
         assert!(err.contains("record 1 has no field matching"), "{err}");
@@ -2162,6 +2189,28 @@ mod tests {
             "non-objects are left to the write path"
         );
         assert_eq!(writable, vec![json!({"id": 1}), json!([1])]);
+    }
+
+    #[test]
+    fn a_bytea_value_the_encoding_refuses_fails_only_its_row() {
+        let cols = vec![
+            ("id".to_string(), "int4".to_string()),
+            ("blob".to_string(), "bytea".to_string()),
+        ];
+        let page = [
+            json!({"id": 1, "blob": "SGVsbG8="}),
+            json!({"id": 2, "blob": "plain token!"}),
+            json!({"id": 3}),
+        ];
+        let (outcomes, writable, positions) =
+            split_writable(&page, &cols, super::BinaryEncoding::Base64, false);
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("row 1: column blob"), "{err}");
+        assert_eq!(writable, vec![page[0].clone(), page[2].clone()]);
+        assert_eq!(positions, vec![0, 2]);
+        let (outcomes, _, _) = split_writable(&page, &cols, super::BinaryEncoding::Text, false);
+        assert!(outcomes.iter().all(Result::is_ok));
     }
 
     fn referencing(on_delete: char, deferrable: bool, has_references: bool) -> ReferencingKey {

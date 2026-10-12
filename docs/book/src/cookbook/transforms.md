@@ -803,8 +803,12 @@ For each change event it:
   `before` image (present under `REPLICA IDENTITY FULL`); one still missing
   **fails the run** (`on_partial_row: fail`), because an upsert would replace or
   null the column. Set `REPLICA IDENTITY FULL` on such tables, or
-  `on_partial_row: pass` for a sink that appends or merges column-wise. The
-  marker itself never reaches the sink;
+  `on_partial_row: pass` for a sink that appends or merges column-wise.
+  `REPLICA IDENTITY FULL` only affects changes written after it: a partial
+  update already in the slot keeps failing every rerun, because the position
+  does not advance past it. Get past it with `on_partial_row: pass` for one run
+  (an upsert sink replaces or nulls the elided columns of those rows) or by
+  resnapshotting the table. The marker itself never reaches the sink;
 - stamps every emitted row with a `marker_field` (`__op`) set to the normalized
   value **`"d"`** (delete) or **`"u"`** (upsert) — *not* the raw op code. A
   downstream sink's `delete_marker` should therefore match `"d"`;

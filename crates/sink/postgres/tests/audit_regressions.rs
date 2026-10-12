@@ -398,6 +398,62 @@ async fn review_862_regressions() {
         vec!["abcd"]
     );
 
+    // review 868 sql 2: under `base64` a non-base64 value fails only its row
+    // on the DLQ path (INSERT, COPY and upsert), so the DLQ can route it.
+    exec(&url, "CREATE TABLE tok2 (id INT PRIMARY KEY, t BYTEA)").await;
+    let page = [
+        json!({"id": 1, "t": "SGVsbG8="}),
+        json!({"id": 2, "t": "plain token!"}),
+    ];
+    let strict = || {
+        config(&url, "tok2", WriteMode::Append, &[])
+            .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Base64)
+    };
+    let out = PostgresSink::new(strict())
+        .await
+        .unwrap()
+        .write_batch_partial(&page)
+        .await
+        .unwrap();
+    assert!(out[0].is_ok());
+    assert!(
+        out[1]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("not base64")
+    );
+    let mut copy = strict();
+    copy.write_method = PostgresWriteMethod::Copy;
+    let out = PostgresSink::new(copy)
+        .await
+        .unwrap()
+        .write_batch_partial(&[json!({"id": 3, "t": "AQI="}), json!({"id": 4, "t": "x"})])
+        .await
+        .unwrap();
+    assert!(out[0].is_ok() && out[1].is_err());
+    let upsert = config(&url, "tok2", WriteMode::Upsert, &["id"])
+        .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Base64);
+    let out = PostgresSink::new(upsert)
+        .await
+        .unwrap()
+        .write_batch_partial(&[
+            json!({"id": 5, "t": "nope!"}),
+            json!({"id": 6, "t": "AQI="}),
+            json!({"t": "AQI="}),
+        ])
+        .await
+        .unwrap();
+    assert!(out[0].is_err() && out[1].is_ok());
+    assert!(
+        out[2].as_ref().unwrap_err().to_string().contains("upsert"),
+        "a keyless row still fails at its own position"
+    );
+    assert_eq!(
+        text_rows(&url, "SELECT id::text FROM tok2 ORDER BY id").await,
+        vec!["1", "3", "6"]
+    );
+
     // M-047: page order holds under a case-insensitive key collation.
     exec(
         &url,

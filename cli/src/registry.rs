@@ -1359,6 +1359,19 @@ pub fn sql_incremental(config: &Value) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("incremental"))
 }
 
+/// The record fields an exactly-once source reads to tell whether a replayed
+/// record was already delivered (`Source::record_covered`).
+pub fn source_position_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "kafka" => &["topic", "partition", "offset"],
+        "postgres-cdc" | "mysql-cdc" => &["lsn"],
+        "mssql-cdc" => &["lsn", "schema", "table"],
+        "mongodb-cdc" => &["resume_token"],
+        "oracle-cdc" => &["commit_scn", "xid"],
+        _ => &[],
+    }
+}
+
 /// See [`EXACTLY_ONCE_SOURCE_KINDS`].
 pub fn source_supports_exactly_once(kind: &str) -> bool {
     source_replay_guarantee(kind) == faucet_core::ReplayGuarantee::Deterministic

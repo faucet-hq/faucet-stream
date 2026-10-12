@@ -517,17 +517,22 @@ async fn a_number_matching_value_detector_takes_the_row_path() {
         "write_batch_columnar unused"
     );
     let got = seen.lock().unwrap().clone();
+    for column in ["id", "acct"] {
+        assert!(
+            got.iter().all(|r| r[column].is_string()),
+            "`{column}` keeps one JSON type on every page: {got:?}"
+        );
+    }
     assert_eq!(
         got[0]["acct"],
-        json!(12345),
-        "a non-card value is untouched"
+        json!("12345"),
+        "a non-card value keeps its digits"
     );
-    assert!(
-        got[1]["acct"].is_string(),
-        "the card number is masked: {}",
-        got[1]
+    assert_ne!(
+        got[1]["acct"],
+        json!("4111111111111111"),
+        "the card number is masked"
     );
-    assert_ne!(got[1]["acct"], json!("4111111111111111"));
 }
 
 /// A non-quarantining quality policy (`abort`) must run *on* the columnar path

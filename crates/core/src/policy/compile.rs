@@ -22,10 +22,19 @@ pub struct CompiledPolicy {
     rules: Vec<PolicyRule>,
 }
 
+fn uses_narrowed_phone(spec: &PolicySpec) -> bool {
+    spec.classifications
+        .iter()
+        .any(|c| c.value_detector == Some(Detector::Phone))
+}
+
 impl CompiledPolicy {
     /// Validate and compile. Every defect surfaces here, at config load.
     pub fn compile(spec: &PolicySpec) -> Result<Self, String> {
         spec.validate()?;
+        if uses_narrowed_phone(spec) {
+            crate::masking::compile::warn_phone_narrowed();
+        }
         let classifications = spec
             .classifications
             .iter()
@@ -160,6 +169,20 @@ mod tests {
         assert!(p.governs("pii") && !p.governs("finance"));
         assert_eq!(p.rules().len(), 1);
         assert_eq!(p.classifications().len(), 3);
+    }
+
+    #[test]
+    fn a_phone_classification_triggers_the_narrowed_matcher_warning() {
+        let spec = |d: &str| -> PolicySpec {
+            serde_json::from_value(serde_json::json!({
+                "classifications": [{"label": "pii", "value_detector": d}],
+                "rules": [{"name": "r", "when": {"label": "pii"}, "deny": true}]
+            }))
+            .unwrap()
+        };
+        assert!(uses_narrowed_phone(&spec("phone")));
+        assert!(!uses_narrowed_phone(&spec("phone_loose")));
+        assert!(CompiledPolicy::compile(&spec("phone")).is_ok());
     }
 
     #[test]

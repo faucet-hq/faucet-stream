@@ -675,15 +675,30 @@ pub async fn partition_roots(
     if oids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
+    let mut conn = control_connection(connection_url, tls).await?;
+    partition_roots_on(&mut conn, oids).await
+}
+
+/// A plain (non-replication) connection for catalog lookups.
+pub async fn control_connection(
+    connection_url: &str,
+    tls: &crate::config::CdcTls,
+) -> Result<PgConnection, FaucetError> {
     let opts: PgConnectOptions = connection_url
         .parse()
         .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
     let opts = apply_cdc_tls(opts, tls);
     use sqlx::ConnectOptions as _;
-    let mut conn: PgConnection = opts
-        .connect()
+    opts.connect()
         .await
-        .map_err(|e| pg_err("postgres-cdc partition lookup connect", e))?;
+        .map_err(|e| pg_err("postgres-cdc partition lookup connect", e))
+}
+
+/// [`partition_roots`] over an open connection.
+pub async fn partition_roots_on(
+    conn: &mut PgConnection,
+    oids: &[u32],
+) -> Result<std::collections::HashMap<u32, String>, FaucetError> {
     let ids: Vec<i64> = oids.iter().map(|o| i64::from(*o)).collect();
     let rows: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT c.oid::int8, rn.nspname::text, r.relname::text \
@@ -693,7 +708,7 @@ pub async fn partition_roots(
           WHERE c.oid::int8 = ANY($1) AND c.relispartition",
     )
     .bind(&ids)
-    .fetch_all(&mut conn)
+    .fetch_all(conn)
     .await
     .map_err(|e| pg_err("postgres-cdc partition lookup", e))?;
     Ok(rows

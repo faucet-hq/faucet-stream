@@ -126,7 +126,8 @@ The `action` block is tagged by `type`:
 
 All detectors are **conservative** — fully anchored full-string regexes — so
 false positives stay rare. They run on string values; a JSON number is only
-checked by `credit_card` and `phone_loose`, and booleans never match. This matters because masking silently rewrites
+checked by `credit_card` and `phone_loose` (which then write every number as a
+string — see below), and booleans never match. This matters because masking silently rewrites
 data: a false positive is a data-quality bug, not just noise.
 
 | `value_detector` | Matches |
@@ -143,14 +144,25 @@ policy that relied on it to catch bare digit runs or national formats now lets
 them through. A policy with a `phone` rule logs a warning when it compiles; switch
 the rule to `phone_loose` to keep the old coverage.
 
+**Numbers become strings under `credit_card` / `phone_loose`.** These two
+detectors can match a JSON number (a card number held as an integer), and a
+masked number is written as a string. If only the matching values were
+rewritten, a column would hold numbers on the pages without a match and strings
+on the pages with one, and a typed sink (Parquet, Delta, Iceberg, a warehouse
+table created from the first page) would refuse the later page. So when a
+policy (for that sink) holds a `credit_card` or `phone_loose` rule, **every
+number in every record is written as a string**, from the first page on: `12345`
+becomes `"12345"` and `-1.5` becomes `"-1.5"`, nested values included; booleans
+and `null` keep their type. Cast a column back with a `cast` transform after
+masking if the destination needs a number, or match card columns by name
+(`fields` / `field_pattern`) instead, which leaves other columns alone.
+
 **Arrow (columnar) runs:** when the source and sink both move Arrow batches,
 masking runs on the batch and a column a name-based rule rewrites is widened to
-a string column from the first page. A `credit_card` or `phone_loose` rule can
-instead turn an integer column into strings only on the pages that happen to
-hold a matching number, which would change the column's type partway through
-the run. A policy with either rule (for that sink) therefore makes the run take
-the row path: the output is the same, without the columnar speed-up. To keep a
-columnar run, match the column by name (`fields` / `field_pattern`) instead.
+a string column from the first page. A policy with a `credit_card` or
+`phone_loose` rule (for that sink) changes the type of every numeric column, so
+the run takes the row path: the output is the same, without the columnar
+speed-up. To keep a columnar run, match the column by name instead.
 
 ## Determinism & joinability
 

@@ -9,7 +9,7 @@
 //! sink-side plumbing.
 
 use crate::auth_catalog::AuthCatalog;
-use crate::config::{ConnectorSpec, NodeSpec, PipelineConfig};
+use crate::config::{ConnectorSpec, NodeSpec, PipelineConfig, TransformSpec};
 use crate::error::{CliError, CliResult};
 use crate::executor::{InvocationErrorKind, InvocationOutcome, RunSummary};
 use crate::merge::merge_value;
@@ -452,7 +452,33 @@ fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
             )));
         }
     }
-    // 4. Durable state — the per-node sequence has to survive a restart.
+    // 4. A replay that straddles a sink's committed position is trimmed per
+    //    record by the source's position fields, so a transform node must not
+    //    remove them unless every sink deduplicates by key.
+    let fields = crate::registry::source_position_fields(src_kind);
+    if !fields.is_empty() && !sink_nodes(cfg)?.iter().all(|(_, _, c)| keyed_sink(c)) {
+        for (id, node) in nodes {
+            let NodeSpec::Transform { transforms } = node else {
+                continue;
+            };
+            if let Some(t) = transforms.iter().find(|t| may_remove_fields(t, fields)) {
+                return Err(CliError::Config(format!(
+                    "node '{id}': `delivery: exactly_once` with source '{src_kind}' needs the \
+                     records to keep {} until the sink — a replay after a crash tells by them \
+                     which records a sink already committed — and the `{}` transform can \
+                     remove or change them. Keep those fields (list them in a `select`), or \
+                     write with `write_mode: upsert` + `key` on every sink",
+                    fields
+                        .iter()
+                        .map(|f| format!("`{f}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    t.kind
+                )));
+            }
+        }
+    }
+    // 5. Durable state — the per-node sequence has to survive a restart.
     match cfg.pipeline.state.as_ref() {
         None => {
             return Err(CliError::Config(
@@ -471,7 +497,7 @@ fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
         }
         Some(_) => {}
     }
-    // 5. No DLQ — routing a row aside breaks the all-or-nothing page commit.
+    // 6. No DLQ — routing a row aside breaks the all-or-nothing page commit.
     if cfg.pipeline.dlq.is_some() {
         return Err(CliError::Config(
             "`delivery: exactly_once` is incompatible with a `dlq:` block in this version: a \
@@ -481,6 +507,47 @@ fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
         ));
     }
     Ok(())
+}
+
+/// A sink config writing with `write_mode: upsert|delete` and a `key`, whose
+/// replays overwrite the same rows.
+fn keyed_sink(config: &Value) -> bool {
+    matches!(
+        config.get("write_mode").and_then(Value::as_str),
+        Some("upsert" | "delete")
+    ) && config
+        .get("key")
+        .and_then(Value::as_array)
+        .is_some_and(|k| !k.is_empty())
+}
+
+/// Whether transform `t` can remove or rewrite any of the top-level `fields`.
+/// Unknown and opaque transforms (`sql`, `wasm`, `cdc_unwrap`, key renames)
+/// are assumed to.
+fn may_remove_fields(t: &TransformSpec, fields: &[&str]) -> bool {
+    fn mentions(v: &Value, field: &str) -> bool {
+        match v {
+            Value::String(s) => s == field || s.starts_with(&format!("{field}.")),
+            Value::Array(items) => items.iter().any(|i| mentions(i, field)),
+            Value::Object(map) => map.iter().any(|(k, v)| k == field || mentions(v, field)),
+            _ => false,
+        }
+    }
+    let named = |f: &&str| mentions(&t.config, f);
+    match t.kind.as_str() {
+        "filter" => false,
+        "flatten" => fields.contains(&"resume_token"),
+        "select" => !fields.iter().all(|f| {
+            t.config
+                .get("fields")
+                .and_then(Value::as_array)
+                .is_some_and(|keep| keep.iter().any(|k| k.as_str() == Some(f)))
+        }),
+        "drop" | "rename_field" | "set" | "cast" | "redact" | "value_case" | "spell_symbols"
+        | "hash" | "json_encode" | "json_parse" | "coalesce" | "split_join" | "lookup"
+        | "explode" => fields.iter().any(named),
+        _ => true,
+    }
 }
 
 /// Resolve one source/sink node's template `ref` + inline overrides into a
@@ -2585,6 +2652,90 @@ pipeline:
     - { from: t2, to: w }
 "#);
         assert_eq!(reaching_sources(&c)["w"], vec!["s".to_string()]);
+    }
+
+    fn eo_kafka_graph(transform: &str, sink_config: &str) -> PipelineConfig {
+        cfg(&format!(
+            r#"version: 1
+name: p
+delivery: exactly_once
+pipeline:
+  state: {{ type: file, config: {{ path: /tmp/st }} }}
+  sources:
+    a: {{ type: kafka, config: {{}} }}
+  sinks:
+    o: {{ type: sqlite, config: {sink_config} }}
+  nodes:
+    s: {{ kind: source, ref: a }}
+    x: {{ kind: transform, transforms: [ {transform} ] }}
+    w: {{ kind: sink, ref: o }}
+  edges:
+    - {{ from: s, to: x }}
+    - {{ from: x, to: w }}
+"#
+        ))
+    }
+
+    /// review 868 other 1: a replay that straddles a committed position is
+    /// trimmed by the source's position fields, so a transform that removes
+    /// them is refused unless every sink deduplicates by key.
+    #[test]
+    fn exactly_once_refuses_a_transform_that_removes_the_position_fields() {
+        let append = "{ path: /tmp/o.db }";
+        for t in [
+            "{ type: select, config: { fields: [value.id] } }",
+            "{ type: drop, config: { fields: [offset] } }",
+            "{ type: cdc_unwrap, config: {} }",
+        ] {
+            let err = validate_topology_spec(&eo_kafka_graph(t, append))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("node 'x'") && err.contains("`offset`"),
+                "{t}: {err}"
+            );
+        }
+        for t in [
+            "{ type: select, config: { fields: [topic, partition, offset, value] } }",
+            "{ type: filter, config: { expr: \"true\" } }",
+            "{ type: flatten, config: {} }",
+            "{ type: drop, config: { fields: [value.secret] } }",
+        ] {
+            let c = eo_kafka_graph(t, append);
+            assert!(
+                !validate_exactly_once(&c)
+                    .err()
+                    .is_some_and(|e| e.to_string().contains("node 'x'")),
+                "{t}"
+            );
+        }
+        let keyed = "{ path: /tmp/o.db, write_mode: upsert, key: [id] }";
+        let c = eo_kafka_graph("{ type: cdc_unwrap, config: {} }", keyed);
+        assert!(
+            !validate_exactly_once(&c)
+                .err()
+                .is_some_and(|e| e.to_string().contains("node 'x'")),
+            "a keyed sink overwrites a replayed record"
+        );
+    }
+
+    #[test]
+    fn flatten_only_rewrites_an_object_position_field() {
+        let t = |kind: &str| TransformSpec {
+            kind: kind.into(),
+            config: serde_json::json!({}),
+        };
+        assert!(may_remove_fields(&t("flatten"), &["resume_token"]));
+        assert!(!may_remove_fields(&t("flatten"), &["lsn"]));
+        assert!(may_remove_fields(&t("sql"), &["lsn"]));
+        let set = TransformSpec {
+            kind: "set".into(),
+            config: serde_json::json!({ "field": "lsn.x", "value": 1 }),
+        };
+        assert!(may_remove_fields(&set, &["lsn"]));
+        assert!(!keyed_sink(
+            &serde_json::json!({ "write_mode": "upsert", "key": [] })
+        ));
     }
 
     #[test]

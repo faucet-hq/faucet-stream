@@ -452,7 +452,9 @@ field list — and rewrites them per action: `redact` (fixed mask), `hash`
 (HMAC-SHA256 keyed / SHA-256 unkeyed; deterministic, so masked values stay
 joinable), `tokenize` (short opaque token), or `partial` (reveal only the last N
 chars). Detectors are conservative (anchored; cards require a valid Luhn
-checksum) so silent over-masking is rare.
+checksum) so silent over-masking is rare. `credit_card` and `phone_loose` can
+match a JSON number, so a policy holding either writes every number as a string,
+keeping each column one type on every page.
 
 The masking pass runs **first** — before the quality, contract, and drift passes
 and before every sink write — so PII never reaches a sink, the DLQ, or a lineage

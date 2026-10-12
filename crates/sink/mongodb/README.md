@@ -156,7 +156,7 @@ MongoDB is schemaless, so unlike the SQL sinks there are no key *columns* — th
 - **`delete`** — each row is removed with `delete_one(filter)`, where the filter is built from the row's `key` fields.
 - **`delete_marker`** (upsert only) — mix upserts and deletes in one stream: rows whose `delete_marker.field` matches one of `delete_marker.values` are routed to `delete_one`; all others are upserted. The marker field is stripped from the upsert replacement so it never lands in the collection — ideal for CDC streams that carry an operation flag like `__op: "u" | "d"`.
 
-Within a single batch, repeated keys are deduped **last-write-wins** before any write is issued, so a page that touches the same `_id` twice results in a single `replace_one` / `delete_one` carrying the final value. Keys compare by their JSON value, as MongoDB does: `7` and `"7"` are two documents.
+Within a single batch, repeated keys are deduped **last-write-wins** before any write is issued, so a page that touches the same `_id` twice results in a single `replace_one` / `delete_one` carrying the final value. Keys compare as MongoDB matches them: `7` and `"7"` are two documents, while numbers compare by value, so `7` and `7.0` are one.
 
 A document missing or null in a key field fails. When a `dlq:` block is configured the good documents are still written and only the missing/null-key documents are routed to the DLQ per-row; without a DLQ the whole batch fails.
 

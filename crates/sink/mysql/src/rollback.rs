@@ -484,7 +484,7 @@ impl MysqlSink {
     /// Swap the kept previous table back with one atomic `RENAME TABLE`.
     async fn rollback_overwrite(
         &self,
-        conn: &mut MySqlConnection,
+        conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
         run_id: &str,
         opts: &RollbackOptions,
     ) -> Result<RollbackOutcome, FaucetError> {
@@ -500,7 +500,7 @@ impl MysqlSink {
         let prev = quote_ident_mysql(&self.previous_table_name());
         let old = quote_ident_mysql(&self.old_table_name());
         let col = &opts.run_id_column;
-        let columns = self.columns_of(&mut *conn, &self.config.table_name).await?;
+        let columns = self.columns_of(conn, &self.config.table_name).await?;
         // The kept table is the image before the *latest* overwrite; if the
         // target no longer holds this run's rows, a later run replaced them.
         let conflicts: i64 = if columns.iter().any(|c| c == col) {
@@ -509,7 +509,7 @@ impl MysqlSink {
                 c = quote_ident_mysql(col)
             ))
             .bind(run_id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await
             .map_err(|e| sink_err("count conflicts", e))?
         } else {
@@ -519,7 +519,7 @@ impl MysqlSink {
             return Ok(RollbackOutcome::blocked(conflicts as u64));
         }
         let restored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {prev}"))
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await
             .map_err(|e| sink_err("count previous rows", e))?;
         if opts.dry_run {
@@ -533,16 +533,16 @@ impl MysqlSink {
         }
         // A target with foreign keys or triggers gets its rows back in place,
         // keeping its definition (#789 SQL-108).
-        let deps = crate::sink::table_dependents(&mut *conn, &self.config.table_name).await?;
+        let deps = crate::sink::table_dependents(conn, &self.config.table_name).await?;
         if !deps.pinned.is_empty() || !deps.referenced_by.is_empty() {
             crate::sink::replace_rows_in_place(
-                &mut *conn,
+                conn,
                 &self.config.table_name,
                 &self.previous_table_name(),
             )
             .await?;
             sqlx::query(&format!("DROP TABLE IF EXISTS {prev}"))
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await
                 .map_err(|e| sink_err("drop previous table", e))?;
             return Ok(RollbackOutcome {
@@ -558,7 +558,7 @@ impl MysqlSink {
             format!("DROP TABLE IF EXISTS {old}"),
         ] {
             sqlx::query(&stmt)
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await
                 .map_err(|e| sink_err("restore previous table", e))?;
         }

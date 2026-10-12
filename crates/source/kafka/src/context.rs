@@ -469,14 +469,12 @@ impl BookmarkContext {
             .iter()
             .map(|(t, p, o)| ((t.clone(), *p), *o))
             .collect();
-        let mut watermarks = HashMap::new();
-        for tp in &assigned {
-            if !seeks.contains_key(tp)
-                && let Ok(w) = consumer.fetch_watermarks(&tp.0, tp.1, COMMITTED_LOOKUP_TIMEOUT)
-            {
-                watermarks.insert(tp.clone(), w);
-            }
-        }
+        let unseeked: Vec<(String, i32)> = assigned
+            .iter()
+            .filter(|tp| !seeks.contains_key(*tp))
+            .cloned()
+            .collect();
+        let watermarks = batch_watermarks(consumer, &unseeked);
         let lows: HashMap<(String, i32), i64> = watermarks
             .iter()
             .map(|(tp, (low, _))| (tp.clone(), *low))
@@ -493,6 +491,56 @@ impl BookmarkContext {
             committed_clamps(&assigned, &committed, &seeks, &lows),
         )
     }
+}
+
+/// The `(low, high)` watermarks of `tps` in two batched list-offsets requests
+/// (log start, then end), so a rebalance callback over many partitions does
+/// not wait out one blocking round trip per partition. A partition whose
+/// offsets are not returned is left out.
+fn batch_watermarks(
+    consumer: &BaseConsumer<BookmarkContext>,
+    tps: &[(String, i32)],
+) -> HashMap<(String, i32), (i64, i64)> {
+    if tps.is_empty() {
+        return HashMap::new();
+    }
+    let query = |at: Offset| {
+        let mut tpl = TopicPartitionList::with_capacity(tps.len());
+        for (t, p) in tps {
+            let _ = tpl.add_partition_offset(t, *p, at);
+        }
+        match consumer.offsets_for_times(tpl, COMMITTED_LOOKUP_TIMEOUT) {
+            Ok(found) => offsets_map(&found),
+            Err(e) => {
+                tracing::warn!(error = %e, "kafka member mode: watermark lookup failed");
+                HashMap::new()
+            }
+        }
+    };
+    let lows = query(Offset::Beginning);
+    let highs = query(Offset::End);
+    pair_watermarks(&lows, &highs)
+}
+
+/// The concrete offset of every partition of `tpl` that carries one.
+fn offsets_map(tpl: &TopicPartitionList) -> HashMap<(String, i32), i64> {
+    tpl.elements()
+        .into_iter()
+        .filter(|e| e.error().is_ok())
+        .filter_map(|e| match e.offset() {
+            Offset::Offset(n) => Some(((e.topic().to_string(), e.partition()), n)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn pair_watermarks(
+    lows: &HashMap<(String, i32), i64>,
+    highs: &HashMap<(String, i32), i64>,
+) -> HashMap<(String, i32), (i64, i64)> {
+    lows.iter()
+        .filter_map(|(tp, low)| highs.get(tp).map(|high| (tp.clone(), (*low, *high))))
+        .collect()
 }
 
 fn committed_map(tpl: &TopicPartitionList) -> HashMap<(String, i32), Option<i64>> {
@@ -700,6 +748,18 @@ mod tests {
             member_seeds(&assigned, &committed, &seeks, &marks, true),
             vec![("t".into(), 1, 40), ("t".into(), 2, 3)]
         );
+    }
+
+    #[test]
+    fn watermarks_pair_only_partitions_with_both_ends() {
+        let tp = |p: i32| ("t".to_string(), p);
+        let lows: HashMap<_, _> = [(tp(0), 3), (tp(1), 0)].into();
+        let highs: HashMap<_, _> = [(tp(0), 9), (tp(2), 5)].into();
+        assert_eq!(pair_watermarks(&lows, &highs), [(tp(0), (3, 9))].into());
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset("t", 0, Offset::Offset(4)).unwrap();
+        tpl.add_partition_offset("t", 1, Offset::End).unwrap();
+        assert_eq!(offsets_map(&tpl), [(tp(0), 4)].into());
     }
 
     #[test]

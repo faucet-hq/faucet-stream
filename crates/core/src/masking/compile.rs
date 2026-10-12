@@ -12,11 +12,11 @@ use std::collections::HashSet;
 
 /// Once per process: `phone` stopped matching bare digit runs in faucet-core
 /// 1.13, so a policy relying on it may now pass phone numbers through (#862 M-019).
-fn warn_phone_narrowed() {
+pub(crate) fn warn_phone_narrowed() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         tracing::warn!(
-            "masking: `value_detector: phone` matches only E.164 (`+…`) and separated \
+            "masking/policy: `value_detector: phone` matches only E.164 (`+…`) and separated \
              North-American numbers; bare digit runs and national formats such as \
              `020 7946 0958` pass through. Use `phone_loose` for the broader matcher"
         );
@@ -34,6 +34,10 @@ pub struct CompiledMasking {
     pub(crate) hasher: Hasher,
     /// Some rule matches by field name, so the walk must build dot-paths.
     pub(crate) needs_paths: bool,
+    /// A value-detector rule can match a number, so every number the pass
+    /// leaves unmasked is written as a string too: a column keeps one type on
+    /// every page instead of flipping when a matching value appears.
+    pub(crate) stringify_numbers: bool,
 }
 
 impl CompiledMasking {
@@ -46,14 +50,12 @@ impl CompiledMasking {
         })
     }
 
-    /// Whether a value-detector rule can match a non-string value (a card
-    /// number held as an integer), so the pass may re-type a column only on
-    /// the pages where such a value happens to appear.
+    /// Whether a value-detector rule can match a number (a card number held
+    /// as an integer), so the pass turns every number into a string and a
+    /// columnar run's Arrow schema no longer describes the masked records.
     #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
     pub(crate) fn retypes_by_value(&self) -> bool {
-        self.rules
-            .iter()
-            .any(|r| r.value_detector.is_some_and(super::detect::matches_numbers))
+        self.stringify_numbers
     }
 }
 
@@ -110,10 +112,14 @@ impl CompiledMasking {
         let needs_paths = rules
             .iter()
             .any(|r| r.field_pattern.is_some() || !r.fields.is_empty());
+        let stringify_numbers = rules
+            .iter()
+            .any(|r| r.value_detector.is_some_and(super::detect::matches_numbers));
         Ok(Self {
             rules,
             hasher: Hasher::from_key(spec.key.as_deref()),
             needs_paths,
+            stringify_numbers,
         })
     }
 

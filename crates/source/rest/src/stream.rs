@@ -3049,6 +3049,25 @@ fn pass_bookmark_after(
     Ok(None)
 }
 
+/// A `requests:` run that `max_pages` cut short cannot consolidate the
+/// per-entry bookmarks, so an incremental pass fails rather than persisting
+/// nothing and re-reading the same pages every run; `assume_ordered` does not
+/// apply across entries.
+fn partitioned_truncation(config: &RestStreamConfig) -> Result<(), FaucetError> {
+    let incremental = config.replication_method == ReplicationMethod::Incremental
+        && config.replication_key.is_some();
+    if incremental && !config.persist_cursor {
+        return Err(FaucetError::Source(format!(
+            "rest: max_pages ({}) cut a `requests:` entry's incremental pass short; the \
+             per-entry bookmarks cannot be consolidated, so the run fails rather than \
+             re-reading the same pages every run (assume_ordered does not apply to \
+             `requests:`). Raise or remove max_pages",
+            config.max_pages.unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
 fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
     match current {
         None => Some(candidate),
@@ -3284,6 +3303,7 @@ impl faucet_core::Source for RestStream {
                 .truncated_passes
                 .load(std::sync::atomic::Ordering::SeqCst);
             if truncated_after != truncated_before {
+                partitioned_truncation(&self.config)?;
                 tracing::warn!(
                     "a partition stopped at max_pages; persisting no consolidated bookmark so its \
                      unread pages are read on the next run"
@@ -3896,6 +3916,22 @@ impl RestStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_truncated_requests_run_fails_only_for_incremental_passes() {
+        let base = RestStreamConfig::new("http://x", "/r").max_pages(2);
+        assert!(partitioned_truncation(&base).is_ok());
+        let incremental = base
+            .clone()
+            .replication_method(ReplicationMethod::Incremental)
+            .replication_key("updated_at")
+            .assume_ordered(true);
+        let err = partitioned_truncation(&incremental)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_pages (2)"), "{err}");
+        assert!(partitioned_truncation(&incremental.persist_cursor(true)).is_ok());
+    }
 
     #[test]
     fn a_truncated_incremental_pass_fails_unless_ordered() {

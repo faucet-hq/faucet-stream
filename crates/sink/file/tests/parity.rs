@@ -194,3 +194,25 @@ async fn an_explicit_schema_refuses_values_that_do_not_fit() {
         .unwrap_err();
     assert!(e.contains("'id'") && e.contains("3.7"), "{e}");
 }
+
+#[tokio::test]
+async fn a_parquet_widening_never_rounds_a_large_integer() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = p(dir.path(), "ids.parquet");
+    let s = sink(json!({ "path": out }));
+    s.write_batch(&[json!({"id": 9_007_199_254_740_993_i64})])
+        .await
+        .unwrap();
+    let e = s
+        .write_batch(&[json!({"id": 0.5})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("2^53"), "{e}");
+    s.flush().await.unwrap();
+    assert_eq!(
+        read_parquet(&out).0,
+        vec![json!({"id": 9_007_199_254_740_993_i64})],
+        "the row already written keeps its exact value"
+    );
+}

@@ -339,8 +339,19 @@ pub(crate) async fn insertable_columns(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ForeignKey {
     pub(crate) name: String,
+    pub(crate) referenced_schema: String,
     pub(crate) referenced_table: String,
+    /// The referenced table lives in the current database.
+    pub(crate) local: bool,
     pub(crate) columns: Vec<(String, String)>,
+}
+
+impl ForeignKey {
+    /// Whether the key references `table` itself, not a same-named table in
+    /// another database.
+    pub(crate) fn references(&self, table: &str) -> bool {
+        self.local && self.referenced_table == table
+    }
 }
 
 pub(crate) async fn table_foreign_keys(
@@ -349,8 +360,10 @@ pub(crate) async fn table_foreign_keys(
 ) -> Result<Vec<ForeignKey>, FaucetError> {
     let rows = sqlx::query(
         "SELECT CAST(CONSTRAINT_NAME AS CHAR) AS N, CAST(COLUMN_NAME AS CHAR) AS C, \
+                CAST(REFERENCED_TABLE_SCHEMA AS CHAR) AS RS, \
                 CAST(REFERENCED_TABLE_NAME AS CHAR) AS RT, \
-                CAST(REFERENCED_COLUMN_NAME AS CHAR) AS RC \
+                CAST(REFERENCED_COLUMN_NAME AS CHAR) AS RC, \
+                CAST(REFERENCED_TABLE_SCHEMA = DATABASE() AS SIGNED) AS L \
          FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
            AND REFERENCED_TABLE_NAME IS NOT NULL \
@@ -368,7 +381,9 @@ pub(crate) async fn table_foreign_keys(
             Some(fk) if fk.name == name => fk.columns.push(pair),
             _ => fks.push(ForeignKey {
                 name,
+                referenced_schema: r.get("RS"),
                 referenced_table: r.get("RT"),
+                local: r.get::<Option<i64>, _>("L") == Some(1),
                 columns: vec![pair],
             }),
         }
@@ -392,8 +407,9 @@ fn fk_violation_sql(table: &str, fk: &ForeignKey) -> String {
         .collect::<Vec<_>>()
         .join(" AND ");
     format!(
-        "SELECT COUNT(*) FROM {} c WHERE {set} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {join})",
+        "SELECT COUNT(*) FROM {} c WHERE {set} AND NOT EXISTS (SELECT 1 FROM {}.{} p WHERE {join})",
         quote_ident_mysql(table),
+        quote_ident_mysql(&fk.referenced_schema),
         quote_ident_mysql(&fk.referenced_table)
     )
 }
@@ -408,30 +424,33 @@ fn fk_violation_sql(table: &str, fk: &ForeignKey) -> String {
 /// For such a table the replace runs with `FOREIGN_KEY_CHECKS = 0` and every
 /// one of the target's foreign keys is re-validated before the commit.
 pub(crate) async fn replace_rows_in_place(
-    conn: &mut MySqlConnection,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
     target: &str,
     source: &str,
 ) -> Result<(), FaucetError> {
-    let into = insertable_columns(&mut *conn, target).await?;
-    let from = insertable_columns(&mut *conn, source).await?;
+    let into = insertable_columns(conn, target).await?;
+    let from = insertable_columns(conn, source).await?;
     let cols = into
         .iter()
         .filter(|c| from.contains(c))
         .map(|c| quote_ident_mysql(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let fks = table_foreign_keys(&mut *conn, target).await?;
-    let self_referencing = fks.iter().any(|fk| fk.referenced_table == target);
+    let fks = table_foreign_keys(conn, target).await?;
+    let self_referencing = fks.iter().any(|fk| fk.references(target));
     let (t, s) = (quote_ident_mysql(target), quote_ident_mysql(source));
     let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql overwrite: replace rows: {e}"));
     if self_referencing {
+        // A dropped future or a failed restore must not return a connection
+        // with foreign-key checks off to the pool.
+        conn.close_on_drop();
         sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
             .map_err(err)?;
     }
     let result = async {
-        let mut tx = sqlx::Connection::begin(&mut *conn).await.map_err(err)?;
+        let mut tx = sqlx::Connection::begin(&mut **conn).await.map_err(err)?;
         for stmt in [
             format!("DELETE FROM {t}"),
             format!("INSERT INTO {t} ({cols}) SELECT {cols} FROM {s}"),
@@ -458,11 +477,17 @@ pub(crate) async fn replace_rows_in_place(
     .await;
     if self_referencing {
         let restored = sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
-            .execute(&mut *conn)
-            .await
-            .map_err(err);
+            .execute(&mut **conn)
+            .await;
         result?;
-        restored?;
+        if let Err(e) = restored {
+            tracing::warn!(
+                table = target,
+                error = %e,
+                "mysql overwrite: rows replaced, but restoring FOREIGN_KEY_CHECKS failed; the \
+                 connection is closed instead of returned to the pool"
+            );
+        }
         return Ok(());
     }
     result
@@ -515,28 +540,43 @@ fn no_matching_column_message(
     )
 }
 
-/// Split a page into per-row outcomes and the records to write: a record that
-/// matches no column fails on its own row instead of failing the page.
-fn split_unmatched(
+/// Split a page into per-row outcomes, the records to write, and each written
+/// record's position in `records`. A record whose binary-column value
+/// `binary_encoding` refuses — or, with `require_match`, that matches no
+/// column — fails on its own row instead of failing the page.
+fn split_writable(
     records: &[Value],
     columns: &[(String, String)],
-) -> (Vec<faucet_core::RowOutcome>, Vec<Value>) {
+    binary: BinaryEncoding,
+    require_match: bool,
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
     let mut outcomes = Vec::with_capacity(records.len());
     let mut writable = Vec::with_capacity(records.len());
+    let mut positions = Vec::with_capacity(records.len());
     for (idx, record) in records.iter().enumerate() {
-        match record.as_object() {
-            Some(obj) if match_columns(columns, obj).is_empty() => {
-                outcomes.push(Err(FaucetError::Sink(no_matching_column_message(
-                    idx, obj, columns,
-                ))));
+        let failure = record.as_object().and_then(|obj| {
+            let matched = match_columns(columns, obj);
+            if require_match && matched.is_empty() {
+                return Some(no_matching_column_message(idx, obj, columns));
             }
-            _ => {
+            matched.iter().find_map(|(col, ty, v)| match v {
+                Value::String(s) if is_binary_type(ty) => binary
+                    .resolve(s)
+                    .err()
+                    .map(|e| format!("mysql: row {idx}: column {col}: {e}")),
+                _ => None,
+            })
+        });
+        match failure {
+            Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
+            None => {
                 outcomes.push(Ok(()));
                 writable.push(record.clone());
+                positions.push(idx);
             }
         }
     }
-    (outcomes, writable)
+    (outcomes, writable, positions)
 }
 
 /// Whether a MySQL `DATA_TYPE` stores raw bytes.
@@ -1749,21 +1789,30 @@ impl MysqlSink {
                 })?;
             let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
             drop(conn);
-            let (outcomes, writable) = split_unmatched(records, &columns);
+            let (outcomes, writable, _) =
+                split_writable(records, &columns, self.config.binary_encoding, true);
             self.write_batch_unbounded(&writable).await?;
             return Ok(outcomes);
         }
 
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL connection acquire failed: {e}")))?;
+        let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
+        drop(conn);
+        let (mut outcomes, writable, positions) =
+            split_writable(records, &columns, self.config.binary_encoding, false);
+        let plan = faucet_core::plan_writes(&writable, &self.config.write);
         self.apply_plans(&faucet_core::plan_writes_ordered(
-            records,
+            &writable,
             &self.config.write,
         ))
         .await?;
 
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
-            outcomes[*idx] = Err(FaucetError::Sink(format!(
+            outcomes[positions[*idx]] = Err(FaucetError::Sink(format!(
                 "mysql {}: {msg}",
                 self.config.write.write_mode.as_str()
             )));
@@ -2376,7 +2425,9 @@ mod tests {
     fn fk_violation_sql_checks_every_key_column() {
         let fk = ForeignKey {
             name: "fk_parent".into(),
+            referenced_schema: "app".into(),
             referenced_table: "cat".into(),
+            local: true,
             columns: vec![
                 ("parent_id".into(), "id".into()),
                 ("org".into(), "org".into()),
@@ -2385,8 +2436,18 @@ mod tests {
         assert_eq!(
             fk_violation_sql("cat", &fk),
             "SELECT COUNT(*) FROM `cat` c WHERE c.`parent_id` IS NOT NULL AND c.`org` IS NOT NULL \
-             AND NOT EXISTS (SELECT 1 FROM `cat` p WHERE p.`id` = c.`parent_id` AND p.`org` = c.`org`)"
+             AND NOT EXISTS (SELECT 1 FROM `app`.`cat` p WHERE p.`id` = c.`parent_id` AND p.`org` = c.`org`)"
         );
+        assert!(fk.references("cat"));
+        let elsewhere = ForeignKey {
+            local: false,
+            ..fk.clone()
+        };
+        assert!(
+            !elsewhere.references("cat"),
+            "a same-named table in another database"
+        );
+        assert!(!fk.references("dog"));
     }
 
     #[test]
@@ -2615,18 +2676,42 @@ mod tests {
         let obj = serde_json::json!({"USERID": 1, "Kind": "a"});
         let matched = match_columns(&cols, obj.as_object().unwrap());
         assert_eq!(matched.len(), 2);
-        let (outcomes, writable) = split_unmatched(
+        let (outcomes, writable, _) = split_writable(
             &[
                 obj.clone(),
                 serde_json::json!({"other": 1}),
                 serde_json::json!(1),
             ],
             &cols,
+            BinaryEncoding::Auto,
+            true,
         );
         assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
         let err = outcomes[1].as_ref().unwrap_err().to_string();
         assert!(err.contains("record 1 has no field matching"), "{err}");
         assert_eq!(writable.len(), 2);
+    }
+
+    #[test]
+    fn a_binary_value_the_encoding_refuses_fails_only_its_row() {
+        let cols = vec![
+            ("id".to_string(), "int".to_string()),
+            ("Blob".to_string(), "varbinary".to_string()),
+        ];
+        let page = [
+            serde_json::json!({"id": 1, "blob": "SGVsbG8="}),
+            serde_json::json!({"id": 2, "blob": "plain token!"}),
+            serde_json::json!({"id": 3, "blob": 7}),
+        ];
+        let (outcomes, writable, positions) =
+            split_writable(&page, &cols, BinaryEncoding::Base64, false);
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("row 1: column Blob"), "{err}");
+        assert_eq!(writable.len(), 2);
+        assert_eq!(positions, vec![0, 2]);
+        let (outcomes, _, _) = split_writable(&page, &cols, BinaryEncoding::Text, false);
+        assert!(outcomes.iter().all(Result::is_ok));
     }
 
     #[test]

@@ -672,6 +672,15 @@ async fn a_change_to_a_leaf_partition_is_routed_to_its_partitioned_table() {
         .expect("plain change");
     assert!(plain.get("partition_root").is_none());
     assert_eq!(source.record_table(plain).as_deref(), Some("public.plain"));
+
+    // A later cycle resolves the same relations from the cache.
+    ddl(&url, "INSERT INTO public.parted VALUES (3, 'eu');").await;
+    let (records, _) = source.fetch_all_incremental().await.expect("second fetch");
+    let parted = records
+        .iter()
+        .find(|r| r["table"] == "parted_eu")
+        .expect("partition change");
+    assert_eq!(parted["partition_root"], "public.parted");
 }
 
 #[tokio::test(flavor = "multi_thread")]

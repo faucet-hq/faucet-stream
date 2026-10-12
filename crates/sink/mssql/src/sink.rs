@@ -913,6 +913,20 @@ fn widened_keyword(
     }
 }
 
+/// The nullability a widened column keeps: a widening that gains `null`
+/// relaxes it, any other re-states the column's current nullability.
+fn widened_nullability(
+    from: Option<&serde_json::Value>,
+    to: &serde_json::Value,
+    current: Option<bool>,
+) -> Option<bool> {
+    if from.is_some_and(|f| faucet_core::adds_null(f, to)) {
+        Some(true)
+    } else {
+        current
+    }
+}
+
 /// `ALTER TABLE <ref> ALTER COLUMN <col> <kw> [NULL|NOT NULL]` — widen an
 /// existing column's type. `ALTER COLUMN` without a nullability clause follows
 /// the session's `ANSI_NULL_DFLT` setting, so the column's current one is
@@ -1547,10 +1561,14 @@ impl Sink for MssqlSink {
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
             let from = c.from.as_ref().and_then(faucet_core::json_schema_base_type);
-            let nullable = current
-                .iter()
-                .find(|i| i.name == c.name)
-                .map(|i| i.is_nullable);
+            let nullable = widened_nullability(
+                c.from.as_ref(),
+                &c.to,
+                current
+                    .iter()
+                    .find(|i| i.name == c.name)
+                    .map(|i| i.is_nullable),
+            );
             let sql = build_alter_type_sql(
                 &self.table_quoted,
                 &c.name,
@@ -1927,6 +1945,26 @@ mod tests {
         );
         let sql = build_alter_type_sql("[t]", "v", "BIGINT", Some(true)).unwrap();
         assert_eq!(sql, "ALTER TABLE [t] ALTER COLUMN [v] BIGINT NULL");
+    }
+
+    #[test]
+    fn a_widening_that_gains_null_relaxes_not_null() {
+        let int = serde_json::json!({"type": "integer"});
+        let nullable = serde_json::json!({"type": ["number", "null"]});
+        let number = serde_json::json!({"type": "number"});
+        assert_eq!(
+            widened_nullability(Some(&int), &nullable, Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            widened_nullability(Some(&int), &number, Some(false)),
+            Some(false)
+        );
+        assert_eq!(widened_nullability(None, &nullable, None), None);
+        assert_eq!(
+            widened_nullability(Some(&nullable), &nullable, Some(true)),
+            Some(true)
+        );
     }
 
     #[test]

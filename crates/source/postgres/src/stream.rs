@@ -265,23 +265,128 @@ fn text_cast_query(query: &str, columns: &[(String, String)]) -> Option<String> 
     Some(format!("SELECT {} FROM ({query}) AS q", select.join(", ")))
 }
 
-/// `query` made safe to nest inside `( … )`: a trailing `;` is dropped and a
-/// newline ends any trailing `--` comment before the closing parenthesis —
-/// both are legal at top level, a syntax error once wrapped (#862 M-066).
-fn for_subquery(query: &str) -> String {
-    format!("{}\n", query.trim_end().trim_end_matches(';').trim_end())
+/// A significant token of a SQL text: a word or one punctuation character,
+/// with string literals, quoted identifiers and comments skipped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SqlToken<'a> {
+    Word(&'a str),
+    Punct(char),
 }
 
-/// Whether `query` is a `WITH` whose CTEs modify data (`DELETE` / `INSERT` /
-/// `UPDATE` / `MERGE … RETURNING`), which Postgres accepts only at top level.
+/// The significant tokens of `sql` with each one's end offset. Literals
+/// (`'…'`, `E'…'`, `$tag$…$tag$`) and quoted identifiers count as one opaque
+/// word; `--` and (nested) `/* */` comments are skipped.
+fn sql_tokens(sql: &str) -> Vec<(SqlToken<'_>, usize)> {
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == b'\'' || c == b'"' {
+            let start = i;
+            let backslash = c == b'\''
+                && i > 0
+                && matches!(b[i - 1], b'e' | b'E')
+                && (i < 2 || !(b[i - 2].is_ascii_alphanumeric() || b[i - 2] == b'_'));
+            i += 1;
+            while i < b.len() {
+                if backslash && b[i] == b'\\' {
+                    i += 2;
+                } else if b[i] == c {
+                    if b.get(i + 1) == Some(&c) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let end = i.min(b.len());
+            out.push((SqlToken::Word(&sql[start..end]), end));
+        } else if c == b'$'
+            && let Some(len) = sql[i + 1..]
+                .find('$')
+                .filter(|&n| {
+                    sql[i + 1..i + 1 + n]
+                        .bytes()
+                        .all(|t| t.is_ascii_alphanumeric() || t == b'_')
+                })
+                .filter(|&n| n == 0 || !b[i + 1].is_ascii_digit())
+        {
+            let tag = &sql[i..i + len + 2];
+            let start = i;
+            let body = i + tag.len();
+            i = sql[body..]
+                .find(tag)
+                .map_or(b.len(), |n| body + n + tag.len());
+            out.push((SqlToken::Word(&sql[start..i]), i));
+        } else if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 {
+            let start = i;
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80 || b[i] == b'$')
+            {
+                i += 1;
+            }
+            out.push((SqlToken::Word(&sql[start..i]), i));
+        } else {
+            let ch = sql[i..].chars().next().unwrap_or(' ');
+            i += ch.len_utf8();
+            out.push((SqlToken::Punct(ch), i));
+        }
+    }
+    out
+}
+
+/// `query` made safe to nest inside `( … )`: it is cut after its last
+/// significant token, so a trailing `;` and any comment around it are gone —
+/// both are legal at top level, a syntax error once wrapped (#862 M-066).
+fn for_subquery(query: &str) -> String {
+    let end = sql_tokens(query)
+        .iter()
+        .rev()
+        .find(|(t, _)| *t != SqlToken::Punct(';'))
+        .map_or(0, |(_, end)| *end);
+    format!("{}\n", &query[..end])
+}
+
+/// Whether `query` is a `WITH` whose CTEs (or main statement) modify data
+/// (`DELETE` / `INSERT` / `UPDATE` / `MERGE`), which Postgres accepts only at
+/// top level. A keyword counts only where a statement starts — right after a
+/// parenthesis — never inside a literal, quoted identifier or comment.
 fn is_data_modifying_with(query: &str) -> bool {
-    let upper = query.trim_start().to_ascii_uppercase();
-    if !upper.starts_with("WITH") {
+    let tokens = sql_tokens(query);
+    if !matches!(tokens.first(), Some((SqlToken::Word(w), _)) if w.eq_ignore_ascii_case("WITH")) {
         return false;
     }
-    upper
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|w| matches!(w, "DELETE" | "INSERT" | "UPDATE" | "MERGE"))
+    tokens.windows(2).any(|pair| {
+        matches!(pair[0].0, SqlToken::Punct('(' | ')'))
+            && matches!(pair[1].0, SqlToken::Word(w)
+                if ["DELETE", "INSERT", "UPDATE", "MERGE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+    })
 }
 
 /// A float as JSON: a number when finite, else Postgres's own spelling.
@@ -1184,9 +1289,42 @@ mod tests {
         assert!(
             text_cast_query("SELECT n FROM t -- note", &cols(&[("n", "NUMERIC")]))
                 .unwrap()
-                .contains("-- note\n) AS q"),
+                .contains("FROM t\n) AS q"),
             "a trailing line comment cannot swallow the closing parenthesis"
         );
+        for q in [
+            "SELECT n FROM t; -- done",
+            "SELECT n FROM t /* a; b */ ;",
+            "SELECT n FROM t;\n-- trailing\n",
+        ] {
+            assert!(
+                text_cast_query(q, &cols(&[("n", "NUMERIC")]))
+                    .unwrap()
+                    .contains("FROM (SELECT n FROM t\n) AS q"),
+                "{q}"
+            );
+        }
+        for q in [
+            "WITH a AS (SELECT * FROM audit WHERE op = 'UPDATE') SELECT n FROM a",
+            "WITH a AS (SELECT \"delete\" AS n FROM t) SELECT n FROM a",
+            "WITH a AS (SELECT n FROM t -- insert\n) SELECT n FROM a",
+            "WITH a AS (SELECT $q$ MERGE $q$ AS s, n FROM t) SELECT n FROM a",
+            "WITH a AS (SELECT E'it\\'s ( update' AS s, n FROM t) SELECT n FROM a",
+        ] {
+            assert!(
+                text_cast_query(q, &cols(&[("n", "NUMERIC")])).is_some(),
+                "a keyword in a literal, identifier or comment is not DML: {q}"
+            );
+        }
+        for q in [
+            "with a as materialized (insert into t values (1) returning n) select n from a",
+            "WITH a AS (SELECT 1) UPDATE t SET n = 1 RETURNING n",
+            "WITH a AS (SELECT 1), b AS ( /* x */ MERGE INTO t USING a ON true WHEN MATCHED THEN DELETE) SELECT 1",
+        ] {
+            assert_eq!(text_cast_query(q, &cols(&[("n", "NUMERIC")])), None, "{q}");
+        }
+        assert_eq!(for_subquery("  ;  "), "\n");
+        assert_eq!(for_subquery("SELECT '$1' || $1"), "SELECT '$1' || $1\n");
         assert_eq!(
             text_cast_query(
                 "WITH d AS (DELETE FROM t RETURNING n) SELECT n FROM d",

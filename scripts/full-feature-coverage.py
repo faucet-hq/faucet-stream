@@ -6,7 +6,9 @@ The published `full` container image is built from the Dockerfile's
 turn must reach every feature the CLI manifest declares, so "full" never quietly
 means "most". The umbrella `faucet-stream` crate's `full` gets the same check,
 minus `default` and the per-transform `transform-*` features, which are subsets
-of `transforms`.
+of `transforms`. Each manifest's docs.rs `features` list must reach every
+feature except the native-heavy `DOCS_RS_EXCLUDED` ones (and aggregates that
+pull them in), so the docs.rs build stays inside its memory limit (#794).
 
 Usage: scripts/full-feature-coverage.py   (run from the repo root)
 """
@@ -20,6 +22,21 @@ CHECKS = (
     ("faucet-stream/Cargo.toml", ("default", "transform-*")),
 )
 DOCKERFILE = "Dockerfile"
+# Features left out of the docs.rs build: their native builds (bundled DuckDB,
+# librdkafka, Oracle) overran the docs.rs sandbox (#794).
+DOCS_RS_EXCLUDED = {
+    "source-duckdb",
+    "sink-duckdb",
+    "transform-sql",
+    "source-kafka",
+    "sink-kafka",
+    "kafka-schema-registry",
+    "lineage-kafka",
+    "triggers-kafka",
+    "source-oracle",
+    "source-oracle-cdc",
+    "sink-oracle",
+}
 
 
 def reachable(features, root="full"):
@@ -51,6 +68,25 @@ def missing(features, exemptions=()):
     )
 
 
+def docs_rs_gaps(features, docs):
+    """Features the docs.rs list should reach but does not, and excluded
+    features it reaches anyway."""
+    if docs.get("all-features"):
+        return [], ["all-features (the docs.rs build runs out of memory, #794)"]
+    reached = set()
+    for name in docs.get("features", []):
+        reached |= reachable(features, name)
+    tainted = {
+        name for name in features if reachable(features, name) & DOCS_RS_EXCLUDED
+    }
+    missing = sorted(
+        name
+        for name in features
+        if name not in tainted and name not in ("default", "full") and name not in reached
+    )
+    return missing, sorted(reached & tainted)
+
+
 def dockerfile_default_features(text):
     found = re.search(r'^ARG DEFAULT_FEATURES="([^"]*)"', text, re.MULTILINE)
     return found.group(1) if found else None
@@ -60,7 +96,17 @@ def main():
     failed = False
     for path, exemptions in CHECKS:
         with open(path, "rb") as f:
-            features = tomllib.load(f).get("features", {})
+            manifest = tomllib.load(f)
+        features = manifest.get("features", {})
+        docs = manifest.get("package", {}).get("metadata", {}).get("docs", {}).get("rs", {})
+        docs_missing, docs_heavy = docs_rs_gaps(features, docs)
+        if docs_missing:
+            failed = True
+            print(f"{path}: [package.metadata.docs.rs] features miss: {', '.join(docs_missing)}")
+        if docs_heavy:
+            failed = True
+            print(f"{path}: [package.metadata.docs.rs] enables: {', '.join(docs_heavy)}")
+            print("  These overran the docs.rs sandbox (#794); list features individually.")
         gaps = missing(features, exemptions)
         if gaps:
             failed = True

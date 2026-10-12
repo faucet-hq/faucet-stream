@@ -605,6 +605,54 @@ async fn a_widened_parquet_schema_carries_the_open_file_and_leaves_no_scratch() 
 
 #[cfg(feature = "file-format-parquet")]
 #[tokio::test]
+async fn a_float_widening_that_would_round_integers_is_refused() {
+    let big = 9_007_199_254_740_993_i64;
+    let dir = tempfile::tempdir().unwrap();
+    let w = local(
+        dir.path(),
+        "big.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    w.write_rows(&[json!({"id": big})]).await.unwrap();
+    let e = w
+        .write_rows(&[json!({"id": 1.5})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("'id'") && e.contains("2^53"), "{e}");
+    w.write_rows(&[json!({"id": 2})]).await.unwrap();
+    w.flush().await.unwrap();
+    let bytes = std::fs::read(dir.path().join("big.parquet")).unwrap();
+    assert_eq!(parquet_shape(bytes), (2, 1));
+
+    let w = local(
+        dir.path(),
+        "late.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    w.write_rows(&[json!({"id": 1.5})]).await.unwrap();
+    let e = w
+        .write_rows(&[json!({"id": big})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("2^53"),
+        "an incoming big integer is not rounded either: {e}"
+    );
+
+    let w = local(
+        dir.path(),
+        "small.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    w.write_rows(&[json!({"id": 7})]).await.unwrap();
+    w.write_rows(&[json!({"id": 1.5})]).await.unwrap();
+    w.flush().await.unwrap();
+}
+
+#[cfg(feature = "file-format-parquet")]
+#[tokio::test]
 async fn a_parquet_type_change_is_refused_without_losing_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let w = local(
