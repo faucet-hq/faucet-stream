@@ -860,7 +860,9 @@ pipeline:
 
 Detectors are conservative (fully anchored; `credit_card` requires a valid
 Luhn checksum; `ssn` excludes never-issued ranges) so false positives stay
-rare. `hash`/`tokenize` are deterministic → masked values stay joinable across
+rare. A `credit_card` or `phone_loose` rule can match a JSON number, so with one
+in the policy every number is written as a string, keeping each column one type
+across pages (see the [masking cookbook](../cookbook/masking.md#detectors)). `hash`/`tokenize` are deterministic → masked values stay joinable across
 pipelines that share a `key`. A malformed policy (empty rules, an empty
 `match`, an invalid regex, an empty `tokenize` prefix) is a config-load error —
 `faucet validate` and [`faucet masking`](./cli.md#masking) catch it.
