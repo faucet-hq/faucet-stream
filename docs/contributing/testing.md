@@ -29,7 +29,11 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   the one exception on PRs: it does not start on the hosted runners, so its
   start failure is fatal only under `FAUCET_REQUIRE_ORACLE`, which the nightly
   job sets (the Instant Client check still honours
-  `FAUCET_REQUIRE_BACKENDS`).
+  `FAUCET_REQUIRE_BACKENDS`). A failing nightly opens or comments on a
+  "Nightly heavy integration suite failed" issue. The Marquez lineage test
+  (`crates/lineage/tests/marquez_integration.rs`, `FAUCET_MARQUEZ_URL`) is
+  manual-only: no CI job runs it, so run it against a local Marquez when
+  changing the HTTP lineage transport.
 - **Cross-connector tests** (a source↔sink round trip, a parity check against
   an older connector, a sink test that reads its output back with a source)
   live in `crates/interop-tests/tests/`, which is never published. A connector
