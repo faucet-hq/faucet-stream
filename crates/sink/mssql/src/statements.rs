@@ -104,7 +104,8 @@ pub(crate) fn staging_relax_sql(
 /// The overwrite swap, column lists built from the **target**: computed and
 /// `rowversion` columns are never copied; the IDENTITY column is copied with
 /// `IDENTITY_INSERT` where staging has a value (so identities survive the
-/// overwrite) and generated where it does not.
+/// overwrite) and generated where it does not. `IDENTITY_INSERT` needs `ALTER`
+/// on the table, so it is switched on only when staging holds such a value.
 pub(crate) fn overwrite_swap_sql(
     target: &str,
     staging: &str,
@@ -133,11 +134,12 @@ pub(crate) fn overwrite_swap_sql(
     let mut with_id = vec![id];
     with_id.extend(plain.iter().copied());
     let all = list(&with_id)?;
-    out.push(format!("SET IDENTITY_INSERT {target} ON"));
     out.push(format!(
-        "INSERT INTO {target} ({all}) SELECT {all} FROM {staging} WHERE {id_q} IS NOT NULL"
+        "IF EXISTS (SELECT 1 FROM {staging} WHERE {id_q} IS NOT NULL) BEGIN \
+         SET IDENTITY_INSERT {target} ON; \
+         INSERT INTO {target} ({all}) SELECT {all} FROM {staging} WHERE {id_q} IS NOT NULL; \
+         SET IDENTITY_INSERT {target} OFF; END"
     ));
-    out.push(format!("SET IDENTITY_INSERT {target} OFF"));
     if !plain.is_empty() {
         let cols = list(&plain)?;
         out.push(format!(
@@ -394,10 +396,11 @@ mod tests {
             swap,
             vec![
                 "DELETE FROM [t]".to_string(),
-                "SET IDENTITY_INSERT [t] ON".to_string(),
-                "INSERT INTO [t] ([ID], [NAME]) SELECT [ID], [NAME] FROM [s] WHERE [ID] IS NOT NULL"
+                "IF EXISTS (SELECT 1 FROM [s] WHERE [ID] IS NOT NULL) BEGIN \
+                 SET IDENTITY_INSERT [t] ON; \
+                 INSERT INTO [t] ([ID], [NAME]) SELECT [ID], [NAME] FROM [s] WHERE [ID] IS NOT NULL; \
+                 SET IDENTITY_INSERT [t] OFF; END"
                     .to_string(),
-                "SET IDENTITY_INSERT [t] OFF".to_string(),
                 "INSERT INTO [t] ([NAME]) SELECT [NAME] FROM [s] WHERE [ID] IS NULL".to_string(),
             ]
         );
@@ -405,7 +408,7 @@ mod tests {
         assert_eq!(no_id[1], "INSERT INTO [t] ([NAME]) SELECT [NAME] FROM [s]");
         assert_eq!(
             overwrite_swap_sql("[t]", "[s]", &cols[..1]).unwrap().len(),
-            4
+            2
         );
         assert_eq!(
             staging_relax_sql("[s]", &cols).unwrap().as_deref(),
