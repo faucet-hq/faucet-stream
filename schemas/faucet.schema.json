@@ -17075,6 +17075,11 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "on_decode_error": {
+                      "description": "What a payload `value_format` cannot decode does: `fail` (default)\nfails the run; `skip` logs a warning and drops it — a JetStream message\nis terminated so it is not redelivered.",
+                      "$ref": "#/$defs/source_nats__NatsOnDecodeError",
+                      "default": "fail"
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -25352,7 +25357,7 @@
                       "default": false
                     },
                     "publish_timeout_secs": {
-                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take before the write fails as retriable, so a server outage\ncannot wedge the run. Default `30`.",
+                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take, so a server outage cannot wedge the run. On a timeout\nthe rows not yet confirmed fail as row errors (DLQ-routable); earlier\nbatches keep their outcomes. Not retried by `resilience.retry`.\nDefault `30`.",
                       "type": [
                         "integer",
                         "string"
@@ -25583,7 +25588,7 @@
                       "default": 1000
                     },
                     "publish_timeout_secs": {
-                      "description": "Seconds one publish group (its publishes and their confirms) may take\nbefore the write fails as retriable — a broker under a memory or disk\nalarm blocks publishers indefinitely. Default `60`.",
+                      "description": "Seconds one publish group (its publishes and their confirms) may take\n— a broker under a memory or disk alarm blocks publishers indefinitely.\nOn a timeout the rows not yet confirmed fail as row errors\n(DLQ-routable); earlier groups keep their outcomes. Not retried by\n`resilience.retry`. Default `60`.",
                       "type": [
                         "integer",
                         "string"
@@ -35097,6 +35102,21 @@
           "description": "The raw bytes, base64-encoded into a JSON string.",
           "type": "string",
           "const": "bytes"
+        }
+      ]
+    },
+    "source_nats__NatsOnDecodeError": {
+      "description": "[`NatsSourceConfig::on_decode_error`].",
+      "oneOf": [
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Warn and drop the message (JetStream: terminate it).",
+          "type": "string",
+          "const": "skip"
         }
       ]
     },
