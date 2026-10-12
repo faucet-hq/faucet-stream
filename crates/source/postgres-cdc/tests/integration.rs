@@ -79,6 +79,7 @@ fn cfg(url: &str, slot: &str, publication: &str) -> PostgresCdcSourceConfig {
         max_cycle_duration: std::time::Duration::from_secs(300),
         max_staged_records: None,
         max_buffered_events: 100_000,
+        max_buffered_bytes: 256 * 1024 * 1024,
         status_update_interval: Duration::from_secs(1),
         tcp_keepalive: Duration::from_secs(60),
         batch_size: faucet_core::DEFAULT_BATCH_SIZE,

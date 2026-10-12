@@ -16102,6 +16102,16 @@
                       "minimum": 0,
                       "default": 100000
                     },
+                    "max_buffered_bytes": {
+                      "description": "Upper bound, in bytes of decoded change data, on the read-ahead\nbuffer described under `max_buffered_events`; reading pauses at\nwhichever limit is reached first. This memory is held in addition to\n`max_staged_records`. Default 268 435 456 (256 MiB).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 268435456
+                    },
                     "status_update_interval": {
                       "description": "Interval at which Standby Status Update keepalives are sent to the\nserver. Must be shorter than `idle_timeout` and well under the\nserver's `wal_sender_timeout` (default 60 s). Default: 10 s.",
                       "type": [

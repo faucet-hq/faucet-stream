@@ -24,6 +24,9 @@ fn default_status_update_interval() -> Duration {
 fn default_max_buffered_events() -> usize {
     100_000
 }
+fn default_max_buffered_bytes() -> usize {
+    256 * 1024 * 1024
+}
 
 fn default_tcp_keepalive() -> Duration {
     Duration::from_secs(60)
@@ -168,6 +171,13 @@ pub struct PostgresCdcSourceConfig {
     /// write can outlast that much change volume. Default 100 000.
     #[serde(default = "default_max_buffered_events")]
     pub max_buffered_events: usize,
+
+    /// Upper bound, in bytes of decoded change data, on the read-ahead
+    /// buffer described under `max_buffered_events`; reading pauses at
+    /// whichever limit is reached first. This memory is held in addition to
+    /// `max_staged_records`. Default 268 435 456 (256 MiB).
+    #[serde(default = "default_max_buffered_bytes")]
+    pub max_buffered_bytes: usize,
 
     /// Interval at which Standby Status Update keepalives are sent to the
     /// server. Must be shorter than `idle_timeout` and well under the
@@ -324,6 +334,11 @@ impl PostgresCdcSourceConfig {
                 self.proto_version
             )));
         }
+        if self.max_buffered_bytes == 0 {
+            return Err(FaucetError::Config(
+                "postgres-cdc: max_buffered_bytes must be > 0".into(),
+            ));
+        }
         if self.idle_timeout.is_zero() {
             return Err(FaucetError::Config(
                 "postgres-cdc: idle_timeout must be > 0".into(),
@@ -450,6 +465,7 @@ mod tests {
             max_cycle_duration: default_max_cycle_duration(),
             max_staged_records: None,
             max_buffered_events: default_max_buffered_events(),
+            max_buffered_bytes: default_max_buffered_bytes(),
             status_update_interval: std::time::Duration::from_secs(10),
             tcp_keepalive: std::time::Duration::from_secs(60),
             batch_size: DEFAULT_BATCH_SIZE,
@@ -582,6 +598,21 @@ mod tests {
     fn batch_size_above_max_is_rejected_by_validate_batch_size() {
         let c = minimal().with_batch_size(faucet_core::MAX_BATCH_SIZE + 1);
         assert!(faucet_core::validate_batch_size(c.batch_size).is_err());
+    }
+
+    #[test]
+    fn max_buffered_bytes_defaults_and_rejects_zero() {
+        let v: PostgresCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "postgres://u:p@localhost/db",
+            "slot_name": "faucet_slot",
+            "publication_name": "faucet_pub",
+        }))
+        .unwrap();
+        assert_eq!(v.max_buffered_bytes, 256 * 1024 * 1024);
+        let mut c = minimal();
+        c.max_buffered_bytes = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("max_buffered_bytes"), "{err}");
     }
 
     #[test]

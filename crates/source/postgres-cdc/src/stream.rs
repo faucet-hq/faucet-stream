@@ -455,6 +455,7 @@ impl PostgresCdcSource {
                 slot_type: self.config.slot_type,
                 tls: &self.config.tls,
                 max_buffered_events: self.config.max_buffered_events,
+                max_buffered_bytes: self.config.max_buffered_bytes,
             };
             let client = replication::connect(&params).await?;
             replication::ensure_slot(
