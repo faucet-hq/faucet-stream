@@ -274,6 +274,33 @@ async fn a_line_persisted_late_by_another_instance_is_still_shipped() {
     assert!(!row.has_pending());
 }
 
+/// Review of #868 (cli F5): an instance logging a run for the first time
+/// holds delivery back from its first captured line on, before that line's
+/// batch is stored — a first batch that lands late is not skipped.
+#[tokio::test]
+async fn a_writers_first_line_holds_delivery_back_before_it_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("first.db");
+    let a = sqlite(&db, "instance-a", Duration::from_secs(30)).await;
+    let b = std::sync::Arc::new(sqlite(&db, "instance-b", Duration::from_secs(30)).await);
+    let hub = faucet_cli::serve::logs::LogHub::new();
+    hub.enable_persistence(b.clone(), 100);
+    let before = seq_at(chrono::Utc::now()) & !0xFFF;
+    hub.capture("run", "INFO", "t".into(), "b-first".into());
+    let live = Duration::from_secs(30);
+    let mut floor = None;
+    for _ in 0..50 {
+        floor = a.log_ship_writer_floor("run", live).await.unwrap();
+        if floor.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let floor = floor.expect("instance B is registered as a writer of the run");
+    assert!(floor + 1 >= before, "{floor} vs {before}");
+    hub.shutdown_persistence(Duration::from_secs(5)).await;
+}
+
 #[tokio::test]
 async fn delivery_contract_memory() {
     delivery_contract(&MemoryHistory::new(Duration::from_secs(60))).await;
