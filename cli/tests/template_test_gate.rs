@@ -234,6 +234,40 @@ async fn sqlite_records_evidence_refuses_stale_claims_prunes_and_cascades() {
     );
 }
 
+/// A deployment whose `tests:` block names only its companions runs the
+/// structural case against a SQLite registry: compose with the registered
+/// source and sink, then validate and expand the result.
+#[tokio::test]
+async fn a_deployment_bundle_without_cases_runs_the_structural_suite() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = sqlite(dir.path()).await;
+    faucet_cli::templates::register(
+        &s,
+        req("kind: sink-template\nname: files\ndescription: files\nsink: { type: file, config: {} }\nper_stream: { path: \"./out/${stream}.jsonl\" }\n".into()),
+    )
+    .await
+    .unwrap();
+    faucet_cli::templates::register(
+        &s,
+        req("kind: source-template\nname: acme\ndescription: acme\nsource:\n  type: rest\n  config: { base_url: \"https://example.com\" }\nstreams:\n  - name: orders\n    source: { config: { path: /orders } }\n".into()),
+    )
+    .await
+    .unwrap();
+    let reg = faucet_cli::templates::register_tested(
+        &s,
+        req("kind: deployment\nname: ops\nstate: { type: memory }\ntests:\n  source: acme\n  source_select: newest\n  sink: files\n  sink_select: newest\n".into()),
+    )
+    .await
+    .unwrap();
+    let t = reg.tests.expect("the structural bundle ran");
+    assert!(t.passed, "{t:#?}");
+    assert!(!t.cases.is_empty(), "{t:#?}");
+    assert_eq!(
+        t.provenance.companions,
+        vec!["acme@1".to_string(), "files@1".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn sync_registers_failing_versions_without_launching_them() {
     use faucet_cli::templates::sync::{apply, plan};
