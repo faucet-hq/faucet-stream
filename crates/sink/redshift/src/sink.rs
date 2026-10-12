@@ -107,11 +107,11 @@ impl RedshiftSink {
             return Ok(());
         }
         if !self.config.create_table {
-            let exists: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM information_schema.tables \
-                 WHERE lower(table_name) = lower($1) \
-                   AND lower(table_schema) = COALESCE(lower($2::text), lower(current_schema()))",
-            )
+            let exists: Option<i32> = sqlx::query_scalar(&format!(
+                "SELECT 1 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE {TARGET_RELATION} LIMIT 1"
+            ))
             .bind(&self.config.table_name)
             .bind(self.config.schema.as_deref())
             .fetch_optional(&self.pool)
@@ -254,16 +254,17 @@ impl RedshiftSink {
         format!("{}{}.{}", self.config.copy_spec().staging_prefix, id, ext)
     }
 
-    /// Discover the destination table's column names in ordinal order via
-    /// `information_schema.columns`. Used by the `insert` path and the CSV
-    /// `copy` path (both need the column set/order).
+    /// Discover the destination table's column names in ordinal order. Used
+    /// by the `insert` path and the CSV `copy` path (both need the column
+    /// set/order).
     async fn discover_columns(&self) -> Result<Vec<String>, FaucetError> {
-        let rows = sqlx::query(
-            "SELECT column_name::text AS column_name FROM information_schema.columns \
-             WHERE lower(table_name) = lower($1) \
-               AND lower(table_schema) = COALESCE(lower($2::text), lower(current_schema())) \
-             ORDER BY ordinal_position",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT a.attname::text AS column_name FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE {TARGET_RELATION} AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum"
+        ))
         .bind(&self.config.table_name)
         .bind(self.config.schema.as_deref())
         .fetch_all(&self.pool)
@@ -299,13 +300,29 @@ impl RedshiftSink {
             FaucetError::Sink("redshift: iam_role is required for copy strategy".into())
         })?;
 
+        // A record sharing no column with the table would load as an all-NULL
+        // row, so it is skipped, as on the INSERT path (#862 L-118).
+        let table_columns = self.discover_columns().await?;
+        let (records, skipped) = loadable_records(records, &table_columns)?;
+        if skipped > 0 {
+            tracing::warn!(
+                table = %self.config.table_name,
+                skipped,
+                "redshift: skipped record(s) with no column matching the table \
+                 (would have loaded an all-NULL row)"
+            );
+        }
+        if records.is_empty() {
+            return Ok(0);
+        }
+
         // Serialize the page and, for CSV, learn the destination column order.
         let (body, columns): (Vec<u8>, Option<Vec<String>>) = match copy_cfg.format {
-            RedshiftCopyFormat::Jsonl => (serialize_jsonl(records)?, None),
-            RedshiftCopyFormat::Csv => {
-                let cols = self.discover_columns().await?;
-                (serialize_csv(records, &cols)?, Some(cols))
-            }
+            RedshiftCopyFormat::Jsonl => (serialize_jsonl(&records)?, None),
+            RedshiftCopyFormat::Csv => (
+                serialize_csv(&records, &table_columns)?,
+                Some(table_columns),
+            ),
         };
         let ext = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => "jsonl",
@@ -412,6 +429,45 @@ impl RedshiftSink {
         Ok(total)
     }
 }
+
+/// The records of a COPY chunk that share a column with the table, and how
+/// many were left out. A chunk where none does is an error: reporting it
+/// written would advance the bookmark past rows that never landed.
+fn loadable_records<'a>(
+    records: &'a [Value],
+    table_columns: &[String],
+) -> Result<(std::borrow::Cow<'a, [Value]>, usize), FaucetError> {
+    if records
+        .iter()
+        .all(|r| crate::copy::shares_a_column(r, table_columns))
+    {
+        return Ok((std::borrow::Cow::Borrowed(records), 0));
+    }
+    let kept: Vec<Value> = records
+        .iter()
+        .filter(|r| crate::copy::shares_a_column(r, table_columns))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Err(FaucetError::Sink(format!(
+            "redshift: no field of the {} record(s) matches a column of the table \
+             (columns: {})",
+            records.len(),
+            table_columns.join(", ")
+        )));
+    }
+    let skipped = records.len() - kept.len();
+    Ok((std::borrow::Cow::Owned(kept), skipped))
+}
+
+/// The catalog predicate (over `pg_class c` / `pg_namespace n`, binds `$1`
+/// table, `$2` schema or NULL) selecting the relation an unqualified `INSERT`
+/// or `COPY` resolves to: the first match on the `search_path`, which
+/// `pg_table_is_visible` reports, not only `current_schema()`.
+const TARGET_RELATION: &str = "lower(c.relname) = lower($1) \
+    AND c.relkind IN ('r', 'p', 'v', 'f') \
+    AND CASE WHEN $2::text IS NULL THEN pg_catalog.pg_table_is_visible(c.oid) \
+        ELSE lower(n.nspname) = lower($2::text) END";
 
 /// Bind one JSON value onto a `sqlx` query as a native scalar type (so it lands
 /// in a typed Redshift column instead of being coerced from `jsonb`). Missing /
@@ -589,6 +645,24 @@ impl faucet_core::Sink for RedshiftSink {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_copy_chunk_drops_records_that_share_no_column() {
+        use serde_json::json;
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let all = [json!({"id": 1}), json!({"NAME": "x"})];
+        let (kept, skipped) = super::loadable_records(&all, &cols).unwrap();
+        assert!(matches!(kept, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(skipped, 0);
+        let mixed = [json!({"id": 1}), json!({}), json!({"other": 2})];
+        let (kept, skipped) = super::loadable_records(&mixed, &cols).unwrap();
+        assert_eq!(kept.as_ref(), &[json!({"id": 1})]);
+        assert_eq!(skipped, 2);
+        let err = super::loadable_records(&[json!({}), json!(3)], &cols)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no field of the 2 record(s)"), "{err}");
+    }
     use super::*;
     use crate::config::{RedshiftCopyFormat, RedshiftWriteStrategy};
     use faucet_common_redshift::RedshiftConnection;
