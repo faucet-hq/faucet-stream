@@ -27,6 +27,7 @@
 
 mod config;
 mod convert;
+mod money;
 mod stream;
 
 pub use config::{MssqlReplication, MssqlSourceConfig, ShardConfig};

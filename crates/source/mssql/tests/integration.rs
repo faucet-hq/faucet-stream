@@ -433,3 +433,70 @@ async fn discover_enumerates_tables_with_schemas() {
         "BIT maps to boolean"
     );
 }
+
+/// L-080: MONEY beyond ±900 billion keeps its cents — the source reads it as
+/// `DECIMAL(19,4)` — with and without bind parameters; a query that cannot be a
+/// derived table (trailing `ORDER BY`) still runs on the float path.
+#[tokio::test(flavor = "multi_thread")]
+async fn money_reads_exactly_at_the_extremes() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+
+    exec(
+        &pool,
+        "CREATE TABLE dbo.ledger (id INT NOT NULL, amount MONEY, fee SMALLMONEY, note NVARCHAR(10))",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.ledger (id, amount, fee, note) VALUES
+            (1, 922337203685477.5807, 214748.3647, N'max'),
+            (2, -922337203685477.5808, -214748.3648, N'min'),
+            (3, 12.3456, 0.5, NULL),
+            (4, NULL, NULL, N'null')",
+    )
+    .await;
+
+    let source_for = |query: &str| {
+        let mut scfg = MssqlSourceConfig::new(cfg.connection_url.clone().unwrap(), query);
+        scfg.connection.tls = cfg.tls.clone();
+        scfg
+    };
+
+    let exact = MssqlSource::new(source_for("SELECT id, amount, fee, note FROM dbo.ledger"))
+        .await
+        .expect("source");
+    let mut rows = exact.fetch_all().await.expect("fetch");
+    rows.sort_by_key(|r| r["id"].as_i64().unwrap());
+    assert_eq!(rows[0]["amount"], "922337203685477.5807");
+    assert_eq!(rows[0]["fee"], "214748.3647");
+    assert_eq!(rows[1]["amount"], "-922337203685477.5808");
+    assert_eq!(rows[1]["fee"], "-214748.3648");
+    assert_eq!(rows[2]["amount"], "12.3456");
+    assert_eq!(rows[2]["fee"], "0.5000");
+    assert_eq!(rows[2]["note"], Value::Null);
+    assert_eq!(rows[3]["amount"], Value::Null);
+    assert_eq!(rows[3]["note"], "null");
+
+    let mut bound = source_for("SELECT * FROM dbo.ledger WHERE id = @P1");
+    bound.params = vec![Value::from(1)];
+    let rows = MssqlSource::new(bound)
+        .await
+        .expect("source")
+        .fetch_all()
+        .await
+        .expect("fetch");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["amount"], "922337203685477.5807");
+
+    let ordered = MssqlSource::new(source_for(
+        "SELECT id, amount FROM dbo.ledger WHERE id = 3 ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = ordered.fetch_all().await.expect("fetch");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["amount"], "12.3456");
+}

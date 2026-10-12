@@ -244,7 +244,7 @@ Discovery reads catalog metadata only — it never scans table data.
 | TINYINT / SMALLINT / INT / BIGINT | number |
 | REAL / FLOAT | number |
 | BIT | bool |
-| DECIMAL / NUMERIC / MONEY | string (precision-preserving; MONEY/SMALLMONEY as exact 4-decimal text — the driver delivers MONEY as a float, which is exact below about ±900 billion, the range we render without loss) |
+| DECIMAL / NUMERIC / MONEY | string (precision-preserving; MONEY/SMALLMONEY as exact 4-decimal text across their whole range — the source reads them as `DECIMAL(19,4)`, see below) |
 | CHAR / VARCHAR / NCHAR / NVARCHAR / TEXT / NTEXT / XML | string |
 | DATE | `YYYY-MM-DD` |
 | TIME | ISO time |
@@ -256,6 +256,16 @@ Discovery reads catalog metadata only — it never scans table data.
 | SQL NULL | `null` |
 
 Each record is keyed by column name, so a query returning two columns with the same name — a join's `id`, or two unaliased expressions (SQL Server names both `""`) — fails with a `FaucetError::Source` asking you to alias them, instead of one silently replacing the other.
+
+**Exact MONEY.** The driver decodes `MONEY` / `SMALLMONEY` as a float, which
+is exact only below about ±900 billion. So before streaming, the source asks
+SQL Server for the query's result shape (`sp_describe_first_result_set`, one
+extra round trip) and, when a column is `MONEY` or `SMALLMONEY`, reads the
+query as `SELECT …, CAST(col AS DECIMAL(19,4)) AS col FROM (<query>) AS _faucet_money`.
+A query that cannot be used as a derived table — a trailing `ORDER BY`
+without `TOP`/`OFFSET`, a CTE, a temp table, unnamed or duplicate columns —
+keeps the float path and logs one warning; cast the column yourself
+(`CAST(amount AS DECIMAL(19,4)) AS amount`) to read such a query exactly.
 
 ## Config loading & schema
 
