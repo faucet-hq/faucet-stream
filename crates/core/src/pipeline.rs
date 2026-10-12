@@ -459,6 +459,14 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             wrapped_source = wrapped_source.with_meter(Arc::clone(m));
             wrapped_sink = wrapped_sink.with_meter(Arc::clone(m));
         }
+        if wrapped_sink.is_overwrite() && wrapped_source.consumes_destructively() {
+            return Err(FaucetError::Config(format!(
+                "write_mode: overwrite cannot read from source '{}': it removes each page from \
+                 its backend once the page is written into the staging copy, and a failed or \
+                 cancelled run discards staging, losing those records for good",
+                wrapped_source.connector_name()
+            )));
+        }
 
         // Hand each connector a pre-labelled round-trip recorder (#638). Done
         // here because the pipeline is the only place that knows the
@@ -3177,6 +3185,42 @@ mod tests {
             self.log("complete");
             Ok(())
         }
+    }
+
+    /// #862 L-023: the overwrite + destructive-consume refusal holds for any
+    /// caller of `Pipeline::run`, not only configs the CLI expands.
+    #[tokio::test]
+    async fn overwrite_refuses_a_source_that_consumes_destructively() {
+        struct Queue(MockSource);
+        #[async_trait]
+        impl Source for Queue {
+            async fn fetch_with_context(
+                &self,
+                ctx: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                self.0.fetch_with_context(ctx).await
+            }
+            fn consumes_destructively(&self) -> bool {
+                true
+            }
+        }
+        let source = Queue(MockSource(vec![json!({"id": 1})]));
+        let (sink, events) = OverwriteRecordingSink::new(true, false);
+        let err = Pipeline::new(&source, &sink).run().await.unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.contains("write_mode: overwrite")),
+            "{err}"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        let (append, _) = OverwriteRecordingSink::new(false, false);
+        assert_eq!(
+            Pipeline::new(&source, &append)
+                .run()
+                .await
+                .unwrap()
+                .records_written,
+            1
+        );
     }
 
     #[tokio::test]
