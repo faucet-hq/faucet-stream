@@ -236,6 +236,9 @@ pub enum SlotType {
 pub enum CdcTls {
     /// No TLS — plaintext.
     Disable,
+    /// TLS when the server offers it, else plaintext, without verifying the
+    /// certificate (libpq's `prefer`; open to downgrade).
+    Prefer,
     /// Require TLS but do not verify the server certificate.
     Require,
     /// Require TLS and verify the certificate chain against `ca_path` (or the
@@ -297,7 +300,7 @@ impl PostgresCdcSourceConfig {
         let from_url = url_tls(&self.connection_url)?;
         Ok(match (&self.tls, from_url) {
             (CdcTls::FromUrl, url) => url.unwrap_or(CdcTls::Disable),
-            (explicit, None) => explicit.clone(),
+            (explicit, None) | (explicit, Some(CdcTls::Prefer)) => explicit.clone(),
             (explicit, Some(url)) if explicit.kind() == url.kind() => match (explicit, url) {
                 (CdcTls::VerifyCa { ca_path: None }, u)
                 | (CdcTls::VerifyFull { ca_path: None }, u) => u,
@@ -379,6 +382,7 @@ impl CdcTls {
         match self {
             CdcTls::FromUrl => "from_url",
             CdcTls::Disable => "disable",
+            CdcTls::Prefer => "prefer",
             CdcTls::Require => "require",
             CdcTls::VerifyCa { .. } => "verify_ca",
             CdcTls::VerifyFull { .. } => "verify_full",
@@ -388,7 +392,7 @@ impl CdcTls {
 
 /// The TLS mode a libpq-style connection string asks for, from its `sslmode`
 /// and `sslrootcert` (URL query or `key=value` form). `allow` / `prefer`
-/// accept plaintext, which is what the replication stream then uses.
+/// use TLS when the server offers it and plaintext otherwise.
 fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
     let params: Vec<(String, String)> = if conn.contains("://") {
         match url::Url::parse(conn) {
@@ -411,7 +415,8 @@ fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
     let ca_path = get("sslrootcert");
     Ok(match get("sslmode").as_deref() {
         None => None,
-        Some("disable" | "allow" | "prefer") => Some(CdcTls::Disable),
+        Some("disable") => Some(CdcTls::Disable),
+        Some("allow" | "prefer") => Some(CdcTls::Prefer),
         Some("require") => Some(CdcTls::Require),
         Some("verify-ca" | "verify_ca") => Some(CdcTls::VerifyCa { ca_path }),
         Some("verify-full" | "verify_full") => Some(CdcTls::VerifyFull { ca_path }),
@@ -503,7 +508,26 @@ mod tests {
         );
         assert_eq!(
             eff("postgres://h/db?sslmode=prefer", CdcTls::FromUrl).unwrap(),
+            CdcTls::Prefer
+        );
+        assert_eq!(
+            eff("host=h sslmode=allow", CdcTls::FromUrl).unwrap(),
+            CdcTls::Prefer
+        );
+        assert_eq!(
+            eff("postgres://h/db?sslmode=prefer", CdcTls::Disable).unwrap(),
             CdcTls::Disable
+        );
+        assert_eq!(
+            eff("postgres://h/db?sslmode=prefer", CdcTls::Require).unwrap(),
+            CdcTls::Require
+        );
+        let err = eff("postgres://h/db?sslmode=disable", CdcTls::Prefer)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`tls.mode: prefer` contradicts `sslmode=disable`"),
+            "{err}"
         );
         assert_eq!(
             eff("postgres://h/db?sslmode=verify-ca", CdcTls::FromUrl).unwrap(),

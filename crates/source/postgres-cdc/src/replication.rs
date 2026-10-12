@@ -447,6 +447,7 @@ pub(crate) fn apply_cdc_tls(
     use sqlx::postgres::PgSslMode;
     match tls {
         CdcTls::FromUrl | CdcTls::Disable => opts.ssl_mode(PgSslMode::Disable),
+        CdcTls::Prefer => opts.ssl_mode(PgSslMode::Prefer),
         CdcTls::Require => opts.ssl_mode(PgSslMode::Require),
         CdcTls::VerifyCa { ca_path } => {
             let o = opts.ssl_mode(PgSslMode::VerifyCa);
@@ -472,6 +473,10 @@ fn tls_config(tls: &crate::config::CdcTls) -> TlsConfig {
     use std::path::PathBuf;
     match tls {
         CdcTls::FromUrl | CdcTls::Disable => TlsConfig::disabled(),
+        CdcTls::Prefer => TlsConfig {
+            mode: pgwire_replication::SslMode::Prefer,
+            ..TlsConfig::disabled()
+        },
         CdcTls::Require => TlsConfig::require(),
         CdcTls::VerifyCa { ca_path } => TlsConfig::verify_ca(ca_path.clone().map(PathBuf::from)),
         CdcTls::VerifyFull { ca_path } => {
@@ -1280,6 +1285,7 @@ mod tests {
     fn tls_config_maps_each_mode() {
         assert_eq!(tls_config(&CdcTls::Disable).mode, SslMode::Disable);
         assert_eq!(tls_config(&CdcTls::Require).mode, SslMode::Require);
+        assert_eq!(tls_config(&CdcTls::Prefer).mode, SslMode::Prefer);
         assert_eq!(
             tls_config(&CdcTls::VerifyCa { ca_path: None }).mode,
             SslMode::VerifyCa

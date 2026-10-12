@@ -17,7 +17,7 @@ Reach for it when you want to stream live mutations out of an operational Postgr
 - **Effectively-once delivery** — `supports_exactly_once()` is `true`; pair with an idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`, `iceberg`, `bigquery`, `kafka`, `snowflake`, `redis`, `mongodb`, `spanner`, `databricks`, `oracle`) under `delivery: exactly_once`.
 - **Snapshot → CDC handoff** — implements `capture_resume_position()` so `faucet replicate` can bulk-snapshot a table and hand off to CDC with no gap and no duplicate.
 - **Crash-safe WAL feedback** — the advertised `confirmed_flush_lsn` advances *only* from a durably-persisted bookmark, so Postgres never recycles WAL for changes the consumer hasn't committed.
-- **TLS-capable** — `require` / `verify_ca` / `verify_full` modes for the replication connection (the default `from_url` honours the connection URL's `sslmode`).
+- **TLS-capable** — `prefer` / `require` / `verify_ca` / `verify_full` modes for the replication connection (the default `from_url` honours the connection URL's `sslmode`).
 - **Type-aware decoding** — booleans, integers, floats (incl. `NaN`/`Infinity`), `numeric` (exact precision), `bytea` (base64), `json`/`jsonb`, and 1-D scalar arrays decode to native JSON; everything else is preserved as raw Postgres text.
 - **OOM and WAL safety valves** — `max_staged_records` bounds a single in-progress transaction; `idle_timeout`, `max_messages` and `max_cycle_duration` (default 5 minutes, so a cycle ends even under steady writes) bound a fetch cycle.
 
@@ -129,8 +129,9 @@ Each fetch cycle drains pending changes and stops once the stream has been idle 
 
 | `mode` | Extra config | Description |
 |--------|--------------|-------------|
-| `from_url` | *(none)* | **Default.** Use the `sslmode` / `sslrootcert` of `connection_url` for both the control-plane and the replication connection (`allow` / `prefer` mean plaintext for the stream). Without an `sslmode` the connection is plaintext and a warning is logged. |
+| `from_url` | *(none)* | **Default.** Use the `sslmode` / `sslrootcert` of `connection_url` for both the control-plane and the replication connection (`allow` / `prefer` map to `prefer`). Without an `sslmode` the connection is plaintext and a warning is logged. |
 | `disable` | *(none)* | Plaintext. Credentials and WAL travel unencrypted (a warning is logged). |
+| `prefer` | *(none)* | TLS when the server offers it, plaintext otherwise; the certificate is not verified (open to downgrade). An explicit mode beside a URL `sslmode=prefer` wins. |
 | `require` | *(none)* | Require TLS, but do not verify the server certificate. |
 | `verify_ca` | `ca_path?` | Require TLS and verify the certificate chain against `ca_path` (or the system roots when omitted). |
 | `verify_full` | `ca_path?` | Require TLS and verify both the certificate chain **and** the hostname. |

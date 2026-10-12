@@ -130,6 +130,37 @@ async fn insert_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sslmode_prefer_falls_back_to_plaintext_on_a_server_without_tls() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.p (id int4 PRIMARY KEY); \
+         CREATE PUBLICATION faucet_pub FOR TABLE public.p;",
+    )
+    .await;
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let mut config = cfg(
+        &format!("{url}{sep}sslmode=prefer"),
+        "faucet_slot",
+        "faucet_pub",
+    );
+    config.tls = faucet_source_postgres_cdc::CdcTls::FromUrl;
+    assert_eq!(
+        config.effective_tls().unwrap(),
+        faucet_source_postgres_cdc::CdcTls::Prefer
+    );
+    let source = PostgresCdcSource::new(config).await.expect("source");
+    let _ = source.fetch_all_incremental().await.expect("warm-up");
+    ddl(&url, "INSERT INTO public.p VALUES (1);").await;
+    let (records, _) = source.fetch_all_incremental().await.expect("fetch");
+    assert_eq!(
+        records.iter().filter(|r| r["op"] == "insert").count(),
+        1,
+        "{records:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn update_and_delete_emit_before_after() {
     let (_pg, url) = start_postgres().await;
     ddl(
