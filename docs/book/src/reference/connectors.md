@@ -419,9 +419,19 @@ Inspect the exact fields with `faucet schema source <name>` / `faucet schema sin
   holding their exact digits instead (one warning per column). The check runs on
   the column's text, before any conversion. *(Breaking default change.)*
 - **Postgres / MySQL query sources — timeouts** — `read_timeout_secs` (default
-  3600, `0` = forever) bounds every wait for the next row; the MySQL source also
+  3600, `0` = forever) bounds every wait for the next row, including the wait
+  for the *first* row (a query that runs longer than that before returning
+  anything fails — raise it for long analytical queries); the Postgres source
+  applies the same bound to its describe, discovery, shard-bounds and digest
+  round trips. Neither driver exposes TCP keepalive, so this timeout is what
+  detects a peer that vanished; the MySQL source also
   sets the session's `net_write_timeout` (`net_write_timeout_secs`, default 3600)
   so a slow sink does not make the server abort a large result.
+- **Postgres / MySQL sinks — timeouts** — `write_timeout_secs` (default 3600,
+  `0` = forever) bounds every page write, the commit-token read, schema reads and
+  evolution, and the overwrite staging setup and abort (MySQL: also the `RENAME`
+  swap). A scoped cleanup, a rollback and the Postgres overwrite commit are bulk
+  statements that can legitimately run long, so they are not bounded.
 
 ## Schema evolution
 
