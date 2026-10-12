@@ -303,14 +303,23 @@ async fn check_reports_auth_and_schema_probes() {
         "missing_table",
     );
     cfg.connection.emulator_host = conn.emulator_host.clone();
-    // With the default `create_table: true` it is created on the first
-    // write, so doctor must not fail it (SQL-138)…
-    let missing = SpannerSink::new(cfg.clone()).await.expect("sink");
+    // With the default `create_table: true` and a `key:` it is created on
+    // the first write, so doctor must not fail it (SQL-138)…
+    let mut keyed = cfg.clone();
+    keyed.write.key = vec!["id".to_string()];
+    let missing = SpannerSink::new(keyed).await.expect("sink");
     let report = missing
         .check(&faucet_core::check::CheckContext::default())
         .await
         .expect("check");
     assert_eq!(report.failed_count(), 0);
+    // …but without a `key:` auto-create cannot run, so it fails (#862 L-102)…
+    let keyless = SpannerSink::new(cfg.clone()).await.expect("sink");
+    let report = keyless
+        .check(&faucet_core::check::CheckContext::default())
+        .await
+        .expect("check");
+    assert_eq!(report.failed_count(), 1);
     // …and without it the schema probe fails.
     cfg.create_table = false;
     let missing = SpannerSink::new(cfg).await.expect("sink");
