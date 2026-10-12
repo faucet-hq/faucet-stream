@@ -185,7 +185,7 @@ pub(crate) async fn run_shard(
 ) -> bool {
     let poll_interval = config.poll_interval();
     let mut last_sequence = bookmarked_sequence.clone();
-    let mut error_attempts: u32 = 0;
+    let mut attempts = Attempts::default();
 
     // The first iterator is retried like a later one (#789 MSG-95): a
     // throttled GetShardIterator at start used to fail the run.
@@ -228,7 +228,7 @@ pub(crate) async fn run_shard(
         drop(permit);
         match response {
             Ok(out) => {
-                error_attempts = 0;
+                attempts = Attempts::default();
                 let records = out.records();
                 if !records.is_empty() {
                     let mut decoded = Vec::with_capacity(records.len());
@@ -292,8 +292,7 @@ pub(crate) async fn run_shard(
                 if service.is_provisioned_throughput_exceeded_exception() {
                     // Expected at the 2 MB/s/shard cap — back off (growing
                     // with each consecutive throttle, #789 MSG-95), don't fail.
-                    error_attempts = error_attempts.saturating_add(1);
-                    let delay = backoff_delay(poll_interval, error_attempts.min(4));
+                    let delay = backoff_delay(poll_interval, attempts.throttled().min(4));
                     tracing::debug!(shard = %shard_id, delay_ms = delay.as_millis() as u64,
                         "kinesis: throughput exceeded; backing off");
                     tokio::time::sleep(delay).await;
@@ -314,7 +313,7 @@ pub(crate) async fn run_shard(
                         }
                     }
                 }
-                error_attempts += 1;
+                let error_attempts = attempts.failed();
                 if error_attempts >= ERROR_RETRY_BUDGET {
                     let _ = tx
                         .send(ShardEvent::Failed {
@@ -334,6 +333,27 @@ pub(crate) async fn run_shard(
                 tokio::time::sleep(delay).await;
             }
         }
+    }
+}
+
+/// Consecutive `GetRecords` setbacks since the last success. Throttles only
+/// lengthen the backoff; they never spend the error budget, so a few throttles
+/// followed by one transient error do not fail the shard.
+#[derive(Debug, Default)]
+struct Attempts {
+    errors: u32,
+    throttles: u32,
+}
+
+impl Attempts {
+    fn throttled(&mut self) -> u32 {
+        self.throttles = self.throttles.saturating_add(1);
+        self.throttles
+    }
+
+    fn failed(&mut self) -> u32 {
+        self.errors = self.errors.saturating_add(1);
+        self.errors
     }
 }
 
@@ -401,6 +421,16 @@ async fn acquire_iterator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttles_do_not_spend_the_error_budget() {
+        let mut a = Attempts::default();
+        for n in 1..=10 {
+            assert_eq!(a.throttled(), n);
+        }
+        assert_eq!(a.failed(), 1);
+        assert!(a.failed() < ERROR_RETRY_BUDGET);
+    }
 
     #[test]
     fn undecodable_records_follow_on_decode_error() {
