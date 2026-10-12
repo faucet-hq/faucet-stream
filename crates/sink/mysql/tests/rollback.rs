@@ -175,7 +175,11 @@ async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
     sink.write_batch(&[json!({"id": 1, "name": "new-1", RUN_COL: "r1"})])
         .await
         .unwrap();
-    exec(&url, "DELETE FROM users WHERE id = 1").await;
+    // A later run deleted key 1 (its journal holds the key).
+    let r2 = MysqlSink::new(upsert_config(&url, "r2")).await.unwrap();
+    r2.write_batch(&[json!({"id": 1, "__op": "d"})])
+        .await
+        .unwrap();
     let mut later = opts(RollbackMode::Upsert);
     later.later_runs = true;
     let out = sink.rollback_run("r1", &later).await.unwrap();

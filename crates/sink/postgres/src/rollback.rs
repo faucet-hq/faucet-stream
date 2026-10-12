@@ -237,8 +237,26 @@ impl PostgresSink {
         &self,
         conn: &mut sqlx::PgConnection,
         entries: &[JournalEntry],
+        run_id: &str,
     ) -> Result<u64, FaucetError> {
         let restorable = faucet_core::rollback::restorable(entries);
+        if restorable.is_empty() {
+            return Ok(0);
+        }
+        let select = journal_sql().later_keys().replace(
+            &quote_ident(faucet_core::rollback::RUN_JOURNAL_TABLE),
+            &self.journal_ref(),
+        );
+        let later: Vec<String> = sqlx::query_scalar(&select)
+            .bind(&self.config.table_name)
+            .bind(run_id)
+            .bind(&self.config.table_name)
+            .bind(run_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| sink_err("read later journals", e))?;
+        let restorable =
+            faucet_core::rollback::touched_later(&restorable, &later, &self.config.write.key);
         if restorable.is_empty() {
             return Ok(0);
         }
@@ -400,7 +418,7 @@ impl PostgresSink {
             .count_conflicts(&mut *conn, &entries, run_id, &opts.run_id_column)
             .await?;
         if opts.later_runs {
-            conflicts += self.count_vanished(&mut *conn, &entries).await?;
+            conflicts += self.count_vanished(&mut *conn, &entries, run_id).await?;
         }
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts));

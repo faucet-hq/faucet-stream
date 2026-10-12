@@ -325,8 +325,11 @@ async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
     exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
     let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
     sink.write_batch(&[user(1, "new-1", "r1")]).await.unwrap();
-    // A later run deleted key 1.
-    exec(&url, "DELETE FROM users WHERE id = 1").await;
+    // A later run deleted key 1 (its journal holds the key).
+    let r2 = SqliteSink::new(upsert_config(&url, "r2")).await.unwrap();
+    r2.write_batch(&[json!({"id": 1, "__op": "d"})])
+        .await
+        .unwrap();
 
     let mut later = opts(RollbackMode::Upsert);
     later.later_runs = true;
@@ -352,6 +355,37 @@ async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
     assert_eq!(
         rows(&url).await,
         vec![(1, "old-1".into(), Some("r0".into()))]
+    );
+}
+
+/// A key the undone run deleted itself is restored even after a later run
+/// that did not touch it (#862 L-117).
+#[tokio::test]
+async fn a_key_the_run_deleted_itself_is_no_conflict_after_an_unrelated_later_run() {
+    let (_dir, url) = fresh_db(CREATE_USERS).await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    exec(&url, "INSERT INTO users VALUES (2, 'old-2', 'r0')").await;
+    let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[json!({"id": 1, "__op": "d"})])
+        .await
+        .unwrap();
+    let r2 = SqliteSink::new(upsert_config(&url, "r2")).await.unwrap();
+    r2.write_batch(&[user(2, "new-2", "r2")]).await.unwrap();
+
+    let mut later = opts(RollbackMode::Upsert);
+    later.later_runs = true;
+    let out = sink.rollback_run("r1", &later).await.unwrap();
+    assert_eq!(
+        (out.restored, out.conflicts, out.applied),
+        (1, 0, true),
+        "{out:?}"
+    );
+    assert_eq!(
+        rows(&url).await,
+        vec![
+            (1, "old-1".into(), Some("r0".into())),
+            (2, "new-2".into(), Some("r2".into()))
+        ]
     );
 }
 
