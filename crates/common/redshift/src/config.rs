@@ -135,8 +135,9 @@ pub struct RedshiftConnection {
     #[serde(default = "default_tls")]
     pub tls: bool,
     /// Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check
-    /// the server certificate against `ssl_root_cert` (or the system roots),
-    /// the latter also its host name.
+    /// the server certificate against `ssl_root_cert` (or, without one, the
+    /// Mozilla root store bundled into the binary — not the operating
+    /// system's), the latter also its host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_mode: Option<RedshiftTlsMode>,
     /// PEM file of the CA that signed the server certificate (the Redshift CA
