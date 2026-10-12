@@ -5825,6 +5825,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -6730,6 +6731,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6799,6 +6801,8 @@ dependencies = [
  "arrow-json 58.3.0",
  "async-stream",
  "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "bytes",
  "faucet-conformance",
  "faucet-core",
@@ -6810,6 +6814,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
  "tracing",
  "url",
