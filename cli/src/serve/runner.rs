@@ -276,9 +276,14 @@ pub(crate) async fn load_selected(
     let mut loaded = load_for(state, body, format, tenant, origin).await?;
     if let Some(sel) = selection {
         let nodes = std::mem::take(&mut loaded.nodes);
-        loaded.nodes = sel.apply(&loaded.cfg, nodes).map_err(|e| {
+        let bad = |e: crate::error::CliError| {
             ServeError::BadConfig(crate::secrets::registry::redact(&e.to_string()).into_owned())
-        })?;
+        };
+        let auth = loaded.auth_catalog().map_err(bad)?;
+        loaded.nodes = sel
+            .apply_resolved(&loaded.cfg, nodes, &auth)
+            .await
+            .map_err(bad)?;
     }
     Ok(loaded)
 }

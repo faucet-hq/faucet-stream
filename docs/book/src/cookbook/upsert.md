@@ -416,6 +416,14 @@ table with a subset:
 - sharing rows that run one after the other (`parent:` / `depends_on`), since
   each level would commit its own swap.
 
+Two rows write the same destination when their sink configs differ only in
+write knobs (`batch_size`, `key`, …) **or** when their sinks report the same
+dataset (the identity lineage and the catalog use — `postgres://…?table=t`),
+so a row that differs in any other setting is still recognised. Checking that
+builds the sinks involved, so it runs when a run starts (and in
+`faucet verify`), only for sink kinds an overwrite row uses; `faucet validate`
+compares configs only.
+
 `faucet run --limit N` on an overwrite row writes its sample to staging and
 then **discards** it: the destination is left unchanged (a warning says so).
 

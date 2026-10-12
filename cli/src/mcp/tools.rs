@@ -1220,7 +1220,12 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         let cfg = parse_config_with(&materialized.body, crate::params::BindMode::Strict, None)?;
         let mut nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
         if let Some(sel) = &materialized.selection {
-            nodes = sel.apply(&cfg, nodes).map_err(|e| e.to_string())?;
+            let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())
+                .map_err(|e| e.to_string())?;
+            nodes = sel
+                .apply_resolved(&cfg, nodes, &auth)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         let run_set: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         let rows = nodes.len();

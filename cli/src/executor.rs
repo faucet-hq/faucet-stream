@@ -499,7 +499,7 @@ pub fn run_expanded_boxed(
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
     if !opts.dry_run {
-        check_overwrite_plan(&nodes, &opts)?;
+        check_overwrite_plan(&nodes, &opts).await?;
     }
     let on_error = opts
         .execution
@@ -911,7 +911,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         let (overwrite_groups, overwrite_task_group) = if opts.dry_run {
             (Vec::new(), HashMap::new())
         } else {
-            plan_overwrite_groups(&units, opts.as_ref())?
+            plan_overwrite_groups(&units, opts.as_ref()).await?
         };
         // A group whose begin fails does not run; the error becomes its
         // members' outcome rather than aborting the whole run (#789 CLI-80).
@@ -1303,7 +1303,7 @@ async fn resolve_product_dims(
 /// part of its data (#789): a source-sharded run (each shard would commit its
 /// own swap — CLI-02), or rows sharing one destination that run in different
 /// levels (each level commits its own swap — CLI-04).
-fn check_overwrite_plan(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> CliResult<()> {
+async fn check_overwrite_plan(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> CliResult<()> {
     if opts.shard.is_some()
         && let Some(node) = nodes.iter().find(|n| crate::destination::is_overwrite(n))
     {
@@ -1314,7 +1314,13 @@ fn check_overwrite_plan(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> CliRes
             node.id
         )));
     }
-    crate::destination::check_overwrite_levels(nodes)
+    if !nodes.iter().any(crate::destination::is_overwrite) {
+        return Ok(());
+    }
+    let ids =
+        crate::destination::Identities::resolve(nodes, &opts.auth, crate::destination::is_overwrite)
+            .await;
+    crate::destination::check_overwrite_levels_with(&ids, nodes)
 }
 
 /// A group of overwrite fan-out invocations sharing one physical destination
@@ -1540,10 +1546,15 @@ type OverwriteTaskGroup = HashMap<(String, Option<String>), usize>;
 /// (#552) The planned overwrite groups plus the invocation → group-index map.
 type OverwritePlan = (Vec<OverwriteGroup>, OverwriteTaskGroup);
 
-fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<OverwritePlan> {
+async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<OverwritePlan> {
     let mut groups: Vec<OverwriteGroup> = Vec::new();
     let mut task_group: HashMap<(String, Option<String>), usize> = HashMap::new();
     let mut index_by_key: HashMap<String, usize> = HashMap::new();
+    let mut reported: HashMap<String, Option<String>> = HashMap::new();
+    let overwriting = units
+        .iter()
+        .filter(|u| node_sink_is_overwrite(&u.node))
+        .count();
     for unit in units {
         if !node_sink_is_overwrite(&unit.node) {
             continue;
@@ -1553,12 +1564,29 @@ fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<Ove
         // Keyed on the destination identity, not the whole config: two rows
         // on one table that differ only in a write knob (`batch_size`, `key`)
         // stage into the same `{table}__faucet_ovw`, so they must share one
-        // begin/commit (#789 CLI-22).
+        // begin/commit (#789 CLI-22). The destination the sink reports joins
+        // rows whose configs differ in any other key (#862 L-044).
         let key = crate::destination::identity(&kind, &cfg);
-        let gi = match index_by_key.get(&key) {
+        let uri_key = if overwriting > 1 {
+            match reported.get(&key) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = crate::destination::reported_identity(&kind, &cfg, &opts.auth).await;
+                    reported.insert(key.clone(), r.clone());
+                    r
+                }
+            }
+        } else {
+            None
+        };
+        let existing = index_by_key
+            .get(&key)
+            .or_else(|| uri_key.as_ref().and_then(|u| index_by_key.get(u)))
+            .copied();
+        let gi = match existing {
             Some(gi) => {
-                groups[*gi].members += 1;
-                *gi
+                groups[gi].members += 1;
+                gi
             }
             None => {
                 let gi = groups.len();
@@ -1568,10 +1596,13 @@ fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<Ove
                     cfg,
                     members: 1,
                 });
-                index_by_key.insert(key, gi);
                 gi
             }
         };
+        index_by_key.insert(key, gi);
+        if let Some(u) = uri_key {
+            index_by_key.insert(u, gi);
+        }
         task_group.insert((unit.node.id.clone(), unit.parent_record_key.clone()), gi);
     }
     Ok((groups, task_group))
@@ -5322,7 +5353,7 @@ mod tests {
         // begin/commit run once — the fix for the last-writer-wins bug.
         let shared = overwrite_child_node(dir.path(), "orders");
         let units = vec![mk(&shared, "1", 1), mk(&shared, "2", 2)];
-        let (groups, task_group) = plan_overwrite_groups(&units, &opts).unwrap();
+        let (groups, task_group) = plan_overwrite_groups(&units, &opts).await.unwrap();
         assert_eq!(
             groups.len(),
             1,
@@ -5338,7 +5369,7 @@ mod tests {
         // group each, exactly as before — the out-of-scope case stays unchanged.
         let per = overwrite_child_node(dir.path(), "orders_${p.id}");
         let units2 = vec![mk(&per, "1", 1), mk(&per, "2", 2)];
-        let (groups2, task_group2) = plan_overwrite_groups(&units2, &opts).unwrap();
+        let (groups2, task_group2) = plan_overwrite_groups(&units2, &opts).await.unwrap();
         assert_eq!(
             groups2.len(),
             2,
@@ -7448,14 +7479,14 @@ matrix:
         // Shared destination across two parents ⇒ members == 2.
         let shared = overwrite_child_node(dir.path(), "orders");
         let units = vec![mk(&shared, "1", 1), mk(&shared, "2", 2)];
-        let (groups, _) = plan_overwrite_groups(&units, &opts).unwrap();
+        let (groups, _) = plan_overwrite_groups(&units, &opts).await.unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, 2, "the two shared-dest units group");
 
         // Per-parent destinations ⇒ two single-member (solo) groups.
         let per = overwrite_child_node(dir.path(), "orders_${p.id}");
         let units2 = vec![mk(&per, "1", 1), mk(&per, "2", 2)];
-        let (groups2, _) = plan_overwrite_groups(&units2, &opts).unwrap();
+        let (groups2, _) = plan_overwrite_groups(&units2, &opts).await.unwrap();
         assert_eq!(groups2.len(), 2);
         assert!(
             groups2.iter().all(|g| g.members == 1),
@@ -7479,10 +7510,19 @@ matrix:
             product_ctx: None,
             legacy_state_keys: Vec::new(),
         };
-        let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts).unwrap();
+        let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts).await.unwrap();
         assert_eq!(groups.len(), 1, "one table ⇒ one staging ⇒ one group");
         assert_eq!(groups[0].members, 2);
         assert_eq!(task_group.len(), 2);
+
+        // #862 L-044: a key the config heuristic does not know about still
+        // writes the same table — the sink's reported destination joins them.
+        let mut c = a.clone();
+        c.id = "c3".into();
+        c.sink.config["busy_timeout_secs"] = json!(9);
+        let (groups, _) = plan_overwrite_groups(&[mk(&a), mk(&c)], &opts).await.unwrap();
+        assert_eq!(groups.len(), 1, "the sink reports one destination");
+        assert_eq!(groups[0].members, 2);
     }
 
     /// #789 CLI-21: the executor's sink decorators forward the inner sink's
