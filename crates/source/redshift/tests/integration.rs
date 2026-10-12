@@ -460,3 +460,21 @@ async fn check_probe_passes() {
         "all probes should pass against a reachable database: {report:?}"
     );
 }
+
+/// A tiny NUMERIC is an exact decimal string, never exponent notation
+/// (#862 L-098).
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_numerics_stay_out_of_exponent_notation() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let source = RedshiftSource::new(full_config(
+        port,
+        "SELECT 0.0000001::numeric(20,10) AS n",
+        1000,
+    ))
+    .expect("source builds");
+    let rows = source.fetch_all().await.expect("query runs");
+    let n = rows[0]["n"].as_str().expect("numeric is a string");
+    assert!(!n.contains(['e', 'E']), "{n}");
+    assert!(n.starts_with("0.0000001"), "{n}");
+}
