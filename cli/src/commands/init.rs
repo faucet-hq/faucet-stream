@@ -54,15 +54,16 @@ pub async fn run(args: InitArgs) -> CliResult<()> {
     pin_project(&args)
 }
 
-/// Pin this faucet version in the `mise.toml` beside the output file.
+/// Pin this faucet version in the project's `mise.toml` (see [`mise_target`]).
 fn pin_project(args: &InitArgs) -> CliResult<()> {
     if args.no_pin {
         return Ok(());
     }
-    let path = match args.output.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join("mise.toml"),
-        _ => std::path::PathBuf::from("mise.toml"),
+    let start = match args.output.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
     };
+    let path = mise_target(&start);
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -80,6 +81,32 @@ fn pin_project(args: &InitArgs) -> CliResult<()> {
         None => println!("{} already pins faucet; left it as is", path.display()),
     }
     Ok(())
+}
+
+/// The `mise.toml` to pin in: the nearest existing `mise.toml` /
+/// `.mise.toml` from the output's directory up to the project root (the first
+/// directory holding `.git`), else a new `mise.toml` at that root, else beside
+/// the output.
+fn mise_target(start: &std::path::Path) -> std::path::PathBuf {
+    let abs = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(start))
+            .unwrap_or_else(|_| start.to_path_buf())
+    };
+    for dir in abs.ancestors() {
+        for name in ["mise.toml", ".mise.toml"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        if dir.join(".git").exists() {
+            return dir.join("mise.toml");
+        }
+    }
+    start.join("mise.toml")
 }
 
 /// Where `--discover` writes the Singer catalog: `catalog.json` next to the
@@ -501,6 +528,21 @@ mod tests {
         broken.output = dir.path().join("r.yaml");
         broken.no_pin = false;
         assert!(super::run(broken).await.is_err());
+    }
+
+    #[test]
+    fn the_pin_goes_to_the_nearest_mise_file_or_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let nested = root.join("pipelines").join("orders");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(super::mise_target(&nested), root.join("mise.toml"));
+        std::fs::write(root.join("pipelines").join(".mise.toml"), "").unwrap();
+        assert_eq!(
+            super::mise_target(&nested),
+            root.join("pipelines").join(".mise.toml")
+        );
     }
 
     /// `--discover` never overwrites an existing catalog without --force

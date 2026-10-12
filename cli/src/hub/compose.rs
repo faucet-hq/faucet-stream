@@ -541,6 +541,14 @@ pub fn compose_with(
 
     let mut doc = Map::new();
     doc.insert("version".into(), json!(1));
+    if let Some(req) = crate::requires::conjoin(
+        [&source.requires_faucet, &sink.requires_faucet]
+            .into_iter()
+            .flatten()
+            .map(String::as_str),
+    ) {
+        doc.insert(crate::requires::KEY.into(), Value::String(req));
+    }
     let name = pairing_name(&source.id(), &sink.id());
     doc.insert("name".into(), Value::String(name.clone()));
     if !params.is_empty() {
@@ -671,6 +679,13 @@ impl Composition {
         }
 
         let mut contributes = Vec::new();
+        if let Some(theirs) = &overlay.requires_faucet {
+            let ours = doc.get(crate::requires::KEY).and_then(Value::as_str);
+            if let Some(req) = crate::requires::conjoin(ours.into_iter().chain([theirs.as_str()])) {
+                doc.insert(crate::requires::KEY.into(), Value::String(req));
+                contributes.push(crate::requires::KEY.to_string());
+            }
+        }
         for (key, value) in overlay.blocks() {
             match key {
                 "state" | "dlq" => {
@@ -1226,6 +1241,27 @@ per_stream:
     fn jsonl_pair() -> Composition {
         let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         compose_with(&src(), &k, ALL).unwrap()
+    }
+
+    #[test]
+    fn the_composition_requires_what_every_template_requires() {
+        assert!(jsonl_pair().document.get(crate::requires::KEY).is_none());
+        let mut source = src();
+        source.requires_faucet = Some(">=1.0".into());
+        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        sink.requires_faucet = Some("<99".into());
+        let c = compose_with(&source, &sink, ALL).unwrap();
+        assert_eq!(c.document[crate::requires::KEY], json!(">=1.0, <99"));
+        let c = c
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nrequires_faucet: \">=1.1\"\n",
+            ))
+            .unwrap();
+        assert_eq!(c.document[crate::requires::KEY], json!(">=1.0, <99, >=1.1"));
+        assert!(
+            c.overlay_contributes
+                .contains(&crate::requires::KEY.to_string())
+        );
     }
 
     /// Two sinks fed by one source template keep separate bookmarks unless a
