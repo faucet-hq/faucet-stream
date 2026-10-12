@@ -743,6 +743,47 @@ async fn one_shot_refusals_the_fail_policy_and_a_broken_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_mirror_fails_naming_a_paused_table() {
+    let (_pg, url) = start_postgres().await;
+    let dir = tempfile::tempdir().unwrap();
+    sql(
+        &url,
+        "CREATE SCHEMA shop; \
+         CREATE TABLE shop.orders (id int8 PRIMARY KEY, v text); \
+         INSERT INTO shop.orders VALUES (1, 'not a number'); \
+         CREATE TABLE public.mirror_orders (id int8 PRIMARY KEY, v int8); \
+         CREATE TABLE shop.items (id int8 PRIMARY KEY); \
+         INSERT INTO shop.items VALUES (1); \
+         CREATE PUBLICATION shop_pub FOR TABLES IN SCHEMA shop;",
+    )
+    .await;
+    let st = dir.path().join("st");
+    let yaml = config(
+        &url,
+        &st,
+        false,
+        "at_least_once",
+        "    on_table_error: pause\n    max_table_failures: 1\n",
+    );
+    let (cfg, compiled) = load(&yaml);
+    let err = run_replication(&cfg, &compiled, options())
+        .await
+        .expect_err("a paused table fails a one-shot mirror")
+        .to_string();
+    assert!(
+        err.contains("did not complete") && err.contains("shop.orders"),
+        "{err}"
+    );
+    assert!(!err.contains("shop.items"), "{err}");
+    let m = marker(&st).await.expect("marker");
+    assert_eq!(m.tables["shop.orders"].phase, TablePhase::Paused);
+    assert_eq!(
+        count(&url, "SELECT count(*) FROM public.mirror_items").await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sharded_snapshots_and_a_re_sync_under_exactly_once() {
     let (_pg, url) = start_postgres().await;
     let dir = tempfile::tempdir().unwrap();

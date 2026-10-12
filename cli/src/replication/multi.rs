@@ -850,6 +850,10 @@ impl Driver {
                 for t in &diff.added {
                     tracing::info!(pipeline = %self.shared.opts.pipeline_name, table = %t, "mirror: table added");
                 }
+                for t in diff.dropped.iter().chain(&diff.refused) {
+                    self.failed.remove(t);
+                    self.retry_at.remove(t);
+                }
                 for t in &diff.dropped {
                     tracing::warn!(pipeline = %self.shared.opts.pipeline_name, table = %t, "mirror: table dropped at the source; no longer routed (destination left untouched)");
                 }
