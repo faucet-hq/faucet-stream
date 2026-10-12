@@ -102,7 +102,9 @@ file is already in place).
   page with every field nullable; a later page that adds a field widens the
   file (earlier rows get null). A number column that holds whole numbers on
   one page and fractions on another widens to `float64` (whichever page comes
-  first; rows already written are cast), and any other field that changes type
+  first; rows already written are cast). The widening is refused, naming the
+  column, when the column holds a whole number beyond ±2^53, which a `float64`
+  would round — cast such a column to one type first. Any other field that changes type
   is an error naming it. With the `arrow` feature an Arrow source writes Parquet without
   building JSON values; Avro accepts the columnar path too.
 
