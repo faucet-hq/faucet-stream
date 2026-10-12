@@ -12,11 +12,11 @@ use std::collections::HashSet;
 
 /// Once per process: `phone` stopped matching bare digit runs in faucet-core
 /// 1.13, so a policy relying on it may now pass phone numbers through (#862 M-019).
-fn warn_phone_narrowed() {
+pub(crate) fn warn_phone_narrowed() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         tracing::warn!(
-            "masking: `value_detector: phone` matches only E.164 (`+…`) and separated \
+            "masking/policy: `value_detector: phone` matches only E.164 (`+…`) and separated \
              North-American numbers; bare digit runs and national formats such as \
              `020 7946 0958` pass through. Use `phone_loose` for the broader matcher"
         );
