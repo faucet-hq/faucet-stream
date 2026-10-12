@@ -1874,7 +1874,7 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
 /// - A file or object destination (#862 M-096): every shard runs at once with
 ///   the same sink config and the writers clobber each other's files.
 pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult<()> {
-    if !cfg.shard.as_ref().is_some_and(|s| s.count >= 2) {
+    if cfg.shard.as_ref().is_none_or(|s| s.count < 2) {
         return Ok(());
     }
     for n in nodes
