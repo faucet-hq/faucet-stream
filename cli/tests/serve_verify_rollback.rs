@@ -529,7 +529,11 @@ async fn cluster_rollback_uses_the_stored_config() {
         "the run's insert is undone"
     );
     assert_eq!(
-        count(&dst, "SELECT count(*) FROM dst WHERE id = 1 AND name = 'old-one'").await,
+        count(
+            &dst,
+            "SELECT count(*) FROM dst WHERE id = 1 AND name = 'old-one'"
+        )
+        .await,
         1,
         "the row it overwrote is restored"
     );
