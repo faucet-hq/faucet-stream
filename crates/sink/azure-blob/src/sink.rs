@@ -41,11 +41,13 @@ impl AzureBlobSink {
         let write = config.write_config();
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
+        let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
         let objects = Arc::new(AzureObjects {
             store: store.clone(),
             container: config.container().to_string(),
             part_bytes: PART_BYTES,
             concurrency: config.concurrency,
+            roundtrips: roundtrips.clone(),
         });
         let backend = RemoteBackend::new(
             objects,
@@ -57,12 +59,14 @@ impl AzureBlobSink {
         .with_multipart(Arc::new(AzureBlocks {
             store: store.clone(),
             part_bytes: PART_BYTES,
+            roundtrips: roundtrips.clone(),
         }));
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
         let identity = AzureIdentity {
             store,
             container: config.container().to_string(),
             prefix: config.prefix.clone(),
+            roundtrips,
         };
         Ok(Self {
             inner: WriterSink::new(writer, identity),
@@ -82,6 +86,7 @@ struct AzureIdentity {
     store: Arc<dyn ObjectStore>,
     container: String,
     prefix: String,
+    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
 }
 
 #[faucet_core::async_trait]
@@ -97,6 +102,10 @@ impl SinkIdentity for AzureIdentity {
 
     fn dataset_uri(&self) -> String {
         format!("az://{}/{}", self.container, self.prefix)
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.roundtrips.install(recorder);
     }
 
     async fn check(
@@ -128,6 +137,7 @@ impl SinkIdentity for AzureIdentity {
 struct AzureBlocks {
     store: Arc<dyn ObjectStore>,
     part_bytes: usize,
+    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
 }
 
 fn azure_err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -149,6 +159,7 @@ impl MultipartClient for AzureBlocks {
         Ok(Box::new(AzureUpload {
             key: key.to_string(),
             upload: Arc::new(Mutex::new(upload)),
+            roundtrips: self.roundtrips.clone(),
         }))
     }
 }
@@ -156,10 +167,12 @@ impl MultipartClient for AzureBlocks {
 struct AzureUpload {
     key: String,
     upload: Arc<Mutex<Box<dyn object_store::MultipartUpload>>>,
+    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
 }
 
 impl MultipartUpload for AzureUpload {
     fn put_part(&self, _number: u32, body: Vec<u8>) -> BoxFuture<Result<(), FaucetError>> {
+        self.roundtrips.record("put");
         let part = self
             .upload
             .lock()
@@ -170,6 +183,7 @@ impl MultipartUpload for AzureUpload {
     }
 
     fn complete(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
+        self.roundtrips.record("put");
         Box::pin(async move {
             let mut upload = Arc::try_unwrap(self.upload)
                 .map_err(|_| azure_err("complete multipart", &self.key, "a part is still open"))?

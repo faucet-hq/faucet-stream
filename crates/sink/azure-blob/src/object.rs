@@ -22,6 +22,7 @@ pub(crate) struct AzureObjects {
     pub container: String,
     pub part_bytes: usize,
     pub concurrency: usize,
+    pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -45,6 +46,7 @@ impl ObjectClient for AzureObjects {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
         let root = list_root(prefix);
+        self.roundtrips.record("list");
         let mut listing = self.store.list(root.as_ref());
         let mut keys = Vec::new();
         while let Some(meta) = listing.next().await {
@@ -58,6 +60,7 @@ impl ObjectClient for AzureObjects {
     }
 
     async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
+        self.roundtrips.record("head");
         match self.store.head(&ObjectPath::from(key)).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
@@ -67,6 +70,7 @@ impl ObjectClient for AzureObjects {
 
     async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
         use tokio::io::AsyncWriteExt as _;
+        self.roundtrips.record("get");
         let got = self
             .store
             .get(&ObjectPath::from(key))
@@ -96,6 +100,7 @@ impl ObjectClient for AzureObjects {
             let body = tokio::fs::read(from)
                 .await
                 .map_err(|e| err("read local file", key, e))?;
+            self.roundtrips.record("put");
             self.store
                 .put(&path, bytes::Bytes::from(body).into())
                 .await
@@ -124,9 +129,11 @@ impl ObjectClient for AzureObjects {
                 break;
             }
             sent += part.len();
+            self.roundtrips.record("put");
             writer.put(bytes::Bytes::from(part));
         }
         if result.is_ok() {
+            self.roundtrips.record("put");
             return match writer.finish().await {
                 Ok(_) => Ok(()),
                 Err(e) => Err(err("complete multipart", key, e)),
@@ -137,6 +144,7 @@ impl ObjectClient for AzureObjects {
     }
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+        self.roundtrips.record("delete");
         match self.store.delete(&ObjectPath::from(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(err("delete", key, e)),
@@ -144,6 +152,7 @@ impl ObjectClient for AzureObjects {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), FaucetError> {
+        self.roundtrips.record("copy");
         self.store
             .copy(&ObjectPath::from(from), &ObjectPath::from(to))
             .await
@@ -171,6 +180,7 @@ mod tests {
             container: "c".into(),
             part_bytes: 4,
             concurrency: 2,
+            roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
         };
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -194,12 +204,47 @@ mod tests {
         assert!(objects.download("p/none", &out).await.is_err());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_call_is_counted_as_a_round_trip() {
+        use faucet_core::observability::{RoundtripRecorder, RoundtripSide};
+        let meter = Arc::new(faucet_core::UsageMeter::new());
+        let objects = objects(Arc::new(object_store::memory::InMemory::new()), 4);
+        objects.roundtrips.install(Arc::new(
+            RoundtripRecorder::new(RoundtripSide::Sink, "p", "", "azure-blob")
+                .with_meter(meter.clone()),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"0123456789").unwrap();
+        objects.upload(&src, "p/big").await.unwrap();
+        std::fs::write(&src, b"xy").unwrap();
+        objects.upload(&src, "p/small").await.unwrap();
+        objects.exists("p/small").await.unwrap();
+        objects.list("p/").await.unwrap();
+        objects
+            .download("p/small", &dir.path().join("o"))
+            .await
+            .unwrap();
+        objects.rename("p/small", "p/moved").await.unwrap();
+        let ops = meter.snapshot().sink_roundtrips;
+        assert_eq!(
+            ops["put"], 5,
+            "three blocks, the block list and one Put Blob: {ops:?}"
+        );
+        assert_eq!(ops["head"], 1);
+        assert_eq!(ops["list"], 1);
+        assert_eq!(ops["get"], 1);
+        assert_eq!(ops["copy"], 1);
+        assert_eq!(ops["delete"], 1);
+    }
+
     fn objects(store: Arc<dyn ObjectStore>, part_bytes: usize) -> AzureObjects {
         AzureObjects {
             store,
             container: "c".into(),
             part_bytes,
             concurrency: 1,
+            roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
         }
     }
 
