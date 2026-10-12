@@ -43,29 +43,33 @@ async fn current_schema_maps_es_field_types() {
     assert_eq!(schema["type"], "object");
     let props = &schema["properties"];
 
-    // Every field is nullable (ES has no NOT NULL) and may hold an array of
-    // its type (ES fields are multi-valued), so array data is not drift
-    // (#789 MSG-50; the old `[base, "null"]` classed every array incompatible).
-    assert_eq!(props["id"], json!({ "type": ["integer", "array", "null"] }));
+    // Every field is nullable (ES has no NOT NULL) and also accepts an array
+    // (ES fields are multi-valued), so array data is not drift (#789 MSG-50).
+    // The array is an "also accepts", not part of the type, so a widening such
+    // as integer→number still classifies as one (#862 L-111).
+    assert_eq!(
+        props["id"],
+        json!({ "type": ["integer", "null"], "x-faucet-also-accepts": ["array"] })
+    );
     assert_eq!(
         props["score"],
-        json!({ "type": ["number", "array", "null"] })
+        json!({ "type": ["number", "null"], "x-faucet-also-accepts": ["array"] })
     );
     assert_eq!(
         props["active"],
-        json!({ "type": ["boolean", "array", "null"] })
+        json!({ "type": ["boolean", "null"], "x-faucet-also-accepts": ["array"] })
     );
     assert_eq!(
         props["name"],
-        json!({ "type": ["string", "array", "null"] })
+        json!({ "type": ["string", "null"], "x-faucet-also-accepts": ["array"] })
     );
     assert_eq!(
         props["body"],
-        json!({ "type": ["string", "array", "null"] })
+        json!({ "type": ["string", "null"], "x-faucet-also-accepts": ["array"] })
     );
     assert_eq!(
         props["meta"],
-        json!({ "type": ["object", "array", "null"] })
+        json!({ "type": ["object", "null"], "x-faucet-also-accepts": ["array"] })
     );
 }
 
