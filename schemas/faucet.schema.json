@@ -4781,6 +4781,14 @@
                 "string",
                 "null"
               ]
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `limit` (default `false`). Only for\nservers that never cap a page below `limit` — a capped page would\nend the run with rows unread — but reject an offset past the end\n(a `400`/`416` on the extra request) instead of returning an empty\npage. A readable `total_path` still wins.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6410,6 +6418,14 @@
             "type": {
               "type": "string",
               "const": "PageNumber"
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `page_size` (default `false`). Only for\nservers that never clamp the page size and reject a page past the\nend; a clamped page would end the run with rows unread.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6434,6 +6450,14 @@
             "type": {
               "type": "string",
               "const": "Offset"
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `limit` (default `false`). Only for\nservers that never clamp `limit` and reject an offset past the end;\na clamped page would end the run with rows unread.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },

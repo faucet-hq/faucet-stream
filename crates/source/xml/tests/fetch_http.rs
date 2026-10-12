@@ -188,6 +188,7 @@ async fn page_number_pagination_walks_pages_until_empty() {
             start_page: 1,
             page_size: None,
             page_size_param: None,
+            stop_when_short: false,
         });
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     assert_eq!(records.len(), 4);
@@ -230,6 +231,7 @@ async fn page_number_pagination_continues_past_a_short_page_until_empty() {
             start_page: 1,
             page_size: Some(3),
             page_size_param: Some("size".into()),
+            stop_when_short: false,
         });
     Mock::given(method("GET"))
         .and(path("/feed.xml"))
@@ -295,6 +297,7 @@ async fn offset_pagination_walks_until_an_empty_page() {
             offset_param: "offset".into(),
             limit_param: "limit".into(),
             limit: 2,
+            stop_when_short: false,
         });
     Mock::given(method("GET"))
         .and(path("/feed.xml"))
@@ -346,6 +349,7 @@ async fn max_pages_caps_fetch() {
             start_page: 1,
             page_size: None,
             page_size_param: None,
+            stop_when_short: false,
         });
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     assert_eq!(records.len(), 4, "max_pages=2 -> at most 4 records");
@@ -373,6 +377,7 @@ async fn identical_page_loop_guard_stops_fetch() {
             start_page: 1,
             page_size: None,
             page_size_param: None,
+            stop_when_short: false,
         });
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     // #321 M4: only page 1 is emitted (2 records). The identical page 2 trips
@@ -455,4 +460,39 @@ async fn a_response_cut_off_mid_document_fails_the_fetch() {
     let config = XmlStreamConfig::new(server.uri(), "/feed.xml").records_element_path("root.item");
     let err = XmlStream::new(config).fetch_all().await.unwrap_err();
     assert!(err.to_string().contains("truncated"), "{err}");
+}
+
+#[tokio::test]
+async fn offset_stop_when_short_ends_on_a_short_page() {
+    let server = MockServer::start().await;
+    for (offset, start, count) in [("0", 0, 2), ("2", 2, 1)] {
+        Mock::given(method("GET"))
+            .and(path("/feed.xml"))
+            .and(query_param("offset", offset))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(items_doc(start, count)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(query_param("offset", "3"))
+        .respond_with(ResponseTemplate::new(416))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/feed.xml")
+        .records_element_path("root.item")
+        .pagination(XmlPagination::Offset {
+            offset_param: "offset".into(),
+            limit_param: "limit".into(),
+            limit: 2,
+            stop_when_short: true,
+        });
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 3);
 }
