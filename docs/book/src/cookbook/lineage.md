@@ -144,8 +144,9 @@ lineage:
 ### Kafka (gated on `lineage-kafka` feature)
 
 Each event is produced as a JSON message to a Kafka topic. Requires building with
-`--features lineage-kafka`. Delivery of one event is bounded at 10 seconds
-(`message.timeout.ms`), so an unreachable broker delays a run by seconds per event
+`--features lineage-kafka`. Delivery of one event takes at most 10 seconds
+(`message.timeout.ms`), plus up to another 10 seconds when the producer's local
+queue is full, so an unreachable broker delays a run by seconds per event
 and the event is dropped, rather than waiting out Kafka's 5-minute default.
 
 ```yaml
