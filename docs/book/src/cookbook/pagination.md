@@ -3,9 +3,14 @@
 The REST source walks multi-page responses automatically. Set `pagination.type`
 to one of the styles below. Every style has a loop/termination guard so a
 misbehaving API can't loop forever. `max_pages` is an optional cap across all of
-them (unset by default); a pass the cap cuts short persists no record-derived or
-window bookmark, because that would skip the pages it never read — only a
-`persist_cursor` bookmark, which names the next unread page, is kept.
+them (unset by default). A pass the cap cuts short keeps only a `persist_cursor`
+bookmark, which names the next unread page. An incremental or windowed pass the
+cap cuts short **fails the run**: a record-derived or window bookmark would skip
+the pages it never read, and keeping none would re-read the same pages every run
+while each run looked green. Set `assume_ordered: true` when the feed returns
+records in ascending `replication_key` order — a truncated incremental pass then
+persists the largest key it read and resumes after it. `assume_ordered` does not
+apply to windowed passes or across `requests:` entries.
 
 | Style | Stops when |
 |-------|-----------|
