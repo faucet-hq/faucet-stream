@@ -1,0 +1,50 @@
+# Google Cloud Spanner change stream → JSON Lines.
+#
+# Reads a Spanner change stream and writes one JSON line per changed row, in
+# the standard CDC envelope (`op` c/u/d, `before`, `after`, `document_key`),
+# so `cdc_unwrap` and the CDC-aware sinks work on it unchanged.
+#
+# Delivery is at-least-once: the bookmark is a snapshot of the partition
+# scheduler and resume is inclusive, so a crash can re-deliver the last few
+# records. Dedupe downstream by `document_key` (or use a keyed upsert sink).
+#
+# Setup against the Spanner emulator (also works for a PostgreSQL-dialect
+# database: add `dialect: postgresql` and create the stream with
+# `CREATE CHANGE STREAM users_changes FOR users`):
+#
+#   docker run --rm -p 9010:9010 gcr.io/cloud-spanner-emulator/emulator
+#   # create the instance/database, then:
+#   #   CREATE TABLE users (id INT64 NOT NULL, name STRING(MAX)) PRIMARY KEY (id)
+#   #   CREATE CHANGE STREAM users_changes FOR users
+#   faucet run cli/examples/spanner_cdc_to_jsonl.yaml
+#
+# Against real Spanner: drop `emulator_host` (Application Default Credentials
+# are used unless an `auth:` block selects a service-account key).
+version: 1
+name: spanner_cdc_to_jsonl
+
+pipeline:
+  source:
+    type: spanner-cdc
+    config:
+      project_id: local-project
+      instance: test-instance
+      database: local-database
+      emulator_host: localhost:9010   # remove for real Spanner
+      change_stream: users_changes
+      start_from:
+        type: now                     # history is not replayed on a fresh run
+      heartbeat_ms: 10000
+      idle_timeout: 60
+      batch_size: 1000
+
+  sink:
+    type: file
+    config:
+      path: ./out/spanner-users-changes.jsonl
+      if_exists: append
+
+  # Durable bookmark: a re-run resumes from the persisted partition snapshot.
+  state:
+    type: file
+    config: { path: ./.faucet-state }
