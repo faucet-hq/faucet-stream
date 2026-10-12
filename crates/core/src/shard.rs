@@ -245,13 +245,13 @@ impl PkShardBounds {
             if range.is_empty() {
                 // A single fully-unbounded shard owns the whole dataset,
                 // NULL-key rows included.
-                "TRUE".to_string()
+                "1=1".to_string()
             } else {
                 // Parenthesize so the OR binds correctly inside the WHERE clause.
                 format!("(({range}) OR {key} IS NULL)")
             }
         } else if range.is_empty() {
-            "TRUE".to_string()
+            "1=1".to_string()
         } else {
             range
         };
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(shards.len(), 1);
         let b = PkShardBounds::from_spec(&shards[0]).unwrap();
         let sql = b.wrap("SELECT * FROM t", ansi_quote);
-        assert!(sql.contains("WHERE TRUE"), "whole-dataset predicate: {sql}");
+        assert!(sql.contains("WHERE 1=1"), "whole-dataset predicate: {sql}");
         assert!(!sql.contains(">="), "no bounds on a lone shard: {sql}");
     }
 

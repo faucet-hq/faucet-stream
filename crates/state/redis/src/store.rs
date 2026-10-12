@@ -100,8 +100,8 @@ impl RedisStateStore {
         let client = redis::Client::open(url.as_ref())
             .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
         let config = redis::aio::ConnectionManagerConfig::new()
-            .set_connection_timeout(CONNECT_TIMEOUT)
-            .set_response_timeout(RESPONSE_TIMEOUT)
+            .set_connection_timeout(Some(CONNECT_TIMEOUT))
+            .set_response_timeout(Some(RESPONSE_TIMEOUT))
             .set_number_of_retries(3);
         let conn = tokio::time::timeout(
             CONNECT_TIMEOUT,

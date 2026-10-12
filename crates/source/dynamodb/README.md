@@ -42,10 +42,20 @@ source:
 | `idle_termination_secs` / `max_messages` | — | Streams: at least one is required so a run terminates |
 | `retry` | `{max_retries: 8, initial_backoff_ms: 100, max_backoff_ms: 10000}` | Throttle / transient retry |
 | `batch_size` | `1000` | Records per page; `0` = one page |
+| `value_format` | `plain` | `plain` JSON or `typed` DynamoDB attribute JSON (see below) |
 
 Items are converted to plain JSON losslessly: numbers that are not exactly
 representable (beyond `i64`/`u64` or an exact `f64`) stay decimal strings,
 sets become arrays, binary becomes base64.
+
+With `value_format: typed` every attribute instead arrives in DynamoDB's
+attribute JSON — `{"pk": {"S": "a"}, "tags": {"SS": ["x"]}, "blob": {"B":
+"AQ=="}, "price": {"N": "12345678901234567890.5"}}` — in scan/query items and in the Streams
+envelope's `key` / `before` / `after` images. Paired with a `value_format:
+typed` DynamoDB sink this copies a table exactly: sets stay sets, binaries stay
+`B`, numbers keep every digit. Transforms and other sinks see the typed
+objects, so use it for DynamoDB-to-DynamoDB copies (a `cdc_unwrap` stage works,
+but the flattened row still carries typed values).
 
 ## Scan and query
 

@@ -217,3 +217,42 @@ async fn key_attributes_take_the_table_declared_type() {
         .is_some()
     );
 }
+
+/// L-106: `value_format: typed` writes attribute JSON exactly — sets, binaries
+/// and numbers keep their DynamoDB types.
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_value_format_writes_attribute_types() {
+    let Some((_c, endpoint, client)) = start().await else {
+        return;
+    };
+    create_table(&client, "typed", ScalarAttributeType::S, false, false).await;
+    let mut cfg = config(&endpoint, "typed");
+    cfg.value_format = faucet_sink_dynamodb::ValueFormat::Typed;
+    let sink = DynamoDbSink::new(cfg).await.unwrap();
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!({
+                "pk": {"S": "a"},
+                "price": {"N": "12345678901234567890.123456789"},
+                "tags": {"SS": ["x", "y"]},
+                "blob": {"B": "AQ=="},
+                "nums": {"NS": ["1", "2"]}
+            }),
+            json!({"pk": "plain", "v": 1}),
+        ])
+        .await
+        .unwrap();
+    assert!(outcomes[0].is_ok());
+    assert!(outcomes[1].is_err());
+    let got = get(&client, "typed", item(vec![("pk", s("a"))]))
+        .await
+        .expect("typed item");
+    use aws_sdk_dynamodb::types::AttributeValue;
+    assert_eq!(got["price"], n("12345678901234567890.123456789"));
+    assert!(matches!(&got["tags"], AttributeValue::Ss(v) if v.len() == 2));
+    assert!(matches!(&got["nums"], AttributeValue::Ns(v) if v.len() == 2));
+    assert_eq!(
+        got["blob"],
+        AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(vec![1]))
+    );
+}

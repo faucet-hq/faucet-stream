@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use faucet_common_mssql::{MssqlPool, build_pool, quote_ident_mssql, with_stateme
 
 use crate::config::{MssqlReplication, MssqlSourceConfig};
 use crate::convert::row_to_json;
+use crate::money;
 
 /// Microsoft SQL Server query source.
 pub struct MssqlSource {
@@ -33,6 +35,8 @@ pub struct MssqlSource {
     /// whole-dataset shard) means the full query is streamed. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
     applied_shard: Mutex<Option<PkShardBounds>>,
+    /// Set once the float-MONEY fallback warning has been logged.
+    money_warned: AtomicBool,
 }
 
 impl MssqlSource {
@@ -45,6 +49,7 @@ impl MssqlSource {
             pool,
             start_bookmark: Mutex::new(None),
             applied_shard: Mutex::new(None),
+            money_warned: AtomicBool::new(false),
         })
     }
 
@@ -321,7 +326,6 @@ impl Source for MssqlSource {
         let cap = if batch_size == 0 { 1024 } else { batch_size };
         let start = self.current_start();
         let (query, values, incr) = build_query_and_params(&self.config, context, start.as_ref());
-        let query = self.shard_wrap(query);
 
         Box::pin(async_stream::try_stream! {
             let mut conn = self
@@ -329,6 +333,17 @@ impl Source for MssqlSource {
                 .get()
                 .await
                 .map_err(|e| FaucetError::Source(format!("MSSQL pool checkout failed: {e}")))?;
+
+            let planned = match self.timeout() {
+                Some(t) => with_statement_timeout(
+                    t,
+                    async { Ok(money::plan(&mut conn, &query, &values).await) },
+                    || FaucetError::Source("MSSQL result-shape probe timed out".into()),
+                )
+                .await?,
+                None => money::plan(&mut conn, &query, &values).await,
+            };
+            let query = self.shard_wrap(money::resolve(query, planned, &self.money_warned));
 
             // Scope the borrowed param slice to the query() call — the
             // QueryStream borrows the connection, not the params.

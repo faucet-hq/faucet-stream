@@ -243,7 +243,8 @@ pub(crate) async fn read_slice(
                             continue;
                         }
                     }
-                    match record_to_envelope(r, &shard_id, &config.table_name) {
+                    match record_to_envelope(r, &shard_id, &config.table_name, config.value_format)
+                    {
                         Ok(pair) => decoded.push(pair),
                         Err(error) => {
                             let _ = tx.send(fail(shard_id, error)).await;

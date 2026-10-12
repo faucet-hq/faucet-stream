@@ -22044,6 +22044,11 @@
                     "table_name": {
                       "description": "Table name.",
                       "type": "string"
+                    },
+                    "value_format": {
+                      "$ref": "#/$defs/source_dynamodb__ValueFormat",
+                      "default": "plain",
+                      "description": "How attribute values appear in records: `plain` JSON (default; sets\nbecome arrays, binaries base64 strings, imprecise numbers decimal\nstrings) or `typed` DynamoDB attribute JSON (`{\"S\": \"a\"}`,\n`{\"SS\": [\"x\"]}`, `{\"B\": \"<base64>\"}`) that a `value_format: typed`\nDynamoDB sink writes back losslessly. Applies to scan/query items and\nto Streams `key` / `before` / `after` images."
                     }
                   },
                   "title": "DynamoDbSourceConfig",
@@ -29551,6 +29556,11 @@
                       "description": "Table name. The table must exist.",
                       "type": "string"
                     },
+                    "value_format": {
+                      "$ref": "#/$defs/sink_dynamodb__ValueFormat",
+                      "default": "plain",
+                      "description": "How records carry attribute values: `plain` JSON (default; arrays\nbecome lists, base64 strings stay strings) or `typed` DynamoDB\nattribute JSON (`{\"S\": \"a\"}`, `{\"SS\": [\"x\"]}`, `{\"B\": \"<base64>\"}`),\nwritten exactly as given — pair it with a `value_format: typed`\nDynamoDB source to copy sets, binaries and exact numbers losslessly.\nIn `typed` mode every attribute, keys included, must be a typed value;\na `delete_marker` field may be `{\"S\": \"<value>\"}` or a plain string."
+                    },
                     "write_mode": {
                       "$ref": "#/$defs/sink_dynamodb__WriteMode",
                       "default": "append",
@@ -30370,6 +30380,21 @@
         }
       ]
     },
+    "source_dynamodb__ValueFormat": {
+      "description": "How records carry attribute values: `plain` JSON (the default) or\nDynamoDB's `typed` attribute JSON (`{\"pk\": {\"S\": \"a\"}, \"tags\": {\"SS\": [..]}}`).\n`typed` keeps sets, binaries and numbers of any precision exactly, so a\nDynamoDB-to-DynamoDB copy round-trips every attribute type.",
+      "oneOf": [
+        {
+          "const": "plain",
+          "description": "Plain JSON: sets become arrays, binaries base64 strings, numbers JSON\nnumbers unless that would lose precision (then decimal strings).",
+          "type": "string"
+        },
+        {
+          "const": "typed",
+          "description": "DynamoDB attribute JSON, one `{\"<type>\": value}` object per attribute.",
+          "type": "string"
+        }
+      ]
+    },
     "sink_databricks__AuthReference": {
       "additionalProperties": true,
       "description": "A `{ ref: <name> }` pointer to a named provider in the top-level `auth:`\ncatalog. The only permitted key is `ref`.",
@@ -30779,6 +30804,21 @@
         }
       },
       "type": "object"
+    },
+    "sink_dynamodb__ValueFormat": {
+      "description": "How records carry attribute values: `plain` JSON (the default) or\nDynamoDB's `typed` attribute JSON (`{\"pk\": {\"S\": \"a\"}, \"tags\": {\"SS\": [..]}}`).\n`typed` keeps sets, binaries and numbers of any precision exactly, so a\nDynamoDB-to-DynamoDB copy round-trips every attribute type.",
+      "oneOf": [
+        {
+          "const": "plain",
+          "description": "Plain JSON: sets become arrays, binaries base64 strings, numbers JSON\nnumbers unless that would lose precision (then decimal strings).",
+          "type": "string"
+        },
+        {
+          "const": "typed",
+          "description": "DynamoDB attribute JSON, one `{\"<type>\": value}` object per attribute.",
+          "type": "string"
+        }
+      ]
     },
     "sink_dynamodb__WriteMode": {
       "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",

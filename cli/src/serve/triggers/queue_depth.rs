@@ -286,6 +286,42 @@ mod kafka_probe {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "triggers-redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_probe_reads_list_and_stream_depth() {
+        use crate::serve::triggers::spec::RedisQueueKind;
+        use redis::AsyncCommands;
+        let container =
+            faucet_conformance::containers::start(testcontainers_modules::redis::Redis::default)
+                .await;
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let _: () = conn.rpush("jobs", &["a", "b", "c"]).await.unwrap();
+        for i in 0..2 {
+            let _: String = conn.xadd("events", "*", &[("n", i)]).await.unwrap();
+        }
+        let list = build_probe(&QueueSpec::Redis {
+            url: url.clone(),
+            key: "jobs".into(),
+            kind: RedisQueueKind::List,
+        })
+        .unwrap();
+        assert_eq!(list.depth().await.unwrap(), 3);
+        assert_eq!(list.queue_label(), "jobs");
+        let stream = build_probe(&QueueSpec::Redis {
+            url,
+            key: "events".into(),
+            kind: RedisQueueKind::Stream,
+        })
+        .unwrap();
+        assert_eq!(stream.depth().await.unwrap(), 2);
+    }
+
     #[tokio::test]
     async fn the_edge_fires_once_per_crossing_and_retracts_a_failed_fire() {
         use crate::serve::history::RunHistory;

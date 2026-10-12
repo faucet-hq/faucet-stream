@@ -6,7 +6,7 @@ use crate::state::SegmentCursor;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity};
 use faucet_common_dynamodb::{
-    item_to_json, item_to_typed_json, json_to_attribute, sdk_error_parts, typed_json_to_item,
+    item_to_typed_json, json_to_attribute, sdk_error_parts, typed_json_to_item,
 };
 use faucet_core::FaucetError;
 use serde_json::Value;
@@ -177,7 +177,12 @@ pub(crate) async fn run_segment(
             }
         };
         consumed += page.capacity.unwrap_or(0.0);
-        let items = match page.items.iter().map(item_to_json).collect() {
+        let items = match page
+            .items
+            .iter()
+            .map(|i| config.value_format.item_to_json(i))
+            .collect()
+        {
             Ok(v) => v,
             Err(error) => {
                 let _ = tx.send(ScanEvent::Failed { segment, error }).await;

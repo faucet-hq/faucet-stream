@@ -1,6 +1,6 @@
 //! Configuration for the DynamoDB sink. No I/O here.
 
-use faucet_common_dynamodb::{DynamoDbCredentials, RetryPolicy};
+use faucet_common_dynamodb::{DynamoDbCredentials, RetryPolicy, ValueFormat};
 use faucet_core::{FaucetError, WriteMode, WriteSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,16 @@ pub struct DynamoDbSinkConfig {
     /// Throttle / unprocessed-item retry policy.
     #[serde(default)]
     pub retry: RetryPolicy,
+
+    /// How records carry attribute values: `plain` JSON (default; arrays
+    /// become lists, base64 strings stay strings) or `typed` DynamoDB
+    /// attribute JSON (`{"S": "a"}`, `{"SS": ["x"]}`, `{"B": "<base64>"}`),
+    /// written exactly as given — pair it with a `value_format: typed`
+    /// DynamoDB source to copy sets, binaries and exact numbers losslessly.
+    /// In `typed` mode every attribute, keys included, must be a typed value;
+    /// a `delete_marker` field may be `{"S": "<value>"}` or a plain string.
+    #[serde(default)]
+    pub value_format: ValueFormat,
 }
 
 fn default_batch_size() -> usize {
@@ -103,6 +113,7 @@ impl DynamoDbSinkConfig {
             expression_attribute_values: BTreeMap::new(),
             on_condition_failure: OnConditionFailure::default(),
             retry: RetryPolicy::default(),
+            value_format: ValueFormat::default(),
         }
     }
 

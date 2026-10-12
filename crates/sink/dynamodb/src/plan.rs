@@ -8,7 +8,8 @@
 use crate::config::{MAX_ITEM_BYTES, MAX_REQUEST_BYTES};
 use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
 use faucet_common_dynamodb::{
-    KeyAttribute, item_size, item_to_typed_json, json_to_item, json_to_key_attribute,
+    KeyAttribute, ScalarType, ValueFormat, item_size, item_to_typed_json, json_to_item,
+    json_to_key_attribute, typed_json_to_attribute, typed_json_to_item,
 };
 use faucet_core::{FaucetError, WriteMode, WriteSpec};
 use serde_json::Value;
@@ -98,17 +99,53 @@ fn is_delete_marked(rec: &Value, spec: &WriteSpec) -> bool {
         return false;
     };
     rec.get(&dm.field)
-        .and_then(Value::as_str)
+        .and_then(|v| v.as_str().or_else(|| v.get("S").and_then(Value::as_str)))
         .is_some_and(|s| dm.values.iter().any(|m| m == s))
+}
+
+/// A typed key value (`{"S": "a"}`) as the table's declared key type.
+fn typed_key_attribute(
+    name: &str,
+    v: &Value,
+    scalar: ScalarType,
+) -> Result<AttributeValue, String> {
+    let av = typed_json_to_attribute(v)
+        .map_err(|_| format!("key attribute '{name}' is not a typed attribute value: {v}"))?;
+    match (scalar, &av) {
+        (ScalarType::String, AttributeValue::S(_))
+        | (ScalarType::Number, AttributeValue::N(_))
+        | (ScalarType::Binary, AttributeValue::B(_)) => Ok(av),
+        (_, AttributeValue::Null(_)) => Err(format!("null value for key attribute '{name}'")),
+        _ => Err(format!(
+            "key attribute '{name}' must be a typed {} value for the table's key, got {v}",
+            match scalar {
+                ScalarType::String => "S",
+                ScalarType::Number => "N",
+                ScalarType::Binary => "B",
+            }
+        )),
+    }
 }
 
 fn row_error(mode: WriteMode, msg: String) -> FaucetError {
     FaucetError::Sink(format!("dynamodb {}: {msg}", mode.as_str()))
 }
 
-/// Plan a page. `keys` is the table's key schema (partition key first); key
-/// attributes are written as the table's declared type.
+/// [`plan_as`] for plain-JSON records.
+#[cfg(test)]
 pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[KeyAttribute]) -> Planned {
+    plan_as(records, spec, keys, ValueFormat::Plain)
+}
+
+/// Plan a page. `keys` is the table's key schema (partition key first); key
+/// attributes are written as the table's declared type. `format` says how the
+/// records carry attribute values.
+pub(crate) fn plan_as(
+    records: &[Value],
+    spec: &WriteSpec,
+    keys: &[KeyAttribute],
+    format: ValueFormat,
+) -> Planned {
     let names: Vec<String> = keys.iter().map(|k| k.name.clone()).collect();
     let mode = spec.write_mode;
     let mut planned = Planned::default();
@@ -129,7 +166,10 @@ pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[KeyAttribute]) -
                 Some(Value::Null) => {
                     missing = Some(format!("null value for key attribute '{name}'"))
                 }
-                Some(v) => match json_to_key_attribute(name, v, k.scalar) {
+                Some(v) => match match format {
+                    ValueFormat::Plain => json_to_key_attribute(name, v, k.scalar),
+                    ValueFormat::Typed => typed_key_attribute(name, v, k.scalar),
+                } {
                     Ok(av) => {
                         key_item.insert(name.clone(), av);
                         continue;
@@ -157,7 +197,14 @@ pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[KeyAttribute]) -
             {
                 map.remove(&dm.field);
             }
-            match json_to_item(&body) {
+            let item = match format {
+                ValueFormat::Plain => json_to_item(&body),
+                ValueFormat::Typed => typed_json_to_item(&body).map_err(|e| match e {
+                    FaucetError::Source(m) => FaucetError::Sink(m),
+                    other => other,
+                }),
+            };
+            match item {
                 Ok(mut item) => {
                     item.extend(key_item);
                     OpKind::Put(item)
@@ -444,5 +491,102 @@ mod tests {
             assert!(c.iter().map(Op::size).sum::<usize>() <= MAX_REQUEST_BYTES);
         }
         assert!(chunk_ops(Vec::new(), 25).is_empty());
+    }
+
+    #[test]
+    fn typed_records_are_written_exactly() {
+        let rows = vec![json!({
+            "pk": {"S": "a"},
+            "sk": {"N": "1"},
+            "tags": {"SS": ["x", "y"]},
+            "blob": {"B": "AQ=="},
+            "big": {"N": "12345678901234567890.123456789"},
+            "nested": {"M": {"bs": {"BS": ["Ag=="]}}}
+        })];
+        let p = plan_as(&rows, &WriteSpec::default(), &keys(), ValueFormat::Typed);
+        assert!(p.failures.is_empty(), "{:?}", p.failures);
+        let OpKind::Put(item) = &p.ops[0].kind else {
+            panic!("expected a put")
+        };
+        assert_eq!(
+            item["tags"],
+            AttributeValue::Ss(vec!["x".into(), "y".into()])
+        );
+        assert_eq!(
+            item["blob"],
+            AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(vec![1]))
+        );
+        assert_eq!(
+            item["big"],
+            AttributeValue::N("12345678901234567890.123456789".into())
+        );
+        assert_eq!(item["pk"], AttributeValue::S("a".into()));
+        assert_eq!(item_to_typed_json(item), rows[0]);
+    }
+
+    #[test]
+    fn typed_keys_must_match_the_declared_type() {
+        let cases = [
+            (
+                json!({"pk": {"N": "1"}, "sk": {"N": "1"}}),
+                "must be a typed S value",
+            ),
+            (
+                json!({"pk": "a", "sk": {"N": "1"}}),
+                "not a typed attribute value",
+            ),
+            (
+                json!({"pk": {"NULL": true}, "sk": {"N": "1"}}),
+                "null value for key attribute 'pk'",
+            ),
+            (
+                json!({"pk": {"S": "a"}, "sk": {"N": "1"}, "v": 3}),
+                "malformed typed attribute",
+            ),
+        ];
+        for (row, want) in cases {
+            let p = plan_as(
+                std::slice::from_ref(&row),
+                &WriteSpec::default(),
+                &keys(),
+                ValueFormat::Typed,
+            );
+            let err = p.failures[&0].to_string();
+            assert!(err.contains(want), "{row}: {err}");
+            assert!(!err.contains("Source error"), "{err}");
+        }
+    }
+
+    #[test]
+    fn typed_delete_markers_and_deletes() {
+        let mut s = spec(WriteMode::Upsert);
+        s.delete_marker = Some(DeleteMarker {
+            field: "op".into(),
+            values: vec!["d".into()],
+        });
+        let rows = vec![
+            json!({"pk": {"S": "a"}, "sk": {"N": "1"}, "op": {"S": "d"}}),
+            json!({"pk": {"S": "b"}, "sk": {"N": "2"}, "op": {"S": "u"}, "v": {"BOOL": true}}),
+            json!({"pk": {"S": "c"}, "sk": {"N": "3"}, "op": "d"}),
+        ];
+        let p = plan_as(&rows, &s, &keys(), ValueFormat::Typed);
+        assert!(p.failures.is_empty(), "{:?}", p.failures);
+        assert!(matches!(p.ops[0].kind, OpKind::Delete(_)));
+        let OpKind::Put(item) = &p.ops[1].kind else {
+            panic!("expected a put")
+        };
+        assert!(!item.contains_key("op"));
+        assert_eq!(item["v"], AttributeValue::Bool(true));
+        assert!(matches!(p.ops[2].kind, OpKind::Delete(_)));
+        let d = plan_as(
+            &[json!({"pk": {"S": "a"}, "sk": {"N": "9"}})],
+            &spec(WriteMode::Delete),
+            &keys(),
+            ValueFormat::Typed,
+        );
+        let OpKind::Delete(key) = &d.ops[0].kind else {
+            panic!("expected a delete")
+        };
+        assert_eq!(key["sk"], AttributeValue::N("9".into()));
     }
 }

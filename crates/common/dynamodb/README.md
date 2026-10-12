@@ -35,6 +35,9 @@ crate rather than this one.
   Writing maps strings → `S`, numbers → `N`, booleans → `BOOL`, `null` →
   `NULL`, arrays → `L`, objects → `M`. `item_to_typed_json` /
   `typed_json_to_item` round-trip DynamoDB typed JSON (used for scan cursors).
+  `ValueFormat` (`plain` / `typed`) is the connectors' `value_format` option;
+  `try_item_to_typed_json`, `streams_item_to_typed_json` and
+  `typed_json_to_attribute` back its `typed` mode.
   `item_size` estimates item size per DynamoDB's sizing rules.
 - **`table`** — `key_schema` (partition key first) from `DescribeTable`.
 - **`retry`** — `RetryPolicy { max_retries, initial_backoff_ms, max_backoff_ms }`

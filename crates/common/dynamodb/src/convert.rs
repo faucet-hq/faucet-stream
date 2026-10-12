@@ -16,6 +16,10 @@
 //! `BOOL`, `null` → `NULL`, array → `L`, object → `M`. JSON has no set or
 //! binary type, so sets and binaries read from DynamoDB come back as lists
 //! and strings respectively.
+//!
+//! [`ValueFormat::Typed`] instead carries every attribute in DynamoDB's typed
+//! attribute JSON (`{"S": "a"}`, `{"NS": ["1"]}`, `{"B": "<base64>"}`), so
+//! sets, binaries and exact numbers survive a DynamoDB-to-DynamoDB copy.
 
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -376,6 +380,97 @@ pub fn typed_json_to_item(v: &Value) -> Result<HashMap<String, AttributeValue>, 
         .collect()
 }
 
+/// How records carry attribute values: `plain` JSON (the default) or
+/// DynamoDB's `typed` attribute JSON (`{"pk": {"S": "a"}, "tags": {"SS": [..]}}`).
+/// `typed` keeps sets, binaries and numbers of any precision exactly, so a
+/// DynamoDB-to-DynamoDB copy round-trips every attribute type.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueFormat {
+    /// Plain JSON: sets become arrays, binaries base64 strings, numbers JSON
+    /// numbers unless that would lose precision (then decimal strings).
+    #[default]
+    Plain,
+    /// DynamoDB attribute JSON, one `{"<type>": value}` object per attribute.
+    Typed,
+}
+
+impl ValueFormat {
+    /// Convert an item read from DynamoDB in this format.
+    pub fn item_to_json(
+        self,
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<Value, FaucetError> {
+        match self {
+            ValueFormat::Plain => item_to_json(item),
+            ValueFormat::Typed => try_item_to_typed_json(item),
+        }
+    }
+
+    /// Convert a DynamoDB Streams image in this format.
+    pub fn streams_item_to_json(
+        self,
+        item: &HashMap<String, StreamsAttr>,
+    ) -> Result<Value, FaucetError> {
+        match self {
+            ValueFormat::Plain => streams_item_to_json(item),
+            ValueFormat::Typed => streams_item_to_typed_json(item),
+        }
+    }
+}
+
+/// [`item_to_typed_json`], failing on an attribute type this SDK version does
+/// not know instead of writing `null`.
+pub fn try_item_to_typed_json(
+    item: &HashMap<String, AttributeValue>,
+) -> Result<Value, FaucetError> {
+    fn check(av: &AttributeValue) -> Result<(), FaucetError> {
+        match av {
+            AttributeValue::L(v) => v.iter().try_for_each(check),
+            AttributeValue::M(m) => m.values().try_for_each(check),
+            AttributeValue::S(_)
+            | AttributeValue::N(_)
+            | AttributeValue::B(_)
+            | AttributeValue::Bool(_)
+            | AttributeValue::Null(_)
+            | AttributeValue::Ss(_)
+            | AttributeValue::Ns(_)
+            | AttributeValue::Bs(_) => Ok(()),
+            other => Err(FaucetError::Source(format!(
+                "dynamodb: unsupported attribute value type {other:?}"
+            ))),
+        }
+    }
+    item.values().try_for_each(check)?;
+    Ok(item_to_typed_json(item))
+}
+
+/// Convert a DynamoDB Streams image to typed attribute JSON.
+pub fn streams_item_to_typed_json(
+    item: &HashMap<String, StreamsAttr>,
+) -> Result<Value, FaucetError> {
+    let converted = item
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), streams_attribute_to_dynamodb(v)?)))
+        .collect::<Result<HashMap<_, _>, FaucetError>>()?;
+    Ok(item_to_typed_json(&converted))
+}
+
+/// Parse one typed attribute (`{"S": "a"}`, `{"NS": ["1"]}`, …).
+pub fn typed_json_to_attribute(v: &Value) -> Result<AttributeValue, FaucetError> {
+    typed_to_attribute(v)
+}
+
 /// DynamoDB's size of a number attribute: roughly one byte per two
 /// significant digits plus one (capped at 21 bytes).
 fn number_size(n: &str) -> usize {
@@ -678,5 +773,67 @@ mod tests {
             (1 + 3) + (1 + 4) + (1 + 4) + (1 + 10) + (1 + 1)
         );
         assert_eq!(number_size(&"9".repeat(60)), 21);
+    }
+
+    #[test]
+    fn value_format_selects_plain_or_typed() {
+        let item: HashMap<String, AttributeValue> = [
+            ("ss".to_string(), AttributeValue::Ss(vec!["a".into()])),
+            ("n".to_string(), AttributeValue::N("1.50".into())),
+            (
+                "l".to_string(),
+                AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+                    "b".to_string(),
+                    AttributeValue::B(Blob::new(vec![1])),
+                )]))]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            ValueFormat::Plain.item_to_json(&item).unwrap(),
+            json!({"ss": ["a"], "n": 1.5, "l": [{"b": "AQ=="}]})
+        );
+        let typed = ValueFormat::Typed.item_to_json(&item).unwrap();
+        assert_eq!(
+            typed,
+            json!({"ss": {"SS": ["a"]}, "n": {"N": "1.50"}, "l": {"L": [{"M": {"b": {"B": "AQ=="}}}]}})
+        );
+        assert_eq!(typed_json_to_item(&typed).unwrap(), item);
+        assert_eq!(
+            typed_json_to_attribute(&json!({"NS": ["1", "2"]})).unwrap(),
+            AttributeValue::Ns(vec!["1".into(), "2".into()])
+        );
+        assert!(typed_json_to_attribute(&json!("plain")).is_err());
+        assert_eq!(ValueFormat::default(), ValueFormat::Plain);
+        let f: ValueFormat = serde_json::from_value(json!("typed")).unwrap();
+        assert_eq!(f, ValueFormat::Typed);
+    }
+
+    #[test]
+    fn streams_images_convert_to_typed_json() {
+        let image: HashMap<String, StreamsAttr> = [
+            (
+                "ns",
+                StreamsAttr::Ns(vec!["12345678901234567890123".into()]),
+            ),
+            (
+                "bs",
+                StreamsAttr::Bs(vec![aws_sdk_dynamodbstreams::primitives::Blob::new(vec![
+                    2,
+                ])]),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            ValueFormat::Typed.streams_item_to_json(&image).unwrap(),
+            json!({"ns": {"NS": ["12345678901234567890123"]}, "bs": {"BS": ["Ag=="]}})
+        );
+        assert_eq!(
+            ValueFormat::Plain.streams_item_to_json(&image).unwrap()["bs"],
+            json!(["Ag=="])
+        );
     }
 }

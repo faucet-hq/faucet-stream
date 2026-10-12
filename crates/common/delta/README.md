@@ -29,4 +29,11 @@ local filesystem only.
 Connector authors normally depend on `faucet-source-delta` /
 `faucet-sink-delta`, which re-export the types they need from here.
 
+**Versioning note.** This crate re-exports `deltalake` itself. That re-export
+follows delta-rs: a new `deltalake` major ships as a minor release of this
+crate (see the re-exported third-party crates exception in
+[CONTRIBUTING.md](https://github.com/faucet-hq/faucet-stream/blob/main/CONTRIBUTING.md#versioning--msrv)).
+Types named through `faucet_common_delta::deltalake` can change with it; the
+faucet-owned types above keep the normal SemVer guarantee.
+
 License: MIT OR Apache-2.0.

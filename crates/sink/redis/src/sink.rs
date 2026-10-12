@@ -56,9 +56,10 @@ impl RedisSink {
             .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
         let manager = redis::aio::ConnectionManagerConfig::new()
             .set_number_of_retries(3)
-            .set_factor(2)
-            .set_max_delay(1000)
-            .set_connection_timeout(std::time::Duration::from_secs(10));
+            .set_min_delay(std::time::Duration::from_millis(2))
+            .set_max_delay(std::time::Duration::from_secs(1))
+            .set_connection_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_response_timeout(None);
         let conn = ConnectionManager::new_with_config(client, manager)
             .await
             .map_err(|e| FaucetError::Sink(format!("Redis connection failed: {e}")))?;
