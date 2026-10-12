@@ -58,6 +58,9 @@ struct SinkState {
     /// Whether any batch has been buffered since the last commit (so `flush`
     /// can skip a no-op commit).
     pending: bool,
+    /// Set when a buffered write failed: the writer may hold part of the
+    /// failed page, so nothing more is written or committed this run.
+    poisoned: Option<String>,
 }
 
 impl SinkState {
@@ -69,7 +72,26 @@ impl SinkState {
             integral: None,
             warned_fields: HashSet::new(),
             pending: false,
+            poisoned: None,
         }
+    }
+
+    /// Fail when an earlier buffered write failed (#862 L-115).
+    fn check_poisoned(&self) -> Result<(), FaucetError> {
+        match &self.poisoned {
+            Some(cause) => Err(FaucetError::Sink(format!(
+                "delta: an earlier write failed ({cause}), so nothing more is written or \
+                 committed this run — the uncommitted rows are dropped and replayed on resume"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop the writer and everything it buffered, and refuse further work.
+    fn poison(&mut self, cause: &FaucetError) {
+        self.writer = None;
+        self.pending = false;
+        self.poisoned = Some(cause.to_string());
     }
 }
 
@@ -109,9 +131,14 @@ impl DeltaSink {
                     .arrow_schema(),
                 None => infer_delta_schema(records, self.config.effective_sample_size())?,
             };
-            state.integral = Some(faucet_common_delta::arrow_bridge::schema_from_delta(
-                &schema,
-            )?);
+            state.integral = Some(
+                faucet_common_delta::arrow_bridge::schema_from_delta(&schema).map_err(
+                    |e| match e {
+                        FaucetError::Source(m) => FaucetError::Sink(m),
+                        other => other,
+                    },
+                )?,
+            );
             state.schema = Some(schema);
         }
         let schema = state.schema.clone().expect("schema set above");
@@ -221,6 +248,7 @@ impl DeltaSink {
         records: &[Value],
         chunk: usize,
     ) -> Result<usize, FaucetError> {
+        state.check_poisoned()?;
         if records.is_empty() {
             return Ok(0);
         }
@@ -252,10 +280,11 @@ impl DeltaSink {
         let schema = state.schema.clone().expect("schema set");
         self.ensure_table_writer(state, &schema).await?;
         let writer = state.writer.as_mut().expect("writer set");
-        writer
-            .write(batch)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("delta: write failed: {e}")))?;
+        if let Err(e) = writer.write(batch).await {
+            let e = FaucetError::Sink(format!("delta: write failed: {e}"));
+            state.poison(&e);
+            return Err(e);
+        }
         state.pending = true;
         self.roll_if_over_target(state).await?;
         Ok(rows)
@@ -413,6 +442,7 @@ impl faucet_core::Sink for DeltaSink {
         }
         let batch = faucet_common_delta::arrow_bridge::batch_to_delta(batch)?;
         let mut state = self.state.lock().await;
+        state.check_poisoned()?;
         if state.schema.is_none() {
             state.schema = Some(batch.schema());
         }
@@ -420,10 +450,11 @@ impl faucet_core::Sink for DeltaSink {
         self.ensure_table_writer(&mut state, &schema).await?;
         let rows = batch.num_rows();
         let writer = state.writer.as_mut().expect("writer set");
-        writer
-            .write(batch)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("delta: columnar write failed: {e}")))?;
+        if let Err(e) = writer.write(batch).await {
+            let e = FaucetError::Sink(format!("delta: columnar write failed: {e}"));
+            state.poison(&e);
+            return Err(e);
+        }
         state.pending = true;
         self.roll_if_over_target(&mut state).await?;
         Ok(rows)
@@ -431,6 +462,7 @@ impl faucet_core::Sink for DeltaSink {
 
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut state = self.state.lock().await;
+        state.check_poisoned()?;
         self.commit_buffered(&mut state).await
     }
 }
@@ -460,6 +492,20 @@ fn warn_on_unknown_fields(
 mod tests {
     use super::*;
     use faucet_core::Sink;
+
+    #[test]
+    fn a_poisoned_state_drops_the_buffer_and_refuses_more() {
+        let mut state = SinkState::new();
+        assert!(state.check_poisoned().is_ok());
+        state.pending = true;
+        state.poison(&FaucetError::Sink("delta: write failed: disk full".into()));
+        assert!(!state.pending && state.writer.is_none());
+        let err = state.check_poisoned().unwrap_err().to_string();
+        assert!(
+            err.contains("disk full") && err.contains("replayed"),
+            "{err}"
+        );
+    }
 
     #[tokio::test]
     async fn trait_metadata_methods() {
