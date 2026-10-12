@@ -114,9 +114,16 @@ pub fn row_to_json(
     for (info, v) in infos.iter().zip(row.sql_values()) {
         let kind = extract_kind(info.oracle_type())
             .map_err(|m| side.err(format!("oracle column {:?}: {m}", info.name())))?;
-        let cell = read_cell(v, kind)
-            .map_err(|e| side.err(format!("oracle decode of column {:?}: {e}", info.name())))?;
-        let value = parse_json_column(info.name(), cell_to_json(cell), json_columns);
+        let decode_err =
+            |e: oracle::Error| side.err(format!("oracle decode of column {:?}: {e}", info.name()));
+        let shaped = if matches!(info.oracle_type(), OracleType::BinaryFloat)
+            && !v.is_null().map_err(decode_err)?
+        {
+            crate::types::float32_to_json(v.get::<f32>().map_err(decode_err)?)
+        } else {
+            cell_to_json(read_cell(v, kind).map_err(decode_err)?)
+        };
+        let value = parse_json_column(info.name(), shaped, json_columns);
         out.insert(info.name().to_string(), value);
     }
     Ok(Value::Object(out))
