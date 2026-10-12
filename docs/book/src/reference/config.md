@@ -177,7 +177,11 @@ Three stages resolve placeholders:
   (see below).
 - **Runtime:** `${row_id.dotted.path}` tokens are resolved per parent record in
   DAG runs. `${now.*}` tokens are resolved per invocation at run time (see
-  below).
+  below). A value lands in the field shaped for it: an `xml` source's `body` /
+  `soap.body_inner` gets it XML-escaped, a `rest` / `webhook` `path` gets an
+  embedded token percent-encoded into one segment (a `path` that is exactly one
+  token takes the value raw), and a SQL source's query gets it as a bind
+  parameter.
 
 Reference cycles surface as a clear `InterpolationCycle` error.
 

@@ -70,7 +70,7 @@ The server listens on `127.0.0.1:8080/webhook`, collects up to 100 POSTed payloa
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen_addr` | string | `"127.0.0.1:8080"` | Address to bind the HTTP server to. Defaults to **loopback only**; bind `0.0.0.0` only behind a trusted gateway (and set `auth_token`). |
-| `path` | string | `"/webhook"` | Endpoint path that accepts `POST` requests. Supports matrix-context substitution — e.g. `path: /hooks/${row.id}` resolves per row at runtime; `{key}` context values are percent-encoded into one segment. Must start with `/`; `?`, `#`, whitespace, `:`/`*`-prefixed segments and braces other than a whole `{name}` segment are rejected at config load (and by `faucet validate`). Through `fetch_with_context` a `{key}` may also sit inside a segment (`/hooks/user-{id}`); a placeholder the context leaves unfilled is refused rather than served as a route capture. |
+| `path` | string | `"/webhook"` | Endpoint path that accepts `POST` requests. Supports matrix-context substitution — e.g. `path: /hooks/${row.id}` resolves per row at runtime, percent-encoded into one segment (a value of `.` or `..` is refused); `{key}` context values are percent-encoded the same way. Must start with `/`; `?`, `#`, whitespace, `:`/`*`-prefixed segments and braces other than a whole `{name}` segment are rejected at config load (and by `faucet validate`). Through `fetch_with_context` a `{key}` may also sit inside a segment (`/hooks/user-{id}`); a placeholder the context leaves unfilled is refused rather than served as a route capture. |
 
 ### Termination
 

@@ -2579,6 +2579,7 @@ async fn run_one_invocation(
             crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
         resolve_xml_body_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        resolve_url_path_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
         let is_fanout = |id: &str| fanout_ctx.contains_key(id);
@@ -3773,6 +3774,23 @@ fn resolve_xml_body_fields(
     Ok(())
 }
 
+/// Resolve fan-out tokens in a source's URL path field with percent-encoded
+/// values (#862 L-122): `rest` and `webhook` `path`. The generic pass then
+/// finds no token left in it.
+fn resolve_url_path_fields(
+    kind: &str,
+    cfg: &mut Value,
+    ctx: &HashMap<String, Value>,
+) -> CliResult<()> {
+    if !matches!(kind, "rest" | "webhook") {
+        return Ok(());
+    }
+    if let Some(Value::String(s)) = cfg.pointer_mut("/path") {
+        *s = crate::interpolate::interpolate_record_path(s, ctx)?;
+    }
+    Ok(())
+}
+
 /// In-place runtime interpolation against a parent-record context. Walks every
 /// string leaf in `value` and replaces `${id.path}` tokens with stringified
 /// values from `ctx`.
@@ -3821,6 +3839,26 @@ mod xml_body_tests {
         assert_eq!(quotes["body"], "<a q=\"x&quot;&apos;y\"/>");
         let mut missing = json!({"body": "${c.nope}"});
         assert!(resolve_xml_body_fields("xml", &mut missing, &ctx).is_err());
+    }
+
+    #[test]
+    fn url_path_fan_out_values_are_percent_encoded() {
+        let ctx: HashMap<String, Value> =
+            HashMap::from([("p".into(), json!({"id": "a/b", "href": "/x/1"}))]);
+        for kind in ["rest", "webhook"] {
+            let mut cfg = json!({"path": "/items/${p.id}", "base_url": "https://h/${p.id}"});
+            resolve_url_path_fields(kind, &mut cfg, &ctx).unwrap();
+            assert_eq!(cfg["path"], "/items/a%2Fb");
+            assert_eq!(cfg["base_url"], "https://h/${p.id}");
+        }
+        let mut whole = json!({"path": "${p.href}"});
+        resolve_url_path_fields("rest", &mut whole, &ctx).unwrap();
+        assert_eq!(whole["path"], "/x/1");
+        let mut other = json!({"path": "/items/${p.id}"});
+        resolve_url_path_fields("graphql", &mut other, &ctx).unwrap();
+        assert_eq!(other["path"], "/items/${p.id}");
+        let mut no_path = json!({"base_url": "https://h"});
+        resolve_url_path_fields("rest", &mut no_path, &ctx).unwrap();
     }
 }
 
