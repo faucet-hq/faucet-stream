@@ -94,6 +94,7 @@ impl WasmInstance {
     }
 
     /// `faucet_v1::log` calls dropped so far by the run's log budget.
+    #[cfg(test)]
     pub(crate) fn dropped_logs(&self) -> u64 {
         self.store
             .data()
