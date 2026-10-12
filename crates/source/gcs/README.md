@@ -480,6 +480,7 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 
 Every object listing page (`list`), object read (`get`, one per object or
 per ranged read) and metadata read (`head`) is reported to faucet's usage
-meter as a source round trip and priced as a GCS class-B request
-(`usage.pricing.object_storage.read_per_1k_requests`); see the
+meter as a source round trip. Reads and metadata reads are priced as GCS
+class-B requests (`usage.pricing.object_storage.read_per_1k_requests`), a
+listing as class A (`write_per_1k_requests`); see the
 [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).

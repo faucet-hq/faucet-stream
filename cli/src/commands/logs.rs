@@ -96,7 +96,7 @@ async fn ship(args: LogsShipArgs) -> CliResult<()> {
     } else {
         eprint!("{}", render_human(&dir, &report));
     }
-    match report.undelivered() {
+    match report.undelivered_here() {
         0 => Ok(()),
         runs => Err(CliError::LogsUndelivered { runs }),
     }
@@ -120,6 +120,7 @@ pub fn render_json(report: &PassReport) -> String {
     serde_json::json!({
         "shipped_lines": report.shipped,
         "undelivered_runs": report.undelivered(),
+        "in_progress_elsewhere": report.undelivered() - report.undelivered_here(),
         "runs": runs,
     })
     .to_string()
@@ -217,6 +218,8 @@ mod tests {
         assert!(h.contains("— down"));
         let j: serde_json::Value = serde_json::from_str(&render_json(&r)).unwrap();
         assert_eq!(j["undelivered_runs"], 1);
+        assert_eq!(j["in_progress_elsewhere"], 1);
+        assert_eq!(r.undelivered_here(), 0, "a live writer elsewhere owns it");
         assert_eq!(j["runs"][0]["run_id"], "r1");
     }
 }

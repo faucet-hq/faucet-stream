@@ -515,6 +515,7 @@ Metrics emitted by this source are labelled `connector="s3"`.
 
 Every `ListObjectsV2` page (`list`), `GetObject` (`get`, one per object or
 per ranged read) and `HeadObject` (`head`) is reported to faucet's usage meter
-as a source round trip and priced as an S3 read request
-(`usage.pricing.object_storage.read_per_1k_requests`); see the
+as a source round trip. Reads and heads are priced as S3 read requests
+(`usage.pricing.object_storage.read_per_1k_requests`), a listing page like a
+PUT (`write_per_1k_requests`); see the
 [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).

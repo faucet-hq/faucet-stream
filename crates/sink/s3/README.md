@@ -501,7 +501,7 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 |---|---|---|
 | `put` | `PutObject`, and each multipart create / part / complete | write (`usage.pricing.object_storage.write_per_1k_requests`) |
 | `copy` | `CopyObject`, and each multipart-copy create / `UploadPartCopy` (an overwrite commit's promote) | write |
-| `list` | each `ListObjectsV2` page (append, overwrite pruning and commit) | read (`read_per_1k_requests`) |
+| `list` | each `ListObjectsV2` page (append, overwrite pruning and commit) | write tier (`write_per_1k_requests`; S3 bills LIST like PUT) |
 | `head` | `HeadObject` (existence checks, and the size probe before a promote) | read |
 | `delete` | `DeleteObject` | free (S3 does not bill deletes) |
 
