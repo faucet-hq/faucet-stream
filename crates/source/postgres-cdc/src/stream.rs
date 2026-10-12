@@ -56,6 +56,29 @@ pub struct PostgresCdcSource {
     /// position [`Source::lag`] measures from while the slot's
     /// `confirmed_flush_lsn` still trails (#733).
     emitted_lsn: std::sync::atomic::AtomicU64,
+    /// Partition root of every relation oid looked up so far (`None`: not a
+    /// partition), kept across fetch cycles so each oid is queried once.
+    partition_roots: std::sync::Mutex<HashMap<u32, Option<String>>>,
+}
+
+/// Split `oids` into the roots already known from `cache` and the oids still
+/// to look up.
+fn cached_roots(
+    cache: &HashMap<u32, Option<String>>,
+    oids: &[u32],
+) -> (HashMap<u32, String>, Vec<u32>) {
+    let mut known = HashMap::new();
+    let mut missing = Vec::new();
+    for oid in oids {
+        match cache.get(oid) {
+            Some(Some(root)) => {
+                known.insert(*oid, root.clone());
+            }
+            Some(None) => {}
+            None => missing.push(*oid),
+        }
+    }
+    (known, missing)
 }
 
 /// Unread WAL: the server's current position minus the furthest point the
@@ -93,7 +116,42 @@ impl PostgresCdcSource {
             pending_bookmark: Mutex::new(None),
             confirmed_lsn: Mutex::new(initial_lsn),
             emitted_lsn: std::sync::atomic::AtomicU64::new(0),
+            partition_roots: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The partition roots of `oids`, from the cache or, for oids not yet
+    /// seen, through one control connection opened at most once per cycle.
+    async fn resolve_partition_roots(
+        &self,
+        oids: &[u32],
+        control: &mut Option<sqlx::PgConnection>,
+    ) -> Result<HashMap<u32, String>, FaucetError> {
+        let (mut known, missing) = {
+            let cache = self
+                .partition_roots
+                .lock()
+                .map_err(|_| FaucetError::Source("postgres-cdc: partition cache poisoned".into()))?;
+            cached_roots(&cache, oids)
+        };
+        if missing.is_empty() {
+            return Ok(known);
+        }
+        let conn = match control {
+            Some(conn) => conn,
+            None => control.insert(
+                replication::control_connection(&self.config.connection_url, &self.config.tls)
+                    .await?,
+            ),
+        };
+        let found = replication::partition_roots_on(conn, &missing).await?;
+        if let Ok(mut cache) = self.partition_roots.lock() {
+            for oid in &missing {
+                cache.insert(*oid, found.get(oid).cloned());
+            }
+        }
+        known.extend(found);
+        Ok(known)
     }
 
     /// Drop this source's replication slot on the server, freeing the WAL it
@@ -517,6 +575,7 @@ impl PostgresCdcSource {
             //    are coalesced into pages carrying `bookmark = Some(end_lsn)`;
             //    `batch_size == 0` emits a single trailing page.
             let mut registry = RelationRegistry::new();
+            let mut control: Option<sqlx::PgConnection> = None;
             let mut state = TxnState {
                 max_staged_records: self.config.max_staged_records,
                 ..TxnState::default()
@@ -605,12 +664,9 @@ impl PostgresCdcSource {
                 }
                 let unresolved = registry.take_unresolved();
                 if !unresolved.is_empty() {
-                    let roots = replication::partition_roots(
-                        &self.config.connection_url,
-                        &self.config.tls,
-                        &unresolved,
-                    )
-                    .await?;
+                    let roots = self
+                        .resolve_partition_roots(&unresolved, &mut control)
+                        .await?;
                     registry.set_roots(&unresolved, roots);
                 }
                 if unexpected_end {
@@ -1027,6 +1083,16 @@ fn cycle_ended(max_cycle: Duration, elapsed: Duration, in_txn: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cached_roots_query_only_unseen_oids() {
+        use super::cached_roots;
+        use std::collections::HashMap;
+        let cache = HashMap::from([(1, Some("public.parted".to_string())), (2, None)]);
+        let (known, missing) = cached_roots(&cache, &[1, 2, 3]);
+        assert_eq!(known, HashMap::from([(1, "public.parted".to_string())]));
+        assert_eq!(missing, vec![3]);
+    }
 
     #[test]
     fn server_version_probe_requires_postgres_14() {
