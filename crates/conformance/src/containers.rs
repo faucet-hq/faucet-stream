@@ -376,12 +376,56 @@ pub fn classify(err: &TestcontainersError) -> AttemptFailure {
             | ClientError::Configuration(_)
             | ClientError::InvalidDockerHost(_),
         ) => AttemptFailure::Unavailable(msg),
+        _ if daemon_unreachable(err) => AttemptFailure::Unavailable(msg),
         TestcontainersError::Client(_)
         | TestcontainersError::WaitContainer(_)
         | TestcontainersError::MissingInfo(_)
         | TestcontainersError::Io(_) => AttemptFailure::Retry(msg),
         _ => AttemptFailure::Fatal(msg),
     }
+}
+
+/// Whether `err` says the Docker daemon itself cannot be reached: its socket is
+/// missing or refuses connections, as when the daemon is stopped.
+fn daemon_unreachable(err: &TestcontainersError) -> bool {
+    use testcontainers::bollard::errors::Error as Bollard;
+    let bollard: &Bollard = match err {
+        TestcontainersError::Io(io) => return io_unreachable(io),
+        TestcontainersError::Client(
+            ClientError::ListContainers(b)
+            | ClientError::CreateContainer(b)
+            | ClientError::StartContainer(b)
+            | ClientError::InspectContainer(b)
+            | ClientError::CreateNetwork(b)
+            | ClientError::InspectNetwork(b)
+            | ClientError::PullImage { err: b, .. }
+            | ClientError::BuildImage { err: b, .. },
+        ) => b,
+        _ => return false,
+    };
+    match bollard {
+        Bollard::SocketNotFoundError(_) => true,
+        Bollard::IOError { err } => io_unreachable(err),
+        other => {
+            let mut cur = std::error::Error::source(other);
+            while let Some(e) = cur {
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(io_unreachable)
+                {
+                    return true;
+                }
+                cur = e.source();
+            }
+            false
+        }
+    }
+}
+
+fn io_unreachable(io: &std::io::Error) -> bool {
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
 }
 
 /// The backoff before attempt `attempt` (1-based); zero before the first.
@@ -521,12 +565,23 @@ pub fn backend_missing(why: &str) {
 
 /// A missing test backend: a skip locally, a failure when `var` is set.
 pub fn backend_missing_for(var: &str, why: &str) {
-    missing(std::env::var_os(var).is_some(), var, why);
+    missing(required(var), var, why);
 }
 
-/// Whether `var` asks for backends to be present.
+/// Whether `var` asks for backends to be present: set to anything but an
+/// empty string, `0`, `false`, `no` or `off`.
 pub fn required(var: &str) -> bool {
-    std::env::var_os(var).is_some()
+    requires(std::env::var_os(var).as_deref())
+}
+
+fn requires(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(v) = value else { return false };
+    let v = v.to_string_lossy();
+    let v = v.trim();
+    !(v.is_empty()
+        || ["0", "false", "no", "off"]
+            .iter()
+            .any(|f| v.eq_ignore_ascii_case(f)))
 }
 
 fn missing(required: bool, var: &str, why: &str) {
@@ -813,6 +868,37 @@ mod tests {
         assert!(!required("FAUCET_CONFORMANCE_NEVER_SET_841"));
         let outcome = std::panic::catch_unwind(|| backend_missing("no docker"));
         assert_eq!(outcome.is_err(), required(REQUIRE_BACKENDS));
+    }
+
+    #[test]
+    fn requirement_is_parsed_not_just_present() {
+        use std::ffi::OsStr;
+        assert!(!requires(None));
+        for off in ["", " ", "0", "false", "FALSE", "no", "Off"] {
+            assert!(!requires(Some(OsStr::new(off))), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            assert!(requires(Some(OsStr::new(on))), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_daemon_is_unavailable_not_retried() {
+        use testcontainers::bollard::errors::Error as Bollard;
+        let refused = TestcontainersError::Client(ClientError::CreateContainer(Bollard::from(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        )));
+        assert!(matches!(classify(&refused), AttemptFailure::Unavailable(_)));
+        let socket = TestcontainersError::Client(ClientError::PullImage {
+            descriptor: "x".into(),
+            err: Bollard::SocketNotFoundError("/var/run/docker.sock".into()),
+        });
+        assert!(matches!(classify(&socket), AttemptFailure::Unavailable(_)));
+        let missing = TestcontainersError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no socket",
+        ));
+        assert!(matches!(classify(&missing), AttemptFailure::Unavailable(_)));
     }
 
     #[test]

@@ -20,7 +20,9 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   [Starting a test container](#starting-a-test-container). A test whose
   backend cannot start (no Docker, an image that will not come up, a missing
   client library) may skip locally, but must **panic** when
-  `FAUCET_REQUIRE_BACKENDS` is set — the `Test`, `Coverage` and Kafka CI jobs
+  `FAUCET_REQUIRE_BACKENDS` is set (to anything but empty, `0`, `false`, `no`
+  or `off`; a stopped Docker daemon counts as unavailable, not as a start
+  failure to retry) — the `Test`, `Coverage` and Kafka CI jobs
   set it, so an unavailable backend fails CI instead of passing silently. Suites too heavy for every PR stay `#[ignore]`d
   and run nightly in `.github/workflows/integration-heavy.yml` (SQL Server CDC,
   the secrets managers, the scaffold build). The Oracle Free container is
