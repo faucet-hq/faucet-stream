@@ -19,7 +19,10 @@ write is broker-acknowledged before it returns.
   `write_batch_partial` it becomes that row's error, so the pipeline routes it
   to the `dlq:`; without a DLQ the batch fails. Takes effect with
   `confirm: true`; set `mandatory: false` to publish to an exchange that may
-  legitimately have no bindings.
+  legitimately have no bindings. **Upgrade note:** `mandatory` used to default
+  to `false`, silently dropping unroutable messages; a config publishing to a
+  fanout/topic exchange that is sometimes unbound now gets row errors (DLQ'd, or
+  a failed batch) unless it sets `mandatory: false`.
 - Per-row problems — a routing key that resolves to nothing / null / a
   container / more than 255 bytes, a record that does not fit `value_format`, a
   broker `nack` — are row errors too. A channel-level failure (e.g. publishing

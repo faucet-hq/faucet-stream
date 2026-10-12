@@ -14,7 +14,7 @@ Reach for it when you want to land pipeline output in Redis as a work queue, an 
 - **Three write targets** — `List` (append via `RPUSH`), `Stream` (append via `XADD` with auto-generated IDs), and `KeyValue` (one key per record via `SET`).
 - **Pipelined batching** — every chunk of records is packed into a single Redis pipeline, so a batch of N writes costs one round-trip instead of N.
 - **Stream field mapping** — for `Stream` mode, each record's top-level JSON object fields become native stream entry fields; non-object records land in a single `_data` field.
-- **Connection reuse** — a multiplexed async connection is opened once in `new()` and shared (cheaply cloned) across every `write_batch` call.
+- **Connection reuse** — a reconnecting connection (`ConnectionManager`) is opened once in `new()` and shared (cheaply cloned) across every `write_batch` call; after the server drops it, the next command reconnects.
 - **Tunable batch window** — `batch_size` controls how many commands go in one pipeline, with a `0` sentinel that passes the upstream page straight through.
 - **Effectively-once delivery** — with `delivery: exactly_once`, each page's records and a per-page commit token commit in one atomic script, so a resumed pipeline skips already-committed pages with zero duplicates.
 - **Preflight probe** — `faucet doctor` issues a non-mutating `PING` over the live connection.
@@ -318,7 +318,7 @@ println!("transferred {} records", result.records_written);
 
 ## How it works
 
-1. `new()` validates `batch_size`, opens a `redis::Client` from `url`, and establishes a **multiplexed async connection** — once. The connection is cheaply cloneable and shared across every `write_batch` call (it multiplexes commands over a single socket).
+1. `new()` validates `batch_size`, opens a `redis::Client` from `url`, and establishes a reconnecting **`ConnectionManager`** — once. It is cheaply cloneable and shared across every `write_batch` call (commands are multiplexed over one socket), and it reconnects when the server drops the connection: a pipeline in flight at that moment fails, later ones use the new connection.
 2. `write_batch` chunks the incoming slice by the effective window (`batch_size`, or the whole slice when `batch_size: 0`).
 3. Each chunk is assembled into one `redis::pipe()` — `RPUSH` for `List`, `XADD` for `Stream`, `SET` for `KeyValue` — and executed in a single round-trip via `query_async`.
 4. Under `delivery: exactly_once`, `write_batch_idempotent` builds the same per-record commands but ships the **whole page** as one Lua script (type check first, then the commands) with a final `SET _faucet_commit_token:<scope> <token>` — see [Effectively-once delivery](#effectively-once-delivery).

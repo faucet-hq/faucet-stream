@@ -341,8 +341,8 @@ impl Source for NatsSource {
 }
 
 /// Compute the poll timeout for this iteration and the idle deadline (if any).
-/// With no idle timeout configured we poll in short bursts so `ctrl_c` and
-/// `max_messages` termination stay responsive.
+/// With no idle timeout configured we poll in short bursts so cancellation
+/// and `max_messages` termination stay responsive.
 fn poll_budget(
     idle: Option<Duration>,
     last_at: Instant,

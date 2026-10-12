@@ -126,8 +126,8 @@ impl faucet_core::Sink for RedisSink {
         )
     }
 
-    /// Non-mutating preflight probe: issue a Redis `PING` over the existing
-    /// multiplexed connection (probe name `"ping"`).
+    /// Non-mutating preflight probe: issue a Redis `PING` over the shared
+    /// reconnecting connection (probe name `"ping"`).
     async fn check(
         &self,
         ctx: &faucet_core::check::CheckContext,
