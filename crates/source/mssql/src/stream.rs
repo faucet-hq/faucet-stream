@@ -723,13 +723,25 @@ impl MssqlSource {
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let start = self.current_start();
         let (query, values, incr) = build_query_and_params(&self.config, context, start.as_ref());
-        let query = self.shard_wrap(query);
 
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| FaucetError::Source(format!("MSSQL pool checkout failed: {e}")))?;
+
+        let planned = match self.timeout() {
+            Some(t) => {
+                with_statement_timeout(
+                    t,
+                    async { Ok(money::plan(&mut conn, &query, &values).await) },
+                    || FaucetError::Source("MSSQL result-shape probe timed out".into()),
+                )
+                .await?
+            }
+            None => money::plan(&mut conn, &query, &values).await,
+        };
+        let query = self.shard_wrap(money::resolve(query, planned, &self.money_warned));
 
         let rows = {
             let owned: Vec<OwnedParam> = values.iter().map(OwnedParam::from_value).collect();
