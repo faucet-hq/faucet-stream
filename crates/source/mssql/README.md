@@ -242,7 +242,7 @@ Discovery reads catalog metadata only — it never scans table data.
 | MSSQL | JSON |
 |-------|------|
 | TINYINT / SMALLINT / INT / BIGINT | number |
-| REAL / FLOAT | number |
+| REAL / FLOAT | number (`REAL` through its shortest decimal form, so `0.1` stays `0.1`) |
 | BIT | bool |
 | DECIMAL / NUMERIC / MONEY | string (precision-preserving; MONEY/SMALLMONEY as exact 4-decimal text — the driver delivers MONEY as a float, which is exact below about ±900 billion, the range we render without loss) |
 | CHAR / VARCHAR / NCHAR / NVARCHAR / TEXT / NTEXT / XML | string |
