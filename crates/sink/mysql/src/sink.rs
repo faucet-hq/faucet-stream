@@ -424,30 +424,33 @@ fn fk_violation_sql(table: &str, fk: &ForeignKey) -> String {
 /// For such a table the replace runs with `FOREIGN_KEY_CHECKS = 0` and every
 /// one of the target's foreign keys is re-validated before the commit.
 pub(crate) async fn replace_rows_in_place(
-    conn: &mut MySqlConnection,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
     target: &str,
     source: &str,
 ) -> Result<(), FaucetError> {
-    let into = insertable_columns(&mut *conn, target).await?;
-    let from = insertable_columns(&mut *conn, source).await?;
+    let into = insertable_columns(&mut **conn, target).await?;
+    let from = insertable_columns(&mut **conn, source).await?;
     let cols = into
         .iter()
         .filter(|c| from.contains(c))
         .map(|c| quote_ident_mysql(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let fks = table_foreign_keys(&mut *conn, target).await?;
+    let fks = table_foreign_keys(&mut **conn, target).await?;
     let self_referencing = fks.iter().any(|fk| fk.references(target));
     let (t, s) = (quote_ident_mysql(target), quote_ident_mysql(source));
     let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql overwrite: replace rows: {e}"));
     if self_referencing {
+        // A dropped future or a failed restore must not return a connection
+        // with foreign-key checks off to the pool.
+        conn.close_on_drop();
         sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
             .map_err(err)?;
     }
     let result = async {
-        let mut tx = sqlx::Connection::begin(&mut *conn).await.map_err(err)?;
+        let mut tx = sqlx::Connection::begin(&mut **conn).await.map_err(err)?;
         for stmt in [
             format!("DELETE FROM {t}"),
             format!("INSERT INTO {t} ({cols}) SELECT {cols} FROM {s}"),
@@ -474,11 +477,17 @@ pub(crate) async fn replace_rows_in_place(
     .await;
     if self_referencing {
         let restored = sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
-            .execute(&mut *conn)
-            .await
-            .map_err(err);
+            .execute(&mut **conn)
+            .await;
         result?;
-        restored?;
+        if let Err(e) = restored {
+            tracing::warn!(
+                table = target,
+                error = %e,
+                "mysql overwrite: rows replaced, but restoring FOREIGN_KEY_CHECKS failed; the \
+                 connection is closed instead of returned to the pool"
+            );
+        }
         return Ok(());
     }
     result
