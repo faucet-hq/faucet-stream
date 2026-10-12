@@ -94,6 +94,8 @@ async fn types_without_a_native_decode_are_read_as_text() {
     for query in [
         "SELECT 2.25::numeric AS n;",
         "SELECT 2.25::numeric AS n -- trailing note",
+        "SELECT 2.25::numeric AS n; -- trailing note",
+        "WITH a AS (SELECT 2.25::numeric AS n, 'UPDATE' AS op) SELECT n FROM a WHERE op = 'UPDATE'",
     ] {
         let source = PostgresSource::new(PostgresSourceConfig::new(&url, query))
             .await
