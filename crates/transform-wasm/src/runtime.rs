@@ -69,13 +69,11 @@ fn execute_page(
     eng.reload_if_changed();
     let mut inst = eng.new_page_instance()?;
     let mut peak_memory = 0u64;
-    let mut dropped_logs = 0u64;
 
     let mut out = Vec::with_capacity(records.len());
     for rec in records {
         if inst.trapped() {
             peak_memory = peak_memory.max(inst.peak_memory());
-            dropped_logs += inst.dropped_logs();
             inst = eng.new_page_instance()?;
         }
         let input = serde_json::to_vec(&rec).map_err(|e| {
@@ -124,13 +122,12 @@ fn execute_page(
         }
     }
     metrics::memory_bytes(module_label, peak_memory.max(inst.peak_memory()));
-    dropped_logs += inst.dropped_logs();
-    if dropped_logs > 0 {
+    if let Some(dropped) = eng.logs.report() {
         tracing::warn!(
             target: "faucet::transform::wasm",
             module = %module_label,
-            dropped = dropped_logs,
-            "wasm module exceeded its log budget; further log lines were dropped"
+            dropped,
+            "wasm module exceeded its log budget; further log lines this run are dropped"
         );
     }
     Ok(out)
@@ -777,12 +774,27 @@ mod tests {
     }
 
     #[test]
-    fn log_calls_are_capped_per_instance() {
+    fn log_calls_are_capped_per_run_across_instances() {
+        let (t, _f) = build(&host_wat(), |_| {});
+        {
+            let eng = t.engine.lock().unwrap();
+            let half = crate::engine::MAX_LOGS_PER_RUN as u64 / 2 + 10;
+            for _ in 0..2 {
+                let mut inst = eng.new_page_instance().unwrap();
+                for _ in 0..half {
+                    inst.run(br#"{"a":1}"#).unwrap();
+                }
+            }
+            let dropped = 2 * half - crate::engine::MAX_LOGS_PER_RUN as u64;
+            assert_eq!(eng.new_page_instance().unwrap().dropped_logs(), dropped);
+            assert_eq!(eng.logs.report(), Some(dropped));
+            assert_eq!(eng.logs.report(), None, "reported once per run");
+        }
         let (t, _f) = build(&host_wat(), |_| {});
         let eng = t.engine.lock().unwrap();
         let mut inst = eng.new_page_instance().unwrap();
         let extra = 25u64;
-        for _ in 0..(crate::engine::MAX_LOGS_PER_INSTANCE as u64 + extra) {
+        for _ in 0..(crate::engine::MAX_LOGS_PER_RUN as u64 + extra) {
             let r = inst.run(br#"{"a":1}"#).unwrap();
             assert!(matches!(r.outcome, Outcome::Emit(_)));
         }
