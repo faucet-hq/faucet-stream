@@ -132,9 +132,9 @@ pub struct PostgresCdcSourceConfig {
     /// The slot's `confirmed_flush_lsn` advances only at the start of a cycle,
     /// from the bookmark the previous cycle persisted. Under steady writes
     /// `idle_timeout` never fires, so without this bound a cycle — and the WAL
-    /// the slot pins — would grow until the primary's disk filled. A
-    /// long-running runtime (`faucet schedule`, `faucet serve`, `faucet
-    /// mirror`) starts the next cycle straight away.
+    /// the slot pins — would grow until the primary's disk filled. `faucet
+    /// mirror` starts the next cycle straight away; under `faucet schedule`
+    /// the next tick resumes; a one-shot `faucet run` (or `serve` run) ends.
     #[serde(
         default = "default_max_cycle_duration",
         with = "faucet_core::config::duration_secs"

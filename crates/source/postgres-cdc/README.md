@@ -94,7 +94,7 @@ pipeline:
 faucet run pipeline.yaml
 ```
 
-Each fetch cycle drains pending changes and stops once the stream has been idle for `idle_timeout` seconds, or at the first transaction boundary after `max_cycle_duration` (default 300 s). The slot's `confirmed_flush_lsn` advances at the start of the next cycle, from the bookmark this one persisted — so the bound is what keeps a busy primary's `pg_wal` from growing without limit. Re-running resumes from the persisted bookmark. For a continuously-running mirror, drive this under `faucet schedule` or `faucet replicate`.
+Each fetch cycle drains pending changes and stops once the stream has been idle for `idle_timeout` seconds, or at the first transaction boundary after `max_cycle_duration` (default 300 s). The slot's `confirmed_flush_lsn` advances at the start of the next cycle, from the bookmark this one persisted — so the bound is what keeps a busy primary's `pg_wal` from growing without limit. Re-running resumes from the persisted bookmark. `faucet mirror` starts the next cycle straight away; under `faucet schedule` the next tick resumes from the bookmark; a one-shot `faucet run` (or a `faucet serve` run) ends when the cycle does. For a continuously-running mirror use `faucet mirror`.
 
 ## Configuration reference
 

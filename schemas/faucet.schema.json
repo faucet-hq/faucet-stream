@@ -16082,7 +16082,7 @@
                       "default": null
                     },
                     "max_cycle_duration": {
-                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. A\nlong-running runtime (`faucet schedule`, `faucet serve`, `faucet\nmirror`) starts the next cycle straight away.",
+                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. `faucet\nmirror` starts the next cycle straight away; under `faucet schedule`\nthe next tick resumes; a one-shot `faucet run` (or `serve` run) ends.",
                       "type": [
                         "integer",
                         "string"
