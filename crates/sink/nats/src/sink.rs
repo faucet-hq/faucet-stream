@@ -124,7 +124,13 @@ impl NatsSink {
                 }
                 Ok::<(), FaucetError>(())
             };
-            self.bounded(work, "publish").await??;
+            match self.bounded(work, "publish").await {
+                Ok(done) => done?,
+                Err(timeout) => {
+                    fail_unconfirmed(&mut outcomes[base..], &timeout);
+                    return Ok(outcomes);
+                }
+            }
         }
         Ok(outcomes)
     }
@@ -147,6 +153,15 @@ impl NatsSink {
                 ))),
             },
         }
+    }
+}
+
+/// A publish group that timed out leaves its unconfirmed rows, and every row
+/// of the groups after it, failed with the timeout; outcomes already decided
+/// (earlier groups, rows that failed on their own) are kept.
+fn fail_unconfirmed(outcomes: &mut [faucet_core::RowOutcome], cause: &FaucetError) {
+    for outcome in outcomes.iter_mut().filter(|o| o.is_ok()) {
+        *outcome = Err(FaucetError::Sink(cause.to_string()));
     }
 }
 
@@ -199,6 +214,29 @@ impl Sink for NatsSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_fails_only_rows_not_yet_decided() {
+        let mut outcomes: Vec<faucet_core::RowOutcome> =
+            vec![Ok(()), Err(FaucetError::Sink("bad subject".into())), Ok(())];
+        let cause = FaucetError::Sink("nats publish did not complete within 30s".into());
+        fail_unconfirmed(&mut outcomes[1..], &cause);
+        assert!(outcomes[0].is_ok());
+        assert!(
+            outcomes[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("bad subject")
+        );
+        assert!(
+            outcomes[2]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("within 30s")
+        );
+    }
     use serde_json::json;
 
     #[tokio::test]
