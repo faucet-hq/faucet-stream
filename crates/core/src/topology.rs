@@ -1746,7 +1746,7 @@ async fn compute_resume(
         }
         positions.push((id.clone(), bm, seq));
     }
-    plan_exactly_once(&positions, source_count, source)
+    plan_exactly_once(&positions, source_count, source, &opts.pipeline_name)
 }
 
 /// Pure exactly-once resume decision over each sink's `(id, position, seq)`.
@@ -1754,6 +1754,7 @@ fn plan_exactly_once(
     positions: &[(String, Option<Value>, u64)],
     source_count: usize,
     source: Option<&dyn Source>,
+    pipeline: &str,
 ) -> Result<ResumePlan, FaucetError> {
     let own = |skip: &dyn Fn(&Option<Value>) -> Option<Value>| -> HashMap<String, SinkResume> {
         positions
@@ -1831,13 +1832,23 @@ fn plan_exactly_once(
             None => format!("'{id}' with no committed position"),
         })
         .collect();
+    let keys: Vec<String> = positions
+        .iter()
+        .map(|(id, _, _)| format!("'{pipeline}::{id}'"))
+        .collect();
     Err(FaucetError::State(format!(
         "topology exactly-once: the sink nodes committed different positions ({}), and the \
          source '{}' cannot order its positions (Source::position_le), so no resume point \
          avoids both lost and duplicated records; resuming by page count is unsafe because \
-         a replay need not produce the same pages",
+         a replay need not produce the same pages. To recover, either delete every sink \
+         node's state ({}) and its commit-token watermark row under the same scope, then \
+         rerun to replay from the start (each sink re-writes what it already holds), or \
+         reset only the sinks that are ahead to the furthest-behind sink's position and \
+         accept duplicates in between; a source that implements Source::position_le resumes \
+         automatically. See the topology cookbook, \"Exactly-once delivery\"",
         committed.join(", "),
         source.map_or("unknown", |s| s.connector_name()),
+        keys.join(", "),
     )))
 }
 
@@ -4244,16 +4255,23 @@ mod graph_safety_tests {
             ],
             1,
             Some(&src),
+            "p",
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("'b' with no committed position"),
             "an unordered source cannot skip by count (#862 H-07): {err}"
         );
+        assert!(
+            err.to_string().contains("'p::a', 'p::b'")
+                && err.to_string().contains("delete every sink node's state"),
+            "the refusal names the recovery: {err}"
+        );
         let plan = plan_exactly_once(
             &[("a".into(), None, 0), ("b".into(), None, 0)],
             1,
             Some(&src),
+            "p",
         )
         .unwrap();
         assert_eq!(plan.start, None);
@@ -4267,6 +4285,7 @@ mod graph_safety_tests {
             ],
             1,
             Some(&ordered),
+            "p",
         )
         .unwrap();
         assert_eq!(plan.start, None);
@@ -4284,6 +4303,7 @@ mod graph_safety_tests {
             ],
             2,
             None,
+            "p",
         )
         .unwrap();
         assert_eq!(plan.start, None);
@@ -4300,6 +4320,7 @@ mod graph_safety_tests {
             ],
             1,
             None,
+            "p",
         )
         .unwrap();
         assert_eq!(plan.start, Some(json!({ "pos": 3 })));

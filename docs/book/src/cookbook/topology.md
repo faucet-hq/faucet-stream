@@ -211,7 +211,23 @@ written again).
 Every built-in exactly-once source orders its positions (the CDC sources, and
 `kafka` per partition). For a source that cannot, sinks that committed different
 positions make the run fail rather than skip replayed pages by count, which
-would lose records whenever the replay cuts its pages differently.
+would lose records whenever the replay cuts its pages differently. The same
+refusal hits a sink node added to an existing graph over such a source, since
+it has no committed position yet. Every later run fails the same way until the
+state is reset; the error names each sink node's state key
+(`{pipeline}::{node}`). Recover in one of two ways:
+
+- **replay from the start** — delete every sink node's state entry and its
+  commit-token watermark row (the `_faucet_commit_token` row, or the sink's
+  equivalent, under the same scope), then rerun. Each sink re-writes what it
+  already holds, so pair this with a keyed upsert sink or accept the
+  duplicates;
+- **resume from the furthest-behind sink** — reset only the sinks that are
+  ahead to that sink's position. The records between the two positions are
+  written again to those sinks.
+
+A third-party source that implements `Source::position_le` (and
+`record_covered`) resumes on its own instead.
 
 No sink is resumed past its own progress, and no sink re-writes a change it
 already has.
