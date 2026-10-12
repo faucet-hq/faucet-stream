@@ -221,6 +221,14 @@ impl BigQuerySource {
     /// [`bigquery-emulator`](https://github.com/goccy/bigquery-emulator) or
     /// drive a wiremock-backed test fixture. Production code should prefer
     /// [`BigQuerySource::new`], which handles credential loading.
+    ///
+    /// Query result pages (`jobs.getQueryResults`) do not go through `client`:
+    /// faucet reads them itself, against `config.api_host` with credentials
+    /// from `config.auth`. Point `api_host` at the same endpoint as the client
+    /// (an emulator or mock), and use
+    /// [`BigQuerySource::from_parts_with_tokens`] to reuse the client's token
+    /// provider — otherwise result pages go to the production API with
+    /// application-default credentials.
     #[doc(hidden)]
     pub fn from_parts(config: BigQuerySourceConfig, client: Client) -> Self {
         Self {
