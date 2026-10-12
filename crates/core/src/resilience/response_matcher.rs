@@ -211,8 +211,9 @@ impl RetryMatcher {
 
     /// The wait before retrying a matched response: `backoff_from`, else
     /// `backoff_secs`, else the server's `Retry-After`, else exponential
-    /// backoff from `base` for the `attempt`-th consecutive match. Errors only
-    /// when `backoff_from` asks for more than `max_wait_secs`.
+    /// backoff from `base` for the `attempt`-th consecutive match. Errors when
+    /// the stated wait (from `backoff_from`, `backoff_secs` or `Retry-After`)
+    /// exceeds `max_wait_secs`.
     pub fn wait(
         &self,
         headers: &HeaderMap,
