@@ -199,16 +199,32 @@ fn is_secret_key(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
-/// The shortest tenant-supplied string registered for redaction (#789
-/// SERVE-24): the redaction set is process-wide, so a short "secret" such
-/// as `https` would mask that word in every tenant's and admin's output.
+/// The shortest tenant-supplied string once registered for redaction.
+#[deprecated(
+    note = "no longer applied: every credential-looking value is registered unless it is a common word"
+)]
 pub const MIN_TENANT_SECRET_LEN: usize = 12;
+
+/// Values under a credential-looking key that are not credentials, and would
+/// mask that word in every tenant's and admin's output if registered (the
+/// redaction set is process-wide).
+const NOT_SECRETS: &[&str] = &[
+    "http", "https", "true", "false", "null", "none", "bearer", "basic", "token", "secret",
+    "password", "default", "client", "admin", "user", "test", "oauth", "oauth2",
+];
+
+/// Whether a credential-keyed value is worth redacting: anything the
+/// registry accepts except a common word.
+fn plausible_secret(s: &str) -> bool {
+    let t = s.trim();
+    !NOT_SECRETS.iter().any(|w| t.eq_ignore_ascii_case(w))
+}
 
 /// Register every credential-looking string in a provider spec for redaction.
 pub fn register_secrets(value: &Value) {
     fn walk(v: &Value, secret: bool) {
         match v {
-            Value::String(s) if secret && s.len() >= MIN_TENANT_SECRET_LEN => {
+            Value::String(s) if secret && plausible_secret(s) => {
                 crate::secrets::registry::register(s)
             }
             Value::Object(m) => m
@@ -764,6 +780,46 @@ pub fn seal_notifications(
     Ok(())
 }
 
+/// Seal every tenant's `notifications:` list still stored in clear (written
+/// before lists were sealed), once a vault key is configured. Logged, never
+/// fatal: a tenant that cannot be resealed keeps its plain list.
+pub async fn reseal_plain_notifications(state: &ServerState) -> usize {
+    let rt = state.tenants();
+    if rt.vault.is_none() {
+        return 0;
+    }
+    let tenants = match state.history().tenant_list().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list tenants to seal their notifications");
+            return 0;
+        }
+    };
+    let mut sealed = 0;
+    for mut rec in tenants {
+        if rec.notifications.is_empty() || rec.notifications_sealed.is_some() {
+            continue;
+        }
+        let list = std::mem::take(&mut rec.notifications);
+        if seal_notifications(&rt, &mut rec, list).is_err() {
+            continue;
+        }
+        match state.history().tenant_upsert(&rec).await {
+            Ok(()) => sealed += 1,
+            Err(e) => {
+                tracing::warn!(tenant = %rec.id, error = %e, "could not seal the tenant's notifications")
+            }
+        }
+    }
+    if sealed > 0 {
+        tracing::info!(
+            tenants = sealed,
+            "sealed tenant notifications stored in clear"
+        );
+    }
+    sealed
+}
+
 /// A tenant's `notifications:` list in clear (a record written before
 /// sealing keeps its plain list).
 pub fn open_notifications(rt: &TenantsRuntime, rec: &TenantRecord) -> Result<Vec<Value>, String> {
@@ -1236,6 +1292,37 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn plain_notifications_are_sealed_once_a_vault_key_is_configured() {
+        let state = crate::serve::test_support::test_state();
+        let mut plain = tenant("acme");
+        plain.notifications = vec![serde_json::json!({"on": ["run_failure"]})];
+        state.history().tenant_upsert(&plain).await.unwrap();
+        state
+            .history()
+            .tenant_upsert(&tenant("empty"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reseal_plain_notifications(&state).await,
+            0,
+            "no vault, nothing sealed"
+        );
+        state.set_tenants(TenantsRuntime::new(
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
+            Default::default(),
+        ));
+        assert_eq!(reseal_plain_notifications(&state).await, 1);
+        let rec = state.history().tenant_get("acme").await.unwrap().unwrap();
+        assert!(rec.notifications.is_empty());
+        assert!(rec.notifications_sealed.is_some());
+        assert_eq!(
+            open_notifications(&state.tenants(), &rec).unwrap(),
+            vec![serde_json::json!({"on": ["run_failure"]})]
+        );
+        assert_eq!(reseal_plain_notifications(&state).await, 0, "idempotent");
+    }
+
     #[test]
     fn sealed_notifications_open_only_with_the_vault_and_as_a_list() {
         let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
@@ -1676,13 +1763,17 @@ mod tests {
         assert!(!out.contains("pw-very-secret-2"), "{out}");
         assert!(out.contains("visible-client"), "{out}");
         assert!(out.contains("https://idp.example/token"), "{out}");
-        // A short tenant "secret" is not registered, so it cannot mask a
-        // common word for everyone.
+        // A common word under a secret key is not registered, so it cannot
+        // mask that word for everyone …
         register_secrets(&serde_json::json!({"config": {"token": "https"}}));
         assert_eq!(
             crate::secrets::registry::redact("https://x").into_owned(),
             "https://x"
         );
+        // … but a short real credential is.
+        register_secrets(&serde_json::json!({"config": {"password": "pw9Zq"}}));
+        assert!(!crate::secrets::registry::redact("login pw9Zq").contains("pw9Zq"));
+        assert!(!plausible_secret(" TRUE "));
     }
 
     #[test]

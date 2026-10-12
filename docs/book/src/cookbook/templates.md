@@ -150,7 +150,10 @@ is still accepted as a pipeline but prints a deprecation notice — add
 A pipeline template's `name:` is its state-key namespace (`{name}::{row}`).
 One registered without a `name:` runs under its **template id** — the same on
 `faucet template run`, a server trigger and MCP — so two unnamed templates
-sharing a state store never read each other's bookmarks.
+sharing a state store never read each other's bookmarks. Releases before this
+ran unnamed templates as `serve` / `pipeline`; see
+[Upgrading](../operations/upgrading.md#registered-pipeline-templates-without-a-name)
+for keeping their bookmarks.
 
 ```bash
 faucet template register hub/source-templates/acme/billing.yaml --launch    # id = acme/billing
@@ -731,7 +734,10 @@ draft.
 without a `tests:` block inherits the newest earlier version's block, copied into
 the new version (`tests.inherited_from` records where from; the response carries
 `tests_inherited_from`). With nothing to inherit, the registration is refused
-with a message saying to add a `tests:` block. `inherited_from` and
+with a message saying to add a `tests:` block. A `tests:` block that generates
+no cases (say `auto: { enum_coverage: true }` on a template with no `values:`
+params) tests nothing, so it is refused too, and the version is not kept.
+Registration always runs the version's bundle. `inherited_from` and
 `locked_suites` are written by the registry; a submitted document that carries
 either is refused.
 

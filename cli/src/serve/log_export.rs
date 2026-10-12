@@ -230,6 +230,9 @@ impl LogExport {
                 summary.skipped += 1;
                 continue;
             }
+            // The listing may predate another instance's ack: ship from the
+            // row as it is now that the lease is ours.
+            let row = history.log_ship_row(&row.run_id).await?.unwrap_or(row);
             let res = self.ship_run(history, &row, settle, &mut summary).await;
             if let Err(e) = history.log_ship_release(&row.run_id).await {
                 tracing::warn!(run_id = %row.run_id, error = %e, "releasing the log-delivery lease failed");
@@ -254,18 +257,26 @@ impl LogExport {
         &self,
         run_attrs: &BTreeMap<String, String>,
         lines: &[ShipLine],
-    ) -> Result<u64, String> {
+    ) -> crate::logship::ExportOutcome {
+        let unavailable = |m: &str| crate::logship::ExportOutcome {
+            error: Some(crate::logship::ExportError {
+                payload_rejected: false,
+                message: m.to_string(),
+                detail: m.to_string(),
+            }),
+            ..Default::default()
+        };
         #[cfg(feature = "otel")]
         {
             match self.exporter().await {
-                Some(e) => e.export(run_attrs, lines).await,
-                None => Err("the OTLP log exporter could not be built".into()),
+                Some(e) => e.export_isolating(run_attrs, lines).await,
+                None => unavailable("the OTLP log exporter could not be built"),
             }
         }
         #[cfg(not(feature = "otel"))]
         {
             let _ = (run_attrs, lines);
-            Err("this binary was built without the `otel` feature".into())
+            unavailable("this binary was built without the `otel` feature")
         }
     }
 
@@ -286,7 +297,11 @@ impl LogExport {
             cap = cap.min(floor);
         }
         let mut after = row.delivered_seq;
-        for _ in 0..MAX_BATCHES_PER_RUN {
+        for batch in 0..MAX_BATCHES_PER_RUN {
+            if batch > 0 && !history.log_ship_claim(&row.run_id, self.lease_ttl).await? {
+                tracing::warn!(run_id = %row.run_id, "lost the log-delivery lease mid-pass");
+                return Ok(());
+            }
             let page = history
                 .list_run_logs(&row.run_id, after, SHIP_BATCH)
                 .await?;
@@ -297,26 +312,38 @@ impl LogExport {
                 .filter(|l| l.seq <= cap)
                 .map(|l| ShipLine::from_rendered(l.seq, &l.ts, &l.level, &l.line, l.attrs))
                 .collect();
-            let Some(last) = lines.last().map(|l| l.seq) else {
+            if lines.is_empty() {
                 break;
-            };
-            match self.export(&run_attrs, &lines).await {
-                Ok(_) => {
-                    metrics::shipped(lines.len() as u64);
-                    summary.shipped += lines.len() as u64;
-                    if !history.log_ship_ack(&row.run_id, last).await? {
-                        tracing::warn!(run_id = %row.run_id, "lost the log-delivery lease mid-pass");
-                        return Ok(());
-                    }
-                    after = Some(last);
+            }
+            let out = self.export(&run_attrs, &lines).await;
+            if let Some(last) = out
+                .handled
+                .checked_sub(1)
+                .and_then(|i| lines.get(i))
+                .map(|l| l.seq)
+            {
+                let delivered = out.handled as u64 - out.dropped;
+                metrics::shipped(delivered);
+                summary.shipped += delivered;
+                if out.dropped > 0 {
+                    metrics::dropped(DropReason::Rejected, out.dropped);
+                    history
+                        .log_ship_add_dropped(&row.run_id, out.dropped)
+                        .await?;
                 }
-                Err(e) => {
-                    metrics::export_error();
-                    summary.failed = true;
-                    tracing::warn!(run_id = %row.run_id, error = %e, "shipping run logs failed");
-                    history.log_ship_fail(&row.run_id, &e).await?;
-                    break;
+                if !history.log_ship_ack(&row.run_id, last).await? {
+                    tracing::warn!(run_id = %row.run_id, "lost the log-delivery lease mid-pass");
+                    return Ok(());
                 }
+                after = Some(last);
+            }
+            if let Some(e) = out.error {
+                metrics::export_error();
+                summary.failed = true;
+                tracing::warn!(run_id = %row.run_id, error = %e.detail, "shipping run logs failed");
+                let stored = crate::secrets::registry::redact(&e.message).into_owned();
+                history.log_ship_fail(&row.run_id, &stored).await?;
+                break;
             }
             if !full {
                 break;
@@ -395,10 +422,40 @@ impl LogExport {
             }
             return Ok(s);
         }
+        // Each run is maintained under its delivery lease, so cluster members
+        // never drop or count the same lines twice, nor act on a stale row.
+        let mut held: Vec<String> = Vec::new();
+        let res = self.maintain_held(history, now, &mut held, &mut s).await;
+        for run_id in held {
+            if let Err(e) = history.log_ship_release(&run_id).await {
+                tracing::warn!(run_id = %run_id, error = %e, "releasing the log-delivery lease failed");
+            }
+        }
+        res.map(|()| s)
+    }
+
+    async fn maintain_held(
+        &self,
+        history: &dyn RunHistory,
+        now: DateTime<Utc>,
+        held: &mut Vec<String>,
+        s: &mut MaintainSummary,
+    ) -> Result<(), HistoryError> {
         let age_cut = seq_at(now - chrono::Duration::from_std(self.max_age).unwrap_or_default());
         let mut pending: Vec<(LogShipRow, u64, u64)> = Vec::new();
         let mut dropped_runs: Vec<String> = Vec::new();
-        for row in history.log_ship_rows(false).await? {
+        for listed in history.log_ship_rows(false).await? {
+            if !history
+                .log_ship_claim(&listed.run_id, self.lease_ttl)
+                .await?
+            {
+                continue;
+            }
+            held.push(listed.run_id.clone());
+            let row = history
+                .log_ship_row(&listed.run_id)
+                .await?
+                .unwrap_or(listed);
             if let (Some(d), Some(at)) = (row.delivered_seq, row.delivered_at)
                 && now - at >= chrono::Duration::from_std(self.retention).unwrap_or_default()
             {
@@ -482,7 +539,7 @@ impl LogExport {
                     .await?;
             }
         }
-        Ok(s)
+        Ok(())
     }
 
     /// The oldest undelivered lines of a run covering `excess` bytes: their

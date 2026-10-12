@@ -1895,6 +1895,21 @@ tests:
     }
 
     #[tokio::test]
+    async fn a_dead_instances_claim_expires_and_a_live_one_holds() {
+        use crate::templates::revalidate::{CLAIM_KEY, META_KEY, revalidate_if_new_release};
+        let s = store().await;
+        let line = crate::template_tests::result::running_line();
+        let live = format!("{line}@{}", chrono::Utc::now().timestamp() + 3600);
+        s.meta_put(CLAIM_KEY, &live).await.unwrap();
+        assert!(revalidate_if_new_release(&s).await.unwrap().is_none());
+        assert_eq!(s.meta_get(META_KEY).await.unwrap(), None);
+        s.meta_put(CLAIM_KEY, &format!("{line}@1")).await.unwrap();
+        assert!(revalidate_if_new_release(&s).await.unwrap().is_some());
+        assert_eq!(s.meta_get(META_KEY).await.unwrap(), Some(line));
+        assert_eq!(s.meta_get(CLAIM_KEY).await.unwrap().as_deref(), Some(""));
+    }
+
+    #[tokio::test]
     async fn pruning_keeps_the_newest_holder() {
         use crate::serve::history::templates::{VERSION_RETAIN, sticky_newest};
         let s = store().await;
@@ -1919,6 +1934,38 @@ tests:
                 &Default::default()
             ),
             Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_a_version_a_pending_launch_request_names() {
+        use crate::serve::history::templates::VERSION_RETAIN;
+        let s = store().await;
+        launched(&s, pipeline("orders", 2)).await;
+        register(
+            &s,
+            req(pipeline("orders", 9).replace("rows", "rows-pinned")),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let change: crate::serve::changes::ChangeRequest =
+            serde_json::from_value(serde_json::json!({
+                "id": "chg-pin", "kind": "template_launch", "status": "pending",
+                "requester": "bob", "requester_role": "operator",
+                "payload": {"id": "orders", "version": 2}, "required_approvals": 1,
+                "approvals": [], "created_at": now, "updated_at": now, "expires_at": now
+            }))
+            .unwrap();
+        s.change_upsert(&change).await.unwrap();
+        for i in 0..(VERSION_RETAIN + 2) {
+            let body = pipeline("orders", 9).replace("rows", &format!("rows-y{i}"));
+            register(&s, req(body)).await.unwrap();
+        }
+        let versions = s.template_versions("orders").await.unwrap();
+        assert!(
+            versions.contains(&2),
+            "the pinned version survives: {versions:?}"
         );
     }
 
@@ -2023,6 +2070,21 @@ tests:
             .await
             .unwrap_err();
         assert!(err.to_string().contains("generates no cases"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_launched_template_refuses_a_version_whose_bundle_generates_no_cases() {
+        let s = store().await;
+        launched(&s, pipeline("orders", 2)).await;
+        let caseless = pipeline("orders", 2)
+            .replace("    values: [us, eu]\n", "")
+            .replace(
+                "    auto: { enum_coverage: true, defaults_baseline: true }\n  fixtures:\n    - name: rows\n      input: [{ \"id\": 1 }, { \"id\": 2 }]\n      expect: { records_written: 2 }\n",
+                "    auto: { enum_coverage: true }\n",
+            );
+        let err = register_tested(&s, req(caseless)).await.unwrap_err();
+        assert!(err.to_string().contains("generates no cases"), "{err}");
+        assert_eq!(s.template_versions("orders").await.unwrap(), vec![1]);
     }
 
     #[tokio::test]

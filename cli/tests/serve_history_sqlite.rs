@@ -1486,6 +1486,19 @@ async fn change_requests_round_trip_and_filter() {
             .as_deref(),
         Some("cas")
     );
+    // A whole-row compare-and-set: a partial approval written from a stale
+    // read loses rather than dropping the one that landed first.
+    let read = mk("p", ChangeKind::Run, ChangeStatus::Pending, "bob", 10);
+    store.change_upsert(&read).await.unwrap();
+    let mut first = read.clone();
+    first.reason = Some("alice approved".into());
+    first.updated_at = now;
+    assert!(store.change_transition_from(&first, &read).await.unwrap());
+    let mut second = read.clone();
+    second.reason = Some("carol approved".into());
+    assert!(!store.change_transition_from(&second, &read).await.unwrap());
+    assert!(store.change_transition_from(&second, &first).await.unwrap());
+    assert!(store.change_delete("p").await.unwrap());
     store
         .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
         .await
@@ -1685,9 +1698,36 @@ async fn an_old_database_is_migrated_and_a_newer_one_refused() {
     .expect("idempotent");
     drop(again);
 
+    // A newer binary whose migrations were all additive leaves
+    // `min_readable` alone: this binary still opens it (a rollback), and
+    // never lowers the stamp.
     {
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         sqlx::query("UPDATE faucet_serve_schema SET version='99' WHERE id='schema'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let rolled_back = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i-rollback".into(),
+    )
+    .await
+    .expect("an additively-newer schema is readable");
+    drop(rolled_back);
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        let stamped: (String,) =
+            sqlx::query_as("SELECT version FROM faucet_serve_schema WHERE id='schema'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(stamped.0, "99", "the stamp never goes down");
+        // A newer binary that made the database unreadable to this one says so.
+        sqlx::query("UPDATE faucet_serve_schema SET version='99' WHERE id='min_readable'")
             .execute(&mut conn)
             .await
             .unwrap();

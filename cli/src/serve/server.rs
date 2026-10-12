@@ -881,6 +881,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     {
         crate::serve::tenants::metrics::describe();
         state.set_tenants(tenants_runtime);
+        crate::serve::tenants::reseal_plain_notifications(&state).await;
         crate::serve::tenants::metrics::refresh_connection_gauges(&state).await;
     }
     // Attach the origins, pull each once so the registry is populated before

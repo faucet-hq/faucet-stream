@@ -86,10 +86,19 @@ pub struct TenantView {
     pub connections: Vec<ConnectionView>,
     /// Runs queued, pending or running for the tenant.
     pub active_runs: usize,
+    /// Why the tenant's sealed `notifications:` could not be shown (no vault
+    /// key on this server, or a key that does not open them); the list then
+    /// reads as empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications_error: Option<String>,
 }
 
 async fn view(state: &ServerState, mut tenant: TenantRecord) -> Result<TenantView, ServeError> {
-    let plain = tenants::open_notifications(&state.tenants(), &tenant).unwrap_or_default();
+    let (plain, notifications_error) = match tenants::open_notifications(&state.tenants(), &tenant)
+    {
+        Ok(list) => (list, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     tenant.notifications = tenants::mask_notifications(&plain);
     tenant.notifications_sealed = None;
     let connections = state
@@ -105,6 +114,7 @@ async fn view(state: &ServerState, mut tenant: TenantRecord) -> Result<TenantVie
         tenant,
         connections,
         active_runs,
+        notifications_error,
     })
 }
 

@@ -631,6 +631,13 @@ impl RunHistory for FallbackHistory {
     ) -> Result<bool, HistoryError> {
         strict!(self, p => p.change_transition(change, from), f => f.change_transition(change, from))
     }
+    async fn change_transition_from(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        before: &crate::serve::changes::ChangeRequest,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.change_transition_from(change, before), f => f.change_transition_from(change, before))
+    }
     async fn change_get(
         &self,
         id: &str,

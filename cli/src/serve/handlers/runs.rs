@@ -53,6 +53,7 @@ pub async fn submit_run(
     if actor.tenant.is_some() {
         return Err(ServeError::Forbidden(TENANT_RAW_CONFIG.to_string()));
     }
+    runner::refuse_reserved_idempotency_key(req.idempotency_key.as_deref())?;
     match runner::submit_gated(state, req, actor).await? {
         SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         // The server (or the caller) wants approval first (#703): the body
@@ -463,6 +464,11 @@ pub async fn rollback_run(
         crate::serve::runner::load_for(&state, &config, format, rec.tenant.as_deref(), origin)
             .await?;
     loaded.require_matrix()?;
+    if !req.dry_run {
+        crate::serve::runner::refuse_unapproved_write(&state, "run rollback")?;
+        crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;
+    }
+    let _permit = crate::serve::runner::inline_permit(&state)?;
     let auth = loaded
         .auth_catalog()
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
@@ -537,6 +543,64 @@ mod tests {
 
     fn global() -> AuthContext {
         AuthContext::system("test")
+    }
+
+    #[tokio::test]
+    async fn a_rollback_is_disabled_under_require_approval_run_but_a_dry_run_answers() {
+        let mut cfg = crate::serve::test_support::test_config();
+        cfg.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        let state = crate::serve::test_support::state_from(&cfg);
+        let mut rec = RunRecord::queued(
+            "r1".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        rec.status = RunStatus::Completed;
+        rec.invocations
+            .push(crate::serve::history::InvocationRecord {
+                row_id: "default".into(),
+                parent_record_key: None,
+                run_id: Some("inv-1".into()),
+                records_written: 0,
+                duration_ms: 0,
+                error: None,
+                usage: None,
+                batches: None,
+                source_lag: None,
+            });
+        state.history().upsert(&rec).await.unwrap();
+        let config = "version: 1\nname: rb\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./out.jsonl } }\n".to_string();
+        let req = |dry_run| RollbackRequest {
+            config: Some(config.clone()),
+            dry_run,
+            ..Default::default()
+        };
+        let err = rollback_run(
+            State(state.clone()),
+            Extension(global()),
+            Path("r1".into()),
+            Some(Json(req(false))),
+        )
+        .await
+        .unwrap_err();
+        let ServeError::Forbidden(m) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(m.contains("run rollback") && m.contains("dry_run"), "{m}");
+        let err = rollback_run(
+            State(state),
+            Extension(global()),
+            Path("r1".into()),
+            Some(Json(req(true))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !matches!(err, ServeError::Forbidden(_)),
+            "a dry run is not refused: {err:?}"
+        );
     }
 
     #[test]

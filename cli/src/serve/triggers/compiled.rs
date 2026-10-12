@@ -94,6 +94,23 @@ impl CompiledTriggers {
                     if tpl.id.trim().is_empty() {
                         return Err(format!("triggers: '{}' template id is empty", t.name));
                     }
+                    for (what, v) in [
+                        ("version", &tpl.version),
+                        ("sink_version", &tpl.sink_version),
+                        ("overlay_version", &tpl.overlay_version),
+                    ] {
+                        if v.as_deref()
+                            .is_some_and(|v| v.trim().parse::<u32>().is_ok())
+                        {
+                            tracing::warn!(
+                                trigger = %t.name,
+                                template = %tpl.id,
+                                "trigger pins `{what}` by number: a numbered version without a \
+                                 label may be pruned once newer versions are registered — pin a \
+                                 channel (e.g. `prod`) instead"
+                            );
+                        }
+                    }
                     if tpl.allow_untested {
                         if t.tenants.is_some() {
                             return Err(format!(

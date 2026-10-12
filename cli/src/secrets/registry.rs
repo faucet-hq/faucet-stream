@@ -6,7 +6,7 @@
 //! from output the CLI emits (the [`RedactingWriter`]).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -27,6 +27,9 @@ pub const MAX_FORMS: usize = 16_384;
 /// per call).
 struct Registry {
     forms: HashMap<String, u64>,
+    /// Process-lifetime credentials (the server's own tokens and keys):
+    /// never evicted, whatever the churn in `forms`.
+    pinned: HashSet<String>,
     seq: u64,
     max_forms: usize,
     compiled: Option<Arc<Compiled>>,
@@ -36,6 +39,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             forms: HashMap::new(),
+            pinned: HashSet::new(),
             seq: 0,
             max_forms: MAX_FORMS,
             compiled: None,
@@ -55,7 +59,9 @@ impl Registry {
     fn insert(&mut self, forms: Vec<String>) {
         self.seq += 1;
         for f in forms {
-            self.forms.insert(f, self.seq);
+            if !self.pinned.contains(&f) {
+                self.forms.insert(f, self.seq);
+            }
         }
         if self.forms.len() > self.max_forms {
             let mut by_age: Vec<(u64, String)> =
@@ -68,8 +74,21 @@ impl Registry {
         self.compiled = None;
     }
 
+    fn pin(&mut self, forms: Vec<String>) {
+        for f in forms {
+            self.forms.remove(&f);
+            self.pinned.insert(f);
+        }
+        self.compiled = None;
+    }
+
     fn compile(&self) -> Compiled {
-        let mut patterns: Vec<String> = self.forms.keys().cloned().collect();
+        let mut patterns: Vec<String> = self
+            .forms
+            .keys()
+            .chain(self.pinned.iter())
+            .cloned()
+            .collect();
         patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         Compiled {
             max_len: patterns.first().map(String::len).unwrap_or(0),
@@ -132,6 +151,19 @@ pub fn register(secret: &str) {
         .write()
         .expect("secret registry lock poisoned")
         .insert(forms_of(secret));
+}
+
+/// [`register`] for a credential the process holds for its whole life (a
+/// server's bearer tokens, vault keys, provider client secrets): it is never
+/// evicted when the registry reaches [`MAX_FORMS`], and never unregistered.
+pub fn register_pinned(secret: &str) {
+    if secret.len() < MIN_REDACT_LEN {
+        return;
+    }
+    registry()
+        .write()
+        .expect("secret registry lock poisoned")
+        .pin(forms_of(secret));
 }
 
 /// Stop scrubbing `secret`: a refresh token rotated away (#789 SERVE-24).
@@ -399,6 +431,34 @@ mod tests {
         let compiled = reg.compile();
         assert_eq!(compiled.max_len, "bounded-secret-5".len());
         assert!(Registry::default().compile().patterns.is_empty());
+    }
+
+    #[test]
+    fn pinned_secrets_survive_eviction_and_are_still_redacted() {
+        let mut reg = Registry {
+            max_forms: 4,
+            ..Registry::default()
+        };
+        reg.pin(forms_of("server-bearer-token"));
+        for i in 0..8 {
+            reg.insert(forms_of(&format!("tenant-secret-{i}")));
+        }
+        assert!(reg.forms.len() <= 4);
+        assert!(reg.pinned.contains("server-bearer-token"));
+        assert!(
+            reg.compile()
+                .patterns
+                .iter()
+                .any(|p| p == "server-bearer-token")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn register_pinned_redacts_and_ignores_short_values() {
+        register_pinned("pinned-cred-value");
+        register_pinned("abc");
+        assert_eq!(redact("token=pinned-cred-value abc"), "token=*** abc");
     }
 
     #[test]

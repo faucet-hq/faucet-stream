@@ -83,11 +83,25 @@ faucet state import orders.yaml before-upgrade.json --overwrite --yes
 
 ### The `faucet serve` history database
 
-The run-history database (`--history`) carries a schema version. An upgraded
-server migrates it in place at startup (adding columns, never dropping any);
-an older server pointed at a database a newer one migrated refuses to start
-and names both versions. Take a backup before upgrading a server so a rollback
+The run-history database (`--history`) carries a schema version and the
+oldest version that can still read it. An upgraded server migrates it in
+place at startup (adding columns, never dropping any). A migration that only
+adds leaves the readable floor alone, so an older server can be rolled back
+onto the database; only a migration an older server cannot read past raises
+the floor, and then the older server refuses to start and names both
+versions. The stamps only ever rise, so an older member of a rolling upgrade
+never lowers them. Take a backup before upgrading a server so a rollback
 has something to restore — see [Backing up the server database](./backup.md).
+
+### Registered pipeline templates without a `name:`
+
+A pipeline template registered without a `name:` now runs under its template
+id (state keys `{id}::{row}`). Earlier releases ran it as `serve` (on a
+server) or `pipeline` (`faucet template run`), so every unnamed template
+shared one namespace. After the upgrade such a template starts from an empty
+bookmark: give it the old `name:` (`serve` or `pipeline`) in a new version to
+keep reading its old state, or move the keys with `faucet state export` /
+`import`.
 
 ## Clusters (`faucet serve --cluster`)
 

@@ -2642,6 +2642,7 @@ components:
         created_by: { type: string }
         connections: { type: array, items: { $ref: "#/components/schemas/Connection" } }
         active_runs: { type: integer }
+        notifications_error: { type: string, description: "Why the sealed notifications list could not be opened; the list then reads as empty." }
     TenantDeleteReport:
       type: object
       required: [runs, usage_records, change_requests, state_keys_deleted, catalog_datasets, catalog_edges, catalog_config_snapshots]
