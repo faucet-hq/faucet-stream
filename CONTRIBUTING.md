@@ -138,6 +138,17 @@ are tracked in the roadmap epic (search the `epic` label).
   them out in the changelog. For a connector, a **breaking change** includes
   renaming/removing a config field, changing a field's type, or changing a
   default in a way that alters behavior — not just Rust API changes.
+- **Re-exported third-party crates (sanctioned exception).** A crate may
+  re-export a third-party crate wholesale so connector authors build against
+  the exact version the connector uses. Today that is `faucet-common-delta`,
+  which re-exports `deltalake` (plus `DeltaTable` / `DeltaTableError`). Such a
+  re-export follows its upstream: moving it to a new upstream major (deltalake
+  0.32 → 1.x shipped this way) is released as a **minor** bump of the
+  re-exporting crate, not a major. Code that names types through the re-export
+  (`faucet_common_delta::deltalake::…`) must be ready to follow upstream's
+  breaking changes; faucet-owned types keep the normal SemVer guarantee. A new
+  wholesale re-export of this kind needs the maintainer's sign-off and an entry
+  here.
 - **Independent crate versions.** Connector crates version independently on
   crates.io, so `faucet-source-rest` and `faucet-sink-bigquery` may sit at
   different versions. Per-crate tags use the form `<crate>-v<X.Y.Z>` (e.g.
