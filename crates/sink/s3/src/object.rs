@@ -39,7 +39,7 @@ pub const MAX_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const COPY_PART_BYTES: u64 = 512 * 1024 * 1024;
 
 /// S3's limit on the parts of one multipart upload.
-const MAX_PARTS: u64 = 10_000;
+pub(crate) const MAX_PARTS: u64 = 10_000;
 
 /// S3's limit on the keys of one `DeleteObjects` request.
 const MAX_DELETE_KEYS: usize = 1_000;
@@ -94,7 +94,7 @@ fn copy_source(bucket: &str, key: &str) -> String {
 
 impl S3Objects {
     /// An SDK failure, typed by its HTTP status (see the module docs).
-    fn sdk_err<E>(&self, what: &str, key: &str, e: SdkError<E>) -> FaucetError
+    pub(crate) fn sdk_err<E>(&self, what: &str, key: &str, e: SdkError<E>) -> FaucetError
     where
         E: std::error::Error + Send + Sync + 'static,
     {

@@ -48,8 +48,8 @@ pub enum S3SinkFormat {
 }
 
 impl S3SinkFormat {
-    /// The shared format this variant maps onto, or `None` for Parquet, which
-    /// is columnar and has its own Arrow writer.
+    /// The row-encoded format this variant maps onto, or `None` for Parquet
+    /// (see [`explicit`](Self::explicit)) and for `auto`.
     pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
         match self {
             Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
@@ -188,7 +188,8 @@ pub struct S3SinkConfig {
     pub batch_size: usize,
     /// Compression codec applied to each uploaded object body. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —
-    /// resolves against `file_extension` (so `.jsonl.gz` triggers gzip).
+    /// resolves against the object name (`path`'s, else `file_extension`, so
+    /// `.jsonl.gz` triggers gzip).
     /// Requires the crate-local `compression` feature. Note: this sink does
     /// **not** set the S3 `Content-Encoding` header, so consumers must
     /// decompress explicitly.
@@ -352,22 +353,17 @@ impl S3SinkConfig {
         self
     }
 
-    /// The effective per-object record cap, combining `batch_size` (write-side
-    /// re-chunking) and `max_records_per_file`. `None` means "no record cap".
-    ///
-    /// Lives on the config rather than the sink because the cross-page
-    /// accumulator (#618) needs it at construction time, and the Parquet path
-    /// needs the same number — two definitions would be one drift away from
-    /// objects of different sizes depending on the format.
+    /// The per-object record cap the sink writes with: `max_records_per_file`,
+    /// and without `path` also `batch_size`, whichever is smaller. `None`
+    /// means "no record cap" (also when the config is invalid).
+    #[deprecated(
+        note = "the sink sizes objects from `write_config().settings()`; read `max_records_per_file` there"
+    )]
     pub fn effective_chunk_cap(&self) -> Option<usize> {
-        match (self.batch_size, self.max_records_per_file) {
-            (0, None) => None,
-            (0, Some(0)) => None,
-            (0, Some(max)) => Some(max),
-            (bs, None) => Some(bs),
-            (bs, Some(0)) => Some(bs),
-            (bs, Some(max)) => Some(bs.min(max)),
-        }
+        self.write_config()
+            .settings()
+            .ok()
+            .and_then(|s| s.max_records_per_file)
     }
 
     pub fn max_bytes_per_file(mut self, max: usize) -> Self {
@@ -709,6 +705,7 @@ mod tests {
     /// the four combinations are genuinely different answers and a wrong one
     /// silently changes object size.
     #[test]
+    #[allow(deprecated)]
     fn the_effective_chunk_cap_covers_the_whole_lattice() {
         let base = S3SinkConfig::new("b");
         let with = |bs: usize, max: Option<usize>| {
@@ -725,6 +722,14 @@ mod tests {
         // Both are caps, so the tighter one binds — in either direction.
         assert_eq!(with(100, Some(500)), Some(100));
         assert_eq!(with(500, Some(100)), Some(100));
+        // With `path` the sink ignores `batch_size` (#862 L-165).
+        let mut c = base.clone();
+        c.path = Some("out/part-{part}.jsonl".into());
+        c.batch_size = 100;
+        c.max_records_per_file = Some(500);
+        assert_eq!(c.effective_chunk_cap(), Some(500));
+        c.max_records_per_file = None;
+        assert_eq!(c.effective_chunk_cap(), None);
     }
 
     #[test]
