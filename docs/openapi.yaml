@@ -980,7 +980,9 @@ paths:
       description: >
         Plan → approve → run (#703). Stores a proposed action — `run` (a
         `POST /v1/runs` body), `template_register` (a `POST /v1/templates` body)
-        or `template_launch` (`{ id, version? }`) — with the plan computed now
+        `template_launch` (`{ id, version? }`), `template_delete`
+        (`{ id, version? }`, no version = every version) or `template_deprecate`
+        (`{ id, version, reason?, undo? }`) — with the plan computed now
         (one `faucet plan` report per root row, a material fingerprint, a
         summary), the requester, and an optional budget the approved run must
         honour. Nothing happens until the approvers named by the `approvals:`
@@ -999,7 +1001,7 @@ paths:
               type: object
               required: [kind, payload]
               properties:
-                kind: { type: string, enum: [run, template_register, template_launch] }
+                kind: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] }
                 payload: { type: object, description: "The proposed action, verbatim." }
                 reason: { type: string, description: "Why — shown to the approvers." }
                 budget: { $ref: "#/components/schemas/BudgetSpec" }
@@ -1020,7 +1022,7 @@ paths:
       security: [{ bearerAuth: [] }]
       parameters:
         - { name: status, in: query, required: false, schema: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] } }
-        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch] } }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] } }
         - { name: requester, in: query, required: false, schema: { type: string } }
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 2000 } }
@@ -1997,8 +1999,12 @@ paths:
       summary: Delete a pipeline template
       description: >
         Removes one version (`version` given) or every version of the template.
-        Runs already produced by it are untouched. Requires the
-        `TemplateAdmin` permission (admin).
+        Runs already produced by it are untouched. 409 when the server runs
+        with `--require-approval template_launch` (or `template_delete`) and
+        the delete moves what a request resolves to — a version that was
+        launched, the `newest` version, a channel's target, or the whole
+        template: propose a `template_delete` change with `POST /v1/changes`
+        instead. Requires the `TemplateAdmin` permission (admin).
       operationId: deleteTemplate
       security: [{ bearerAuth: [] }]
       parameters:
@@ -2009,6 +2015,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
   /v1/templates/{id}/tags:
     post:
       summary: Point a named channel at a template version
@@ -2172,8 +2179,11 @@ paths:
         A retired version keeps running when pinned, or when `stable` or a
         channel points at it, and every trigger of it carries a `deprecated`
         field. `newest` skips it and `launch` refuses it. Pass `undo: true` to
-        revive. `version` is a number or a channel name. Requires the
-        `TemplateAdmin` permission (admin) and the `templates` Cargo feature.
+        revive. `version` is a number or a channel name. 409 when the server
+        runs with `--require-approval template_launch` (or
+        `template_deprecate`): propose a `template_deprecate` change with
+        `POST /v1/changes` instead. Requires the `TemplateAdmin` permission
+        (admin) and the `templates` Cargo feature.
       operationId: deprecateTemplateVersion
       security: [{ bearerAuth: [] }]
       parameters:
@@ -2203,6 +2213,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
   /v1/templates/{id}/versions/{version}/test:
     post:
@@ -3212,7 +3223,7 @@ components:
       required: [id, kind, status, requester, requester_role, payload, required_approvals, created_at, updated_at, expires_at]
       properties:
         id: { type: string }
-        kind: { type: string, enum: [run, template_register, template_launch] }
+        kind: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] }
         status: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] }
         requester: { type: string }
         tenant: { type: string, description: "The tenant the proposed run is for (#709)." }

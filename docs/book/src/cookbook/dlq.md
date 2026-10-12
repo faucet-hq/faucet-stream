@@ -251,7 +251,11 @@ A discarded envelope's payload stays in the file. When it must not be kept — P
 that reached the DLQ after a masking mistake, say — add `--purge`: every discarded
 envelope is removed from the file itself (an atomic rewrite), with no archive.
 Run it while nothing writes the DLQ; a file that changes during the rewrite is
-refused rather than losing the new lines.
+refused rather than losing the new lines. An encrypted DLQ (below) is re-sealed
+as it is rewritten — a fresh header and an integrity trailer over the records
+kept, under the current key — so it still opens and the sink can keep
+appending to it; that needs the key (`--encryption-key`), and a file that fails
+its integrity check is refused.
 
 A `file` DLQ that rolls over writes numbered parts. Its configured path reads
 every part — `failed-{part}.jsonl`, or `failed.jsonl` with

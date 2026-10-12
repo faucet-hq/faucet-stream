@@ -576,3 +576,56 @@ async fn a_registered_template_may_use_a_subprocess_connector() {
         .await;
     assert_eq!(code, 202, "{r}");
 }
+
+/// Review of #868 (cli F1–F4, F11): a wildcard segment that can reach a system
+/// tree, a template override without a `type`, a `sql` transform relation and
+/// a partition bound probe are all checked before anything runs, while a sink
+/// or state store may still use a directory that holds a protected file.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_way_a_config_names_a_local_path_is_checked_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = spawn(dir.path(), PRINCIPALS, |_| {}, false).await;
+    let input = csv_input(dir.path());
+    let out = dir.path().join("out.jsonl");
+    let sink = format!(
+        "{{ type: jsonl, config: {{ path: \"{}\" }} }}",
+        out.display()
+    );
+    let refused = [
+        format!(
+            "version: 1\npipeline:\n  source: {{ type: file, config: {{ path: \"/p*/self/environ\", format: raw_text }} }}\n  sink: {sink}\n"
+        ),
+        format!(
+            "version: 1\npipeline:\n  sources:\n    x: {{ type: csv, config: {{ path: in.csv }} }}\n  sinks:\n    o: {sink}\n  nodes:\n    src: {{ kind: source, ref: x, config: {{ path: /proc/self/environ }} }}\n    out: {{ kind: sink, ref: o }}\n  edges:\n    - [src, out]\n"
+        ),
+        format!(
+            "version: 1\npipeline:\n  sources:\n    x: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {sink}\nmatrix:\n  - id: r\n    fan_out:\n      source: {{ ref: x, config: {{ path: /proc/self/environ }} }}\n      select: \"$.id\"\n      as: v\n"
+        ),
+        format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {sink}\n  transforms:\n    - type: sql\n      config:\n        query: \"SELECT * FROM batch, env\"\n        relations:\n          - {{ name: env, source: {{ type: csv, path: /proc/self/environ, has_header: false }} }}\n",
+            input.display()
+        ),
+        format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {sink}\npartition:\n  kind: integer\n  from: 0\n  chunk_size: 10\n  bounds: inclusive\n  to: {{ from_source: {{ type: file, config: {{ path: /proc/self/environ, format: raw_text }} }}, value_path: \"$.nope\" }}\n",
+            input.display()
+        ),
+    ];
+    for config in refused {
+        let (code, err) = api
+            .post("admin-tok", "/v1/runs", json!({"config": config}))
+            .await;
+        assert_eq!(code, 403, "{config}: {err}");
+        assert!(message(&err).contains("may not"), "{err}");
+        assert!(!err.to_string().contains("PATH="), "{err}");
+    }
+
+    let beside = format!(
+        "version: 1\nname: beside\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {sink}\n  state: {{ type: file, config: {{ path: \"{}\" }} }}\n",
+        input.display(),
+        dir.path().display()
+    );
+    let (code, r) = api
+        .post("admin-tok", "/v1/runs", json!({"config": beside}))
+        .await;
+    assert_eq!(code, 202, "a state store beside the auth config: {r}");
+}

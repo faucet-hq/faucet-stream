@@ -346,6 +346,14 @@ pub struct PurgeOutcome {
 /// appending to the DLQ would lose its new lines to the rename. Run it while
 /// nothing writes the DLQ.
 pub fn purge(location: &str) -> CliResult<PurgeOutcome> {
+    purge_with(location, &DlqDecryptor::default())
+}
+
+/// [`purge`] with the keys an encrypted DLQ was sealed with: a file sealed
+/// with whole-file integrity is rewritten and re-sealed under a fresh header
+/// and trailer, so it still verifies for the file source and for the DLQ
+/// sink's next append. Without a key such a file is refused.
+pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome> {
     let files = expand_location(location)?;
     let mut out = PurgeOutcome::default();
     for file in &files {
@@ -363,16 +371,22 @@ pub fn purge(location: &str) -> CliResult<PurgeOutcome> {
         let text = std::fs::read_to_string(file).map_err(|e| {
             CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
         })?;
-        let mut kept = String::with_capacity(text.len());
-        let mut purged = 0usize;
-        for line in text.lines() {
-            if ids.contains(&reader::line_id(line)) {
-                purged += 1;
-            } else {
-                kept.push_str(line);
-                kept.push('\n');
+        let (kept, purged) = match dec.reseal_without(file, &text, &ids)? {
+            Some(rebuilt) => rebuilt,
+            None => {
+                let mut kept = String::with_capacity(text.len());
+                let mut purged = 0usize;
+                for line in text.lines() {
+                    if ids.contains(&reader::line_id(line)) {
+                        purged += 1;
+                    } else {
+                        kept.push_str(line);
+                        kept.push('\n');
+                    }
+                }
+                (kept, purged)
             }
-        }
+        };
         let tmp = file.with_file_name(format!(
             "{}.faucet-purge",
             file.file_name()
@@ -436,6 +450,95 @@ fn append_to(path: &std::path::Path, body: &str) -> CliResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Review of #868 (cli F8): purging an encrypted DLQ file sealed with
+    /// whole-file integrity re-seals it, so it still verifies and can still be
+    /// appended to; without the key, or when the file is damaged, it is refused.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn purge_reseals_an_encrypted_dlq_file() {
+        use faucet_common_file::sealed_lines::{LineSeal, Opened, open, open_for_append};
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut body = String::from_utf8(seal.header(&enc)).unwrap();
+        let mut lines = Vec::new();
+        for text in ["keep-1", "secret", "keep-2"] {
+            let line = String::from_utf8(seal.seal(&enc, text.as_bytes())).unwrap();
+            lines.push(line.trim_end().to_string());
+            body.push_str(&line);
+        }
+        body.push_str(&String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, &body).unwrap();
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id(&lines[1])),
+        )
+        .unwrap();
+        let loc = file.to_str().unwrap();
+
+        let err = purge(loc).unwrap_err().to_string();
+        assert!(
+            err.contains("encrypted") && err.contains("--encryption-key"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "untouched");
+
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        let out = purge_with(loc, &dec).unwrap();
+        assert_eq!((out.purged, out.files_rewritten), (1, 1));
+        let raw = std::fs::read(&file).unwrap();
+        match open(&raw, &enc).unwrap() {
+            Opened::Sealed { plain, .. } => {
+                assert_eq!(String::from_utf8(plain).unwrap(), "keep-1\nkeep-2\n")
+            }
+            other => panic!("expected a verified sealed file, got {other:?}"),
+        }
+        assert!(matches!(
+            open_for_append(&raw, &enc).unwrap(),
+            Opened::Sealed { .. }
+        ));
+        assert!(!String::from_utf8_lossy(&raw).contains(&lines[1]));
+
+        let mut damaged: Vec<&str> = body.lines().collect();
+        damaged.remove(2);
+        let damaged = format!("{}\n", damaged.join("\n"));
+        std::fs::write(&file, &damaged).unwrap();
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id(&lines[0])),
+        )
+        .unwrap();
+        let err = purge_with(loc, &dec).unwrap_err().to_string();
+        assert!(err.contains("can not be purged"), "{err}");
+
+        use base64::Engine as _;
+        let unbound: Vec<String> = ["old-1", "old-2"]
+            .iter()
+            .map(|t| base64::engine::general_purpose::STANDARD.encode(enc.encrypt(t.as_bytes())))
+            .collect();
+        std::fs::write(&file, format!("{}\n{}\n", unbound[0], unbound[1])).unwrap();
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id(&unbound[0])),
+        )
+        .unwrap();
+        let out = purge_with(loc, &dec).unwrap();
+        assert_eq!(
+            out.purged, 1,
+            "a file without a trailer is filtered line by line"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{}\n", unbound[1])
+        );
+    }
 
     #[test]
     fn purge_removes_discarded_lines_from_disk() {

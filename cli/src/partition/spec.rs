@@ -123,6 +123,21 @@ pub struct BoundProbe {
 }
 
 impl PartitionSpec {
+    /// The bound probe this range runs before planning, if it has one.
+    pub fn probe_mut(&mut self) -> Option<&mut BoundProbe> {
+        match self {
+            Self::Integer {
+                to: IntBound::Discovered(p),
+                ..
+            }
+            | Self::Offset {
+                total: CountBound::Discovered(p),
+                ..
+            } => Some(p),
+            _ => None,
+        }
+    }
+
     /// Fail-fast validation, run by `faucet validate` and again before any run.
     /// Range/size errors surface from the planners; this covers what has to be
     /// checked before planning is even attempted.

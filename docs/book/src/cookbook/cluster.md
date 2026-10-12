@@ -393,9 +393,15 @@ How it differs from the other sharders:
 - **No incremental replication on key-range shards:** the ranges of a
   `postgres` / `mysql` / `mssql` / `sqlite` source are re-planned from the
   current `MIN`/`MAX` every run, so a key range can move to a shard whose cursor
-  bookmark is already past a late row. `faucet validate` refuses `shard:` with
-  `replication: { type: incremental }` on those sources while a `state:` block
-  is set.
+  bookmark is already past a late row. `faucet serve --cluster` refuses a
+  `shard: { count: 2+ }` run with `replication: { type: incremental }` on those
+  sources while a `state:` block is set (`422`).
+- **No shared file destination:** every shard of a row runs at once with the
+  same sink config, so a file or object sink would have several writers
+  clobbering each other's files; such a sharded run is refused too. Write to a
+  database or keyed sink instead.
+- `faucet run`, `validate` and `schedule` ignore `shard:` (the config runs as
+  one unsharded invocation), so there these two cases only log a warning.
 - **Rebalancing:** a shard whose owning instance's lease expires is reclaimed by
   the lease loop — requeued to another worker, or poisoned (failed) past
   `--cluster-max-attempts`. New members pick up unassigned/reclaimed shards on

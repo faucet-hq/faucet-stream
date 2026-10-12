@@ -70,8 +70,8 @@ fn template_kind<'a>(
 /// Force `sandbox: true` on every SQL connector the config can build, so a
 /// query loaded by `faucet serve` cannot read or attach host files (#862 H-04).
 /// Templates, row overrides, topology nodes, fan-out sources, the mirror
-/// snapshot and DLQ sinks are all covered; a submitted `sandbox: false` is
-/// overwritten.
+/// snapshot, partition bound probes, `verify.destination` and DLQ sinks are
+/// all covered; a submitted `sandbox: false` is overwritten.
 pub fn confine_sql(cfg: &mut PipelineConfig) {
     let source_kind = |k: &str| SANDBOXED_SOURCE_KINDS.contains(&k);
     let sink_kind = |k: &str| SANDBOXED_SINK_KINDS.contains(&k);
@@ -158,6 +158,21 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         && source_kind(&r.snapshot.source.kind)
     {
         force_sandbox(&mut r.snapshot.source.config);
+    }
+    let probes = cfg
+        .partition
+        .iter_mut()
+        .chain(cfg.matrix.iter_mut().filter_map(|r| r.partition.as_mut()))
+        .filter_map(crate::partition::PartitionSpec::probe_mut);
+    for probe in probes {
+        if source_kind(&probe.from_source.kind) {
+            force_sandbox(&mut probe.from_source.config);
+        }
+    }
+    if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut())
+        && source_kind(&dest.kind)
+    {
+        force_sandbox(&mut dest.config);
     }
 }
 
@@ -370,20 +385,51 @@ fn file_is_protected(path: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Whether reading `path` as data — a file, a directory read recursively, or
-/// a glob (a `${…}` token counts as `*`) — would reach a system tree or a
-/// protected file.
-fn data_path_is_protected(path: &str) -> bool {
-    let pattern = replace_tokens(path);
-    let Some(glob_at) = pattern.find(['*', '?', '[']) else {
-        let normalized = normalize_path(std::path::Path::new(path));
-        return in_system_dir(std::path::Path::new(path))
-            || in_system_dir(&normalized)
-            || protected_files(|f| f.starts_with(&normalized));
+/// How a connector touches a local path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Reads it: a file, a directory's files (all of them when `recursive`),
+    /// or a glob's matches.
+    Read { recursive: bool },
+    /// Writes the file it names (a `{…}` segment is a template).
+    Write,
+}
+
+/// Upper bound on the existing glob matches checked for a symlink into a
+/// protected location when a config is loaded.
+const GLOB_CHECK_LIMIT: usize = 10_000;
+
+/// Whether reading or writing `path` — a file, a directory, or a glob (a
+/// `${…}` token counts as `*`) — would reach a system tree or a protected
+/// file.
+fn data_path_is_protected(path: &str, access: Access) -> bool {
+    let pattern = match access {
+        Access::Read { .. } => replace_tokens(path),
+        Access::Write => replace_templates(&replace_tokens(path)),
     };
+    if !pattern.contains(['*', '?', '[']) {
+        let raw = std::path::Path::new(path);
+        let normalized = normalize_path(raw);
+        if in_system_dir(raw) || in_system_dir(&normalized) {
+            return true;
+        }
+        return protected_files(|f| match access {
+            Access::Write => f == normalized,
+            Access::Read { recursive } => {
+                f == normalized
+                    || f.parent() == Some(normalized.as_path())
+                    || (recursive && f.starts_with(&normalized))
+            }
+        });
+    }
+    glob_is_protected(&pattern, access)
+}
+
+fn glob_is_protected(pattern: &str, access: Access) -> bool {
+    let glob_at = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
     let (dir, rest) = match pattern[..glob_at].rfind('/') {
         Some(slash) => (&pattern[..slash.max(1)], &pattern[slash + 1..]),
-        None => (".", pattern.as_str()),
+        None => (".", pattern),
     };
     if rest.split('/').any(|c| c == "..") {
         return true;
@@ -393,10 +439,69 @@ fn data_path_is_protected(path: &str) -> bool {
         return true;
     }
     let full = format!("{}/{rest}", dir.display().to_string().trim_end_matches('/'));
-    match glob::Pattern::new(&full) {
+    if pattern_can_reach_system_dir(&full)
+        || (pattern.starts_with('/') && pattern_can_reach_system_dir(pattern))
+    {
+        return true;
+    }
+    let hit = match glob::Pattern::new(&full) {
         Ok(p) => protected_files(|f| p.matches_path(f)),
         Err(_) => protected_files(|f| f.starts_with(&dir)),
+    };
+    hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&full))
+}
+
+/// Whether an absolute glob pattern could match a path in a system tree,
+/// compared segment by segment (`**` spans any number of segments).
+fn pattern_can_reach_system_dir(pattern: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    SYSTEM_DIRS.iter().any(|d| {
+        let target: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
+        segments_can_reach(&segments, &target)
+    })
+}
+
+fn segments_can_reach(pattern: &[&str], target: &[&str]) -> bool {
+    let Some((first, tail)) = target.split_first() else {
+        return true;
+    };
+    let Some((p, rest)) = pattern.split_first() else {
+        return false;
+    };
+    if *p == "**" {
+        return segments_can_reach(rest, target) || segments_can_reach(pattern, tail);
     }
+    let matches = glob::Pattern::new(p).map_or(true, |g| g.matches(first));
+    matches && segments_can_reach(rest, tail)
+}
+
+/// Whether an existing match of `pattern` resolves (through a symlink) into a
+/// system tree or onto a protected file.
+fn glob_match_escapes(pattern: &str) -> bool {
+    let Ok(matches) = glob::glob(pattern) else {
+        return false;
+    };
+    matches
+        .take(GLOB_CHECK_LIMIT)
+        .filter_map(Result::ok)
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .any(|real| in_system_dir(&real) || protected_files(|f| f == real))
+}
+
+/// Replace `{…}` path-template segments (a file sink's `{part}`) with `*`.
+fn replace_templates(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        out.push('*');
+        rest = match rest[start..].find('}') {
+            Some(end) => &rest[start + end + 1..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
 }
 
 fn replace_tokens(path: &str) -> String {
@@ -503,8 +608,14 @@ fn local_path(value: &str) -> Option<&str> {
 /// values come from the clock or the config itself, never from records.
 const STATIC_PATH_TOKENS: &[&str] = &["now", "backfill", "partition"];
 
-fn check_local_paths(config: &Value, caller: bool, found: &mut Vec<String>) {
-    fn walk(v: &Value, under_path_key: bool, caller: bool, found: &mut Vec<String>) {
+fn check_local_paths(config: &Value, access: Access, caller: bool, found: &mut Vec<String>) {
+    fn walk(
+        v: &Value,
+        under_path_key: bool,
+        access: Access,
+        caller: bool,
+        found: &mut Vec<String>,
+    ) {
         match v {
             Value::String(s) if under_path_key => {
                 let Some(path) = local_path(s) else {
@@ -524,48 +635,183 @@ fn check_local_paths(config: &Value, caller: bool, found: &mut Vec<String>) {
                         return;
                     }
                 }
-                if data_path_is_protected(path) {
+                if data_path_is_protected(path, access) {
                     found.push(s.clone());
                 }
             }
             Value::Array(items) => items
                 .iter()
-                .for_each(|i| walk(i, under_path_key, caller, found)),
+                .for_each(|i| walk(i, under_path_key, access, caller, found)),
             Value::Object(map) => {
                 for (k, child) in map {
-                    walk(child, is_path_key(k), caller, found);
+                    walk(child, is_path_key(k), access, caller, found);
                 }
             }
             _ => {}
         }
     }
-    walk(config, false, caller, found);
+    let access = match access {
+        Access::Read { .. } => Access::Read {
+            recursive: config.get("recursive").and_then(Value::as_bool) == Some(true),
+        },
+        Access::Write => Access::Write,
+    };
+    walk(config, false, access, caller, found);
 }
 
-/// Local paths in `doc` (any `{type, config}` of a [`LOCAL_PATH_KINDS`] kind)
-/// that would read or write a system tree or a server credential file.
+/// The access a document position implies: under a `sink` / `sinks` / `dlq` /
+/// `state` key (or a topology node of `kind: sink`) a connector writes;
+/// anywhere else it reads.
+fn access_under(key: &str, inherited: Access) -> Access {
+    match key {
+        "sink" | "sinks" | "dlq" | "state" => Access::Write,
+        "source" | "sources" | "snapshot" | "from_source" | "destination" | "relations" => {
+            Access::Read { recursive: false }
+        }
+        _ => inherited,
+    }
+}
+
+/// Local paths in `doc` — any `{type, config}` of a [`LOCAL_PATH_KINDS`] kind,
+/// and the file-backed relations of a `sql` transform — that would read or
+/// write a system tree or a server credential file.
 pub fn server_data_paths(doc: &Value, caller: bool) -> Vec<String> {
-    fn walk(v: &Value, caller: bool, found: &mut Vec<String>) {
+    fn walk(v: &Value, access: Access, caller: bool, found: &mut Vec<String>) {
         match v {
             Value::Object(map) => {
-                if let (Some(Value::String(t)), Some(cfg)) = (map.get("type"), map.get("config"))
-                    && LOCAL_PATH_KINDS.contains(&t.as_str())
-                {
-                    check_local_paths(cfg, caller, found);
+                let access = match map.get("kind").and_then(Value::as_str) {
+                    Some("sink") => Access::Write,
+                    Some("source") => Access::Read { recursive: false },
+                    _ => access,
+                };
+                match (map.get("type").and_then(Value::as_str), map.get("config")) {
+                    (Some(t), Some(cfg)) if LOCAL_PATH_KINDS.contains(&t) => {
+                        check_local_paths(cfg, access, caller, found);
+                    }
+                    (Some("csv" | "jsonl"), None) => {
+                        if let Some(path) = map.get("path") {
+                            let wrapped = serde_json::json!({ "path": path });
+                            check_local_paths(&wrapped, access, caller, found);
+                        }
+                    }
+                    _ => {}
                 }
-                map.values().for_each(|c| walk(c, caller, found));
+                for (k, c) in map {
+                    walk(c, access_under(k, access), caller, found);
+                }
             }
-            Value::Array(items) => items.iter().for_each(|c| walk(c, caller, found)),
+            Value::Array(items) => items.iter().for_each(|c| walk(c, access, caller, found)),
             _ => {}
         }
     }
     let mut found = Vec::new();
-    walk(doc, caller, &mut found);
+    walk(doc, Access::Read { recursive: false }, caller, &mut found);
     found
 }
 
+fn template_spec<'a>(
+    templates: &'a std::collections::HashMap<String, crate::config::ConnectorSpec>,
+    legacy: &'a Option<crate::config::ConnectorSpec>,
+    name: Option<&str>,
+) -> Option<&'a crate::config::ConnectorSpec> {
+    let name = name.unwrap_or("default");
+    templates.get(name).or(if name == "default" {
+        legacy.as_ref()
+    } else {
+        None
+    })
+}
+
+/// The connector a template override builds: its kind (the override's, else
+/// the template's) and the template config with the override merged over it.
+fn resolve_override(
+    templates: &std::collections::HashMap<String, crate::config::ConnectorSpec>,
+    legacy: &Option<crate::config::ConnectorSpec>,
+    name: Option<&str>,
+    kind: Option<&str>,
+    config: Option<&Value>,
+) -> Option<(String, Value)> {
+    let template = template_spec(templates, legacy, name);
+    let kind = kind.or(template.map(|t| t.kind.as_str()))?.to_string();
+    let mut merged = template
+        .map(|t| t.config.clone())
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    if let Some(over) = config {
+        crate::merge::merge_value(&mut merged, over.clone());
+    }
+    Some((kind, merged))
+}
+
+/// The connectors a config builds from a template override — matrix-row
+/// `source` / `sink` / `fan_out.source` and topology `source` / `sink`
+/// nodes — resolved against their template, with the access each implies.
+fn override_connectors(cfg: &PipelineConfig) -> Vec<(String, Value, Access)> {
+    let p = &cfg.pipeline;
+    let read = Access::Read { recursive: false };
+    let mut out = Vec::new();
+    for node in p.nodes.values() {
+        let resolved = match node {
+            crate::config::NodeSpec::Source {
+                template,
+                kind,
+                config,
+            } => resolve_override(
+                &p.sources,
+                &p.source,
+                template.as_deref(),
+                kind.as_deref(),
+                config.as_ref(),
+            )
+            .map(|(k, c)| (k, c, read)),
+            crate::config::NodeSpec::Sink {
+                template,
+                kind,
+                config,
+            } => resolve_override(
+                &p.sinks,
+                &p.sink,
+                template.as_deref(),
+                kind.as_deref(),
+                config.as_ref(),
+            )
+            .map(|(k, c)| (k, c, Access::Write)),
+            _ => None,
+        };
+        out.extend(resolved);
+    }
+    for row in &cfg.matrix {
+        let no_templates = Default::default();
+        let discover = row.discover.as_ref().map(|d| &d.source);
+        let discover_templates = match discover {
+            Some(d) if d.r#ref.is_none() => &no_templates,
+            _ => &p.sources,
+        };
+        let overrides = [
+            (row.source.as_ref(), &p.sources, &p.source, read),
+            (discover, discover_templates, &None, read),
+            (row.sink.as_ref(), &p.sinks, &p.sink, Access::Write),
+        ];
+        for (over, templates, legacy, access) in overrides {
+            let Some(over) = over else { continue };
+            out.extend(
+                resolve_override(
+                    templates,
+                    legacy,
+                    over.r#ref.as_deref(),
+                    over.kind.as_deref(),
+                    over.config.as_ref(),
+                )
+                .map(|(k, c)| (k, c, access)),
+            );
+        }
+    }
+    out
+}
+
 /// Refuse a config whose local-file connectors, state store or DLQ point at
-/// a system tree or a file the server keeps its credentials in.
+/// a system tree or a file the server keeps its credentials in. Run it before
+/// anything in the config executes (bound probes, discovery) and again over
+/// the expanded rows.
 pub fn refuse_server_paths(
     cfg: &PipelineConfig,
     nodes: &[ExpandedNode],
@@ -576,19 +822,23 @@ pub fn refuse_server_paths(
         Ok(doc) => server_data_paths(&doc, caller),
         Err(e) => return Err(ServeError::Internal(format!("serializing config: {e}"))),
     };
-    let mut check = |kind: &str, config: &Value| {
+    let mut check = |kind: &str, config: &Value, access: Access| {
         if LOCAL_PATH_KINDS.contains(&kind) {
-            check_local_paths(config, caller, &mut found);
+            check_local_paths(config, access, caller, &mut found);
         }
     };
+    let read = Access::Read { recursive: false };
+    for (kind, config, access) in override_connectors(cfg) {
+        check(&kind, &config, access);
+    }
     for n in nodes {
-        check(&n.source.kind, &n.source.config);
-        check(&n.sink.kind, &n.sink.config);
+        check(&n.source.kind, &n.source.config, read);
+        check(&n.sink.kind, &n.sink.config, Access::Write);
         if let Some(st) = &n.state {
-            check(&st.kind, &st.config);
+            check(&st.kind, &st.config, Access::Write);
         }
         if let Some(d) = &n.dlq {
-            check(&d.sink.kind, &d.sink.config);
+            check(&d.sink.kind, &d.sink.config, Access::Write);
         }
     }
     if found.is_empty() {
@@ -953,6 +1203,7 @@ pub async fn load_submission_scoped(
     // materializes into one row per object at trigger time. This is the one
     // network call in the submit path, so it runs under a hard timeout — a
     // hung upstream describe endpoint must not wedge `POST /v1/runs`.
+    refuse_server_paths(&cfg, &[], origin)?;
     let auth =
         build_catalog(tenant.as_deref(), &cfg).map_err(|e| ServeError::BadConfig(e.to_string()))?;
     tokio::time::timeout(
@@ -1402,6 +1653,10 @@ schedule:
         assert!(file_is_protected(&format!("{}-wal", db.display())));
     }
 
+    fn read_protected(path: &str) -> bool {
+        data_path_is_protected(path, Access::Read { recursive: false })
+    }
+
     #[test]
     fn local_paths_and_globs_that_reach_protected_files_are_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -1414,33 +1669,27 @@ schedule:
         std::fs::create_dir(&data).unwrap();
         let d = dir.path().display();
 
-        assert!(data_path_is_protected("/proc/self/environ"));
-        assert!(data_path_is_protected("/sys/kernel"));
-        assert!(data_path_is_protected("/dev/stdin"));
-        assert!(!data_path_is_protected("/dev/null"));
-        assert!(data_path_is_protected(&auth.display().to_string()));
-        assert!(data_path_is_protected(&format!(
-            "{d}/data/../etc/auth.yaml"
-        )));
+        assert!(read_protected("/proc/self/environ"));
+        assert!(read_protected("/sys/kernel"));
+        assert!(read_protected("/dev/stdin"));
+        assert!(!read_protected("/dev/null"));
+        assert!(read_protected(&auth.display().to_string()));
+        assert!(read_protected(&format!("{d}/data/../etc/auth.yaml")));
         assert!(
-            data_path_is_protected(&format!("{d}/etc")),
+            read_protected(&format!("{d}/etc")),
             "a directory holding one"
         );
-        assert!(data_path_is_protected(&format!("{d}/etc/*.yaml")));
+        assert!(read_protected(&format!("{d}/etc/*.yaml")));
         assert!(
-            data_path_is_protected(&format!("{d}/*")),
+            read_protected(&format!("{d}/*")),
             "a glob that recurses into it"
         );
-        assert!(data_path_is_protected(&format!(
-            "{d}/data/*/../../etc/auth.yaml"
-        )));
-        assert!(data_path_is_protected(&format!(
-            "{d}/etc/${{now.date}}.yaml"
-        )));
-        assert!(!data_path_is_protected(&format!("{d}/data/in.csv")));
-        assert!(!data_path_is_protected(&format!("{d}/data/*.csv")));
-        assert!(!data_path_is_protected(&format!("{d}/etc/*.csv")));
-        assert!(!data_path_is_protected(&format!(
+        assert!(read_protected(&format!("{d}/data/*/../../etc/auth.yaml")));
+        assert!(read_protected(&format!("{d}/etc/${{now.date}}.yaml")));
+        assert!(!read_protected(&format!("{d}/data/in.csv")));
+        assert!(!read_protected(&format!("{d}/data/*.csv")));
+        assert!(!read_protected(&format!("{d}/etc/*.csv")));
+        assert!(!read_protected(&format!(
             "{d}/data/dt=${{now.date}}/x.jsonl"
         )));
 
@@ -1472,6 +1721,166 @@ schedule:
         assert!(server_data_paths(&caller, false).is_empty());
         let clock = json!({"type": "jsonl", "config": {"path": "out/${now.date}.jsonl"}});
         assert!(server_data_paths(&clock, true).is_empty());
+    }
+
+    #[test]
+    fn a_wildcard_in_any_segment_that_can_reach_a_system_tree_is_refused() {
+        for glob in [
+            "/p*/self/environ",
+            "/*/self/environ",
+            "/**/environ",
+            "/[p]roc/self/environ",
+            "/pro?/self/environ",
+            "/[/x",
+            "/${x}/self/environ",
+        ] {
+            assert!(read_protected(glob), "{glob}");
+        }
+        assert!(segments_can_reach(&["**", "x"], &["proc"]));
+        assert!(segments_can_reach(&["proc"], &["proc"]));
+        assert!(!segments_can_reach(&[], &["proc"]));
+        assert!(!segments_can_reach(&["data", "*"], &["proc"]));
+        assert!(!pattern_can_reach_system_dir("/data/*/x.csv"));
+        assert!(!read_protected("/no-such-faucet-dir/*/x.csv"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_glob_match_that_is_a_symlink_into_a_system_tree_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join("link")).unwrap();
+        std::fs::write(dir.path().join("plain.csv"), "a\n").unwrap();
+        let d = dir.path().display();
+        assert!(read_protected(&format!("{d}/l*")));
+        assert!(!read_protected(&format!("{d}/*.csv")));
+        assert!(
+            !data_path_is_protected(&format!("{d}/l*"), Access::Write),
+            "a sink path is never expanded"
+        );
+    }
+
+    #[test]
+    fn writing_beside_a_protected_file_is_allowed_but_reading_it_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let db = deep.join("history.db");
+        std::fs::write(&db, "x").unwrap();
+        protect_file(&db);
+        let d = dir.path().display();
+        let b = deep.display();
+        let write = |p: &str| data_path_is_protected(p, Access::Write);
+        assert!(write(&db.display().to_string()));
+        assert!(
+            write(&format!("{b}/{{part}}.db")),
+            "a template that can name it"
+        );
+        assert!(!write(&b.to_string()), "a state store directory holding it");
+        assert!(!write(&format!("{b}/out.jsonl")));
+        assert!(read_protected(&b.to_string()), "a listing of its directory");
+        assert!(!read_protected(&format!("{d}/a")), "a listing one level up");
+        assert!(data_path_is_protected(
+            &format!("{d}/a"),
+            Access::Read { recursive: true }
+        ));
+        assert_eq!(replace_templates("x/{part}/y{z"), "x/*/y*");
+
+        let state =
+            json!({"pipeline": {"state": {"type": "file", "config": {"path": b.to_string()}}}});
+        assert!(server_data_paths(&state, true).is_empty());
+        let recursive = json!({"pipeline": {"source": {"type": "file", "config": {"path": format!("{d}/a"), "recursive": true}}}});
+        assert_eq!(server_data_paths(&recursive, true).len(), 1);
+        let node = json!({"pipeline": {"nodes": {"out": {"kind": "sink", "type": "file", "config": {"path": b.to_string()}}}}});
+        assert!(server_data_paths(&node, true).is_empty());
+    }
+
+    #[test]
+    fn sql_transform_relations_are_path_checked() {
+        let doc = json!({"pipeline": {"transforms": [{"type": "sql", "config": {
+        "query": "SELECT * FROM batch, env",
+        "relations": [
+            {"name": "env", "source": {"type": "csv", "path": "/proc/self/environ", "has_header": false}},
+            {"name": "j", "source": {"type": "jsonl", "path": "/sys/x"}},
+            {"name": "v", "source": {"type": "values", "columns": ["a"], "rows": [[1]]}}
+        ]}}]}});
+        let found = server_data_paths(&doc, true);
+        assert_eq!(found, vec!["/proc/self/environ", "/sys/x"]);
+    }
+
+    fn cfg_of(yaml: &str) -> PipelineConfig {
+        PipelineConfig::from_value(serde_yaml::from_str(yaml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn template_overrides_without_a_type_are_checked_against_the_template_kind() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let topology = cfg_of(
+            "version: 1\npipeline:\n  sources:\n    x: { type: csv, config: { path: in.csv } }\n  sinks:\n    o: { type: jsonl, config: { path: out.jsonl } }\n  nodes:\n    src: { kind: source, ref: x, config: { path: /proc/self/environ } }\n    out: { kind: sink, ref: o }\n  edges:\n    - [src, out]\n",
+        );
+        let err = refuse_server_paths(&topology, &[], caller).unwrap_err();
+        assert!(message(&err).contains("/proc/self/environ"), "{err:?}");
+
+        let fan_out = cfg_of(
+            "version: 1\npipeline:\n  sources:\n    x: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\nmatrix:\n  - id: r\n    fan_out:\n      source: { ref: x, config: { path: /sys/kernel } }\n      select: \"$.id\"\n      as: v\n  - id: standalone\n    fan_out:\n      source: { type: file, config: { path: /dev/stdin } }\n      select: \"$.id\"\n      as: w\n",
+        );
+        let err = refuse_server_paths(&fan_out, &[], caller).unwrap_err();
+        assert!(message(&err).contains("/sys/kernel"), "{err:?}");
+        assert!(message(&err).contains("/dev/stdin"), "{err:?}");
+
+        let retyped = cfg_of(
+            "version: 1\npipeline:\n  sources:\n    x: { type: rest, config: { path: /proc/self/environ } }\n  sink: { type: stdout, config: {} }\nmatrix:\n  - id: r\n    source: { ref: x, type: file }\n",
+        );
+        assert!(refuse_server_paths(&retyped, &[], caller).is_err());
+
+        let sink = cfg_of(
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sinks:\n    o: { type: jsonl, config: { path: out.jsonl } }\nmatrix:\n  - id: r\n    sink: { ref: o, config: { path: /dev/stdout } }\n",
+        );
+        assert!(refuse_server_paths(&sink, &[], caller).is_err());
+
+        let fine = cfg_of(
+            "version: 1\npipeline:\n  sources:\n    x: { type: rest, config: { url: \"http://h\", path: /users } }\n  sink: { type: stdout, config: {} }\nmatrix:\n  - id: r\n    source: { ref: x, config: { path: \"/users/${now.date}\" } }\n  - id: missing\n    source: { ref: nope, config: { path: /proc/x } }\n",
+        );
+        assert!(refuse_server_paths(&fine, &[], caller).is_ok());
+    }
+
+    #[test]
+    fn bound_probes_and_the_verify_destination_are_sandboxed() {
+        let mut cfg = cfg_of(
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\npartition:\n  kind: integer\n  from: 0\n  chunk_size: 10\n  bounds: inclusive\n  to: { from_source: { type: duckdb, config: { database: \":memory:\", query: \"SELECT 1 AS m\" } }, value_path: \"$.m\" }\nverify:\n  key: [id]\n  destination: { type: sqlite, config: { database: x.db, query: \"SELECT 1\" } }\nmatrix:\n  - id: r\n    partition:\n      kind: offset\n      chunk_size: 10\n      total: { from_source: { type: sqlite, config: { database: x.db, query: \"SELECT 1 AS n\" } }, value_path: \"$.n\" }\n  - id: plain\n    partition: { kind: integer, from: 0, to: 5, chunk_size: 1, bounds: inclusive }\n",
+        );
+        confine_sql(&mut cfg);
+        let top = cfg.partition.as_mut().and_then(|p| p.probe_mut()).unwrap();
+        assert_eq!(top.from_source.config["sandbox"], true);
+        let row = cfg.matrix[0]
+            .partition
+            .as_mut()
+            .and_then(|p| p.probe_mut())
+            .unwrap();
+        assert_eq!(row.from_source.config["sandbox"], true);
+        assert!(
+            cfg.matrix[1]
+                .partition
+                .as_mut()
+                .unwrap()
+                .probe_mut()
+                .is_none()
+        );
+        let dest = cfg.verify.as_ref().unwrap().destination.as_ref().unwrap();
+        assert_eq!(dest.config["sandbox"], true);
+    }
+
+    #[tokio::test]
+    async fn a_probe_reading_a_protected_path_is_refused_before_it_runs() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let body = "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\npartition:\n  kind: integer\n  from: 0\n  chunk_size: 10\n  bounds: inclusive\n  to: { from_source: { type: file, config: { path: /proc/self/environ, format: raw_text } }, value_path: \"$.nope\" }\n";
+        let err = load_submission(body, ConfigFormat::Yaml, None, None, caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
     }
 
     #[tokio::test]

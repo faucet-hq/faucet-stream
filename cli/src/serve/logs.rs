@@ -423,6 +423,13 @@ async fn persist_writer(
                 line,
                 attrs,
             } => {
+                if !runs.contains_key(&run_id)
+                    && let Err(e) = history
+                        .log_ship_writer_mark(&run_id, seq.saturating_sub(1))
+                        .await
+                {
+                    tracing::warn!(run_id, error = %e, "registering the run-log writer failed");
+                }
                 let st = runs.entry(run_id.clone()).or_default();
                 if st.persisted >= cap {
                     if !st.truncated {
@@ -669,6 +676,7 @@ mod tests {
     struct DropCounter {
         fail_inserts: bool,
         dropped: std::sync::Mutex<HashMap<String, u64>>,
+        marks: std::sync::Mutex<Vec<(String, u64)>>,
     }
 
     #[async_trait::async_trait]
@@ -743,9 +751,48 @@ mod tests {
                 .or_default() += n;
             Ok(())
         }
+        async fn log_ship_writer_mark(
+            &self,
+            run_id: &str,
+            through: u64,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.marks.lock().unwrap().push((run_id.into(), through));
+            Ok(())
+        }
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    /// Review of #868 (cli F5): a writer registers its watermark when it first
+    /// sees a run, before its first batch reaches the store, so a first batch
+    /// that lands late is still ahead of what the shipper acknowledges.
+    #[tokio::test]
+    async fn a_writer_registers_its_watermark_before_its_first_batch() {
+        let history = Arc::new(DropCounter {
+            fail_inserts: true,
+            ..Default::default()
+        });
+        let hub = LogHub::new();
+        hub.enable_persistence(history.clone(), 100);
+        let before = (chrono::Utc::now().timestamp_micros() as u64) << 12;
+        hub.capture("r1", "INFO", "t".into(), "first".into());
+        let mut first = None;
+        for _ in 0..100 {
+            first = history.marks.lock().unwrap().first().cloned();
+            if first.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (run, through) = first.expect("the writer registered the run");
+        assert_eq!(run, "r1");
+        assert!(
+            through + 1 >= before,
+            "registered just below the first line"
+        );
+        hub.shutdown_persistence(std::time::Duration::from_secs(5))
+            .await;
     }
 
     #[test]

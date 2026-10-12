@@ -1110,6 +1110,14 @@ pub async fn submit(
     // At-least-once duplicate-write warning for clustered / source-sharded runs
     // with an append-mode destination (F26/F39).
     let sharded = loaded.cfg.shard.as_ref().is_some_and(|s| s.count >= 2);
+    if sharded && state.cluster().enabled() {
+        crate::expand::check_sharding(&loaded.cfg, &loaded.nodes).map_err(|e| {
+            ServeError::Unprocessable {
+                message: e.to_string(),
+                details: None,
+            }
+        })?;
+    }
     warn_if_cluster_at_least_once(&loaded, state.cluster().enabled(), sharded);
 
     // Completion-callback validation (#481) — before the queue reservation, so a

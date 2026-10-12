@@ -132,6 +132,37 @@ impl DlqDecryptor {
         false
     }
 
+    /// The lines of `text` without those whose id is in `drop`, when `text`
+    /// is a DLQ file sealed with whole-file integrity: the kept records are
+    /// re-sealed under a fresh header and trailer (with the current key), so
+    /// the rewritten file still verifies. `None` for a file whose lines are
+    /// not sealed this way, which can be filtered line by line. A sealed file
+    /// needs a key, and one that fails its integrity check is refused.
+    pub fn reseal_without(
+        &self,
+        file: &Path,
+        text: &str,
+        drop: &std::collections::HashSet<String>,
+    ) -> Result<Option<(String, usize)>, FaucetError> {
+        let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+            return Ok(None);
+        };
+        if !first.starts_with(SEALED_LINE_PREFIX) {
+            return Ok(None);
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            return reseal(enc, file, text, drop);
+        }
+        #[cfg(not(feature = "encryption"))]
+        let _ = drop;
+        Err(FaucetError::Config(format!(
+            "DLQ file '{}' is encrypted; purging it rewrites its integrity trailer, which \
+             needs the key (--encryption-key, or the config's dlq `encryption` block)",
+            file.display()
+        )))
+    }
+
     fn decode(&self, line: &str) -> LineDecode {
         let trimmed = line.trim();
         if !trimmed.starts_with(SEALED_LINE_PREFIX) {
@@ -161,6 +192,48 @@ impl DlqDecryptor {
         // build): report it as encrypted rather than malformed.
         LineDecode::Undecryptable
     }
+}
+
+#[cfg(feature = "encryption")]
+fn reseal(
+    enc: &faucet_core::CompiledEncryption,
+    file: &Path,
+    text: &str,
+    drop: &std::collections::HashSet<String>,
+) -> Result<Option<(String, usize)>, FaucetError> {
+    use base64::Engine as _;
+    use faucet_common_file::sealed_lines::{LineSeal, Opened, open};
+    let damaged = |why: String| {
+        FaucetError::Source(format!(
+            "DLQ file '{}' can not be purged: {why}",
+            file.display()
+        ))
+    };
+    match open(text.as_bytes(), enc).map_err(|e| damaged(e.to_string()))? {
+        Opened::Sealed { .. } => {}
+        Opened::Legacy { .. } | Opened::Empty => return Ok(None),
+    }
+    let mut seal = LineSeal::new();
+    let mut out = String::from_utf8_lossy(&seal.header(enc)).into_owned();
+    let mut purged = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if drop.contains(&line_id(line)) {
+            purged += 1;
+            continue;
+        }
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(line.trim())
+            .map_err(|e| damaged(format!("a line is not base64: {e}")))?;
+        match enc.open_line(&sealed) {
+            Ok(faucet_core::SealedLine::Data(plain)) => {
+                out.push_str(&String::from_utf8_lossy(&seal.seal(enc, &plain)));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(damaged(e.to_string())),
+        }
+    }
+    out.push_str(&String::from_utf8_lossy(&seal.trailer(enc)));
+    Ok(Some((out, purged)))
 }
 
 /// A pre-built source attached to a single [`ExpandedNode`](crate::expand::ExpandedNode)

@@ -478,7 +478,7 @@ for the full walkthrough.
 #### Change approvals (`--require-approval`)
 
 `POST /v1/changes` stores a proposed `run` / `template_register` /
-`template_launch` with its plan and runs it only once the approvers named by
+`template_launch` / `template_delete` / `template_deprecate` with its plan and runs it only once the approvers named by
 the `approvals:` block of `--auth-config` approve it (#703). faucet re-plans
 at approval and refuses to run a change whose plan moved underneath the
 approver (`invalidated`). `faucet serve --require-approval run` turns every

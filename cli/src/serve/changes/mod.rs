@@ -54,13 +54,21 @@ pub enum ChangeKind {
     TemplateRegister,
     /// Launch a template version (`POST /v1/templates/{id}/launch`).
     TemplateLaunch,
+    /// Delete a template or one of its versions
+    /// (`DELETE /v1/templates/{id}[?version=]`).
+    TemplateDelete,
+    /// Retire or revive one template version
+    /// (`POST /v1/templates/{id}/versions/{version}/deprecate`).
+    TemplateDeprecate,
 }
 
 impl ChangeKind {
-    pub const ALL: [ChangeKind; 3] = [
+    pub const ALL: [ChangeKind; 5] = [
         ChangeKind::Run,
         ChangeKind::TemplateRegister,
         ChangeKind::TemplateLaunch,
+        ChangeKind::TemplateDelete,
+        ChangeKind::TemplateDeprecate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -68,7 +76,20 @@ impl ChangeKind {
             ChangeKind::Run => "run",
             ChangeKind::TemplateRegister => "template_register",
             ChangeKind::TemplateLaunch => "template_launch",
+            ChangeKind::TemplateDelete => "template_delete",
+            ChangeKind::TemplateDeprecate => "template_deprecate",
         }
+    }
+
+    /// The kind whose `--require-approval` and approval rule also govern this
+    /// one: deleting or retiring a version moves what callers resolve to, as a
+    /// launch does.
+    pub fn governed_by(self) -> Option<ChangeKind> {
+        matches!(
+            self,
+            ChangeKind::TemplateDelete | ChangeKind::TemplateDeprecate
+        )
+        .then_some(ChangeKind::TemplateLaunch)
     }
 }
 
@@ -79,8 +100,11 @@ impl FromStr for ChangeKind {
             "run" => Ok(ChangeKind::Run),
             "template_register" | "template-register" => Ok(ChangeKind::TemplateRegister),
             "template_launch" | "template-launch" => Ok(ChangeKind::TemplateLaunch),
+            "template_delete" | "template-delete" => Ok(ChangeKind::TemplateDelete),
+            "template_deprecate" | "template-deprecate" => Ok(ChangeKind::TemplateDeprecate),
             other => Err(format!(
-                "unknown change kind `{other}` (expected run, template_register or template_launch)"
+                "unknown change kind `{other}` (expected run, template_register, \
+                 template_launch, template_delete or template_deprecate)"
             )),
         }
     }
@@ -338,6 +362,29 @@ pub struct LaunchPayload {
     pub version: Option<crate::serve::history::templates::VersionSelector>,
 }
 
+/// Executing a `template_delete` request needs this: the template, and the
+/// version to remove (every version when absent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletePayload {
+    pub id: String,
+    #[cfg(feature = "templates")]
+    #[serde(default)]
+    pub version: Option<crate::serve::history::templates::VersionSelector>,
+}
+
+/// Executing a `template_deprecate` request needs this: the version to
+/// retire (or, with `undo`, revive) and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeprecatePayload {
+    pub id: String,
+    #[cfg(feature = "templates")]
+    pub version: crate::serve::history::templates::VersionSelector,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub undo: bool,
+}
+
 fn store_err(e: HistoryError) -> ServeError {
     ServeError::from_history("change store", e)
 }
@@ -591,6 +638,98 @@ async fn plan_template_launch(
 }
 
 #[cfg(feature = "templates")]
+async fn existing_state(
+    state: &ServerState,
+    id: &str,
+) -> Result<crate::serve::history::templates::TemplateState, ServeError> {
+    let st = crate::templates::template_state(&state.history(), id)
+        .await
+        .map_err(template_err)?;
+    if st.versions.is_empty() {
+        return Err(ServeError::NotFound);
+    }
+    Ok(st)
+}
+
+#[cfg(feature = "templates")]
+async fn resolve_existing(
+    state: &ServerState,
+    id: &str,
+    st: &crate::serve::history::templates::TemplateState,
+    selector: crate::serve::history::templates::VersionSelector,
+) -> Result<u32, ServeError> {
+    let version = crate::templates::resolve_version(&state.history(), id, selector)
+        .await
+        .map_err(template_err)?;
+    if !st.versions.contains(&version) {
+        return Err(ServeError::Unprocessable {
+            message: format!("template '{id}' has no version {version}"),
+            details: None,
+        });
+    }
+    Ok(version)
+}
+
+#[cfg(feature = "templates")]
+async fn plan_template_delete(
+    state: &ServerState,
+    payload: &DeletePayload,
+) -> Result<ChangePlan, ServeError> {
+    let st = existing_state(state, &payload.id).await?;
+    let target = match payload.version {
+        Some(sel) => Some(resolve_existing(state, &payload.id, &st, sel).await?),
+        None => None,
+    };
+    let removes: Vec<u32> = match target {
+        Some(v) => vec![v],
+        None => st.versions.clone(),
+    };
+    Ok(ChangePlan {
+        material: sha_hex(&format!(
+            "delete\n{}\n{:?}\n{:?}",
+            payload.id, removes, st.stable
+        )),
+        summary: json!({
+            "template": payload.id,
+            "delete": match target {
+                Some(v) => json!(v),
+                None => json!("all"),
+            },
+            "versions_removed": removes,
+            "stable_before": st.stable,
+            "newest_before": st.newest,
+        }),
+        rows: Vec::new(),
+    })
+}
+
+#[cfg(feature = "templates")]
+async fn plan_template_deprecate(
+    state: &ServerState,
+    payload: &DeprecatePayload,
+) -> Result<ChangePlan, ServeError> {
+    let st = existing_state(state, &payload.id).await?;
+    let version = resolve_existing(state, &payload.id, &st, payload.version).await?;
+    let retired = st.version_deprecation(version).is_some();
+    Ok(ChangePlan {
+        material: sha_hex(&format!(
+            "deprecate\n{}\n{version}\n{}\n{retired}",
+            payload.id, payload.undo
+        )),
+        summary: json!({
+            "template": payload.id,
+            "target_version": version,
+            "selector": payload.version,
+            "action": if payload.undo { "revive" } else { "retire" },
+            "deprecated_before": retired,
+            "newest_before": st.newest,
+            "reason": payload.reason,
+        }),
+        rows: Vec::new(),
+    })
+}
+
+#[cfg(feature = "templates")]
 fn template_err(e: crate::error::CliError) -> ServeError {
     use crate::error::CliError;
     match e {
@@ -635,8 +774,23 @@ async fn plan_for(
                 .map_err(|e| ServeError::BadConfig(format!("template_launch payload: {e}")))?;
             plan_template_launch(state, &body).await
         }
+        #[cfg(feature = "templates")]
+        ChangeKind::TemplateDelete => {
+            let body: DeletePayload = serde_json::from_value(payload.clone())
+                .map_err(|e| ServeError::BadConfig(format!("template_delete payload: {e}")))?;
+            plan_template_delete(state, &body).await
+        }
+        #[cfg(feature = "templates")]
+        ChangeKind::TemplateDeprecate => {
+            let body: DeprecatePayload = serde_json::from_value(payload.clone())
+                .map_err(|e| ServeError::BadConfig(format!("template_deprecate payload: {e}")))?;
+            plan_template_deprecate(state, &body).await
+        }
         #[cfg(not(feature = "templates"))]
-        ChangeKind::TemplateRegister | ChangeKind::TemplateLaunch => {
+        ChangeKind::TemplateRegister
+        | ChangeKind::TemplateLaunch
+        | ChangeKind::TemplateDelete
+        | ChangeKind::TemplateDeprecate => {
             let _ = (state, actor, trusted);
             Err(ServeError::Unprocessable {
                 message: "template changes require a server built with the `templates` feature"
@@ -1109,13 +1263,30 @@ async fn execute(
                 })
                 .map_err(template_err)
         }
-        #[cfg(not(feature = "templates"))]
-        ChangeKind::TemplateRegister | ChangeKind::TemplateLaunch => {
-            Err(ServeError::Unprocessable {
-                message: "template changes require the `templates` feature".into(),
-                details: None,
-            })
+        #[cfg(feature = "templates")]
+        ChangeKind::TemplateDelete => {
+            let body: DeletePayload = match serde_json::from_value(change.payload.clone()) {
+                Ok(b) => b,
+                Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+            };
+            execute_template_delete(state, &body, &fresh).await
         }
+        #[cfg(feature = "templates")]
+        ChangeKind::TemplateDeprecate => {
+            let body: DeprecatePayload = match serde_json::from_value(change.payload.clone()) {
+                Ok(b) => b,
+                Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+            };
+            execute_template_deprecate(state, &body, &fresh, &change.requester).await
+        }
+        #[cfg(not(feature = "templates"))]
+        ChangeKind::TemplateRegister
+        | ChangeKind::TemplateLaunch
+        | ChangeKind::TemplateDelete
+        | ChangeKind::TemplateDeprecate => Err(ServeError::Unprocessable {
+            message: "template changes require the `templates` feature".into(),
+            details: None,
+        }),
     };
     match outcome {
         Ok((run_id, template)) => {
@@ -1139,6 +1310,68 @@ async fn execute(
         }
         Err(e) => finish_failed(state, actor, change, e.to_string()).await,
     }
+}
+
+/// The version a planned `template_*` change targets, from its summary.
+#[cfg(feature = "templates")]
+fn planned_version(plan: &ChangePlan, key: &str) -> Option<u32> {
+    plan.summary
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+#[cfg(feature = "templates")]
+async fn execute_template_delete(
+    state: &ServerState,
+    body: &DeletePayload,
+    plan: &ChangePlan,
+) -> Result<(Option<String>, Option<TemplateOutcome>), ServeError> {
+    let target = planned_version(plan, "delete");
+    let removed = state
+        .history()
+        .template_delete(&body.id, target)
+        .await
+        .map_err(|e| ServeError::from_history("deleting template", e))?;
+    if removed == 0 {
+        return Err(ServeError::NotFound);
+    }
+    Ok((
+        None,
+        target.map(|version| TemplateOutcome {
+            id: body.id.clone(),
+            version,
+        }),
+    ))
+}
+
+#[cfg(feature = "templates")]
+async fn execute_template_deprecate(
+    state: &ServerState,
+    body: &DeprecatePayload,
+    plan: &ChangePlan,
+    requester: &str,
+) -> Result<(Option<String>, Option<TemplateOutcome>), ServeError> {
+    let version = planned_version(plan, "target_version").ok_or_else(|| {
+        ServeError::Internal("template_deprecate plan carries no target version".into())
+    })?;
+    crate::templates::set_version_deprecated(
+        &state.history(),
+        &body.id,
+        version,
+        body.reason.clone(),
+        Some(requester),
+        !body.undo,
+    )
+    .await
+    .map_err(template_err)?;
+    Ok((
+        None,
+        Some(TemplateOutcome {
+            id: body.id.clone(),
+            version,
+        }),
+    ))
 }
 
 async fn finish_failed(
@@ -1308,6 +1541,11 @@ mod tests {
         );
         assert!("nope".parse::<ChangeKind>().unwrap_err().contains("nope"));
         assert_eq!(ChangeKind::Run.to_string(), "run");
+        assert_eq!(
+            ChangeKind::TemplateDeprecate.governed_by(),
+            Some(ChangeKind::TemplateLaunch)
+        );
+        assert_eq!(ChangeKind::TemplateLaunch.governed_by(), None);
         for s in [
             ChangeStatus::Pending,
             ChangeStatus::Approved,
@@ -1830,6 +2068,8 @@ mod tests {
         for (kind, needle) in [
             (ChangeKind::TemplateRegister, "template_register payload"),
             (ChangeKind::TemplateLaunch, "template_launch payload"),
+            (ChangeKind::TemplateDelete, "template_delete payload"),
+            (ChangeKind::TemplateDeprecate, "template_deprecate payload"),
         ] {
             let err = create(&state, &actor("bob"), new(kind, json!({"x": 1})))
                 .await
@@ -1881,6 +2121,56 @@ mod tests {
             .unwrap();
         assert_eq!(launch.status, ChangeStatus::Executed, "{:?}", launch.error);
 
+        let retire = |undo: bool| {
+            new(
+                ChangeKind::TemplateDeprecate,
+                json!({"id": "tpl", "version": 1, "reason": "r", "undo": undo}),
+            )
+        };
+        let dep = create(&state, &actor("bob"), retire(false)).await.unwrap();
+        crate::templates::set_version_deprecated(&state.history(), "tpl", 1, None, None, true)
+            .await
+            .unwrap();
+        let dep = approve(&state, &actor("alice"), &dep.id, None)
+            .await
+            .unwrap();
+        assert_eq!(dep.status, ChangeStatus::Invalidated, "retired meanwhile");
+        let revive = create(&state, &actor("bob"), retire(true)).await.unwrap();
+        let revive = approve(&state, &actor("alice"), &revive.id, None)
+            .await
+            .unwrap();
+        assert_eq!(revive.status, ChangeStatus::Executed, "{:?}", revive.error);
+        assert_eq!(revive.template.as_ref().unwrap().version, 1);
+        let st = state.history().template_state("tpl").await.unwrap();
+        assert!(st.version_deprecation(1).is_none());
+        let err = create(
+            &state,
+            &actor("bob"),
+            new(
+                ChangeKind::TemplateDeprecate,
+                json!({"id": "tpl", "version": 9}),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Unprocessable { .. }), "{err:?}");
+        let gone = create(
+            &state,
+            &actor("bob"),
+            new(
+                ChangeKind::TemplateDelete,
+                json!({"id": "tpl", "version": 1}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gone.plan.as_ref().unwrap().summary["delete"], 1);
+        state.history().template_delete("tpl", None).await.unwrap();
+        let gone = approve(&state, &actor("alice"), &gone.id, None)
+            .await
+            .unwrap();
+        assert_eq!(gone.status, ChangeStatus::Failed, "the template is gone");
+
         let bare = create(
             &state,
             &actor("bob"),
@@ -1912,7 +2202,12 @@ mod tests {
             refused.error
         );
 
-        for kind in [ChangeKind::TemplateRegister, ChangeKind::TemplateLaunch] {
+        for kind in [
+            ChangeKind::TemplateRegister,
+            ChangeKind::TemplateLaunch,
+            ChangeKind::TemplateDelete,
+            ChangeKind::TemplateDeprecate,
+        ] {
             let c = stored(kind, json!({"x": 1}), "m", 1);
             save(&state, &c).await.unwrap();
             let done = approve(&state, &actor("alice"), &c.id, None).await.unwrap();

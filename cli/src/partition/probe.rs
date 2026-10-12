@@ -193,9 +193,9 @@ async fn probe_value(p: &BoundProbe, auth: &AuthCatalog) -> CliResult<Value> {
     match found.as_slice() {
         [] => Err(CliError::Config(format!(
             "partition bound probe: value_path '{}' matched nothing in the probe's first \
-             record ({})",
+             record (fields: {})",
             p.value_path,
-            crate::secrets::registry::redact(&first.to_string())
+            field_names(first)
         ))),
         [one] => Ok(one.clone()),
         many => Err(CliError::Config(format!(
@@ -221,7 +221,8 @@ fn as_i64(v: &Value, path: &str) -> CliResult<i64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
         .ok_or_else(|| {
             CliError::Config(format!(
-                "partition bound probe: '{path}' is not an integer (got {v})"
+                "partition bound probe: '{path}' is not an integer (got {})",
+                json_type(v)
             ))
         })
 }
@@ -236,15 +237,68 @@ fn as_u64(v: &Value, path: &str) -> CliResult<u64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
         .ok_or_else(|| {
             CliError::Config(format!(
-                "partition bound probe: '{path}' is not a non-negative integer (got {v})"
+                "partition bound probe: '{path}' is not a non-negative integer (got {})",
+                json_type(v)
             ))
         })
+}
+
+/// A record's top-level field names, for an error message that must not
+/// echo the values.
+fn field_names(record: &Value) -> String {
+    match record {
+        Value::Object(map) if map.is_empty() => "none".into(),
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.join(", ")
+        }
+        other => format!("not an object but {}", json_type(other)),
+    }
+}
+
+/// A value's JSON type, named without its contents.
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number that is not a whole value in range",
+        Value::String(_) => "a non-numeric string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn probe_errors_name_fields_and_types_but_never_values() {
+        assert_eq!(field_names(&json!({"b": "s3cret", "a": 1})), "a, b");
+        assert_eq!(field_names(&json!({})), "none");
+        assert_eq!(
+            field_names(&json!("s3cret")),
+            "not an object but a non-numeric string"
+        );
+        for v in [
+            json!(null),
+            json!(true),
+            json!(1.5),
+            json!([1]),
+            json!({"k": "s3cret"}),
+        ] {
+            assert!(!json_type(&v).contains("s3cret"));
+        }
+        let e = as_i64(&json!("s3cret"), "$.x").unwrap_err().to_string();
+        assert!(
+            !e.contains("s3cret") && e.contains("non-numeric string"),
+            "{e}"
+        );
+        let e = as_u64(&json!(-1), "$.x").unwrap_err().to_string();
+        assert!(e.contains("not a whole value in range"), "{e}");
+    }
 
     /// An offline placeholder is one chunk wide for either bound style, and
     /// a literal spec is left alone (#789 CLI-57).

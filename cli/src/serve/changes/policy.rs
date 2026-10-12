@@ -126,8 +126,14 @@ impl ApprovalPolicy {
         self.expire_secs.unwrap_or(DEFAULT_EXPIRE_SECS)
     }
 
-    /// The rule for `kind`.
+    /// The rule for `kind`. A kind no rule names explicitly but that another
+    /// kind governs (a template delete or deprecation, governed by
+    /// `template_launch`) takes the governing kind's rule.
     pub fn effective(&self, kind: ChangeKind) -> EffectiveRule {
+        let kind = match kind.governed_by() {
+            Some(governing) if !self.rules.iter().any(|r| r.kinds.contains(&kind)) => governing,
+            _ => kind,
+        };
         let rule = self
             .rules
             .iter()
@@ -271,6 +277,23 @@ mod tests {
             .may_approve(ChangeKind::TemplateLaunch, &ctx("root", Role::Admin), "bob")
             .unwrap_err();
         assert!(err.contains("alice"), "{err}");
+    }
+
+    #[test]
+    fn a_delete_or_deprecation_takes_the_launch_rule_unless_named() {
+        let p: ApprovalPolicy = serde_yaml::from_str(
+            "rules:\n  - kinds: [run]\n    roles: [operator]\n  - kinds: [template_launch]\n    min_approvers: 2\n  - kinds: [template_deprecate]\n    roles: [operator]\n",
+        )
+        .unwrap();
+        assert_eq!(p.effective(ChangeKind::TemplateDelete).min_approvers, 2);
+        assert_eq!(
+            p.effective(ChangeKind::TemplateDeprecate).roles,
+            vec![Role::Operator]
+        );
+        assert_eq!(
+            ApprovalPolicy::default().effective(ChangeKind::TemplateDelete),
+            EffectiveRule::default()
+        );
     }
 
     #[test]

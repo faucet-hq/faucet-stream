@@ -170,7 +170,7 @@ fn discard(args: DlqDiscardArgs) -> CliResult<()> {
         &dec,
     )?;
     if args.purge {
-        let purged = dlq_replay::purge(&args.location)?;
+        let purged = dlq_replay::purge_with(&args.location, &dec)?;
         if args.json {
             println!(
                 "{}",

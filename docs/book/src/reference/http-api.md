@@ -196,10 +196,17 @@ never read the server's own credentials. Refused with `403`:
 
 The same files and trees are refused as **data**: a `file`, `csv`, `jsonl`,
 `parquet`, `sqlite`, `duckdb`, `delta` or `iceberg` source, sink, state store
-or DLQ whose path (or directory, or glob) reaches one of them is a `403`. In
-a config the request carries, such a path may not take a value from records
-(`${parent.*}` and other runtime tokens other than `${now.*}`, `${backfill.*}`
-and `${partition.*}`).
+or DLQ — including a template override, topology node, fan-out source,
+partition bound probe, `verify.destination` and a `sql` transform's `csv` /
+`jsonl` relation — that would reach one of them is a `403`, before any of the
+config runs. A read is refused when its path is such a file, a directory
+listing that would include one (any depth with `recursive: true`), or a glob
+any of whose segments could match into a system tree or onto a protected file
+(an existing match that is a symlink into one counts). A sink or state store
+is refused only when it would write such a file, so it may use a directory
+that also holds one. In a config the request carries, such a path may not
+take a value from records (`${parent.*}` and other runtime tokens other than
+`${now.*}`, `${backfill.*}` and `${partition.*}`).
 
 ### SQL connectors run sandboxed
 
@@ -210,8 +217,8 @@ gets `enable_external_access = false` with extension autoload off and the
 configuration locked (a query cannot `SET` it back), and each SQLite
 connection allows no attached database (which also stops `VACUUM INTO`;
 extension loading is always off). The server sets the flag on every template,
-row override, topology node, fan-out source and DLQ sink, overwriting a
-`sandbox: false`. Such a query still reads and writes its own database; it
+row override, topology node, fan-out source, partition bound probe,
+`verify.destination` and DLQ sink, overwriting a `sandbox: false`. Such a query still reads and writes its own database; it
 fails with a `Permission Error` / `too many attached databases` the moment it
 reaches past it. The `sql` transform is always sandboxed this way.
 
@@ -288,7 +295,7 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `GET` | `/v1/state/{pipeline}/{row}` | `200` | A row's bookmark, envelope sequence and markers (admin / `StateAdmin`) |
 | `PUT` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Move the row's bookmark (admin / `StateAdmin`); `409` while a run holds the row |
 | `DELETE` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Reset the row so its next run re-syncs (admin / `StateAdmin`); `409` while a run holds the row |
-| `POST` | `/v1/changes` | `201` | Propose a [change request](../cookbook/approvals.md) (`kind` = `run` / `template_register` / `template_launch`, `payload`, `reason`, `budget`); planned now, executed on approval — operator / `ChangeRequest` |
+| `POST` | `/v1/changes` | `201` | Propose a [change request](../cookbook/approvals.md) (`kind` = `run` / `template_register` / `template_launch` / `template_delete` / `template_deprecate`, `payload`, `reason`, `budget`); planned now, executed on approval — operator / `ChangeRequest` |
 | `GET` | `/v1/changes` | `200` | List change requests (`status`, `kind`, `requester`, `limit`), newest first, plan rows omitted — viewer / `ChangeRead` |
 | `GET` | `/v1/changes/{id}` | `200` | One change request with its plan — viewer / `ChangeRead` |
 | `POST` | `/v1/changes/{id}/approve` | `200` | Approve (`comment`); at quorum re-plans and executes, or marks it `invalidated` — `ChangeApprove`, then the `approvals:` policy |
@@ -545,8 +552,12 @@ lifecycle routes refuse with `409` and point at `POST /v1/changes`:
 `POST /v1/templates` (both kinds when it also launches or assigns channels),
 `/launch`, `/rollback` and `/tags` (`template_launch`) and a non-dry-run
 `/v1/templates/sync` (either kind); the MCP `register_template` /
-`launch_template` / `rollback_template` tools refuse the same way. An approved
-change executes through the registry. `--templates-sync` registers and
+`launch_template` / `rollback_template` tools refuse the same way. Under
+`template_launch` (or `template_delete` / `template_deprecate`), a `DELETE` of
+a launched version, the `newest` version, a channel's target or the whole
+template, and a version `/deprecate`, refuse too: propose them as
+`template_delete` / `template_deprecate` changes. An approved change executes
+through the registry. `--templates-sync` registers and
 launches on its own schedule, so the server refuses to start with it and
 either template kind gated.
 
