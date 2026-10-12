@@ -249,8 +249,11 @@ pub fn bind_values(
 
 /// The type a value binds as, matching what splicing its text used to mean
 /// (#862 M-028): a quoted literal is text, and a bare token holding an
-/// integer as a string (`"42"`, the usual shape of an API id) is the number
-/// the spliced `42` was. Other values keep their JSON type.
+/// integer or a decimal as a string (`"42"`, `"12.50"`) is the number the
+/// spliced `42` / `12.50` was. A decimal binds only when a double holds it
+/// exactly enough (at most [`MAX_DECIMAL_DIGITS`] significant digits);
+/// beyond that it stays text, so a comparison fails loudly instead of
+/// matching a rounded value. Other values keep their JSON type.
 fn bind_type(value: Value, quoted: bool) -> Value {
     match value {
         Value::Number(n) if quoted => Value::String(n.to_string()),
@@ -259,8 +262,33 @@ fn bind_type(value: Value, quoted: bool) -> Value {
             Ok(i) => Value::from(i),
             Err(_) => Value::String(s),
         },
+        Value::String(s) if !quoted && is_plain_decimal(&s) => {
+            match s.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                Some(n) => Value::Number(n),
+                None => Value::String(s),
+            }
+        }
         other => other,
     }
+}
+
+/// Significant digits a decimal string may carry and still bind as a number:
+/// every decimal of up to 15 significant digits survives a round trip
+/// through an IEEE 754 double.
+const MAX_DECIMAL_DIGITS: usize = 15;
+
+/// `-?(0|[1-9][0-9]*)\.[0-9]+` with at most [`MAX_DECIMAL_DIGITS`]
+/// significant digits.
+fn is_plain_decimal(s: &str) -> bool {
+    let Some((int, frac)) = s.strip_prefix('-').unwrap_or(s).split_once('.') else {
+        return false;
+    };
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int) || !digits(frac) || (int.len() > 1 && int.starts_with('0')) {
+        return false;
+    }
+    let all = format!("{int}{frac}");
+    all.trim_start_matches('0').trim_end_matches('0').len() <= MAX_DECIMAL_DIGITS
 }
 
 /// `-?[0-9]+` without a leading zero (a zero-padded code stays text).
@@ -505,6 +533,37 @@ mod tests {
         assert_eq!(at(7), json!(0));
         assert_eq!(at(8), json!("42"));
         assert!(!is_plain_integer("-"));
+    }
+
+    /// Review of #868 (cli F10): a bare decimal string binds as the number
+    /// its spliced text was; one a double would round, a zero-padded one, an
+    /// exponent and a quoted one stay text.
+    #[test]
+    fn decimal_strings_bind_as_numbers_when_a_double_holds_them() {
+        let ctx = HashMap::from([(
+            "p".to_string(),
+            json!({"amount": "12.50", "neg": "-0.25", "wide": "1234567890.12345678", "pad": "01.5", "exp": "1e3", "dot": "5.", "lead": ".5"}),
+        )]);
+        let p = plan(
+            "WHERE a = ${p.amount} AND b = ${p.neg} AND c = ${p.wide} AND d = ${p.pad} \
+             AND e = ${p.exp} AND f = ${p.dot} AND g = ${p.lead} AND h = '${p.amount}'",
+            fanout,
+        )
+        .unwrap();
+        let v = bind_values(&p, &ctx).unwrap();
+        let at = |i: usize| v[&format!("faucet_bind_{i}")].clone();
+        assert_eq!(at(0), json!(12.5));
+        assert_eq!(at(1), json!(-0.25));
+        assert_eq!(at(2), json!("1234567890.12345678"));
+        assert_eq!(at(3), json!("01.5"));
+        assert_eq!(at(4), json!("1e3"));
+        assert_eq!(at(5), json!("5."));
+        assert_eq!(at(6), json!(".5"));
+        assert_eq!(at(7), json!("12.50"));
+        assert!(is_plain_decimal("0.000000000000001"));
+        assert!(is_plain_decimal("123456789012345.0"));
+        assert!(!is_plain_decimal("1234567890123456.0"));
+        assert!(!is_plain_decimal("-"));
     }
 
     #[test]

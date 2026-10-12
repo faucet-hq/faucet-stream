@@ -241,9 +241,11 @@ quoted literal (`WHERE name = '${p.name}'`); a token embedded in a longer
 literal (`'x-${p.id}'`), inside a quoted identifier or inside a comment cannot
 be bound and is refused when the config loads. The value binds with the type
 its text had in the SQL: a quoted literal binds as text (a number becomes its
-digits), and a bare token holding an integer as a string (`"42"`, the usual
-shape of an API id) binds as that integer; anything else keeps its JSON type,
-so compare a string value with a numeric column through a `CAST`. A token that fills a `table`,
+digits), and a bare token holding an integer or a decimal as a string (`"42"`,
+the usual shape of an API id, or `"12.50"`) binds as that number — a decimal
+only up to 15 significant digits, which a double holds exactly; a longer one,
+like anything else, keeps its JSON type, so compare it with a numeric column
+through a `CAST`. A token that fills a `table`,
 `table_name`, `table_id`, `collection`, `index`, `schema` or `dataset` field
 must resolve to a plain identifier (letters, digits, `_`, `.`, `-`, `$`).
 `${now.*}` is the run clock, not upstream data, and still substitutes as text.

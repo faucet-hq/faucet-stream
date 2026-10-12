@@ -170,15 +170,24 @@ pipeline:
 }
 
 /// #862 M-028: a parent id carried as a string (`"42"`, the usual shape from an
-/// API) still filters an integer column, and a quoted token binds as text.
+/// API) still filters an integer column, a decimal string (`"12.50"`) a
+/// numeric one (review of #868, cli F10), and a quoted token binds as text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_string_parent_id_filters_an_integer_column() {
     let (_c, url) = start_postgres().await;
-    exec(&url, "CREATE TABLE items (id BIGINT, code TEXT)").await;
-    exec(&url, "INSERT INTO items VALUES (42, '7'), (43, '8')").await;
+    exec(
+        &url,
+        "CREATE TABLE items (id BIGINT, code TEXT, amount NUMERIC(8,2))",
+    )
+    .await;
+    exec(
+        &url,
+        "INSERT INTO items VALUES (42, '7', 12.50), (42, '7', 12.51), (43, '8', 12.50)",
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let parents = dir.path().join("parents.csv");
-    std::fs::write(&parents, "ix,id,code\na,42,7\n").unwrap();
+    std::fs::write(&parents, "ix,id,code,amount\na,42,7,12.50\n").unwrap();
     let out = dir.path().join("out");
     let yaml = format!(
         r#"
@@ -193,7 +202,7 @@ pipeline:
       type: postgres
       config:
         connection_url: "{url}"
-        query: "SELECT id, code FROM items WHERE id = ${{p.id}} AND code = '${{p.code}}'"
+        query: "SELECT id, code FROM items WHERE id = ${{p.id}} AND code = '${{p.code}}' AND amount = ${{p.amount}}"
   sinks:
     trash: {{ type: jsonl, config: {{ path: "{trash}" }} }}
     child: {{ type: jsonl, config: {{ path: "{out}/${{p.ix}}.jsonl" }} }}
