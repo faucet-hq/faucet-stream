@@ -6,6 +6,10 @@ polling, no `updated_at` column required.
 
 ## Prepare Postgres
 
+**PostgreSQL 14 or newer is required**: the replication stream is opened with
+the pgoutput `messages` option, which PostgreSQL 13 and older reject.
+`faucet doctor` reports the server version as a `server_version` probe.
+
 CDC needs logical replication enabled (`wal_level = logical`) and a publication
 for the tables you want to follow:
 
@@ -46,7 +50,9 @@ faucet run postgres_cdc_to_jsonl.yaml
 ```
 
 Open a `psql` session and `INSERT`/`UPDATE`/`DELETE` some rows — the connector
-drains them every fetch cycle until `idle_timeout` fires.
+drains them every fetch cycle until `idle_timeout` fires, or at the first
+transaction boundary after `max_cycle_duration` (default 300 s) so a busy
+database still lets each cycle end and the slot advance.
 
 ## Why the state store matters here
 

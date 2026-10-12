@@ -30,6 +30,8 @@ block, nothing changes.
 | `profile_drift` | a column's learned profile drifted from its baseline (`profiling.on_drift: notify` or `fail`) — one event per finding | warning |
 | `change_requested` | a [change request](./approvals.md) awaits approval — sent through the proposed config's own `notifications:` rules | info |
 | `budget_exceeded` | a run crossed a [`budget:`](./usage.md#run-budgets) ceiling and was stopped | error |
+| `connection_needs_reauth` | a tenant connection's token endpoint revoked its credentials (`faucet serve` with tenants) — sent through the tenant's `notifications:` | error |
+| `log_export_failed` | a run's [log export](../operations/observability.md#shipping-logs) kept failing past `notify_after_secs`, or buffered lines were dropped before delivery | warning |
 
 Events fire from every runtime — `faucet run`, `faucet schedule`,
 `faucet serve`, and `faucet mirror` — because the emit sites live in the
@@ -208,7 +210,7 @@ faucet notify test pipeline.yaml --event run_failure
 `--event` accepts any event kind (`run_failure`, `run_success`, `sla_breach`,
 `circuit_open`, `contract_abort`, `dlq_threshold`, `scheduler_stuck`,
 `profile_drift`, `change_requested`, `budget_exceeded`,
-`connection_needs_reauth`); `--profile` selects a `profiles:` overlay.
+`connection_needs_reauth`, `log_export_failed`); `--profile` selects a `profiles:` overlay.
 
 The synthetic event uses the row `faucet-notify-test`, so its PagerDuty dedup
 key (`<pipeline>:faucet-notify-test`) never matches a real run's, and a

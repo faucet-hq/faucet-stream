@@ -1189,6 +1189,17 @@ Every error is a JSON `ApiError`:
 | `429` | Run queue full (carries `Retry-After`) |
 | `500` | Internal error |
 
+**A row that is already running.** Every run takes a lease on each row in the
+config's durable `state:` store, and the server never overrides a live one
+(there is no `--force` over HTTP). A second run of the same row — another
+`POST /v1/runs`, a trigger or template fire, a backfill unit, or a `faucet run`
+/ `faucet schedule` process on the same store — is accepted (`202`) but its
+invocation **fails** with an error naming the holder's run id, pid and lease
+expiry. Recovery: wait for the holder to finish, cancel it
+(`POST /v1/runs/{id}/cancel`, which releases the lease as it stops), or, if its
+process crashed on another host, wait for the lease to expire about a minute
+after it stopped renewing.
+
 ## Metrics
 
 `/metrics` serves the standard `faucet_*` pipeline metrics plus serve-specific

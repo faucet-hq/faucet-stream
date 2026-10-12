@@ -33,7 +33,7 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | XML / SOAP | T1 ✅ᵐ | `source-xml` | ✓ | ✗ | ✗ | ✗ | ✗ | streaming XML→JSON, dot-path extraction, first-class `soap:` block (envelope + headers + fault handling) |
 | gRPC | T1 ✅ | `source-grpc` | ✓⁴ | ✗ | ✗ | ✗ | ✗ | dynamic protobuf; unary + server-streaming |
 | PostgreSQL | T1 ✅ | `source-postgres` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query, rows as JSON; incremental `${bookmark}` replication in cursor order |
-| PostgreSQL CDC | T1 ✅ | `source-postgres-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | logical replication (pgoutput), LSN bookmarks |
+| PostgreSQL CDC | T1 ✅ | `source-postgres-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | logical replication (pgoutput), LSN bookmarks; PostgreSQL 14+ |
 | MySQL | T1 ✅ | `source-mysql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query, rows as JSON; incremental `@bookmark` replication in cursor order |
 | MySQL CDC | T1 ✅ | `source-mysql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | binlog row events, file/pos or GTID bookmarks |
 | Microsoft SQL Server | T1 ✅ | `source-mssql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (tiberius), rows as JSON |
@@ -200,6 +200,22 @@ fails outright once they accumulate. Only the **append** path accumulates:
 `delivery: exactly_once` and the DLQ path commit per page, because a watermark
 must land with its own page and a DLQ must name which rows of *this* page
 failed.
+With neither `commit_rows` nor `commit_bytes` set, a group commits at
+**100,000 rows or ~256 MiB**, whichever comes first (`0` removes a limit), so a
+large load never holds the whole run in memory. A group whose commit fails
+keeps its uncommitted rows, so a retried `flush` commits them instead of
+reporting success with nothing written.
+
+**CDC and query-result defaults (#814).** `postgres-cdc` ends a fetch cycle at
+the first transaction boundary after `max_cycle_duration` (default `300` s,
+`0` = unbounded) even while changes keep arriving, so the next cycle can
+advance the slot and release WAL. `mssql-cdc` fails a run that resumes behind
+the capture instance's retained minimum LSN (`on_gap: fail`, the default;
+`skip` resumes from the earliest retained change after you re-snapshot). The
+`databricks` source receives row-path results through presigned
+cloud-storage links (`result_disposition: external_links`, the default), so
+the client must reach the workspace's storage; `inline` keeps results in the
+API response, which Databricks caps at 25 MiB.
 
 **Auto-create (`create_table`, #580).** Every **table-based** sink —
 `bigquery`, `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`, `snowflake`,
@@ -443,6 +459,26 @@ sinks can actually *act* on it varies:
 `on_drift: evolve` against a detect-only or schemaless sink is rejected at
 config-load. See [Schema drift](../cookbook/schema-drift.md) for the per-sink
 nuances (e.g. SQLite widening is a no-op; Elasticsearch can only add fields).
+
+## Connector behaviour notes
+
+- **BigQuery sink — unknown fields fail.** A record field the table has no
+  column for fails the write (streaming, `MERGE`, effectively-once and load
+  jobs alike) instead of being silently dropped. Evolve the table
+  (`schema: {on_drift: evolve}`) or drop the field (`on_drift: ignore` or a
+  `drop` transform).
+- **BigQuery sink — `bulk_load` restrictions.** `bulk_load` (`arrow` builds)
+  stages Parquet on GCS; `bulk_load.write_disposition` accepts only
+  `WRITE_APPEND`, and a staged `overwrite` is refused. Without a `bulk_load`
+  block the columnar path loads bucket-free.
+- **BigQuery sink — `job_timeout`** (seconds, default `3600`, `0` = no limit)
+  bounds every job the sink starts (MERGE, overwrite swap, cleanup, DDL, load);
+  a job past the limit is cancelled before the write fails.
+- **Webhook source — signature verification.** An optional `signature` block
+  verifies an HMAC (`sha256` / `sha512`, hex or base64, optional prefix and
+  timestamp header with `tolerance_secs`) over the raw body in constant time;
+  a request that fails it gets `401` and is not stored. See the
+  [webhook README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/webhook).
 
 ## Authentication at a glance
 

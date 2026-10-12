@@ -170,6 +170,9 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
   type (e.g. INT64→FLOAT64), so a base-type widening fails with guidance to set
   `allow_type_widening: false` (classifying it incompatible instead). DDL runs
   as a bounded long-running operation via the admin API.
+- **BigQuery** — adds columns, widens and relaxes in place. Without a
+  `schema:` block, a record field the table has no column for **fails** the
+  write rather than being dropped; use `evolve` or `ignore` to choose.
 - **Databricks** — `ALTER TABLE … ADD COLUMNS` for new columns and `ALTER COLUMN
   … DROP NOT NULL` for relaxation. A numeric widening from
   `tinyint`/`smallint`/`int`/`float` to `DOUBLE` enables Delta type widening

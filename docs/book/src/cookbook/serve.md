@@ -146,6 +146,17 @@ The claim is atomic, so concurrent retries can't both start a run.
 > backend recovers — retry then, or resubmit without a key if at-least-once is
 > acceptable. Submissions without a key are unaffected.
 
+## Overlapping runs of one row
+
+Each run leases its rows in the config's durable `state:` store, so two runs
+of the same row never start from the same bookmark. The server has no override
+for a live lease: a second run of a row that is already running — from the API,
+a trigger, a template, a backfill, or a `faucet run` / `faucet schedule` on the
+same store — fails with the holder's run id, pid and lease expiry. Cancel the
+holder (its lease is released as it stops) or wait for it to finish; a holder
+that crashed on another host keeps the lease until it expires, about a minute
+after it stopped renewing.
+
 ## Cancellation
 
 `POST /v1/runs/{id}/cancel` cooperatively cancels an in-flight run (202); on an

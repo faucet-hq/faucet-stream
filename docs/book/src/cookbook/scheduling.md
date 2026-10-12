@@ -118,6 +118,13 @@ already executing.
 | `queue` | One missed tick is buffered and fires immediately when the current run finishes. Further misses during that same run collapse into the single queued tick (in-memory only — lost on restart). Use when missing a cycle is unacceptable but strict concurrency still must be preserved. |
 | `forbid` | The process exits non-zero the moment an overlap would occur. Use when overlapping runs would produce corrupt output or you want a hard guarantee that no two instances run simultaneously — pair with a supervisor that alerts or pages on non-zero exit. |
 
+The overlap policy is in-process: it only knows about this scheduler's own
+runs. Across processes, every run also takes a lease on its row in the durable
+`state:` store, so a tick whose row is still being run by another process (a
+second scheduler, a `faucet run`, or `faucet serve` on the same store) fails
+with the holder's run id, pid and lease expiry. `faucet schedule` has no
+`--force`; stop the other process or wait for its lease to expire.
+
 **Choosing between skip and queue:** if your pipeline is idempotent and
 catching up after a long run matters (e.g. incremental replication with
 state), use `queue`. If occasional missed cycles are harmless and you prefer
