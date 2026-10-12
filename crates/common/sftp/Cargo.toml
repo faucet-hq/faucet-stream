@@ -19,6 +19,9 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "time"] }
 russh.workspace = true
 russh-sftp.workspace = true
+base64.workspace = true
+hmac.workspace = true
+sha1.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

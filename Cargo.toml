@@ -298,6 +298,8 @@ blake3 = "1"
 # AEAD for encryption-at-rest of FileStateStore bookmarks + JSONL/DLQ output (#207).
 aes-gcm = "0.11"
 hmac = "0.12"
+# HMAC-SHA1 for hashed OpenSSH known_hosts entries (the SFTP connectors).
+sha1 = "0.10"
 crc = "3"
 md-5 = "0.10"
 dashmap = "6"
