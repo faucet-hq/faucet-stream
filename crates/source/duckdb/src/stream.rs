@@ -697,12 +697,8 @@ mod tests {
     fn typeof_fallback_reads_types_and_tolerates_empty_results() {
         let conn = Connection::open_in_memory().unwrap();
         let params = [DuckValue::Int(1)];
-        let typed = describe_by_typeof(
-            &conn,
-            "SELECT 1::UHUGEINT AS u, ?::INTEGER AS i;",
-            &params,
-        )
-        .unwrap();
+        let typed = describe_by_typeof(&conn, "SELECT 1::UHUGEINT AS u, ?::INTEGER AS i;", &params)
+            .unwrap();
         assert_eq!(
             typed,
             vec![
@@ -710,12 +706,8 @@ mod tests {
                 ("i".to_string(), "INTEGER".to_string())
             ]
         );
-        let empty = describe_by_typeof(
-            &conn,
-            "SELECT 1::UHUGEINT AS u WHERE ? = 2",
-            &params,
-        )
-        .unwrap();
+        let empty =
+            describe_by_typeof(&conn, "SELECT 1::UHUGEINT AS u WHERE ? = 2", &params).unwrap();
         assert_eq!(empty, vec![("u".to_string(), String::new())]);
         assert!(describe_by_typeof(&conn, "PRAGMA version", &[]).is_none());
     }
