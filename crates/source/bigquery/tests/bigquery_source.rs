@@ -1318,10 +1318,10 @@ async fn get_job_falls_back_on_an_unknown_column_type() {
         .and_then(|q| q.schema)
         .and_then(|s| s.fields)
         .expect("schema");
-    assert_eq!(
+    assert!(matches!(
         fields[0].r#type,
         gcp_bigquery_client::model::field_type::FieldType::String
-    );
+    ));
 }
 
 #[tokio::test]
