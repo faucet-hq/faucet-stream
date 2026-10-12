@@ -57,17 +57,27 @@ impl PageBuilder {
         }
     }
 
+    /// Rows held behind the oldest undecided XA transaction: transactions
+    /// committed after it and other prepared ones. Its own rows are not held
+    /// behind anything (the in-progress buffer cap bounds them).
     fn held_len(&self) -> usize {
+        let blocker = self.oldest_undecided();
         self.held.iter().map(|(r, _)| r.len()).sum::<usize>()
-            + self.prepared.values().map(Vec::len).sum::<usize>()
+            + self
+                .prepared
+                .iter()
+                .filter(|(x, _)| Some(*x) != blocker)
+                .map(|(_, r)| r.len())
+                .sum::<usize>()
     }
 
     fn check_capacity(&self, extra: usize) -> Result<(), String> {
         match self.max_records {
             Some(max) if self.held_len() + extra > max => Err(format!(
-                "mysql-cdc: transactions held behind an undecided XA transaction ({}) exceed \
-                 max_staged_records ({max}); find it with XA RECOVER and decide it (XA COMMIT \
-                 / XA ROLLBACK), or raise max_staged_records",
+                "mysql-cdc: rows of transactions held behind the undecided XA transaction ({}) \
+                 exceed {max} (max_staged_records, 1,000,000 when unset); its own rows do not \
+                 count. Find it with XA RECOVER and decide it (XA COMMIT / XA ROLLBACK), or \
+                 raise max_staged_records",
                 self.oldest_undecided()
                     .map_or_else(|| "?".to_string(), |x| x.to_string())
             )),
@@ -119,7 +129,8 @@ impl PageBuilder {
         rows: Vec<Value>,
         now: Instant,
     ) -> Result<(), String> {
-        self.check_capacity(rows.len())?;
+        let behind = self.oldest_undecided().is_some_and(|b| *b != xid);
+        self.check_capacity(if behind { rows.len() } else { 0 })?;
         self.prepared_at.entry(xid.clone()).or_insert(now);
         self.prepared.entry(xid).or_default().extend(rows);
         Ok(())
@@ -328,9 +339,11 @@ mod tests {
     fn held_rows_are_bounded() {
         let now = Instant::now();
         let mut b = PageBuilder::new(10, Duration::from_secs(1), Some(2));
-        b.prepare(xid("a"), vec![json!(1), json!(2)], now).unwrap();
+        b.prepare(xid("a"), vec![json!(1), json!(2), json!(3)], now)
+            .expect("the blocking XA transaction's own rows are not held behind it");
+        assert!(b.commit(vec![json!(4), json!(5)], bm(1), now).is_empty());
         assert!(b.take_error().is_none());
-        assert!(b.commit(vec![json!(3)], bm(1), now).is_empty());
+        assert!(b.commit(vec![json!(6)], bm(2), now).is_empty());
         let err = b.take_error().expect("capacity error");
         assert!(err.contains("max_staged_records"), "{err}");
         assert!(err.contains("X'61',X'',1"), "{err}");
