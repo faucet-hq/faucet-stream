@@ -40,6 +40,8 @@ pub(crate) struct ColumnInfo {
     pub identity: bool,
     /// The column's `DEFAULT` expression, if any.
     pub default: Option<String>,
+    /// The default is `DEFAULT ON NULL`: it also replaces an explicit `NULL`.
+    pub default_on_null: bool,
 }
 
 /// How a value is bound for a destination column.
@@ -162,7 +164,18 @@ pub(crate) fn clamp_fraction(s: &str) -> String {
 /// `DATE`/`TIMESTAMP` bind keeps only the wall-clock fields, so without this
 /// `…-08:00` and `…Z` values would land as inconsistent instants.
 pub(crate) fn utc_wall_time(s: &str) -> Option<String> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
+    const OFFSET_FORMATS: [&str; 4] = [
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f %#z",
+        "%Y-%m-%dT%H:%M%#z",
+    ];
+    let s = s.trim();
+    let dt = chrono::DateTime::parse_from_rfc3339(s).ok().or_else(|| {
+        OFFSET_FORMATS
+            .iter()
+            .find_map(|f| chrono::DateTime::parse_from_str(s, f).ok())
+    })?;
     Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string())
 }
 
@@ -496,14 +509,15 @@ pub(crate) const TABLE_EXISTS_SQL: &str = "SELECT COUNT(*) FROM ALL_TABLES \
 
 /// Column metadata (`:1` owner or NULL, `:2` table).
 pub(crate) const COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.DATA_PRECISION, \
-    c.DATA_SCALE, c.NULLABLE, c.VIRTUAL_COLUMN, NVL(i.GENERATION_TYPE, 'NONE'), c.DATA_DEFAULT \
+    c.DATA_SCALE, c.NULLABLE, c.VIRTUAL_COLUMN, NVL(i.GENERATION_TYPE, 'NONE'), c.DATA_DEFAULT, \
+    c.DEFAULT_ON_NULL \
     FROM ALL_TAB_COLS c LEFT JOIN ALL_TAB_IDENTITY_COLS i \
       ON i.OWNER = c.OWNER AND i.TABLE_NAME = c.TABLE_NAME AND i.COLUMN_NAME = c.COLUMN_NAME \
     WHERE c.OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND c.TABLE_NAME = :2 \
       AND c.HIDDEN_COLUMN = 'NO' ORDER BY c.COLUMN_ID";
 
 /// One [`COLUMNS_SQL`] row: name, type, precision, scale, nullable,
-/// virtual, identity generation, default.
+/// virtual, identity generation, default, default-on-null.
 pub(crate) type ColumnRow = (
     String,
     String,
@@ -513,12 +527,22 @@ pub(crate) type ColumnRow = (
     String,
     String,
     Option<String>,
+    Option<String>,
 );
 
 /// Build a [`ColumnInfo`] from one [`COLUMNS_SQL`] row.
 pub(crate) fn column_from_row(row: ColumnRow) -> ColumnInfo {
-    let (name, data_type, precision, scale, nullable, virtual_column, generation, data_default) =
-        row;
+    let (
+        name,
+        data_type,
+        precision,
+        scale,
+        nullable,
+        virtual_column,
+        generation,
+        data_default,
+        default_on_null,
+    ) = row;
     let identity = generation != "NONE";
     ColumnInfo {
         name,
@@ -532,6 +556,7 @@ pub(crate) fn column_from_row(row: ColumnRow) -> ColumnInfo {
         default: data_default
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty() && !identity && virtual_column != "YES"),
+        default_on_null: default_on_null.as_deref() == Some("YES"),
     }
 }
 
@@ -622,8 +647,8 @@ pub(crate) fn clone_table_sql(staging: &str, target: &str) -> String {
 /// identity column — `BY DEFAULT` and `GENERATED ALWAYS` alike (#862 M-048) —
 /// and every other column the writer cannot supply becomes nullable (the
 /// clone kept its `NOT NULL`; the swap leaves those columns to the target),
-/// and each column `DEFAULT` is copied so a record that omits the column gets
-/// the target's default, not `NULL`.
+/// and each column `DEFAULT` (`DEFAULT ON NULL` included) is copied, so a
+/// column no record of a page carries gets the target's default, not `NULL`.
 pub(crate) fn staging_fixups_sql(
     staging: &str,
     target_cols: &[ColumnInfo],
@@ -637,7 +662,10 @@ pub(crate) fn staging_fixups_sql(
                 &[ORA_ALREADY_NULL],
             ));
         } else if let Some(d) = &c.default {
-            out.push(format!("ALTER TABLE {staging} MODIFY ({col} DEFAULT {d})"));
+            let on_null = if c.default_on_null { " ON NULL" } else { "" };
+            out.push(format!(
+                "ALTER TABLE {staging} MODIFY ({col} DEFAULT{on_null} {d})"
+            ));
         }
     }
     Ok(out)
@@ -973,6 +1001,7 @@ mod tests {
             insertable: true,
             identity: false,
             default: None,
+            default_on_null: false,
         }
     }
 
@@ -1036,6 +1065,21 @@ mod tests {
             clamp_fraction("2024-01-02T03:04:05.123456789012+01:00"),
             "2024-01-02T03:04:05.123456789+01:00"
         );
+    }
+
+    #[test]
+    fn other_iso_offset_spellings_also_land_in_utc() {
+        for (input, want) in [
+            ("2024-01-02T03:04:05-0800", "2024-01-02T11:04:05"),
+            ("2024-01-02T03:04:05-08", "2024-01-02T11:04:05"),
+            ("2024-01-02 03:04:05.5+0100", "2024-01-02T02:04:05.500"),
+            ("2024-01-02 03:04:05 +01:00", "2024-01-02T02:04:05"),
+            ("2024-01-02T03:04+02:00", "2024-01-02T01:04:00"),
+        ] {
+            assert_eq!(utc_wall_time(input).as_deref(), Some(want), "{input}");
+        }
+        assert_eq!(utc_wall_time("2024-01-02T03:04:05"), None);
+        assert_eq!(utc_wall_time("not a date"), None);
     }
 
     #[test]
@@ -1237,6 +1281,13 @@ mod tests {
             fix[2],
             "ALTER TABLE \"S\" MODIFY (\"STATUS\" DEFAULT 'new')"
         );
+        let mut on_null = col("FLAG", "CHAR", None, None);
+        on_null.default = Some("'N'".into());
+        on_null.default_on_null = true;
+        assert_eq!(
+            staging_fixups_sql("\"S\"", &[on_null]).unwrap(),
+            vec!["ALTER TABLE \"S\" MODIFY (\"FLAG\" DEFAULT ON NULL 'N')".to_string()]
+        );
 
         let swap = overwrite_swap_sql("\"T\"", "\"S\"", &cols).unwrap();
         assert_eq!(
@@ -1359,6 +1410,7 @@ mod tests {
             "NO".into(),
             "ALWAYS".into(),
             None,
+            None,
         ));
         assert!(!c.nullable);
         assert!(!c.insertable);
@@ -1371,6 +1423,7 @@ mod tests {
             "YES".into(),
             "NONE".into(),
             Some("1".into()),
+            None,
         ));
         assert_eq!(
             v.default, None,
@@ -1386,6 +1439,7 @@ mod tests {
             "NO".into(),
             "BY DEFAULT".into(),
             Some("\"ISEQ$$_1\".nextval".into()),
+            None,
         ));
         assert!(ok.insertable && ok.nullable && ok.identity);
         assert_eq!(ok.default, None);
@@ -1398,8 +1452,11 @@ mod tests {
             "NO".into(),
             "NONE".into(),
             Some(" 'x' \n".into()),
+            Some("YES".into()),
         ));
         assert_eq!(d.default.as_deref(), Some("'x'"));
+        assert!(d.default_on_null);
+        assert!(!c.default_on_null);
 
         let recs = vec![json!({"id": 1}), json!(5)];
         assert_eq!(case_records(&recs, true)[0], json!({"ID": 1}));
@@ -1429,6 +1486,7 @@ mod tests {
             insertable,
             identity: false,
             default: None,
+            default_on_null: false,
         }
     }
 
