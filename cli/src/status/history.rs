@@ -19,7 +19,7 @@ pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<String>) {
         }
         let at = r.finished_at.or(r.started_at).unwrap_or(r.submitted_at);
         for inv in &r.invocations {
-            if inv.parent_record_key.is_some() {
+            if inv.parent_record_key.is_some() || inv.skipped {
                 continue;
             }
             runs.push(HistoryRun {
@@ -120,6 +120,7 @@ mod tests {
             usage: None,
             batches: None,
             source_lag: None,
+            skipped: false,
         }
     }
 

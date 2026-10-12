@@ -2822,6 +2822,7 @@ components:
         error: { type: string, nullable: true }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }
         source_lag: { $ref: "#/components/schemas/SourceLag" }
+        skipped: { type: boolean, description: "The invocation never ran because its parent or a `depends_on` row failed or was skipped; `error` names it. Absent when false." }
       example:
         row_id: orders_to_warehouse
         parent_record_key: example

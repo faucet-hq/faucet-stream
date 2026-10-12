@@ -328,6 +328,7 @@ catalog: {{ url: "{catalog_url}" }}
         usage: None,
         batches: None,
         source_lag: None,
+        skipped: false,
     }];
     handle.store.upsert(&rec).await.unwrap();
     let r = faucet_cli::commands::status::build(&args(&cfg))

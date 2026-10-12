@@ -339,7 +339,8 @@ fn rewrite_empty(dt: &DataType, v: &mut Value, restore: bool) {
 /// drop the nulls Arrow had to invent for them (keys a sibling record had).
 pub const ABSENT_MARKER: &str = "__faucet_absent";
 
-/// Mark each record with the schema fields it lacks. Returns `false` (and
+/// Mark each record with the top-level schema fields it lacks (a key missing
+/// inside a nested object is not tracked). Returns `false` (and
 /// leaves the page untouched) when every record carries every field, or when
 /// a record carries a key of the marker's name itself, which is never
 /// overwritten.
@@ -477,6 +478,19 @@ mod tests {
         assert_eq!(rows, vec![serde_json::json!({ "list": [{ "c": 1 }] })]);
     }
     use serde_json::json;
+
+    #[test]
+    fn absent_marking_covers_top_level_keys_only() {
+        let mut recs = vec![
+            json!({"id": 1, "o": {"a": 1, "b": 2}}),
+            json!({"o": {"a": 3}}),
+        ];
+        let schema = infer_schema(&recs).unwrap();
+        assert!(mark_absent_fields(&mut recs, &schema));
+        assert_eq!(recs[0][ABSENT_MARKER], Value::Null);
+        assert_eq!(recs[1][ABSENT_MARKER], json!("id"));
+        assert!(recs[1]["o"].get(ABSENT_MARKER).is_none());
+    }
 
     #[test]
     fn round_trip_scalars_nulls_nested() {

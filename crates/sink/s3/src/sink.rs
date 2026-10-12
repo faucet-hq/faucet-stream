@@ -3,7 +3,6 @@
 use crate::config::S3SinkConfig;
 use crate::object::{PART_BYTES, S3Objects};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use faucet_common_file::write::{
@@ -166,7 +165,7 @@ impl MultipartClient for S3Parts {
             .content_type(content_type(key))
             .send()
             .await
-            .map_err(|e| s3_err("start multipart", key, DisplayErrorContext(e)))?;
+            .map_err(|e| o.sdk_err("start multipart", key, e))?;
         let upload_id = created
             .upload_id()
             .ok_or_else(|| s3_err("start multipart", key, "no upload id"))?
@@ -178,6 +177,23 @@ impl MultipartClient for S3Parts {
             parts: Arc::new(Mutex::new(Vec::new())),
         }))
     }
+}
+
+/// The S3 part number of part `number`, refusing one past S3's limit of
+/// [`MAX_PARTS`](crate::object::MAX_PARTS) parts per upload.
+fn part_number(number: u32, key: &str) -> Result<i32, FaucetError> {
+    if u64::from(number) > crate::object::MAX_PARTS {
+        return Err(s3_err(
+            "upload part",
+            key,
+            format!(
+                "the object needs more than S3's {} parts; set `max_bytes_per_file` so files \
+                 roll over before that",
+                crate::object::MAX_PARTS
+            ),
+        ));
+    }
+    i32::try_from(number).map_err(|_| s3_err("upload part", key, "part number out of range"))
 }
 
 struct S3Upload {
@@ -196,8 +212,7 @@ impl MultipartUpload for S3Upload {
             self.parts.clone(),
         );
         Box::pin(async move {
-            let number =
-                i32::try_from(number).map_err(|_| s3_err("upload part", &key, "too many parts"))?;
+            let number = part_number(number, &key)?;
             let _slot = o
                 .part_slots
                 .acquire()
@@ -214,7 +229,7 @@ impl MultipartUpload for S3Upload {
                 .body(ByteStream::from(body))
                 .send()
                 .await
-                .map_err(|e| s3_err("upload part", &key, DisplayErrorContext(e)))?;
+                .map_err(|e| o.sdk_err("upload part", &key, e))?;
             parts.lock().unwrap_or_else(|p| p.into_inner()).push(
                 CompletedPart::builder()
                     .part_number(number)
@@ -244,7 +259,7 @@ impl MultipartUpload for S3Upload {
                 )
                 .send()
                 .await
-                .map_err(|e| s3_err("complete multipart", &self.key, DisplayErrorContext(e)))?;
+                .map_err(|e| o.sdk_err("complete multipart", &self.key, e))?;
             Ok(())
         })
     }
@@ -259,8 +274,26 @@ impl MultipartUpload for S3Upload {
                 .upload_id(&self.upload_id)
                 .send()
                 .await
-                .map_err(|e| s3_err("abort multipart", &self.key, DisplayErrorContext(e)))?;
+                .map_err(|e| o.sdk_err("abort multipart", &self.key, e))?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #862 L-163: a streamed object stops with a clear error at S3's
+    /// 10,000-part limit instead of an opaque rejection from the store.
+    #[test]
+    fn part_numbers_stop_at_the_s3_limit() {
+        assert_eq!(part_number(1, "k").unwrap(), 1);
+        assert_eq!(part_number(10_000, "k").unwrap(), 10_000);
+        let err = part_number(10_001, "k").unwrap_err().to_string();
+        assert!(
+            err.contains("10000 parts") && err.contains("max_bytes_per_file"),
+            "{err}"
+        );
     }
 }

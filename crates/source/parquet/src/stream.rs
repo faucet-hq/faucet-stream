@@ -55,6 +55,17 @@ impl ParquetSource {
                 "parquet source: concurrency must be > 0".into(),
             ));
         }
+        faucet_core::ParquetReadOptions {
+            columns: config.columns.clone(),
+        }
+        .validate()
+        .map_err(|e| match e {
+            FaucetError::Config(m) => FaucetError::Config(format!(
+                "parquet source: {}",
+                m.trim_start_matches("parquet.")
+            )),
+            other => other,
+        })?;
 
         let s3_store = match &config.source {
             ParquetLocation::S3(s3) => Some(build_s3_store(s3)?),
@@ -838,6 +849,19 @@ fn schema_mismatch_message_pair(
 
 #[cfg(test)]
 mod tests {
+    /// #862 L-164: an empty projection would decode every row as `{}`.
+    #[tokio::test]
+    async fn an_empty_column_list_is_refused_at_construction() {
+        use super::*;
+        let mut cfg = ParquetSourceConfig::local("x.parquet");
+        cfg.columns = Some(Vec::new());
+        let err = ParquetSource::new(cfg).await.err().unwrap();
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.starts_with("parquet source: ")),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn ranged_reads_are_pinned_to_the_etag_the_head_saw() {
         use super::*;

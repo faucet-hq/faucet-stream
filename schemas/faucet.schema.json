@@ -2104,12 +2104,13 @@
       "type": "object",
       "properties": {
         "id": {
-          "description": "Row identifier. Required for parent/child references and runtime\n`${id.path}` interpolation. Anonymous rows get a synthetic `row-N` id.",
+          "description": "Row identifier. Required for parent/child references and runtime\n`${id.path}` interpolation. Anonymous rows get a synthetic `row-N` id.\nLetters, digits, `_` and `-` only.",
           "type": [
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "pattern": "^[A-Za-z0-9_-]+$"
         },
         "parent": {
           "description": "If set, this row runs once per record produced by the named parent row.",
@@ -17526,7 +17527,7 @@
                     },
                     "connect_timeout_secs": {
                       "default": 30,
-                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -25828,7 +25829,7 @@
                     },
                     "connect_timeout_secs": {
                       "default": 30,
-                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -26170,7 +26171,7 @@
                       "default": 1000
                     },
                     "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the S3 `Content-Encoding` header, so consumers must\ndecompress explicitly.",
+                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the S3 `Content-Encoding` header, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_s3__CompressionConfig",
                       "default": "auto"
                     },
@@ -28173,7 +28174,7 @@
                       ]
                     },
                     "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
+                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_gcs__CompressionConfig",
                       "default": "auto"
                     },
@@ -28997,7 +28998,7 @@
                       "default": 1000
                     },
                     "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set any `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
+                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set any `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_azure-blob__CompressionConfig",
                       "default": "auto"
                     },

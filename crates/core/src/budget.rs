@@ -548,7 +548,7 @@ impl Sink for BudgetSink {
             }
         }
         let written = self.inner.write_batch_columnar(batch).await?;
-        self.account(written as u64, batch.get_array_memory_size() as u64);
+        self.account(written as u64, crate::columnar::batch_slice_bytes(batch));
         Ok(written)
     }
 }

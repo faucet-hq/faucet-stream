@@ -291,7 +291,7 @@ impl ColumnAcc {
 fn value_text(v: &Value) -> std::borrow::Cow<'_, str> {
     match v {
         Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        other => std::borrow::Cow::Owned(other.to_string()),
+        other => std::borrow::Cow::Owned(crate::util::canonical_json(other)),
     }
 }
 
@@ -391,6 +391,19 @@ impl Profiler {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #862 L-034: an object's text does not depend on key insertion order.
+    #[test]
+    fn value_text_is_independent_of_key_order() {
+        let mut a = serde_json::Map::new();
+        a.insert("b".into(), json!(1));
+        a.insert("a".into(), json!(2));
+        let mut b = serde_json::Map::new();
+        b.insert("a".into(), json!(2));
+        b.insert("b".into(), json!(1));
+        assert_eq!(value_text(&Value::Object(a)), r#"{"a":2,"b":1}"#);
+        assert_eq!(value_text(&Value::Object(b)), r#"{"a":2,"b":1}"#);
+    }
 
     fn profile(records: &[Value]) -> RunProfile {
         let mut p = Profiler::new(ProfilingSpec::default());

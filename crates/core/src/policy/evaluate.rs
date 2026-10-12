@@ -146,8 +146,6 @@ pub fn rule_applies(rule: &PolicyRule, label: &str, sink: &SinkFacts) -> bool {
     })
 }
 
-/// Evaluate every rule against every labelled column heading into `sink`.
-/// Deterministic order: rules in declaration order, columns as given.
 /// The violations a quarantine would cause at the DLQ: every labelled column
 /// of the record (`columns`), evaluated with `dlq` as their destination, when
 /// anything is `quarantined`. The quarantined record reaches the DLQ in full,
@@ -165,6 +163,8 @@ pub fn dlq_violations(
     evaluate(policy, dlq, columns)
 }
 
+/// Evaluate every rule against every labelled column heading into `sink`.
+/// Deterministic order: rules in declaration order, columns as given.
 pub fn evaluate(
     policy: &CompiledPolicy,
     sink: &SinkFacts,

@@ -163,7 +163,7 @@ pub struct RemoteBackend {
     scratch: tempfile::TempDir,
     /// Held locked for the backend's life, so a later run can tell this
     /// scratch directory from one a crashed run left behind.
-    _owner: std::fs::File,
+    _owner: Option<std::fs::File>,
     uploads: usize,
     slots: Arc<tokio::sync::Semaphore>,
     in_flight: std::sync::Mutex<Vec<InFlight>>,
@@ -179,13 +179,33 @@ const UNOWNED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 *
 
 /// Lock the owner file under a private name and only then rename it into
 /// place, so a concurrent sweep never sees an unlocked `.owner` in a live
-/// directory and removes it.
-fn lock_owner(dir: &Path) -> std::io::Result<std::fs::File> {
+/// directory and removes it. On a file system without file locks the
+/// directory is left without an owner file (`None`): the lock only guards
+/// cleanup, and an unowned directory is swept by age instead.
+fn lock_owner(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
     let pending = dir.join(".owner.pending");
     let file = std::fs::File::create(&pending)?;
-    file.try_lock().map_err(std::io::Error::other)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(std::io::Error::other(
+                "the new owner file is locked by another process",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "remote file sink: the scratch file system does not support file locks; \
+                 an abandoned scratch directory is removed only once it is a day old"
+            );
+            drop(file);
+            std::fs::remove_file(&pending)?;
+            return Ok(None);
+        }
+    }
     std::fs::rename(&pending, dir.join(OWNER_FILE))?;
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Remove the scratch directories in `parent` whose run is gone: a crashed
@@ -216,13 +236,30 @@ fn sweep_orphaned_scratch(parent: &Path) {
 }
 
 fn scratch_is_orphaned(dir: &Path) -> bool {
-    match std::fs::File::open(dir.join(OWNER_FILE)) {
-        Ok(owner) => owner.try_lock().is_ok(),
-        Err(_) => std::fs::metadata(dir)
+    let aged = || {
+        std::fs::metadata(dir)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > UNOWNED_MAX_AGE),
+            .is_some_and(|age| age > UNOWNED_MAX_AGE)
+    };
+    match std::fs::File::open(dir.join(OWNER_FILE)) {
+        Ok(owner) => match owner.try_lock() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(_)) => aged(),
+        },
+        Err(_) => aged(),
+    }
+}
+
+/// A dropped backend (a cancelled or hard-dropped sink) stops its background
+/// uploads, so nothing is published for a sink that is gone.
+impl Drop for RemoteBackend {
+    fn drop(&mut self) {
+        for u in self.pending().drain(..) {
+            u.handle.abort();
+        }
     }
 }
 
@@ -523,6 +560,15 @@ struct RemoteStream {
     slots: Arc<tokio::sync::Semaphore>,
     next: u32,
     parts: Vec<Upload>,
+}
+
+/// Parts still uploading when the stream is dropped unfinished are stopped.
+impl Drop for RemoteStream {
+    fn drop(&mut self) {
+        for p in self.parts.drain(..) {
+            p.abort();
+        }
+    }
 }
 
 impl RemoteStream {
@@ -829,6 +875,35 @@ pub(crate) mod tests {
 
     fn template(name: &str) -> NameTemplate {
         NameTemplate { name: name.into() }
+    }
+
+    /// #862 L-162: background uploads stop when the backend or a part stream
+    /// is dropped, rather than publishing for a sink that is gone.
+    #[tokio::test]
+    async fn dropping_the_backend_or_a_stream_stops_its_uploads() {
+        let mem = Arc::new(Mem::default());
+        mem.delay_ms.store(300, SeqCst);
+        let b = RemoteBackend::new(mem.clone(), "a/", &template("x"), None).unwrap();
+        let scratch = b.scratch_dir().join("f");
+        std::fs::write(&scratch, b"x").unwrap();
+        b.spawn_upload(&scratch, "a/x".into()).await.unwrap();
+        drop(b);
+
+        let parts = MemParts {
+            mem: mem.clone(),
+            size: 1,
+        };
+        let mut stream = RemoteStream {
+            upload: Some(parts.start("a/y").await.unwrap()),
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            next: 1,
+            parts: Vec::new(),
+        };
+        stream.put(vec![1]).await.unwrap();
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(mem.keys().is_empty(), "{:?}", mem.keys());
+        assert_eq!(mem.parts_put.load(SeqCst), 0);
     }
 
     #[test]

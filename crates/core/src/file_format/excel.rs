@@ -77,12 +77,17 @@ pub fn decode(
     }
     // A calamine range is rectangular, so every row is exactly as wide as the
     // header and each cell has its own (now unique) key.
+    let timestamps = timestamp_columns(range.rows().skip(header_row + 1));
     let mut out = Vec::new();
     for row in range.rows().skip(header_row + 1) {
         let obj: Map<String, Value> = headers
             .iter()
             .cloned()
-            .zip(row.iter().map(cell_to_value))
+            .zip(
+                row.iter()
+                    .enumerate()
+                    .map(|(i, c)| cell_to_value_in(c, timestamps.get(i).copied().unwrap_or(false))),
+            )
             .collect();
         out.push(Value::Object(obj));
     }
@@ -203,13 +208,19 @@ fn float_to_value(f: f64) -> Value {
 /// 1904 date system is honoured. A serial outside chrono's range keeps the
 /// raw number.
 fn excel_datetime_text(dt: &calamine::ExcelDateTime) -> String {
+    excel_datetime_text_in(dt, false)
+}
+
+/// [`excel_datetime_text`], always as a timestamp when `timestamp` (a column
+/// that holds times), so a value at midnight has its neighbours' shape.
+fn excel_datetime_text_in(dt: &calamine::ExcelDateTime, timestamp: bool) -> String {
     if dt.is_duration() {
         return dt
             .as_duration()
             .map_or_else(|| dt.as_f64().to_string(), |d| d.to_string());
     }
     match dt.as_datetime() {
-        Some(t) if t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
+        Some(t) if !timestamp && t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
         Some(t) => t.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
         None => dt.as_f64().to_string(),
     }
@@ -225,7 +236,34 @@ fn cell_to_string(cell: &calamine::Data) -> String {
     }
 }
 
+#[cfg(test)]
 fn cell_to_value(cell: &calamine::Data) -> Value {
+    cell_to_value_in(cell, false)
+}
+
+/// Which columns hold a date/time cell with a time of day: their date/time
+/// cells are all written as timestamps.
+fn timestamp_columns<'a>(rows: impl Iterator<Item = &'a [calamine::Data]>) -> Vec<bool> {
+    let mut out = Vec::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if let calamine::Data::DateTime(dt) = cell
+                && dt.is_datetime()
+                && dt
+                    .as_datetime()
+                    .is_some_and(|t| t.time() != chrono::NaiveTime::MIN)
+            {
+                if out.len() <= i {
+                    out.resize(i + 1, false);
+                }
+                out[i] = true;
+            }
+        }
+    }
+    out
+}
+
+fn cell_to_value_in(cell: &calamine::Data, timestamp: bool) -> Value {
     use calamine::Data;
     match cell {
         Data::Empty => Value::Null,
@@ -237,7 +275,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
         // integer is what makes a write→read round trip faithful; without it
         // every count comes back as `1.0`.
         Data::Float(f) => float_to_value(*f),
-        Data::DateTime(dt) => Value::String(excel_datetime_text(dt)),
+        Data::DateTime(dt) => Value::String(excel_datetime_text_in(dt, timestamp)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),
     }
@@ -419,6 +457,27 @@ mod tests {
             cell_to_value(&dt(1e12, ExcelDateTimeType::DateTime, false)),
             json!("1000000000000")
         );
+    }
+
+    /// #862 L-168: in a column that holds times, a value at midnight is a
+    /// timestamp like its neighbours; a date-only column stays dates.
+    #[test]
+    fn a_midnight_value_in_a_timestamp_column_keeps_the_timestamp_shape() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+        let dt = |v| Data::DateTime(ExcelDateTime::new(v, ExcelDateTimeType::DateTime, false));
+        let rows = [
+            vec![dt(45000.0), dt(45000.0), Data::Int(1)],
+            vec![dt(45000.5), dt(45001.0), Data::Empty],
+        ];
+        let cols = timestamp_columns(rows.iter().map(Vec::as_slice));
+        assert_eq!(cols, vec![true]);
+        assert_eq!(
+            cell_to_value_in(&rows[0][0], cols[0]),
+            json!("2023-03-15T00:00:00")
+        );
+        assert_eq!(cell_to_value_in(&rows[0][1], false), json!("2023-03-15"));
+        let span = Data::DateTime(ExcelDateTime::new(1.5, ExcelDateTimeType::TimeDelta, false));
+        assert_eq!(cell_to_value_in(&span, true), json!("PT129600S"));
     }
 
     /// Header cells are read as text. An empty header must be the empty

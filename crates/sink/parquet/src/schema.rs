@@ -69,10 +69,57 @@ fn make_nullable(field: &Field) -> Field {
         DataType::LargeList(inner) => DataType::LargeList(Arc::new(make_nullable(inner.as_ref()))),
         // Null in every sampled record: a nullable string column (no format
         // can store a Null-typed one).
-        DataType::Null => DataType::Utf8,
+        DataType::Null => {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(NULL_INFERRED.into(), "true".into());
+            return Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata);
+        }
         other => other.clone(),
     };
     Field::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
+}
+
+/// Field metadata marking a string column inferred from a sample where it was
+/// always null: its type was a guess, so later values of another type are
+/// written as text rather than failing the batch.
+pub(crate) const NULL_INFERRED: &str = "faucet.null_inferred";
+
+/// `records` with every non-string value of a top-level [`NULL_INFERRED`]
+/// column rendered as text, or `None` when nothing needs converting.
+pub(crate) fn stringify_null_inferred(schema: &Schema, records: &[Value]) -> Option<Vec<Value>> {
+    let names: Vec<&str> = schema
+        .fields()
+        .iter()
+        .filter(|f| f.metadata().contains_key(NULL_INFERRED))
+        .map(|f| f.name().as_str())
+        .collect();
+    let needs = |r: &Value| {
+        names
+            .iter()
+            .any(|n| r.get(*n).is_some_and(|v| !v.is_null() && !v.is_string()))
+    };
+    if names.is_empty() || !records.iter().any(needs) {
+        return None;
+    }
+    Some(
+        records
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                if let Value::Object(map) = &mut r {
+                    for n in &names {
+                        if let Some(v) = map.get_mut(*n)
+                            && !v.is_null()
+                            && !v.is_string()
+                        {
+                            *v = Value::String(faucet_core::util::canonical_json(v));
+                        }
+                    }
+                }
+                r
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

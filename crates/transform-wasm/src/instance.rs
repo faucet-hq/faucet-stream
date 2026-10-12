@@ -93,9 +93,14 @@ impl WasmInstance {
         self.trapped
     }
 
-    /// `faucet_v1::log` calls dropped by the per-instance cap.
+    /// `faucet_v1::log` calls dropped so far by the run's log budget.
+    #[cfg(test)]
     pub(crate) fn dropped_logs(&self) -> u64 {
-        self.store.data().logs_dropped
+        self.store
+            .data()
+            .logs
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Peak linear-memory size seen so far on this instance (bytes).

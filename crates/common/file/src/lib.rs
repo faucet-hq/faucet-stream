@@ -206,7 +206,7 @@ impl ObjectFilter {
     /// Whether to read `key` (`size` in bytes, when the listing reports it)
     /// listed under `prefix`.
     pub fn keep(&self, key: &str, size: Option<u64>, prefix: &str) -> bool {
-        if key.ends_with('/') && size.unwrap_or(0) == 0 {
+        if (key.ends_with('/') || key.ends_with("_$folder$")) && size.unwrap_or(0) == 0 {
             return false;
         }
         match &self.include {
@@ -248,6 +248,8 @@ mod tests {
         let f = ObjectFilter::default();
         assert!(f.keep("out/part-0001.parquet", Some(10), "out/"));
         assert!(!f.keep("out/_SUCCESS", Some(0), "out/"));
+        assert!(!f.keep("out/day=1_$folder$", Some(0), "out/"));
+        assert!(f.keep("out/day=1_$folder$", Some(3), "out/"));
         assert!(!f.keep("out/.part-0001.parquet.crc", Some(8), "out/"));
         assert!(!f.keep("out/_temporary/0/part-1.json", Some(8), "out/"));
         assert!(!f.keep("out/sub/", Some(0), "out/"));

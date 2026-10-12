@@ -98,12 +98,27 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Du
     if let Ok(secs) = raw.parse::<u64>() {
         return Some(std::time::Duration::from_secs(secs));
     }
-    let when = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
-    Some(
-        (when.with_timezone(&chrono::Utc) - chrono::Utc::now())
-            .to_std()
-            .unwrap_or_default(),
-    )
+    if let Ok(secs) = raw.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some(std::time::Duration::from_secs(secs.ceil() as u64));
+    }
+    let when = parse_http_date(raw)?;
+    Some((when - chrono::Utc::now()).to_std().unwrap_or_default())
+}
+
+/// An HTTP date in any of the three forms RFC 9110 §5.6.7 requires a recipient
+/// to accept: IMF-fixdate, the obsolete RFC 850 form and asctime.
+fn parse_http_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(when) = chrono::DateTime::parse_from_rfc2822(raw) {
+        return Some(when.with_timezone(&chrono::Utc));
+    }
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(&collapsed, f).ok())
+        .map(|n| n.and_utc())
 }
 
 /// `FaucetError::RateLimited(wait)` when `wait` is at most `max`; above it a
@@ -791,6 +806,26 @@ mod tests {
             w > std::time::Duration::from_secs(100) && w <= std::time::Duration::from_secs(120)
         );
         h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_obsolete_date_forms_and_fractional_seconds() {
+        let mut h = reqwest::header::HeaderMap::new();
+        for past in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
+            h.insert(reqwest::header::RETRY_AFTER, past.parse().unwrap());
+            assert_eq!(retry_after(&h), Some(std::time::Duration::ZERO), "{past}");
+        }
+        let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+        for f in ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"] {
+            let v = future.format(f).to_string();
+            h.insert(reqwest::header::RETRY_AFTER, v.parse().unwrap());
+            let w = retry_after(&h).unwrap();
+            assert!(w > std::time::Duration::from_secs(250), "{v}: {w:?}");
+        }
+        h.insert(reqwest::header::RETRY_AFTER, "1.2".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(std::time::Duration::from_secs(2)));
+        h.insert(reqwest::header::RETRY_AFTER, "-3".parse().unwrap());
         assert_eq!(retry_after(&h), None);
     }
 

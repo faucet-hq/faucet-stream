@@ -85,7 +85,8 @@ pub fn is_exact(text: &str) -> bool {
     let Ok(Value::Number(n)) = serde_json::from_str::<Value>(text) else {
         return false;
     };
-    normalize(text).is_some() && normalize(text) == normalize(&n.to_string())
+    let exact = normalize(text);
+    exact.is_some() && exact == normalize(&n.to_string())
 }
 
 /// Byte ranges of the number tokens in JSON `text` (outside strings).
@@ -158,18 +159,54 @@ pub fn parse_json_exact(
 }
 
 /// Why [`parse_json_exact`] refused a document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JsonNumberError {
     /// Numbers a `Value` cannot hold exactly, under [`JsonBigNumbers::Fail`].
+    #[error(
+        "{} number(s) cannot be held exactly, first {}",
+        .0.len(),
+        .0.first().map(InexactNumber::preview).unwrap_or_default()
+    )]
     Inexact(Vec<InexactNumber>),
     /// The text is not valid JSON.
+    #[error("invalid JSON: {0}")]
     Invalid(String),
 }
+
+impl std::fmt::Display for InexactNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} cannot be held exactly", self.preview())
+    }
+}
+
+impl std::error::Error for InexactNumber {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn errors_render_a_message() {
+        let n = InexactNumber {
+            text: "123456789012345678901234567890".into(),
+        };
+        assert_eq!(
+            n.to_string(),
+            "123456789012345678901234… cannot be held exactly"
+        );
+        let e = JsonNumberError::Inexact(vec![n.clone(), n]);
+        assert!(
+            e.to_string()
+                .starts_with("2 number(s) cannot be held exactly, first 1234"),
+            "{e}"
+        );
+        assert_eq!(
+            JsonNumberError::Invalid("eof".into()).to_string(),
+            "invalid JSON: eof"
+        );
+        let _: &dyn std::error::Error = &e;
+    }
 
     #[test]
     fn exactness_follows_the_float_serde_json_produces() {

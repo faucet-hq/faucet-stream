@@ -1227,6 +1227,8 @@ pub async fn preview_records(
                 id,
                 "source",
             )?;
+            let mut c = c;
+            crate::preview_sample::bound_batch_size(&k, &mut c, limit);
             let source = build_source(&k, c, auth, None).await?;
             let sample = crate::preview_sample::sample(
                 source.as_ref(),

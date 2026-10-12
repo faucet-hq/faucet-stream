@@ -745,14 +745,12 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
         .find(|n| matches!(n.role, crate::expand::NodeRole::Root))
         .ok_or_else(|| "no root row to preview".to_string())?;
 
-    let source = crate::registry::build_source(
-        &first_root.source.kind,
-        first_root.source.config.clone(),
-        &ctx.auth,
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let mut source_cfg = first_root.source.config.clone();
+    crate::preview_sample::bound_batch_size(&first_root.source.kind, &mut source_cfg, limit);
+    let source =
+        crate::registry::build_source(&first_root.source.kind, source_cfg, &ctx.auth, None)
+            .await
+            .map_err(|e| e.to_string())?;
     let stages =
         crate::transforms::compile_transforms(&first_root.transforms).map_err(|e| e.to_string())?;
     let compiled = stages

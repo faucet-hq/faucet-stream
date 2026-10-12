@@ -12,8 +12,8 @@ use faucet_core::FaucetError;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
@@ -24,14 +24,41 @@ use wasmtime::{
 pub(crate) struct HostState {
     pub(crate) limits: StoreLimits,
     pub(crate) epoch_base: Instant,
-    pub(crate) logs_emitted: u32,
-    pub(crate) logs_dropped: u64,
+    pub(crate) logs: Arc<LogBudget>,
+}
+
+/// The `faucet_v1::log` budget of one compiled transform, shared by every
+/// instance it creates (one per page, plus one after each trap), so the cap
+/// holds for the whole run.
+#[derive(Default)]
+pub(crate) struct LogBudget {
+    emitted: AtomicU32,
+    pub(crate) dropped: AtomicU64,
+    warned: AtomicBool,
+}
+
+impl LogBudget {
+    fn admit(&self) -> bool {
+        if self.emitted.load(Ordering::Relaxed) >= MAX_LOGS_PER_RUN {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.emitted.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Dropped lines so far, and whether this is the first time they are
+    /// reported (the warning is logged once per run).
+    pub(crate) fn report(&self) -> Option<u64> {
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        (dropped > 0 && !self.warned.swap(true, Ordering::Relaxed)).then_some(dropped)
+    }
 }
 
 /// Longest `faucet_v1::log` message forwarded; longer ones are truncated.
 pub(crate) const MAX_LOG_BYTES: usize = 4096;
-/// Log lines one instance may emit; the rest are counted and reported once.
-pub(crate) const MAX_LOGS_PER_INSTANCE: u32 = 100;
+/// Log lines one transform may emit per run; the rest are counted and reported.
+pub(crate) const MAX_LOGS_PER_RUN: u32 = 100;
 /// Table-element ceiling, so a module cannot grow a table past the memory cap.
 pub(crate) const MAX_TABLE_ELEMENTS: usize = 100_000;
 
@@ -48,6 +75,21 @@ pub(crate) struct WasmEngine {
     path: PathBuf,
     mtime: Option<SystemTime>,
     reload_on_change: bool,
+    pub(crate) logs: Arc<LogBudget>,
+}
+
+impl Drop for WasmEngine {
+    fn drop(&mut self) {
+        let dropped = self.logs.dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::warn!(
+                target: "faucet::transform::wasm",
+                module = %self.module_label,
+                dropped,
+                "wasm module log lines dropped this run (budget {MAX_LOGS_PER_RUN})"
+            );
+        }
+    }
 }
 
 impl WasmEngine {
@@ -78,6 +120,7 @@ impl WasmEngine {
             path,
             mtime,
             reload_on_change: cfg.reload_on_change,
+            logs: Arc::default(),
         };
 
         // Validate the ABI by instantiating once and resolving the required
@@ -170,8 +213,7 @@ impl WasmEngine {
             HostState {
                 limits,
                 epoch_base: Instant::now(),
-                logs_emitted: 0,
-                logs_dropped: 0,
+                logs: Arc::clone(&self.logs),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -193,7 +235,7 @@ impl WasmEngine {
 
 /// Compiled modules by content, shared across invocations: a fan-out of N
 /// parents running one module compiles it once.
-type ModuleCache = Mutex<HashMap<(u64, usize), (Engine, Module)>>;
+type ModuleCache = Mutex<HashMap<(u64, usize), (Arc<[u8]>, Engine, Module)>>;
 
 /// Entries kept before the cache is cleared.
 const MODULE_CACHE_CAP: usize = 64;
@@ -212,8 +254,11 @@ fn cached_module(
     bytes.hash(&mut hasher);
     let key = (hasher.finish(), bytes.len());
     let cache = MODULE_CACHE.get_or_init(Default::default);
-    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return Ok(hit.clone());
+    if let Some((cached, engine, module)) =
+        cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
+        && **cached == *bytes
+    {
+        return Ok((engine.clone(), module.clone()));
     }
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -233,7 +278,7 @@ fn cached_module(
     if map.len() >= MODULE_CACHE_CAP {
         map.clear();
     }
-    map.insert(key, (engine.clone(), module.clone()));
+    map.insert(key, (Arc::from(bytes), engine.clone(), module.clone()));
     Ok((engine, module))
 }
 
@@ -257,12 +302,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>, FaucetError> {
             "faucet_v1",
             "log",
             |mut caller: Caller<'_, HostState>, level: i32, ptr: i32, len: i32| {
-                let state = caller.data_mut();
-                if state.logs_emitted >= MAX_LOGS_PER_INSTANCE {
-                    state.logs_dropped += 1;
+                if !caller.data().logs.admit() {
                     return;
                 }
-                state.logs_emitted += 1;
                 let capped = len.clamp(0, MAX_LOG_BYTES as i32);
                 let msg = read_host_string(&mut caller, ptr, capped);
                 emit_log(level, &msg);
@@ -315,4 +357,29 @@ pub(crate) fn memory_export(
             "wasm transform: module does not export a linear memory named 'memory'".to_owned(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #862 I-008: a cache entry under the same digest but other bytes is a
+    /// miss, never the wrong module.
+    #[test]
+    fn a_digest_collision_is_a_cache_miss() {
+        let real = wat::parse_str(r#"(module (func (export "real")))"#).unwrap();
+        let other = wat::parse_str(r#"(module (func (export "other")))"#).unwrap();
+        let (engine, wrong) = cached_module(std::path::Path::new("o.wasm"), &other, "o").unwrap();
+        let mut hasher = std::hash::DefaultHasher::new();
+        real.hash(&mut hasher);
+        let key = (hasher.finish(), real.len());
+        MODULE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(key, (Arc::from(&other[..]), engine, wrong));
+        let (_, module) = cached_module(std::path::Path::new("r.wasm"), &real, "r").unwrap();
+        assert!(module.get_export("real").is_some());
+        assert!(module.get_export("other").is_none());
+    }
 }

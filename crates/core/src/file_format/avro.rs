@@ -265,7 +265,7 @@ pub fn datum_to_json(datum: &Av, schema: &Schema) -> Result<Value, FaucetError> 
 /// Build the Avro datum for `value` under `schema`, accepting the JSON shapes
 /// [`datum_to_json`] produces (the inverse mapping). The error names the path
 /// that did not fit.
-pub fn datum_from_json(value: &Value, schema: &Schema) -> Result<Av, String> {
+pub fn datum_from_json(value: &Value, schema: &Schema) -> Result<Av, FaucetError> {
     datum_from_json_with(value, schema, BytesText::Hex)
 }
 
@@ -292,9 +292,14 @@ pub enum BytesText {
 
 /// [`datum_from_json`] with an explicit reading of JSON strings for
 /// `bytes` / `fixed` values. A JSON array of byte numbers is accepted either way.
-pub fn datum_from_json_with(value: &Value, schema: &Schema, text: BytesText) -> Result<Av, String> {
+pub fn datum_from_json_with(
+    value: &Value,
+    schema: &Schema,
+    text: BytesText,
+) -> Result<Av, FaucetError> {
     let names = named(schema);
     from_json(value, schema, &names, text, "")
+        .map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
 }
 
 fn root_to_json(
@@ -329,7 +334,7 @@ fn to_json(
         && stack.contains(&n)
     {
         let inner = to_json(v, s, names, Mode::Record, &mut Vec::new())?;
-        return Ok(Value::String(inner.to_string()));
+        return Ok(Value::String(crate::util::canonical_json(&inner)));
     }
     Ok(match (v, s) {
         (Av::Union(i, inner), Schema::Union(u)) => {
@@ -341,7 +346,7 @@ fn to_json(
                     return Ok(Value::Null);
                 }
                 let j = to_json(inner, branch, names, Mode::Record, &mut Vec::new())?;
-                return Ok(Value::String(j.to_string()));
+                return Ok(Value::String(crate::util::canonical_json(&j)));
             }
             to_json(inner, branch, names, mode, stack)?
         }
@@ -1306,6 +1311,27 @@ pub(crate) fn read_batches_checked<R: std::io::Read>(
 mod tests {
     use super::*;
 
+    /// #862 L-034: a complex-union value stringified for an Arrow column is
+    /// canonical JSON (sorted keys), whatever the record's field order.
+    #[test]
+    fn complex_union_text_is_canonical_json() {
+        let schema = Schema::parse_str(
+            r#"["null", "string", {"type":"record","name":"r","fields":[
+                {"name":"z","type":"long"},{"name":"a","type":"long"}]}]"#,
+        )
+        .unwrap();
+        let datum = Av::Union(
+            2,
+            Box::new(Av::Record(vec![
+                ("z".into(), Av::Long(1)),
+                ("a".into(), Av::Long(2)),
+            ])),
+        );
+        let names = named(&schema);
+        let v = to_json(&datum, &schema, &names, Mode::Arrow, &mut Vec::new()).unwrap();
+        assert_eq!(v, json!(r#"{"a":2,"z":1}"#));
+    }
+
     #[test]
     fn datum_conversion_keeps_logical_types_exact_and_round_trips() {
         let schema = Schema::parse_str(
@@ -1324,7 +1350,11 @@ mod tests {
             json!(7),
             "a non-record datum is not wrapped"
         );
-        assert!(datum_from_json(&json!({"amount": 1}), &schema).is_err());
+        let err = datum_from_json(&json!({"amount": 1}), &schema).unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Sink(m) if m.starts_with("json->avro: ")),
+            "{err}"
+        );
     }
 
     fn logical_schema() -> Value {

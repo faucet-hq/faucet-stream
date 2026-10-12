@@ -95,6 +95,8 @@ struct WriterState {
     /// Single-file mode: the fixed path holds a file this run published, so the
     /// next write continues it.
     published: bool,
+    /// The one-time warning about rewriting the single file was logged.
+    warned_rewrite: bool,
 }
 
 impl WriterState {
@@ -106,6 +108,7 @@ impl WriterState {
             files_written: 0,
             warned_fields: std::collections::HashSet::new(),
             published: false,
+            warned_rewrite: false,
         }
     }
 }
@@ -254,6 +257,8 @@ impl ParquetSink {
         records: &[Value],
     ) -> Result<RecordBatch, FaucetError> {
         warn_on_unknown_fields(warned_fields, &schema, records);
+        let owned = crate::schema::stringify_null_inferred(&schema, records);
+        let records = owned.as_deref().unwrap_or(records);
 
         let mut decoder = arrow_json::ReaderBuilder::new(schema.clone())
             .build_decoder()
@@ -411,6 +416,14 @@ impl ParquetSink {
     async fn continue_published(&self, state: &mut WriterState) -> Result<(), FaucetError> {
         if !self.single_file || !state.published || state.writer.is_some() {
             return Ok(());
+        }
+        if !state.warned_rewrite {
+            state.warned_rewrite = true;
+            tracing::warn!(
+                "parquet sink: single-file mode rewrites the whole file after every flush, so a \
+                 source that bookmarks every page costs time and I/O quadratic in the run's \
+                 size; write to a directory (or a `{{part}}` path) instead"
+            );
         }
         let path = self
             .next_object_path()?
@@ -993,6 +1006,48 @@ mod tests {
         assert_eq!(text("deleted_at").value(1), "2026-10-01");
         assert_eq!(text("amount").value(1), "12.5");
         assert!(arrow::array::Array::is_null(&text("amount"), 0));
+    }
+
+    /// #862 L-159: a column null throughout the sample is a string column, and
+    /// later numbers, booleans or objects in it are written as their text
+    /// instead of failing the batch.
+    #[tokio::test]
+    async fn non_string_values_in_a_null_sampled_column_are_written_as_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sparse.parquet");
+        let sink = ParquetSink::new(cfg(&path)).await.unwrap();
+        sink.write_batch(&[json!({"id": 1, "v": null})])
+            .await
+            .unwrap();
+        sink.write_batch(&[
+            json!({"id": 2, "v": 5}),
+            json!({"id": 3, "v": true}),
+            json!({"id": 4, "v": {"b": 1, "a": 2}}),
+            json!({"id": 5, "v": "s"}),
+            json!({"id": 6}),
+        ])
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let batch = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let v = batch
+            .column(batch.schema().index_of("v").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(v.value(1), "5");
+        assert_eq!(v.value(2), "true");
+        assert_eq!(v.value(3), r#"{"a":2,"b":1}"#);
+        assert_eq!(v.value(4), "s");
+        assert!(arrow::array::Array::is_null(&v, 5));
     }
 
     /// A store whose multipart uploads never complete and count their aborts.

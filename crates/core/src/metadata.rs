@@ -174,13 +174,30 @@ impl MetadataSink {
     /// Return a copy of `records` with the metadata columns injected. Non-object
     /// records pass through unchanged (nowhere to stamp).
     fn stamp(&self, records: &[Value]) -> Vec<Value> {
+        self.stamp_with(records, true)
+    }
+
+    /// `records` as they will be written, for admission checks: the same
+    /// columns, without consuming sequence numbers.
+    fn preview(&self, records: &[Value]) -> Vec<Value> {
+        self.stamp_with(records, false)
+    }
+
+    fn stamp_with(&self, records: &[Value], advance: bool) -> Vec<Value> {
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut next = self.seq.load(Ordering::Relaxed);
         records
             .iter()
             .map(|rec| match rec {
                 Value::Object(map) => {
                     let mut map = map.clone();
-                    self.inject(&mut map, &now);
+                    let seq = if advance {
+                        self.seq.fetch_add(1, Ordering::Relaxed)
+                    } else {
+                        next += 1;
+                        next - 1
+                    };
+                    self.inject(&mut map, &now, seq, advance);
                     Value::Object(map)
                 }
                 other => other.clone(),
@@ -188,7 +205,7 @@ impl MetadataSink {
             .collect()
     }
 
-    fn inject(&self, map: &mut Map<String, Value>, now: &str) {
+    fn inject(&self, map: &mut Map<String, Value>, now: &str, seq: u64, note: bool) {
         for &col in &self.meta.columns {
             let name = self.meta.column_name(col);
             let value = match col {
@@ -197,9 +214,9 @@ impl MetadataSink {
                 }
                 MetadataColumn::RunId => Value::String(self.ctx.run_id.clone()),
                 MetadataColumn::Source => Value::String(self.ctx.source.clone()),
-                MetadataColumn::Sequence => Value::from(self.seq.fetch_add(1, Ordering::Relaxed)),
+                MetadataColumn::Sequence => Value::from(seq),
             };
-            if map.insert(name.clone(), value).is_some() {
+            if map.insert(name.clone(), value).is_some() && note {
                 self.note_collision(name);
             }
         }
@@ -282,7 +299,7 @@ impl MetadataSink {
 #[async_trait::async_trait]
 impl Sink for MetadataSink {
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
+        self.inner.admit_page(&self.preview(records)).await
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.ensure_columns().await?;
@@ -641,6 +658,53 @@ mod tests {
         assert_eq!(
             stamped[0]["_faucet_sequence"].as_u64().unwrap() + 1,
             stamped[1]["_faucet_sequence"].as_u64().unwrap()
+        );
+    }
+
+    /// #862 L-029: admission sees the page as it will be written (with the
+    /// metadata columns), so a byte budget counts them, without consuming
+    /// sequence numbers.
+    #[tokio::test]
+    async fn admit_page_forwards_the_stamped_page() {
+        #[derive(Default)]
+        struct Admits(std::sync::Mutex<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl Sink for Admits {
+            async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().extend_from_slice(records);
+                Ok(())
+            }
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+        }
+        let meta =
+            CompiledMetadata::compile(&spec(&[MetadataColumn::RunId, MetadataColumn::Sequence]))
+                .unwrap()
+                .unwrap();
+        let inner = std::sync::Arc::new(Admits::default());
+        struct Shared(std::sync::Arc<Admits>);
+        #[async_trait::async_trait]
+        impl Sink for Shared {
+            async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+                self.0.admit_page(records).await
+            }
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                self.0.write_batch(records).await
+            }
+        }
+        let sink = MetadataSink::new(Box::new(Shared(std::sync::Arc::clone(&inner))), meta, ctx());
+        sink.admit_page(&[json!({"id": 1}), json!("x")])
+            .await
+            .unwrap();
+        let admitted = inner.0.lock().unwrap().clone();
+        assert_eq!(admitted[0]["_faucet_run_id"], "run-42");
+        assert_eq!(admitted[0]["_faucet_sequence"], 0);
+        assert_eq!(admitted[1], json!("x"));
+        let stamped = sink.stamp(&[json!({"id": 1})]);
+        assert_eq!(
+            stamped[0]["_faucet_sequence"], 0,
+            "admission consumed no sequence"
         );
     }
 

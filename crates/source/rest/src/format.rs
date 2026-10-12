@@ -481,6 +481,7 @@ pub fn parse_excel(
         .iter()
         .map(cell_to_string)
         .collect();
+    let timestamps = timestamp_columns(range.rows().skip(header_row + 1));
     let mut out = Vec::new();
     for row in range.rows().skip(header_row + 1) {
         let mut obj = Map::new();
@@ -490,7 +491,10 @@ pub fn parse_excel(
                 .cloned()
                 .filter(|k| !k.is_empty())
                 .unwrap_or_else(|| format!("column_{i}"));
-            obj.insert(key, cell_to_value(cell));
+            obj.insert(
+                key,
+                cell_to_value_in(cell, timestamps.get(i).copied().unwrap_or(false)),
+            );
         }
         out.push(Value::Object(obj));
     }
@@ -518,13 +522,20 @@ pub fn parse_excel(
 /// 1904 date system is honoured. A serial outside chrono's range keeps the
 /// raw number.
 fn excel_datetime_text(dt: &calamine::ExcelDateTime) -> String {
+    excel_datetime_text_in(dt, false)
+}
+
+/// [`excel_datetime_text`], always as a timestamp when `timestamp` (a column
+/// that holds times), so a value at midnight has its neighbours' shape.
+#[cfg(feature = "excel")]
+fn excel_datetime_text_in(dt: &calamine::ExcelDateTime, timestamp: bool) -> String {
     if dt.is_duration() {
         return dt
             .as_duration()
             .map_or_else(|| dt.as_f64().to_string(), |d| d.to_string());
     }
     match dt.as_datetime() {
-        Some(t) if t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
+        Some(t) if !timestamp && t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
         Some(t) => t.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
         None => dt.as_f64().to_string(),
     }
@@ -541,8 +552,36 @@ fn cell_to_string(cell: &calamine::Data) -> String {
     }
 }
 
-#[cfg(feature = "excel")]
+#[cfg(all(feature = "excel", test))]
 fn cell_to_value(cell: &calamine::Data) -> Value {
+    cell_to_value_in(cell, false)
+}
+
+/// Which columns hold a date/time cell with a time of day: their date/time
+/// cells are all written as timestamps.
+#[cfg(feature = "excel")]
+fn timestamp_columns<'a>(rows: impl Iterator<Item = &'a [calamine::Data]>) -> Vec<bool> {
+    let mut out = Vec::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if let calamine::Data::DateTime(dt) = cell
+                && dt.is_datetime()
+                && dt
+                    .as_datetime()
+                    .is_some_and(|t| t.time() != chrono::NaiveTime::MIN)
+            {
+                if out.len() <= i {
+                    out.resize(i + 1, false);
+                }
+                out[i] = true;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "excel")]
+fn cell_to_value_in(cell: &calamine::Data, timestamp: bool) -> Value {
     use calamine::Data;
     match cell {
         Data::Empty => Value::Null,
@@ -552,7 +591,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
         Data::Float(f) => serde_json::Number::from_f64(*f)
             .map(Value::Number)
             .unwrap_or(Value::Null),
-        Data::DateTime(dt) => Value::String(excel_datetime_text(dt)),
+        Data::DateTime(dt) => Value::String(excel_datetime_text_in(dt, timestamp)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),
     }
@@ -1005,6 +1044,26 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("excel")
+        );
+    }
+
+    /// #862 L-168: a midnight value in a column that holds times keeps the
+    /// timestamp shape.
+    #[cfg(feature = "excel")]
+    #[test]
+    fn a_midnight_value_in_a_timestamp_column_keeps_the_timestamp_shape() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+        let dt = |v| Data::DateTime(ExcelDateTime::new(v, ExcelDateTimeType::DateTime, false));
+        let rows = [vec![dt(45000.0), dt(45000.0)], vec![dt(45000.5)]];
+        let cols = timestamp_columns(rows.iter().map(Vec::as_slice));
+        assert_eq!(cols, vec![true]);
+        assert_eq!(
+            cell_to_value_in(&rows[0][0], cols[0]),
+            Value::String("2023-03-15T00:00:00".into())
+        );
+        assert_eq!(
+            cell_to_value_in(&rows[0][1], false),
+            Value::String("2023-03-15".into())
         );
     }
 

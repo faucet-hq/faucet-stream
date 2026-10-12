@@ -481,18 +481,26 @@ async fn expire_lease(store: &dyn StateStore, key: &str, run_id: &str) {
     }
 }
 
-/// Remove the lease at `key` unless another run has taken it.
+/// Remove the lease at `key` unless another run has taken it: a conditional
+/// write of `null`, which [`read`] and a take treat as no lease, so a run that
+/// took the lease between the read and the write keeps it.
 async fn release_lease(store: &dyn StateStore, key: &str, run_id: &str) {
-    match store.get(key).await {
-        Ok(Some(v)) if RunLease::from_value(v.clone()).is_some_and(|l| l.run_id != run_id) => {}
-        Ok(_) => {
-            if let Err(e) = store.delete(key).await {
-                tracing::warn!(key, error = %e, "run lease could not be removed");
-            }
-        }
+    let current = match store.get(key).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return,
         Err(e) => {
             tracing::warn!(key, error = %e, "run lease unreadable at release");
+            return;
         }
+    };
+    if RunLease::from_value(current.clone()).is_some_and(|l| l.run_id != run_id) {
+        return;
+    }
+    if let Err(e) = store
+        .compare_and_put(key, Some(&current), &Value::Null)
+        .await
+    {
+        tracing::warn!(key, error = %e, "run lease could not be removed");
     }
 }
 
@@ -574,6 +582,69 @@ mod tests {
         assert!(renewed.expires_at >= first.expires_at);
         guard.release().await;
         assert!(read(store.as_ref(), "p::r").await.unwrap().is_none());
+    }
+
+    /// #862 L-022: a run that takes the lease between release's read and its
+    /// write keeps it.
+    #[tokio::test]
+    async fn release_is_a_conditional_write() {
+        struct Racing {
+            inner: MemoryStateStore,
+        }
+        #[faucet_core::async_trait]
+        impl StateStore for Racing {
+            async fn get(&self, k: &str) -> Result<Option<Value>, FaucetError> {
+                self.inner.get(k).await
+            }
+            async fn put(&self, k: &str, v: &Value) -> Result<(), FaucetError> {
+                self.inner.put(k, v).await
+            }
+            async fn delete(&self, k: &str) -> Result<(), FaucetError> {
+                self.inner.delete(k).await
+            }
+            async fn compare_and_put(
+                &self,
+                k: &str,
+                expected: Option<&Value>,
+                v: &Value,
+            ) -> Result<bool, FaucetError> {
+                if v.is_null() {
+                    let other = serde_json::to_value(RunLease::new("run-2", Utc::now())).unwrap();
+                    self.inner.put(k, &other).await?;
+                }
+                self.inner.compare_and_put(k, expected, v).await
+            }
+        }
+        let racing = Racing {
+            inner: MemoryStateStore::new(),
+        };
+        let lease = serde_json::to_value(RunLease::new("run-1", Utc::now())).unwrap();
+        racing.put("p::r::__lease__", &lease).await.unwrap();
+        release_lease(&racing, "p::r::__lease__", "run-1").await;
+        let held = read(&racing, "p::r").await.unwrap().unwrap();
+        assert_eq!(held.run_id, "run-2");
+
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        release_lease(store.as_ref(), "p::r::__lease__", "run-1").await;
+        assert!(store.get("p::r::__lease__").await.unwrap().is_none());
+        release_lease(
+            flaky(false, true, false).as_ref(),
+            "p::r::__lease__",
+            "run-1",
+        )
+        .await;
+        let guard = acquire(Arc::clone(&store), "p::r", "run-1").await.unwrap();
+        guard.release().await;
+        assert_eq!(
+            store.get("p::r::__lease__").await.unwrap(),
+            Some(Value::Null)
+        );
+        let next = acquire(Arc::clone(&store), "p::r", "run-3").await.unwrap();
+        assert_eq!(
+            read(store.as_ref(), "p::r").await.unwrap().unwrap().run_id,
+            "run-3"
+        );
+        next.release().await;
     }
 
     #[tokio::test]

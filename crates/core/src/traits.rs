@@ -417,14 +417,6 @@ pub trait Source: Send + Sync {
         None
     }
 
-    /// The earliest stream position every one of `positions` can resume from
-    /// (#731): the shared change stream restarts there and each table skips
-    /// what it has already applied. The default picks the position that
-    /// [`position_le`](Self::position_le) orders at or before all the others,
-    /// and `None` when there is none (an empty slice, or positions this source
-    /// cannot order). Sources whose positions are only partially ordered (one
-    /// cursor per capture instance, say) override it with a component-wise
-    /// minimum.
     /// Whether the stream had already delivered `record`'s change at stream
     /// position `position` (#854): `Some(true)` when a run resumed from
     /// `position` would not deliver it again, `Some(false)` when it would, and
@@ -438,6 +430,14 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// The earliest stream position every one of `positions` can resume from
+    /// (#731): the shared change stream restarts there and each table skips
+    /// what it has already applied. The default picks the position that
+    /// [`position_le`](Self::position_le) orders at or before all the others,
+    /// and `None` when there is none (an empty slice, or positions this source
+    /// cannot order). Sources whose positions are only partially ordered (one
+    /// cursor per capture instance, say) override it with a component-wise
+    /// minimum.
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         let first = positions.first()?;
         if positions.iter().all(|p| p == first) {
