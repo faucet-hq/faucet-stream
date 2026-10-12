@@ -1137,20 +1137,6 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             }
         }
 
-        if cfg.shard.is_some()
-            && state.is_some()
-            && pk_range_bookmarked(&merged_source.kind, &merged_source.config)
-        {
-            return Err(CliError::Config(format!(
-                "row '{}': `shard:` cannot be combined with incremental replication on source \
-                 '{}' — key ranges are re-planned every run while each shard keeps its own \
-                 cursor, so a key range can move to a shard whose cursor is already past a \
-                 late row and that row is never read. Remove `shard:` or the incremental \
-                 replication setting",
-                ids[i], merged_source.kind
-            )));
-        }
-
         // ── Overwrite gates (load-time, #492) ───────────────────────────
         // Overwrite replaces the whole destination via an atomic begin/commit
         // staging swap. It has no per-page watermark, and its staging table is
@@ -1609,8 +1595,11 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
-    if cfg.shard.as_ref().is_some_and(|s| s.count >= 2) {
-        check_sharded_file_sinks(&out)?;
+    if let Err(e) = check_sharding(cfg, &out) {
+        tracing::warn!(
+            "{e} (`shard:` takes effect only under `faucet serve --cluster`, which refuses \
+             this config; elsewhere it runs unsharded)"
+        );
     }
     for warning in out.iter().filter_map(rewritten_file_warning) {
         tracing::warn!("{warning}");
@@ -1873,6 +1862,37 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
         "file" => cfg.get("incremental").is_some_and(|v| !v.is_null()),
         _ => false,
     }
+}
+
+/// Refuse rows that `shard:` would break, where `shard:` takes effect (a
+/// `faucet serve --cluster` run with `shard.count >= 2`; `faucet run`,
+/// `validate` and `schedule` ignore it and only warn).
+///
+/// - An incrementally replicated, key-range sharded SQL source (#862 M-040):
+///   key ranges are re-planned every run while each shard keeps its own
+///   cursor, so a late row can land in a range whose shard is already past it.
+/// - A file or object destination (#862 M-096): every shard runs at once with
+///   the same sink config and the writers clobber each other's files.
+pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult<()> {
+    if !cfg.shard.as_ref().is_some_and(|s| s.count >= 2) {
+        return Ok(());
+    }
+    for n in nodes
+        .iter()
+        .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    {
+        if n.state.is_some() && pk_range_bookmarked(&n.source.kind, &n.source.config) {
+            return Err(CliError::Config(format!(
+                "row '{}': `shard:` cannot be combined with incremental replication on source \
+                 '{}' — key ranges are re-planned every run while each shard keeps its own \
+                 cursor, so a key range can move to a shard whose cursor is already past a \
+                 late row and that row is never read. Remove `shard:` or the incremental \
+                 replication setting",
+                n.id, n.source.kind
+            )));
+        }
+    }
+    check_sharded_file_sinks(nodes)
 }
 
 /// `shard:` runs every shard of a row at once with the same sink config, so a
@@ -2504,11 +2524,18 @@ pipeline:
             std::path::Path::new("t.yaml"),
         )
         .unwrap();
-        let err = expand(&cfg).unwrap_err().to_string();
+        let nodes = expand(&cfg).expect("`faucet run` ignores `shard:`, so it only warns");
+        let err = check_sharding(&cfg, &nodes).unwrap_err().to_string();
         assert!(err.contains("`shard:` cannot be combined"), "{err}");
         let cfg = PipelineConfig::from_text(&yaml("postgres", ""), std::path::Path::new("t.yaml"))
             .unwrap();
-        assert!(expand(&cfg).is_ok());
+        assert!(check_sharding(&cfg, &expand(&cfg).unwrap()).is_ok());
+        let one = PipelineConfig::from_text(
+            &yaml("postgres", "shard: { count: 1 }"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        assert!(check_sharding(&one, &expand(&one).unwrap()).is_ok());
         assert!(pk_range_bookmarked(
             "mysql",
             &serde_json::json!({"replication": {"type": "incremental"}})
@@ -4414,7 +4441,7 @@ pipeline:
     }
 
     /// #862 M-096: shards run at once with one sink config, so a file or
-    /// object destination is refused under `shard:`.
+    /// object destination is refused where `shard:` takes effect.
     #[test]
     fn sharded_rows_may_not_share_a_file_destination() {
         let run = |sink: &str| {
@@ -4423,7 +4450,9 @@ pipeline:
                  {{ database_url: \"sqlite:/tmp/s.db\", query: \"SELECT 1\", shard: {{ key: id }} }} }}\n  \
                  sink: {sink}\n"
             );
-            expand(&parse_with_extension(&yaml, "yaml").unwrap())
+            let cfg = parse_with_extension(&yaml, "yaml").unwrap();
+            let nodes = expand(&cfg).expect("`faucet run` ignores `shard:`");
+            check_sharding(&cfg, &nodes)
         };
         let err = run(r#"{ type: file, config: { path: /tmp/m096/out.jsonl } }"#)
             .unwrap_err()
