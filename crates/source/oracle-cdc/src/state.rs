@@ -29,6 +29,11 @@ pub struct Position {
     /// `RESETLOGS_CHANGE#` of the incarnation the position belongs to; absent
     /// in bookmarks written before it was recorded.
     pub resetlogs_scn: Option<u64>,
+    /// `INCARNATION_SCN` of the pluggable database's current incarnation
+    /// (`V$PDB_INCARNATION`), when the source is connected to a PDB: a PDB
+    /// point-in-time recovery or flashback starts a new one without a
+    /// database-wide RESETLOGS.
+    pub pdb_incarnation_scn: Option<u64>,
 }
 
 impl Position {
@@ -40,6 +45,7 @@ impl Position {
             restart_scn: restart.min(scn.saturating_add(1)),
             committed_xids: Vec::new(),
             resetlogs_scn: None,
+            pdb_incarnation_scn: None,
         }
     }
 
@@ -67,6 +73,39 @@ impl Position {
                     );
                 }
                 self.resetlogs_scn = Some(current);
+                Ok(())
+            }
+        }
+    }
+
+    /// Tie the position to the PDB incarnation that began at `current`
+    /// (`None` outside a PDB, or when it could not be read), refusing a
+    /// position taken in another one — a PDB point-in-time recovery or
+    /// flashback, which leaves the database's RESETLOGS SCN unchanged.
+    pub fn bind_pdb_incarnation(&mut self, current: Option<u64>) -> Result<(), FaucetError> {
+        let Some(current) = current else {
+            return Ok(());
+        };
+        match self.pdb_incarnation_scn {
+            Some(r) if r != current => Err(FaucetError::Source(format!(
+                "oracle-cdc: the bookmark was taken in the pluggable database incarnation that \
+                 began at SCN {r}, but the PDB's current incarnation began at SCN {current} (a \
+                 point-in-time recovery or flashback); its changes after the branch point may \
+                 no longer exist. Re-snapshot the tables and reset the bookmark"
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                if self.commit_scn >= current {
+                    tracing::warn!(
+                        connector = "oracle-cdc",
+                        commit_scn = self.commit_scn,
+                        pdb_incarnation_scn = current,
+                        "the bookmark predates PDB incarnation tracking and lies after the PDB's \
+                         current incarnation SCN, so a PDB recovery before the upgrade cannot be \
+                         detected; it is bound to the current PDB incarnation from now on"
+                    );
+                }
+                self.pdb_incarnation_scn = Some(current);
                 Ok(())
             }
         }
@@ -130,6 +169,9 @@ impl Position {
         if let Some(r) = self.resetlogs_scn {
             v["resetlogs_scn"] = json!(r);
         }
+        if let Some(r) = self.pdb_incarnation_scn {
+            v["pdb_incarnation_scn"] = json!(r);
+        }
         v
     }
 
@@ -158,11 +200,16 @@ impl Position {
             None | Some(Value::Null) => None,
             Some(_) => Some(scn("resetlogs_scn")?),
         };
+        let pdb_incarnation_scn = match obj.get("pdb_incarnation_scn") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(scn("pdb_incarnation_scn")?),
+        };
         Ok(Self {
             commit_scn: scn("commit_scn")?,
             restart_scn: scn("restart_scn")?,
             committed_xids: xids,
             resetlogs_scn,
+            pdb_incarnation_scn,
         })
     }
 }
@@ -221,6 +268,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_pdb_incarnation_is_recorded_and_enforced() {
+        let mut p = Position::at(10, 5);
+        p.bind_pdb_incarnation(None).unwrap();
+        assert_eq!(p.pdb_incarnation_scn, None);
+        assert!(p.to_value().get("pdb_incarnation_scn").is_none());
+        p.bind_pdb_incarnation(Some(7)).unwrap();
+        let v = p.to_value();
+        assert_eq!(v["pdb_incarnation_scn"], 7);
+        let mut back = Position::from_value(&v).unwrap();
+        back.bind_pdb_incarnation(Some(7)).unwrap();
+        back.bind_pdb_incarnation(None).unwrap();
+        let err = back.bind_pdb_incarnation(Some(42)).unwrap_err();
+        assert!(err.to_string().contains("began at SCN 42"), "{err}");
+        let mut legacy = Position::at(50, 50);
+        legacy.bind_pdb_incarnation(Some(40)).unwrap();
+        assert_eq!(legacy.pdb_incarnation_scn, Some(40));
+        assert!(
+            Position::from_value(&json!({
+                "commit_scn": 1, "restart_scn": 1, "pdb_incarnation_scn": "x"
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn a_record_is_covered_by_a_lower_scn_or_an_emitted_transaction_at_it() {
