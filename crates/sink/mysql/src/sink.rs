@@ -428,15 +428,15 @@ pub(crate) async fn replace_rows_in_place(
     target: &str,
     source: &str,
 ) -> Result<(), FaucetError> {
-    let into = insertable_columns(&mut **conn, target).await?;
-    let from = insertable_columns(&mut **conn, source).await?;
+    let into = insertable_columns(conn, target).await?;
+    let from = insertable_columns(conn, source).await?;
     let cols = into
         .iter()
         .filter(|c| from.contains(c))
         .map(|c| quote_ident_mysql(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let fks = table_foreign_keys(&mut **conn, target).await?;
+    let fks = table_foreign_keys(conn, target).await?;
     let self_referencing = fks.iter().any(|fk| fk.references(target));
     let (t, s) = (quote_ident_mysql(target), quote_ident_mysql(source));
     let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql overwrite: replace rows: {e}"));

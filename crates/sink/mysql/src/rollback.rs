@@ -500,9 +500,7 @@ impl MysqlSink {
         let prev = quote_ident_mysql(&self.previous_table_name());
         let old = quote_ident_mysql(&self.old_table_name());
         let col = &opts.run_id_column;
-        let columns = self
-            .columns_of(&mut **conn, &self.config.table_name)
-            .await?;
+        let columns = self.columns_of(conn, &self.config.table_name).await?;
         // The kept table is the image before the *latest* overwrite; if the
         // target no longer holds this run's rows, a later run replaced them.
         let conflicts: i64 = if columns.iter().any(|c| c == col) {
@@ -535,7 +533,7 @@ impl MysqlSink {
         }
         // A target with foreign keys or triggers gets its rows back in place,
         // keeping its definition (#789 SQL-108).
-        let deps = crate::sink::table_dependents(&mut **conn, &self.config.table_name).await?;
+        let deps = crate::sink::table_dependents(conn, &self.config.table_name).await?;
         if !deps.pinned.is_empty() || !deps.referenced_by.is_empty() {
             crate::sink::replace_rows_in_place(
                 conn,
