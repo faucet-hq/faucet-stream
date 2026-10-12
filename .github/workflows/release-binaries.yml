@@ -51,10 +51,10 @@ env:
 # per-crate tag so the ~50 other `<crate>-vX.Y.Z` tags release-plz pushes per
 # release do not trigger binary builds. On pull requests only the cheap
 # `dist plan` job runs (build jobs are gated on publishing).
-# NOTE: release-plz pushes tags with the workflow-scoped GITHUB_TOKEN, and
-# GitHub suppresses workflow triggers from GITHUB_TOKEN-pushed refs — so the
-# tag push does NOT fire this workflow on its own. Until a RELEASE_PLZ_TOKEN
-# PAT is configured for the publish job, trigger a release build manually:
+# NOTE: the publish job pushes tags with RELEASE_PLZ_TOKEN, so the tag push
+# fires this workflow. If RELEASE_PLZ_TOKEN is unset, release-plz falls back to
+# the workflow-scoped GITHUB_TOKEN, whose ref pushes GitHub does not let
+# trigger workflows; then trigger the release build manually:
 #   gh workflow run release-binaries.yml --ref faucet-cli-vX.Y.Z
 # (workflow_dispatch on the tag ref; the plan job reads the tag from the ref).
 on:
@@ -384,6 +384,7 @@ jobs:
       - name: Rebuild the site with the new connector feed
         env:
           GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN || secrets.RELEASE_PLZ_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::Set SITE_DISPATCH_TOKEN (or RELEASE_PLZ_TOKEN) with contents:write on faucet-hq/faucet-hq.github.io; the site picks up the feed at its next scheduled build"
@@ -391,7 +392,7 @@ jobs:
           fi
           gh api --method POST repos/faucet-hq/faucet-hq.github.io/dispatches \
             -f event_type=faucet-release \
-            -f "client_payload[tag]=${{ needs.plan.outputs.tag }}"
+            -f "client_payload[tag]=$TAG"
 
   publish-homebrew-formula:
     needs:
