@@ -35,6 +35,12 @@ spec:
         {{- if .Values.secret.create }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret-env.yaml") . | sha256sum }}
         {{- end }}
+        {{- if and (eq .Values.serve.history.backend "postgres") .Values.serve.history.url (not .Values.serve.history.existingSecret) }}
+        checksum/serve-history: {{ include (print $.Template.BasePath "/secret-serve-history.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if .Values.otel.logs.enabled }}
+        checksum/otel: {{ include (print $.Template.BasePath "/otel-logs.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.serve.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -252,8 +258,8 @@ spec:
         {{- end }}
         {{- if and .Values.otel.logs.enabled (not .Values.serve.otel.enabled) }}
         - name: otel-config
-          configMap:
-            name: {{ include "faucet-stream.fullname" . }}-otel
+          secret:
+            secretName: {{ include "faucet-stream.fullname" . }}-otel
         {{- end }}
         {{- range $key, $f := $features }}
         {{- $block := index $.Values.serve $key }}

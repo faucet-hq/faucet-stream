@@ -1,11 +1,12 @@
 {{- if .Values.otel.logs.enabled -}}
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
   name: {{ include "faucet-stream.fullname" . }}-otel
   labels:
     {{- include "faucet-stream.labels" . | nindent 4 }}
-data:
+type: Opaque
+stringData:
   otel.yaml: |
     endpoint: {{ .Values.otel.logs.endpoint | quote }}
     protocol: {{ .Values.otel.logs.protocol }}

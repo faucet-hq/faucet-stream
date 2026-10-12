@@ -143,7 +143,7 @@ otel:
     endpoint: ""            # e.g. http://otel-collector:4317 (grpc) / :4318 (http)
     protocol: grpc          # grpc | http
     serviceName: faucet
-    headers: {}             # e.g. { authorization: "Bearer ..." }
+    headers: {}             # e.g. { authorization: "Bearer ..." } — rendered into a Secret
     retentionSeconds: 86400
     maxAgeSeconds: 604800
     maxBytes: 1073741824
@@ -190,7 +190,8 @@ serve:
     # on the command line; a postgres DSN is stored in a chart-managed Secret.
     url: ""
     # Or read the URL from your own Secret (recommended for postgres, so the
-    # password never sits in Helm values).
+    # password never sits in Helm values). Pods restart on a `url` change;
+    # after changing an existingSecret's value, restart the deployment yourself.
     existingSecret: ""
     existingSecretKey: FAUCET_SERVE_HISTORY
 
