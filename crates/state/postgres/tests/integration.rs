@@ -182,6 +182,9 @@ async fn values_containing_nul_round_trip() {
         .await
         .expect("batch with NUL");
     assert_eq!(store.get("nul2").await.expect("get"), Some(v));
+    let lookalike = json!({"$faucet_nul_escaped_json": "[1,2]"});
+    store.put("lookalike", &lookalike).await.expect("put");
+    assert_eq!(store.get("lookalike").await.expect("get"), Some(lookalike));
 }
 
 #[tokio::test(flavor = "multi_thread")]
