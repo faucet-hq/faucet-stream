@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 offset_param: "offset".into(),
                 limit_param: "limit".into(),
                 limit: 250,
+                stop_when_short: false,
             })
             .max_pages(usize::MAX),
     );

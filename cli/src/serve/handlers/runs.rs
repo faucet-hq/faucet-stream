@@ -569,6 +569,7 @@ mod tests {
                 usage: None,
                 batches: None,
                 source_lag: None,
+                skipped: false,
             });
         state.history().upsert(&rec).await.unwrap();
         let config = "version: 1\nname: rb\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./out.jsonl } }\n".to_string();

@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 start_page: 1,
                 page_size: Some(500),
                 page_size_param: Some("size".into()),
+                stop_when_short: false,
             })
             .max_pages(50),
     );

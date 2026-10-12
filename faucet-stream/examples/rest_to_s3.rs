@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 limit: 500,
                 total_path: Some("$.meta.total".into()),
                 rows_path: None,
+                stop_when_short: false,
             })
             .max_pages(usize::MAX)
             .request_delay(Duration::from_millis(50))
