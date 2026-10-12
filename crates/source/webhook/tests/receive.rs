@@ -249,3 +249,32 @@ async fn a_stalled_sender_cannot_hold_the_run_open() {
     assert!(started.elapsed() < Duration::from_secs(30));
     drop(stalled);
 }
+
+/// #862 L-130: a `{key}` inside a segment is filled from the context, and one
+/// the context does not fill is refused instead of becoming a route capture.
+#[tokio::test]
+async fn partial_segment_placeholders_resolve_and_unfilled_ones_fail() {
+    let missing = WebhookSource::new(WebhookSourceConfig::new().path("/hooks/{id}"));
+    let ctx: HashMap<String, Value> = [("other".to_string(), json!(1))].into_iter().collect();
+    let err = missing.fetch_with_context(&ctx).await.unwrap_err();
+    assert!(err.to_string().contains("did not fill"), "{err}");
+
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .path("/hooks/user-{id}")
+            .max_payloads(1)
+            .timeout_secs(10),
+    );
+    let ctx: HashMap<String, Value> = [("id".to_string(), json!(7))].into_iter().collect();
+    let run = tokio::spawn(async move { source.fetch_with_context(&ctx).await });
+    let url = format!("http://{addr}/hooks/user-7");
+    let client = reqwest::Client::new();
+    let resp = post_until_up(&client, &url, || {
+        client.post(&url).json(&json!({"ok": true}))
+    })
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(run.await.unwrap().unwrap().len(), 1);
+}
