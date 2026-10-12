@@ -566,6 +566,35 @@ async fn mysql_review_862_regressions() {
         .unwrap();
     assert_eq!(checks, 1);
 
+    // review 868 sql 4: a key to a same-named table in another database is
+    // not self-referencing, and is validated against that database's table.
+    exec(
+        &pool,
+        "CREATE DATABASE other; \
+         CREATE TABLE other.dog (id INT PRIMARY KEY); \
+         INSERT INTO other.dog VALUES (1), (2); \
+         CREATE TABLE dog (id INT PRIMARY KEY, parent_id INT, \
+           CONSTRAINT fk_dog_other FOREIGN KEY (parent_id) REFERENCES other.dog(id)); \
+         INSERT INTO dog VALUES (7, 2)",
+    )
+    .await;
+    let ovw = || config(&url, "dog", WriteMode::Overwrite, &[]);
+    let sink = MysqlSink::new(ovw()).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[json!({"id": 5, "parent_id": 1})])
+        .await
+        .unwrap();
+    MysqlSink::new(ovw())
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&pool, "SELECT CAST(id AS CHAR) FROM dog ORDER BY id").await,
+        vec!["5"]
+    );
+
     // M-065: relaxing NOT NULL keeps a BIT literal default.
     exec(
         &pool,

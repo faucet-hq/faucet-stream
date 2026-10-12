@@ -339,8 +339,19 @@ pub(crate) async fn insertable_columns(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ForeignKey {
     pub(crate) name: String,
+    pub(crate) referenced_schema: String,
     pub(crate) referenced_table: String,
+    /// The referenced table lives in the current database.
+    pub(crate) local: bool,
     pub(crate) columns: Vec<(String, String)>,
+}
+
+impl ForeignKey {
+    /// Whether the key references `table` itself, not a same-named table in
+    /// another database.
+    pub(crate) fn references(&self, table: &str) -> bool {
+        self.local && self.referenced_table == table
+    }
 }
 
 pub(crate) async fn table_foreign_keys(
@@ -349,8 +360,10 @@ pub(crate) async fn table_foreign_keys(
 ) -> Result<Vec<ForeignKey>, FaucetError> {
     let rows = sqlx::query(
         "SELECT CAST(CONSTRAINT_NAME AS CHAR) AS N, CAST(COLUMN_NAME AS CHAR) AS C, \
+                CAST(REFERENCED_TABLE_SCHEMA AS CHAR) AS RS, \
                 CAST(REFERENCED_TABLE_NAME AS CHAR) AS RT, \
-                CAST(REFERENCED_COLUMN_NAME AS CHAR) AS RC \
+                CAST(REFERENCED_COLUMN_NAME AS CHAR) AS RC, \
+                CAST(REFERENCED_TABLE_SCHEMA = DATABASE() AS SIGNED) AS L \
          FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
            AND REFERENCED_TABLE_NAME IS NOT NULL \
@@ -368,7 +381,9 @@ pub(crate) async fn table_foreign_keys(
             Some(fk) if fk.name == name => fk.columns.push(pair),
             _ => fks.push(ForeignKey {
                 name,
+                referenced_schema: r.get("RS"),
                 referenced_table: r.get("RT"),
+                local: r.get::<Option<i64>, _>("L") == Some(1),
                 columns: vec![pair],
             }),
         }
@@ -392,8 +407,9 @@ fn fk_violation_sql(table: &str, fk: &ForeignKey) -> String {
         .collect::<Vec<_>>()
         .join(" AND ");
     format!(
-        "SELECT COUNT(*) FROM {} c WHERE {set} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {join})",
+        "SELECT COUNT(*) FROM {} c WHERE {set} AND NOT EXISTS (SELECT 1 FROM {}.{} p WHERE {join})",
         quote_ident_mysql(table),
+        quote_ident_mysql(&fk.referenced_schema),
         quote_ident_mysql(&fk.referenced_table)
     )
 }
@@ -421,7 +437,7 @@ pub(crate) async fn replace_rows_in_place(
         .collect::<Vec<_>>()
         .join(", ");
     let fks = table_foreign_keys(&mut *conn, target).await?;
-    let self_referencing = fks.iter().any(|fk| fk.referenced_table == target);
+    let self_referencing = fks.iter().any(|fk| fk.references(target));
     let (t, s) = (quote_ident_mysql(target), quote_ident_mysql(source));
     let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql overwrite: replace rows: {e}"));
     if self_referencing {
@@ -2400,7 +2416,9 @@ mod tests {
     fn fk_violation_sql_checks_every_key_column() {
         let fk = ForeignKey {
             name: "fk_parent".into(),
+            referenced_schema: "app".into(),
             referenced_table: "cat".into(),
+            local: true,
             columns: vec![
                 ("parent_id".into(), "id".into()),
                 ("org".into(), "org".into()),
@@ -2409,8 +2427,15 @@ mod tests {
         assert_eq!(
             fk_violation_sql("cat", &fk),
             "SELECT COUNT(*) FROM `cat` c WHERE c.`parent_id` IS NOT NULL AND c.`org` IS NOT NULL \
-             AND NOT EXISTS (SELECT 1 FROM `cat` p WHERE p.`id` = c.`parent_id` AND p.`org` = c.`org`)"
+             AND NOT EXISTS (SELECT 1 FROM `app`.`cat` p WHERE p.`id` = c.`parent_id` AND p.`org` = c.`org`)"
         );
+        assert!(fk.references("cat"));
+        let elsewhere = ForeignKey {
+            local: false,
+            ..fk.clone()
+        };
+        assert!(!elsewhere.references("cat"), "a same-named table in another database");
+        assert!(!fk.references("dog"));
     }
 
     #[test]
