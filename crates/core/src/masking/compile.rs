@@ -39,6 +39,7 @@ pub struct CompiledMasking {
 impl CompiledMasking {
     /// Whether a name-based rule matches the top-level field `name`, so the
     /// pass may rewrite (and re-type) every value of it.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
     pub(crate) fn rewrites_name(&self, name: &str) -> bool {
         self.rules.iter().any(|r| {
             r.fields.contains(name) || r.field_pattern.as_ref().is_some_and(|p| p.is_match(name))
@@ -48,6 +49,7 @@ impl CompiledMasking {
     /// Whether a value-detector rule can match a non-string value (a card
     /// number held as an integer), so the pass may re-type a column only on
     /// the pages where such a value happens to appear.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
     pub(crate) fn retypes_by_value(&self) -> bool {
         self.rules
             .iter()
