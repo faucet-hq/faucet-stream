@@ -117,7 +117,8 @@ or `cargo install faucet-cli --features "source-databricks,arrow"` (CLI).
 
 ## Out of scope (v1)
 
-`discover()` via `INFORMATION_SCHEMA`, Unity Catalog Volumes, and a Databricks
-SQL sink (use the Delta sink).
+`discover()` via `INFORMATION_SCHEMA` and reading from Unity Catalog Volumes.
+To write to a SQL warehouse, use the
+[`faucet-sink-databricks`](https://crates.io/crates/faucet-sink-databricks) sink.
 
 License: MIT OR Apache-2.0.
