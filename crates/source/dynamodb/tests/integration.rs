@@ -347,3 +347,43 @@ async fn streams_cdc_captures_changes_and_resumes() {
             .contains_key("shardId-00000000000000000000-deadbeef")
     );
 }
+
+/// L-106: `value_format: typed` emits DynamoDB attribute JSON, so sets,
+/// binaries and high-precision numbers are read exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_value_format_reads_attribute_json() {
+    let Some((_c, endpoint, client)) = start().await else {
+        return;
+    };
+    create_table(&client, "typed", ScalarAttributeType::S, false, false).await;
+    use aws_sdk_dynamodb::primitives::Blob;
+    use aws_sdk_dynamodb::types::AttributeValue;
+    put_items(
+        &client,
+        "typed",
+        vec![item(vec![
+            ("pk", s("a")),
+            ("price", n("12345678901234567890.123456789")),
+            ("tags", AttributeValue::Ss(vec!["x".into()])),
+            ("blob", AttributeValue::B(Blob::new(vec![1]))),
+        ])],
+    )
+    .await;
+    let mut cfg = config(&endpoint, "typed");
+    cfg.value_format = faucet_source_dynamodb::ValueFormat::Typed;
+    let records = DynamoDbSource::new(cfg)
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        records,
+        vec![json!({
+            "pk": {"S": "a"},
+            "price": {"N": "12345678901234567890.123456789"},
+            "tags": {"SS": ["x"]},
+            "blob": {"B": "AQ=="}
+        })]
+    );
+}

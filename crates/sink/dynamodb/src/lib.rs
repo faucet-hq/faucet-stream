@@ -21,4 +21,4 @@ pub use config::{
 };
 pub use sink::DynamoDbSink;
 
-pub use faucet_common_dynamodb::{DynamoDbCredentials, RetryPolicy, build_client};
+pub use faucet_common_dynamodb::{DynamoDbCredentials, RetryPolicy, ValueFormat, build_client};

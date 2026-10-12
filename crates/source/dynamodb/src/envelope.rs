@@ -16,7 +16,7 @@
 //! "dynamodb.amazonaws.com"`.
 
 use aws_sdk_dynamodbstreams::types::Record;
-use faucet_common_dynamodb::streams_item_to_json;
+use faucet_common_dynamodb::ValueFormat;
 use faucet_core::FaucetError;
 use serde_json::{Value, json};
 
@@ -104,6 +104,7 @@ pub fn record_to_envelope(
     record: &Record,
     shard_id: &str,
     table: &str,
+    format: ValueFormat,
 ) -> Result<(String, Value), FaucetError> {
     let sr = record.dynamodb().ok_or_else(|| {
         FaucetError::Source(format!(
@@ -118,7 +119,7 @@ pub fn record_to_envelope(
         ))
     })?;
     let image = |m: Option<&std::collections::HashMap<String, _>>| -> Result<Value, FaucetError> {
-        m.map(streams_item_to_json)
+        m.map(|m| format.streams_item_to_json(m))
             .transpose()
             .map(|v| v.unwrap_or(Value::Null))
     };
@@ -183,6 +184,20 @@ mod tests {
     }
 
     #[test]
+    fn typed_envelopes_carry_attribute_json() {
+        let (_, env) = record_to_envelope(
+            &record(OperationType::Modify, true, true),
+            "s1",
+            "t",
+            ValueFormat::Typed,
+        )
+        .unwrap();
+        assert_eq!(env["key"], json!({"pk": {"S": "a"}}));
+        assert_eq!(env["before"], json!({"pk": {"S": "a"}, "v": {"S": "old"}}));
+        assert_eq!(env["after"]["v"], json!({"S": "new"}));
+    }
+
+    #[test]
     fn op_mapping() {
         assert_eq!(op_for_event("INSERT"), "c");
         assert_eq!(op_for_event("MODIFY"), "u");
@@ -192,8 +207,13 @@ mod tests {
 
     #[test]
     fn insert_modify_remove_envelopes() {
-        let (seq, env) =
-            record_to_envelope(&record(OperationType::Insert, false, true), "s1", "t").unwrap();
+        let (seq, env) = record_to_envelope(
+            &record(OperationType::Insert, false, true),
+            "s1",
+            "t",
+            ValueFormat::Plain,
+        )
+        .unwrap();
         assert_eq!(seq, "100");
         assert_eq!(env["op"], "c");
         assert_eq!(env["before"], Value::Null);
@@ -208,8 +228,13 @@ mod tests {
         assert_eq!(env["event_id"], "e1");
         assert_eq!(env["user_identity"], Value::Null);
 
-        let (_, env) =
-            record_to_envelope(&record(OperationType::Modify, true, true), "s1", "t").unwrap();
+        let (_, env) = record_to_envelope(
+            &record(OperationType::Modify, true, true),
+            "s1",
+            "t",
+            ValueFormat::Plain,
+        )
+        .unwrap();
         assert_eq!(env["op"], "u");
         assert_eq!(env["before"]["v"], "old");
 
@@ -220,7 +245,7 @@ mod tests {
                 .r#type("Service")
                 .build(),
         );
-        let (_, env) = record_to_envelope(&rec, "s1", "t").unwrap();
+        let (_, env) = record_to_envelope(&rec, "s1", "t", ValueFormat::Plain).unwrap();
         assert_eq!(env["op"], "d");
         assert_eq!(env["after"], Value::Null);
         assert_eq!(
@@ -233,7 +258,7 @@ mod tests {
     fn malformed_records_error() {
         let no_sr = Record::builder().event_id("x").build();
         assert!(
-            record_to_envelope(&no_sr, "s", "t")
+            record_to_envelope(&no_sr, "s", "t", ValueFormat::Plain)
                 .unwrap_err()
                 .to_string()
                 .contains("no stream record")
@@ -242,7 +267,7 @@ mod tests {
             .dynamodb(StreamRecord::builder().build())
             .build();
         assert!(
-            record_to_envelope(&no_seq, "s", "t")
+            record_to_envelope(&no_seq, "s", "t", ValueFormat::Plain)
                 .unwrap_err()
                 .to_string()
                 .contains("no sequence number")
@@ -250,7 +275,7 @@ mod tests {
         let no_name = Record::builder()
             .dynamodb(StreamRecord::builder().sequence_number("1").build())
             .build();
-        let (_, env) = record_to_envelope(&no_name, "s", "t").unwrap();
+        let (_, env) = record_to_envelope(&no_name, "s", "t", ValueFormat::Plain).unwrap();
         assert_eq!(env["event_name"], "UNKNOWN");
         assert_eq!(env["key"], Value::Null);
     }

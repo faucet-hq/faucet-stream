@@ -3,7 +3,7 @@
 //! conditional item-by-item writes.
 
 use crate::config::{DynamoDbSinkConfig, OnConditionFailure};
-use crate::plan::{Op, OpKind, chunk_ops, plan, request_canon};
+use crate::plan::{Op, OpKind, chunk_ops, plan_as, request_canon};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use faucet_common_dynamodb::{
@@ -340,7 +340,7 @@ impl faucet_core::Sink for DynamoDbSink {
             return Ok(0);
         }
         let (keys, names) = self.table_keys().await?;
-        let planned = plan(records, &self.config.write, keys);
+        let planned = plan_as(records, &self.config.write, keys, self.config.value_format);
         if let Some((row, e)) = planned.failures.iter().next() {
             return Err(FaucetError::Sink(format!(
                 "dynamodb: row {row} of {}: {e}",
@@ -374,7 +374,7 @@ impl faucet_core::Sink for DynamoDbSink {
             return Ok(Vec::new());
         }
         let (keys, names) = self.table_keys().await?;
-        let planned = plan(records, &self.config.write, keys);
+        let planned = plan_as(records, &self.config.write, keys, self.config.value_format);
         let outcomes = self.execute(planned.ops, names).await?;
         Ok(row_outcomes(records.len(), planned.failures, outcomes))
     }

@@ -30,6 +30,7 @@ sink:
 | `expression_attribute_names` / `expression_attribute_values` | `{}` | For `condition_expression` |
 | `on_condition_failure` | `skip` | `skip` (treat as already applied) or `fail` (row error → DLQ) |
 | `retry` | `{max_retries: 8, initial_backoff_ms: 100, max_backoff_ms: 10000}` | Throttle / unprocessed-item retry |
+| `value_format` | `plain` | `plain` JSON or `typed` DynamoDB attribute JSON (see below) |
 
 ## Write modes
 
@@ -43,6 +44,17 @@ number or a decimal string (exact, as the source emits numbers beyond `f64`), an
 `S` key a string; any other value fails its row before anything is sent. So a
 table-to-table copy keeps binary and high-precision keys. Non-key attributes keep
 their JSON type (`S` / `N` / `L` / `M`).
+
+**Lossless copies (`value_format: typed`).** Plain JSON has no set, binary or
+arbitrary-precision number, so with the default `plain` format a non-key set
+is written back as a list (`L`), a binary as a base64 string (`S`) and a number
+the source had to emit as a decimal string as `S`. Set `value_format: typed` on
+both the DynamoDB source and this sink and records carry DynamoDB's attribute
+JSON (`{"pk": {"S": "a"}, "tags": {"SS": ["x"]}, "blob": {"B": "AQ=="}}`),
+written exactly as given. In `typed` mode every attribute must be a typed
+value — a plain value fails its row — key attributes must carry the table's
+declared type (`S` / `N` / `B`), and a `delete_marker` field may be either
+`{"S": "d"}` or a plain string.
 `overwrite` is not supported (no atomic table swap). `dedups_by_key()` is true
 for `upsert` / `delete` with a `key`, so `delivery: exactly_once` is satisfied by
 the keyed-upsert mechanism.

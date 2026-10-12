@@ -37,5 +37,5 @@ pub use state::{ScanBookmark, SegmentCursor, StreamBookmark};
 pub use stream::DynamoDbSource;
 
 pub use faucet_common_dynamodb::{
-    DynamoDbCredentials, RetryPolicy, build_client, build_streams_client,
+    DynamoDbCredentials, RetryPolicy, ValueFormat, build_client, build_streams_client,
 };

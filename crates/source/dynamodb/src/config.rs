@@ -1,6 +1,6 @@
 //! Configuration for the DynamoDB source. No I/O here.
 
-use faucet_common_dynamodb::{DynamoDbCredentials, RetryPolicy};
+use faucet_common_dynamodb::{DynamoDbCredentials, RetryPolicy, ValueFormat};
 use faucet_core::FaucetError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -145,6 +145,15 @@ pub struct DynamoDbSourceConfig {
     /// 1000.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// How attribute values appear in records: `plain` JSON (default; sets
+    /// become arrays, binaries base64 strings, imprecise numbers decimal
+    /// strings) or `typed` DynamoDB attribute JSON (`{"S": "a"}`,
+    /// `{"SS": ["x"]}`, `{"B": "<base64>"}`) that a `value_format: typed`
+    /// DynamoDB sink writes back losslessly. Applies to scan/query items and
+    /// to Streams `key` / `before` / `after` images.
+    #[serde(default)]
+    pub value_format: ValueFormat,
 }
 
 fn default_segments() -> u32 {
@@ -202,6 +211,7 @@ impl DynamoDbSourceConfig {
             max_messages: None,
             retry: RetryPolicy::default(),
             batch_size: default_batch_size(),
+            value_format: ValueFormat::default(),
         }
     }
 
