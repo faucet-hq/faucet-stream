@@ -1093,12 +1093,8 @@ fn copyable_settings(index_settings: &Value) -> Value {
 /// A `text` field without a keyword sub-field cannot be matched exactly, so
 /// the cleanup is refused rather than deleting nothing. Dotted names walk
 /// object properties; an unmapped field is returned unchanged.
-fn term_field(properties: &Value, field: &str) -> Result<String, String> {
-    term_target(properties, field).map(|(target, _)| target)
-}
-
-/// [`term_field`] plus the target's `ignore_above`: a longer string is stored
-/// but not indexed, so a `term` query on it matches nothing.
+/// Also returns the target's `ignore_above`: a longer string is stored but
+/// not indexed, so a `term` query on it matches nothing.
 fn term_target(properties: &Value, field: &str) -> Result<(String, Option<u64>), String> {
     let ignore_above = |d: &Value| d.get("ignore_above").and_then(Value::as_u64);
     let mut props = properties;
@@ -1912,6 +1908,10 @@ mod tests {
         assert!(err.contains("ignore_above") && err.contains("(4)"), "{err}");
         assert!(check_ignore_above("tenant", &json!(123456), limit).is_ok());
         assert!(check_ignore_above("plain", &json!("long value"), None).is_ok());
+    }
+
+    fn term_field(properties: &Value, field: &str) -> Result<String, String> {
+        term_target(properties, field).map(|(target, _)| target)
     }
 
     #[test]

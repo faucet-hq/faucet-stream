@@ -72,7 +72,11 @@ pub(crate) enum CancelOutcome {
     Succeeded,
     /// The write fails. `terminal` says whether the job is known to have
     /// stopped; while it may still run, it may still read its inputs.
-    Failed { error: FaucetError, terminal: bool },
+    Failed {
+        error: FaucetError,
+        #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+        terminal: bool,
+    },
 }
 
 /// Request `jobs.cancel` for a job that outlived `job_timeout`, then poll it
