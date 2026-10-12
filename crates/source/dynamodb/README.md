@@ -100,7 +100,11 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
   expired unread, a bookmarked position was trimmed, or a shard bookmarked with
   no position was last known empty more than 23 hours ago (its trim horizon
   never reports trimming, so records written and trimmed since would be lost
-  silently). With
+  silently). Run a streams pipeline more often than every 23 hours (or
+  continuously): a daily schedule with an idle shard reaches that limit on most
+  runs. A bookmark written before `verified_at` existed cannot be checked on its
+  first resume — the source logs a warning naming those shards, and the check
+  applies from that run on. With
   `on_gap: resnapshot` the source instead scans the whole table (emitted as
   `op: "r"` envelopes, no bookmark until the scan completes) and then replays the
   retained stream from the trim horizon; on an upsert sink this converges.

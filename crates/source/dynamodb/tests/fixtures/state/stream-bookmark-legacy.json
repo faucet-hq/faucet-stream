@@ -1,0 +1,8 @@
+{
+  "stream_arn": "arn:aws:dynamodb:us-east-1:123456789012:table/t/stream/2026-01-01T00:00:00.000",
+  "shards": {
+    "shardId-00000000000000000001-aaaaaaaa": "",
+    "shardId-00000000000000000002-bbbbbbbb": "49600000000000000000000000000000000000000000000000000002"
+  },
+  "finished": ["shardId-00000000000000000000-cccccccc"]
+}

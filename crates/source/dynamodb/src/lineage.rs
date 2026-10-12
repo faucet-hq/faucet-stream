@@ -173,6 +173,19 @@ pub fn stale_empty_shards(bm: &StreamBookmark, described: &[ShardInfo], now: i64
         .collect()
 }
 
+/// Empty-position shards of a bookmark written before `verified_at` existed:
+/// their retention cannot be checked on this resume.
+pub fn unverified_empty_shards(bm: &StreamBookmark, described: &[ShardInfo]) -> Vec<String> {
+    let (ids, _) = ids_and_parents(described);
+    bm.shards
+        .iter()
+        .filter(|(id, seq)| {
+            seq.is_empty() && ids.contains(*id) && !bm.verified_at.contains_key(*id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// The resume position `capture_resume_position` returns: every current
 /// shard opened at its trim horizon. Replaying the retained window after a
 /// snapshot converges on an upsert sink.
@@ -318,5 +331,7 @@ mod tests {
         let mut legacy = StreamBookmark::default();
         legacy.shards.insert("a".into(), String::new());
         assert!(stale_empty_shards(&legacy, &described, now).is_empty());
+        assert_eq!(unverified_empty_shards(&legacy, &described), vec!["a"]);
+        assert!(unverified_empty_shards(&bm, &described).is_empty());
     }
 }
