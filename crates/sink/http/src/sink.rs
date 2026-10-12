@@ -169,6 +169,7 @@ impl HttpSink {
                 Ok(resp) => {
                     match check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
                         Ok(_) => return Ok(()),
+                        Err(FaucetError::Source(message)) => FaucetError::Sink(message),
                         Err(e) => e,
                     }
                 }
