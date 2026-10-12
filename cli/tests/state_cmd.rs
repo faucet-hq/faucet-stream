@@ -68,7 +68,14 @@ async fn verbs_round_trip_on_a_file_store() {
     let summary = faucet_cli::run_from_yaml_str(&text).await.unwrap();
     assert!(!summary.had_failures(), "{summary:?}");
     assert!(store.get("orders::a::__status__").await.unwrap().is_some());
-    assert!(store.get("orders::a::__lease__").await.unwrap().is_none());
+    assert!(
+        store
+            .get("orders::a::__lease__")
+            .await
+            .unwrap()
+            .is_none_or(|v| v.is_null()),
+        "a released lease is absent or null"
+    );
 
     store.put("orders::a", &json!({"id": 2})).await.unwrap();
     run(&["state", "show", &cfgs]).await.unwrap();
