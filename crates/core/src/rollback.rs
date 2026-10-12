@@ -478,7 +478,10 @@ mod tests {
             primary_key: PRIMARY_KEY_TEXT,
         };
         let sql = j.later_keys();
-        assert!(sql.contains("run_id <> $2") && sql.contains("run_id = $4"), "{sql}");
+        assert!(
+            sql.contains("run_id <> $2") && sql.contains("run_id = $4"),
+            "{sql}"
+        );
     }
 
     #[test]
