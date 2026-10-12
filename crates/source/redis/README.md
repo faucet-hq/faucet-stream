@@ -13,7 +13,7 @@ Built on a lazily-opened, reconnecting `ConnectionManager` and each mode's nativ
 
 - **Three source modes** — `List` (FIFO list elements), `Stream` (entries with IDs + fields), and `Keys` (glob-matched keys with their values).
 - **Native streaming in all three modes** — `stream_pages` walks the list, stream, or keyspace in pages so the sink writes as data arrives.
-- **Server-side cursoring** — `Keys` drives the `SCAN` cursor manually and `MGET`s a page at a time, so a million-key namespace never materializes in memory at once.
+- **Server-side cursoring** — `Keys` drives the `SCAN` cursor manually and `MGET`s a page at a time, so a million-key namespace's values never materialize in memory at once.
 - **Never touches consumer groups** — every read is `XRANGE`, so a preview or run never claims entries into a group's pending list.
 - **Faithful values** — values that are valid JSON are parsed (`parse_json`; `containers` keeps scalars the strings Redis holds), and binary values are base64-encoded (`binary`) instead of failing the read.
 - **Connection reuse** — one reconnecting connection (`ConnectionManager`) is opened on first use and cheaply cloned across every call (no per-call TCP/AUTH handshake); after the server drops it, the next command reconnects instead of every later call failing.
@@ -108,7 +108,7 @@ Each entry is returned as:
 
 #### `Keys`
 
-Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
+Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once — the run keeps a 16-byte fingerprint of every matched key name, so memory grows with the number of keys matched, not their length. A key name that is not valid UTF-8 is rendered into the record's `key` per `binary`. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

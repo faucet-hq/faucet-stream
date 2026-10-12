@@ -229,7 +229,8 @@ impl faucet_core::Sink for RedisSink {
         }
         script.invoke_async::<i64>(&mut conn).await.map_err(|e| {
             FaucetError::Sink(format!(
-                "Redis exactly-once write failed (nothing was written): {e}"
+                "Redis exactly-once write failed (the watermark was not advanced; commands \
+                 before the failure may have been applied and are re-sent on retry): {e}"
             ))
         })?;
 
