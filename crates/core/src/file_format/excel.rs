@@ -83,9 +83,11 @@ pub fn decode(
         let obj: Map<String, Value> = headers
             .iter()
             .cloned()
-            .zip(row.iter().enumerate().map(|(i, c)| {
-                cell_to_value_in(c, timestamps.get(i).copied().unwrap_or(false))
-            }))
+            .zip(
+                row.iter()
+                    .enumerate()
+                    .map(|(i, c)| cell_to_value_in(c, timestamps.get(i).copied().unwrap_or(false))),
+            )
             .collect();
         out.push(Value::Object(obj));
     }

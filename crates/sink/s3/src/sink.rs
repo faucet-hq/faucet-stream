@@ -291,6 +291,9 @@ mod tests {
         assert_eq!(part_number(1, "k").unwrap(), 1);
         assert_eq!(part_number(10_000, "k").unwrap(), 10_000);
         let err = part_number(10_001, "k").unwrap_err().to_string();
-        assert!(err.contains("10000 parts") && err.contains("max_bytes_per_file"), "{err}");
+        assert!(
+            err.contains("10000 parts") && err.contains("max_bytes_per_file"),
+            "{err}"
+        );
     }
 }

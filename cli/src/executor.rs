@@ -7955,7 +7955,10 @@ mod bind_and_dlq_tests {
                 &self,
                 _target: usize,
             ) -> Result<Vec<faucet_core::ShardSpec>, FaucetError> {
-                Ok(vec![faucet_core::ShardSpec::whole(), faucet_core::ShardSpec::whole()])
+                Ok(vec![
+                    faucet_core::ShardSpec::whole(),
+                    faucet_core::ShardSpec::whole(),
+                ])
             }
             async fn apply_shard(&self, _: &faucet_core::ShardSpec) -> Result<(), FaucetError> {
                 Err(FaucetError::Source("shard applied".into()))
@@ -8004,9 +8007,18 @@ mod bind_and_dlq_tests {
             .next()
             .await
             .unwrap();
-        assert!(first.err().unwrap().to_string().contains("native bound=true"));
+        assert!(
+            first
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("native bound=true")
+        );
         assert_eq!(src.config_schema(), json!({"probe": true}));
-        assert_eq!(src.capture_resume_position().await.unwrap(), Some(json!("pos")));
+        assert_eq!(
+            src.capture_resume_position().await.unwrap(),
+            Some(json!("pos"))
+        );
         assert!(src.is_shardable());
         assert_eq!(src.enumerate_shards(4).await.unwrap().len(), 2);
         let whole = faucet_core::ShardSpec::whole();

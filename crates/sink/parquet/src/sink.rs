@@ -1016,7 +1016,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("sparse.parquet");
         let sink = ParquetSink::new(cfg(&path)).await.unwrap();
-        sink.write_batch(&[json!({"id": 1, "v": null})]).await.unwrap();
+        sink.write_batch(&[json!({"id": 1, "v": null})])
+            .await
+            .unwrap();
         sink.write_batch(&[
             json!({"id": 2, "v": 5}),
             json!({"id": 3, "v": true}),

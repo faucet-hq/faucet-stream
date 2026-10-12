@@ -824,7 +824,9 @@ mod tests {
         let mut cfg = CsvSinkConfig::new(p.to_str().unwrap());
         cfg.append = true;
         let sink = CsvSink::new(cfg);
-        sink.write_batch(&[json!({"id": 3, "name": "c"})]).await.unwrap();
+        sink.write_batch(&[json!({"id": 3, "name": "c"})])
+            .await
+            .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "id,name\n1,a\n3,c\n");
     }

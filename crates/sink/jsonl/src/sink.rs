@@ -235,7 +235,10 @@ async fn refuse_sealed_file(
     let Ok(sealed) = base64::engine::general_purpose::STANDARD.decode(first.trim()) else {
         return Ok(());
     };
-    if matches!(enc.open_line(&sealed), Ok(faucet_core::SealedLine::Header(_))) {
+    if matches!(
+        enc.open_line(&sealed),
+        Ok(faucet_core::SealedLine::Header(_))
+    ) {
         return Err(FaucetError::Sink(format!(
             "{} was written by the file sink with whole-file integrity; the jsonl sink cannot \
              append to it without making it unreadable — write it with the file sink",
@@ -259,11 +262,8 @@ async fn trim_partial_pretty_record(path: &std::path::Path) -> std::io::Result<(
     let mut start = 0usize;
     while let Some(i) = raw[start..].iter().position(|b| *b == b'\n') {
         let line = &raw[start..start + i];
-        let ends_value = line
-            .first()
-            .is_some_and(|b| !b.is_ascii_whitespace())
-            && line != b"{"
-            && line != b"[";
+        let ends_value =
+            line.first().is_some_and(|b| !b.is_ascii_whitespace()) && line != b"{" && line != b"[";
         start += i + 1;
         if ends_value {
             keep = start;
@@ -820,21 +820,30 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("sealed.jsonl");
             let enc = faucet_core::CompiledEncryption::compile(&spec("k")).unwrap();
-            let header = base64::engine::general_purpose::STANDARD.encode(enc.encrypt_bound(
-                b"{}",
-                faucet_core::encryption::SEALED_LINES_HEADER_CONTEXT,
-            ));
+            let header = base64::engine::general_purpose::STANDARD.encode(
+                enc.encrypt_bound(b"{}", faucet_core::encryption::SEALED_LINES_HEADER_CONTEXT),
+            );
             std::fs::write(&path, format!("{header}\n")).unwrap();
-            let sink = JsonlSink::new(JsonlSinkConfig::new(&path).append(true).encryption(spec("k")));
+            let sink = JsonlSink::new(
+                JsonlSinkConfig::new(&path)
+                    .append(true)
+                    .encryption(spec("k")),
+            );
             let err = sink.write_batch(&[json!({"a": 1})]).await.unwrap_err();
             assert!(err.to_string().contains("whole-file integrity"), "{err}");
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{header}\n"));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{header}\n")
+            );
 
             let legacy = dir.path().join("legacy.jsonl");
             let line = base64::engine::general_purpose::STANDARD.encode(enc.encrypt(b"{}"));
             std::fs::write(&legacy, format!("{line}\nnot base64\n")).unwrap();
-            let sink =
-                JsonlSink::new(JsonlSinkConfig::new(&legacy).append(true).encryption(spec("k")));
+            let sink = JsonlSink::new(
+                JsonlSinkConfig::new(&legacy)
+                    .append(true)
+                    .encryption(spec("k")),
+            );
             sink.write_batch(&[json!({"a": 1})]).await.unwrap();
             sink.flush().await.unwrap();
             let missing = dir.path().join("new.jsonl");

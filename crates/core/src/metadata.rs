@@ -678,12 +678,10 @@ mod tests {
                 Ok(records.len())
             }
         }
-        let meta = CompiledMetadata::compile(&spec(&[
-            MetadataColumn::RunId,
-            MetadataColumn::Sequence,
-        ]))
-        .unwrap()
-        .unwrap();
+        let meta =
+            CompiledMetadata::compile(&spec(&[MetadataColumn::RunId, MetadataColumn::Sequence]))
+                .unwrap()
+                .unwrap();
         let inner = std::sync::Arc::new(Admits::default());
         struct Shared(std::sync::Arc<Admits>);
         #[async_trait::async_trait]
@@ -696,13 +694,18 @@ mod tests {
             }
         }
         let sink = MetadataSink::new(Box::new(Shared(std::sync::Arc::clone(&inner))), meta, ctx());
-        sink.admit_page(&[json!({"id": 1}), json!("x")]).await.unwrap();
+        sink.admit_page(&[json!({"id": 1}), json!("x")])
+            .await
+            .unwrap();
         let admitted = inner.0.lock().unwrap().clone();
         assert_eq!(admitted[0]["_faucet_run_id"], "run-42");
         assert_eq!(admitted[0]["_faucet_sequence"], 0);
         assert_eq!(admitted[1], json!("x"));
         let stamped = sink.stamp(&[json!({"id": 1})]);
-        assert_eq!(stamped[0]["_faucet_sequence"], 0, "admission consumed no sequence");
+        assert_eq!(
+            stamped[0]["_faucet_sequence"], 0,
+            "admission consumed no sequence"
+        );
     }
 
     #[test]

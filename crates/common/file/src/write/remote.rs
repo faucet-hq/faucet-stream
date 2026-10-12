@@ -188,7 +188,9 @@ fn lock_owner(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(std::io::Error::other("the new owner file is locked by another process"));
+            return Err(std::io::Error::other(
+                "the new owner file is locked by another process",
+            ));
         }
         Err(std::fs::TryLockError::Error(e)) => {
             tracing::warn!(

@@ -516,7 +516,8 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         let n = self.inner.write_batch_columnar(batch).await?;
         if let Some(m) = &self.meter {
             let rows = batch.num_rows().max(1);
-            let bytes = crate::columnar::batch_slice_bytes(batch).saturating_mul(n.min(rows) as u64)
+            let bytes = crate::columnar::batch_slice_bytes(batch)
+                .saturating_mul(n.min(rows) as u64)
                 / rows as u64;
             counter!("faucet_sink_bytes_total", self.metric_labels()).increment(bytes);
             m.add_written(n as u64, bytes);

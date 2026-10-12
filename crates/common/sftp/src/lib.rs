@@ -496,8 +496,11 @@ fn hashed_host_matches(hashed: &str, name: &str) -> bool {
     let (Ok(salt), Ok(hash)) = (b64.decode(salt), b64.decode(hash)) else {
         return false;
     };
-    hmac::Hmac::<sha1::Sha1>::new_from_slice(&salt)
-        .is_ok_and(|mac| mac.chain_update(name.as_bytes()).verify_slice(&hash).is_ok())
+    hmac::Hmac::<sha1::Sha1>::new_from_slice(&salt).is_ok_and(|mac| {
+        mac.chain_update(name.as_bytes())
+            .verify_slice(&hash)
+            .is_ok()
+    })
 }
 
 fn wildmatch(pattern: &str, name: &str) -> bool {
@@ -1016,7 +1019,6 @@ mod tests {
         assert!(extras.revoked.is_empty() && !extras.cert_authority);
     }
 
-
     /// #862 L-160: a revocation written against a hashed host is enforced.
     #[test]
     fn hashed_host_entries_match_their_host() {
@@ -1028,7 +1030,11 @@ mod tests {
             let mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(salt)
                 .unwrap()
                 .chain_update(name.as_bytes());
-            format!("|1|{}|{}", b64.encode(salt), b64.encode(mac.finalize().into_bytes()))
+            format!(
+                "|1|{}|{}",
+                b64.encode(salt),
+                b64.encode(mac.finalize().into_bytes())
+            )
         };
         assert!(hosts_match(&hash("sftp.example"), "sftp.example"));
         assert!(!hosts_match(&hash("sftp.example"), "other.example"));
@@ -1037,7 +1043,11 @@ mod tests {
         assert!(!hosts_match("|1|nosep", "h"));
         assert!(!hosts_match("|1|%%%|%%%", "h"));
         let extras = scan_known_hosts(
-            &format!("@revoked {} ssh-ed25519 {}\n", hash("sftp.example"), body(ED25519_A)),
+            &format!(
+                "@revoked {} ssh-ed25519 {}\n",
+                hash("sftp.example"),
+                body(ED25519_A)
+            ),
             "sftp.example",
             22,
         );

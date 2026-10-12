@@ -627,7 +627,12 @@ mod tests {
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         release_lease(store.as_ref(), "p::r::__lease__", "run-1").await;
         assert!(store.get("p::r::__lease__").await.unwrap().is_none());
-        release_lease(flaky(false, true, false).as_ref(), "p::r::__lease__", "run-1").await;
+        release_lease(
+            flaky(false, true, false).as_ref(),
+            "p::r::__lease__",
+            "run-1",
+        )
+        .await;
         let guard = acquire(Arc::clone(&store), "p::r", "run-1").await.unwrap();
         guard.release().await;
         assert_eq!(
@@ -635,7 +640,10 @@ mod tests {
             Some(Value::Null)
         );
         let next = acquire(Arc::clone(&store), "p::r", "run-3").await.unwrap();
-        assert_eq!(read(store.as_ref(), "p::r").await.unwrap().unwrap().run_id, "run-3");
+        assert_eq!(
+            read(store.as_ref(), "p::r").await.unwrap().unwrap().run_id,
+            "run-3"
+        );
         next.release().await;
     }
 

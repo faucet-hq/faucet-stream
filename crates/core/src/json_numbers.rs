@@ -196,7 +196,11 @@ mod tests {
             "123456789012345678901234… cannot be held exactly"
         );
         let e = JsonNumberError::Inexact(vec![n.clone(), n]);
-        assert!(e.to_string().starts_with("2 number(s) cannot be held exactly, first 1234"), "{e}");
+        assert!(
+            e.to_string()
+                .starts_with("2 number(s) cannot be held exactly, first 1234"),
+            "{e}"
+        );
         assert_eq!(
             JsonNumberError::Invalid("eof".into()).to_string(),
             "invalid JSON: eof"

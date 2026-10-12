@@ -217,7 +217,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                                 let reg = tracing_subscriber::registry()
                                     .with(layer)
                                     .with(make_filter())
-                                    .with(cfg.tracing.is_some().then(tracing_subscriber::fmt::layer));
+                                    .with(
+                                        cfg.tracing.is_some().then(tracing_subscriber::fmt::layer),
+                                    );
                                 if reg.try_init().is_err() {
                                     tracing::warn!(
                                         "tracing subscriber already installed and no trace \
@@ -234,7 +236,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                         }
                         installed = true;
                     }
-                    Err(e) => tracing::warn!("OTLP trace exporter init failed; traces are not exported: {e}"),
+                    Err(e) => tracing::warn!(
+                        "OTLP trace exporter init failed; traces are not exported: {e}"
+                    ),
                 }
             }
         }

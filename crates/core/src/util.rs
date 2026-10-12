@@ -812,10 +812,7 @@ mod tests {
     #[test]
     fn retry_after_accepts_obsolete_date_forms_and_fractional_seconds() {
         let mut h = reqwest::header::HeaderMap::new();
-        for past in [
-            "Sunday, 06-Nov-94 08:49:37 GMT",
-            "Sun Nov  6 08:49:37 1994",
-        ] {
+        for past in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
             h.insert(reqwest::header::RETRY_AFTER, past.parse().unwrap());
             assert_eq!(retry_after(&h), Some(std::time::Duration::ZERO), "{past}");
         }

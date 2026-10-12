@@ -856,7 +856,10 @@ mod tests {
         let mut cfg = ParquetSourceConfig::local("x.parquet");
         cfg.columns = Some(Vec::new());
         let err = ParquetSource::new(cfg).await.err().unwrap();
-        assert!(matches!(&err, FaucetError::Config(m) if m.starts_with("parquet source: ")), "{err}");
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.starts_with("parquet source: ")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -1058,7 +1058,10 @@ mod tests {
         let doc = summary_document("demo", now, now, &summary);
         assert_eq!(doc.status, "failed");
         assert_eq!(doc.rows[1].status, "skipped");
-        assert_eq!((doc.totals.ok, doc.totals.failed, doc.totals.skipped), (0, 1, 1));
+        assert_eq!(
+            (doc.totals.ok, doc.totals.failed, doc.totals.skipped),
+            (0, 1, 1)
+        );
         #[cfg(feature = "serve")]
         {
             use crate::serve::history::InvocationRecord;

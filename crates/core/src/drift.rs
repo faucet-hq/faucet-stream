@@ -451,7 +451,10 @@ mod tests {
         let page = schema(json!({"flag": {"type": ["boolean", "null"]}}));
         let d = diff_schema(&strict, &page, true);
         assert_eq!(d.widenings[0].to, json!({"type": "null"}));
-        assert!(adds_null(d.widenings[0].from.as_ref().unwrap(), &d.widenings[0].to));
+        assert!(adds_null(
+            d.widenings[0].from.as_ref().unwrap(),
+            &d.widenings[0].to
+        ));
         let plain = schema(json!({"flag": {"type": ["integer", "null"]}}));
         let page = schema(json!({"flag": {"type": "boolean"}}));
         assert_eq!(diff_schema(&plain, &page, true).incompatible.len(), 1);
