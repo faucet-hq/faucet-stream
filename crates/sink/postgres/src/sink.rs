@@ -1678,52 +1678,57 @@ impl faucet_core::Sink for PostgresSink {
     /// sink-instance memory, because the CLI runs begin, the writes and the
     /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        let first_run =
-            self.config.create_table && !self.table_exists(&self.config.table_name).await?;
-        let staging =
-            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-        let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
+        bounded(self.config.write_timeout_secs, "begin_overwrite", async {
+            let first_run =
+                self.config.create_table && !self.table_exists(&self.config.table_name).await?;
+            let staging =
+                qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+            let target =
+                qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+            let mut conn =
+                self.pool.acquire().await.map_err(|e| {
+                    FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}"))
+                })?;
+            sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("postgres overwrite: drop stale staging: {e}"))
+                })?;
+            if first_run {
+                return Ok(());
+            }
+            // Fail before the load, not at the commit, when the swap cannot run.
+            let referencing = referencing_foreign_keys(&mut conn, &target).await?;
+            clear_statements(&target, &referencing)?;
+            sqlx::query(&format!(
+                "CREATE TABLE {staging} (LIKE {target} INCLUDING DEFAULTS INCLUDING GENERATED)"
+            ))
             .execute(&mut *conn)
             .await
             .map_err(|e| {
-                FaucetError::Sink(format!("postgres overwrite: drop stale staging: {e}"))
+                FaucetError::Sink(format!(
+                    "postgres overwrite: create staging from '{}' (does the table exist?): {e}",
+                    self.config.table_name
+                ))
             })?;
-        if first_run {
-            return Ok(());
-        }
-        // Fail before the load, not at the commit, when the swap cannot run.
-        let referencing = referencing_foreign_keys(&mut conn, &target).await?;
-        clear_statements(&target, &referencing)?;
-        sqlx::query(&format!(
-            "CREATE TABLE {staging} (LIKE {target} INCLUDING DEFAULTS INCLUDING GENERATED)"
-        ))
-        .execute(&mut *conn)
+            // Identity columns are filled by the target's sequence at the swap, so
+            // staging accepts rows that omit them.
+            let roles = column_roles(&mut conn, &target).await?;
+            for (col, _) in &roles.identity {
+                sqlx::query(&format!(
+                    "ALTER TABLE {staging} ALTER COLUMN {} DROP NOT NULL",
+                    quote_ident(col)
+                ))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("postgres overwrite: prepare staging: {e}"))
+                })?;
+            }
+            Ok(())
+        })
         .await
-        .map_err(|e| {
-            FaucetError::Sink(format!(
-                "postgres overwrite: create staging from '{}' (does the table exist?): {e}",
-                self.config.table_name
-            ))
-        })?;
-        // Identity columns are filled by the target's sequence at the swap, so
-        // staging accepts rows that omit them.
-        let roles = column_roles(&mut conn, &target).await?;
-        for (col, _) in &roles.identity {
-            sqlx::query(&format!(
-                "ALTER TABLE {staging} ALTER COLUMN {} DROP NOT NULL",
-                quote_ident(col)
-            ))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: prepare staging: {e}")))?;
-        }
-        Ok(())
     }
 
     /// Atomically replace the destination in one transaction. Full overwrite:
@@ -1818,25 +1823,32 @@ impl faucet_core::Sink for PostgresSink {
 
     /// Probe for the `<table>__faucet_ovw` staging table (read-only).
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        Ok(Some(self.table_exists(&self.staging_table_name()).await?))
+        bounded(
+            self.config.write_timeout_secs,
+            "overwrite_staging_exists",
+            async { Ok(Some(self.table_exists(&self.staging_table_name()).await?)) },
+        )
+        .await
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
     /// behind. Best-effort — the destination was never touched (on a first run
     /// it was never created).
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        let staging =
-            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: drop staging: {e}")))?;
-        Ok(())
+        bounded(self.config.write_timeout_secs, "abort_overwrite", async {
+            let staging =
+                qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+            let mut conn =
+                self.pool.acquire().await.map_err(|e| {
+                    FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}"))
+                })?;
+            sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("postgres overwrite: drop staging: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     fn dedups_by_key(&self) -> bool {
@@ -1858,7 +1870,10 @@ impl faucet_core::Sink for PostgresSink {
     }
 
     async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.forget_run_impl(run_id).await
+        bounded(self.config.write_timeout_secs, "forget_run", async {
+            self.forget_run_impl(run_id).await
+        })
+        .await
     }
 
     async fn rewind_commit_token(
@@ -1866,7 +1881,12 @@ impl faucet_core::Sink for PostgresSink {
         scope: &str,
         token: Option<&str>,
     ) -> Result<(), FaucetError> {
-        self.rewind_commit_token_impl(scope, token).await
+        bounded(
+            self.config.write_timeout_secs,
+            "rewind_commit_token",
+            async { self.rewind_commit_token_impl(scope, token).await },
+        )
+        .await
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
@@ -1885,46 +1905,50 @@ impl faucet_core::Sink for PostgresSink {
     /// relation via `to_regclass`), additionally reading `a.attnotnull` so
     /// nullability round-trips through `pg_udt_to_json_schema`.
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
-        // JSON-column mode stores each record whole; the physical columns are
-        // not the record's fields, so there is nothing to drift against
-        // (#789 SQL-20).
-        if !matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap) {
-            return Ok(None);
-        }
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-        let rows: Vec<(String, String, bool)> = sqlx::query(
-            "SELECT a.attname::text AS column_name, t.typname::text AS udt_name, a.attnotnull \
-             FROM pg_catalog.pg_attribute a \
-             JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
-             WHERE a.attrelid = to_regclass($1)::oid \
-               AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-        )
-        .bind(&table_ref)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("postgres current_schema query failed: {e}")))?
-        .iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("column_name"),
-                row.get::<String, _>("udt_name"),
-                row.get::<bool, _>("attnotnull"),
+        bounded(self.config.write_timeout_secs, "current_schema", async {
+            // JSON-column mode stores each record whole; the physical columns are
+            // not the record's fields, so there is nothing to drift against
+            // (#789 SQL-20).
+            if !matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap) {
+                return Ok(None);
+            }
+            let table_ref =
+                qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+            let rows: Vec<(String, String, bool)> = sqlx::query(
+                "SELECT a.attname::text AS column_name, t.typname::text AS udt_name, a.attnotnull \
+                 FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+                 WHERE a.attrelid = to_regclass($1)::oid \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
             )
+            .bind(&table_ref)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres current_schema query failed: {e}")))?
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("column_name"),
+                    row.get::<String, _>("udt_name"),
+                    row.get::<bool, _>("attnotnull"),
+                )
+            })
+            .collect();
+
+            if rows.is_empty() {
+                return Ok(None); // table does not exist yet
+            }
+
+            let mut props = serde_json::Map::new();
+            for (name, udt, notnull) in rows {
+                props.insert(name, pg_udt_to_json_schema(&udt, !notnull));
+            }
+            Ok(Some(
+                serde_json::json!({ "type": "object", "properties": props }),
+            ))
         })
-        .collect();
-
-        if rows.is_empty() {
-            return Ok(None); // table does not exist yet
-        }
-
-        let mut props = serde_json::Map::new();
-        for (name, udt, notnull) in rows {
-            props.insert(name, pg_udt_to_json_schema(&udt, !notnull));
-        }
-        Ok(Some(
-            serde_json::json!({ "type": "object", "properties": props }),
-        ))
+        .await
     }
 
     /// Apply an additive schema evolution (new columns, lossless widenings,
@@ -1935,44 +1959,47 @@ impl faucet_core::Sink for PostgresSink {
         &self,
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres evolve acquire failed: {e}")))?;
+        bounded(self.config.write_timeout_secs, "evolve_schema", async {
+            let table_ref =
+                qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+            let mut conn =
+                self.pool.acquire().await.map_err(|e| {
+                    FaucetError::Sink(format!("postgres evolve acquire failed: {e}"))
+                })?;
 
-        for c in &evolution.additions {
-            let t =
-                faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
-            sqlx::query(&build_add_column_sql(&table_ref, &c.name, t))
+            for c in &evolution.additions {
+                let t = faucet_core::json_schema_base_type(&c.to)
+                    .unwrap_or(faucet_core::SqlBaseType::Text);
+                sqlx::query(&build_add_column_sql(&table_ref, &c.name, t))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("postgres ADD COLUMN {} failed: {e}", c.name))
+                    })?;
+            }
+            for c in &evolution.widenings {
+                sqlx::query(&build_alter_type_sql(
+                    &table_ref,
+                    &c.name,
+                    widened_keyword(c),
+                ))
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| {
-                    FaucetError::Sink(format!("postgres ADD COLUMN {} failed: {e}", c.name))
+                    FaucetError::Sink(format!("postgres ALTER TYPE {} failed: {e}", c.name))
                 })?;
-        }
-        for c in &evolution.widenings {
-            sqlx::query(&build_alter_type_sql(
-                &table_ref,
-                &c.name,
-                widened_keyword(c),
-            ))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!("postgres ALTER TYPE {} failed: {e}", c.name))
-            })?;
-        }
-        for col in &evolution.relax_nullability {
-            sqlx::query(&build_drop_not_null_sql(&table_ref, col))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("postgres DROP NOT NULL {col} failed: {e}"))
-                })?;
-        }
-        Ok(())
+            }
+            for col in &evolution.relax_nullability {
+                sqlx::query(&build_drop_not_null_sql(&table_ref, col))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("postgres DROP NOT NULL {col} failed: {e}"))
+                    })?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     fn dataset_uri(&self) -> String {
@@ -2069,19 +2096,26 @@ impl faucet_core::Sink for PostgresSink {
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.ensure_commit_table().await?;
-        let sql = format!(
-            "SELECT {k} FROM {t} WHERE {s} = $1",
-            t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-            k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-            s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-        );
-        let row = sqlx::query(&sql)
-            .bind(scope)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL token read failed: {e}")))?;
-        Ok(row.map(|r| r.get::<String, _>(0)))
+        bounded(
+            self.config.write_timeout_secs,
+            "last_committed_token",
+            async {
+                self.ensure_commit_table().await?;
+                let sql = format!(
+                    "SELECT {k} FROM {t} WHERE {s} = $1",
+                    t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+                    k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
+                    s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+                );
+                let row = sqlx::query(&sql)
+                    .bind(scope)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("PostgreSQL token read failed: {e}")))?;
+                Ok(row.map(|r| r.get::<String, _>(0)))
+            },
+        )
+        .await
     }
 
     async fn write_batch_idempotent(
