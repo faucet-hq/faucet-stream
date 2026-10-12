@@ -17,7 +17,7 @@ Reach for it when you want to stream live mutations out of an operational Postgr
 - **Effectively-once delivery** — `supports_exactly_once()` is `true`; pair with an idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`, `iceberg`, `bigquery`, `kafka`, `snowflake`, `redis`, `mongodb`, `spanner`, `databricks`, `oracle`) under `delivery: exactly_once`.
 - **Snapshot → CDC handoff** — implements `capture_resume_position()` so `faucet replicate` can bulk-snapshot a table and hand off to CDC with no gap and no duplicate.
 - **Crash-safe WAL feedback** — the advertised `confirmed_flush_lsn` advances *only* from a durably-persisted bookmark, so Postgres never recycles WAL for changes the consumer hasn't committed.
-- **TLS-capable** — `require` / `verify_ca` / `verify_full` modes for the replication connection (plaintext `disable` is the default for back-compat).
+- **TLS-capable** — `require` / `verify_ca` / `verify_full` modes for the replication connection (the default `from_url` honours the connection URL's `sslmode`).
 - **Type-aware decoding** — booleans, integers, floats (incl. `NaN`/`Infinity`), `numeric` (exact precision), `bytea` (base64), `json`/`jsonb`, and 1-D scalar arrays decode to native JSON; everything else is preserved as raw Postgres text.
 - **OOM and WAL safety valves** — `max_staged_records` bounds a single in-progress transaction; `idle_timeout`, `max_messages` and `max_cycle_duration` (default 5 minutes, so a cycle ends even under steady writes) bound a fetch cycle.
 
@@ -293,7 +293,7 @@ A **permanent** slot keeps pinning WAL even when no consumer is connected — an
 
 ## Snapshot → CDC handoff
 
-This source implements `capture_resume_position()`: it ensures the slot exists, reads the server's **current WAL LSN** (`pg_current_wal_lsn`) as a resume bookmark, and consumes no changes. The `faucet replicate` command uses it to anchor the CDC stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink.
+This source implements `capture_resume_position()`: it ensures the slot exists, reads the slot's position (`confirmed_flush_lsn`, else `restart_lsn`, else the server's current WAL LSN for a slot that reports none yet) as a resume bookmark, and consumes no changes. The `faucet replicate` command uses it to anchor the CDC stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink.
 
 Capture uses the permanent slot (`slot_type: temporary` is refused at config load), so WAL is retained across the snapshot. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
 
@@ -339,7 +339,7 @@ let state = Arc::new(FileStateStore::new("./state"));
 
 ## How it works
 
-Built on the [`pgwire-replication`](https://crates.io/crates/pgwire-replication) crate for the logical-replication wire protocol; the `pgoutput` payload bytes are decoded by a hand-rolled decoder in this crate so the output record shape stays under our control. The `sqlx` Postgres driver handles slot lifecycle (create / advance / drop) and the `pg_current_wal_lsn` probe. Standby Status Updates are sent every `status_update_interval` to keep the connection alive and report the flush position. The replication connection is created once and held for the lifetime of the source.
+Built on the [`pgwire-replication`](https://crates.io/crates/pgwire-replication) crate for the logical-replication wire protocol; the `pgoutput` payload bytes are decoded by a hand-rolled decoder in this crate so the output record shape stays under our control. The `sqlx` Postgres driver handles slot lifecycle (create / advance / drop) and the slot-position probe. Standby Status Updates are sent every `status_update_interval` to keep the connection alive and report the flush position. A replication connection is opened at the start of each fetch cycle and closed when the cycle ends.
 
 ## Lineage dataset URI
 
