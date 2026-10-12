@@ -122,8 +122,14 @@ jobs:
         run: |
           python3 scripts/test_vendor_names.py
           python3 scripts/vendor-names.py
-      - name: Check no connector crate depends on another connector (#784)
-        run: python3 scripts/connector-deps.py
+      - name: Check no published crate depends on a connector (#784)
+        run: |
+          python3 scripts/test_connector_deps.py
+          python3 scripts/connector-deps.py
+      - name: Check version-blind advisory ignores cover only triaged versions
+        run: |
+          python3 scripts/test_advisory_scope.py
+          python3 scripts/advisory-scope.py
       - name: Check no published crate packages a private key (#789 SUPPLY-20)
         run: python3 scripts/packaged-keys.py
       - name: Check `full` enables every feature and the image builds `full` (#845)
