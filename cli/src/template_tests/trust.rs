@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::error::{CliError, CliResult};
+use crate::error::CliResult;
 
 /// The trust settings of the `faucet serve` process running tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub fn screen(doc: &Value) -> CliResult<()> {
 pub fn screen_with(_policy: &ServerTestPolicy, doc: &Value) -> CliResult<()> {
     #[cfg(feature = "serve")]
     crate::serve::load::refuse_server_secrets(doc)
-        .map_err(|e| CliError::Config(format!("refused by the server: {e}")))?;
+        .map_err(|e| crate::error::CliError::Config(format!("refused by the server: {e}")))?;
     #[cfg(not(feature = "serve"))]
     let _ = doc;
     Ok(())
