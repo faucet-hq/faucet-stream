@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Fail when a published connector crate depends on another connector (#784).
+"""Fail when a published crate depends on a connector crate (#784).
 
-A `faucet-source-*`, `faucet-sink-*` or `faucet-common-*` crate may depend on
-`faucet-core`, its own `faucet-common-*` crate and third-party crates, in every
+Every published workspace crate except the two aggregators (`faucet-stream`,
+`faucet-cli`, which depend on every connector by design) must not depend on a
+`faucet-source-*` / `faucet-sink-*` crate other than itself, in every
 dependency section including `[dev-dependencies]` and target-specific tables.
 A versioned edge to another connector makes `cargo publish` need that connector
 on crates.io first, which the release order does not guarantee. Tests that need
@@ -16,7 +17,7 @@ import sys
 import tomllib
 
 CONNECTOR_PREFIXES = ("faucet-source-", "faucet-sink-")
-CHECKED_PREFIXES = CONNECTOR_PREFIXES + ("faucet-common-",)
+AGGREGATORS = {"faucet-stream", "faucet-cli"}
 SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 
@@ -31,7 +32,7 @@ def dependency_tables(manifest):
 def violations(manifest):
     package = manifest.get("package", {})
     name = package.get("name", "")
-    if not name.startswith(CHECKED_PREFIXES) or package.get("publish") is False:
+    if not name or name in AGGREGATORS or package.get("publish") is False:
         return []
     found = []
     for section, table in dependency_tables(manifest):
@@ -55,12 +56,12 @@ def main():
         with open(path, "rb") as f:
             found += violations(tomllib.load(f))
     if found:
-        print("Connector crates must not depend on other connector crates (#784).")
+        print("Published crates must not depend on connector crates (#784).")
         print("Move the test that needs both into crates/interop-tests:")
         for line in found:
             print(f"  {line}")
         return 1
-    print("connector-deps: no connector crate depends on another connector")
+    print("connector-deps: no published crate depends on a connector")
     return 0
 
 

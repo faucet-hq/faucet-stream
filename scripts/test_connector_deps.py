@@ -64,12 +64,23 @@ class Violations(unittest.TestCase):
             '[dev-dependencies]\nfaucet-source-x = "1"\n'
         )
         interop = manifest(
-            '[package]\nname = "faucet-interop-tests"\n'
+            '[package]\nname = "faucet-interop-tests"\npublish = false\n'
             '[dev-dependencies]\nfaucet-source-x = "1"\n'
         )
         self.assertEqual(cd.violations(ok), [])
         self.assertEqual(cd.violations(unpublished), [])
         self.assertEqual(cd.violations(interop), [])
+
+
+    def test_other_published_crates_are_checked_but_aggregators_are_not(self):
+        core = manifest(
+            '[package]\nname = "faucet-lineage"\n'
+            '[dev-dependencies]\nfaucet-sink-jsonl = "1"\n'
+        )
+        self.assertEqual(cd.violations(core), ["faucet-lineage: [dev-dependencies] faucet-sink-jsonl"])
+        for agg in ("faucet-stream", "faucet-cli"):
+            m = manifest(f'[package]\nname = "{agg}"\n[dependencies]\nfaucet-sink-jsonl = "1"\n')
+            self.assertEqual(cd.violations(m), [])
 
 
 class Workspace(unittest.TestCase):
