@@ -4,7 +4,7 @@ Where everything lives in the faucet-stream repository. For how the pieces fit
 together at run time, see the [architecture guide](docs/architecture/README.md);
 to start contributing, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The workspace has <!--COUNT:crates-->111<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
+The workspace has <!--COUNT:crates-->112<!--/COUNT--> crates: <!--COUNT:sources-->44<!--/COUNT-->
 source connectors, <!--COUNT:sinks-->35<!--/COUNT--> sink connectors and
 <!--COUNT:common-->23<!--/COUNT--> shared connector libraries, plus the core, auth, state,
 lineage, transform and test crates below.

@@ -10,6 +10,8 @@
 //!   `instance` / `database` / `auth` / `max_sessions` / `emulator_host`)
 //!   plus [`SpannerConnection::connect`] / [`SpannerConnection::connect_admin`]
 //!   client builders.
+//! - [`dialect`] — GoogleSQL vs PostgreSQL dialect differences (quoting,
+//!   placeholders, catalog queries, DDL type names).
 //! - [`types`] — `INFORMATION_SCHEMA` type-string parsing and the mapping to
 //!   JSON-Schema fragments.
 //! - [`decode`] — generic Spanner row → `serde_json::Value` decoding for
@@ -18,9 +20,11 @@
 //!   by the destination column type.
 
 pub mod decode;
+pub mod dialect;
 pub mod encode;
 pub mod types;
 
+pub use dialect::SpannerDialect;
 use faucet_core::FaucetError;
 use gcloud_gax::conn::Environment;
 use gcloud_spanner::admin::AdminClientConfig;
@@ -116,6 +120,11 @@ pub struct SpannerConnection {
     /// The env var is still honored when this field is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulator_host: Option<String>,
+    /// SQL dialect the database was created with: `google_standard_sql`
+    /// (default) or `postgresql`. A database's dialect is fixed at creation
+    /// and is not auto-detected; set this to match it.
+    #[serde(default, skip_serializing_if = "SpannerDialect::is_default")]
+    pub dialect: SpannerDialect,
 }
 
 impl SpannerConnection {
@@ -279,6 +288,7 @@ mod tests {
             auth: SpannerCredentials::default(),
             max_sessions: default_max_sessions(),
             emulator_host: None,
+            dialect: SpannerDialect::default(),
         }
     }
 

@@ -122,6 +122,16 @@ mutation API pairs naturally with `write_mode: upsert` (`InsertOrUpdate` keyed
 on the primary key) and supports effectively-once delivery via a commit-token
 read-write transaction.
 
+### Spanner query source vs. change streams
+
+- **`source-spanner`** runs a query. Use it for snapshots and for incremental
+  pulls on a monotonic column (misses hard deletes).
+- **`source-spanner-cdc`** reads a [change stream](https://cloud.google.com/spanner/docs/change-streams)
+  and emits every `INSERT`/`UPDATE`/`DELETE`, deletes included, as a CDC
+  envelope you can feed to `cdc_unwrap`. Delivery is at-least-once, so pair it
+  with a keyed upsert sink. Create the stream with
+  `value_capture_type = 'NEW_ROW'` if you want whole rows in `after`.
+
 ## Sinks: column-mapped vs. JSON blob (SQL databases)
 
 The Postgres/MySQL/SQLite/SQL Server sinks can write either:

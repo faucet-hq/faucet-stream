@@ -7,9 +7,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use faucet_common_spanner::SpannerDialect;
 use faucet_common_spanner::decode::row_to_json;
-use faucet_common_spanner::quote_ident_spanner;
-use faucet_common_spanner::types::{parse_spanner_type, spanner_type_to_json_schema};
+use faucet_common_spanner::dialect::named_to_positional;
+use faucet_common_spanner::types::spanner_type_to_json_schema;
 use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
@@ -62,7 +63,10 @@ impl SpannerSource {
     /// (they bind by name, not by position in the text).
     fn shard_wrap(&self, query: String) -> String {
         match &*self.applied_shard.lock().expect("shard mutex poisoned") {
-            Some(bounds) => bounds.wrap(&query, quote_ident_spanner),
+            Some(bounds) => {
+                let dialect = self.config.connection.dialect;
+                bounds.wrap(&query, |ident| dialect.quote_ident(ident))
+            }
             None => query,
         }
     }
@@ -190,6 +194,37 @@ fn build_statement(query: &str, params: &[(String, Value)]) -> Result<Statement,
     Ok(stmt)
 }
 
+/// Adapt a resolved query and its named binds to the database dialect.
+///
+/// GoogleSQL binds by name, so the query is returned untouched. PostgreSQL
+/// binds by position: each `@name` the query uses becomes `$N` (numbered by
+/// first use) and the value is re-keyed to the wire name `pN`. Parameters the
+/// query never mentions are dropped, because PostgreSQL rejects a bind with no
+/// matching placeholder. Authors keep writing `@bookmark` and `@name` in both
+/// dialects, so a config ports between them without edits.
+fn finalize_for_dialect(
+    dialect: SpannerDialect,
+    query: String,
+    params: Vec<(String, Value)>,
+) -> (String, Vec<(String, Value)>) {
+    if !dialect.is_postgresql() {
+        return (query, params);
+    }
+    let names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+    let (sql, order) = named_to_positional(&query, &names);
+    let renamed = order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            params
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| (dialect.bind_name(name, i + 1), v.clone()))
+        })
+        .collect();
+    (sql, renamed)
+}
+
 /// One flattened `INFORMATION_SCHEMA.COLUMNS` row used by
 /// [`Source::discover`]: `(table, column, spanner_type, is_nullable)`.
 type CatalogRow = (String, String, String, bool);
@@ -198,7 +233,10 @@ type CatalogRow = (String, String, String, bool);
 /// [`DatasetDescriptor`](faucet_core::DatasetDescriptor) per table. Pure —
 /// unit-testable without a live database. Spanner has no cheap row estimate
 /// (no `reltuples` analogue), so descriptors carry none.
-fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDescriptor> {
+fn descriptors_from_catalog(
+    dialect: SpannerDialect,
+    rows: Vec<CatalogRow>,
+) -> Vec<faucet_core::DatasetDescriptor> {
     /// In-progress per-table accumulator: `(table, columns)`.
     type PendingTable = (String, Vec<(String, Value)>);
 
@@ -207,7 +245,7 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 
     let flush = |cur: Option<PendingTable>, out: &mut Vec<faucet_core::DatasetDescriptor>| {
         if let Some((table, cols)) = cur {
-            let query = format!("SELECT * FROM {}", quote_ident_spanner(&table));
+            let query = format!("SELECT * FROM {}", dialect.quote_ident(&table));
             out.push(
                 faucet_core::DatasetDescriptor::new(
                     table,
@@ -225,7 +263,7 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
             flush(current.take(), &mut out);
             current = Some((table, Vec::new()));
         }
-        let fragment = spanner_type_to_json_schema(&parse_spanner_type(&spanner_type), is_nullable);
+        let fragment = spanner_type_to_json_schema(&dialect.parse_type(&spanner_type), is_nullable);
         if let Some((_, cols)) = current.as_mut() {
             cols.push((column, fragment));
         }
@@ -288,6 +326,7 @@ impl Source for SpannerSource {
         let start = self.current_start();
         let (query, params, incr) = build_query_and_params(&self.config, context, start.as_ref());
         let query = self.shard_wrap(query);
+        let (query, params) = finalize_for_dialect(self.config.connection.dialect, query, params);
 
         Box::pin(async_stream::try_stream! {
             let stmt = build_statement(&query, &params)?;
@@ -399,30 +438,58 @@ impl Source for SpannerSource {
              ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
           WHERE t.TABLE_TYPE = 'BASE TABLE' AND t.TABLE_SCHEMA = '' \
           ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
+        // PostgreSQL-dialect databases expose a lower-case `information_schema`
+        // whose default schema is `public`.
+        const PG_CATALOG_SQL: &str = "SELECT c.table_name, c.column_name, c.spanner_type, \
+                c.is_nullable \
+           FROM information_schema.columns AS c \
+           JOIN information_schema.tables AS t \
+             ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+          WHERE t.table_type = 'BASE TABLE' AND t.table_schema = 'public' \
+          ORDER BY c.table_name, c.ordinal_position";
+        let dialect = self.config.connection.dialect;
+        let (catalog_sql, col_table, col_column, col_type, col_nullable) =
+            if dialect.is_postgresql() {
+                (
+                    PG_CATALOG_SQL,
+                    "table_name",
+                    "column_name",
+                    "spanner_type",
+                    "is_nullable",
+                )
+            } else {
+                (
+                    CATALOG_SQL,
+                    "TABLE_NAME",
+                    "COLUMN_NAME",
+                    "SPANNER_TYPE",
+                    "IS_NULLABLE",
+                )
+            };
 
         let map_err =
             |e: String| FaucetError::Source(format!("spanner: catalog discovery failed: {e}"));
 
         let mut tx = self.read_txn().await?;
         let mut iter = tx
-            .query(Statement::new(CATALOG_SQL))
+            .query(Statement::new(catalog_sql))
             .await
             .map_err(|e| map_err(e.to_string()))?;
 
         let mut catalog: Vec<CatalogRow> = Vec::new();
         while let Some(row) = iter.next().await.map_err(|e| map_err(e.to_string()))? {
             let table: String = row
-                .column_by_name("TABLE_NAME")
+                .column_by_name(col_table)
                 .map_err(|e| map_err(e.to_string()))?;
             let column: String = row
-                .column_by_name("COLUMN_NAME")
+                .column_by_name(col_column)
                 .map_err(|e| map_err(e.to_string()))?;
             let spanner_type: String = row
-                .column_by_name("SPANNER_TYPE")
+                .column_by_name(col_type)
                 .map_err(|e| map_err(e.to_string()))?;
             // Absent/odd IS_NULLABLE over-approximates to nullable.
             let nullable: String = row
-                .column_by_name("IS_NULLABLE")
+                .column_by_name(col_nullable)
                 .unwrap_or_else(|_| "YES".to_string());
             catalog.push((
                 table,
@@ -432,7 +499,7 @@ impl Source for SpannerSource {
             ));
         }
 
-        Ok(descriptors_from_catalog(catalog))
+        Ok(descriptors_from_catalog(dialect, catalog))
     }
 
     /// Shardable when a [`ShardConfig`](crate::config::ShardConfig) is set.
@@ -457,8 +524,10 @@ impl Source for SpannerSource {
         let start = self.current_start();
         let (inner, params, _incr) =
             build_query_and_params(&self.config, &HashMap::new(), start.as_ref());
-        let key = quote_ident_spanner(&shard_cfg.key);
-        let bounds_sql = pk_bounds_query(&inner, &key, "INT64");
+        let dialect = self.config.connection.dialect;
+        let key = dialect.quote_ident(&shard_cfg.key);
+        let bounds_sql = pk_bounds_query(&inner, &key, dialect.int64_cast_target());
+        let (bounds_sql, params) = finalize_for_dialect(dialect, bounds_sql, params);
 
         let map_err = |e: String| {
             FaucetError::Source(format!(
@@ -749,7 +818,9 @@ mod tests {
             json!({"key": "id", "lo": 100, "hi": 200, "lo_unbounded": false, "hi_unbounded": false}),
         );
         let bounds = PkShardBounds::from_spec(&spec).unwrap();
-        let sql = bounds.wrap("SELECT * FROM t", quote_ident_spanner);
+        let sql = bounds.wrap("SELECT * FROM t", |i| {
+            SpannerDialect::GoogleStandardSql.quote_ident(i)
+        });
         assert!(sql.contains("(SELECT * FROM t) AS _faucet_shard"), "{sql}");
         assert!(sql.contains("`id` >= 100"), "backtick-quoted key: {sql}");
         assert!(sql.contains("`id` < 200"), "half-open upper bound: {sql}");
@@ -759,7 +830,9 @@ mod tests {
     fn last_shard_wrap_covers_null_keys() {
         let shards = plan_pk_shards("id", 0, 99, 3);
         let last = PkShardBounds::from_spec(shards.last().unwrap()).unwrap();
-        let sql = last.wrap("SELECT * FROM t", quote_ident_spanner);
+        let sql = last.wrap("SELECT * FROM t", |i| {
+            SpannerDialect::GoogleStandardSql.quote_ident(i)
+        });
         assert!(
             sql.contains("`id` IS NULL"),
             "last shard must match NULL keys: {sql}"
@@ -783,7 +856,7 @@ mod tests {
         );
         let wrapped = PkShardBounds::from_spec(&spec)
             .unwrap()
-            .wrap(&q, quote_ident_spanner);
+            .wrap(&q, |i| SpannerDialect::GoogleStandardSql.quote_ident(i));
         assert!(
             wrapped.contains("@bookmark"),
             "bind param survives: {wrapped}"
@@ -814,7 +887,7 @@ mod tests {
             cat_row("orders", "note", "STRING(MAX)", true),
             cat_row("users", "score", "FLOAT64", false),
         ];
-        let ds = descriptors_from_catalog(rows);
+        let ds = descriptors_from_catalog(SpannerDialect::GoogleStandardSql, rows);
         assert_eq!(ds.len(), 2);
 
         assert_eq!(ds[0].name, "orders");
@@ -840,7 +913,7 @@ mod tests {
     #[test]
     fn descriptors_quote_hostile_identifiers() {
         let rows = vec![cat_row("we`ird", "id", "INT64", false)];
-        let ds = descriptors_from_catalog(rows);
+        let ds = descriptors_from_catalog(SpannerDialect::GoogleStandardSql, rows);
         let q = ds[0].config_patch["query"].as_str().unwrap();
         assert_eq!(
             q, "SELECT * FROM `we``ird`",
@@ -850,6 +923,61 @@ mod tests {
 
     #[test]
     fn descriptors_empty_catalog_is_empty() {
-        assert!(descriptors_from_catalog(Vec::new()).is_empty());
+        assert!(descriptors_from_catalog(SpannerDialect::GoogleStandardSql, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn googlesql_finalize_is_the_identity() {
+        let params = vec![("bookmark".to_string(), serde_json::json!("2020"))];
+        let (q, p) = finalize_for_dialect(
+            SpannerDialect::GoogleStandardSql,
+            "SELECT * FROM t WHERE c > @bookmark".into(),
+            params.clone(),
+        );
+        assert_eq!(q, "SELECT * FROM t WHERE c > @bookmark");
+        assert_eq!(p, params);
+    }
+
+    #[test]
+    fn postgresql_finalize_numbers_params_and_drops_unused() {
+        let params = vec![
+            ("bookmark".to_string(), serde_json::json!("2020")),
+            ("region".to_string(), serde_json::json!("eu")),
+            ("unused".to_string(), serde_json::json!(1)),
+        ];
+        let (q, p) = finalize_for_dialect(
+            SpannerDialect::Postgresql,
+            "SELECT * FROM t WHERE r = @region AND c > @bookmark AND d > @bookmark".into(),
+            params,
+        );
+        assert_eq!(q, "SELECT * FROM t WHERE r = $1 AND c > $2 AND d > $2");
+        assert_eq!(
+            p,
+            vec![
+                ("p1".to_string(), serde_json::json!("eu")),
+                ("p2".to_string(), serde_json::json!("2020")),
+            ]
+        );
+    }
+
+    #[test]
+    fn postgresql_descriptors_use_double_quotes_and_pg_types() {
+        let ds = descriptors_from_catalog(
+            SpannerDialect::Postgresql,
+            vec![
+                ("ord".into(), "id".into(), "bigint".into(), false),
+                (
+                    "ord".into(),
+                    "note".into(),
+                    "character varying".into(),
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].config_patch["query"], "SELECT * FROM \"ord\"");
+        let props = &ds[0].schema.as_ref().unwrap()["properties"];
+        assert_eq!(props["id"]["type"], "integer");
+        assert_eq!(props["note"]["type"], serde_json::json!(["string", "null"]));
     }
 }

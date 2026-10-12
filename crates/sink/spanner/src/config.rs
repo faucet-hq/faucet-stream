@@ -80,6 +80,7 @@ impl SpannerSinkConfig {
                 auth: Default::default(),
                 max_sessions: 100,
                 emulator_host: None,
+                dialect: Default::default(),
             },
             table_name: table_name.into(),
             create_table: default_create_table(),

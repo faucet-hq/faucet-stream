@@ -55,6 +55,33 @@ pub fn parse_spanner_type(raw: &str) -> SpannerType {
     }
 }
 
+/// Parse a PostgreSQL-dialect `information_schema.columns.spanner_type`
+/// string (e.g. `character varying`, `bigint`, `character varying[]`).
+/// Unrecognized types parse as [`SpannerType::Other`], never an error.
+pub fn parse_pg_spanner_type(raw: &str) -> SpannerType {
+    let lower = raw.trim().to_ascii_lowercase();
+    if let Some(inner) = lower.strip_suffix("[]") {
+        return SpannerType::Array(Box::new(parse_pg_spanner_type(inner)));
+    }
+    // Strip a length / precision parameter: `character varying(100)`.
+    let base = lower.split('(').next().unwrap_or(&lower).trim();
+    match base {
+        "boolean" | "bool" => SpannerType::Bool,
+        "bigint" | "int8" => SpannerType::Int64,
+        "real" | "float4" => SpannerType::Float32,
+        "double precision" | "float8" => SpannerType::Float64,
+        "timestamp with time zone" | "timestamptz" | "spanner.commit_timestamp" => {
+            SpannerType::Timestamp
+        }
+        "date" => SpannerType::Date,
+        "character varying" | "varchar" | "text" => SpannerType::String,
+        "bytea" => SpannerType::Bytes,
+        "numeric" | "decimal" => SpannerType::Numeric,
+        "jsonb" => SpannerType::Json,
+        _ => SpannerType::Other,
+    }
+}
+
 /// Map a [`SpannerType`] to the JSON-Schema fragment faucet's discover /
 /// schema-drift machinery expects (an `infer_schema`-shaped `{"type": …}`).
 /// `nullable` widens the type with `"null"`.
@@ -116,6 +143,31 @@ mod tests {
             parse_spanner_type("ARRAY<STRING(MAX)>"),
             SpannerType::Array(Box::new(SpannerType::String))
         );
+    }
+
+    #[test]
+    fn parses_postgresql_type_strings() {
+        for (raw, want) in [
+            ("bigint", SpannerType::Int64),
+            ("character varying", SpannerType::String),
+            ("character varying(100)", SpannerType::String),
+            ("numeric", SpannerType::Numeric),
+            ("jsonb", SpannerType::Json),
+            ("timestamp with time zone", SpannerType::Timestamp),
+            ("bytea", SpannerType::Bytes),
+            ("double precision", SpannerType::Float64),
+            ("real", SpannerType::Float32),
+            ("boolean", SpannerType::Bool),
+            ("date", SpannerType::Date),
+        ] {
+            assert_eq!(parse_pg_spanner_type(raw), want, "{raw}");
+        }
+        assert_eq!(
+            parse_pg_spanner_type("character varying[]"),
+            SpannerType::Array(Box::new(SpannerType::String))
+        );
+        assert_eq!(parse_pg_spanner_type("interval"), SpannerType::Other);
+        assert_eq!(parse_pg_spanner_type(""), SpannerType::Other);
     }
 
     #[test]

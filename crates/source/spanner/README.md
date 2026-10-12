@@ -42,6 +42,7 @@ sink:
 | `state_key` | | derived | Explicit state-store key for the bookmark. Defaults to `spanner:<project>.<instance>.<database>:<query-fingerprint>`. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
 | `max_sessions` | | `100` | Upper bound on pooled Spanner sessions (gRPC channels are sized at one per 100 sessions). |
 | `emulator_host` | | — | Spanner emulator endpoint (`host:port`); plaintext + unauthenticated. See [Emulator](#emulator). |
+| `dialect` | | `google_standard_sql` | SQL dialect the database was created with: `google_standard_sql` or `postgresql`. Not auto-detected; set it to match the database. See [PostgreSQL dialect](#postgresql-dialect). |
 | `shard` | | — | `{key: <INT64 column>}` — opt in to PK-range sharding for clustered execution. |
 
 ## Record shape
@@ -117,6 +118,34 @@ splits the range into contiguous half-open slices; each worker streams
 shards are open-ended and exactly one shard also matches `key IS NULL`, so
 concurrent inserts outside the enumerated range and NULL-key rows are read by
 exactly one shard. Has no effect outside the cluster coordinator.
+
+## PostgreSQL dialect
+
+A Spanner database is created with one dialect and keeps it. For a
+PostgreSQL-dialect database set `dialect: postgresql`:
+
+```yaml
+source:
+  kind: spanner
+  config:
+    project_id: my-project
+    instance: my-instance
+    database: my-pg-db
+    dialect: postgresql
+    query: 'SELECT * FROM orders WHERE updated_at > @bookmark::timestamptz'
+```
+
+- Keep writing `@bookmark` and `@name` for parameters, as in GoogleSQL. faucet
+  rewrites each one to a positional `$N` and binds it as `pN`, so a config ports
+  between dialects. A parameter the query never mentions is not sent. `@`
+  inside string literals, quoted identifiers and comments is left alone.
+- Everything else in `query` is PostgreSQL SQL. Cast the bookmark yourself when
+  the column type needs it, for example `@bookmark::timestamptz`.
+- `faucet discover` reads the lower-case `information_schema` (schema
+  `public`) and emits `SELECT * FROM "table"` config patches.
+- `shard` bounds use `CAST(... AS bigint)` and double-quoted identifiers.
+- Values decode the same way as in GoogleSQL: `numeric` is a string, `jsonb`
+  is structured JSON, `bytea` is base64.
 
 ## Emulator
 

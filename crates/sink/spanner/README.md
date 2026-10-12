@@ -42,6 +42,7 @@ pipeline:
 | `auth` | object | `application_default` | Credentials — see [Authentication](#authentication). |
 | `max_sessions` | integer | `100` | Upper bound on pooled Spanner sessions. Channels are sized at one per 100 sessions. |
 | `emulator_host` | string | — | Emulator endpoint (`host:port`). Plaintext + unauthenticated; scoped to this connector (no env-var races). `SPANNER_EMULATOR_HOST` is still honored when unset. |
+| `dialect` | | `google_standard_sql` | SQL dialect the database was created with: `google_standard_sql` or `postgresql`. Not auto-detected; set it to match the database. See [PostgreSQL dialect](#postgresql-dialect). |
 | `batch_size` | integer | `1000` | Rows per commit. `0` = no row-count re-chunking (the cell budget below still applies). |
 | `ddl_timeout_secs` | integer | `300` | Bound on schema-change (long-running DDL operation) waits. |
 | `write_mode` | string | `append` | `append` \| `upsert` \| `delete`. |
@@ -112,6 +113,25 @@ The table is auto-created via the admin DDL API on first use. On crash either th
 - **Base-type widenings (e.g. INT64→FLOAT64) are not supported by Spanner.** The sink returns a typed error advising `allow_type_widening: false`, which makes the drift policy classify the change `incompatible` and route it via `on_incompatible` (`fail` or `quarantine`).
 
 DDL runs as a Spanner long-running operation, bounded by `ddl_timeout_secs`.
+
+## PostgreSQL dialect
+
+Set `dialect: postgresql` for a PostgreSQL-dialect database. Writes still use
+mutations, so row encoding is unchanged. The dialect changes the SQL faucet
+sends:
+
+- **Metadata** is read from the lower-case `information_schema` (schema
+  `public`).
+- **Auto-created tables** use `character varying` columns and
+  `PRIMARY KEY (...)` inside the column list.
+- **The commit-token table** (`faucet_commit_token`) is created with a
+  `spanner.commit_timestamp` column.
+- **Schema evolution** adds columns with PostgreSQL types (`bigint`,
+  `double precision`, `boolean`, `character varying`, `jsonb`) and relaxes
+  `NOT NULL` with `ALTER COLUMN ... DROP NOT NULL`.
+- **Scoped cleanup** binds the scope as positional parameters and casts them
+  (`CAST($1 AS bigint)`). `bytea`, `jsonb` and array columns cannot be used in a
+  cleanup scope.
 
 ## Emulator
 

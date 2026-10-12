@@ -168,6 +168,7 @@ pub const PLAN_LIVE_REFUSED_KINDS: &[&str] = &[
     "mongodb-cdc",
     "mssql-cdc",
     "oracle-cdc",
+    "spanner-cdc",
     "kafka",
     "webhook",
     "websocket",

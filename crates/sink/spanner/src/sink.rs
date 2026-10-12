@@ -10,10 +10,10 @@
 
 use crate::config::SpannerSinkConfig;
 use async_trait::async_trait;
+use faucet_common_spanner::SpannerDialect;
 use faucet_common_spanner::decode::SpannerJson;
 use faucet_common_spanner::encode::{EncodedKind, canonical_kind, encode_to_kind};
-use faucet_common_spanner::quote_ident_spanner;
-use faucet_common_spanner::types::{SpannerType, parse_spanner_type, spanner_type_to_json_schema};
+use faucet_common_spanner::types::{SpannerType, spanner_type_to_json_schema};
 use faucet_core::FaucetError;
 use gcloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
 use gcloud_googleapis::spanner::v1::Mutation;
@@ -213,27 +213,13 @@ fn chunk_by_cells(planned: Vec<Planned>, batch_size: usize, budget: usize) -> Ve
 ///
 /// Types with no equality semantics (JSON, ARRAY, STRUCT/PROTO) are refused
 /// rather than silently compared.
-fn scope_cast_expr(param: &str, ty: &SpannerType) -> Result<String, String> {
-    Ok(match ty {
-        // Already a STRING parameter — no conversion needed.
-        SpannerType::String => format!("@{param}"),
-        SpannerType::Bool => format!("CAST(@{param} AS BOOL)"),
-        SpannerType::Int64 => format!("CAST(@{param} AS INT64)"),
-        SpannerType::Float32 => format!("CAST(@{param} AS FLOAT32)"),
-        SpannerType::Float64 => format!("CAST(@{param} AS FLOAT64)"),
-        SpannerType::Timestamp => format!("CAST(@{param} AS TIMESTAMP)"),
-        SpannerType::Date => format!("CAST(@{param} AS DATE)"),
-        SpannerType::Numeric => format!("CAST(@{param} AS NUMERIC)"),
-        // BYTES travel base64-encoded everywhere else in this connector, so
-        // decode rather than reinterpreting the text's UTF-8 bytes.
-        SpannerType::Bytes => format!("FROM_BASE64(@{param})"),
-        SpannerType::Json | SpannerType::Array(_) | SpannerType::Other => {
-            return Err(
-                "column type does not support equality and cannot be used in a cleanup scope"
-                    .into(),
-            );
-        }
-    })
+fn scope_cast_expr(
+    d: SpannerDialect,
+    param: &str,
+    index: usize,
+    ty: &SpannerType,
+) -> Result<String, String> {
+    d.scope_cast_expr(&d.placeholder(param, index), ty)
 }
 
 /// Canonical text form of a scope value for its STRING-bound parameter.
@@ -256,20 +242,25 @@ fn scope_param_text(value: &Value, ty: &SpannerType) -> Result<String, String> {
 
 /// `SELECT <pk…> FROM <table> WHERE <col> = <expr> AND …` — reads the primary
 /// keys of every row the invocation claimed to be authoritative for.
-fn build_scope_select_sql(table: &str, pk: &[String], preds: &[(String, String)]) -> String {
+fn build_scope_select_sql(
+    d: SpannerDialect,
+    table: &str,
+    pk: &[String],
+    preds: &[(String, String)],
+) -> String {
     let cols = pk
         .iter()
-        .map(|c| quote_ident_spanner(c))
+        .map(|c| d.quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
     let where_clause = preds
         .iter()
-        .map(|(col, expr)| format!("{} = {expr}", quote_ident_spanner(col)))
+        .map(|(col, expr)| format!("{} = {expr}", d.quote_ident(col)))
         .collect::<Vec<_>>()
         .join(" AND ");
     format!(
         "SELECT {cols} FROM {} WHERE {where_clause}",
-        quote_ident_spanner(table)
+        d.quote_ident(table)
     )
 }
 
@@ -366,60 +357,50 @@ fn validate_key_matches_pk(key: &[String], pk: &[String], table: &str) -> Result
 /// Map a [`faucet_core::SqlBaseType`] to the Spanner DDL keyword used when
 /// adding a column during schema evolution. Integers land as `INT64` and
 /// floats as `FLOAT64` — Spanner's widest numeric types.
-fn spanner_keyword(t: faucet_core::SqlBaseType) -> &'static str {
+fn spanner_keyword(d: SpannerDialect, t: faucet_core::SqlBaseType) -> &'static str {
     use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "INT64",
-        Double => "FLOAT64",
-        Boolean => "BOOL",
-        Text => "STRING(MAX)",
-        Json => "JSON",
+    match (d, t) {
+        (SpannerDialect::GoogleStandardSql, Integer) => "INT64",
+        (SpannerDialect::GoogleStandardSql, Double) => "FLOAT64",
+        (SpannerDialect::GoogleStandardSql, Boolean) => "BOOL",
+        (SpannerDialect::GoogleStandardSql, Text) => "STRING(MAX)",
+        (SpannerDialect::GoogleStandardSql, Json) => "JSON",
+        (SpannerDialect::Postgresql, Integer) => "bigint",
+        (SpannerDialect::Postgresql, Double) => "double precision",
+        (SpannerDialect::Postgresql, Boolean) => "boolean",
+        (SpannerDialect::Postgresql, Text) => "character varying",
+        (SpannerDialect::Postgresql, Json) => "jsonb",
     }
 }
 
 /// Render a [`SpannerType`] back to its DDL form, used when re-emitting a
 /// column to relax `NOT NULL`. `Other` (STRUCT/PROTO) cannot be re-emitted.
-fn spanner_type_ddl(ty: &SpannerType) -> Result<String, String> {
-    Ok(match ty {
-        SpannerType::Bool => "BOOL".into(),
-        SpannerType::Int64 => "INT64".into(),
-        SpannerType::Float32 => "FLOAT32".into(),
-        SpannerType::Float64 => "FLOAT64".into(),
-        SpannerType::Timestamp => "TIMESTAMP".into(),
-        SpannerType::Date => "DATE".into(),
-        SpannerType::String => "STRING(MAX)".into(),
-        SpannerType::Bytes => "BYTES(MAX)".into(),
-        SpannerType::Numeric => "NUMERIC".into(),
-        SpannerType::Json => "JSON".into(),
-        SpannerType::Array(inner) => format!("ARRAY<{}>", spanner_type_ddl(inner)?),
-        SpannerType::Other => {
-            return Err("cannot re-emit a STRUCT/PROTO column in DDL".into());
-        }
-    })
+fn spanner_type_ddl(d: SpannerDialect, ty: &SpannerType) -> Result<String, String> {
+    d.type_ddl(ty)
 }
 
 /// `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <c> <kw>` — idempotent addition.
 /// New columns are always nullable (Spanner requires a default for NOT NULL
 /// additions, and drift additions are nullable by construction).
-fn build_add_column_sql(table: &str, col: &str, t: faucet_core::SqlBaseType) -> String {
+fn build_add_column_sql(
+    d: SpannerDialect,
+    table: &str,
+    col: &str,
+    t: faucet_core::SqlBaseType,
+) -> String {
     format!(
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
-        quote_ident_spanner(table),
-        quote_ident_spanner(col),
-        spanner_keyword(t)
+        d.quote_ident(table),
+        d.quote_ident(col),
+        spanner_keyword(d, t)
     )
 }
 
 /// `ALTER TABLE <t> ALTER COLUMN <c> <TYPE>` — re-emitting the column at its
 /// current type *without* `NOT NULL` relaxes the null constraint (Spanner has
 /// no `DROP NOT NULL`). Idempotent.
-fn build_alter_column_sql(table: &str, col: &str, type_ddl: &str) -> String {
-    format!(
-        "ALTER TABLE {} ALTER COLUMN {} {}",
-        quote_ident_spanner(table),
-        quote_ident_spanner(col),
-        type_ddl
-    )
+fn build_alter_column_sql(d: SpannerDialect, table: &str, col: &str, type_ddl: &str) -> String {
+    d.relax_not_null_sql(table, col, type_ddl)
 }
 
 /// Commit-token watermark table name. Spanner (GoogleSQL) identifiers must
@@ -430,14 +411,60 @@ pub(crate) const SPANNER_COMMIT_TOKEN_TABLE: &str = "faucet_commit_token";
 
 /// DDL for the commit-token watermark table (exactly-once). `updated_at` is a
 /// commit-timestamp column so replays are debuggable without a clock source.
-fn commit_token_ddl() -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {t} ({s} STRING(MAX) NOT NULL, {k} STRING(MAX) NOT NULL, \
-         updated_at TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY ({s})",
-        t = quote_ident_spanner(SPANNER_COMMIT_TOKEN_TABLE),
-        s = quote_ident_spanner(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-        k = quote_ident_spanner(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-    )
+fn commit_token_ddl(d: SpannerDialect) -> String {
+    let t = d.quote_ident(SPANNER_COMMIT_TOKEN_TABLE);
+    let sc = d.quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL);
+    let k = d.quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL);
+    let text = d.text_ddl();
+    let updated = d.commit_timestamp_column("updated_at");
+    match d {
+        SpannerDialect::GoogleStandardSql => format!(
+            "CREATE TABLE IF NOT EXISTS {t} ({sc} {text} NOT NULL, {k} {text} NOT NULL, \
+             {updated}) PRIMARY KEY ({sc})"
+        ),
+        SpannerDialect::Postgresql => format!(
+            "CREATE TABLE IF NOT EXISTS {t} ({sc} {text} NOT NULL, {k} {text} NOT NULL, \
+             {updated}, PRIMARY KEY ({sc}))"
+        ),
+    }
+}
+
+/// `CREATE TABLE` for an auto-created target. Every column is text; the key
+/// columns are `NOT NULL` because Spanner rejects a null in a primary key.
+/// GoogleSQL puts `PRIMARY KEY` after the column list, PostgreSQL inside it.
+fn build_create_table_sql(
+    d: SpannerDialect,
+    table: &str,
+    columns: &[String],
+    key: &[String],
+) -> String {
+    let text = d.text_ddl();
+    let cols: Vec<String> = columns
+        .iter()
+        .map(|name| {
+            let null = if key.iter().any(|k| k == name) {
+                " NOT NULL"
+            } else {
+                ""
+            };
+            format!("{} {text}{null}", d.quote_ident(name))
+        })
+        .collect();
+    let pk: Vec<String> = key.iter().map(|k| d.quote_ident(k)).collect();
+    match d {
+        SpannerDialect::GoogleStandardSql => format!(
+            "CREATE TABLE IF NOT EXISTS {} ({}) PRIMARY KEY ({})",
+            d.quote_ident(table),
+            cols.join(", "),
+            pk.join(", ")
+        ),
+        SpannerDialect::Postgresql => format!(
+            "CREATE TABLE IF NOT EXISTS {} ({}, PRIMARY KEY ({}))",
+            d.quote_ident(table),
+            cols.join(", "),
+            pk.join(", ")
+        ),
+    }
 }
 
 /// Render cached metadata as the `infer_schema`-shaped object
@@ -487,6 +514,10 @@ pub struct SpannerSink {
 }
 
 impl SpannerSink {
+    fn dialect(&self) -> SpannerDialect {
+        self.config.connection.dialect
+    }
+
     /// Create a new Spanner sink. Validates the config and builds the client
     /// (session pool). Table metadata is read lazily on first write.
     pub async fn new(config: SpannerSinkConfig) -> Result<Self, FaucetError> {
@@ -511,13 +542,8 @@ impl SpannerSink {
                 .single()
                 .await
                 .map_err(|e| sink_err("metadata read", e))?;
-            let mut stmt = Statement::new(
-                "SELECT c.COLUMN_NAME AS name, c.SPANNER_TYPE AS spanner_type, \
-                 c.IS_NULLABLE AS is_nullable FROM INFORMATION_SCHEMA.COLUMNS c \
-                 WHERE c.TABLE_SCHEMA = '' AND c.TABLE_NAME = @table \
-                 ORDER BY c.ORDINAL_POSITION",
-            );
-            stmt.add_param("table", &self.config.table_name);
+            let mut stmt = Statement::new(self.dialect().table_columns_sql());
+            stmt.add_param(&self.dialect().table_param_name(), &self.config.table_name);
             let mut iter = tx
                 .query(stmt)
                 .await
@@ -536,7 +562,7 @@ impl SpannerSink {
                 let nullable = row
                     .column_by_name::<String>("is_nullable")
                     .map_err(|e| sink_err("metadata decode", e))?;
-                columns.push((name, parse_spanner_type(&ty), nullable == "YES"));
+                columns.push((name, self.dialect().parse_type(&ty), nullable == "YES"));
             }
         }
         if columns.is_empty() {
@@ -550,12 +576,8 @@ impl SpannerSink {
                 .single()
                 .await
                 .map_err(|e| sink_err("metadata read", e))?;
-            let mut stmt = Statement::new(
-                "SELECT ic.COLUMN_NAME AS name FROM INFORMATION_SCHEMA.INDEX_COLUMNS ic \
-                 WHERE ic.TABLE_SCHEMA = '' AND ic.TABLE_NAME = @table \
-                 AND ic.INDEX_NAME = 'PRIMARY_KEY' ORDER BY ic.ORDINAL_POSITION",
-            );
-            stmt.add_param("table", &self.config.table_name);
+            let mut stmt = Statement::new(self.dialect().primary_key_sql());
+            stmt.add_param(&self.dialect().table_param_name(), &self.config.table_name);
             let mut iter = tx
                 .query(stmt)
                 .await
@@ -692,26 +714,10 @@ impl SpannerSink {
                 )));
             }
         }
-        // Key columns must be NOT NULL — Spanner rejects a null in a primary
-        // key, so a nullable key column would fail every write.
-        let cols: Vec<String> = columns
-            .iter()
-            .map(|c| {
-                let null = if key.iter().any(|k| k == &c.name) {
-                    " NOT NULL"
-                } else {
-                    ""
-                };
-                format!("{} STRING(MAX){null}", quote_ident_spanner(&c.name))
-            })
-            .collect();
-        let pk: Vec<String> = key.iter().map(|k| quote_ident_spanner(k)).collect();
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({}) PRIMARY KEY ({})",
-            quote_ident_spanner(&self.config.table_name),
-            cols.join(", "),
-            pk.join(", ")
-        );
+        // Key columns are emitted `NOT NULL`: Spanner rejects a null in a
+        // primary key, so a nullable key column would fail every write.
+        let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let ddl = build_create_table_sql(self.dialect(), &self.config.table_name, &names, key);
         self.run_ddl(vec![ddl]).await
     }
     /// Run DDL statements through the admin API, bounded by
@@ -744,7 +750,9 @@ impl SpannerSink {
     /// Ensure the commit-token watermark table exists (once per sink).
     async fn ensure_token_table(&self) -> Result<(), FaucetError> {
         self.token_table_ready
-            .get_or_try_init(|| async { self.run_ddl(vec![commit_token_ddl()]).await })
+            .get_or_try_init(|| async {
+                self.run_ddl(vec![commit_token_ddl(self.dialect())]).await
+            })
             .await?;
         Ok(())
     }
@@ -791,8 +799,10 @@ impl SpannerSink {
                      completeness claim and `key` are in destination column terms"
                 ))
             })?;
-            let name = format!("scope_{idx}");
-            let expr = scope_cast_expr(&name, ty).map_err(|e| {
+            let d = self.dialect();
+            let written = format!("scope_{idx}");
+            let name = d.bind_name(&written, idx + 1);
+            let expr = scope_cast_expr(d, &written, idx + 1, ty).map_err(|e| {
                 FaucetError::Sink(format!("spanner cleanup: scope column `{col}`: {e}"))
             })?;
             let text = scope_param_text(value, ty).map_err(|e| {
@@ -801,7 +811,7 @@ impl SpannerSink {
             preds.push((col.clone(), expr));
             params.push((name, text));
         }
-        let sql = build_scope_select_sql(table, &meta.pk, &preds);
+        let sql = build_scope_select_sql(self.dialect(), table, &meta.pk, &preds);
 
         // Fingerprint what this run wrote, encoded through the destination
         // column types so it compares like-for-like with what Spanner returns.
@@ -995,7 +1005,7 @@ impl faucet_core::Sink for SpannerSink {
         for c in &evolution.additions {
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
-            statements.push(build_add_column_sql(table, &c.name, t));
+            statements.push(build_add_column_sql(self.dialect(), table, &c.name, t));
         }
 
         // Widenings: Spanner can only "widen" nullability. A widening whose
@@ -1023,10 +1033,10 @@ impl faucet_core::Sink for SpannerSink {
                     c.name
                 ))
             })?;
-            let ddl = spanner_type_ddl(ty).map_err(|e| {
+            let ddl = spanner_type_ddl(self.dialect(), ty).map_err(|e| {
                 FaucetError::Sink(format!("spanner widen column `{}`: {e}", c.name))
             })?;
-            statements.push(build_alter_column_sql(table, &c.name, &ddl));
+            statements.push(build_alter_column_sql(self.dialect(), table, &c.name, &ddl));
         }
         for col in &evolution.relax_nullability {
             let meta = meta
@@ -1037,9 +1047,9 @@ impl faucet_core::Sink for SpannerSink {
                     "spanner relax: column `{col}` not found in table `{table}`"
                 ))
             })?;
-            let ddl = spanner_type_ddl(ty)
+            let ddl = spanner_type_ddl(self.dialect(), ty)
                 .map_err(|e| FaucetError::Sink(format!("spanner relax column `{col}`: {e}")))?;
-            statements.push(build_alter_column_sql(table, col, &ddl));
+            statements.push(build_alter_column_sql(self.dialect(), table, col, &ddl));
         }
 
         if !statements.is_empty() {
@@ -1528,15 +1538,30 @@ mod tests {
     #[test]
     fn add_column_ddl() {
         assert_eq!(
-            build_add_column_sql("t", "email", faucet_core::SqlBaseType::Text),
+            build_add_column_sql(
+                SpannerDialect::GoogleStandardSql,
+                "t",
+                "email",
+                faucet_core::SqlBaseType::Text
+            ),
             "ALTER TABLE `t` ADD COLUMN IF NOT EXISTS `email` STRING(MAX)"
         );
         assert_eq!(
-            build_add_column_sql("t", "n", faucet_core::SqlBaseType::Integer),
+            build_add_column_sql(
+                SpannerDialect::GoogleStandardSql,
+                "t",
+                "n",
+                faucet_core::SqlBaseType::Integer
+            ),
             "ALTER TABLE `t` ADD COLUMN IF NOT EXISTS `n` INT64"
         );
         assert_eq!(
-            build_add_column_sql("t", "j", faucet_core::SqlBaseType::Json),
+            build_add_column_sql(
+                SpannerDialect::GoogleStandardSql,
+                "t",
+                "j",
+                faucet_core::SqlBaseType::Json
+            ),
             "ALTER TABLE `t` ADD COLUMN IF NOT EXISTS `j` JSON"
         );
     }
@@ -1544,25 +1569,40 @@ mod tests {
     #[test]
     fn alter_column_ddl_reemits_type_without_not_null() {
         assert_eq!(
-            build_alter_column_sql("t", "name", "STRING(MAX)"),
+            build_alter_column_sql(
+                SpannerDialect::GoogleStandardSql,
+                "t",
+                "name",
+                "STRING(MAX)"
+            ),
             "ALTER TABLE `t` ALTER COLUMN `name` STRING(MAX)"
         );
     }
 
     #[test]
     fn spanner_type_ddl_round_trips() {
-        assert_eq!(spanner_type_ddl(&SpannerType::Int64).unwrap(), "INT64");
         assert_eq!(
-            spanner_type_ddl(&SpannerType::Array(Box::new(SpannerType::Float64))).unwrap(),
+            spanner_type_ddl(SpannerDialect::GoogleStandardSql, &SpannerType::Int64).unwrap(),
+            "INT64"
+        );
+        assert_eq!(
+            spanner_type_ddl(
+                SpannerDialect::GoogleStandardSql,
+                &SpannerType::Array(Box::new(SpannerType::Float64))
+            )
+            .unwrap(),
             "ARRAY<FLOAT64>"
         );
-        assert_eq!(spanner_type_ddl(&SpannerType::Bytes).unwrap(), "BYTES(MAX)");
-        assert!(spanner_type_ddl(&SpannerType::Other).is_err());
+        assert_eq!(
+            spanner_type_ddl(SpannerDialect::GoogleStandardSql, &SpannerType::Bytes).unwrap(),
+            "BYTES(MAX)"
+        );
+        assert!(spanner_type_ddl(SpannerDialect::GoogleStandardSql, &SpannerType::Other).is_err());
     }
 
     #[test]
     fn commit_token_ddl_shape() {
-        let ddl = commit_token_ddl();
+        let ddl = commit_token_ddl(SpannerDialect::GoogleStandardSql);
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS `faucet_commit_token`"));
         assert!(ddl.contains("`scope` STRING(MAX) NOT NULL"));
         assert!(ddl.contains("`token` STRING(MAX) NOT NULL"));
@@ -1640,7 +1680,7 @@ mod tests {
 
     #[test]
     fn scope_cast_expr_per_column_type() {
-        let e = |ty| scope_cast_expr("scope_0", &ty).unwrap();
+        let e = |ty| scope_cast_expr(SpannerDialect::GoogleStandardSql, "scope_0", 1, &ty).unwrap();
         // STRING is already the bound parameter's type — no cast.
         assert_eq!(e(SpannerType::String), "@scope_0");
         assert_eq!(e(SpannerType::Int64), "CAST(@scope_0 AS INT64)");
@@ -1661,7 +1701,7 @@ mod tests {
             SpannerType::Array(Box::new(SpannerType::Int64)),
             SpannerType::Other,
         ] {
-            let err = scope_cast_expr("p", &ty).unwrap_err();
+            let err = scope_cast_expr(SpannerDialect::GoogleStandardSql, "p", 1, &ty).unwrap_err();
             assert!(err.contains("does not support equality"), "{err}");
         }
     }
@@ -1695,6 +1735,7 @@ mod tests {
     #[test]
     fn scope_select_sql_quotes_and_ands() {
         let sql = build_scope_select_sql(
+            SpannerDialect::GoogleStandardSql,
             "orders",
             &["id".into()],
             &[("contact_id".into(), "CAST(@scope_0 AS INT64)".into())],
@@ -1705,6 +1746,7 @@ mod tests {
         );
 
         let sql = build_scope_select_sql(
+            SpannerDialect::GoogleStandardSql,
             "orders",
             &["tenant".into(), "id".into()],
             &[
@@ -1863,5 +1905,66 @@ mod tests {
         for d in &plan.deletes {
             build_delete_mutation("t", d, &meta()).unwrap();
         }
+    }
+
+    const PG: SpannerDialect = SpannerDialect::Postgresql;
+
+    #[test]
+    fn postgresql_commit_token_ddl_puts_primary_key_inside_the_column_list() {
+        assert_eq!(
+            commit_token_ddl(PG),
+            "CREATE TABLE IF NOT EXISTS \"faucet_commit_token\" (\"scope\" character varying \
+             NOT NULL, \"token\" character varying NOT NULL, updated_at \
+             spanner.commit_timestamp, PRIMARY KEY (\"scope\"))"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_per_dialect() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let key = vec!["id".to_string()];
+        assert_eq!(
+            build_create_table_sql(SpannerDialect::GoogleStandardSql, "t", &cols, &key),
+            "CREATE TABLE IF NOT EXISTS `t` (`id` STRING(MAX) NOT NULL, `name` STRING(MAX)) \
+             PRIMARY KEY (`id`)"
+        );
+        assert_eq!(
+            build_create_table_sql(PG, "t", &cols, &key),
+            "CREATE TABLE IF NOT EXISTS \"t\" (\"id\" character varying NOT NULL, \"name\" \
+             character varying, PRIMARY KEY (\"id\"))"
+        );
+    }
+
+    #[test]
+    fn postgresql_add_and_relax_column_ddl() {
+        assert_eq!(
+            build_add_column_sql(PG, "t", "n", faucet_core::SqlBaseType::Integer),
+            "ALTER TABLE \"t\" ADD COLUMN IF NOT EXISTS \"n\" bigint"
+        );
+        assert_eq!(
+            build_add_column_sql(PG, "t", "j", faucet_core::SqlBaseType::Json),
+            "ALTER TABLE \"t\" ADD COLUMN IF NOT EXISTS \"j\" jsonb"
+        );
+        assert_eq!(
+            build_alter_column_sql(PG, "t", "name", "character varying"),
+            "ALTER TABLE \"t\" ALTER COLUMN \"name\" DROP NOT NULL"
+        );
+    }
+
+    #[test]
+    fn postgresql_scope_select_uses_positional_params() {
+        let expr = scope_cast_expr(PG, "scope_0", 1, &SpannerType::Int64).unwrap();
+        assert_eq!(expr, "CAST($1 AS bigint)");
+        let sql = build_scope_select_sql(
+            PG,
+            "orders",
+            &["id".to_string()],
+            &[("contact_id".to_string(), expr)],
+        );
+        assert_eq!(
+            sql,
+            "SELECT \"id\" FROM \"orders\" WHERE \"contact_id\" = CAST($1 AS bigint)"
+        );
+        assert_eq!(PG.bind_name("scope_0", 1), "p1");
     }
 }

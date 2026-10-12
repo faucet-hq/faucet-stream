@@ -6,8 +6,12 @@
 //! (the emulator endpoint rides the connector's `emulator_host` config field,
 //! so parallel tests never race on process-global state).
 
+#![allow(dead_code)] // each test binary uses a different subset of the helpers
+
 use faucet_source_spanner::{SpannerConnection, SpannerCredentials};
-use gcloud_googleapis::spanner::admin::database::v1::CreateDatabaseRequest;
+use gcloud_googleapis::spanner::admin::database::v1::{
+    CreateDatabaseRequest, UpdateDatabaseDdlRequest,
+};
 use gcloud_googleapis::spanner::admin::instance::v1::{CreateInstanceRequest, Instance};
 use gcloud_spanner::client::Client;
 use gcloud_spanner::statement::Statement;
@@ -52,13 +56,14 @@ pub fn connection(host: &str, database: &str) -> SpannerConnection {
         auth: SpannerCredentials::ApplicationDefault,
         max_sessions: 20,
         emulator_host: Some(host.to_string()),
+        dialect: Default::default(),
     }
 }
 
 /// Create the shared test instance (idempotent: AlreadyExists is fine) and a
 /// database with the given DDL. The port maps before the emulator's gRPC
 /// server accepts calls, so instance creation doubles as the readiness poll.
-pub async fn create_database(host: &str, database: &str, ddl: &[&str]) {
+pub async fn ensure_instance(host: &str, database: &str) -> gcloud_spanner::admin::client::Client {
     let conn = connection(host, database);
     // The mapped port exists before the emulator's gRPC server listens, so
     // even building the admin channel can hit ConnectionRefused — retry it.
@@ -101,7 +106,12 @@ pub async fn create_database(host: &str, database: &str, ddl: &[&str]) {
         }
     }
     assert!(created, "spanner emulator never became ready");
+    admin
+}
 
+/// Create the shared instance (if needed) and a GoogleSQL database with `ddl`.
+pub async fn create_database(host: &str, database: &str, ddl: &[&str]) {
+    let admin = ensure_instance(host, database).await;
     let req = CreateDatabaseRequest {
         parent: format!("projects/{PROJECT}/instances/{INSTANCE}"),
         create_statement: format!("CREATE DATABASE `{database}`"),
@@ -116,6 +126,56 @@ pub async fn create_database(host: &str, database: &str, ddl: &[&str]) {
         .wait(None)
         .await
         .expect("database LRO");
+}
+
+/// `DatabaseDialect::POSTGRESQL` on the wire.
+const DIALECT_POSTGRESQL: i32 = 2;
+
+/// A [`SpannerConnection`] for a PostgreSQL-dialect database.
+pub fn pg_connection(host: &str, database: &str) -> SpannerConnection {
+    let mut conn = connection(host, database);
+    conn.dialect = faucet_source_spanner::SpannerDialect::Postgresql;
+    conn
+}
+
+/// Create a PostgreSQL-dialect database and apply `ddl` (PG databases cannot
+/// take DDL in the create request).
+pub async fn create_pg_database(host: &str, database: &str, ddl: &[&str]) {
+    let admin = ensure_instance(host, database).await;
+    admin
+        .database()
+        .create_database(
+            CreateDatabaseRequest {
+                parent: format!("projects/{PROJECT}/instances/{INSTANCE}"),
+                create_statement: format!("CREATE DATABASE \"{database}\""),
+                database_dialect: DIALECT_POSTGRESQL,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create pg database")
+        .wait(None)
+        .await
+        .expect("pg database LRO");
+    if ddl.is_empty() {
+        return;
+    }
+    admin
+        .database()
+        .update_database_ddl(
+            UpdateDatabaseDdlRequest {
+                database: format!("projects/{PROJECT}/instances/{INSTANCE}/databases/{database}"),
+                statements: ddl.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("pg ddl")
+        .wait(None)
+        .await
+        .expect("pg ddl LRO");
 }
 
 /// Raw data-plane client for seeding/inspecting test data.

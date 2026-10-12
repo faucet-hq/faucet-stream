@@ -147,6 +147,7 @@ impl SpannerSourceConfig {
                 auth: Default::default(),
                 max_sessions: 100,
                 emulator_host: None,
+                dialect: Default::default(),
             },
             query: query.into(),
             params: HashMap::new(),

@@ -39,6 +39,7 @@
 //! | `source-kafka` | Apache Kafka consumer source |
 //! | `source-kinesis` | AWS Kinesis Data Streams source |
 //! | `source-spanner` | Google Cloud Spanner query source |
+//! | `source-spanner-cdc` | Google Cloud Spanner change streams (CDC) source |
 //! | `source-parquet` | Deprecated Parquet file source (use `source-file`) |
 //! | `source-delta` | Apache Delta Lake source (local FS or S3/Azure/GCS, time travel) |
 //! | `source-databricks` | Databricks SQL query source (Statement Execution API) |
@@ -245,6 +246,11 @@ pub mod source {
     #[cfg(feature = "source-spanner")]
     pub mod spanner {
         pub use faucet_source_spanner::*;
+    }
+
+    #[cfg(feature = "source-spanner-cdc")]
+    pub mod spanner_cdc {
+        pub use faucet_source_spanner_cdc::*;
     }
 
     #[cfg(feature = "source-parquet")]
@@ -459,6 +465,11 @@ pub mod source {
     #[cfg(feature = "source-spanner")]
     pub mod spanner {
         pub use faucet_source_spanner::*;
+    }
+
+    #[cfg(feature = "source-spanner-cdc")]
+    pub mod spanner_cdc {
+        pub use faucet_source_spanner_cdc::*;
     }
 
     #[cfg(feature = "source-parquet")]
@@ -741,9 +752,13 @@ pub mod common_kinesis {
 }
 
 /// Shared Cloud Spanner types (credentials enum, connection block, value
-/// conversion), re-exported for library callers when either Spanner
+/// conversion), re-exported for library callers when any Spanner
 /// connector is enabled.
-#[cfg(any(feature = "source-spanner", feature = "sink-spanner"))]
+#[cfg(any(
+    feature = "source-spanner",
+    feature = "source-spanner-cdc",
+    feature = "sink-spanner"
+))]
 pub mod common_spanner {
     pub use faucet_common_spanner::*;
 }

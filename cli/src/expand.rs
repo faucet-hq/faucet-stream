@@ -1846,8 +1846,8 @@ fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
 fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
     let mode = || cfg.get("mode").and_then(Value::as_str);
     match kind {
-        "postgres-cdc" | "mysql-cdc" | "mongodb-cdc" | "mssql-cdc" | "oracle-cdc" | "kafka"
-        | "kinesis" | "rabbitmq" | "nats" | "pubsub" | "sqs" => true,
+        "postgres-cdc" | "mysql-cdc" | "mongodb-cdc" | "mssql-cdc" | "oracle-cdc"
+        | "spanner-cdc" | "kafka" | "kinesis" | "rabbitmq" | "nats" | "pubsub" | "sqs" => true,
         "dynamodb" => mode() == Some("streams"),
         "iceberg" => mode() == Some("incremental"),
         "postgres" | "mysql" => crate::registry::sql_incremental(cfg),
