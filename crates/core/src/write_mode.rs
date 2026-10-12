@@ -260,14 +260,39 @@ pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
     plan_writes_by(page, spec, canonical)
 }
 
-/// [`plan_writes`] deduplicating only keys with equal JSON values, so `7` and
-/// `"7"` stay two rows — for a sink whose destination keeps them apart, such
-/// as a document store's `_id` (#862 M-018).
+/// [`plan_writes`] deduplicating only keys a document store treats as equal:
+/// `7` and `"7"` stay two rows, while numbers compare by value, so `7` and
+/// `7.0` are one — as a document store's `_id` match does (#862 M-018).
 pub fn plan_writes_exact(page: &[Value], spec: &WriteSpec) -> WritePlan {
     plan_writes_by(page, spec, |k| {
-        let values: Vec<Value> = k.0.iter().map(|(_, v)| v.clone()).collect();
+        let values: Vec<Value> = k.0.iter().map(|(_, v)| numeric_value(v)).collect();
         crate::util::canonical_json(&Value::Array(values))
     })
+}
+
+/// `v` with every whole float written as the integer it equals, so numbers
+/// compare by value; other values are unchanged.
+fn numeric_value(v: &Value) -> Value {
+    match v {
+        Value::Number(n) if n.is_f64() => {
+            let f = n.as_f64().unwrap_or(f64::NAN);
+            let whole = f.is_finite() && f.fract() == 0.0;
+            if whole && f >= i64::MIN as f64 && f < i64::MAX as f64 {
+                Value::from(f as i64)
+            } else if whole && f >= 0.0 && f < u64::MAX as f64 {
+                Value::from(f as u64)
+            } else {
+                v.clone()
+            }
+        }
+        Value::Array(items) => Value::Array(items.iter().map(numeric_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), numeric_value(v)))
+                .collect(),
+        ),
+        _ => v.clone(),
+    }
 }
 
 fn plan_writes_by(
@@ -474,6 +499,32 @@ mod tests {
             plan_writes(&page, &spec).upserts,
             vec![json!({"id": 7, "v": "c"})]
         );
+    }
+
+    #[test]
+    fn exact_planning_compares_numbers_by_value() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            ..Default::default()
+        };
+        let page = vec![
+            json!({"id": 7, "v": 1}),
+            json!({"id": 7.0, "v": 2}),
+            json!({"id": 7.5, "v": 3}),
+            json!({"id": {"a": [1.0]}, "v": 4}),
+            json!({"id": {"a": [1]}, "v": 5}),
+            json!({"id": 9_007_199_254_740_993_u64, "v": 6}),
+            json!({"id": 9_007_199_254_740_992.0, "v": 7}),
+            json!({"id": 1.8e19, "v": 8}),
+            json!({"id": 1e300, "v": 9}),
+        ];
+        let v: Vec<Value> = plan_writes_exact(&page, &spec)
+            .upserts
+            .iter()
+            .map(|r| r["v"].clone())
+            .collect();
+        assert_eq!(v, vec![json!(2), json!(3), json!(5), json!(6), json!(7), json!(8), json!(9)]);
     }
 
     /// An object inserted in reverse-sorted key order (#817).
