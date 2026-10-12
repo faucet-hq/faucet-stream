@@ -1129,11 +1129,18 @@ impl faucet_core::Source for GcsSource {
             .await
             .map_err(|e| FaucetError::Source(format!("gcs: catalog discovery failed: {e}")))?;
 
+        let prefix = self.config.prefix.as_deref().unwrap_or("");
         let objects: Vec<String> = response
             .objects
             .into_iter()
+            .filter(|o| {
+                !o.name.is_empty()
+                    && !faucet_common_file::write::is_unfinished_output_key(&o.name)
+                    && self
+                        .filter
+                        .keep(&o.name, u64::try_from(o.size).ok(), prefix)
+            })
             .map(|o| o.name)
-            .filter(|n| !n.is_empty() && !faucet_common_file::write::is_unfinished_output_key(n))
             .collect();
         let prefixes = response
             .prefixes
