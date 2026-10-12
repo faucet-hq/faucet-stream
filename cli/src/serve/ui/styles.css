@@ -1397,6 +1397,10 @@ select {
 .tpl-tests-why code { font-family: var(--font-mono); font-size: 0.78rem; }
 .tpl-tests-cases { white-space: nowrap; }
 .tpl-tests-warn code { font-family: var(--font-mono); font-size: 0.78rem; }
+.tpl-untested { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 8px 10px; border-left: 3px solid var(--cancelled); border-radius: var(--r); background: color-mix(in srgb, var(--cancelled) 7%, var(--surface)); color: var(--ink); font-size: 0.85rem; }
+.tpl-untested[hidden] { display: none; }
+.tpl-untested-opt { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+.tpl-untested-opt code { font-family: var(--font-mono); font-size: 0.78rem; }
 .tpl-tests-tbl { font-size: 0.78rem; table-layout: auto; min-width: 560px; }
 .tpl-tests-tbl td, .tpl-tests-tbl th { white-space: nowrap; }
 .tpl-tests-tbl td, .tpl-tests-tbl th { padding: 4px 8px; }

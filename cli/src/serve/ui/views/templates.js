@@ -1111,6 +1111,10 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       <section class="tpl-seg">
         <header class="tpl-seg-head"><h3>Run</h3></header>
         <div class="tpl-seg-fields"><label class="tpl-field-wide">run name <input id="tg-name" placeholder="optional" /></label></div>
+        <div class="tpl-untested" id="tg-untested" hidden>
+          <span id="tg-untested-why"></span>
+          <label class="tpl-untested-opt"><input type="checkbox" id="tg-allow-untested" /> run anyway — the run is labelled <code>allow_untested</code> and audited</label>
+        </div>
       </section>
       <div class="submit-actions"><button id="tg-go" class="btn-primary">Run</button></div>
       <pre id="tg-out" class="submit-out" hidden></pre>
@@ -1208,6 +1212,17 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       .join("");
     host.querySelector("#tg-version-show").innerHTML = `<b class="mono">v${picked}</b>${pills}`;
     for (const r of rows) r.classList.toggle("tpl-version-picked", Number(r.dataset.version) === picked);
+    // After a launch, an unlabelled version whose tests do not pass runs only
+    // with allow_untested (the server refuses it otherwise).
+    const t = testsFor(d, picked);
+    const labelled = st.stable === picked || st.newest === picked || Object.values(st.tags || {}).includes(picked);
+    const gated = st.stable != null && !labelled && !!t && t.status !== "passing";
+    const untested = host.querySelector("#tg-untested");
+    untested.hidden = !gated;
+    if (!gated) host.querySelector("#tg-allow-untested").checked = false;
+    host.querySelector("#tg-untested-why").innerHTML = gated
+      ? `v${picked} holds no label and its tests are ${testPill(t.status)}.`
+      : "";
   };
   for (const r of rows) {
     r.title = `run v${r.dataset.version}`;
@@ -1386,6 +1401,13 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     }
     const name = host.querySelector("#tg-name").value.trim();
     if (name) body.name = name;
+    if (!host.querySelector("#tg-untested").hidden) {
+      if (!host.querySelector("#tg-allow-untested").checked) {
+        toast("this version's tests do not pass — tick \"run anyway\" to run it", "error");
+        return;
+      }
+      body.allow_untested = true;
+    }
     try {
       // The submit response is flattened into the trigger response, so `run_id`
       // and `status` sit at the top level alongside `template_version`.
