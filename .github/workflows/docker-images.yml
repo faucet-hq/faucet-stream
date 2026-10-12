@@ -6,7 +6,7 @@ name: Docker images
 # profile your deployment needs.
 #
 # Triggers:
-#   - manual (workflow_dispatch), optional push
+#   - manual (workflow_dispatch), optional push: `:<profile>-<sha>` only
 #   - on a published `faucet-cli-v*` GitHub release (pushes :<profile> and
 #     :<version>-<profile>). release-plz publishes a GitHub release per crate
 #     tag, so both jobs gate on the faucet-cli tag to build ONCE per app
@@ -120,18 +120,32 @@ jobs:
         id: tags
         run: |
           base="${{ steps.img.outputs.name }}"
-          tags="${base}:${{ matrix.profile }}"
+          profile="${{ matrix.profile }}"
           v=""
           if [ "${{ github.event_name }}" = "release" ]; then
             v="${GITHUB_REF_NAME#faucet-cli-v}"; v="${v#v}"
           elif [ -n "$RELEASE" ]; then
             v="$RELEASE"
           fi
+          # Floating tags (:<profile>, :latest) only ever move to the newest
+          # faucet-cli release; anything else gets an immutable tag.
+          newest="$(git tag --list 'faucet-cli-v[0-9]*' | sed 's/^faucet-cli-v//' | sort -V | tail -1)"
+          tags=""
           if [ -n "$v" ]; then
-            tags="${tags},${base}:${v}-${{ matrix.profile }}"
-            if [ "${{ matrix.profile }}" = "full" ]; then
-              tags="${tags},${base}:latest,${base}:${v}"
+            tags="${base}:${v}-${profile}"
+            if [ "$profile" = "full" ]; then
+              tags="${tags},${base}:${v}"
             fi
+            if [ "$v" = "$newest" ]; then
+              tags="${tags},${base}:${profile}"
+              if [ "$profile" = "full" ]; then
+                tags="${tags},${base}:latest"
+              fi
+            else
+              echo "::notice::$v is not the newest faucet-cli release ($newest); floating tags stay put"
+            fi
+          else
+            tags="${base}:${profile}-${GITHUB_SHA::12}"
           fi
           echo "tags=${tags}" >>"$GITHUB_OUTPUT"
 
