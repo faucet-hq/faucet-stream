@@ -630,7 +630,9 @@ pub struct StateStoreSpec {
 pub struct MatrixRow {
     /// Row identifier. Required for parent/child references and runtime
     /// `${id.path}` interpolation. Anonymous rows get a synthetic `row-N` id.
+    /// Letters, digits, `_` and `-` only.
     #[serde(default)]
+    #[schemars(pattern(r"^[A-Za-z0-9_-]+$"))]
     pub id: Option<String>,
 
     /// If set, this row runs once per record produced by the named parent row.
