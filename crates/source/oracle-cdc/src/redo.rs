@@ -544,7 +544,9 @@ pub fn parse_lob_change(sql: &str) -> Result<LobChange, String> {
 }
 
 /// Whether `change` rewrites the whole value: contiguous writes from offset 1
-/// and no trim, so the result does not depend on the value it replaced.
+/// and no trim, so the result does not depend on the value it replaced. An
+/// in-place overwrite of a longer value's prefix logs the same pieces and is
+/// indistinguishable here (documented in the README).
 pub fn is_full_rewrite(change: &LobChange) -> bool {
     if change.trim.is_some() || change.writes.is_empty() {
         return false;
