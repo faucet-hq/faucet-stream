@@ -1942,7 +1942,7 @@ async fn overwrite_target_probe_non_404_errors() {
             "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
         )))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-            "error": {"code": 500, "message": "backend error"}
+            "error": {"code": 500, "errors": [], "message": "backend error", "status": "INTERNAL"}
         })))
         .mount(&server)
         .await;
