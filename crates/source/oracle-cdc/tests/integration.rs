@@ -374,10 +374,13 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
     common::exec(
         &conn,
         &[
-            "CREATE TABLE CDC_L (ID NUMBER PRIMARY KEY, NOTE CLOB, X XMLTYPE) \
-             XMLTYPE COLUMN X STORE AS BINARY XML",
+            "CREATE TABLE CDC_L (ID NUMBER PRIMARY KEY, NOTE CLOB)",
             "ALTER TABLE CDC_L ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
-            "INSERT INTO CDC_L (ID, NOTE, X) VALUES (2, 'base', XMLTYPE('<a>1</a>'))",
+            "INSERT INTO CDC_L (ID, NOTE) VALUES (2, 'base')",
+            "CREATE TABLE CDC_X (ID NUMBER PRIMARY KEY, X XMLTYPE) \
+             XMLTYPE COLUMN X STORE AS BINARY XML",
+            "ALTER TABLE CDC_X ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
+            "INSERT INTO CDC_X (ID, X) VALUES (2, XMLTYPE('<a>1</a>'))",
         ],
     )
     .await;
@@ -431,7 +434,7 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
     assert!(err.contains("partial LOB write"), "{err}");
     let mut skip_cfg = lob_cfg.clone();
     skip_cfg.on_unsupported = faucet_source_oracle_cdc::OnUnsupported::Skip;
-    let skipping = OracleCdcSource::new(skip_cfg.clone()).await.unwrap();
+    let skipping = OracleCdcSource::new(skip_cfg).await.unwrap();
     skipping.apply_start_bookmark(anchor).await.unwrap();
     let (records, _, _) = drain(&skipping).await;
     assert!(
@@ -441,21 +444,27 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
 
     // A binary XMLType update is logged as XML document pieces LogMiner
     // cannot render as SQL.
-    let anchor = lob_src.capture_resume_position().await.unwrap().unwrap();
+    let mut xml_cfg = cfg(&conn);
+    xml_cfg.tables = vec!["FAUCET.CDC_X".into()];
+    let xml_src = OracleCdcSource::new(xml_cfg.clone())
+        .await
+        .expect("xml source");
+    let anchor = xml_src.capture_resume_position().await.unwrap().unwrap();
     common::exec(
         &conn,
-        &["UPDATE CDC_L SET X = XMLTYPE('<a>2</a>') WHERE ID = 2"],
+        &["UPDATE CDC_X SET X = XMLTYPE('<a>2</a>') WHERE ID = 2"],
     )
     .await;
-    lob_src.apply_start_bookmark(anchor.clone()).await.unwrap();
-    let err = drain_err(&lob_src)
+    xml_src.apply_start_bookmark(anchor.clone()).await.unwrap();
+    let err = drain_err(&xml_src)
         .await
         .expect("a binary XMLType change fails by default");
     assert!(
         err.contains("binary XMLType") || err.contains("cannot decode"),
         "{err}"
     );
-    let skipping = OracleCdcSource::new(skip_cfg).await.unwrap();
+    xml_cfg.on_unsupported = faucet_source_oracle_cdc::OnUnsupported::Skip;
+    let skipping = OracleCdcSource::new(xml_cfg).await.unwrap();
     skipping.apply_start_bookmark(anchor).await.unwrap();
     assert!(drain_err(&skipping).await.is_none(), "skip drops it");
 
