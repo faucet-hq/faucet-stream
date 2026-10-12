@@ -338,6 +338,14 @@ position already covers (by the record's `topic` / `partition` / `offset`). Two
 bookmarks over different partition sets cannot be ordered, and such a resume
 fails rather than guess.
 
+The drop happens at each sink node, after every transform node, so the records
+must still carry `topic`, `partition` and `offset` when they reach the sink.
+`faucet validate` refuses an exactly-once graph whose transform nodes can remove
+or change those fields (a `select` that omits them, a `drop`, `cdc_unwrap`,
+`sql`, …) unless every sink writes with `write_mode: upsert` + `key`; a replayed
+record that reaches an append sink without them fails the run rather than being
+written twice.
+
 Pair with any idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`,
 `bigquery`, `iceberg`, `kafka`, `snowflake`, `redis`, `mongodb`) and a durable
 state store:

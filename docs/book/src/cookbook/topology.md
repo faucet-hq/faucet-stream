@@ -205,8 +205,13 @@ already committed, by **position**: the replay does not need to repeat the
 original page boundaries. A replayed page that straddles a sink's committed
 position keeps only the records past it, judged per record by the source (a
 record must still carry the source's position fields — `lsn` for postgres-cdc,
-`topic`/`partition`/`offset` for kafka — when it reaches the sink, or it is
-written again).
+mysql-cdc and mssql-cdc, `resume_token` for mongodb-cdc, `commit_scn`/`xid` for
+oracle-cdc, `topic`/`partition`/`offset` for kafka — when it reaches the sink).
+A transform node that can remove or change those fields (a `select` that omits
+them, a `drop`, `cdc_unwrap`, `sql`, `wasm`, a key rename) is refused at config
+load unless every sink writes with `write_mode: upsert` + `key`, whose replays
+overwrite the same rows; a replayed record that still arrives without them at
+an append sink fails the run rather than being written twice.
 
 Every built-in exactly-once source orders its positions (the CDC sources, and
 `kafka` per partition). For a source that cannot, sinks that committed different

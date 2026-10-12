@@ -2300,6 +2300,38 @@ fn covered_page(src: &dyn Source, page: &StreamPage, through: &Value) -> PageCov
     }
 }
 
+/// Drop the records of a replayed page that `src` reports as already
+/// delivered at `through`. A record it cannot classify — a transform removed
+/// the source's position fields — is kept for a sink that deduplicates by key,
+/// and refused otherwise: writing it could duplicate a committed record.
+fn trim_covered(
+    records: &mut Vec<Value>,
+    src: &dyn Source,
+    through: &Value,
+    keyed: bool,
+    sink_id: &str,
+) -> Result<(), FaucetError> {
+    let mut unknown = false;
+    records.retain(|r| match src.record_covered(r, through) {
+        Some(covered) => !covered,
+        None => {
+            unknown = true;
+            true
+        }
+    });
+    if unknown && !keyed {
+        return Err(FaucetError::State(format!(
+            "topology exactly-once: a replayed page straddles the position sink '{sink_id}' \
+             already committed, and source '{}' cannot tell from a record reaching it whether \
+             it was delivered — a transform removed the source's position fields (`topic` / \
+             `partition` / `offset` for kafka, `lsn` for postgres-cdc / mysql-cdc / mssql-cdc). \
+             Keep those fields until the sink, or write with `write_mode: upsert` + `key`",
+            src.connector_name()
+        )));
+    }
+    Ok(())
+}
+
 async fn run_sink_node(
     node_id: String,
     sink: Box<dyn Sink>,
@@ -2310,6 +2342,7 @@ async fn run_sink_node(
     let upstream = opts.upstream.clone();
     let position_source = opts.position_source.clone();
     let mut skip_through = opts.resume.as_ref().and_then(|r| r.skip_through.clone());
+    let keyed = sink.dedups_by_key();
     let sink_id = node_id.clone();
     let pages = Box::pin(async_stream::stream! {
         loop {
@@ -2322,15 +2355,16 @@ async fn run_sink_node(
                     // that straddles the position keeps only the records the
                     // source says were not yet delivered there (#862 M-027).
                     if let (Some(through), Some(src)) = (skip_through.as_ref(), position_source.as_ref()) {
-                        match covered_page(src.as_ref(), &page, through) {
-                            PageCoverage::Committed => continue,
-                            PageCoverage::Straddles => {
-                                page.records.retain(|r| src.record_covered(r, through) != Some(true));
-                            }
-                            PageCoverage::Past => {
-                                page.records.retain(|r| src.record_covered(r, through) != Some(true));
-                                skip_through = None;
-                            }
+                        let coverage = covered_page(src.as_ref(), &page, through);
+                        if coverage == PageCoverage::Committed {
+                            continue;
+                        }
+                        if let Err(e) = trim_covered(&mut page.records, src.as_ref(), through, keyed, &sink_id) {
+                            yield Err(e);
+                            break;
+                        }
+                        if coverage == PageCoverage::Past {
+                            skip_through = None;
                         }
                     }
                     yield Ok::<StreamPage, FaucetError>(page);
@@ -4118,6 +4152,54 @@ mod graph_safety_tests {
 
         assert_eq!(ahead.ns(), vec![7, 8, 9, 10], "record 6 was committed");
         assert_eq!(behind.ns(), vec![6, 7, 8, 9, 10]);
+    }
+
+    /// review 868 other 1: a straddling page whose records lost the source's
+    /// position fields to a transform fails rather than writing duplicates.
+    #[tokio::test]
+    async fn eo_a_straddling_page_without_position_fields_is_refused() {
+        let store = Arc::new(MemoryStateStore::new());
+        seed(&store, "p::ahead", 6, 6).await;
+        seed(&store, "p::behind", 5, 5).await;
+        let ahead = TokenSink::new().committed("p::ahead", 6, 6);
+        let behind = TokenSink::new().committed("p::behind", 5, 5);
+        let (source, _) = LogSource::new(10, 2, true);
+        let strip: crate::stage::PageFnBox = Arc::new(|records: Vec<Value>| {
+            Ok(records
+                .into_iter()
+                .map(|r| json!({ "m": r["n"].clone() }))
+                .collect())
+        });
+        let topo = Topology::builder()
+            .source("s", Box::new(source))
+            .transform("x", vec![CompiledStage::PageFn(strip)])
+            .tee("t", 4, Some(2))
+            .sink("ahead", Box::new(ahead.clone()))
+            .sink("behind", Box::new(behind))
+            .edge("s", "x")
+            .edge("x", "t")
+            .edge("t", "ahead")
+            .edge("t", "behind")
+            .build()
+            .unwrap();
+        let err = topo
+            .run_with(
+                TopologyOptions::new("p").with_state_store(store.clone()),
+                eo(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("position fields") && err.contains("'ahead'"), "{err}");
+        assert!(ahead.rows.lock().unwrap().is_empty(), "nothing was written twice");
+    }
+
+    #[test]
+    fn trim_covered_keeps_unclassified_records_for_a_keyed_sink() {
+        let (src, _) = LogSource::new(1, 1, true);
+        let mut records = vec![json!({ "n": 1 }), json!({ "n": 3 }), json!({ "m": 2 })];
+        trim_covered(&mut records, &src, &json!({ "pos": 2 }), true, "k").unwrap();
+        assert_eq!(records, vec![json!({ "n": 3 }), json!({ "m": 2 })]);
     }
 
     /// #862 M-010: a page-level stage in a transform node runs off the worker,
