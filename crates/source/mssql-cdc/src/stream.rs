@@ -62,6 +62,9 @@ impl MssqlCdcSource {
     /// instance exists).
     pub async fn new(config: MssqlCdcSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        if let Some(warning) = config.pool_size_warning() {
+            tracing::warn!(connector = "mssql-cdc", "{warning}");
+        }
         let pool = build_pool(&config.connection, config.pool_size()).await?;
         let state_key_value = config.resolved_state_key();
 
