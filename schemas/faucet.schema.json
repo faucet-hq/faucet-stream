@@ -6828,16 +6828,6 @@
           }
         },
         {
-          "description": "TLS when the server offers it, else plaintext, without verifying the\ncertificate (libpq's `prefer`; open to downgrade).",
-          "type": "object",
-          "properties": {
-            "mode": {
-              "type": "string",
-              "const": "prefer"
-            }
-          }
-        },
-        {
           "description": "Require TLS but do not verify the server certificate.",
           "type": "object",
           "properties": {
@@ -6886,6 +6876,16 @@
             "mode": {
               "type": "string",
               "const": "from_url"
+            }
+          }
+        },
+        {
+          "description": "TLS when the server offers it, else plaintext, without verifying the\ncertificate (libpq's `prefer`; open to downgrade).",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "prefer"
             }
           }
         }

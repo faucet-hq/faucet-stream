@@ -356,9 +356,7 @@ impl S3SinkConfig {
     /// The per-object record cap the sink writes with: `max_records_per_file`,
     /// and without `path` also `batch_size`, whichever is smaller. `None`
     /// means "no record cap" (also when the config is invalid).
-    #[deprecated(
-        note = "the sink sizes objects from `write_config().settings()`; read `max_records_per_file` there"
-    )]
+    /// The sink sizes objects from `write_config().settings()`; prefer reading it there.
     pub fn effective_chunk_cap(&self) -> Option<usize> {
         self.write_config()
             .settings()
@@ -705,7 +703,6 @@ mod tests {
     /// the four combinations are genuinely different answers and a wrong one
     /// silently changes object size.
     #[test]
-    #[allow(deprecated)]
     fn the_effective_chunk_cap_covers_the_whole_lattice() {
         let base = S3SinkConfig::new("b");
         let with = |bs: usize, max: Option<usize>| {

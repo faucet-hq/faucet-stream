@@ -149,7 +149,6 @@ pub struct BigQuerySinkConfig {
     /// endpoint; overridden in tests to point the streaming load at a wiremock
     /// server. Not user-facing, and never read from a config: it would
     /// receive the bearer token.
-    #[doc(hidden)]
     #[serde(skip)]
     #[schemars(skip)]
     pub upload_base_url: Option<String>,

@@ -147,7 +147,6 @@ pub struct BigQuerySourceConfig {
     /// schema-tolerant fallback, SQL-172). Defaults to the real endpoint;
     /// overridden in tests to point at a mock server. Not user-facing, and
     /// never read from a config: it would receive the bearer token.
-    #[doc(hidden)]
     #[serde(skip)]
     #[schemars(skip)]
     pub api_host: Option<String>,

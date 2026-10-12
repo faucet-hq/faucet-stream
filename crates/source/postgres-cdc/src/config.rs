@@ -236,9 +236,6 @@ pub enum SlotType {
 pub enum CdcTls {
     /// No TLS — plaintext.
     Disable,
-    /// TLS when the server offers it, else plaintext, without verifying the
-    /// certificate (libpq's `prefer`; open to downgrade).
-    Prefer,
     /// Require TLS but do not verify the server certificate.
     Require,
     /// Require TLS and verify the certificate chain against `ca_path` (or the
@@ -256,6 +253,9 @@ pub enum CdcTls {
     /// plaintext when it sets none.
     #[default]
     FromUrl,
+    /// TLS when the server offers it, else plaintext, without verifying the
+    /// certificate (libpq's `prefer`; open to downgrade).
+    Prefer,
 }
 
 impl std::fmt::Debug for PostgresCdcSourceConfig {
