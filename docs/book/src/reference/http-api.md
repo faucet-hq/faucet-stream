@@ -196,10 +196,17 @@ never read the server's own credentials. Refused with `403`:
 
 The same files and trees are refused as **data**: a `file`, `csv`, `jsonl`,
 `parquet`, `sqlite`, `duckdb`, `delta` or `iceberg` source, sink, state store
-or DLQ whose path (or directory, or glob) reaches one of them is a `403`. In
-a config the request carries, such a path may not take a value from records
-(`${parent.*}` and other runtime tokens other than `${now.*}`, `${backfill.*}`
-and `${partition.*}`).
+or DLQ — including a template override, topology node, fan-out source,
+partition bound probe, `verify.destination` and a `sql` transform's `csv` /
+`jsonl` relation — that would reach one of them is a `403`, before any of the
+config runs. A read is refused when its path is such a file, a directory
+listing that would include one (any depth with `recursive: true`), or a glob
+any of whose segments could match into a system tree or onto a protected file
+(an existing match that is a symlink into one counts). A sink or state store
+is refused only when it would write such a file, so it may use a directory
+that also holds one. In a config the request carries, such a path may not
+take a value from records (`${parent.*}` and other runtime tokens other than
+`${now.*}`, `${backfill.*}` and `${partition.*}`).
 
 ### SQL connectors run sandboxed
 
@@ -210,8 +217,8 @@ gets `enable_external_access = false` with extension autoload off and the
 configuration locked (a query cannot `SET` it back), and each SQLite
 connection allows no attached database (which also stops `VACUUM INTO`;
 extension loading is always off). The server sets the flag on every template,
-row override, topology node, fan-out source and DLQ sink, overwriting a
-`sandbox: false`. Such a query still reads and writes its own database; it
+row override, topology node, fan-out source, partition bound probe,
+`verify.destination` and DLQ sink, overwriting a `sandbox: false`. Such a query still reads and writes its own database; it
 fails with a `Permission Error` / `too many attached databases` the moment it
 reaches past it. The `sql` transform is always sandboxed this way.
 
