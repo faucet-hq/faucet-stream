@@ -760,7 +760,30 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature but bundled DuckDB, librdkafka and Oracle (docs.rs OOM, #794); see scripts/full-feature-coverage.py.
+features = [
+    "arrow", "catalog", "cli-dev", "cli-interactive", "cli-progress", "cli-tui", "compression",
+    "contract", "delta-azure", "delta-gcs", "delta-s3", "file-formats", "google-sa",
+    "hub-remote", "mcp", "mtls", "oauth1", "otel", "policy", "quality-jsonschema",
+    "rabbitmq-tls", "schedule", "secrets", "serve-history-postgres", "serve-history-sqlite",
+    "serve-ui", "sink-azure-blob", "sink-bigquery", "sink-clickhouse-staging", "sink-csv",
+    "sink-databricks-staging", "sink-delta", "sink-dynamodb", "sink-elasticsearch",
+    "sink-file", "sink-gcs", "sink-http", "sink-iceberg", "sink-jsonl", "sink-kinesis",
+    "sink-mongodb", "sink-mssql-staging", "sink-mysql", "sink-nats", "sink-parquet",
+    "sink-postgres", "sink-pubsub", "sink-rabbitmq", "sink-redis", "sink-redshift", "sink-s3",
+    "sink-sftp", "sink-singer", "sink-snowflake", "sink-spanner", "sink-sqlite", "sink-sqs",
+    "sink-stdout", "source-azure-blob", "source-bigquery", "source-clickhouse", "source-csv",
+    "source-databricks", "source-delta", "source-dynamodb", "source-elasticsearch",
+    "source-file", "source-gcs", "source-graphql", "source-grpc", "source-iceberg",
+    "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "source-kinesis",
+    "source-mongodb", "source-mongodb-cdc", "source-mssql", "source-mssql-cdc", "source-mysql",
+    "source-mysql-cdc", "source-nats", "source-parquet", "source-postgres",
+    "source-postgres-cdc", "source-pubsub", "source-rabbitmq", "source-redis",
+    "source-redshift", "source-rest-excel", "source-s3", "source-sftp", "source-singer",
+    "source-snowflake", "source-spanner", "source-sqlite", "source-sqs", "source-webhook",
+    "source-websocket", "source-xml-excel", "state", "templates-sync-object-store", "tenants",
+    "transform-wasm", "transforms", "triggers-object-store", "triggers-redis",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
 

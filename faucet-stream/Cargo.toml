@@ -680,7 +680,35 @@ name = "csv_to_bigquery"
 required-features = ["source-file", "file-format-csv", "sink-bigquery"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature but bundled DuckDB, librdkafka and Oracle (docs.rs OOM, #794); see scripts/full-feature-coverage.py.
+features = [
+    "arrow", "compression", "contract", "delta-azure", "delta-gcs", "delta-s3", "encryption",
+    "file-formats", "google-sa", "lineage", "masking", "mtls", "oauth1", "policy",
+    "quality-jsonschema", "rabbitmq-tls", "sink-azure-blob", "sink-bigquery",
+    "sink-clickhouse-staging", "sink-csv", "sink-databricks-staging", "sink-delta",
+    "sink-dynamodb", "sink-elasticsearch", "sink-file", "sink-gcs", "sink-http",
+    "sink-iceberg", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql", "sink-jsonl",
+    "sink-kinesis", "sink-mongodb", "sink-mssql-staging", "sink-mysql", "sink-nats",
+    "sink-parquet", "sink-postgres", "sink-pubsub", "sink-rabbitmq", "sink-redis",
+    "sink-redshift", "sink-s3", "sink-sftp", "sink-singer", "sink-snowflake", "sink-spanner",
+    "sink-sqlite", "sink-sqs", "sink-stdout", "source-azure-blob", "source-bigquery",
+    "source-clickhouse", "source-csv", "source-databricks", "source-delta", "source-dynamodb",
+    "source-elasticsearch", "source-file", "source-gcs", "source-graphql", "source-grpc",
+    "source-iceberg", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql",
+    "source-kinesis", "source-mongodb", "source-mongodb-cdc", "source-mssql",
+    "source-mssql-cdc", "source-mysql", "source-mysql-cdc", "source-nats", "source-parquet",
+    "source-postgres", "source-postgres-cdc", "source-pubsub", "source-rabbitmq",
+    "source-redis", "source-redshift", "source-rest-excel", "source-s3", "source-sftp",
+    "source-singer", "source-snowflake", "source-spanner", "source-sqlite", "source-sqs",
+    "source-webhook", "source-websocket", "source-xml-excel", "state", "transform-cast",
+    "transform-coalesce", "transform-cross-join", "transform-drop", "transform-explode",
+    "transform-filter", "transform-flatten", "transform-hash", "transform-json-encode",
+    "transform-json-parse", "transform-keys-case", "transform-lookup", "transform-redact",
+    "transform-rename-field", "transform-rename-keys", "transform-select", "transform-set",
+    "transform-spell-symbols", "transform-split-join", "transform-tree-flatten",
+    "transform-unpivot", "transform-value-case", "transform-wasm", "transform-zip-columns",
+    "transforms",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
 
