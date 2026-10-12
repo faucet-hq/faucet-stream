@@ -14,7 +14,9 @@ as the `INSERT` does; `schema.table` and `catalog.schema.table` are honoured.
 The sink is **append-only**; keyed upsert and an Arrow-native columnar fast path
 are tracked as follow-ups.
 
-In `auto_map` mode a record with no field matching a column of the table is
+In `auto_map` mode a field matches its column exactly or, failing that,
+ignoring ASCII case (DuckDB identifiers are case-insensitive), so `ID` lands in
+column `id` instead of failing the write. A record with no field matching a column of the table is
 refused rather than skipped: `write_batch` fails the page, and with a `dlq:`
 block the record fails on its own row (routed to the DLQ) while the rest of the
 page is written.

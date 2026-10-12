@@ -41,7 +41,9 @@ pub struct PostgresSourceConfig {
     pub shard: Option<ShardConfig>,
     /// Longest the source waits on the server for the next row (or for a
     /// whole result in `fetch_all`), in seconds, before the read fails.
-    /// Defaults to 3600; `0` waits forever.
+    /// This includes the wait for the first row, so a query that computes
+    /// longer than this before returning anything fails. Defaults to 3600;
+    /// `0` waits forever.
     ///
     /// A peer that disappears without closing the connection (a failover, an
     /// idle eviction by a NAT or load balancer) otherwise leaves the read

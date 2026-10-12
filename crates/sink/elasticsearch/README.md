@@ -95,7 +95,8 @@ dataset and a failed/cancelled run leaves the previous data intact:
 1. `begin` creates a fresh physical index `{index}-faucet-ovw-…` (copying the
    current target's mappings **and** its settings — analysis, shard/replica
    counts, `refresh_interval`, index sorting, `mapping.*`, ingest pipelines,
-   lifecycle policy, minus identity keys such as `uuid`) behind a marker alias
+   lifecycle policy, shard allocation / routing, `auto_expand_replicas`,
+   `hidden`, minus identity keys such as `uuid`) behind a marker alias
    `{index}-faucet-ovw-staging`,
    and the run's documents are indexed through that marker (`_bulk` with
    `require_alias=true`, so a write without a staging index fails instead of
@@ -255,7 +256,7 @@ Setting `id_field` to a stable business key makes resumed/retried runs **idempot
 
 ## Schema evolution
 
-`ElasticsearchSink` reports its live index mappings via `current_schema()` (`GET /<index>/_mapping`; every field is reported as `[type, "array", "null"]` because ES has no NOT NULL concept and every field is multi-valued, so array data is not drift; a missing index → `None`), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real index. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`ElasticsearchSink` reports its live index mappings via `current_schema()` (`GET /<index>/_mapping`; every field is reported as `[type, "null"]` (ES has no NOT NULL concept) that also accepts arrays (`x-faucet-also-accepts: ["array"]`, every field is multi-valued), so array data is not drift and a widening such as integer → number is still classified as a widening; a missing index → `None`), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real index. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
 
 Under `on_drift: evolve`, `ElasticsearchSink::evolve_schema()` is **add-fields only**:
 

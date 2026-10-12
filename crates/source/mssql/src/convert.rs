@@ -64,6 +64,16 @@ pub(crate) fn money_text(f: f64) -> String {
     format!("{sign}{}.{:04}", abs / 10_000, abs % 10_000)
 }
 
+/// A `REAL` as the JSON number its shortest decimal form names, so `0.1`
+/// stays `0.1` rather than widening to `0.10000000149011612`.
+pub(crate) fn real_json(f: f32) -> Value {
+    f.to_string()
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map_or(Value::Null, Value::Number)
+}
+
 /// Convert a non-temporal [`ColumnData`] to JSON.
 ///
 /// Returns `Some(Value::Null)` for a SQL NULL in a non-temporal column, and
@@ -75,7 +85,7 @@ fn scalar_to_json(data: &ColumnData<'_>) -> Option<Value> {
         ColumnData::I16(o) => o.map(|n| json!(n)),
         ColumnData::I32(o) => o.map(|n| json!(n)),
         ColumnData::I64(o) => o.map(|n| json!(n)),
-        ColumnData::F32(o) => o.map(|f| json!(f)),
+        ColumnData::F32(o) => o.map(real_json),
         ColumnData::F64(o) => o.map(|f| json!(f)),
         ColumnData::Bit(o) => o.map(|b| json!(b)),
         ColumnData::String(o) => o.as_ref().map(|s| json!(s.as_ref())),
@@ -168,6 +178,17 @@ pub(crate) fn numeric_to_string(n: Numeric) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn real_keeps_its_shortest_decimal_form() {
+        assert_eq!(super::real_json(0.1), serde_json::json!(0.1));
+        assert_eq!(super::real_json(-3.5), serde_json::json!(-3.5));
+        assert_eq!(super::real_json(f32::NAN), serde_json::Value::Null);
+        assert_eq!(
+            super::scalar_to_json(&tiberius::ColumnData::F32(Some(0.1))),
+            Some(serde_json::json!(0.1))
+        );
+    }
 
     #[test]
     fn duplicate_column_names_the_column_or_the_empty_name() {

@@ -20,7 +20,9 @@ behave identically on both sides.
 - **`RedshiftConnection`** — `host`, `port` (default `5439`), `database`,
   `user`, `credentials`, a `tls` toggle (default `true`), and the optional
   `tls_mode` (`disable` | `prefer` | `require` | `verify_ca` | `verify_full`,
-  overrides `tls`) + `ssl_root_cert` (CA PEM path for the verifying modes).
+  overrides `tls`) + `ssl_root_cert` (CA PEM path for the verifying modes;
+  without it they verify against the Mozilla root store bundled into the
+  binary, not the operating system's).
   Flattened into both end configs.
 
 ## Helpers

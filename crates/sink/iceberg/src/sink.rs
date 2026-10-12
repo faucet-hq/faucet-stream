@@ -144,8 +144,23 @@ impl SinkState {
 }
 
 /// The table property that carries `scope`'s last committed token, so the
-/// watermark outlives the expiry of the snapshot that recorded it.
+/// watermark outlives the expiry of the snapshot that recorded it. A long
+/// scope is shortened to a digest form, since catalogs cap property keys
+/// (Glue at 255 bytes); shorter scopes keep their verbatim key.
 pub(crate) fn token_property(scope: &str) -> String {
+    format!(
+        "{}.{}",
+        faucet_core::idempotency::ICEBERG_TOKEN_PROP,
+        faucet_core::idempotency::scope_key(scope, MAX_PROPERTY_SCOPE)
+    )
+}
+
+/// The longest scope [`token_property`] keeps verbatim: 255 bytes minus the
+/// `faucet.commit-token.` prefix.
+const MAX_PROPERTY_SCOPE: usize = 200;
+
+/// The key an earlier release wrote a long scope's token under.
+fn legacy_token_property(scope: &str) -> String {
     format!("{}.{scope}", faucet_core::idempotency::ICEBERG_TOKEN_PROP)
 }
 
@@ -869,12 +884,11 @@ impl faucet_core::Sink for IcebergSink {
                 state.pending_commit = Some((scope.to_string(), token.to_string()));
                 Ok(n)
             }
-            Err(e) => {
-                // Uncommitted pages carry no token: committing them on the
-                // error unwind's flush would make the resume replay them.
-                state.poison(&e);
-                Err(e)
-            }
+            // A failure before anything reached the writer (table resolution,
+            // a record that does not fit) leaves no uncommitted rows of this
+            // page, so the sink stays usable; a writer failure part-way has
+            // already poisoned it in `write_page`.
+            Err(e) => Err(e),
         }
     }
 
@@ -898,7 +912,10 @@ impl faucet_core::Sink for IcebergSink {
         };
 
         let meta = table.metadata();
-        let carried = meta.properties().get(&token_property(scope));
+        let carried = meta
+            .properties()
+            .get(&token_property(scope))
+            .or_else(|| meta.properties().get(&legacy_token_property(scope)));
         let props = meta.snapshots().map(|s| {
             let summary = s.summary();
             (
@@ -1116,6 +1133,11 @@ mod tests {
         let err = state.check_poisoned().unwrap_err();
         assert!(err.to_string().contains("upload failed"), "{err}");
         assert_eq!(token_property("p::r"), "faucet.commit-token.p::r");
+        let long = "x".repeat(300);
+        let key = token_property(&long);
+        assert!(key.len() <= 255, "{}", key.len());
+        assert_ne!(key, legacy_token_property(&long));
+        assert_eq!(legacy_token_property("p::r"), token_property("p::r"));
     }
 
     #[test]

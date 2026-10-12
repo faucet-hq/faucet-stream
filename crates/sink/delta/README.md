@@ -64,7 +64,7 @@ License: MIT OR Apache-2.0.
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** — every `batch_size` chunk of a page is decoded before any is buffered, so a record that does not fit fails the page with none of it written — unless `target_file_size` is set and `batch_size` splits a page (then **best-effort**) — a page is one Delta commit unless target_file_size commits part of a chunked page early. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** — every `batch_size` chunk of a page is decoded before any is buffered, so a record that does not fit fails the page with none of it written — unless `target_file_size` is set and `batch_size` splits a page (then **best-effort**) — a page is one Delta commit unless target_file_size commits part of a chunked page early. A write the buffered writer itself rejects drops everything buffered since the last commit and fails every later write and the flush of the run, so a fragment of the failed page is never committed; the dropped rows are replayed on resume. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

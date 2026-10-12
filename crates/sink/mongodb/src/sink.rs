@@ -205,9 +205,6 @@ fn check_key_alignment(key: &[String], seen: &[faucet_core::KeyTuple]) -> Result
     Ok(())
 }
 
-/// The `cursor.firstBatch` of a command reply (`listCollections`,
-/// `listIndexes`). A collection has at most 64 indexes, so one batch holds
-/// them all. Pure.
 /// What one `insert_many` call of `n` documents did, given its rejected
 /// `(index, message)` pairs: the batch positions that failed, and how many
 /// leading positions are settled (inserted or failed). An unordered insert
@@ -217,6 +214,28 @@ fn check_key_alignment(key: &[String], seen: &[faucet_core::KeyTuple]) -> Result
 struct InsertStep {
     failed: Vec<(usize, String)>,
     consumed: usize,
+}
+
+/// How many times [`insert_partial`](MongoSink) re-sends a batch whose
+/// `insert_many` failed without per-document write errors.
+const INSERT_RESENDS: u32 = 3;
+
+/// MongoDB's duplicate-key error code.
+const DUPLICATE_KEY: i32 = 11000;
+
+/// The rejections of an `insert_many` as `(index, message)`. On a re-sent
+/// batch a duplicate key on a document whose `_id` this sink generated means
+/// the document landed in an earlier attempt, so it is not a failure.
+fn landed_on_resend(
+    rejected: Vec<(usize, i32, String)>,
+    resent: bool,
+    generated_id: impl Fn(usize) -> bool,
+) -> Vec<(usize, String)> {
+    rejected
+        .into_iter()
+        .filter(|(pos, code, _)| !(resent && *code == DUPLICATE_KEY && generated_id(*pos)))
+        .map(|(pos, _, msg)| (pos, msg))
+        .collect()
 }
 
 fn insert_step(n: usize, ordered: bool, rejected: &[(usize, String)]) -> InsertStep {
@@ -236,6 +255,9 @@ fn insert_step(n: usize, ordered: bool, rejected: &[(usize, String)]) -> InsertS
     }
 }
 
+/// The `cursor.firstBatch` of a command reply (`listCollections`,
+/// `listIndexes`). A collection has at most 64 indexes, so one batch holds
+/// them all. Pure.
 fn first_batch(reply: &Document) -> Vec<Document> {
     reply
         .get_document("cursor")
@@ -426,8 +448,12 @@ impl MongoSink {
     /// server rejects (`insert_many`'s `write_errors`, by index) or that is
     /// not a JSON object fails alone and is DLQ'd; the rest are inserted —
     /// under `ordered: true` the batch resumes after the rejected document.
-    /// An outer `Err` is returned only while nothing has been inserted, so a
-    /// failed call never leaves rows that a DLQ replay would duplicate.
+    /// A batch that fails without per-document errors (a dropped connection, a
+    /// server error) is re-sent up to [`INSERT_RESENDS`] times; documents keep
+    /// the `_id` they were given, so a re-send cannot insert one twice. An
+    /// outer `Err` is returned only while nothing has been inserted, so a
+    /// failed call never leaves rows that a DLQ replay would duplicate; after
+    /// that, the documents still pending fail per row.
     async fn insert_partial(
         &self,
         records: &[Value],
@@ -438,9 +464,18 @@ impl MongoSink {
             .collection::<Document>(&self.effective_collection());
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         let mut docs: Vec<(usize, Document)> = Vec::with_capacity(records.len());
+        // Documents given an `_id` here (instead of by the driver) keep it
+        // across a re-sent batch, so a re-send cannot insert them twice.
+        let mut generated = std::collections::HashSet::new();
         for (i, r) in records.iter().enumerate() {
             match Self::value_to_document(r) {
-                Ok(d) => docs.push((i, d)),
+                Ok(mut d) => {
+                    if !d.contains_key("_id") {
+                        d.insert("_id", bson::oid::ObjectId::new());
+                        generated.insert(i);
+                    }
+                    docs.push((i, d));
+                }
                 Err(e) => outcomes[i] = Err(e),
             }
         }
@@ -450,18 +485,22 @@ impl MongoSink {
             self.config.batch_size
         };
         let mut inserted_any = false;
+        let mut resends = 0u32;
         let mut pending: &[(usize, Document)] = &docs;
         while !pending.is_empty() {
             let take = chunk.min(pending.len());
             let batch = &pending[..take];
+            // A re-send is unordered: the documents that landed before the
+            // failure come back as duplicate keys, which must not stop it.
+            let ordered = self.config.ordered && resends == 0;
             let opts = mongodb::options::InsertManyOptions::builder()
-                .ordered(self.config.ordered)
+                .ordered(ordered)
                 .build();
             let result = collection
                 .insert_many(batch.iter().map(|(_, d)| d))
                 .with_options(opts)
                 .await;
-            let rejected: Vec<(usize, String)> = match result {
+            let rejected: Vec<(usize, i32, String)> = match result {
                 Ok(_) => Vec::new(),
                 Err(e) => match e.kind.as_ref() {
                     // A write-concern error means the server applied the inserts
@@ -479,15 +518,24 @@ impl MongoSink {
                         ime.write_errors
                             .iter()
                             .flatten()
-                            .map(|we| (we.index, we.message.clone()))
+                            .map(|we| (we.index, we.code, we.message.clone()))
                             .collect()
                     }
                     mongodb::error::ErrorKind::InsertMany(ime) if ime.write_errors.is_some() => ime
                         .write_errors
                         .iter()
                         .flatten()
-                        .map(|we| (we.index, we.message.clone()))
+                        .map(|we| (we.index, we.code, we.message.clone()))
                         .collect(),
+                    // A transport or server failure says nothing about which
+                    // documents of the batch landed: re-send it a few times
+                    // before giving up (#862 L-104).
+                    _ if resends < INSERT_RESENDS => {
+                        resends += 1;
+                        tracing::warn!(error = %e, resends, "MongoDB insert_many failed; re-sending the batch");
+                        tokio::time::sleep(std::time::Duration::from_millis(200 << resends)).await;
+                        continue;
+                    }
                     _ if !inserted_any => {
                         return Err(FaucetError::Sink(format!(
                             "MongoDB insert_many failed: {e}"
@@ -504,13 +552,17 @@ impl MongoSink {
                     }
                 },
             };
-            let step = insert_step(take, self.config.ordered, &rejected);
+            let rejected = landed_on_resend(rejected, resends > 0, |pos| {
+                generated.contains(&batch[pos].0)
+            });
+            let step = insert_step(take, ordered, &rejected);
             for (pos, msg) in &step.failed {
                 outcomes[batch[*pos].0] = Err(FaucetError::Sink(format!(
                     "MongoDB rejected the document: {msg}"
                 )));
             }
             inserted_any |= step.consumed > step.failed.len();
+            resends = 0;
             pending = &pending[step.consumed..];
         }
         Ok(outcomes)
@@ -1089,8 +1141,9 @@ impl faucet_core::Sink for MongoSink {
 
     /// Write a batch and report per-row outcomes.
     ///
-    /// In append mode this delegates to [`write_batch`](faucet_core::Sink::write_batch) and
-    /// maps a single success onto an all-`Ok(())` vector (the trait default).
+    /// In append and overwrite mode each document gets its own outcome: one
+    /// the server rejects, or that is not a JSON object, fails alone and the
+    /// rest are inserted (see `insert_partial`).
     /// In upsert/delete mode the good rows are applied (upserts + deletes), and
     /// only the rows whose key could not be extracted (missing / null key) are
     /// reported as `Err` so the pipeline routes them to the DLQ per-row instead
@@ -1309,6 +1362,24 @@ mod tests {
         assert_eq!(step.failed, vec![(1, "bad".to_string())]);
         let step = insert_step(4, true, &[]);
         assert_eq!((step.consumed, step.failed.len()), (4, 0));
+    }
+
+    #[test]
+    fn a_resend_treats_duplicates_of_generated_ids_as_landed() {
+        let rejected = || {
+            vec![
+                (0, DUPLICATE_KEY, "dup".to_string()),
+                (1, DUPLICATE_KEY, "dup".to_string()),
+                (2, 121, "invalid".to_string()),
+            ]
+        };
+        let generated = |pos: usize| pos == 0;
+        assert_eq!(
+            landed_on_resend(rejected(), true, generated),
+            vec![(1, "dup".to_string()), (2, "invalid".to_string())],
+            "only a generated id's duplicate on a re-send has landed"
+        );
+        assert_eq!(landed_on_resend(rejected(), false, generated).len(), 3);
     }
 
     #[test]

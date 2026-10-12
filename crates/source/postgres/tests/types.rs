@@ -89,6 +89,17 @@ async fn types_without_a_native_decode_are_read_as_text() {
     let n = row["n"].as_str().expect("numeric is a string");
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
 
+    // #862 L-073: the fallback decoder (duplicate names skip the text cast)
+    // never renders a NUMERIC in exponent notation.
+    let tiny = PostgresSource::new(PostgresSourceConfig::new(
+        &url,
+        "SELECT 0.0000001::numeric(20,10) AS n, 0.0000001::numeric(20,10) AS n",
+    ))
+    .await
+    .expect("source");
+    let row = &tiny.fetch_all().await.expect("fetch")[0];
+    assert_eq!(row["n"], json!("0.00000010"));
+
     // #862 M-066: a trailing semicolon or line comment survives the text-cast
     // wrapper a NUMERIC column triggers.
     for query in [

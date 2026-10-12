@@ -39,7 +39,7 @@ sink:
 | `batch_size` | | `1000` | Records per emitted page. `0` emits the whole result set as one page. |
 | `exact_staleness_secs` | | — | Read at a timestamp this many seconds in the past (stale read, served by any replica) instead of a strong read. |
 | `replication` | | `{type: full}` | `full` or `{type: incremental, column, initial_value}` — see below. |
-| `state_key` | | derived | Explicit state-store key for the bookmark. Defaults to `spanner:<project>.<instance>.<database>:<query-fingerprint>`. |
+| `state_key` | | derived | Explicit state-store key for the bookmark. Defaults to `spanner:<project>.<instance>.<database>:<query-fingerprint>`. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
 | `max_sessions` | | `100` | Upper bound on pooled Spanner sessions (gRPC channels are sized at one per 100 sessions). |
 | `emulator_host` | | — | Spanner emulator endpoint (`host:port`); plaintext + unauthenticated. See [Emulator](#emulator). |
 | `shard` | | — | `{key: <INT64 column>}` — opt in to PK-range sharding for clustered execution. |

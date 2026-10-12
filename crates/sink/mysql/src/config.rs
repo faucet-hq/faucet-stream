@@ -80,7 +80,11 @@ pub struct MysqlSinkConfig {
     #[serde(flatten)]
     pub write: WriteSpec,
     /// Longest a page write may wait on the server, in seconds, before it
-    /// fails. Defaults to 3600; `0` waits forever.
+    /// fails. Defaults to 3600; `0` waits forever. The same bound applies to
+    /// the commit-token read, schema reads and evolution, and the overwrite
+    /// staging setup, `RENAME` swap and abort; the bulk statements of a
+    /// scoped cleanup and a rollback are not bounded, because they can
+    /// legitimately run longer.
     ///
     /// A peer that disappears without closing the connection (a failover, an
     /// idle-eviction by a NAT or load balancer) otherwise leaves the write

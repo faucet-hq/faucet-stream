@@ -95,11 +95,13 @@ impl PostgresSource {
             context,
         )
         .0;
-        let described = (&self.pool).describe(&probe).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "postgres: could not describe the incremental query: {e}"
-            ))
-        })?;
+        let described = bounded(self.config.read_timeout_secs, (&self.pool).describe(&probe))
+            .await?
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "postgres: could not describe the incremental query: {e}"
+                ))
+            })?;
         let type_name = described
             .columns()
             .iter()
@@ -165,8 +167,8 @@ impl PostgresSource {
     /// returned unchanged, so its own error surfaces when it runs.
     async fn typed_query(&self, query: String) -> String {
         use sqlx::Executor;
-        match (&self.pool).describe(&query).await {
-            Ok(described) => {
+        match bounded(self.config.read_timeout_secs, (&self.pool).describe(&query)).await {
+            Ok(Ok(described)) => {
                 let columns: Vec<(String, String)> = described
                     .columns()
                     .iter()
@@ -174,7 +176,7 @@ impl PostgresSource {
                     .collect();
                 text_cast_query(&query, &columns).unwrap_or(query)
             }
-            Err(_) => query,
+            _ => query,
         }
     }
 
@@ -577,7 +579,7 @@ fn pg_value_to_json(
     }
     // NUMERIC / DECIMAL → string, preserving exact precision.
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
-        return Ok(Value::String(v.to_string()));
+        return Ok(Value::String(v.to_plain_string()));
     }
     // BYTEA → base64 (so binary survives the JSON round-trip).
     if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
@@ -606,19 +608,27 @@ async fn bounded_read<T>(
     secs: u64,
     fut: impl std::future::Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, FaucetError> {
-    let result = if secs == 0 {
-        fut.await
-    } else {
-        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
-            Ok(result) => result,
-            Err(_) => {
-                return Err(FaucetError::Source(format!(
-                    "PostgreSQL read timed out after {secs}s waiting for the server (read_timeout_secs)"
-                )));
-            }
-        }
-    };
-    result.map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))
+    bounded(secs, fut)
+        .await?
+        .map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))
+}
+
+/// Like [`bounded_read`], but hands the server's own error back to the caller
+/// so it can word it.
+async fn bounded<T>(
+    secs: u64,
+    fut: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<Result<T, sqlx::Error>, FaucetError> {
+    if secs == 0 {
+        return Ok(fut.await);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
+        .await
+        .map_err(|_| {
+            FaucetError::Source(format!(
+                "PostgreSQL read timed out after {secs}s waiting for the server (read_timeout_secs)"
+            ))
+        })
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given
@@ -1042,10 +1052,12 @@ impl faucet_core::Source for PostgresSource {
                         AND pc.relname = t.table_name
                         AND pc.relispartition)
              ORDER BY c.table_schema, c.table_name, c.ordinal_position"#;
-        let rows = sqlx::query(sql)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Source(format!("postgres: catalog discovery failed: {e}")))?;
+        let rows = bounded(
+            self.config.read_timeout_secs,
+            sqlx::query(sql).fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(|e| FaucetError::Source(format!("postgres: catalog discovery failed: {e}")))?;
 
         let catalog: Vec<CatalogRow> = rows
             .iter()
@@ -1066,7 +1078,9 @@ impl faucet_core::Source for PostgresSource {
             })
             .collect::<Result<_, _>>()?;
 
-        let keys = primary_keys(&self.pool).await?;
+        let keys = bounded(self.config.read_timeout_secs, primary_keys(&self.pool))
+            .await?
+            .map_err(key_discovery_error)?;
         Ok(faucet_core::attach_primary_keys(
             descriptors_from_catalog(catalog, quote_ident),
             keys,
@@ -1095,9 +1109,9 @@ impl faucet_core::Source for PostgresSource {
             }
         };
         let bounds_sql = pk_bounds_query(&base, &quote_ident(&shard_cfg.key), "BIGINT");
-        let row = bind_params(sqlx::query(&bounds_sql), &self.config.params, &binds)?
-            .fetch_one(&self.pool)
-            .await
+        let query = bind_params(sqlx::query(&bounds_sql), &self.config.params, &binds)?;
+        let row = bounded(self.config.read_timeout_secs, query.fetch_one(&self.pool))
+            .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
                     "postgres: failed to compute shard bounds for key {:?} \
@@ -1147,9 +1161,9 @@ impl faucet_core::Source for PostgresSource {
         };
         let inner = bounds.wrap(&base, quote_ident);
         let sql = digest_query(&inner, key, columns);
-        let row = bind_params(sqlx::query(&sql), &self.config.params, &binds)?
-            .fetch_one(&self.pool)
-            .await
+        let query = bind_params(sqlx::query(&sql), &self.config.params, &binds)?;
+        let row = bounded(self.config.read_timeout_secs, query.fetch_one(&self.pool))
+            .await?
             .map_err(|e| FaucetError::Source(format!("postgres: range digest failed: {e}")))?;
         let rows: i64 = row
             .try_get("rows")
@@ -1200,7 +1214,7 @@ pub fn digest_query(inner: &str, key: &str, columns: &[String]) -> String {
 /// Every primary-key column in the database, `(table, column)` in key order.
 async fn primary_keys(
     pool: &sqlx::Pool<sqlx::Postgres>,
-) -> Result<Vec<(String, String)>, FaucetError> {
+) -> Result<Vec<(String, String)>, sqlx::Error> {
     let key_sql = r#"
             SELECT tc.table_schema || '.' || tc.table_name AS name, k.column_name
               FROM information_schema.table_constraints tc
@@ -1212,10 +1226,7 @@ async fn primary_keys(
              WHERE tc.constraint_type = 'PRIMARY KEY'
                AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
              ORDER BY tc.table_schema, tc.table_name, k.ordinal_position"#;
-    sqlx::query_as(key_sql)
-        .fetch_all(pool)
-        .await
-        .map_err(key_discovery_error)
+    sqlx::query_as(key_sql).fetch_all(pool).await
 }
 
 fn key_discovery_error(e: sqlx::Error) -> FaucetError {
@@ -1230,6 +1241,29 @@ mod tests {
     fn real_values_use_their_shortest_form() {
         assert_eq!(float4_json(0.1), serde_json::json!(0.1));
         assert_eq!(float4_json(f32::INFINITY), serde_json::json!("Infinity"));
+    }
+
+    #[tokio::test]
+    async fn bounded_keeps_the_server_error_and_times_out() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok::<_, sqlx::Error>(())
+        };
+        let err = bounded(1, slow).await.unwrap_err();
+        assert!(err.to_string().contains("read_timeout_secs"), "{err}");
+        let inner = bounded(0, async { Err::<i32, _>(sqlx::Error::RowNotFound) })
+            .await
+            .unwrap();
+        assert!(matches!(inner, Err(sqlx::Error::RowNotFound)));
+    }
+
+    #[test]
+    fn numeric_text_never_uses_exponent_notation() {
+        use std::str::FromStr as _;
+        let v = sqlx::types::BigDecimal::from_str("0.0000001000").unwrap();
+        assert_eq!(v.to_plain_string(), "0.0000001000");
+        let big = sqlx::types::BigDecimal::from_str("1E+30").unwrap();
+        assert_eq!(big.to_plain_string(), "1000000000000000000000000000000");
     }
 
     #[tokio::test]

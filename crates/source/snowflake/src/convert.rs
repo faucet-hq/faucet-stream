@@ -19,7 +19,7 @@
 //! | `timestamp_ntz`         | `String` `YYYY-MM-DDTHH:MM:SS[.fff…]` (no offset) |
 //! | `timestamp_ltz`         | `String` UTC, `…Z`                       |
 //! | `timestamp_tz`          | `String` wall time with its `+HH:MM` offset |
-//! | `variant` / `object` / `array` | parsed JSON value (falls back to `String`) |
+//! | `variant` / `object` / `array` | parsed JSON value (falls back to `String`; a number an `f64` cannot hold exactly becomes a string of its digits) |
 //! | anything else           | `String` (raw cell)                      |
 //!
 //! `null` cells map to `Value::Null` regardless of declared type.
@@ -90,8 +90,11 @@ fn cell_to_json(cell: Option<&Value>, ty: &str, scale: i64) -> Value {
         "fixed" => parse_number(s, scale),
         "real" => parse_real(s),
         "boolean" => parse_bool(s),
+        // A number an f64 cannot hold exactly is kept as a string of its digits.
         "variant" | "object" | "array" => {
-            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned()))
+            faucet_core::parse_json_exact(s, faucet_core::JsonBigNumbers::String)
+                .map(|(v, _)| v)
+                .unwrap_or_else(|_| Value::String(s.to_owned()))
         }
         "date" | "time" | "timestamp_ntz" | "timestamp_ltz" | "timestamp_tz" => {
             temporal_to_iso(s, &ty)
@@ -506,6 +509,18 @@ mod tests {
         let row = [json!(r#"{"k":1}"#)];
         let cols = [col("DATA", "variant")];
         assert_eq!(row_to_json(&row, &cols), json!({"DATA": {"k": 1}}));
+    }
+
+    #[test]
+    fn variant_keeps_numbers_an_f64_cannot_hold_as_strings() {
+        let row = [json!(
+            r#"{"big":12345678901234567890123,"pi":3.141592653589793238,"n":2.5}"#
+        )];
+        let cols = [col("DATA", "variant")];
+        assert_eq!(
+            row_to_json(&row, &cols),
+            json!({"DATA": {"big": "12345678901234567890123", "pi": "3.141592653589793238", "n": 2.5}})
+        );
     }
 
     #[test]

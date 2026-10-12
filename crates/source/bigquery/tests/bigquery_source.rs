@@ -1244,3 +1244,134 @@ async fn result_reader_credential_failure_is_a_typed_auth_error() {
         "{err:?}"
     );
 }
+
+/// A typed client plus the raw target pointed at `server`, for exercising the
+/// shared `tolerant_*` fallbacks directly (#862 L-093).
+async fn raw_parts(
+    server: &MockServer,
+) -> (
+    gcp_bigquery_client::Client,
+    BigQueryCredentials,
+    tempfile::NamedTempFile,
+) {
+    let sa_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        sa_file.path(),
+        dummy_service_account_json(&server.uri()).to_string(),
+    )
+    .unwrap();
+    let creds = BigQueryCredentials::ServiceAccountKeyPath {
+        path: sa_file.path().to_str().unwrap().into(),
+    };
+    let tokens = faucet_common_bigquery::token_provider(&creds)
+        .await
+        .expect("token provider");
+    let client = ClientBuilder::new()
+        .with_v2_base_url(server.uri())
+        .build_from_authenticator(tokens)
+        .await
+        .expect("client");
+    (client, creds, sa_file)
+}
+
+async fn mount_both(server: &MockServer, verb: &str, tail: &str, response: ResponseTemplate) {
+    for p in [tail.to_string(), format!("/bigquery/v2{tail}")] {
+        Mock::given(method(verb))
+            .and(path(p))
+            .respond_with(response.clone())
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn get_job_falls_back_on_an_unknown_column_type() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let job = json!({
+        "jobReference": {"projectId": PROJECT_ID, "jobId": "j1"},
+        "status": {"state": "DONE"},
+        "statistics": {"query": {"schema": {"fields": [
+            {"name": "span", "type": "RANGE", "rangeElementType": {"type": "DATE"}}
+        ]}}}
+    });
+    let tail = format!("/projects/{PROJECT_ID}/jobs/j1");
+    mount_both(
+        &server,
+        "GET",
+        &tail,
+        ResponseTemplate::new(200).set_body_json(job),
+    )
+    .await;
+    let (client, creds, _f) = raw_parts(&server).await;
+    let target = faucet_common_bigquery::raw::RawTarget {
+        creds: &creds,
+        host: Some(&server.uri()),
+    };
+    let job =
+        faucet_common_bigquery::raw::tolerant_get_job(&client, target, PROJECT_ID, "j1", None)
+            .await
+            .expect("the raw fallback decodes the job");
+    let fields = job
+        .statistics
+        .and_then(|s| s.query)
+        .and_then(|q| q.schema)
+        .and_then(|s| s.fields)
+        .expect("schema");
+    assert!(matches!(
+        fields[0].r#type,
+        gcp_bigquery_client::model::field_type::FieldType::String
+    ));
+}
+
+#[tokio::test]
+async fn get_query_results_falls_back_and_keeps_an_error_status() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let page = json!({
+        "jobComplete": true,
+        "jobReference": {"projectId": PROJECT_ID, "jobId": "j2"},
+        "schema": {"fields": [{"name": "span", "type": "RANGE"}]},
+        "rows": [{"f": [{"v": "[1, 2)"}]}],
+        "totalRows": "1"
+    });
+    mount_both(
+        &server,
+        "GET",
+        &format!("/projects/{PROJECT_ID}/queries/j2"),
+        ResponseTemplate::new(200).set_body_json(page),
+    )
+    .await;
+    mount_both(
+        &server,
+        "GET",
+        &format!("/projects/{PROJECT_ID}/queries/j3"),
+        ResponseTemplate::new(502).set_body_string("<html>Bad Gateway</html>"),
+    )
+    .await;
+    let (client, creds, _f) = raw_parts(&server).await;
+    let target = faucet_common_bigquery::raw::RawTarget {
+        creds: &creds,
+        host: Some(&server.uri()),
+    };
+    let params =
+        gcp_bigquery_client::model::get_query_results_parameters::GetQueryResultsParameters::default();
+    let ok = faucet_common_bigquery::raw::tolerant_get_query_results(
+        &client,
+        target,
+        PROJECT_ID,
+        "j2",
+        params.clone(),
+    )
+    .await
+    .expect("the raw fallback decodes the page");
+    assert_eq!(ok.rows.map(|r| r.len()), Some(1));
+
+    let err = faucet_common_bigquery::raw::tolerant_get_query_results(
+        &client, target, PROJECT_ID, "j3", params,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("502"), "{err}");
+}

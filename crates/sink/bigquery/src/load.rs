@@ -96,8 +96,17 @@ pub async fn write_columnar(
         .job_id
         .ok_or_else(|| FaucetError::Sink("BigQuery load job returned no jobId".into()))?;
     let loaded = await_load_job(client, config, &job_id, job_ref.location.as_deref()).await;
-    delete_staged(cfg, &key).await;
-    loaded?;
+    match &loaded {
+        Err((_, false)) => {
+            tracing::warn!(
+                key,
+                job_id,
+                "leaving the staged load object: the job may still run"
+            );
+        }
+        _ => delete_staged(cfg, &key).await,
+    }
+    loaded.map_err(|(e, _)| e)?;
 
     tracing::info!(
         table = %format!("{}.{}.{}", config.project_id, config.dataset_id, config.table_id),
@@ -245,7 +254,9 @@ pub async fn write_columnar_media_with_schema(
         FaucetError::Sink("BigQuery media load job returned no jobReference.jobId".into())
     })?;
     let location = job["jobReference"]["location"].as_str();
-    await_load_job(client, config, job_id, location).await?;
+    await_load_job(client, config, job_id, location)
+        .await
+        .map_err(|(e, _)| e)?;
 
     tracing::info!(
         table = %format!("{}.{}.{table_id}", config.project_id, config.dataset_id),
@@ -259,13 +270,15 @@ pub async fn write_columnar_media_with_schema(
 
 /// Poll a load job by id until it reports `DONE`, mapping a runtime
 /// `status.error_result` to `Err` (a failed job still returns HTTP 200 with the
-/// error in the body — the trap `await_query_complete` also guards).
+/// error in the body — the trap `await_query_complete` also guards). The
+/// error's flag is `false` only when the job timed out and may still be
+/// running.
 async fn await_load_job(
     client: &Client,
     config: &BigQuerySinkConfig,
     job_id: &str,
     location: Option<&str>,
-) -> Result<(), FaucetError> {
+) -> Result<(), (FaucetError, bool)> {
     let started = std::time::Instant::now();
     loop {
         let target = faucet_common_bigquery::raw::RawTarget {
@@ -280,23 +293,35 @@ async fn await_load_job(
             location,
         )
         .await
-        .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
+        .map_err(|e| {
+            (
+                FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")),
+                true,
+            )
+        })?;
         let status = job.status.ok_or_else(|| {
-            FaucetError::Sink("BigQuery load job returned no status; cannot confirm".into())
+            (
+                FaucetError::Sink("BigQuery load job returned no status; cannot confirm".into()),
+                true,
+            )
         })?;
         if let Some(err) = status.error_result {
-            return Err(FaucetError::Sink(format!(
-                "BigQuery load job {job_id} failed: {err}"
-            )));
+            return Err((
+                FaucetError::Sink(format!("BigQuery load job {job_id} failed: {err}")),
+                true,
+            ));
         }
         if status.state.as_deref() == Some("DONE") {
             return Ok(());
         }
         if crate::sink::job_timed_out(config.job_timeout, started) {
-            return Err(crate::sink::cancel_timed_out_job(
-                client, config, "load", job_id, location,
-            )
-            .await);
+            match crate::sink::cancel_timed_out_job(client, config, "load", job_id, location).await
+            {
+                crate::sink::CancelOutcome::Succeeded => continue,
+                crate::sink::CancelOutcome::Failed { error, terminal } => {
+                    return Err((error, terminal));
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

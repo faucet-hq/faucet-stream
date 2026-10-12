@@ -83,7 +83,7 @@ Record fields with no matching column are dropped with a one-shot warning per fi
 
 ## Write modes
 
-- **`append`** (default) — `InsertOrUpdate` mutations, so a replayed page (a later chunk failed after an earlier one committed, or a crash before the bookmark) converges instead of failing every retry on `ALREADY_EXISTS`. Two different records with the same PRIMARY KEY therefore leave the later one. Under `delivery: exactly_once` append uses `Insert` (a committed page is never replayed), so a duplicate key fails the page.
+- **`append`** (default) — `InsertOrUpdate` mutations, so a replayed page (a later chunk failed after an earlier one committed, or a crash before the bookmark) converges instead of failing every retry on `ALREADY_EXISTS`. Two different records with the same PRIMARY KEY are therefore merged column by column: the later record's columns overwrite the stored values, and columns it does not carry keep theirs. Under `delivery: exactly_once` append uses `Insert` (a committed page is never replayed), so a duplicate key fails the page.
 - **`upsert`** — `InsertOrUpdate` keyed on the table's PRIMARY KEY. `key` must equal the PK column set; this is validated on first write and by `faucet doctor`.
 - **`delete`** / `delete_marker` — `Delete` mutations. Key values are re-ordered into PK order automatically. Note Spanner cascades deletes to `INTERLEAVE IN PARENT … ON DELETE CASCADE` child tables.
 
@@ -125,7 +125,7 @@ first written page's inferred columns when it does not exist — a first-ever
 sync cannot assume the destination is already there. Every inferred column is
 created **nullable**: a column present in page 1 is not required forever, and a
 `NOT NULL` inferred from one page fails page 2 the first time a record omits
-the field (narrowing later is the `schema:` drift policy's job). Every auto-created column is **`STRING(MAX)`** (key columns `STRING(MAX) NOT NULL`): numbers and booleans are stored as their text, so define the table yourself and set `create_table: false` for typed columns. The sink reports `STRING` and `JSON` columns as accepting any JSON value, so a `schema:` drift policy does not flag numeric fields against them. The DDL is `CREATE TABLE IF NOT EXISTS`, so concurrent first writers do not race. Spanner requires a primary key, so auto-create needs `key:`; without one a missing table errors naming that requirement rather than inventing a key column. `faucet doctor` skips (does not fail) the schema probe for a table that will be created on first write.
+the field (narrowing later is the `schema:` drift policy's job). Every auto-created column is **`STRING(MAX)`** (key columns `STRING(MAX) NOT NULL`): numbers and booleans are stored as their text, so define the table yourself and set `create_table: false` for typed columns. The sink reports `STRING` and `JSON` columns as accepting any JSON value, so a `schema:` drift policy does not flag numeric fields against them. The DDL is `CREATE TABLE IF NOT EXISTS`, so concurrent first writers do not race. Spanner requires a primary key, so auto-create needs `key:`; without one a missing table errors naming that requirement rather than inventing a key column. `faucet doctor` skips (does not fail) the schema probe for a table that will be created on first write, and fails it when a missing table has no `key:` to be created with.
 
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.

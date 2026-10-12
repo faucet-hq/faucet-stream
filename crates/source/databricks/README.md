@@ -59,7 +59,7 @@ the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/fauc
 | `result_disposition` | `external_links` \| `inline` | `external_links` | how the row path receives results. `external_links` downloads each chunk from a presigned cloud-storage URL (no size cap; the client must reach the workspace's storage); `inline` keeps results in the API response, which Databricks fails above 25 MiB. Ignored under `arrow_native`. |
 | `arrow_native` | bool | `false` | fetch as `EXTERNAL_LINKS` + `ARROW_STREAM` and decode Arrow IPC; enables the columnar fast path. Requires the `arrow` feature and `replication: full`. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode). |
 | `replication` | `{ type: full \| incremental, column, initial_value }` | `full` | incremental cursor |
-| `state_key` | string? | derived | explicit bookmark key |
+| `state_key` | string? | derived | explicit bookmark key. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
 
 ```yaml
 pipeline:
@@ -117,7 +117,8 @@ or `cargo install faucet-cli --features "source-databricks,arrow"` (CLI).
 
 ## Out of scope (v1)
 
-`discover()` via `INFORMATION_SCHEMA`, Unity Catalog Volumes, and a Databricks
-SQL sink (use the Delta sink).
+`discover()` via `INFORMATION_SCHEMA` and reading from Unity Catalog Volumes.
+To write to a SQL warehouse, use the
+[`faucet-sink-databricks`](https://crates.io/crates/faucet-sink-databricks) sink.
 
 License: MIT OR Apache-2.0.

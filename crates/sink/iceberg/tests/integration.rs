@@ -645,11 +645,12 @@ async fn a_failed_idempotent_page_commits_nothing_and_tokens_are_carried() {
             .await
             .is_err()
     );
-    assert!(
-        sink.flush().await.is_err(),
-        "a poisoned sink refuses to commit"
-    );
-    assert!(sink.write_batch(&[json!({"id": 9})]).await.is_err());
+    // Every chunk is decoded before any is written, so nothing of the page
+    // reached the writer: the sink stays usable and the flush commits nothing
+    // of it (#862 L-116).
+    sink.flush()
+        .await
+        .expect("nothing of the failed page is pending");
     assert_eq!(read_rows(&dir, "eo").await, vec![json!({"id": 1})]);
 
     let fresh = IcebergSink::new(cfg).await.expect("sink");

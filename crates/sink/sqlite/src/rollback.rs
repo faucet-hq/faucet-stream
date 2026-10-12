@@ -256,12 +256,25 @@ impl SqliteSink {
         &self,
         tx: &mut Tx<'_>,
         entries: &[JournalEntry],
+        run_id: &str,
     ) -> Result<u64, FaucetError> {
         let restorable = faucet_core::rollback::restorable(entries);
         if restorable.is_empty() {
             return Ok(0);
         }
+        let later: Vec<String> = sqlx::query_scalar(&journal_sql().later_keys())
+            .bind(&self.config.table_name)
+            .bind(run_id)
+            .bind(&self.config.table_name)
+            .bind(run_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| sink_err("read later journals", e))?;
         let key = &self.config.write.key;
+        let restorable = faucet_core::rollback::touched_later(&restorable, &later, key);
+        if restorable.is_empty() {
+            return Ok(0);
+        }
         let table_ref = quote_ident_sqlite(&self.config.table_name);
         let sql = journal_sql();
         let per = (MAX_SQLITE_PARAMS / key.len().max(1)).max(1);
@@ -392,7 +405,7 @@ impl SqliteSink {
             .count_conflicts(tx, &entries, run_id, &opts.run_id_column)
             .await?;
         if opts.later_runs {
-            conflicts += self.count_vanished(tx, &entries).await?;
+            conflicts += self.count_vanished(tx, &entries, run_id).await?;
         }
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts));

@@ -372,7 +372,19 @@ fn is_naive_timestamp(ty: &str) -> bool {
         && t != "TIMESTAMPTZ"
 }
 
-/// Record fields (first-seen order) that are not columns of the table.
+/// The value a record carries for `col`. DuckDB identifiers are
+/// case-insensitive, so a field matches its column exactly first and otherwise
+/// ignoring ASCII case.
+fn field_value<'a>(obj: &'a serde_json::Map<String, Value>, col: &str) -> Option<&'a Value> {
+    obj.get(col).or_else(|| {
+        obj.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(col))
+            .map(|(_, v)| v)
+    })
+}
+
+/// Record fields (first-seen order) that match no column of the table, exactly
+/// or ignoring ASCII case.
 fn missing_fields(records: &[Value], cols: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for key in records
@@ -380,7 +392,7 @@ fn missing_fields(records: &[Value], cols: &[String]) -> Vec<String> {
         .filter_map(Value::as_object)
         .flat_map(|o| o.keys())
     {
-        if !cols.contains(key) && !out.contains(key) {
+        if !cols.iter().any(|c| c.eq_ignore_ascii_case(key)) && !out.contains(key) {
             out.push(key.clone());
         }
     }
@@ -420,13 +432,13 @@ fn insert_rows(
         let obj = rec
             .as_object()
             .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
-        if !cols.iter().any(|c| obj.contains_key(c)) {
+        if !cols.iter().any(|c| field_value(obj, c).is_some()) {
             return Err(FaucetError::Sink(no_matching_column_message(
                 idx, obj, cols,
             )));
         }
         for c in cols {
-            if obj.contains_key(c) {
+            if field_value(obj, c).is_some() {
                 used.insert(c.as_str());
             }
         }
@@ -455,7 +467,7 @@ fn insert_rows(
     let mut params: Vec<DuckValue> = Vec::with_capacity(rows.len() * num_cols);
     for obj in &rows {
         for c in &insert_cols {
-            let value = match obj.get(*c) {
+            let value = match field_value(obj, c) {
                 Some(Value::String(v)) if naive_ts.contains(c.as_str()) => {
                     DuckValue::Text(utc_wall_time(v).unwrap_or_else(|| v.clone()))
                 }
@@ -557,11 +569,13 @@ impl DuckdbSink {
 
         // AutoMap needs a page to infer from; a page with nothing inferable
         // leaves the table uncreated so the next page can try.
-        let columns = match (json_column, faucet_core::plan_columns(records)) {
+        let mut columns = match (json_column, faucet_core::plan_columns(records)) {
             (Some(_), _) => Vec::new(),
             (None, Some(c)) => c,
             (None, None) => return Ok(()),
         };
+        let mut seen = HashSet::new();
+        columns.retain(|c| seen.insert(c.name.to_ascii_lowercase()));
         let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
         guard
             .execute_batch(&sql)
@@ -805,6 +819,39 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         assert_eq!(count(&sink, "t"), 2);
+    }
+
+    #[tokio::test]
+    async fn fields_match_columns_ignoring_case() {
+        let sink = sink_with_table(
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+            "t",
+            DuckdbColumnMapping::AutoMap,
+        )
+        .await;
+        let n = sink
+            .write_batch(&[json!({"ID": 1, "Name": "a"}), json!({"id": 2, "name": "b"})])
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let conn = sink.conn.lock().unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM t ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        let cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns WHERE table_name = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 2, "no column was added for a case variant");
+        assert!(missing_fields(&[json!({"ID": 1})], &["id".to_string()]).is_empty());
     }
 
     #[tokio::test]

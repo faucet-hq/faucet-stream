@@ -1999,41 +1999,44 @@ impl faucet_core::Sink for MysqlSink {
     /// sink-instance memory, because the CLI runs begin, the writes and the
     /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        let first_run =
-            self.config.create_table && !self.table_exists(&self.config.table_name).await?;
-        let staging = quote_ident_mysql(&self.staging_table_name());
-        let old = quote_ident_mysql(&self.old_table_name());
-        let target = quote_ident_mysql(&self.config.table_name);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
-        if !first_run {
-            let deps = table_dependents(&mut conn, &self.config.table_name).await?;
-            if !deps.referenced_by.is_empty() {
-                return Err(referenced_overwrite_error(
-                    &self.config.table_name,
-                    &deps.referenced_by,
-                ));
+        bounded(self.config.write_timeout_secs, "begin_overwrite", async {
+            let first_run =
+                self.config.create_table && !self.table_exists(&self.config.table_name).await?;
+            let staging = quote_ident_mysql(&self.staging_table_name());
+            let old = quote_ident_mysql(&self.old_table_name());
+            let target = quote_ident_mysql(&self.config.table_name);
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
+            if !first_run {
+                let deps = table_dependents(&mut conn, &self.config.table_name).await?;
+                if !deps.referenced_by.is_empty() {
+                    return Err(referenced_overwrite_error(
+                        &self.config.table_name,
+                        &deps.referenced_by,
+                    ));
+                }
             }
-        }
-        let mut stmts = vec![
-            format!("DROP TABLE IF EXISTS {staging}"),
-            format!("DROP TABLE IF EXISTS {old}"),
-        ];
-        if !first_run {
-            stmts.push(format!("CREATE TABLE {staging} LIKE {target}"));
-        }
-        for stmt in stmts {
-            sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
-                FaucetError::Sink(format!(
-                    "mysql overwrite: prepare staging from '{}' (does the table exist?): {e}",
-                    self.config.table_name
-                ))
-            })?;
-        }
-        Ok(())
+            let mut stmts = vec![
+                format!("DROP TABLE IF EXISTS {staging}"),
+                format!("DROP TABLE IF EXISTS {old}"),
+            ];
+            if !first_run {
+                stmts.push(format!("CREATE TABLE {staging} LIKE {target}"));
+            }
+            for stmt in stmts {
+                sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
+                    FaucetError::Sink(format!(
+                        "mysql overwrite: prepare staging from '{}' (does the table exist?): {e}",
+                        self.config.table_name
+                    ))
+                })?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Atomically replace the destination via `RENAME TABLE` — MySQL performs a
@@ -2042,124 +2045,140 @@ impl faucet_core::Sink for MysqlSink {
     /// staging → target` publishes the freshly-loaded staging table as the new
     /// target in one step; the old table is then dropped.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        let staging = quote_ident_mysql(&self.staging_table_name());
-        let old = quote_ident_mysql(&self.old_table_name());
-        let target = quote_ident_mysql(&self.config.table_name);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
-        if !self.table_exists(&self.config.table_name).await? {
-            // First run: staging holds everything; publish it as the target.
-            // A run that wrote nothing has no staging either, and leaves no table.
-            if self.table_exists(&self.staging_table_name()).await? {
-                sqlx::query(&format!("RENAME TABLE {staging} TO {target}"))
+        bounded(self.config.write_timeout_secs, "commit_overwrite", async {
+            let staging = quote_ident_mysql(&self.staging_table_name());
+            let old = quote_ident_mysql(&self.old_table_name());
+            let target = quote_ident_mysql(&self.config.table_name);
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
+            if !self.table_exists(&self.config.table_name).await? {
+                // First run: staging holds everything; publish it as the target.
+                // A run that wrote nothing has no staging either, and leaves no table.
+                if self.table_exists(&self.staging_table_name()).await? {
+                    sqlx::query(&format!("RENAME TABLE {staging} TO {target}"))
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("mysql overwrite: publish staging: {e}"))
+                        })?;
+                }
+                return Ok(());
+            }
+            // A target with foreign keys or triggers keeps its definition: its
+            // rows are replaced in place instead of renaming staging over it,
+            // which would publish a table without them (#789 SQL-108).
+            let deps = table_dependents(&mut conn, &self.config.table_name).await?;
+            if !deps.referenced_by.is_empty() {
+                return Err(referenced_overwrite_error(
+                    &self.config.table_name,
+                    &deps.referenced_by,
+                ));
+            }
+            if !deps.pinned.is_empty() {
+                if self.config.write.keeps_previous() {
+                    let prev = self.previous_table_name();
+                    let q = quote_ident_mysql(&prev);
+                    for stmt in [
+                        format!("DROP TABLE IF EXISTS {q}"),
+                        format!("CREATE TABLE {q} LIKE {target}"),
+                    ] {
+                        sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
+                            FaucetError::Sink(format!("mysql overwrite: keep previous copy: {e}"))
+                        })?;
+                    }
+                    replace_rows_in_place(&mut conn, &prev, &self.config.table_name).await?;
+                }
+                replace_rows_in_place(
+                    &mut conn,
+                    &self.config.table_name,
+                    &self.staging_table_name(),
+                )
+                .await?;
+                sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| {
-                        FaucetError::Sink(format!("mysql overwrite: publish staging: {e}"))
+                        FaucetError::Sink(format!("mysql overwrite: drop staging: {e}"))
                     })?;
+                return Ok(());
             }
-            return Ok(());
-        }
-        // A target with foreign keys or triggers keeps its definition: its
-        // rows are replaced in place instead of renaming staging over it,
-        // which would publish a table without them (#789 SQL-108).
-        let deps = table_dependents(&mut conn, &self.config.table_name).await?;
-        if !deps.referenced_by.is_empty() {
-            return Err(referenced_overwrite_error(
-                &self.config.table_name,
-                &deps.referenced_by,
-            ));
-        }
-        if !deps.pinned.is_empty() {
+            // `rollback.keep_previous`: the replaced table is kept as
+            // `<table>__faucet_prev` (the rename is already the atomic unit, so
+            // no copy is needed) instead of being dropped (#706).
             if self.config.write.keeps_previous() {
-                let prev = self.previous_table_name();
-                let q = quote_ident_mysql(&prev);
-                for stmt in [
-                    format!("DROP TABLE IF EXISTS {q}"),
-                    format!("CREATE TABLE {q} LIKE {target}"),
-                ] {
-                    sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
-                        FaucetError::Sink(format!("mysql overwrite: keep previous copy: {e}"))
+                let prev = quote_ident_mysql(&self.previous_table_name());
+                sqlx::query(&format!("DROP TABLE IF EXISTS {prev}"))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("mysql overwrite: drop older previous: {e}"))
                     })?;
-                }
-                replace_rows_in_place(&mut conn, &prev, &self.config.table_name).await?;
-            }
-            replace_rows_in_place(
-                &mut conn,
-                &self.config.table_name,
-                &self.staging_table_name(),
-            )
-            .await?;
-            sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("mysql overwrite: drop staging: {e}")))?;
-            return Ok(());
-        }
-        // `rollback.keep_previous`: the replaced table is kept as
-        // `<table>__faucet_prev` (the rename is already the atomic unit, so
-        // no copy is needed) instead of being dropped (#706).
-        if self.config.write.keeps_previous() {
-            let prev = quote_ident_mysql(&self.previous_table_name());
-            sqlx::query(&format!("DROP TABLE IF EXISTS {prev}"))
+                sqlx::query(&format!(
+                    "RENAME TABLE {target} TO {prev}, {staging} TO {target}"
+                ))
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| {
-                    FaucetError::Sink(format!("mysql overwrite: drop older previous: {e}"))
+                    FaucetError::Sink(format!("mysql overwrite swap (RENAME) failed: {e}"))
                 })?;
+                return Ok(());
+            }
             sqlx::query(&format!(
-                "RENAME TABLE {target} TO {prev}, {staging} TO {target}"
+                "RENAME TABLE {target} TO {old}, {staging} TO {target}"
             ))
             .execute(&mut *conn)
             .await
             .map_err(|e| FaucetError::Sink(format!("mysql overwrite swap (RENAME) failed: {e}")))?;
-            return Ok(());
-        }
-        sqlx::query(&format!(
-            "RENAME TABLE {target} TO {old}, {staging} TO {target}"
-        ))
-        .execute(&mut *conn)
+            sqlx::query(&format!("DROP TABLE IF EXISTS {old}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mysql overwrite: drop old table: {e}")))?;
+            Ok(())
+        })
         .await
-        .map_err(|e| FaucetError::Sink(format!("mysql overwrite swap (RENAME) failed: {e}")))?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {old}"))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("mysql overwrite: drop old table: {e}")))?;
-        Ok(())
     }
 
     /// Probe for the `<table>__faucet_ovw` staging table, or the
     /// `<table>__faucet_ovw_old` a swap interrupted mid-`RENAME` leaves (read-only).
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        Ok(Some(
-            self.table_exists(&self.staging_table_name()).await?
-                || self.table_exists(&self.old_table_name()).await?,
-        ))
+        bounded(
+            self.config.write_timeout_secs,
+            "overwrite_staging_exists",
+            async {
+                Ok(Some(
+                    self.table_exists(&self.staging_table_name()).await?
+                        || self.table_exists(&self.old_table_name()).await?,
+                ))
+            },
+        )
+        .await
     }
 
     /// Drop the staging (and any old) table so a failed/cancelled overwrite
     /// leaves nothing behind. Best-effort — the destination was never touched.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        let staging = quote_ident_mysql(&self.staging_table_name());
-        let old = quote_ident_mysql(&self.old_table_name());
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
-        for stmt in [
-            format!("DROP TABLE IF EXISTS {staging}"),
-            format!("DROP TABLE IF EXISTS {old}"),
-        ] {
-            sqlx::query(&stmt)
-                .execute(&mut *conn)
+        bounded(self.config.write_timeout_secs, "abort_overwrite", async {
+            let staging = quote_ident_mysql(&self.staging_table_name());
+            let old = quote_ident_mysql(&self.old_table_name());
+            let mut conn = self
+                .pool
+                .acquire()
                 .await
-                .map_err(|e| FaucetError::Sink(format!("mysql overwrite: drop staging: {e}")))?;
-        }
-        Ok(())
+                .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
+            for stmt in [
+                format!("DROP TABLE IF EXISTS {staging}"),
+                format!("DROP TABLE IF EXISTS {old}"),
+            ] {
+                sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
+                    FaucetError::Sink(format!("mysql overwrite: drop staging: {e}"))
+                })?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     fn dedups_by_key(&self) -> bool {
@@ -2181,7 +2200,10 @@ impl faucet_core::Sink for MysqlSink {
     }
 
     async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.forget_run_impl(run_id).await
+        bounded(self.config.write_timeout_secs, "forget_run", async {
+            self.forget_run_impl(run_id).await
+        })
+        .await
     }
 
     async fn rewind_commit_token(
@@ -2189,7 +2211,12 @@ impl faucet_core::Sink for MysqlSink {
         scope: &str,
         token: Option<&str>,
     ) -> Result<(), FaucetError> {
-        self.rewind_commit_token_impl(scope, token).await
+        bounded(
+            self.config.write_timeout_secs,
+            "rewind_commit_token",
+            async { self.rewind_commit_token_impl(scope, token).await },
+        )
+        .await
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
@@ -2208,24 +2235,27 @@ impl faucet_core::Sink for MysqlSink {
     /// qualifier to thread. `DATA_TYPE` / `IS_NULLABLE` round-trip through
     /// `mysql_data_type_to_json_schema`.
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
-        // JSON-column mode stores each record whole; the physical columns are
-        // not the record's fields, so there is nothing to drift against
-        // (#789 SQL-20).
-        if !matches!(self.config.column_mapping, MysqlColumnMapping::AutoMap) {
-            return Ok(None);
-        }
-        let columns = self.read_columns().await?;
-        if columns.is_empty() {
-            return Ok(None); // table does not exist yet
-        }
+        bounded(self.config.write_timeout_secs, "current_schema", async {
+            // JSON-column mode stores each record whole; the physical columns are
+            // not the record's fields, so there is nothing to drift against
+            // (#789 SQL-20).
+            if !matches!(self.config.column_mapping, MysqlColumnMapping::AutoMap) {
+                return Ok(None);
+            }
+            let columns = self.read_columns().await?;
+            if columns.is_empty() {
+                return Ok(None); // table does not exist yet
+            }
 
-        let mut props = serde_json::Map::new();
-        for (name, data_type, nullable) in columns {
-            props.insert(name, mysql_data_type_to_json_schema(&data_type, nullable));
-        }
-        Ok(Some(
-            serde_json::json!({ "type": "object", "properties": props }),
-        ))
+            let mut props = serde_json::Map::new();
+            for (name, data_type, nullable) in columns {
+                props.insert(name, mysql_data_type_to_json_schema(&data_type, nullable));
+            }
+            Ok(Some(
+                serde_json::json!({ "type": "object", "properties": props }),
+            ))
+        })
+        .await
     }
 
     /// Apply an additive schema evolution (new columns, lossless widenings,
@@ -2238,83 +2268,87 @@ impl faucet_core::Sink for MysqlSink {
     /// relaxations re-emit the column as its current mapped type with an
     /// explicit `NULL`.
     async fn evolve_schema(&self, evolution: &SchemaEvolution) -> Result<(), FaucetError> {
-        let table_ref = quote_ident_mysql(&self.config.table_name);
+        bounded(self.config.write_timeout_secs, "evolve_schema", async {
+            let table_ref = quote_ident_mysql(&self.config.table_name);
 
-        // Read the current columns up front: needed for ADD-COLUMN idempotency
-        // (pre-check by name) and to derive a column's existing type when
-        // relaxing nullability.
-        let current = self.read_columns().await?;
-        let existing: std::collections::HashSet<&str> =
-            current.iter().map(|(n, _, _)| n.as_str()).collect();
+            // Read the current columns up front: needed for ADD-COLUMN idempotency
+            // (pre-check by name) and to derive a column's existing type when
+            // relaxing nullability.
+            let current = self.read_columns().await?;
+            let existing: std::collections::HashSet<&str> =
+                current.iter().map(|(n, _, _)| n.as_str()).collect();
 
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL evolve acquire failed: {e}")))?;
-
-        for c in &evolution.additions {
-            // Idempotency: MySQL lacks ADD COLUMN IF NOT EXISTS, so skip a
-            // column that already exists rather than erroring on a re-run.
-            if existing.contains(c.name.as_str()) {
-                continue;
-            }
-            let t = json_schema_base_type(&c.to).unwrap_or(SqlBaseType::Text);
-            sqlx::query(&build_add_column_sql(&table_ref, &c.name, t))
-                .execute(&mut *conn)
+            let mut conn = self
+                .pool
+                .acquire()
                 .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("MySQL ADD COLUMN {} failed: {e}", c.name))
-                })?;
-        }
+                .map_err(|e| FaucetError::Sink(format!("MySQL evolve acquire failed: {e}")))?;
 
-        for c in &evolution.widenings {
-            // An integer column that starts receiving fractions becomes an
-            // exact DECIMAL, never DOUBLE (which would round every stored value
-            // above 2^53), and MODIFY re-emits the rest of the definition so
-            // NOT NULL, the default and the comment survive (#789 SQL-78).
-            let t = json_schema_base_type(&c.to).unwrap_or(SqlBaseType::Text);
-            let new_type = widened_type(c.from.as_ref().and_then(json_schema_base_type), t);
-            let sql = match self.column_definition(&mut conn, &c.name).await? {
-                Some((def, nullable)) => {
-                    if def.extra.to_ascii_lowercase().contains("auto_increment") {
-                        return Err(FaucetError::SchemaDrift {
-                            columns: vec![c.name.clone()],
-                            message: format!(
-                                "mysql: column {} is AUTO_INCREMENT and cannot widen to {new_type}",
-                                c.name
-                            ),
-                        });
-                    }
-                    redefine_column_sql(&table_ref, &c.name, &def, Some(new_type), nullable)
+            for c in &evolution.additions {
+                // Idempotency: MySQL lacks ADD COLUMN IF NOT EXISTS, so skip a
+                // column that already exists rather than erroring on a re-run.
+                if existing.contains(c.name.as_str()) {
+                    continue;
                 }
-                None => None,
-            };
-            let Some(sql) = sql else { continue };
-            sqlx::query(&sql).execute(&mut *conn).await.map_err(|e| {
-                FaucetError::Sink(format!("MySQL MODIFY COLUMN {} failed: {e}", c.name))
-            })?;
-        }
+                let t = json_schema_base_type(&c.to).unwrap_or(SqlBaseType::Text);
+                sqlx::query(&build_add_column_sql(&table_ref, &c.name, t))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("MySQL ADD COLUMN {} failed: {e}", c.name))
+                    })?;
+            }
 
-        for col in &evolution.relax_nullability {
-            // MySQL's MODIFY COLUMN replaces the whole definition, so re-emit
-            // the column exactly as it is — type, charset, collation, default,
-            // AUTO_INCREMENT, ON UPDATE, comment — with only NOT NULL dropped
-            // (#789 SQL-33).
-            let Some((def, _)) = self.column_definition(&mut conn, col).await? else {
-                continue;
-            };
-            let Some(sql) = relax_column_sql(&table_ref, col, &def) else {
-                tracing::warn!(column = %col, "mysql: not relaxing NOT NULL on a generated column");
-                continue;
-            };
-            sqlx::query(&sql)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MySQL DROP NOT NULL {col} failed: {e}")))?;
-        }
+            for c in &evolution.widenings {
+                // An integer column that starts receiving fractions becomes an
+                // exact DECIMAL, never DOUBLE (which would round every stored value
+                // above 2^53), and MODIFY re-emits the rest of the definition so
+                // NOT NULL, the default and the comment survive (#789 SQL-78).
+                let t = json_schema_base_type(&c.to).unwrap_or(SqlBaseType::Text);
+                let new_type = widened_type(c.from.as_ref().and_then(json_schema_base_type), t);
+                let sql = match self.column_definition(&mut conn, &c.name).await? {
+                    Some((def, nullable)) => {
+                        if def.extra.to_ascii_lowercase().contains("auto_increment") {
+                            return Err(FaucetError::SchemaDrift {
+                                columns: vec![c.name.clone()],
+                                message: format!(
+                                    "mysql: column {} is AUTO_INCREMENT and cannot widen to {new_type}",
+                                    c.name
+                                ),
+                            });
+                        }
+                        redefine_column_sql(&table_ref, &c.name, &def, Some(new_type), nullable)
+                    }
+                    None => None,
+                };
+                let Some(sql) = sql else { continue };
+                sqlx::query(&sql).execute(&mut *conn).await.map_err(|e| {
+                    FaucetError::Sink(format!("MySQL MODIFY COLUMN {} failed: {e}", c.name))
+                })?;
+            }
 
-        Ok(())
+            for col in &evolution.relax_nullability {
+                // MySQL's MODIFY COLUMN replaces the whole definition, so re-emit
+                // the column exactly as it is — type, charset, collation, default,
+                // AUTO_INCREMENT, ON UPDATE, comment — with only NOT NULL dropped
+                // (#789 SQL-33).
+                let Some((def, _)) = self.column_definition(&mut conn, col).await? else {
+                    continue;
+                };
+                let Some(sql) = relax_column_sql(&table_ref, col, &def) else {
+                    tracing::warn!(column = %col, "mysql: not relaxing NOT NULL on a generated column");
+                    continue;
+                };
+                sqlx::query(&sql)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MySQL DROP NOT NULL {col} failed: {e}")))?;
+            }
+
+            Ok(())
+
+        })
+        .await
     }
 
     /// Write records to MySQL.
@@ -2363,24 +2397,31 @@ impl faucet_core::Sink for MysqlSink {
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.ensure_commit_table().await?;
-        let sql = format!(
-            "SELECT {k} FROM {t} WHERE {s} = ?",
-            t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-            k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-            s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-        );
-        for key in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
-            let row = sqlx::query(&sql)
-                .bind(key)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
-            if let Some(r) = row {
-                return Ok(Some(r.get::<String, _>(0)));
-            }
-        }
-        Ok(None)
+        bounded(
+            self.config.write_timeout_secs,
+            "last_committed_token",
+            async {
+                self.ensure_commit_table().await?;
+                let sql = format!(
+                    "SELECT {k} FROM {t} WHERE {s} = ?",
+                    t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+                    k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
+                    s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+                );
+                for key in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
+                    let row = sqlx::query(&sql)
+                        .bind(key)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
+                    if let Some(r) = row {
+                        return Ok(Some(r.get::<String, _>(0)));
+                    }
+                }
+                Ok(None)
+            },
+        )
+        .await
     }
 
     async fn write_batch_idempotent(

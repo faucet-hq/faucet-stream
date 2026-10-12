@@ -48,9 +48,11 @@ pub struct BigQuerySinkConfig {
     pub insert_id_field: Option<String>,
     /// Longest the sink waits, in seconds, for one BigQuery job it started (a
     /// MERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before
-    /// cancelling it and failing the write. Default `3600`; `0` waits for as
-    /// long as the job runs. A job that times out is cancelled so it cannot
-    /// commit after the run has been reported failed.
+    /// requesting its cancellation and failing the write. Default `3600`; `0`
+    /// waits for as long as the job runs. After the cancel the sink waits up
+    /// to 30 s for the job to stop; a job that finished successfully before
+    /// the cancel took effect is treated as completed, and the error says
+    /// when a job could not be confirmed stopped (it may still commit).
     #[serde(
         default = "default_job_timeout",
         with = "faucet_core::config::duration_secs"
@@ -145,8 +147,10 @@ pub struct BigQuerySinkConfig {
     /// (`{base}/upload/bigquery/v2/…`), which is a fixed Google host the
     /// `gcp_bigquery_client` client does not route. Defaults to the real
     /// endpoint; overridden in tests to point the streaming load at a wiremock
-    /// server. Not user-facing.
-    #[serde(default, skip_serializing)]
+    /// server. Not user-facing, and never read from a config: it would
+    /// receive the bearer token.
+    #[doc(hidden)]
+    #[serde(skip)]
     #[schemars(skip)]
     pub upload_base_url: Option<String>,
     /// Resumable-upload chunk threshold in bytes (compressed) — the accumulated

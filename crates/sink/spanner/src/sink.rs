@@ -1116,12 +1116,23 @@ impl faucet_core::Sink for SpannerSink {
                     }
                 }
             }
-            Ok(Ok(None)) if self.config.create_table => Probe::skip(
+            Ok(Ok(None)) if self.config.create_table && !self.config.write.key.is_empty() => {
+                Probe::skip(
+                    "schema",
+                    format!(
+                        "table `{}` does not exist yet; it will be created on first write",
+                        self.config.table_name
+                    ),
+                )
+            }
+            Ok(Ok(None)) if self.config.create_table => Probe::fail_hint(
                 "schema",
+                started.elapsed(),
                 format!(
-                    "table `{}` does not exist yet; it will be created on first write",
+                    "table `{}` does not exist, and `create_table` cannot create it without `key:`",
                     self.config.table_name
                 ),
+                "set `key:` to the PRIMARY KEY columns the table should have, or create the table",
             ),
             Ok(Ok(None)) => Probe::fail_hint(
                 "schema",

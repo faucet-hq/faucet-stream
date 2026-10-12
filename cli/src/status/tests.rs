@@ -582,3 +582,19 @@ fn child_reasons_follow_the_childs_own_health() {
         Some("child row 'kid' is degraded")
     );
 }
+
+#[test]
+fn staging_object_matches_the_sinks_name() {
+    assert_eq!(staging_object("sqlite", "t"), "t__faucet_ovw");
+    #[cfg(feature = "sink-postgres")]
+    {
+        let long = "x".repeat(60);
+        let name = staging_object("postgres", &long);
+        assert!(name.len() <= 63, "{name}");
+        assert_eq!(
+            name,
+            faucet_sink_postgres::sink::overwrite_staging_table_name(&long)
+        );
+        assert_eq!(staging_object("postgres", "t"), "t__faucet_ovw");
+    }
+}

@@ -131,9 +131,7 @@ async fn execute<T: DeserializeOwned>(req: reqwest_bq::RequestBuilder) -> Result
     let status = resp.status();
     let bytes = resp.bytes().await?;
     if !status.is_success() {
-        return Err(BQError::ResponseError {
-            error: serde_json::from_slice(&bytes)?,
-        });
+        return Err(status_error(status.as_u16(), &bytes));
     }
     let mut value: Value = serde_json::from_slice(&bytes)?;
     let rewritten = normalize_field_types(&mut value);
@@ -144,6 +142,27 @@ async fn execute<T: DeserializeOwned>(req: reqwest_bq::RequestBuilder) -> Result
         );
     }
     Ok(serde_json::from_value(value)?)
+}
+
+/// The error for a non-2xx response: BigQuery's own error document when the
+/// body is one, otherwise the HTTP status and the start of the body (a proxy's
+/// HTML page, say), so the status is never lost to a decode error.
+fn status_error(status: u16, body: &[u8]) -> BQError {
+    use gcp_bigquery_client::error::{NestedResponseError, ResponseError};
+    if let Ok(error) = serde_json::from_slice::<ResponseError>(body) {
+        return BQError::ResponseError { error };
+    }
+    let text: String = String::from_utf8_lossy(body).chars().take(200).collect();
+    BQError::ResponseError {
+        error: ResponseError {
+            error: NestedResponseError {
+                code: i64::from(status),
+                errors: Vec::new(),
+                message: format!("HTTP {status}: {}", text.trim()),
+                status: String::new(),
+            },
+        },
+    }
 }
 
 async fn get<T: DeserializeOwned>(
@@ -373,6 +392,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BQError::NoToken), "{err:?}");
+    }
+
+    #[test]
+    fn a_non_json_error_body_keeps_its_status() {
+        let BQError::ResponseError { error } = status_error(502, b"<html>Bad Gateway</html>")
+        else {
+            panic!("expected a response error");
+        };
+        assert_eq!(error.error.code, 502);
+        assert!(
+            error.error.message.contains("HTTP 502"),
+            "{}",
+            error.error.message
+        );
+        assert!(error.error.message.contains("Bad Gateway"));
+        let json = br#"{"error":{"code":404,"errors":[],"message":"Not found: Table","status":"NOT_FOUND"}}"#;
+        let BQError::ResponseError { error } = status_error(404, json) else {
+            panic!("expected a response error");
+        };
+        assert_eq!(error.error.message, "Not found: Table");
+        assert_eq!(error.error.status, "NOT_FOUND");
     }
 
     #[test]

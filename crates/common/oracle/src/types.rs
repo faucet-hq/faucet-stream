@@ -84,6 +84,17 @@ fn float_to_json(f: f64) -> Value {
         .unwrap_or_else(|| Value::String(f.to_string()))
 }
 
+/// A `BINARY_FLOAT` through its shortest decimal form, so `0.1` stays `0.1`
+/// instead of widening to `0.10000000149011612`; non-finite values as text.
+pub(crate) fn float32_to_json(f: f32) -> Value {
+    if !f.is_finite() {
+        return Value::String(f.to_string());
+    }
+    f.to_string()
+        .parse::<f64>()
+        .map_or_else(|_| Value::String(f.to_string()), float_to_json)
+}
+
 /// Convert an Oracle decimal string to JSON without losing precision.
 pub fn number_text_to_json(text: &str) -> Value {
     let t = text.trim();
@@ -272,7 +283,8 @@ impl TypeFamily {
             // are emitted as their exact text.
             TypeFamily::Integer => json!({ "type": ["integer", "string"] }),
             TypeFamily::Decimal => json!({ "type": ["number", "string"] }),
-            TypeFamily::BinaryFloat => json!({ "type": "number" }),
+            // Non-finite values (`Inf`, `NaN`) are emitted as text.
+            TypeFamily::BinaryFloat => json!({ "type": ["number", "string"] }),
             TypeFamily::Boolean => json!({ "type": "boolean" }),
             TypeFamily::Json => json!({ "type": "object" }),
             TypeFamily::Raw | TypeFamily::Blob => {
@@ -621,7 +633,13 @@ mod tests {
         // Values past i64/u64 or f64 exactness are emitted as text.
         assert_eq!(Integer.json_schema()["type"], json!(["integer", "string"]));
         assert_eq!(Decimal.json_schema()["type"], json!(["number", "string"]));
-        assert_eq!(BinaryFloat.json_schema()["type"], "number");
+        assert_eq!(
+            BinaryFloat.json_schema()["type"],
+            json!(["number", "string"])
+        );
+        assert_eq!(super::float32_to_json(0.1), json!(0.1));
+        assert_eq!(super::float32_to_json(f32::INFINITY), json!("inf"));
+        assert_eq!(super::float32_to_json(f32::NAN), json!("NaN"));
         assert_eq!(Boolean.json_schema()["type"], "boolean");
         assert_eq!(Json.json_schema()["type"], "object");
         assert_eq!(Blob.json_schema()["contentEncoding"], "base64");

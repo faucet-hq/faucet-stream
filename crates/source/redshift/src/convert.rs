@@ -83,7 +83,7 @@ pub(crate) fn pg_value_to_json(
     }
     // NUMERIC / DECIMAL → string, preserving exact precision.
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
-        return Ok(Value::String(v.to_string()));
+        return Ok(Value::String(v.to_plain_string()));
     }
     // Binary (VARBYTE / bytea) → base64 so it survives the JSON round-trip.
     if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {

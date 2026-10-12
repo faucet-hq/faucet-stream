@@ -235,6 +235,42 @@ fn describe(conn: &Connection, query: &str, params: &[DuckValue]) -> Option<Vec<
     Some(out)
 }
 
+/// The column types of `query` read with `typeof(COLUMNS(*))` over its first
+/// row: the fallback when `DESCRIBE` cannot plan it (e.g. bound parameters).
+/// An empty result reports no types, which is harmless: no row needs a cast.
+fn describe_by_typeof(
+    conn: &Connection,
+    query: &str,
+    params: &[DuckValue],
+) -> Option<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT typeof(COLUMNS(*)) FROM (\n{}\n) AS __faucet_t LIMIT 1",
+            trimmed(query)
+        ))
+        .ok()?;
+    let batches: Vec<_> = stmt
+        .query_arrow(duckdb::params_from_iter(params.iter().cloned()))
+        .ok()?
+        .collect();
+    let schema = stmt.schema();
+    let row = batches.iter().find(|b| b.num_rows() > 0);
+    let mut out = Vec::with_capacity(schema.fields().len());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let ty = match row {
+            Some(batch) => batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(0)
+                .to_string(),
+            None => String::new(),
+        };
+        out.push((field.name().clone(), ty));
+    }
+    Some(out)
+}
+
 /// Run `query`, handing each converted Arrow batch to `sink`. Results stream
 /// chunk by chunk (`duckdb_execute_prepared_streaming`), so memory stays
 /// bounded; only a statement that cannot be wrapped for the schema probe (a
@@ -247,12 +283,21 @@ fn run_query(
     mut sink: impl FnMut(Vec<Value>) -> Result<bool, FaucetError>,
 ) -> Result<(), FaucetError> {
     let params: Vec<DuckValue> = binds.iter().map(json_to_duck).collect();
-    let plan = match describe(conn, query, &params) {
+    let described =
+        describe(conn, query, &params).or_else(|| describe_by_typeof(conn, query, &params));
+    let plan = match described {
         Some(columns) => plan_from_description(query, &columns)?,
-        None => Plan {
-            sql: trimmed(query).to_string(),
-            duck_types: Vec::new(),
-        },
+        None => {
+            tracing::warn!(
+                "DuckDB could not describe the query's column types, so UHUGEINT, BIT, \
+                 BIGNUM and TIMETZ columns are not cast to text and may lose information; \
+                 cast them to VARCHAR in the query"
+            );
+            Plan {
+                sql: trimmed(query).to_string(),
+                duck_types: Vec::new(),
+            }
+        }
     };
     let bound = || duckdb::params_from_iter(params.iter().cloned());
 
@@ -628,6 +673,43 @@ mod tests {
         context.insert("val".to_string(), serde_json::json!("1; DROP TABLE x; --"));
         let records = source.fetch_with_context(&context).await.unwrap();
         assert_eq!(records[0]["result"], "1; DROP TABLE x; --");
+    }
+
+    #[tokio::test]
+    async fn lossy_types_are_cast_when_the_query_binds_parameters() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT 340282366920938463463374607431768211455::UHUGEINT AS u, {val} AS v",
+        ))
+        .await
+        .unwrap();
+        let mut context = HashMap::new();
+        context.insert("val".to_string(), serde_json::json!("x"));
+        let records = source.fetch_with_context(&context).await.unwrap();
+        assert_eq!(
+            records[0]["u"],
+            json!("340282366920938463463374607431768211455")
+        );
+        assert_eq!(records[0]["v"], json!("x"));
+    }
+
+    #[test]
+    fn typeof_fallback_reads_types_and_tolerates_empty_results() {
+        let conn = Connection::open_in_memory().unwrap();
+        let params = [DuckValue::Int(1)];
+        let typed = describe_by_typeof(&conn, "SELECT 1::UHUGEINT AS u, ?::INTEGER AS i;", &params)
+            .unwrap();
+        assert_eq!(
+            typed,
+            vec![
+                ("u".to_string(), "UHUGEINT".to_string()),
+                ("i".to_string(), "INTEGER".to_string())
+            ]
+        );
+        let empty =
+            describe_by_typeof(&conn, "SELECT 1::UHUGEINT AS u WHERE ? = 2", &params).unwrap();
+        assert_eq!(empty, vec![("u".to_string(), String::new())]);
+        assert!(describe_by_typeof(&conn, "PRAGMA version", &[]).is_none());
     }
 
     #[tokio::test]

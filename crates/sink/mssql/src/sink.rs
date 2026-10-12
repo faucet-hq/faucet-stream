@@ -616,7 +616,7 @@ impl MssqlSink {
     }
 
     /// Apply planned upsert/delete groups atomically, in page order, in a
-    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`faucet_core::plan_writes_ordered`]
+    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`page_plans`],
     /// so a delete that precedes an upsert of a key equal under the column
     /// collation (`"Bob"` / `"bob"`) cannot run after it and remove the row.
     async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
@@ -773,6 +773,60 @@ impl MssqlSink {
         self.exec_params(conn, stmts.delete, &refs, "cleanup delete")
             .await
     }
+}
+
+/// The upsert/delete groups for one page. A single plan (one MERGE per kind)
+/// unless a deleted key may equal an upserted one under the column's collation
+/// (case, trailing spaces, or a non-ASCII key the check cannot fold); only then
+/// does page order matter, so the page is split into op runs
+/// ([`faucet_core::plan_writes_ordered`]).
+fn page_plans(records: &[Value], spec: &faucet_core::WriteSpec) -> Vec<faucet_core::WritePlan> {
+    let single = faucet_core::plan_writes(records, spec);
+    if collation_collision(&single) {
+        faucet_core::plan_writes_ordered(records, spec)
+    } else {
+        vec![single]
+    }
+}
+
+/// A key folded the way a case-insensitive collation compares it; `None` when
+/// it holds a non-ASCII string, which accent-insensitive collations may fold
+/// further than this check can.
+fn folded_key(values: impl Iterator<Item = Value>) -> Option<Vec<String>> {
+    values
+        .map(|v| match v {
+            Value::String(s) if s.is_ascii() => Some(s.trim_end_matches(' ').to_ascii_lowercase()),
+            Value::String(_) => None,
+            other => Some(other.to_string()),
+        })
+        .collect()
+}
+
+/// Whether some deleted key may equal some upserted key under the collation.
+fn collation_collision(plan: &faucet_core::WritePlan) -> bool {
+    if plan.deletes.is_empty() || plan.upserts.is_empty() {
+        return false;
+    }
+    let key: Vec<&String> = plan
+        .deletes
+        .first()
+        .map(|k| k.0.iter().map(|(c, _)| c).collect())
+        .unwrap_or_default();
+    let mut upserted = std::collections::HashSet::new();
+    for rec in &plan.upserts {
+        let values = key
+            .iter()
+            .map(|c| rec.get(c.as_str()).cloned().unwrap_or(Value::Null));
+        match folded_key(values) {
+            Some(k) => {
+                upserted.insert(k);
+            }
+            None => return true,
+        }
+    }
+    plan.deletes.iter().any(|d| {
+        folded_key(d.0.iter().map(|(_, v)| v.clone())).is_none_or(|k| upserted.contains(&k))
+    })
 }
 
 /// The prepared statements and key typing a scoped cleanup runs with.
@@ -1167,10 +1221,7 @@ impl Sink for MssqlSink {
                 )));
             }
             let total = self
-                .apply_plans(&faucet_core::plan_writes_ordered(
-                    records,
-                    &self.config.write,
-                ))
+                .apply_plans(&page_plans(records, &self.config.write))
                 .await?;
             tracing::info!(
                 table = %self.config.table,
@@ -1248,11 +1299,8 @@ impl Sink for MssqlSink {
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
             let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.apply_plans(&faucet_core::plan_writes_ordered(
-                records,
-                &self.config.write,
-            ))
-            .await?;
+            self.apply_plans(&page_plans(records, &self.config.write))
+                .await?;
 
             let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
             for (idx, msg) in &plan.failed {
@@ -1677,7 +1725,7 @@ impl Sink for MssqlSink {
         // the append path's INSERTs, inside this same BEGIN TRAN.
         let written = match &plan {
             Some(_) => {
-                let plans = faucet_core::plan_writes_ordered(records, &self.config.write);
+                let plans = page_plans(records, &self.config.write);
                 match self.apply_plans_no_txn(&mut conn, &plans).await {
                     Ok(n) => n,
                     Err((e, timed_out)) => {
@@ -1793,6 +1841,35 @@ impl Sink for MssqlSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_splits_into_op_runs_only_on_a_collation_collision() {
+        use serde_json::json;
+        let spec: faucet_core::WriteSpec = serde_json::from_value(json!({
+            "write_mode": "upsert",
+            "key": ["id"],
+            "delete_marker": { "field": "op", "values": ["d"] }
+        }))
+        .unwrap();
+        let interleaved = [
+            json!({"id": "a", "op": "d"}),
+            json!({"id": "b", "v": 1}),
+            json!({"id": "c", "op": "d"}),
+            json!({"id": "e", "v": 2}),
+        ];
+        assert_eq!(page_plans(&interleaved, &spec).len(), 1);
+        let colliding = [
+            json!({"id": "Bob", "op": "d"}),
+            json!({"id": "bob ", "v": 1}),
+        ];
+        assert_eq!(page_plans(&colliding, &spec).len(), 2);
+        let accented = [json!({"id": "José", "op": "d"}), json!({"id": "x", "v": 1})];
+        assert_eq!(page_plans(&accented, &spec).len(), 2);
+        let numbers = [json!({"id": 1, "op": "d"}), json!({"id": 2, "v": 1})];
+        assert_eq!(page_plans(&numbers, &spec).len(), 1);
+        let only_upserts = [json!({"id": "a"}), json!({"id": "A"})];
+        assert_eq!(page_plans(&only_upserts, &spec).len(), 1);
+    }
 
     // dataset_uri test is skipped: MssqlSink::new() requires a live pool
     // (connects to SQL Server in new()), and no offline constructor exists.

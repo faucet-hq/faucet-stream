@@ -389,6 +389,7 @@ impl ElasticsearchSink {
             if retry.is_empty() {
                 break;
             }
+            let retry = with_later_same_id(entries, &pending, retry);
             attempt += 1;
             tracing::debug!(
                 items = retry.len(),
@@ -579,7 +580,8 @@ impl ElasticsearchSink {
         };
         let mut term_scope = std::collections::BTreeMap::new();
         for (field, value) in scope {
-            let target = term_field(&properties, field).map_err(FaucetError::Sink)?;
+            let (target, limit) = term_target(&properties, field).map_err(FaucetError::Sink)?;
+            check_ignore_above(field, value, limit).map_err(FaucetError::Sink)?;
             term_scope.insert(target, value.clone());
         }
         let body = build_cleanup_query(&term_scope, &ids);
@@ -916,6 +918,53 @@ fn plan_origins(page: &[Value], spec: &faucet_core::WriteSpec) -> PlanWithOrigin
     }
 }
 
+/// The `_id` a `_bulk` entry (action line + optional source line) addresses.
+fn entry_doc_id(entry: &str) -> Option<String> {
+    let action: Value = serde_json::from_str(entry.lines().next()?).ok()?;
+    let meta = action.as_object()?.values().next()?;
+    match meta.get("_id")? {
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// `retry` plus every later entry of `pending` that addresses the `_id` of a
+/// retried one, in the original order: re-sending only the rejected entry
+/// would let it overwrite a later write to the same document (#862 L-110).
+fn with_later_same_id(entries: &[String], pending: &[usize], retry: Vec<usize>) -> Vec<usize> {
+    let retried: std::collections::HashSet<usize> = retry.iter().copied().collect();
+    let mut first_retry_of: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for &i in &retry {
+        if let Some(id) = entry_doc_id(&entries[i]) {
+            first_retry_of.entry(id).or_insert(i);
+        }
+    }
+    if first_retry_of.is_empty() {
+        return retry;
+    }
+    pending
+        .iter()
+        .copied()
+        .filter(|i| {
+            retried.contains(i)
+                || entry_doc_id(&entries[*i])
+                    .and_then(|id| first_retry_of.get(&id).copied())
+                    .is_some_and(|first| *i > first)
+        })
+        .collect()
+}
+
+/// How [`current_schema`](faucet_core::Sink::current_schema) reports a field
+/// of JSON type `base`: nullable, and also accepting an array, which is not
+/// part of the type so it never takes part in widening.
+fn reported_field(base: &str) -> Value {
+    serde_json::json!({
+        "type": [base, "null"],
+        (faucet_core::DRIFT_ALSO_ACCEPTS): ["array"],
+    })
+}
+
 /// How many times a `429` / `503` bulk item is re-sent on its own.
 const ITEM_RETRY_LIMIT: u32 = 5;
 
@@ -993,7 +1042,7 @@ fn first_failure(items: &[Value]) -> Result<(), FaucetError> {
 /// per-index identity keys Elasticsearch refuses on create. Copying only the
 /// mappings lost analyzers (so mappings referencing them failed), shard and
 /// replica counts, `refresh_interval`, index sorting and lifecycle policy
-/// (#789 MSG-51).
+/// (#789 MSG-51), shard allocation / routing and `hidden` (#862 L-113).
 fn copyable_settings(index_settings: &Value) -> Value {
     const KEEP: &[&str] = &[
         "analysis",
@@ -1010,6 +1059,11 @@ fn copyable_settings(index_settings: &Value) -> Value {
         "lifecycle",
         "max_ngram_diff",
         "max_shingle_diff",
+        "routing",
+        "routing_partition_size",
+        "auto_expand_replicas",
+        "hidden",
+        "query",
     ];
     let mut out = serde_json::Map::new();
     if let Some(obj) = index_settings.as_object() {
@@ -1024,6 +1078,13 @@ fn copyable_settings(index_settings: &Value) -> Value {
         lc.remove("rollover_alias");
         lc.remove("indexing_complete");
     }
+    // `initial_recovery` pins a shrunk/split index's first allocation to its
+    // source's nodes; a fresh staging index has no such source.
+    if let Some(Value::Object(allocation)) =
+        out.get_mut("routing").and_then(|r| r.get_mut("allocation"))
+    {
+        allocation.remove("initial_recovery");
+    }
     Value::Object(out)
 }
 
@@ -1032,7 +1093,10 @@ fn copyable_settings(index_settings: &Value) -> Value {
 /// A `text` field without a keyword sub-field cannot be matched exactly, so
 /// the cleanup is refused rather than deleting nothing. Dotted names walk
 /// object properties; an unmapped field is returned unchanged.
-fn term_field(properties: &Value, field: &str) -> Result<String, String> {
+/// Also returns the target's `ignore_above`: a longer string is stored but
+/// not indexed, so a `term` query on it matches nothing.
+fn term_target(properties: &Value, field: &str) -> Result<(String, Option<u64>), String> {
+    let ignore_above = |d: &Value| d.get("ignore_above").and_then(Value::as_u64);
     let mut props = properties;
     let mut def: Option<&Value> = None;
     for part in field.split('.') {
@@ -1041,27 +1105,40 @@ fn term_field(properties: &Value, field: &str) -> Result<String, String> {
                 def = Some(d);
                 props = d.get("properties").unwrap_or(&Value::Null);
             }
-            None => return Ok(field.to_string()),
+            None => return Ok((field.to_string(), None)),
         }
     }
     let Some(def) = def else {
-        return Ok(field.to_string());
+        return Ok((field.to_string(), None));
     };
     if def.get("type").and_then(Value::as_str) != Some("text") {
-        return Ok(field.to_string());
+        return Ok((field.to_string(), ignore_above(def)));
     }
     let keyword = def.get("fields").and_then(Value::as_object).and_then(|f| {
         f.iter()
             .find(|(_, d)| d.get("type").and_then(Value::as_str) == Some("keyword"))
-            .map(|(name, _)| name.clone())
     });
     match keyword {
-        Some(sub) => Ok(format!("{field}.{sub}")),
+        Some((sub, d)) => Ok((format!("{field}.{sub}"), ignore_above(d))),
         None => Err(format!(
             "cleanup: scope field '{field}' is mapped as analyzed `text` with no `keyword` \
              sub-field, so an exact match is impossible and the cleanup would delete nothing — \
              map it as `keyword` (or add a `keyword` sub-field)"
         )),
+    }
+}
+
+/// Refuse a scope value longer than its target's `ignore_above`: such a value
+/// is not indexed, so the cleanup would match (and delete) nothing (#862 L-112).
+fn check_ignore_above(field: &str, value: &Value, limit: Option<u64>) -> Result<(), String> {
+    match (value.as_str(), limit) {
+        (Some(s), Some(limit)) if s.chars().count() as u64 > limit => Err(format!(
+            "cleanup: scope value for '{field}' is {} characters, longer than the field's \
+             `ignore_above` ({limit}), so it is not indexed and the cleanup would delete \
+             nothing — raise `ignore_above` or map the field as `keyword` without a limit",
+            s.chars().count()
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1349,11 +1426,9 @@ impl faucet_core::Sink for ElasticsearchSink {
                 let es_type = def.get("type").and_then(|t| t.as_str()).unwrap_or("object");
                 let base = es_type_to_json(es_type);
                 // ES has no NOT NULL → every field is nullable, and any field
-                // holds an array of its type (#789 MSG-50).
-                out_props.insert(
-                    field.clone(),
-                    serde_json::json!({ "type": [base, "array", "null"] }),
-                );
+                // holds an array of its type (#789 MSG-50). The array is an
+                // also-accepted type, so it stays out of widening (#862 L-111).
+                out_props.insert(field.clone(), reported_field(base));
             }
         }
 
@@ -1748,6 +1823,12 @@ mod tests {
             "refresh_interval": "30s",
             "analysis": {"analyzer": {"a": {"type": "custom", "tokenizer": "standard"}}},
             "lifecycle": {"name": "p", "rollover_alias": "orders"},
+            "routing": {"allocation": {
+                "include": {"_tier_preference": "data_hot"},
+                "initial_recovery": {"_id": "n1"}
+            }},
+            "auto_expand_replicas": "0-1",
+            "hidden": "true",
             "uuid": "abc",
             "creation_date": "1",
             "provided_name": "orders-1",
@@ -1760,10 +1841,77 @@ mod tests {
                 "number_of_replicas": "1",
                 "refresh_interval": "30s",
                 "analysis": {"analyzer": {"a": {"type": "custom", "tokenizer": "standard"}}},
-                "lifecycle": {"name": "p"}
+                "lifecycle": {"name": "p"},
+                "routing": {"allocation": {"include": {"_tier_preference": "data_hot"}}},
+                "auto_expand_replicas": "0-1",
+                "hidden": "true"
             })
         );
         assert_eq!(copyable_settings(&json!("x")), json!({}));
+    }
+
+    #[test]
+    fn a_retried_entry_takes_later_writes_to_its_id_along() {
+        let e = |action: &str, id: &str, v: i32| {
+            format!("{{\"{action}\":{{\"_index\":\"i\",\"_id\":\"{id}\"}}}}\n{{\"v\":{v}}}\n")
+        };
+        let entries = vec![
+            e("index", "a", 1),
+            e("index", "b", 1),
+            e("index", "a", 2),
+            e("delete", "b", 0),
+            "{\"index\":{\"_index\":\"i\"}}\n{\"v\":9}\n".to_string(),
+        ];
+        assert_eq!(entry_doc_id(&entries[0]).as_deref(), Some("a"));
+        assert_eq!(entry_doc_id(&entries[4]), None);
+        let pending: Vec<usize> = (0..entries.len()).collect();
+        assert_eq!(with_later_same_id(&entries, &pending, vec![0]), vec![0, 2]);
+        assert_eq!(with_later_same_id(&entries, &pending, vec![2]), vec![2]);
+        assert_eq!(
+            with_later_same_id(&entries, &pending, vec![1, 4]),
+            vec![1, 3, 4]
+        );
+    }
+
+    #[test]
+    fn reported_fields_accept_arrays_and_still_widen() {
+        let dest = json!({"type": "object", "properties": {
+            "n": reported_field("integer"),
+            "tags": reported_field("string"),
+        }});
+        let page = json!({"type": "object", "properties": {
+            "n": {"type": "number"},
+            "tags": {"type": "array"},
+        }});
+        let diff = faucet_core::drift::diff_schema(&dest, &page, true);
+        assert_eq!(
+            diff.widenings
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["n"]
+        );
+        assert!(diff.incompatible.is_empty(), "{diff:?}");
+    }
+
+    #[test]
+    fn cleanup_refuses_scope_values_past_ignore_above() {
+        let props = json!({
+            "tenant": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4}}},
+            "plain": {"type": "keyword"}
+        });
+        let (target, limit) = term_target(&props, "tenant").unwrap();
+        assert_eq!((target.as_str(), limit), ("tenant.keyword", Some(4)));
+        assert_eq!(term_target(&props, "plain").unwrap().1, None);
+        assert!(check_ignore_above("tenant", &json!("abcd"), limit).is_ok());
+        let err = check_ignore_above("tenant", &json!("abcde"), limit).unwrap_err();
+        assert!(err.contains("ignore_above") && err.contains("(4)"), "{err}");
+        assert!(check_ignore_above("tenant", &json!(123456), limit).is_ok());
+        assert!(check_ignore_above("plain", &json!("long value"), None).is_ok());
+    }
+
+    fn term_field(properties: &Value, field: &str) -> Result<String, String> {
+        term_target(properties, field).map(|(target, _)| target)
     }
 
     #[test]

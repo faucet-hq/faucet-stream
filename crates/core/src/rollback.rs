@@ -100,8 +100,9 @@ pub struct RollbackOptions {
     /// Count what would change without changing anything.
     pub dry_run: bool,
     /// A later run wrote this dataset after the one being undone. A journaled
-    /// key with a before-image whose row is now gone was then deleted by that
-    /// later run, so restoring it would resurrect it: it counts as a conflict.
+    /// key with a before-image whose row is now gone, and which a later run's
+    /// journal also holds, was deleted by that later run, so restoring it
+    /// would resurrect it: it counts as a conflict.
     #[serde(default)]
     pub later_runs: bool,
 }
@@ -287,6 +288,22 @@ impl JournalSql {
         )
     }
 
+    /// The keys other runs journaled against one table at or after the first
+    /// journal row of one run. Binds: `p1` table, `p2` run, `p3` table, `p4`
+    /// run.
+    pub fn later_keys(&self) -> String {
+        format!(
+            "SELECT key_json FROM {t} WHERE table_name = {p1} AND run_id <> {p2} \
+             AND recorded_at >= (SELECT MIN(recorded_at) FROM {t} WHERE table_name = {p3} \
+             AND run_id = {p4})",
+            t = self.t(),
+            p1 = (self.placeholder)(1),
+            p2 = (self.placeholder)(2),
+            p3 = (self.placeholder)(3),
+            p4 = (self.placeholder)(4),
+        )
+    }
+
     /// Drop one run's journal rows for one table (after a restore).
     pub fn delete_table(&self) -> String {
         format!(
@@ -396,6 +413,31 @@ pub fn restorable(entries: &[JournalEntry]) -> Vec<&JournalEntry> {
     entries.iter().filter(|e| e.before.is_some()).collect()
 }
 
+/// The restorable entries whose key a later run also journaled
+/// (`later_keys` holds that run's `key_json` texts, from
+/// [`JournalSql::later_keys`]). Only such a key's missing row was deleted by a
+/// later run; a key the undone run deleted itself is not among them, so
+/// restoring it is the undo, not a conflict.
+pub fn touched_later<'a>(
+    restorable: &[&'a JournalEntry],
+    later_keys: &[String],
+    key: &[String],
+) -> Vec<&'a JournalEntry> {
+    let later: std::collections::HashSet<String> = later_keys
+        .iter()
+        .filter_map(|k| JournalEntry::decode(k, None).ok())
+        .map(|e| key_json(&e.tuple(key)))
+        .collect();
+    if later.is_empty() {
+        return Vec::new();
+    }
+    restorable
+        .iter()
+        .copied()
+        .filter(|e| later.contains(&key_json(&e.tuple(key))))
+        .collect()
+}
+
 pub fn plan_restore(entries: &[JournalEntry]) -> (Vec<&JournalEntry>, Vec<serde_json::Value>) {
     let mut deletes = Vec::new();
     let mut restores = Vec::new();
@@ -412,6 +454,35 @@ pub fn plan_restore(entries: &[JournalEntry]) -> (Vec<&JournalEntry>, Vec<serde_
 mod tests {
     use super::*;
     use crate::write_mode::WriteMode;
+
+    #[test]
+    fn only_keys_a_later_run_journaled_count_as_touched_later() {
+        let key = vec!["id".to_string()];
+        let entries = vec![
+            JournalEntry::decode(r#"{"id":"1"}"#, Some(r#"{"id":1}"#)).unwrap(),
+            JournalEntry::decode(r#"{"id":"2"}"#, Some(r#"{"id":2}"#)).unwrap(),
+        ];
+        let kept = restorable(&entries);
+        let touched = touched_later(&kept, &[r#"{"id":"2"}"#.to_string(), "junk".into()], &key);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].key["id"], "2");
+        assert!(touched_later(&kept, &[], &key).is_empty());
+        let j = JournalSql {
+            quote: |s| format!("\"{s}\""),
+            placeholder: |n| format!("${n}"),
+            before_type: "JSONB",
+            insert_prefix: "INSERT",
+            insert_suffix: "",
+            now: "now()",
+            key_column: KEY_COLUMN_TEXT,
+            primary_key: PRIMARY_KEY_TEXT,
+        };
+        let sql = j.later_keys();
+        assert!(
+            sql.contains("run_id <> $2") && sql.contains("run_id = $4"),
+            "{sql}"
+        );
+    }
 
     #[test]
     fn restorable_keeps_only_keys_with_a_before_image() {

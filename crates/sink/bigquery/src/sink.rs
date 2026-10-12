@@ -61,31 +61,96 @@ pub(crate) fn job_timed_out(limit: Duration, started: std::time::Instant) -> boo
     !limit.is_zero() && started.elapsed() >= limit
 }
 
-/// Best-effort `jobs.cancel` for a job that outlived `job_timeout`, returning
-/// the error the write fails with (SQL-96).
+/// How long [`cancel_timed_out_job`] waits for a cancelled job to stop.
+const CANCEL_CONFIRM: Duration = Duration::from_secs(30);
+
+/// What became of a job that outlived `job_timeout` once cancellation was
+/// requested.
+pub(crate) enum CancelOutcome {
+    /// It finished successfully before the cancel took effect: its changes
+    /// committed, so the caller carries on as if it had completed in time.
+    Succeeded,
+    /// The write fails. `terminal` says whether the job is known to have
+    /// stopped; while it may still run, it may still read its inputs.
+    Failed {
+        error: FaucetError,
+        #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+        terminal: bool,
+    },
+}
+
+/// Request `jobs.cancel` for a job that outlived `job_timeout`, then poll it
+/// (up to [`CANCEL_CONFIRM`]) until it stops (SQL-96). A job that won the race
+/// and succeeded is reported as such instead of as a failure.
 pub(crate) async fn cancel_timed_out_job(
     client: &Client,
     config: &BigQuerySinkConfig,
     kind: &str,
     job_id: &str,
     location: Option<&str>,
-) -> FaucetError {
+) -> CancelOutcome {
     let secs = config.job_timeout.as_secs();
-    let cancelled = match client
+    let failed = |what: String, terminal: bool| CancelOutcome::Failed {
+        error: FaucetError::Sink(format!(
+            "BigQuery {kind} job '{job_id}' did not complete within job_timeout ({secs}s); \
+             {what}. Raise `job_timeout` (0 = no limit) for long-running jobs"
+        )),
+        terminal,
+    };
+    if let Err(e) = client
         .job()
         .cancel_job(&config.project_id, job_id, location)
         .await
     {
-        Ok(_) => "cancelled".to_string(),
-        Err(e) => {
-            tracing::warn!(job_id, error = %e, "BigQuery jobs.cancel failed after job_timeout");
-            format!("cancel failed: {e}")
+        tracing::warn!(job_id, error = %e, "BigQuery jobs.cancel failed after job_timeout");
+        return failed(
+            format!("cancel failed ({e}), so the job may still commit"),
+            false,
+        );
+    }
+    let deadline = std::time::Instant::now() + CANCEL_CONFIRM;
+    loop {
+        let target = faucet_common_bigquery::raw::RawTarget {
+            creds: &config.auth,
+            host: config.upload_base_url.as_deref(),
+        };
+        let job = match faucet_common_bigquery::raw::tolerant_get_job(
+            client,
+            target,
+            &config.project_id,
+            job_id,
+            location,
+        )
+        .await
+        {
+            Ok(job) => job,
+            Err(e) => {
+                return failed(
+                    format!(
+                        "cancel requested but not confirmed cancelled ({e}), so the job may \
+                         still commit"
+                    ),
+                    false,
+                );
+            }
+        };
+        if let Some(status) = job.status
+            && status.state.as_deref() == Some("DONE")
+        {
+            return match status.error_result {
+                None => CancelOutcome::Succeeded,
+                Some(_) => failed("cancelled".to_string(), true),
+            };
         }
-    };
-    FaucetError::Sink(format!(
-        "BigQuery {kind} job '{job_id}' did not complete within job_timeout ({secs}s); \
-         {cancelled}. Raise `job_timeout` (0 = no limit) for long-running jobs"
-    ))
+        if std::time::Instant::now() >= deadline {
+            return failed(
+                "cancel requested but the job has not stopped yet, so it may still commit"
+                    .to_string(),
+                false,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// `true` when a `tables.get` error is a 404 (table does not exist) — used by
@@ -93,6 +158,14 @@ pub(crate) async fn cancel_timed_out_job(
 /// than a hard error.
 fn is_table_not_found(err: &BQError) -> bool {
     matches!(err, BQError::ResponseError { error } if error.error.code == 404)
+}
+
+/// A 404 that names the *table* (`Not found: Table p:d.t`), as opposed to a
+/// missing dataset or project, which creating the table cannot fix.
+fn is_missing_table(err: &BQError) -> bool {
+    matches!(err, BQError::ResponseError { error }
+        if error.error.code == 404
+            && error.error.message.to_ascii_lowercase().contains("not found: table"))
 }
 
 /// Max attempts (including the first) for a transient BigQuery control-plane call.
@@ -1357,7 +1430,10 @@ impl BigQuerySink {
                 return Ok(load_output_rows(&job));
             }
             if self.job_timed_out(started) {
-                return Err(self.cancel_timed_out_job("load", job_id, location).await);
+                match self.cancel_timed_out_job("load", job_id, location).await {
+                    CancelOutcome::Succeeded => continue,
+                    CancelOutcome::Failed { error, .. } => return Err(error),
+                }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -1403,14 +1479,14 @@ impl BigQuerySink {
         job_timed_out(self.config.job_timeout, started)
     }
 
-    /// Cancel a job that outlived `job_timeout` and build the run's error, so
-    /// the job cannot commit after the write was reported failed (SQL-96).
+    /// Request cancellation of a job that outlived `job_timeout` and wait for
+    /// it to stop (SQL-96).
     async fn cancel_timed_out_job(
         &self,
         kind: &str,
         job_id: &str,
         location: Option<&str>,
-    ) -> FaucetError {
+    ) -> CancelOutcome {
         cancel_timed_out_job(&self.client, &self.config, kind, job_id, location).await
     }
 
@@ -1917,11 +1993,13 @@ impl BigQuerySink {
                     break;
                 }
                 if self.job_timed_out(started) {
-                    return Err((
-                        self.cancel_timed_out_job("query", &job_id, location.as_deref())
-                            .await,
-                        false,
-                    ));
+                    match self
+                        .cancel_timed_out_job("query", &job_id, location.as_deref())
+                        .await
+                    {
+                        CancelOutcome::Succeeded => break,
+                        CancelOutcome::Failed { error, .. } => return Err((error, false)),
+                    }
                 }
                 // The server long-poll normally blocks until completion, but if
                 // it returns early, back off so a still-running job can't turn
@@ -2266,9 +2344,9 @@ impl faucet_core::Sink for BigQuerySink {
 
         let probe = match result {
             Ok(Ok(_table)) => Probe::pass("auth", started.elapsed()),
-            // A 404 proves the credentials work; the table is created on the
-            // first write.
-            Ok(Err(e)) if self.config.create_table && is_table_not_found(&e) => {
+            // A 404 naming the table proves the credentials and dataset work;
+            // the table is created on the first write.
+            Ok(Err(e)) if self.config.create_table && is_missing_table(&e) => {
                 Probe::pass("auth", started.elapsed())
             }
             Ok(Err(e)) => Probe::fail_hint(
@@ -3600,6 +3678,34 @@ mod tests {
         // 404 is the table-not-found probe signal (used to decide create-vs-use).
         assert!(is_table_not_found(&response_err(404)));
         assert!(!is_table_not_found(&response_err(500)));
+    }
+
+    #[test]
+    fn only_a_missing_table_passes_the_preflight() {
+        use gcp_bigquery_client::error::{BQError, NestedResponseError, ResponseError};
+        let err = |code: i64, message: &str| BQError::ResponseError {
+            error: ResponseError {
+                error: NestedResponseError {
+                    code,
+                    errors: Vec::new(),
+                    message: message.to_string(),
+                    status: String::new(),
+                },
+            },
+        };
+        assert!(super::is_missing_table(&err(404, "Not found: Table p:d.t")));
+        assert!(!super::is_missing_table(&err(
+            404,
+            "Not found: Dataset p:d"
+        )));
+        assert!(!super::is_missing_table(&err(
+            404,
+            "Not found: Project typo"
+        )));
+        assert!(!super::is_missing_table(&err(
+            403,
+            "Not found: Table p:d.t"
+        )));
     }
 
     #[test]

@@ -184,7 +184,7 @@ pub(crate) async fn token_provider_bq(
                 .await
                 .map_err(BQError::InvalidServiceAccountAuthenticator)?
         }
-        BigQueryCredentials::ApplicationDefault => match authorized_user_adc()? {
+        BigQueryCredentials::ApplicationDefault => match authorized_user_adc().await? {
             Some(secret) => yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
                 .build()
                 .await
@@ -215,7 +215,7 @@ fn adc_path(gac: Option<String>, home: Option<String>) -> Option<std::path::Path
 /// The `authorized_user` secret in the ADC file, if that is what it holds
 /// (`gcloud auth application-default login`). yup-oauth2's ADC flow only
 /// knows service accounts and instance metadata.
-fn authorized_user_adc()
+async fn authorized_user_adc()
 -> Result<Option<gcp_bigquery_client::yup_oauth2::authorized_user::AuthorizedUserSecret>, BQError> {
     let Some(path) = adc_path(
         std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok(),
@@ -223,7 +223,7 @@ fn authorized_user_adc()
     ) else {
         return Ok(None);
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
         return Ok(None);
     };
     parse_authorized_user(&contents)
@@ -233,16 +233,21 @@ fn parse_authorized_user(
     contents: &str,
 ) -> Result<Option<gcp_bigquery_client::yup_oauth2::authorized_user::AuthorizedUserSecret>, BQError>
 {
-    let is_user = serde_json::from_str::<serde_json::Value>(contents)
+    let kind = serde_json::from_str::<serde_json::Value>(contents)
         .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(|t| t == "authorized_user")
-        })
-        .unwrap_or(false);
-    if !is_user {
-        return Ok(None);
+        .and_then(|v| v.get("type")?.as_str().map(str::to_string));
+    match kind.as_deref() {
+        Some("authorized_user") => {}
+        None | Some("service_account") => return Ok(None),
+        Some(other) => {
+            return Err(BQError::InvalidApplicationDefaultCredentialsAuthenticator(
+                std::io::Error::other(format!(
+                    "the application-default credentials file has type {other:?}, which is \
+                     not supported; use a service-account key or \
+                     `gcloud auth application-default login`"
+                )),
+            ));
+        }
     }
     serde_json::from_str(contents)
         .map(Some)
@@ -288,6 +293,10 @@ mod tests {
         );
         assert!(parse_authorized_user("not json").unwrap().is_none());
         assert!(parse_authorized_user(r#"{"type":"authorized_user"}"#).is_err());
+        let external = parse_authorized_user(r#"{"type":"external_account"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(external.contains("\"external_account\""), "{external}");
     }
 
     #[tokio::test]
