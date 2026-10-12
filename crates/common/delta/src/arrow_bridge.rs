@@ -20,13 +20,13 @@ pub fn schema_from_delta(
     let mut buf = Vec::new();
     {
         let mut writer = delta_arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema)
-            .map_err(|e| bridge_error("encode Delta schema", &e))?;
+            .map_err(|e| source_bridge_error("encode Delta schema", &e))?;
         writer
             .finish()
-            .map_err(|e| bridge_error("encode Delta schema", &e))?;
+            .map_err(|e| source_bridge_error("encode Delta schema", &e))?;
     }
     let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(buf), None)
-        .map_err(|e| bridge_error("decode Delta schema", &e))?;
+        .map_err(|e| source_bridge_error("decode Delta schema", &e))?;
     Ok(reader.schema())
 }
 
@@ -117,12 +117,30 @@ fn into_delta_ffi(
     }
 }
 
+/// A bridge failure on the write side (`schema_to_delta`, `batch_to_delta`).
 fn bridge_error(what: &str, detail: &dyn std::fmt::Display) -> FaucetError {
-    FaucetError::Custom(format!("delta: arrow bridge could not {what}: {detail}").into())
+    FaucetError::Sink(format!("delta: arrow bridge could not {what}: {detail}"))
+}
+
+/// A bridge failure on the read side (`schema_from_delta`).
+fn source_bridge_error(what: &str, detail: &dyn std::fmt::Display) -> FaucetError {
+    FaucetError::Source(format!("delta: arrow bridge could not {what}: {detail}"))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bridge_errors_are_typed_by_side() {
+        assert!(matches!(
+            super::bridge_error("x", &"y"),
+            faucet_core::FaucetError::Sink(m) if m.contains("could not x: y")
+        ));
+        assert!(matches!(
+            super::source_bridge_error("x", &"y"),
+            faucet_core::FaucetError::Source(_)
+        ));
+    }
+
     use std::collections::HashMap;
     use std::sync::Arc;
 
