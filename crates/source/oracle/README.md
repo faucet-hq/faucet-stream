@@ -29,7 +29,7 @@ Connection fields (`connect_string` or `host` + `service_name`/`sid`, `username`
 | `max_connections` | `10` | Pooled sessions. |
 | `statement_timeout_secs` | `300` | Per-round-trip call timeout (`0` disables). |
 | `replication` | `{ type: full }` | Or `{ type: incremental, column, initial_value }`. |
-| `state_key` | derived | Bookmark key; defaults to `oracle:<service>:<query hash>`. |
+| `state_key` | derived | Bookmark key; defaults to `oracle:<service>:<query hash>`. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
 | `shard` | — | `{ key: ID }` — integer output column for PK-range sharding. |
 | `json_columns` | `[]` | Output columns whose text is JSON, emitted as parsed values. |
 

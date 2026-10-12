@@ -25,7 +25,7 @@ rows as JSON objects with `O(batch_size)` memory. It supports **full** and
 | `max_connections` | no | Pool size (default `10`). |
 | `batch_size` | no | Rows per emitted page (default `1000`; `0` = one page). |
 | `replication` | no | `{ type: full }` (default) or `{ type: incremental, column, initial_value }`. |
-| `state_key` | no | Explicit bookmark key; otherwise derived from host/database/query. |
+| `state_key` | no | Explicit bookmark key; otherwise derived from host/database/query. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
 
 ## Incremental replication
 
