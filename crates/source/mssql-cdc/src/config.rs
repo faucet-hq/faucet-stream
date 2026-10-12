@@ -166,6 +166,19 @@ impl MssqlCdcSourceConfig {
             .max(u32::try_from(self.capture_instances.len()).unwrap_or(u32::MAX))
     }
 
+    /// A warning when the pool must exceed `max_connections`, because each
+    /// poll holds one connection per capture instance with changes.
+    pub fn pool_size_warning(&self) -> Option<String> {
+        let size = self.pool_size();
+        (size > self.max_connections).then(|| {
+            format!(
+                "mssql-cdc: the connection pool is raised from max_connections = {} to {size}, \
+                 one per capture instance, so a poll can open {size} concurrent connections",
+                self.max_connections
+            )
+        })
+    }
+
     /// The state-store key for this source's LSN bookmark map. Uses the explicit
     /// `state_key` override when set, otherwise a derived, stable key.
     pub fn resolved_state_key(&self) -> String {
@@ -360,8 +373,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(c.pool_size(), 5);
+        assert!(c.pool_size_warning().is_none());
         c.max_connections = 1;
         assert_eq!(c.pool_size(), 2);
+        let warning = c.pool_size_warning().unwrap();
+        assert!(warning.contains("max_connections = 1 to 2"), "{warning}");
     }
 
     #[test]

@@ -270,6 +270,82 @@ async fn a_cancelled_run_flushes_what_it_accepted() {
     );
 }
 
+/// A live-feed source: it holds what it received until the run is cancelled,
+/// then yields that tail and ends (`Source::set_cancel` returns `true`).
+struct BufferingFeed {
+    cancel: std::sync::Mutex<Option<CancellationToken>>,
+}
+
+#[async_trait::async_trait]
+impl faucet_core::Source for BufferingFeed {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, faucet_core::FaucetError> {
+        Ok(Vec::new())
+    }
+    fn set_cancel(&self, cancel: CancellationToken) -> bool {
+        *self.cancel.lock().unwrap() = Some(cancel);
+        true
+    }
+    fn stream_pages<'a>(
+        &'a self,
+        _ctx: &'a std::collections::HashMap<String, serde_json::Value>,
+        _batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<
+                    Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let cancel = self.cancel.lock().unwrap().clone().unwrap_or_default();
+        Box::pin(async_stream::stream! {
+            cancel.cancelled().await;
+            yield Ok(faucet_core::StreamPage {
+                records: vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})],
+                bookmark: None,
+            });
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_source_that_drains_on_cancel_has_its_tail_written_then_flushed() {
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone());
+    let source = BufferingFeed {
+        cancel: std::sync::Mutex::new(None),
+    };
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        canceller.cancel();
+    });
+
+    let result = Pipeline::new(&source, &sink)
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect("a cancelled run stops cleanly");
+
+    assert_eq!(
+        result.records_written, 2,
+        "the buffered tail must be written"
+    );
+    let events = log.events();
+    let write = events
+        .iter()
+        .position(|e| matches!(e, Event::Write(2)))
+        .expect("the tail reaches the sink");
+    assert!(
+        events[write..].iter().any(|e| matches!(e, Event::Flush)),
+        "the tail is flushed after it is written: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn cancelling_before_the_first_page_writes_nothing_and_claims_nothing() {
     let log = EventLog::new();

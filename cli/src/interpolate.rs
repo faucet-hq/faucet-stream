@@ -129,21 +129,73 @@ pub fn interpolate_value_with_env(value: &mut Value, overlay: &EnvOverlay) -> Cl
 pub fn interpolate_record(input: &str, ctx: &HashMap<String, Value>) -> CliResult<String> {
     rewrite(input, |body| match classify_directive(body) {
         Directive::LoadTime { .. } => Ok(None),
+        Directive::Deferred { id, path } => Ok(Some(value_to_string_record(&resolve_token(
+            body, id, path, ctx,
+        )?))),
+    })
+}
+
+/// The value a deferred `${id.path}` token names in `ctx`.
+fn resolve_token(
+    body: &str,
+    id: &str,
+    path: &str,
+    ctx: &HashMap<String, Value>,
+) -> CliResult<Value> {
+    let record = ctx
+        .get(id)
+        .ok_or_else(|| CliError::UnknownInterpolationId {
+            id: id.to_owned(),
+            token: format!("${{{body}}}"),
+        })?;
+    resolve_dotted(record, path).ok_or_else(|| CliError::MissingRecordField {
+        id: id.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
+/// [`interpolate_record`] for a URL path field (#862 L-122). A token embedded
+/// in a longer path (`/items/${parent.id}`) is percent-encoded, so a value
+/// holding `/`, `?` or `#` stays inside its segment, and a value of `.` or
+/// `..` is refused. A field that is exactly one token (`${parent.href}`)
+/// takes the value raw, so a parent's own relative path still works.
+pub fn interpolate_record_path(input: &str, ctx: &HashMap<String, Value>) -> CliResult<String> {
+    if is_single_token(input) {
+        return interpolate_record(input, ctx);
+    }
+    rewrite(input, |body| match classify_directive(body) {
+        Directive::LoadTime { .. } => Ok(None),
         Directive::Deferred { id, path } => {
-            let record = ctx
-                .get(id)
-                .ok_or_else(|| CliError::UnknownInterpolationId {
-                    id: id.to_owned(),
-                    token: format!("${{{body}}}"),
-                })?;
-            let resolved =
-                resolve_dotted(record, path).ok_or_else(|| CliError::MissingRecordField {
-                    id: id.to_owned(),
-                    path: path.to_owned(),
-                })?;
-            Ok(Some(value_to_string_record(&resolved)))
+            let raw = value_to_string_record(&resolve_token(body, id, path, ctx)?);
+            if raw == "." || raw == ".." {
+                return Err(CliError::Config(format!(
+                    "`${{{body}}}` resolved to `{raw}` inside a URL path, which would change \
+                     the path rather than fill one segment"
+                )));
+            }
+            Ok(Some(encode_path_segment(&raw)))
         }
     })
+}
+
+fn is_single_token(input: &str) -> bool {
+    input
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|body| !body.is_empty() && !body.contains('}'))
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// [`interpolate_record`] for a field holding XML text: every substituted
@@ -152,20 +204,9 @@ pub fn interpolate_record(input: &str, ctx: &HashMap<String, Value>) -> CliResul
 pub fn interpolate_record_xml(input: &str, ctx: &HashMap<String, Value>) -> CliResult<String> {
     rewrite(input, |body| match classify_directive(body) {
         Directive::LoadTime { .. } => Ok(None),
-        Directive::Deferred { id, path } => {
-            let record = ctx
-                .get(id)
-                .ok_or_else(|| CliError::UnknownInterpolationId {
-                    id: id.to_owned(),
-                    token: format!("${{{body}}}"),
-                })?;
-            let resolved =
-                resolve_dotted(record, path).ok_or_else(|| CliError::MissingRecordField {
-                    id: id.to_owned(),
-                    path: path.to_owned(),
-                })?;
-            Ok(Some(escape_xml_text(&value_to_string_record(&resolved))))
-        }
+        Directive::Deferred { id, path } => Ok(Some(escape_xml_text(&value_to_string_record(
+            &resolve_token(body, id, path, ctx)?,
+        )))),
     })
 }
 
@@ -945,6 +986,34 @@ mod tests {
     fn passes_through_text_with_no_directives() {
         let out = interpolate("just a string").unwrap();
         assert_eq!(out, "just a string");
+    }
+
+    #[test]
+    fn path_fields_encode_embedded_tokens_and_keep_a_whole_token_raw() {
+        let ctx: HashMap<String, Value> = HashMap::from([(
+            "p".to_string(),
+            json!({"id": "a/b?c#d e", "href": "/v1/items/7?x=1", "dot": "..", "n": 5}),
+        )]);
+        assert_eq!(
+            interpolate_record_path("/items/${p.id}/sub", &ctx).unwrap(),
+            "/items/a%2Fb%3Fc%23d%20e/sub"
+        );
+        assert_eq!(interpolate_record_path("/n/${p.n}", &ctx).unwrap(), "/n/5");
+        assert_eq!(
+            interpolate_record_path("${p.href}", &ctx).unwrap(),
+            "/v1/items/7?x=1"
+        );
+        let err = interpolate_record_path("/items/${p.dot}", &ctx).unwrap_err();
+        assert!(err.to_string().contains("would change"), "{err}");
+        assert!(interpolate_record_path("/items/${p.nope}", &ctx).is_err());
+        assert_eq!(
+            interpolate_record_path("/env/${env:HOME}", &ctx).unwrap(),
+            "/env/${env:HOME}"
+        );
+        assert_eq!(interpolate_record_path("/static", &ctx).unwrap(), "/static");
+        assert!(!is_single_token("${a}${b}"));
+        assert!(!is_single_token("${}"));
+        assert!(is_single_token("${p.href}"));
     }
 
     #[test]

@@ -23,7 +23,10 @@ pub mod spawn;
 pub mod temp;
 
 pub use env::{BASELINE_ENV, InheritEnv};
-pub use lines::{CappedLine, DEFAULT_MAX_LINE_BYTES, read_capped_line};
+pub use lines::{
+    CappedLine, DEFAULT_MAX_LINE_BYTES, MAX_LOG_LINE_BYTES, read_capped_line, read_log_line,
+    skip_line_rest,
+};
 pub use message::{SingerMessage, parse_line};
 pub use redact::{Redactor, secret_like_values};
 pub use spawn::spawn_command;

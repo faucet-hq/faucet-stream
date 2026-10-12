@@ -214,14 +214,51 @@ fn sanitize_row_id(name: &str) -> String {
     }
 }
 
-/// Assign each dataset a row id — which is also its state key, so it must not
-/// depend on listing order or on which other datasets happen to exist.
+/// Assign each dataset a row id — which is also its state key, so it depends
+/// only on the dataset itself, never on listing order or on which other
+/// datasets exist (#862 L-040).
 ///
-/// A dataset keeps its plain sanitized name when that is unambiguous; it gets a
-/// `-<hash>` suffix of its full name (plus its config patch, for exact
-/// duplicates) when the sanitized name is reserved, empty, or shared with
-/// another dataset whose name is not literally that id.
+/// A dataset whose name is already a valid, unreserved row id keeps it; any
+/// other gets its sanitized name plus a `-<hash>` of its full name. Datasets
+/// listed under one identical name also hash their config patch; fully
+/// identical entries, which are interchangeable, are numbered.
 pub(crate) fn unique_row_ids(datasets: &[DatasetDescriptor]) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut name_count: HashMap<&str, usize> = HashMap::new();
+    for d in datasets {
+        *name_count.entry(d.name.as_str()).or_default() += 1;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    datasets
+        .iter()
+        .map(|d| {
+            let base = sanitize_row_id(&d.name);
+            let duplicate = name_count[d.name.as_str()] > 1;
+            let reserved = crate::expand::RESERVED_IDS.contains(&base.as_str());
+            let stem = if d.name == base && !reserved && !duplicate {
+                base
+            } else {
+                let mut material = d.name.clone();
+                if duplicate {
+                    material.push('\0');
+                    material.push_str(&d.config_patch.to_string());
+                }
+                format!("{base}-{:08x}", fnv1a(&material) as u32)
+            };
+            let mut id = stem.clone();
+            let mut n = 1;
+            while !seen.insert(id.clone()) {
+                n += 1;
+                id = format!("{stem}-{n}");
+            }
+            id
+        })
+        .collect()
+}
+
+/// The ids releases before #862 L-040 assigned, for each dataset whose id
+/// changed: a sanitized name stayed plain unless another dataset shared it.
+pub(crate) fn legacy_row_ids(datasets: &[DatasetDescriptor]) -> Vec<Option<String>> {
     use std::collections::{HashMap, HashSet};
     let bases: Vec<String> = datasets.iter().map(|d| sanitize_row_id(&d.name)).collect();
     let mut base_count: HashMap<&str, usize> = HashMap::new();
@@ -230,11 +267,13 @@ pub(crate) fn unique_row_ids(datasets: &[DatasetDescriptor]) -> Vec<String> {
         *base_count.entry(b.as_str()).or_default() += 1;
         *name_count.entry(d.name.as_str()).or_default() += 1;
     }
+    let current = unique_row_ids(datasets);
     let mut seen: HashSet<String> = HashSet::new();
     datasets
         .iter()
         .zip(&bases)
-        .map(|(d, base)| {
+        .zip(current)
+        .map(|((d, base), now)| {
             let reserved = crate::expand::RESERVED_IDS.contains(&base.as_str())
                 || d.name.chars().all(|c| !c.is_ascii_alphanumeric());
             let exact = d.name == *base && name_count[d.name.as_str()] == 1;
@@ -255,7 +294,7 @@ pub(crate) fn unique_row_ids(datasets: &[DatasetDescriptor]) -> Vec<String> {
                 n += 1;
                 id = format!("{stem}-{n}");
             }
-            id
+            (id != now).then_some(id)
         })
         .collect()
 }
@@ -395,6 +434,7 @@ fn render_discovered_config(
         .map_err(|e| CliError::Internal(format!("yaml render: {e}")))?;
 
     let row_ids = unique_row_ids(datasets);
+    let legacy_ids = legacy_row_ids(datasets);
     let shared_sink = shared_sink_spec(&root, sink_template);
     let destinations: Vec<Option<String>> = datasets
         .iter()
@@ -434,6 +474,9 @@ fn render_discovered_config(
         }
         let mut row =
             json!({ "id": id, "source": { "config": inert_directives(d.config_patch.clone()) } });
+        if let Some(old) = &legacy_ids[i] {
+            row["legacy_state_ids"] = json!([old]);
+        }
         // Cost hint for `execution.schedule: lpt` (#644). Discovery is the one
         // place that knows both halves, so it is where the estimate belongs —
         // the executor just ranks by it.
@@ -745,9 +788,45 @@ mod tests {
         assert_eq!(sanitize_row_id("public.orders"), "public_orders");
         assert_eq!(sanitize_row_id("raw/orders/"), "raw_orders");
         assert_eq!(sanitize_row_id("...."), "dataset");
+        let ids = unique_row_ids(&[ds("public.orders", "table", json!({}))]);
+        assert!(ids[0].starts_with("public_orders-"), "{ids:?}");
         assert_eq!(
-            unique_row_ids(&[ds("public.orders", "table", json!({}))]),
-            vec!["public_orders"]
+            unique_row_ids(&[ds("orders", "table", json!({}))]),
+            vec!["orders"]
+        );
+    }
+
+    /// #862 L-040: a dataset's id depends on it alone, so a newly discovered
+    /// dataset that sanitizes alike never renames an existing row; the id an
+    /// earlier release used is reported so its state can be moved.
+    #[test]
+    fn a_new_look_alike_dataset_leaves_existing_ids_alone() {
+        let before = [ds("public.orders", "table", json!({"q": 1}))];
+        let after = [
+            ds("public.orders", "table", json!({"q": 1})),
+            ds("public/orders", "table", json!({"q": 2})),
+        ];
+        assert_eq!(unique_row_ids(&before)[0], unique_row_ids(&after)[0]);
+        assert_eq!(
+            legacy_row_ids(&before),
+            vec![Some("public_orders".to_string())]
+        );
+        assert_eq!(
+            legacy_row_ids(&[ds("orders", "table", json!({}))]),
+            vec![None]
+        );
+        let legacy_after = legacy_row_ids(&after);
+        assert!(legacy_after.iter().all(Option::is_none), "{legacy_after:?}");
+        let rendered = render_discovered_config(
+            "version: 1\nname: d\npipeline:\n  source: { type: sqlite, config: { path: x.db } }\n  sink: { type: stdout, config: {} }\n",
+            "default",
+            None,
+            &before,
+        )
+        .unwrap();
+        assert!(
+            rendered.contains("legacy_state_ids") && rendered.contains("public_orders"),
+            "{rendered}"
         );
     }
 
@@ -866,7 +945,8 @@ pipeline:
         let cfg = crate::config::parse_with_extension(&doc, "yaml").unwrap();
         let nodes = crate::expand::expand(&cfg).unwrap();
         assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0].id, "public_orders");
+        assert_eq!(nodes[0].id, "public_orders-1f58f903");
+        assert_eq!(nodes[0].legacy_state_ids, vec!["public_orders".to_string()]);
         assert_eq!(
             nodes[0].source.config["query"], "SELECT * FROM \"public\".\"orders\"",
             "row patch deep-merged over the connection config"
@@ -877,8 +957,14 @@ pipeline:
         );
         // #789 FILE-05: one fixed jsonl path would have the rows overwrite each
         // other, so each row writes its own file.
-        assert_eq!(nodes[0].sink.config["path"], "./out.public_orders.jsonl");
-        assert_eq!(nodes[1].sink.config["path"], "./out.sales_leads.jsonl");
+        assert_eq!(
+            nodes[0].sink.config["path"],
+            "./out.public_orders-1f58f903.jsonl"
+        );
+        assert_eq!(
+            nodes[1].sink.config["path"],
+            "./out.sales_leads-befd6242.jsonl"
+        );
     }
 
     #[test]

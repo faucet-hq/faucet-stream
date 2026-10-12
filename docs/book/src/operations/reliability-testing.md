@@ -123,6 +123,11 @@ Separately, a cancelled run *flushes*: that is the difference between a
 cooperative cancel and a dropped future, and it is what makes a buffered
 Parquet footer or an S3 multipart commit instead of orphaning.
 
+A source that buffers records it cannot re-read (a live WebSocket feed) takes
+the run's token through `Source::set_cancel` and returns `true`; the pipeline
+then keeps polling it after the cancel, so the tail it yields is written and
+flushed before the run ends.
+
 ### Cleanup safety (`reliability_cleanup_safety`)
 
 Scoped cleanup is the only feature that **deletes destination rows**, so its

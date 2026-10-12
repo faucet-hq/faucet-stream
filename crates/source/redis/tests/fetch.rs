@@ -417,6 +417,25 @@ async fn fetch_all_keys_returns_key_value_pairs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_non_utf8_key_name_is_read_not_fatal() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let _: () = conn.set(vec![0xff_u8, b'k'], "1").await.unwrap();
+    let source = RedisSource::new(RedisSourceConfig::new(
+        &url,
+        RedisSourceType::Keys {
+            pattern: "*k".into(),
+        },
+    ))
+    .unwrap();
+    let records = source.fetch_all().await.expect("fetch_all ok");
+    assert_eq!(
+        records,
+        vec![serde_json::json!({"key": "/2s=", "value": 1})]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fetch_all_keys_non_json_value_falls_back_to_string() {
     let (_container, url) = start_redis().await;
     let mut conn = open_conn(&url).await;

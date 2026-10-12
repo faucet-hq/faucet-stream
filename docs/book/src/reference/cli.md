@@ -1811,7 +1811,9 @@ faucet run pipeline.yaml --output json      # one JSON document: per-row + total
 faucet run pipeline.yaml --output ndjson     # one JSON object per matrix row
 ```
 
-Each row reports `status`, `error` (the failure message, redacted),
+Each row reports `status` (`ok`, `failed`, or `skipped` for a row that never
+ran because its parent or a `depends_on` row failed — counted under
+`totals.skipped`, not `totals.failed`), `error` (the failure message, redacted),
 `rows_in` / `rows_out`, `duration_ms`, `dlq_count`, `bookmark` (after the run),
 `batches` (how its sink writes ended — see
 [batch outcomes](../cookbook/dlq.md#seeing-what-happened-to-each-batch)),

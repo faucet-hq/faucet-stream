@@ -2981,8 +2981,9 @@ fn parse_retry_after(headers: &HeaderMap) -> Duration {
 
 /// Whether `path` addresses something in `body`, telling "no records" from "the
 /// records key is absent" (API-23). A path matching nothing still resolves when
-/// its container does (`$.items[*]` over `{"items": []}`), and an empty body
-/// (a `204`, a tolerated error) always resolves.
+/// the container before its first wildcard does (`$.items[*]` over
+/// `{"items": []}`, `$.orders[*].lines[*]` over orders without lines), and an
+/// empty body (a `204`, a tolerated error) always resolves.
 fn records_path_resolves(body: &Value, path: &str) -> bool {
     use jsonpath_rust::JsonPath;
     let matches = |p: &str| body.query(p).map_or(true, |m| !m.is_empty());
@@ -2993,8 +2994,12 @@ fn records_path_resolves(body: &Value, path: &str) -> bool {
     {
         return true;
     }
-    let parent = if let Some(p) = path.strip_suffix(".*") {
-        p
+    let first_multi = ["[*]", ".*", "[?", ".."]
+        .iter()
+        .filter_map(|t| path.find(t))
+        .min();
+    let parent = if let Some(i) = first_multi {
+        &path[..i]
     } else if path.ends_with(']')
         && let Some(open) = path.rfind('[')
     {
@@ -4005,6 +4010,18 @@ mod tests {
         ));
         assert!(!records_path_resolves(&json!({"error": "busy"}), "$.items"));
         assert!(!records_path_resolves(&json!({"e": 1}), "$.d.items.*"));
+        let nested = "$.orders[*].lines[*]";
+        assert!(records_path_resolves(
+            &json!({"orders": [{"id": 1}]}),
+            nested
+        ));
+        assert!(records_path_resolves(&json!({"orders": []}), nested));
+        assert!(!records_path_resolves(&json!({"error": "busy"}), nested));
+        assert!(records_path_resolves(
+            &json!({"orders": [{"id": 1}]}),
+            "$.orders[*].lines[?(@.qty > 0)]"
+        ));
+        assert!(records_path_resolves(&json!({"items": []}), "$.items[0]"));
     }
 
     #[test]

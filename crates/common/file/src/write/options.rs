@@ -64,7 +64,8 @@ pub enum FileWriteMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ParquetCodec {
-    /// Uncompressed pages.
+    /// Uncompressed pages. `uncompressed` is a deprecated name for it.
+    #[serde(alias = "uncompressed")]
     None,
     /// Snappy: fast and universally readable.
     Snappy,
@@ -251,8 +252,11 @@ mod tests {
     }
 
     #[test]
-    fn parquet_codec_has_one_name_per_value_and_a_per_sink_default() {
-        assert!(serde_json::from_value::<ParquetCodec>(json!("uncompressed")).is_err());
+    fn parquet_codec_keeps_its_deprecated_name_and_a_per_sink_default() {
+        assert_eq!(
+            serde_json::from_value::<ParquetCodec>(json!("uncompressed")).unwrap(),
+            ParquetCodec::None
+        );
         let p = ParquetOptions::default();
         assert_eq!(p.codec_or(ParquetCodec::Zstd), ParquetCodec::Zstd);
         let p: ParquetOptions = serde_json::from_value(json!({"compression": "lz4"})).unwrap();

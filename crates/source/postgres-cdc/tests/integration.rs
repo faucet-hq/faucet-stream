@@ -79,6 +79,7 @@ fn cfg(url: &str, slot: &str, publication: &str) -> PostgresCdcSourceConfig {
         max_cycle_duration: std::time::Duration::from_secs(300),
         max_staged_records: None,
         max_buffered_events: 100_000,
+        max_buffered_bytes: 256 * 1024 * 1024,
         status_update_interval: Duration::from_secs(1),
         tcp_keepalive: Duration::from_secs(60),
         batch_size: faucet_core::DEFAULT_BATCH_SIZE,
@@ -125,6 +126,37 @@ async fn insert_round_trip() {
     assert!(
         bookmark.is_some(),
         "bookmark must be Some after committed txns"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sslmode_prefer_falls_back_to_plaintext_on_a_server_without_tls() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.p (id int4 PRIMARY KEY); \
+         CREATE PUBLICATION faucet_pub FOR TABLE public.p;",
+    )
+    .await;
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let mut config = cfg(
+        &format!("{url}{sep}sslmode=prefer"),
+        "faucet_slot",
+        "faucet_pub",
+    );
+    config.tls = faucet_source_postgres_cdc::CdcTls::FromUrl;
+    assert_eq!(
+        config.effective_tls().unwrap(),
+        faucet_source_postgres_cdc::CdcTls::Prefer
+    );
+    let source = PostgresCdcSource::new(config).await.expect("source");
+    let _ = source.fetch_all_incremental().await.expect("warm-up");
+    ddl(&url, "INSERT INTO public.p VALUES (1);").await;
+    let (records, _) = source.fetch_all_incremental().await.expect("fetch");
+    assert_eq!(
+        records.iter().filter(|r| r["op"] == "insert").count(),
+        1,
+        "{records:?}"
     );
 }
 

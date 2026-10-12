@@ -431,3 +431,85 @@ async fn a_bookmark_under_a_padded_chunk_id_moves_to_the_current_key() {
         "its state moved over"
     );
 }
+
+/// #862 L-040: a discovered row whose id changed carries the old id in
+/// `legacy_state_ids`; its first run moves the bookmark across, also into
+/// each partition chunk's key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_adopts_the_bookmark_stored_under_its_legacy_id() {
+    use faucet_core::StateStore;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.jsonl");
+    seed(dir.path(), 1);
+    let state_dir = dir.path().join("state");
+    let yaml = format!(
+        r#"
+version: 1
+name: p
+pipeline:
+  source:
+    type: csv
+    config:
+      path: "{dir}/in-0.csv"
+  state:
+    type: file
+    config:
+      path: "{state}"
+  sink:
+    type: jsonl
+    config:
+      path: "{out}"
+      append: true
+matrix:
+  - id: public_orders-1a2b3c4d
+    legacy_state_ids: [public_orders]
+"#,
+        dir = dir.path().display(),
+        state = state_dir.display(),
+        out = out.display()
+    );
+    let path = dir.path().join("p.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
+    let nodes = expand(&cfg).expect("expand");
+    assert_eq!(nodes[0].legacy_state_ids, vec!["public_orders".to_string()]);
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    store
+        .put("p::public_orders", &serde_json::json!({"parked": true}))
+        .await
+        .unwrap();
+    let summary = run_expanded(nodes, opts("p", None)).await.expect("run");
+    assert!(!summary.had_failures());
+    assert_eq!(store.get("p::public_orders").await.unwrap(), None);
+    assert!(
+        store
+            .get("p::public_orders-1a2b3c4d")
+            .await
+            .unwrap()
+            .is_some(),
+        "the bookmark moved to the row's current key"
+    );
+
+    let bad = yaml.replace("[public_orders]", "[\"public.orders\"]");
+    let cfg = PipelineConfig::from_text(&bad, &path).expect("config parses");
+    let err = expand(&cfg).unwrap_err();
+    assert!(err.to_string().contains("legacy_state_ids"), "{err}");
+
+    let chunked = yaml.replace("in-0.csv", "in-${partition.start}.csv").replace(
+        "matrix:",
+        "partition:\n  kind: integer\n  from: 0\n  to: 1\n  chunk_size: 1\n  bounds: inclusive\nmatrix:",
+    );
+    let cfg = PipelineConfig::from_text(&chunked, &path).expect("config parses");
+    let nodes = expand(&cfg).expect("expand");
+    assert!(
+        nodes.iter().all(|n| n
+            .legacy_state_ids
+            .iter()
+            .any(|old| old.starts_with("public_orders::partition::"))),
+        "{:?}",
+        nodes
+            .iter()
+            .map(|n| &n.legacy_state_ids)
+            .collect::<Vec<_>>()
+    );
+}

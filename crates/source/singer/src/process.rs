@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faucet_core::{FaucetError, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -168,8 +168,13 @@ impl TapProcess {
             let stderr_tail = Arc::clone(&stderr_tail);
             let redactor = redactor.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                while let Ok(Some(line)) = faucet_common_singer::read_log_line(
+                    &mut reader,
+                    faucet_common_singer::MAX_LOG_LINE_BYTES,
+                )
+                .await
+                {
                     let redacted = redactor.redact(&line);
                     tracing::debug!(target: "faucet_source_singer::tap", "{redacted}");
                     let mut tail = stderr_tail.lock().unwrap();

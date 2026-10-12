@@ -182,6 +182,20 @@ goes for every `supports_*` probe and for `supported_write_modes()` — the CLI
 gates configs on them. A sink that lists `Upsert` but can't apply a
 `delete_marker` rejects it as a `Config` error rather than ignoring it.
 
+### Multi-table mirror hooks
+
+A CDC source joins a multi-table `faucet mirror` (`mirror.tables`) through four
+defaulted `Source` methods. The mirror resumes one shared stream from the
+earliest table's position, so a replayed page can reach tables that already
+applied part of it:
+
+| Method | Contract |
+|---|---|
+| `record_table(&record)` | The table a change belongs to, spelled exactly as the paired bulk source's `discover()` names it; `None` for DDL / control events. Required — without it the source cannot be mirrored per table. |
+| `position_le(a, b)` | `Some(true)` when every change up to bookmark `a` is covered by `b`; `None` when the two cannot be related. |
+| `position_min(positions)` | The earliest position every table can resume from. Override it when positions are only partially ordered (one cursor per capture instance). |
+| `record_covered(&record, &position)` | Whether a run resumed from `position` would not deliver `record` again. **Implement it**: pages are cut differently on replay, so a page can straddle a table's committed position, and only this per-record test drops what that table already applied. Returning `None` (the default) re-delivers those changes — duplicates on an append destination; the mirror logs a warning when it happens. |
+
 ## Retries
 
 - **Reads and other idempotent calls** inside your connector retry transient

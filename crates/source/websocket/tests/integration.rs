@@ -651,3 +651,90 @@ async fn a_stalled_upgrade_times_out_without_leaking_the_url_query() {
     assert!(msg.contains("timed out"), "{msg}");
     assert!(!msg.contains("s3cret"), "{msg}");
 }
+
+#[derive(Default)]
+struct CapturingSink(std::sync::Mutex<Vec<serde_json::Value>>);
+
+#[async_trait::async_trait]
+impl faucet_core::Sink for CapturingSink {
+    async fn write_batch(&self, records: &[serde_json::Value]) -> Result<usize, FaucetError> {
+        self.0.lock().unwrap().extend(records.iter().cloned());
+        Ok(records.len())
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_run_writes_the_buffered_tail() {
+    let url = spawn_pushing_server(vec![
+        r#"{"id":1}"#.into(),
+        r#"{"id":2}"#.into(),
+        r#"{"id":3}"#.into(),
+    ])
+    .await;
+    let mut cfg = base_config(&url);
+    cfg.idle_timeout = Some(Duration::from_secs(60));
+    let src = WebsocketSource::new(cfg).unwrap();
+    let sink = CapturingSink::default();
+    let token = faucet_core::CancellationToken::new();
+    let pipeline = faucet_core::Pipeline::new(&src, &sink).with_cancel(token.clone());
+    let cancel_later = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token.cancel();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(pipeline.run(), cancel_later)
+    })
+    .await
+    .expect("a cancelled run ends promptly");
+    assert_eq!(result.unwrap().records_written, 3);
+    let ids: Vec<i64> = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn a_cancel_during_a_reconnect_wait_ends_the_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut cfg = base_config(&url);
+    cfg.reconnect = true;
+    cfg.reconnect_backoff = Duration::from_secs(30);
+    cfg.idle_timeout = Some(Duration::from_secs(600));
+    let src = WebsocketSource::new(cfg).unwrap();
+    let token = faucet_core::CancellationToken::new();
+    assert!(src.set_cancel(token.clone()));
+    let ctx = std::collections::HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1000);
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token.cancel();
+    });
+    let next = tokio::time::timeout(Duration::from_secs(10), pages.next())
+        .await
+        .expect("the reconnect wait is cut short by the cancel");
+    assert!(next.is_none(), "nothing was buffered: {next:?}");
+    canceller.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancel_before_streaming_yields_nothing() {
+    let url = spawn_pushing_server(vec![r#"{"id":1}"#.into()]).await;
+    let mut cfg = base_config(&url);
+    cfg.idle_timeout = Some(Duration::from_secs(60));
+    let src = WebsocketSource::new(cfg).unwrap();
+    let token = faucet_core::CancellationToken::new();
+    token.cancel();
+    assert!(src.set_cancel(token));
+    let ctx = std::collections::HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1000);
+    let next = tokio::time::timeout(Duration::from_secs(5), pages.next())
+        .await
+        .expect("ends at once");
+    assert!(next.is_none());
+}

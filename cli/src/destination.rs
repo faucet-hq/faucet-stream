@@ -15,7 +15,8 @@ use crate::expand::{ExpandedNode, NodeRole};
 use crate::interpolate::{Directive, iter_directives};
 
 /// Sink config keys that tune *how* a sink writes, not *where*. Two rows whose
-/// configs differ only in these write the same destination.
+/// configs differ only in these write the same destination. The fallback when
+/// a sink does not report its destination ([`Identities::resolve`]).
 const NON_IDENTITY_KEYS: &[&str] = &[
     "batch_size",
     "max_connections",
@@ -63,11 +64,106 @@ fn has_runtime_token(v: &Value) -> bool {
 /// A stable identity for the destination a node's sink writes, when it can be
 /// known before the run: `None` when the sink config carries a per-invocation
 /// token (`${parent.*}`, `${dim.*}`), whose destinations differ at run time.
+/// Derived from the config alone; [`Identities`] adds what sinks report.
 pub fn destination_key(node: &ExpandedNode) -> Option<String> {
-    if has_runtime_token(&node.sink.config) {
-        return None;
+    Identities::default().key(node)
+}
+
+/// Destination identities the sinks themselves report (#862 L-044): the
+/// normalised [`Sink::dataset_uri`](faucet_core::Sink::dataset_uri), keyed by
+/// node id. A node without one falls back to the config identity.
+#[derive(Debug, Default, Clone)]
+pub struct Identities(HashMap<String, String>);
+
+impl Identities {
+    /// The config identity of `node`'s destination; `None` for a
+    /// per-invocation one.
+    pub fn key(&self, node: &ExpandedNode) -> Option<String> {
+        if has_runtime_token(&node.sink.config) {
+            return None;
+        }
+        Some(identity(&node.sink.kind, &node.sink.config))
     }
-    Some(identity(&node.sink.kind, &node.sink.config))
+
+    /// Whether two nodes write one destination: their configs say so, or both
+    /// sinks report the same one.
+    pub fn same(&self, a: &ExpandedNode, b: &ExpandedNode) -> bool {
+        let (Some(ka), Some(kb)) = (self.key(a), self.key(b)) else {
+            return false;
+        };
+        ka == kb || matches!((self.0.get(&a.id), self.0.get(&b.id)), (Some(x), Some(y)) if x == y)
+    }
+
+    /// Ask the sinks where they write. Only nodes that could share a
+    /// destination with a `relevant` node are built: same sink kind, no
+    /// per-invocation token, at least two such nodes. Identical configs build
+    /// once. A sink that cannot be built, or reports no destination, keeps the
+    /// config identity.
+    pub async fn resolve(
+        nodes: &[ExpandedNode],
+        auth: &crate::auth_catalog::AuthCatalog,
+        relevant: impl Fn(&ExpandedNode) -> bool,
+    ) -> Self {
+        let kinds: HashSet<&str> = nodes
+            .iter()
+            .filter(|n| relevant(n))
+            .map(|n| n.sink.kind.as_str())
+            .collect();
+        let candidates: Vec<&ExpandedNode> = nodes
+            .iter()
+            .filter(|n| kinds.contains(n.sink.kind.as_str()) && !has_runtime_token(&n.sink.config))
+            .collect();
+        let mut per_kind: HashMap<&str, usize> = HashMap::new();
+        for n in &candidates {
+            *per_kind.entry(n.sink.kind.as_str()).or_default() += 1;
+        }
+        let mut by_config: HashMap<String, Option<String>> = HashMap::new();
+        let mut out = HashMap::new();
+        for n in candidates
+            .into_iter()
+            .filter(|n| per_kind[n.sink.kind.as_str()] > 1)
+        {
+            let config_key = format!(
+                "{}\u{0}{}",
+                n.sink.kind,
+                serde_json::to_string(&n.sink.config).unwrap_or_default()
+            );
+            let reported = match by_config.get(&config_key) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = reported_identity(&n.sink.kind, &n.sink.config, auth).await;
+                    by_config.insert(config_key, r.clone());
+                    r
+                }
+            };
+            if let Some(r) = reported {
+                out.insert(n.id.clone(), r);
+            }
+        }
+        Self(out)
+    }
+}
+
+/// The destination a built sink reports, normalised; `None` when the sink
+/// cannot be built or reports the uninformative default `<name>://unknown`.
+pub async fn reported_identity(
+    kind: &str,
+    config: &Value,
+    auth: &crate::auth_catalog::AuthCatalog,
+) -> Option<String> {
+    let sink = crate::registry::build_sink(kind, config.clone(), auth)
+        .await
+        .map_err(|e| {
+            tracing::debug!(sink = kind, error = %e, "destination identity: sink not built; using its config")
+        })
+        .ok()?;
+    uri_identity(kind, &sink.dataset_uri())
+}
+
+fn uri_identity(kind: &str, uri: &str) -> Option<String> {
+    let uri = faucet_core::redact_uri_credentials(uri.trim());
+    let uri = uri.trim_end_matches('/');
+    (!uri.is_empty() && !uri.ends_with("://unknown")).then(|| format!("{kind}\u{0}uri\u{0}{uri}"))
 }
 
 /// The destination identity of a resolved sink config: the kind plus every
@@ -104,11 +200,17 @@ pub fn describe(node: &ExpandedNode) -> String {
 
 /// Rows other than `node` in `all` that write the same destination.
 pub fn peers<'a>(node: &ExpandedNode, all: &'a [ExpandedNode]) -> Vec<&'a ExpandedNode> {
-    let Some(key) = destination_key(node) else {
-        return Vec::new();
-    };
+    peers_with(&Identities::default(), node, all)
+}
+
+/// [`peers`] by the given identities.
+pub fn peers_with<'a>(
+    ids: &Identities,
+    node: &ExpandedNode,
+    all: &'a [ExpandedNode],
+) -> Vec<&'a ExpandedNode> {
     all.iter()
-        .filter(|n| n.id != node.id && destination_key(n).as_deref() == Some(key.as_str()))
+        .filter(|n| n.id != node.id && ids.same(node, n))
         .collect()
 }
 
@@ -116,9 +218,31 @@ pub fn peers<'a>(node: &ExpandedNode, all: &'a [ExpandedNode]) -> Vec<&'a Expand
 /// parked `status:`, a serve/MCP/template selection) leaves out a row that
 /// shares a full-overwrite destination with a selected row (#789 CLI-04).
 pub fn check_overwrite_selection(all: &[ExpandedNode], selected: &[ExpandedNode]) -> CliResult<()> {
+    check_overwrite_selection_with(&Identities::default(), all, selected)
+}
+
+/// [`check_overwrite_selection`] with the destinations the sinks report.
+pub async fn check_overwrite_selection_resolved(
+    all: &[ExpandedNode],
+    selected: &[ExpandedNode],
+    auth: &crate::auth_catalog::AuthCatalog,
+) -> CliResult<()> {
+    if all.len() == selected.len() || !selected.iter().any(is_full_overwrite) {
+        return Ok(());
+    }
+    let ids = Identities::resolve(all, auth, is_full_overwrite).await;
+    check_overwrite_selection_with(&ids, all, selected)
+}
+
+/// [`check_overwrite_selection`] by the given identities.
+pub fn check_overwrite_selection_with(
+    ids: &Identities,
+    all: &[ExpandedNode],
+    selected: &[ExpandedNode],
+) -> CliResult<()> {
     let chosen: HashSet<&str> = selected.iter().map(|n| n.id.as_str()).collect();
     for node in selected.iter().filter(|n| is_full_overwrite(n)) {
-        let left_out: Vec<&str> = peers(node, all)
+        let left_out: Vec<&str> = peers_with(ids, node, all)
             .into_iter()
             .filter(|p| !chosen.contains(p.id.as_str()))
             .map(|p| p.id.as_str())
@@ -190,9 +314,14 @@ fn levels(nodes: &[ExpandedNode]) -> HashMap<&str, usize> {
 /// execution levels (#789 CLI-04): each level commits its own swap, so the
 /// later level would replace the earlier one's rows.
 pub fn check_overwrite_levels(nodes: &[ExpandedNode]) -> CliResult<()> {
+    check_overwrite_levels_with(&Identities::default(), nodes)
+}
+
+/// [`check_overwrite_levels`] by the given identities.
+pub fn check_overwrite_levels_with(ids: &Identities, nodes: &[ExpandedNode]) -> CliResult<()> {
     let level_of = levels(nodes);
     for node in nodes.iter().filter(|n| is_full_overwrite(n)) {
-        for peer in peers(node, nodes) {
+        for peer in peers_with(ids, node, nodes) {
             if level_of.get(peer.id.as_str()) != level_of.get(node.id.as_str()) {
                 return Err(CliError::Config(format!(
                     "rows '{}' and '{}' both replace {} with `write_mode: overwrite`, but one \
@@ -229,7 +358,29 @@ pub fn check_verify_scope(node: &ExpandedNode, all: &[ExpandedNode]) -> CliResul
 /// Refuse to verify a row whose destination other rows also write: its source
 /// covers only part of what the destination holds (#789 CLI-08).
 pub fn check_owns_destination(node: &ExpandedNode, all: &[ExpandedNode]) -> CliResult<()> {
-    let shared: Vec<&str> = peers(node, all).iter().map(|p| p.id.as_str()).collect();
+    check_owns_destination_with(&Identities::default(), node, all)
+}
+
+/// [`check_owns_destination`] with the destinations the sinks report.
+pub async fn check_owns_destination_resolved(
+    node: &ExpandedNode,
+    all: &[ExpandedNode],
+    auth: &crate::auth_catalog::AuthCatalog,
+) -> CliResult<()> {
+    let ids = Identities::resolve(all, auth, |n| n.id == node.id).await;
+    check_owns_destination_with(&ids, node, all)
+}
+
+/// [`check_owns_destination`] by the given identities.
+pub fn check_owns_destination_with(
+    ids: &Identities,
+    node: &ExpandedNode,
+    all: &[ExpandedNode],
+) -> CliResult<()> {
+    let shared: Vec<&str> = peers_with(ids, node, all)
+        .iter()
+        .map(|p| p.id.as_str())
+        .collect();
     if !shared.is_empty() {
         return Err(CliError::Config(format!(
             "verify: row '{}' shares {} with row(s) {}, so its source covers only part of the \
@@ -362,6 +513,69 @@ mod tests {
             ow("other"),
         );
         check_overwrite_levels(&[first, child]).unwrap();
+    }
+
+    #[cfg(feature = "sink-sqlite")]
+    #[tokio::test]
+    async fn the_destination_a_sink_reports_finds_peers_the_config_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = format!("sqlite:{}", dir.path().join("x.db").display());
+        let cfg = |timeout: u64| {
+            json!({"database_url": db, "table_name": "t", "write_mode": "overwrite",
+                   "column_mapping": "auto_map", "busy_timeout_secs": timeout})
+        };
+        let first = node("first", NodeRole::Root, &[], cfg(5));
+        let second = node("second", NodeRole::Root, &["first"], cfg(9));
+        let nodes = vec![first.clone(), second.clone()];
+        check_overwrite_levels(&nodes).unwrap();
+        let auth = crate::auth_catalog::AuthCatalog::new();
+        let reported = reported_identity("sqlite", &first.sink.config, &auth).await;
+        assert!(reported.is_some(), "the sqlite sink reports its table");
+        let ids = Identities::resolve(&nodes, &auth, is_overwrite).await;
+        assert!(ids.same(&first, &second), "{ids:?}");
+        let e = check_overwrite_levels_with(&ids, &nodes)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'second'"), "{e}");
+
+        let e = check_overwrite_selection_resolved(&nodes, std::slice::from_ref(&first), &auth)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'second'"), "{e}");
+        check_overwrite_selection_resolved(&nodes, &nodes, &auth)
+            .await
+            .unwrap();
+
+        let plain = node(
+            "plain",
+            NodeRole::Root,
+            &[],
+            json!({"database_url": db, "table_name": "t", "column_mapping": "auto_map"}),
+        );
+        let other = node(
+            "other",
+            NodeRole::Root,
+            &[],
+            json!({"database_url": db, "table_name": "t", "column_mapping": "auto_map", "busy_timeout_secs": 1}),
+        );
+        let e = check_owns_destination_resolved(&plain, &[plain.clone(), other.clone()], &auth)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'other'"), "{e}");
+
+        assert!(
+            reported_identity("sqlite", &json!({"nope": 1}), &auth)
+                .await
+                .is_none()
+        );
+        assert!(uri_identity("x", "x://unknown").is_none());
+        assert!(uri_identity("x", " ").is_none());
+        assert_eq!(
+            uri_identity("pg", "postgres://u:p@h/db?table=t/"),
+            uri_identity("pg", "postgres://u:q@h/db?table=t")
+        );
     }
 
     #[test]

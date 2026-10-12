@@ -140,9 +140,13 @@ fn descriptors_to_rows(
     sink_ref: Option<&str>,
 ) -> CliResult<Vec<MatrixRow>> {
     let ids = crate::commands::discover::unique_row_ids(descriptors);
+    let legacy = crate::commands::discover::legacy_row_ids(descriptors);
     let mut rows = Vec::with_capacity(descriptors.len());
-    for (d, id) in descriptors.iter().zip(&ids) {
+    for ((d, id), old) in descriptors.iter().zip(&ids).zip(&legacy) {
         let mut row = json!({ "id": id, "source": { "config": d.config_patch } });
+        if let Some(old) = old {
+            row["legacy_state_ids"] = json!([old]);
+        }
         if src_ref != "default" {
             row["source"]["ref"] = json!(src_ref);
         }

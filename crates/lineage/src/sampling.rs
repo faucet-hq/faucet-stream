@@ -519,6 +519,10 @@ impl Source for SamplingSource {
     fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
         self.inner.set_run_clock(now);
     }
+
+    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
+        self.inner.set_cancel(cancel)
+    }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await
     }
@@ -1009,6 +1013,7 @@ mod tests {
         ));
         assert!(got.load(std::sync::atomic::Ordering::Relaxed));
         s.set_run_clock(chrono::Utc::now());
+        assert!(!s.set_cancel(faucet_core::CancellationToken::new()));
     }
 
     /// An idempotent, upsert-capable sink: the sampler must forward every

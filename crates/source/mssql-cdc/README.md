@@ -20,7 +20,8 @@ never re-reads an already-committed change.
   captured tables — is emitted whole, in its own order, as one `StreamPage`
   with a bookmark, so nothing partially-visible ever leaks. Each poll holds one
   pooled connection per capture instance (`max_connections` is raised to that
-  count when lower).
+  count when lower, with a startup warning) — a mirror over many captured
+  tables opens that many concurrent connections to the source database.
 - **Resumable & exactly-once capable.** The bookmark is a monotonic LSN; on
   resume the next poll starts at `increment(bookmark)`. `supports_exactly_once()`
   is `true`, and `capture_resume_position()` anchors CDC before a bulk snapshot

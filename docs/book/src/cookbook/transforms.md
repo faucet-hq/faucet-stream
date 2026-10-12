@@ -306,7 +306,9 @@ Both transforms rename keys, but they're aimed at different jobs:
 
 `rename_field` errors if a target name already exists on the record
 (same collision rule as `flatten` and `keys_case`) — to avoid silently
-overwriting a real value.
+overwriting a real value. `rename_keys` follows the same rule: two keys in one
+object that rename to the same name fail the record instead of the later one
+replacing the earlier.
 
 ## `cast` — type coercion
 
@@ -720,7 +722,7 @@ Analytics / report APIs (e.g. a query-language `tableData` payload) return resul
   config: { columns_path: "columns[*].name", rows_path: "rows" }
 ```
 
-`{columns: [{name: day}, {name: sessions}], rows: [["2026-01-01", 12]]}` → `{day: "2026-01-01", sessions: 12}`. A row whose width differs from the column count fails loudly rather than misaligning fields. Gated on the `transform-zip-columns` feature (in `transforms` / `full`).
+`{columns: [{name: day}, {name: sessions}], rows: [["2026-01-01", 12]]}` → `{day: "2026-01-01", sessions: 12}`. A row whose width differs from the column count fails loudly rather than misaligning fields, and so does a column list that names the same column twice (the later value would otherwise replace the earlier one). Gated on the `transform-zip-columns` feature (in `transforms` / `full`).
 
 ### Several column groups (`groups`)
 

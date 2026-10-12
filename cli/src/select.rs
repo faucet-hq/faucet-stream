@@ -289,6 +289,20 @@ impl SelectionRequest {
         crate::destination::check_overwrite_selection(&all, &selected)?;
         Ok(selected)
     }
+
+    /// [`apply`](Self::apply), also asking the sinks where they write so an
+    /// overwrite peer whose config differs is not left out (#862 L-044).
+    pub async fn apply_resolved(
+        &self,
+        cfg: &crate::config::PipelineConfig,
+        nodes: Vec<ExpandedNode>,
+        auth: &crate::auth_catalog::AuthCatalog,
+    ) -> CliResult<Vec<ExpandedNode>> {
+        let all = nodes.clone();
+        let selected = self.apply(cfg, nodes)?;
+        crate::destination::check_overwrite_selection_resolved(&all, &selected, auth).await?;
+        Ok(selected)
+    }
 }
 
 /// Why a selection on a topology-mode config is refused.

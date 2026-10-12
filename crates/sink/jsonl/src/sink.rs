@@ -135,7 +135,12 @@ impl JsonlSink {
                 })?;
             }
             if append && self.writes_plain_lines() {
-                trim_partial_line(&self.config.path).await.map_err(|e| {
+                let trimmed = if self.config.pretty {
+                    trim_partial_pretty_record(&self.config.path).await
+                } else {
+                    trim_partial_line(&self.config.path).await
+                };
+                trimmed.map_err(|e| {
                     FaucetError::Sink(format!(
                         "failed to repair a partial last line in {}: {e}",
                         self.config.path.display()
@@ -200,6 +205,81 @@ async fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
         let _ = path;
         Ok(())
     }
+}
+
+/// Refuse to append to a file the file sink wrote with whole-file integrity
+/// (its first line is a sealed v2 header): lines this sink appends carry no
+/// binding to that file, and a reader then refuses the whole file.
+#[cfg(feature = "encryption")]
+async fn refuse_sealed_file(
+    path: &std::path::Path,
+    enc: &faucet_core::CompiledEncryption,
+) -> Result<(), FaucetError> {
+    use base64::Engine as _;
+    use tokio::io::AsyncBufReadExt;
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(FaucetError::Sink(format!(
+                "failed to open {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let mut first = String::new();
+    let mut reader = tokio::io::BufReader::new(file);
+    if reader.read_line(&mut first).await.is_err() {
+        return Ok(());
+    }
+    let Ok(sealed) = base64::engine::general_purpose::STANDARD.decode(first.trim()) else {
+        return Ok(());
+    };
+    if matches!(
+        enc.open_line(&sealed),
+        Ok(faucet_core::SealedLine::Header(_))
+    ) {
+        return Err(FaucetError::Sink(format!(
+            "{} was written by the file sink with whole-file integrity; the jsonl sink cannot \
+             append to it without making it unreadable — write it with the file sink",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Cut a torn last record of pretty-printed output, where one record spans
+/// several lines: keep everything through the last line that ends a
+/// top-level value (a complete line starting at column 0 that does not open
+/// an object or array).
+async fn trim_partial_pretty_record(path: &std::path::Path) -> std::io::Result<()> {
+    let raw = match tokio::fs::read(path).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut keep = 0usize;
+    let mut start = 0usize;
+    while let Some(i) = raw[start..].iter().position(|b| *b == b'\n') {
+        let line = &raw[start..start + i];
+        let ends_value =
+            line.first().is_some_and(|b| !b.is_ascii_whitespace()) && line != b"{" && line != b"[";
+        start += i + 1;
+        if ends_value {
+            keep = start;
+        }
+    }
+    if keep < raw.len() {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = raw.len() - keep,
+            "jsonl sink: cutting a partial last record left by an interrupted write"
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(keep as u64)?;
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Cut a torn last line (bytes after the final newline) left by a write that
@@ -271,6 +351,14 @@ impl faucet_core::Sink for JsonlSink {
         // `encryption:` block never creates an empty output file.
         #[cfg(feature = "encryption")]
         let encryption = self.compiled_encryption().await?;
+
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = encryption
+            && self.config.append
+            && !self.opened_once.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            refuse_sealed_file(&self.config.path, enc).await?;
+        }
 
         let mut guard = self.ensure_open().await?;
         let writer = guard.as_mut().expect("writer opened in ensure_open");
@@ -382,6 +470,29 @@ mod tests {
         trim_partial_line(&long).await.unwrap();
         assert_eq!(std::fs::read(&long).unwrap().len(), 0);
         trim_partial_line(&dir.path().join("missing.jsonl"))
+            .await
+            .unwrap();
+    }
+
+    /// #862 L-156: a torn pretty-printed record spans several lines; the cut
+    /// goes back to the end of the last whole record.
+    #[tokio::test]
+    async fn a_pretty_append_run_cuts_a_torn_multi_line_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, "{\n  \"id\": 1\n}\n7\n{\n  \"id\": 2,\n  \"o\": {\n").unwrap();
+        let sink = JsonlSink::new(JsonlSinkConfig::new(&path).append(true).pretty(true));
+        sink.write_batch(&[json!({"id": 3})]).await.unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"id\": 1\n}\n7\n{\n  \"id\": 3\n}\n"
+        );
+        let whole = dir.path().join("whole.jsonl");
+        std::fs::write(&whole, "[]\n").unwrap();
+        trim_partial_pretty_record(&whole).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&whole).unwrap(), "[]\n");
+        trim_partial_pretty_record(&dir.path().join("missing.jsonl"))
             .await
             .unwrap();
     }
@@ -700,6 +811,45 @@ mod tests {
 
             let lines = decrypt_lines(&path, "k");
             assert_eq!(lines, vec![json!({"first": 1}), json!({"second": 2})]);
+        }
+
+        /// #862 L-158: appending to a file the file sink sealed whole would
+        /// make every line of it unreadable.
+        #[tokio::test]
+        async fn appending_to_a_sealed_v2_file_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sealed.jsonl");
+            let enc = faucet_core::CompiledEncryption::compile(&spec("k")).unwrap();
+            let header = base64::engine::general_purpose::STANDARD.encode(
+                enc.encrypt_bound(b"{}", faucet_core::encryption::SEALED_LINES_HEADER_CONTEXT),
+            );
+            std::fs::write(&path, format!("{header}\n")).unwrap();
+            let sink = JsonlSink::new(
+                JsonlSinkConfig::new(&path)
+                    .append(true)
+                    .encryption(spec("k")),
+            );
+            let err = sink.write_batch(&[json!({"a": 1})]).await.unwrap_err();
+            assert!(err.to_string().contains("whole-file integrity"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{header}\n")
+            );
+
+            let legacy = dir.path().join("legacy.jsonl");
+            let line = base64::engine::general_purpose::STANDARD.encode(enc.encrypt(b"{}"));
+            std::fs::write(&legacy, format!("{line}\nnot base64\n")).unwrap();
+            let sink = JsonlSink::new(
+                JsonlSinkConfig::new(&legacy)
+                    .append(true)
+                    .encryption(spec("k")),
+            );
+            sink.write_batch(&[json!({"a": 1})]).await.unwrap();
+            sink.flush().await.unwrap();
+            let missing = dir.path().join("new.jsonl");
+            refuse_sealed_file(&missing, &enc).await.unwrap();
+            std::fs::write(&missing, "%%%\n").unwrap();
+            refuse_sealed_file(&missing, &enc).await.unwrap();
         }
 
         #[tokio::test]

@@ -1167,7 +1167,7 @@ impl RestStreamConfig {
                 || self
                     .records_path
                     .as_deref()
-                    .is_some_and(|p| p.matches("[*]").count() + p.matches("..").count() > 1);
+                    .is_some_and(|p| multi_match_segments(p) > 1);
             if fans_out {
                 return Err(faucet_core::FaucetError::Config(
                     "rest: `pagination: Offset` advances by the record count, but this \
@@ -1474,9 +1474,42 @@ impl RestStreamConfig {
     }
 }
 
+/// How many segments of a JSONPath can match more than one node: wildcards
+/// (`[*]`, `.*`), recursive descent (`..`), filters (`[?…]`), unions
+/// (`[a,b]`) and slices (`[1:3]`).
+fn multi_match_segments(path: &str) -> usize {
+    let recursive = path.matches("..").count();
+    let dot_star = path.matches(".*").count();
+    let brackets = path
+        .split('[')
+        .skip(1)
+        .filter_map(|rest| rest.split_once(']').map(|(inner, _)| inner))
+        .filter(|inner| {
+            let inner = inner.trim();
+            inner == "*"
+                || inner.starts_with('?')
+                || (!inner.starts_with(['\'', '"']) && (inner.contains(',') || inner.contains(':')))
+        })
+        .count();
+    recursive + dot_star + brackets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_match_segments_count_every_fan_out_spelling() {
+        assert_eq!(multi_match_segments("$.items"), 0);
+        assert_eq!(multi_match_segments("$.items[0]"), 0);
+        assert_eq!(multi_match_segments("$['a,b']"), 0);
+        assert_eq!(multi_match_segments("$.items[*]"), 1);
+        assert_eq!(multi_match_segments("$.data.*.items[*]"), 2);
+        assert_eq!(multi_match_segments("$.orders[*].lines.*"), 2);
+        assert_eq!(multi_match_segments("$.orders[*].lines[?(@.qty>0)]"), 2);
+        assert_eq!(multi_match_segments("$.orders[0,1].lines[1:3]"), 2);
+        assert_eq!(multi_match_segments("$..items[*]"), 2);
+    }
     use faucet_core::{BindFormat, BindTarget, ReplicationBind};
 
     fn bind() -> ReplicationBind {
@@ -2027,6 +2060,7 @@ mod tests {
             limit: 100,
             total_path: None,
             rows_path: rows_path.map(str::to_string),
+            stop_when_short: false,
         };
         let mut c = RestStreamConfig::new("https://api.example.com", "/orders")
             .records_path("$.orders[*].lines[*]")

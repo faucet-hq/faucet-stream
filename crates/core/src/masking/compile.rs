@@ -137,20 +137,26 @@ impl CompiledMasking {
     /// The action a name-based rule applies to the field at the dot-path
     /// `column`, matched on the field itself or on any ancestor — the same
     /// depth-first walk [`apply_masking`](super::apply_masking) performs, so a
-    /// container matched by name masks every leaf beneath it. Value-detector
-    /// rules are not consulted: they depend on the value, not the name.
+    /// container matched by name masks every leaf beneath it. A value-detector
+    /// rule declared before the name rule could fire on the leaf first with a
+    /// different action, so the action is then unknown (`None`).
     pub fn name_action_for(&self, column: &str) -> Option<&'static str> {
         let mut end = 0;
         while end < column.len() {
             end = column[end..].find('.').map_or(column.len(), |i| end + i);
             let prefix = &column[..end];
-            if let Some(rule) = self.rules.iter().find(|r| {
-                r.fields.contains(prefix)
+            let leaf = end == column.len();
+            for r in &self.rules {
+                if r.fields.contains(prefix)
                     || r.field_pattern
                         .as_ref()
                         .is_some_and(|re| re.is_match(prefix))
-            }) {
-                return Some(rule.action_label);
+                {
+                    return Some(r.action_label);
+                }
+                if leaf && r.value_detector.is_some() {
+                    return None;
+                }
             }
             end += 1;
         }
@@ -302,17 +308,35 @@ mod tests {
         assert!(matches!(err, FaucetError::Config(m) if m.contains("tokenize prefix")));
     }
 
+    /// #862 L-043: a detector rule declared before a name rule can mask the
+    /// leaf first with its own action, so the leaf's action is unknown; an
+    /// ancestor matched by name still decides, as detectors never fire on a
+    /// container.
+    #[test]
+    fn name_action_for_is_unknown_behind_an_earlier_detector_rule() {
+        let c = CompiledMasking::compile(&spec(json!({
+            "rules": [
+                { "match": { "value_detector": "email" }, "action": { "type": "redact" } },
+                { "match": { "fields": ["contact"] }, "action": { "type": "hash" } },
+                { "match": { "fields": ["mail"] }, "action": { "type": "hash" } }
+            ]
+        })))
+        .unwrap();
+        assert_eq!(c.name_action_for("mail"), None);
+        assert_eq!(c.name_action_for("contact.mail"), Some("hash"));
+    }
+
     #[test]
     fn name_action_for_matches_the_field_or_an_ancestor() {
         let c = CompiledMasking::compile_for_sink(
             &spec(json!({
                 "rules": [
-                    { "match": { "value_detector": "email" }, "action": { "type": "redact" } },
                     { "match": { "fields": ["phones"] }, "action": { "type": "hash" } },
                     { "match": { "field_pattern": "^card$" }, "action": { "type": "partial" } },
                     { "match": { "fields": ["user.ssn"] }, "action": { "type": "tokenize" } },
                     { "match": { "fields": ["other"] }, "action": { "type": "redact" },
-                      "applies_to": ["elsewhere"] }
+                      "applies_to": ["elsewhere"] },
+                    { "match": { "value_detector": "email" }, "action": { "type": "redact" } }
                 ]
             })),
             &["here"],

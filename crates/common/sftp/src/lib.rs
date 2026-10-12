@@ -133,8 +133,8 @@ pub struct SftpConnectionConfig {
     /// Host-key verification policy (default: `accept_new`).
     #[serde(default)]
     pub known_hosts: HostKeyPolicy,
-    /// Seconds the TCP connect, SSH handshake and authentication together may
-    /// take (default 30). A server that accepts and then stalls fails the run
+    /// Seconds the TCP connect, SSH handshake, authentication and the SFTP
+    /// subsystem start together may take (default 30). A server that accepts and then stalls fails the run
     /// instead of hanging it.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
@@ -464,19 +464,43 @@ fn scan_known_hosts(text: &str, host: &str, port: u16) -> KnownHostsExtras {
     out
 }
 
-/// OpenSSH host-pattern matching: comma-separated `*` / `?` globs, and a
-/// matching `!pattern` excludes the host outright.
+/// OpenSSH host-pattern matching: comma-separated `*` / `?` globs or hashed
+/// `|1|salt|hash` entries, and a matching `!pattern` excludes the host
+/// outright.
 fn hosts_match(patterns: &str, name: &str) -> bool {
+    let matches = |p: &str| match p.strip_prefix("|1|") {
+        Some(hashed) => hashed_host_matches(hashed, name),
+        None => wildmatch(p, name),
+    };
     let mut hit = false;
     for p in patterns.split(',') {
         match p.strip_prefix('!') {
-            Some(neg) if wildmatch(neg, name) => return false,
+            Some(neg) if matches(neg) => return false,
             Some(_) => {}
-            None if wildmatch(p, name) => hit = true,
+            None if matches(p) => hit = true,
             None => {}
         }
     }
     hit
+}
+
+/// A hashed known_hosts entry (`salt|hash`, both base64): HMAC-SHA1 of the
+/// host name keyed by the salt.
+fn hashed_host_matches(hashed: &str, name: &str) -> bool {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let Some((salt, hash)) = hashed.split_once('|') else {
+        return false;
+    };
+    let (Ok(salt), Ok(hash)) = (b64.decode(salt), b64.decode(hash)) else {
+        return false;
+    };
+    hmac::Hmac::<sha1::Sha1>::new_from_slice(&salt).is_ok_and(|mac| {
+        mac.chain_update(name.as_bytes())
+            .verify_slice(&hash)
+            .is_ok()
+    })
 }
 
 fn wildmatch(pattern: &str, name: &str) -> bool {
@@ -504,11 +528,14 @@ fn wildmatch(pattern: &str, name: &str) -> bool {
 /// Returns [`FaucetError::Auth`] when authentication or host-key verification
 /// fails, and [`FaucetError::Custom`] for transport / subsystem errors.
 pub async fn connect(cfg: &SftpConnectionConfig) -> Result<SftpSession, FaucetError> {
-    let session = authenticate(cfg).await?;
-    // The `Handle` (`session`) can be dropped once the subsystem is open: the
+    // The `Handle` can be dropped once the subsystem is open: the
     // `SftpSession` holds its own clone of the session message sender, so the
     // SSH session task stays alive as long as the returned session is held.
-    open_session(&session).await
+    within_connect_timeout(cfg, async {
+        let handle = authenticate_unbounded(cfg).await?;
+        open_session(&handle).await
+    })
+    .await
 }
 
 /// `posix-rename@openssh.com`: a rename that replaces an existing target
@@ -575,12 +602,23 @@ pub fn is_no_such_file(e: &SftpError) -> bool {
 pub async fn connect_with_extensions(
     cfg: &SftpConnectionConfig,
 ) -> Result<SftpConnection, FaucetError> {
-    let handle = authenticate(cfg).await?;
-    let session = open_session(&handle).await?;
-    let raw = match probe_posix_rename(&handle).await {
-        Ok(raw) => raw,
-        Err(e) => {
+    let limit = connect_limit(cfg);
+    let started = std::time::Instant::now();
+    let (handle, session) = within_connect_timeout(cfg, async {
+        let handle = authenticate_unbounded(cfg).await?;
+        let session = open_session(&handle).await?;
+        Ok((handle, session))
+    })
+    .await?;
+    let remaining = limit.saturating_sub(started.elapsed());
+    let raw = match tokio::time::timeout(remaining, probe_posix_rename(&handle)).await {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(e)) => {
             tracing::debug!(error = %e, "SFTP extension probe failed; using plain RENAME");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("SFTP extension probe timed out; using plain RENAME");
             None
         }
     };
@@ -602,24 +640,29 @@ async fn probe_posix_rename(
         .then_some(raw))
 }
 
-async fn authenticate(
+fn connect_limit(cfg: &SftpConnectionConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1))
+}
+
+/// Run the connect steps (TCP, SSH handshake, authentication, SFTP subsystem
+/// start) under `connect_timeout_secs`.
+async fn within_connect_timeout<T>(
     cfg: &SftpConnectionConfig,
-) -> Result<russh::client::Handle<ClientHandler>, FaucetError> {
-    let limit = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
-    tokio::time::timeout(limit, authenticate_unbounded(cfg))
-        .await
-        .map_err(|_| {
-            FaucetError::Custom(
-                format!(
-                    "SFTP connect to {}:{} did not finish the SSH handshake and \
-                     authentication within {}s (connect_timeout_secs)",
-                    cfg.host,
-                    cfg.port,
-                    limit.as_secs()
-                )
-                .into(),
+    steps: impl std::future::Future<Output = Result<T, FaucetError>>,
+) -> Result<T, FaucetError> {
+    let limit = connect_limit(cfg);
+    tokio::time::timeout(limit, steps).await.map_err(|_| {
+        FaucetError::Custom(
+            format!(
+                "SFTP connect to {}:{} did not finish the SSH handshake, authentication and \
+                 SFTP subsystem start within {}s (connect_timeout_secs)",
+                cfg.host,
+                cfg.port,
+                limit.as_secs()
             )
-        })?
+            .into(),
+        )
+    })?
 }
 
 async fn authenticate_unbounded(
@@ -974,6 +1017,41 @@ mod tests {
         assert!(!wildmatch("a?", "a"));
         let extras = scan_known_hosts("@revoked\nhost ssh-ed25519\n@bogus host t k\n", "host", 22);
         assert!(extras.revoked.is_empty() && !extras.cert_authority);
+    }
+
+    /// #862 L-160: a revocation written against a hashed host is enforced.
+    #[test]
+    fn hashed_host_entries_match_their_host() {
+        use base64::Engine as _;
+        use hmac::Mac as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let salt = b"0123456789abcdefghij";
+        let hash = |name: &str| {
+            let mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(salt)
+                .unwrap()
+                .chain_update(name.as_bytes());
+            format!(
+                "|1|{}|{}",
+                b64.encode(salt),
+                b64.encode(mac.finalize().into_bytes())
+            )
+        };
+        assert!(hosts_match(&hash("sftp.example"), "sftp.example"));
+        assert!(!hosts_match(&hash("sftp.example"), "other.example"));
+        assert!(hosts_match(&hash("[h]:2222"), "[h]:2222"));
+        assert!(!hosts_match(&format!("*,!{}", hash("h")), "h"));
+        assert!(!hosts_match("|1|nosep", "h"));
+        assert!(!hosts_match("|1|%%%|%%%", "h"));
+        let extras = scan_known_hosts(
+            &format!(
+                "@revoked {} ssh-ed25519 {}\n",
+                hash("sftp.example"),
+                body(ED25519_A)
+            ),
+            "sftp.example",
+            22,
+        );
+        assert_eq!(extras.revoked.len(), 1);
     }
 
     #[tokio::test]

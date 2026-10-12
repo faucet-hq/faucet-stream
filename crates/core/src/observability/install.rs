@@ -217,7 +217,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                                 let reg = tracing_subscriber::registry()
                                     .with(layer)
                                     .with(make_filter())
-                                    .with(tracing_subscriber::fmt::layer());
+                                    .with(
+                                        cfg.tracing.is_some().then(tracing_subscriber::fmt::layer),
+                                    );
                                 if reg.try_init().is_err() {
                                     tracing::warn!(
                                         "tracing subscriber already installed and no trace \
@@ -234,7 +236,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                         }
                         installed = true;
                     }
-                    Err(e) => tracing::warn!("OTLP trace exporter init failed; logs-only: {e}"),
+                    Err(e) => tracing::warn!(
+                        "OTLP trace exporter init failed; traces are not exported: {e}"
+                    ),
                 }
             }
         }
@@ -260,7 +264,7 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
 
             let reg = tracing_subscriber::registry()
                 .with(make_filter())
-                .with(tracing_subscriber::fmt::layer())
+                .with(cfg.tracing.is_some().then(tracing_subscriber::fmt::layer))
                 .with(otel_error_layer);
             if reg.try_init().is_err() {
                 // Some other code path has already set a global default. Log and
@@ -487,10 +491,14 @@ static BUILD_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::n
 ///
 /// First call wins (a process has one build); returns `false` when a version
 /// was already set. Re-registers the gauge so a recorder installed before
-/// this call reports the new version too.
+/// this call reports the new version too, and sets the series it reported
+/// until now to 0, so the recorder never holds two versions at 1.
 pub fn set_build_version(version: &'static str) -> bool {
     let first = BUILD_VERSION.set(version).is_ok();
     if first {
+        if version != env!("CARGO_PKG_VERSION") {
+            metrics::gauge!("faucet_build_info", "version" => env!("CARGO_PKG_VERSION")).set(0.0);
+        }
         register_build_info();
     }
     first

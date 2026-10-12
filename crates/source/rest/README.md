@@ -78,7 +78,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `base_url` | string | `""` | Base URL of the API (trailing slash trimmed). |
-| `path` | string | `""` | URL path relative to `base_url`. Supports `{key}` placeholders for partition substitution (e.g. `/orgs/{org_id}/users`). Substituted values are percent-encoded, so `/`, `?` or `#` in a value stays inside its segment; a value of exactly `.` or `..` is refused. |
+| `path` | string | `""` | URL path relative to `base_url`. Supports `{key}` placeholders for partition substitution (e.g. `/orgs/{org_id}/users`). Substituted values are percent-encoded, so `/`, `?` or `#` in a value stays inside its segment; a value of exactly `.` or `..` is refused. A CLI fan-out token embedded in the path (`/users/${parent.id}/orders`) is encoded the same way; a `path` that is exactly one token (`${parent.href}`) takes the parent's value raw, so a relative path a parent returned still works. |
 | `method` | string | `GET` | HTTP method for the request. |
 | `auth` | `Auth` / `{ ref }` | `none` | Inline `{ type, config }` auth, or a `{ ref: <name> }` pointer to a shared provider. See [Authentication](#authentication). |
 | `headers` | map<string,string> | empty | Static HTTP headers sent on **every** request (data pages, async-job requests, and OData `$metadata` probes). Applied *before* auth, so an auth header of the same name wins on a clash. Values honor `${env:}` / `${param.*}` interpolation and pass through the secrets/redaction boundary. An invalid header name/value is rejected at config load. See [Custom request headers](#custom-request-headers). |
@@ -957,7 +957,7 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |
-| `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it. The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
+| `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path`, `stop_when_short` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it; set `stop_when_short: true` for a server that never caps a page but rejects an offset past the end (`400`/`416`). The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 

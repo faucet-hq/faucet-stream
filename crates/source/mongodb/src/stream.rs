@@ -420,15 +420,7 @@ fn is_discoverable(name: &str) -> bool {
 /// (auth database) and query options removed, so a URI carrying options
 /// still yields one well-formed, stable catalog identity (#789 MSG-92).
 pub(crate) fn collection_uri(connection_uri: &str, database: &str, collection: &str) -> String {
-    let redacted = faucet_core::redact_uri_credentials(connection_uri);
-    let base = match redacted.find("://") {
-        Some(i) => {
-            let rest = &redacted[i + 3..];
-            let end = rest.find(['/', '?']).unwrap_or(rest.len());
-            &redacted[..i + 3 + end]
-        }
-        None => redacted.as_str(),
-    };
+    let base = faucet_core::redacted_uri_authority(connection_uri);
     format!("{base}/{database}/{collection}")
 }
 

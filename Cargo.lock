@@ -5271,12 +5271,15 @@ name = "faucet-common-sftp"
 version = "1.0.8"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "faucet-core",
+ "hmac 0.12.1",
  "russh",
  "russh-sftp",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
  "tempfile",
  "tokio",
  "tracing",

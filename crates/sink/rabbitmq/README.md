@@ -19,7 +19,10 @@ write is broker-acknowledged before it returns.
   `write_batch_partial` it becomes that row's error, so the pipeline routes it
   to the `dlq:`; without a DLQ the batch fails. Takes effect with
   `confirm: true`; set `mandatory: false` to publish to an exchange that may
-  legitimately have no bindings.
+  legitimately have no bindings. **Upgrade note:** `mandatory` used to default
+  to `false`, silently dropping unroutable messages; a config publishing to a
+  fanout/topic exchange that is sometimes unbound now gets row errors (DLQ'd, or
+  a failed batch) unless it sets `mandatory: false`.
 - Per-row problems — a routing key that resolves to nothing / null / a
   container / more than 255 bytes, a record that does not fit `value_format`, a
   broker `nack` — are row errors too. A channel-level failure (e.g. publishing
@@ -44,7 +47,7 @@ flattened in alongside these fields:
 | `value_format`         | `json`/`string`/`bytes` | `json`  | body encoding (`string` needs string records, `bytes` base64 strings) |
 | `persistent`           | `bool`                  | `true`  | delivery mode 2 (persisted on durable queues) |
 | `mandatory`            | `bool`                  | `true`  | return unroutable messages as row errors (takes effect with `confirm`; ignored without it) |
-| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; a timeout fails the write as retriable |
+| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; on a timeout the rows not yet confirmed fail with a `timeout`-class row error — a `resilience.poison` policy resubmits them, otherwise they go to the DLQ — and earlier groups keep their outcomes |
 | `confirm`              | `bool`                  | `true`  | wait for publisher confirms |
 | `batch_size`           | `usize`                 | `1000`  | messages published before awaiting their confirms (`0` = whole batch) |
 

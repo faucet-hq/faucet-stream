@@ -70,7 +70,7 @@ The server listens on `127.0.0.1:8080/webhook`, collects up to 100 POSTed payloa
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen_addr` | string | `"127.0.0.1:8080"` | Address to bind the HTTP server to. Defaults to **loopback only**; bind `0.0.0.0` only behind a trusted gateway (and set `auth_token`). |
-| `path` | string | `"/webhook"` | Endpoint path that accepts `POST` requests. Supports matrix-context substitution — e.g. `path: /hooks/${row.id}` resolves per row at runtime; `{key}` context values are percent-encoded into one segment. Must start with `/`; `?`, `#`, whitespace, `:`/`*`-prefixed segments and braces other than a whole `{name}` segment are rejected at config load. |
+| `path` | string | `"/webhook"` | Endpoint path that accepts `POST` requests. Supports matrix-context substitution — e.g. `path: /hooks/${row.id}` resolves per row at runtime, percent-encoded into one segment (a value of `.` or `..` is refused); `{key}` context values are percent-encoded the same way. Must start with `/`; `?`, `#`, whitespace, `:`/`*`-prefixed segments and braces other than a whole `{name}` segment are rejected at config load (and by `faucet validate`). Through `fetch_with_context` a `{key}` may also sit inside a segment (`/hooks/user-{id}`); a placeholder the context leaves unfilled is refused rather than served as a route capture. |
 
 ### Termination
 
@@ -87,7 +87,7 @@ The receive window ends as soon as **any** configured condition is met; the serv
 |-------|------|---------|-------------|
 | `max_body_bytes` | int | `1048576` | Max accepted request body size (1 MiB). Larger POSTs are rejected with `413 Payload Too Large` before buffering, so one huge request can't exhaust memory. |
 | `auth_token` | string \| null | `null` | Optional shared secret. When set, requests must carry it in the `Authorization` header (raw value or `Bearer <token>`); others get `401`. Comparison is constant-time. Strongly recommended whenever `listen_addr` isn't loopback. |
-| `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused). Checked in constant time; failures get `401`. |
+| `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused; the timestamp must be plain unix seconds, as the content is rebuilt from its integer value). One signature per request in the `<timestamp>.<body>` layout is supported — schemes that sign another layout (`v0:<ts>:<body>`), pack `t=…,v1=…` into one header, send several signatures during key rotation, or use URL-safe / unpadded base64 cannot be verified. Checked in constant time; failures get `401`. |
 
 ### Batching
 

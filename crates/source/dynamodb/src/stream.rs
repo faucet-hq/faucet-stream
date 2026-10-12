@@ -8,6 +8,7 @@ use crate::envelope::snapshot_envelope;
 use crate::lag::{LagTracker, now_ms, probe_starts};
 use crate::lineage::{
     Planner, capture_bookmark, detect_gaps, ids_and_parents, stale_empty_shards, start_for,
+    unverified_empty_shards,
 };
 use crate::scan::{ScanEvent, expressions, run_segment};
 use crate::sched::Scheduler;
@@ -286,6 +287,16 @@ impl DynamoDbSource {
                 .unwrap_or_default();
 
             let mut gaps = detect_gaps(&bm, &arn, &described);
+            let unverified = unverified_empty_shards(&bm, &described);
+            if !unverified.is_empty() {
+                tracing::warn!(
+                    connector = "dynamodb",
+                    shards = %unverified.join(", "),
+                    "the bookmark predates empty-shard verification, so records written to these \
+                     shards and trimmed before this run cannot be detected; verification applies \
+                     from this run on"
+                );
+            }
             if gaps.is_empty() {
                 gaps.extend(stale_empty_shards(&bm, &described, crate::state::unix_now()));
             }

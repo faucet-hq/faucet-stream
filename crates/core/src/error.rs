@@ -142,6 +142,18 @@ pub enum FaucetError {
     #[error("Circuit open after {failures} consecutive failures; cooldown {cooldown:?}")]
     CircuitOpen { failures: u32, cooldown: Duration },
 
+    /// An operation did not finish within its time bound (a publish waiting
+    /// for broker confirms, a flush). Its outcome is unknown, so it is
+    /// retriable: the resilience policy classifies it as
+    /// [`RetryClass::Timeout`](crate::resilience::RetryClass::Timeout).
+    #[error("{operation} timed out after {after:?}")]
+    Timeout {
+        /// What was being waited on, e.g. `"nats publish"`.
+        operation: String,
+        /// The bound that elapsed.
+        after: Duration,
+    },
+
     /// A custom error from a third-party connector.
     ///
     /// Use this to wrap your own error types without losing the error chain:
@@ -201,6 +213,7 @@ impl FaucetError {
             // on the first 429 (audit #146 H3).
             FaucetError::HttpStatus { status, .. } => *status >= 500 || *status == 429,
             FaucetError::RateLimited(_) => true,
+            FaucetError::Timeout { .. } => true,
             _ => false,
         }
     }
@@ -270,6 +283,16 @@ mod tests {
             body: "Too Many Requests".into(),
         };
         assert!(err.is_retriable());
+    }
+
+    #[test]
+    fn timeout_is_retriable_and_names_the_operation() {
+        let err = FaucetError::Timeout {
+            operation: "nats publish".into(),
+            after: Duration::from_secs(30),
+        };
+        assert!(err.is_retriable());
+        assert_eq!(err.to_string(), "nats publish timed out after 30s");
     }
 
     #[test]

@@ -92,6 +92,23 @@ pub struct NatsSourceConfig {
     /// payload alone).
     #[serde(default)]
     pub include_metadata: bool,
+
+    /// What a payload `value_format` cannot decode does: `fail` (default)
+    /// fails the run; `skip` logs a warning and drops it — a JetStream message
+    /// is terminated so it is not redelivered.
+    #[serde(default)]
+    pub on_decode_error: NatsOnDecodeError,
+}
+
+/// [`NatsSourceConfig::on_decode_error`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NatsOnDecodeError {
+    /// Fail the run.
+    #[default]
+    Fail,
+    /// Warn and drop the message (JetStream: terminate it).
+    Skip,
 }
 
 /// How [`NatsSourceConfig::value_format`] decodes a payload.
@@ -129,6 +146,7 @@ impl NatsSourceConfig {
             progress_interval_secs: default_progress_interval_secs(),
             value_format: NatsValueFormat::Auto,
             include_metadata: false,
+            on_decode_error: NatsOnDecodeError::Fail,
         }
     }
 

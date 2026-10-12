@@ -148,6 +148,10 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         self.inner.set_run_clock(now);
     }
 
+    fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
+        self.inner.set_cancel(cancel)
+    }
+
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
     }
@@ -236,7 +240,7 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         let labels = self.metric_labels();
         Box::pin(inner.inspect(move |page| {
             if let Ok(page) = page {
-                let bytes = page.batch.get_array_memory_size() as u64;
+                let bytes = crate::columnar::batch_slice_bytes(&page.batch);
                 counter!("faucet_source_bytes_total", labels.clone()).increment(bytes);
                 meter.add_read(page.batch.num_rows() as u64, bytes);
             }
@@ -398,6 +402,7 @@ pub(crate) fn error_kind(e: &FaucetError) -> &'static str {
         FaucetError::State(_) => "State",
         FaucetError::StateIncompatible { .. } => "StateIncompatible",
         FaucetError::CircuitOpen { .. } => "CircuitOpen",
+        FaucetError::Timeout { .. } => "Timeout",
         FaucetError::Custom(_) => "Custom",
     }
 }
@@ -516,7 +521,8 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         let n = self.inner.write_batch_columnar(batch).await?;
         if let Some(m) = &self.meter {
             let rows = batch.num_rows().max(1);
-            let bytes = (batch.get_array_memory_size() as u64).saturating_mul(n.min(rows) as u64)
+            let bytes = crate::columnar::batch_slice_bytes(batch)
+                .saturating_mul(n.min(rows) as u64)
                 / rows as u64;
             counter!("faucet_sink_bytes_total", self.metric_labels()).increment(bytes);
             m.add_written(n as u64, bytes);
@@ -932,6 +938,9 @@ pub(crate) mod source_tests {
 
     #[async_trait::async_trait]
     impl crate::Source for RoutedSource {
+        fn set_cancel(&self, _cancel: tokio_util::sync::CancellationToken) -> bool {
+            true
+        }
         async fn fetch_with_context(
             &self,
             _ctx: &std::collections::HashMap<String, serde_json::Value>,
@@ -994,6 +1003,7 @@ pub(crate) mod source_tests {
         let wrapped = InstrumentedSource::new(&inner, labels());
         assert_forwards_multi_table_hooks(&wrapped);
         wrapped.set_run_clock(chrono::Utc::now());
+        assert!(wrapped.set_cancel(tokio_util::sync::CancellationToken::new()));
     }
 
     // Process-global recorder shared across all observability tests in this
@@ -1237,6 +1247,13 @@ pub(crate) mod source_tests {
                     cooldown: Duration::from_secs(60),
                 },
                 "CircuitOpen",
+            ),
+            (
+                FaucetError::Timeout {
+                    operation: "op".into(),
+                    after: Duration::from_secs(1),
+                },
+                "Timeout",
             ),
             (
                 FaucetError::Custom(Box::new(std::io::Error::other("boom"))),

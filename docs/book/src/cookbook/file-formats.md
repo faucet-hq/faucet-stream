@@ -155,6 +155,11 @@ The two in bold worth planning around: **XML trims padding**, so quote-and-pad
 alignment does not survive a round trip; and **xlsx returns a big integer as a
 string**, which is visible and correctable, unlike a rounded number.
 
+An xlsx date/time cell reads as text: `YYYY-MM-DD` for a date, an ISO
+timestamp (`2023-03-15T12:30:00`) when the value has a time of day. A column
+holding any time of day is read as timestamps throughout, so a value at exactly
+midnight in it is `2023-03-15T00:00:00`, not a bare date.
+
 Reading `json_lines` / `json_array`, a number literal that the parsed record
 cannot hold exactly — an integer beyond 2^64, or a decimal with more
 significant digits than a double keeps — fails the read naming the literal,
@@ -197,6 +202,15 @@ an error naming `xml.record_element`, rather than a guess.
 
 Attributes become `@name`, text becomes `#text` (or the value directly when an
 element holds only text), and namespaces are stripped to their local name.
+Two attributes that share a local name in different namespaces keep their
+prefix (`@a:id`, `@b:id`) instead of one replacing the other.
+
+Attributes are parsed strictly, as the XML specification requires: an element
+that repeats an attribute, or an attribute value that uses an entity other than
+the five predefined ones (`&amp;` `&lt;` `&gt;` `&quot;` `&apos;`) or a
+character reference, fails the read with the attribute named. Attribute values
+are whitespace-normalised (tabs and newlines become spaces). Documents that
+earlier releases read leniently despite these defects are now refused.
 
 On write, a field name that is not a legal XML element name (a space, a slash, a
 leading digit) has the offending characters replaced with `_` — the document
@@ -559,9 +573,11 @@ is listed here. Renamed keys and values keep working as aliases, and
 
 - **`mode` is now `if_exists`**, with the values `replace` (default), `append`
   and `error`. `mode:` and the values `overwrite` / `error_if_exists` still work.
-- **Removed aliases:** `csv.write_headers` (use `csv.has_headers`),
-  `max_rows_per_file` (use `max_records_per_file`) and the Parquet codec
-  `uncompressed` (use `none`).
+- **Deprecated names:** `csv.write_headers` (use `csv.has_headers`),
+  `max_rows_per_file` on the `file` sink (use `max_records_per_file`) and the
+  Parquet codec `uncompressed` (use `none`). A patch release once refused
+  them; they load again, with the one-line warning, until the next major
+  release.
 - **One `parquet:` block** on every file-writing sink. Only the default codec
   differs: `snappy` on the `file` sink, `zstd` on the object-store sinks.
 - **SFTP rollover** caps each file at `min(batch_size, max_records_per_file)`,

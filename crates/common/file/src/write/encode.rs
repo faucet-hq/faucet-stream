@@ -787,7 +787,10 @@ fn open_lines(
             if ctx.encrypted() {
                 resumed = Some(ctx.resume_seal(tmp, label)?);
             } else {
-                cut_torn_line(tmp)?;
+                cut_torn_line(
+                    tmp,
+                    ctx.format == FileFormat::JsonLines && ctx.json_lines.pretty,
+                )?;
             }
         } else if ctx.encrypted() {
             let stored = ctx.read_stored(existing, label);
@@ -813,9 +816,25 @@ fn open_lines(
     }
 }
 
+/// End of the last whole record of pretty-printed JSON Lines, where one
+/// record spans several lines: just past the last complete line that starts
+/// at column 0 and does not open an object or array.
+pub(crate) fn pretty_record_end(raw: &[u8]) -> usize {
+    let (mut keep, mut start) = (0, 0);
+    while let Some(i) = raw[start..].iter().position(|b| *b == b'\n') {
+        let line = &raw[start..start + i];
+        start += i + 1;
+        if line.first().is_some_and(|b| !b.is_ascii_whitespace()) && line != b"{" && line != b"[" {
+            keep = start;
+        }
+    }
+    keep
+}
+
 /// Cut bytes after the last newline — a line torn by a run that stopped
-/// mid-write — so appended lines start on a line boundary.
-fn cut_torn_line(path: &Path) -> Result<(), FaucetError> {
+/// mid-write — so appended lines start on a line boundary. With `pretty`
+/// output a record spans lines, so the cut goes back to the last whole one.
+fn cut_torn_line(path: &Path, pretty: bool) -> Result<(), FaucetError> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut f = OpenOptions::new()
         .read(true)
@@ -823,6 +842,21 @@ fn cut_torn_line(path: &Path) -> Result<(), FaucetError> {
         .open(path)
         .map_err(|e| io_err("opening", path, e))?;
     let len = f.metadata().map_err(|e| io_err("reading", path, e))?.len();
+    if pretty {
+        let mut raw = Vec::new();
+        f.read_to_end(&mut raw)
+            .map_err(|e| io_err("reading", path, e))?;
+        let keep = pretty_record_end(&raw) as u64;
+        if keep < len {
+            tracing::warn!(
+                path = %path.display(),
+                bytes = len - keep,
+                "file sink: cutting a partial last record left by an interrupted write"
+            );
+            f.set_len(keep).map_err(|e| io_err("truncating", path, e))?;
+        }
+        return Ok(());
+    }
     let mut end = len;
     let mut buf = vec![0u8; 8192];
     let keep = loop {

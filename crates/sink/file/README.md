@@ -27,7 +27,7 @@ sink:
 | `compression` | `auto` | `auto` (from the suffix), `none`, `gzip`, `zstd`. Applies to every format: a Parquet, Avro or Excel file is compressed whole on top of its internal compression (`x.parquet.gz`); the file source reads it back, but most other readers cannot open it without decompressing first. |
 | `if_exists` | `replace` | What to do with a file that already exists: `replace` (write beside it, rename over it), `append`, `error`. `append` extends a JSON Lines, CSV or raw-text file; for the whole-document formats it needs a numbered output (a `{part}` template or a rollover cap), and each run then adds new parts after the highest existing one. `mode` is accepted as another name for this key, and `overwrite` / `error_if_exists` for its values. |
 | `write_mode` | `append` | `overwrite` replaces the destination's whole output set when the run succeeds — see below. |
-| `max_records_per_file` | none | Roll to a new file after this many records. |
+| `max_records_per_file` | none | Roll to a new file after this many records. `max_rows_per_file` is a deprecated name for it. |
 | `max_bytes_per_file` | none | Roll once a file holds this many bytes, counted as the records' JSON size before compression (on the columnar Parquet path, their in-memory Arrow size). |
 | `create_dirs` | `true` | Create missing directories. |
 | `batch_size` | 1000 | Page-size hint; the sink writes whatever page it is handed. |
@@ -35,7 +35,7 @@ sink:
 | `excel` | `{}` | `sheet` name for the workbook. |
 | `xml` | `{root_element: records, record_element: record}` | XML framing. |
 | `avro` | `{}` | Writer `schema` (inferred from the records when unset) and block `codec` (`null`, `deflate`, `snappy`, `zstd`). |
-| `parquet` | `{compression: snappy, row_group_size: 1048576}` | `compression` is the column-chunk codec: `none`, `snappy` (the default here), `gzip`, `zstd`, `lz4`. `row_group_size` caps the rows per row group. `schema` is an optional explicit column list — see below. |
+| `parquet` | `{compression: snappy, row_group_size: 1048576}` | `compression` is the column-chunk codec: `none` (`uncompressed` is a deprecated name), `snappy` (the default here), `gzip`, `zstd`, `lz4`. `row_group_size` caps the rows per row group. `schema` is an optional explicit column list — see below. |
 | `json_lines` | `{pretty: false}` | `pretty: true` pretty-prints each record across several lines, as the `jsonl` sink's `pretty` does. The file source cannot read that back one record per line, so the sink then offers no `readback_source`. |
 | `encryption` | none | `{key, previous_keys, algorithm}` (feature `encryption`): encrypt the output at rest with AES-256-GCM — see below. |
 

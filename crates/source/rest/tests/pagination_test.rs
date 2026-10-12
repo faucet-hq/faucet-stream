@@ -188,6 +188,7 @@ fn offset_pagination_advances() {
         limit: 50,
         total_path: Some("$.total".into()),
         rows_path: None,
+        stop_when_short: false,
     };
 
     let body = json!({"total": 120});
@@ -219,6 +220,7 @@ fn offset_stops_on_repeated_identical_page_without_total_path() {
         limit: 2,
         total_path: None,
         rows_path: None,
+        stop_when_short: false,
     };
     let mut state = PaginationState::default();
     let body = json!([{"id": 1}, {"id": 2}]);
@@ -240,6 +242,7 @@ fn offset_continues_on_distinct_pages_without_total_path() {
         limit: 2,
         total_path: None,
         rows_path: None,
+        stop_when_short: false,
     };
     let mut state = PaginationState::default();
 
@@ -279,6 +282,7 @@ fn offset_repeated_metadata_body_with_total_path_does_not_false_stop() {
         limit: 50,
         total_path: Some("$.total".into()),
         rows_path: None,
+        stop_when_short: false,
     };
     let mut state = PaginationState::default();
     let body = json!({"total": 120});
@@ -476,6 +480,7 @@ fn offset_rows_path_advances_by_server_rows_not_child_records() {
         limit: 2,
         total_path: None,
         rows_path: Some("$.orders".into()),
+        stop_when_short: false,
     };
     let mut state = PaginationState::default();
     let body = json!({"orders": [{"lines": [1, 2]}, {"lines": [3]}]});

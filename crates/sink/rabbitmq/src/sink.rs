@@ -123,21 +123,22 @@ impl RabbitMqSink {
         };
 
         let limit = std::time::Duration::from_secs(self.config.publish_timeout_secs);
-        for group in prepared.chunks(chunk) {
+        for (n, group) in prepared.chunks(chunk).enumerate() {
             // Bounded: a broker resource alarm (`connection.blocked`) holds
             // publishers indefinitely (#789 MSG-84).
-            tokio::time::timeout(
+            let done = tokio::time::timeout(
                 limit,
                 self.publish_group(&channel, group, &props, options, &mut outcomes),
             )
-            .await
-            .map_err(|_| {
-                FaucetError::Sink(format!(
-                    "rabbitmq sink: a publish batch did not complete within {}s \
-                         (broker blocked by a resource alarm?)",
-                    self.config.publish_timeout_secs
-                ))
-            })??;
+            .await;
+            match done {
+                Ok(published) => published?,
+                Err(_) => {
+                    let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
+                    fail_unconfirmed(&mut outcomes, unconfirmed, limit);
+                    return Ok(outcomes);
+                }
+            }
         }
         Ok(outcomes)
     }
@@ -357,9 +358,63 @@ impl Sink for RabbitMqSink {
     }
 }
 
+/// A publish group that timed out leaves its rows, and every row of the
+/// groups after it, failed with the timeout unless already decided (earlier
+/// groups' confirms, rows that failed on their own).
+/// The error is the typed, retriable [`FaucetError::Timeout`] (a broker
+/// resource alarm blocking publishers is the usual cause).
+fn fail_unconfirmed(
+    outcomes: &mut [faucet_core::RowOutcome],
+    rows: impl Iterator<Item = usize>,
+    after: std::time::Duration,
+) {
+    for i in rows {
+        if outcomes[i].is_ok() {
+            outcomes[i] = Err(FaucetError::Timeout {
+                operation: "rabbitmq publish (broker blocked by a resource alarm?)".into(),
+                after,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_fails_only_rows_not_yet_decided() {
+        let mut outcomes: Vec<faucet_core::RowOutcome> = vec![
+            Ok(()),
+            Err(FaucetError::Sink("unroutable".into())),
+            Ok(()),
+            Ok(()),
+        ];
+        fail_unconfirmed(
+            &mut outcomes,
+            [1usize, 3].into_iter(),
+            std::time::Duration::from_secs(60),
+        );
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        assert!(
+            outcomes[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("unroutable")
+        );
+        assert!(
+            outcomes[3]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("timed out after 60s")
+        );
+        assert_eq!(
+            faucet_core::resilience::classify(outcomes[3].as_ref().unwrap_err()),
+            Some(faucet_core::resilience::RetryClass::Timeout)
+        );
+    }
     use lapin::message::{BasicReturnMessage, Delivery};
     use serde_json::json;
 

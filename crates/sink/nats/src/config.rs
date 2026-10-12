@@ -44,8 +44,11 @@ pub struct NatsSinkConfig {
     pub jetstream: bool,
 
     /// Seconds a publish batch (publishes plus the flush, or the JetStream
-    /// acks) may take before the write fails as retriable, so a server outage
-    /// cannot wedge the run. Default `30`.
+    /// acks) may take, so a server outage cannot wedge the run. On a timeout
+    /// the rows not yet confirmed fail with a `timeout`-class row error: a
+    /// `resilience.poison` policy resubmits them, otherwise they go to the
+    /// DLQ; earlier batches keep their outcomes. A timed-out flush is retried
+    /// by `resilience.retry`. Default `30`.
     #[serde(default = "default_publish_timeout_secs")]
     pub publish_timeout_secs: u64,
 }

@@ -24,6 +24,9 @@ fn default_status_update_interval() -> Duration {
 fn default_max_buffered_events() -> usize {
     100_000
 }
+fn default_max_buffered_bytes() -> usize {
+    256 * 1024 * 1024
+}
 
 fn default_tcp_keepalive() -> Duration {
     Duration::from_secs(60)
@@ -129,9 +132,9 @@ pub struct PostgresCdcSourceConfig {
     /// The slot's `confirmed_flush_lsn` advances only at the start of a cycle,
     /// from the bookmark the previous cycle persisted. Under steady writes
     /// `idle_timeout` never fires, so without this bound a cycle — and the WAL
-    /// the slot pins — would grow until the primary's disk filled. A
-    /// long-running runtime (`faucet schedule`, `faucet serve`, `faucet
-    /// mirror`) starts the next cycle straight away.
+    /// the slot pins — would grow until the primary's disk filled. `faucet
+    /// mirror` starts the next cycle straight away; under `faucet schedule`
+    /// the next tick resumes; a one-shot `faucet run` (or `serve` run) ends.
     #[serde(
         default = "default_max_cycle_duration",
         with = "faucet_core::config::duration_secs"
@@ -168,6 +171,13 @@ pub struct PostgresCdcSourceConfig {
     /// write can outlast that much change volume. Default 100 000.
     #[serde(default = "default_max_buffered_events")]
     pub max_buffered_events: usize,
+
+    /// Upper bound, in bytes of decoded change data, on the read-ahead
+    /// buffer described under `max_buffered_events`; reading pauses at
+    /// whichever limit is reached first. This memory is held in addition to
+    /// `max_staged_records`. Default 268 435 456 (256 MiB).
+    #[serde(default = "default_max_buffered_bytes")]
+    pub max_buffered_bytes: usize,
 
     /// Interval at which Standby Status Update keepalives are sent to the
     /// server. Must be shorter than `idle_timeout` and well under the
@@ -226,6 +236,9 @@ pub enum SlotType {
 pub enum CdcTls {
     /// No TLS — plaintext.
     Disable,
+    /// TLS when the server offers it, else plaintext, without verifying the
+    /// certificate (libpq's `prefer`; open to downgrade).
+    Prefer,
     /// Require TLS but do not verify the server certificate.
     Require,
     /// Require TLS and verify the certificate chain against `ca_path` (or the
@@ -287,7 +300,7 @@ impl PostgresCdcSourceConfig {
         let from_url = url_tls(&self.connection_url)?;
         Ok(match (&self.tls, from_url) {
             (CdcTls::FromUrl, url) => url.unwrap_or(CdcTls::Disable),
-            (explicit, None) => explicit.clone(),
+            (explicit, None) | (explicit, Some(CdcTls::Prefer)) => explicit.clone(),
             (explicit, Some(url)) if explicit.kind() == url.kind() => match (explicit, url) {
                 (CdcTls::VerifyCa { ca_path: None }, u)
                 | (CdcTls::VerifyFull { ca_path: None }, u) => u,
@@ -323,6 +336,11 @@ impl PostgresCdcSourceConfig {
                  support is not yet available via pgwire-replication), got {}",
                 self.proto_version
             )));
+        }
+        if self.max_buffered_bytes == 0 {
+            return Err(FaucetError::Config(
+                "postgres-cdc: max_buffered_bytes must be > 0".into(),
+            ));
         }
         if self.idle_timeout.is_zero() {
             return Err(FaucetError::Config(
@@ -364,6 +382,7 @@ impl CdcTls {
         match self {
             CdcTls::FromUrl => "from_url",
             CdcTls::Disable => "disable",
+            CdcTls::Prefer => "prefer",
             CdcTls::Require => "require",
             CdcTls::VerifyCa { .. } => "verify_ca",
             CdcTls::VerifyFull { .. } => "verify_full",
@@ -373,7 +392,7 @@ impl CdcTls {
 
 /// The TLS mode a libpq-style connection string asks for, from its `sslmode`
 /// and `sslrootcert` (URL query or `key=value` form). `allow` / `prefer`
-/// accept plaintext, which is what the replication stream then uses.
+/// use TLS when the server offers it and plaintext otherwise.
 fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
     let params: Vec<(String, String)> = if conn.contains("://") {
         match url::Url::parse(conn) {
@@ -396,7 +415,8 @@ fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
     let ca_path = get("sslrootcert");
     Ok(match get("sslmode").as_deref() {
         None => None,
-        Some("disable" | "allow" | "prefer") => Some(CdcTls::Disable),
+        Some("disable") => Some(CdcTls::Disable),
+        Some("allow" | "prefer") => Some(CdcTls::Prefer),
         Some("require") => Some(CdcTls::Require),
         Some("verify-ca" | "verify_ca") => Some(CdcTls::VerifyCa { ca_path }),
         Some("verify-full" | "verify_full") => Some(CdcTls::VerifyFull { ca_path }),
@@ -450,6 +470,7 @@ mod tests {
             max_cycle_duration: default_max_cycle_duration(),
             max_staged_records: None,
             max_buffered_events: default_max_buffered_events(),
+            max_buffered_bytes: default_max_buffered_bytes(),
             status_update_interval: std::time::Duration::from_secs(10),
             tcp_keepalive: std::time::Duration::from_secs(60),
             batch_size: DEFAULT_BATCH_SIZE,
@@ -487,7 +508,26 @@ mod tests {
         );
         assert_eq!(
             eff("postgres://h/db?sslmode=prefer", CdcTls::FromUrl).unwrap(),
+            CdcTls::Prefer
+        );
+        assert_eq!(
+            eff("host=h sslmode=allow", CdcTls::FromUrl).unwrap(),
+            CdcTls::Prefer
+        );
+        assert_eq!(
+            eff("postgres://h/db?sslmode=prefer", CdcTls::Disable).unwrap(),
             CdcTls::Disable
+        );
+        assert_eq!(
+            eff("postgres://h/db?sslmode=prefer", CdcTls::Require).unwrap(),
+            CdcTls::Require
+        );
+        let err = eff("postgres://h/db?sslmode=disable", CdcTls::Prefer)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`tls.mode: prefer` contradicts `sslmode=disable`"),
+            "{err}"
         );
         assert_eq!(
             eff("postgres://h/db?sslmode=verify-ca", CdcTls::FromUrl).unwrap(),
@@ -582,6 +622,21 @@ mod tests {
     fn batch_size_above_max_is_rejected_by_validate_batch_size() {
         let c = minimal().with_batch_size(faucet_core::MAX_BATCH_SIZE + 1);
         assert!(faucet_core::validate_batch_size(c.batch_size).is_err());
+    }
+
+    #[test]
+    fn max_buffered_bytes_defaults_and_rejects_zero() {
+        let v: PostgresCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "postgres://u:p@localhost/db",
+            "slot_name": "faucet_slot",
+            "publication_name": "faucet_pub",
+        }))
+        .unwrap();
+        assert_eq!(v.max_buffered_bytes, 256 * 1024 * 1024);
+        let mut c = minimal();
+        c.max_buffered_bytes = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("max_buffered_bytes"), "{err}");
     }
 
     #[test]

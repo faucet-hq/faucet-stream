@@ -98,10 +98,10 @@ impl PostgresCdcSource {
                 "postgres-cdc: the replication connection is plaintext — credentials and every \
                  row change travel unencrypted; set `sslmode` in connection_url or `tls.mode`"
             ),
-            crate::config::CdcTls::Require => tracing::warn!(
+            crate::config::CdcTls::Require | crate::config::CdcTls::Prefer => tracing::warn!(
                 slot = %config.slot_name,
-                "postgres-cdc: TLS without certificate verification (`require`) — use \
-                 `verify_full` to authenticate the server"
+                "postgres-cdc: TLS without certificate verification (`require` / `prefer`) — \
+                 use `verify_full` to authenticate the server"
             ),
             _ => {}
         }
@@ -512,6 +512,7 @@ impl PostgresCdcSource {
                 slot_type: self.config.slot_type,
                 tls: &self.config.tls,
                 max_buffered_events: self.config.max_buffered_events,
+                max_buffered_bytes: self.config.max_buffered_bytes,
             };
             let client = replication::connect(&params).await?;
             replication::ensure_slot(

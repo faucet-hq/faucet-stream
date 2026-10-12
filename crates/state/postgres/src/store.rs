@@ -169,11 +169,16 @@ fn holds_nul(v: &Value) -> bool {
     }
 }
 
+fn envelope_shaped(v: &Value) -> bool {
+    matches!(v, Value::Object(o) if o.len() == 1 && o.get(NUL_ENVELOPE_KEY).is_some_and(Value::is_string))
+}
+
 /// JSONB rejects U+0000, so a value holding it (an opaque cursor, a text
 /// bookmark) is stored as its JSON text inside a one-key envelope, where the
-/// NUL is the escape `\u0000`, not a character.
+/// NUL is the escape `\u0000`, not a character. A value that itself looks like
+/// the envelope is escaped the same way, so reading it back never unwraps it.
 pub(crate) fn wrap_nul(value: &Value) -> Result<std::borrow::Cow<'_, Value>, FaucetError> {
-    if !holds_nul(value) {
+    if !holds_nul(value) && !envelope_shaped(value) {
         return Ok(std::borrow::Cow::Borrowed(value));
     }
     let text = serde_json::to_string(value)
@@ -398,6 +403,14 @@ mod tests {
         let other = serde_json::json!({ NUL_ENVELOPE_KEY: 3 });
         assert_eq!(unwrap_nul(other.clone()).unwrap(), other);
         assert!(unwrap_nul(serde_json::json!({ NUL_ENVELOPE_KEY: "{" })).is_err());
+        for lookalike in [
+            serde_json::json!({ NUL_ENVELOPE_KEY: "[1,2]" }),
+            serde_json::json!({ NUL_ENVELOPE_KEY: "not json" }),
+        ] {
+            let stored = wrap_nul(&lookalike).unwrap().into_owned();
+            assert_ne!(stored, lookalike);
+            assert_eq!(unwrap_nul(stored).unwrap(), lookalike);
+        }
     }
 
     #[test]

@@ -630,7 +630,9 @@ pub struct StateStoreSpec {
 pub struct MatrixRow {
     /// Row identifier. Required for parent/child references and runtime
     /// `${id.path}` interpolation. Anonymous rows get a synthetic `row-N` id.
+    /// Letters, digits, `_` and `-` only.
     #[serde(default)]
+    #[schemars(pattern(r"^[A-Za-z0-9_-]+$"))]
     pub id: Option<String>,
 
     /// If set, this row runs once per record produced by the named parent row.
@@ -713,6 +715,13 @@ pub struct MatrixRow {
     /// `^[a-z0-9][a-z0-9_-]*$`, deduped).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+
+    /// Row ids an earlier release stored this row's state under. While the
+    /// row has no state of its own, its first run moves the bookmark from the
+    /// first of these that holds one. `faucet discover` writes it when a
+    /// dataset's row id changed (#862 L-040).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_state_ids: Vec<String>,
 
     /// Split this row into N independent invocations over a chunked range
     /// (#479), each scoped by `${partition.*}` tokens substituted into the

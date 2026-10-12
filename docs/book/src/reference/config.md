@@ -177,7 +177,11 @@ Three stages resolve placeholders:
   (see below).
 - **Runtime:** `${row_id.dotted.path}` tokens are resolved per parent record in
   DAG runs. `${now.*}` tokens are resolved per invocation at run time (see
-  below).
+  below). A value lands in the field shaped for it: an `xml` source's `body` /
+  `soap.body_inner` gets it XML-escaped, a `rest` / `webhook` `path` gets an
+  embedded token percent-encoded into one segment (a `path` that is exactly one
+  token takes the value raw), and a SQL source's query gets it as a bind
+  parameter.
 
 Reference cycles surface as a clear `InterpolationCycle` error.
 
@@ -412,6 +416,15 @@ Semantics:
   `depends_on:` edges are rejected at load time by `faucet validate`.
 - Ordering works identically under `faucet run`, `schedule`, and `serve` —
   they all execute the same expanded plan.
+
+### `legacy_state_ids` — carry state across a row-id change
+
+A row's id is part of its state key, so renaming a row would start it from
+scratch. `legacy_state_ids: [old_id, …]` lists ids the row's state was stored
+under before; while the row has no state of its own, its first run moves the
+bookmark from the first of them that holds one (a partition chunk looks under
+`old_id::partition::<chunk>`). `faucet discover` and runtime fan-out write it
+when a dataset's id changed (see [Discover](../cookbook/discover.md)).
 
 ### `fan_out:` / `for_each:` — discovery-driven fan-out (#501)
 

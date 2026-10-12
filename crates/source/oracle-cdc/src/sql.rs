@@ -80,6 +80,16 @@ pub(crate) const SCN_AGE_SQL: &str = "SELECT EXTRACT(DAY FROM d) * 86400 + EXTRA
     * 3600 + EXTRACT(MINUTE FROM d) * 60 + EXTRACT(SECOND FROM d) FROM (SELECT \
     SCN_TO_TIMESTAMP(:1) - SCN_TO_TIMESTAMP(:2) AS d FROM DUAL)";
 
+/// The current incarnation SCN of the pluggable database the session is in
+/// (`NULL` outside a PDB).
+pub(crate) const PDB_INCARNATION_SQL: &str = "SELECT MAX(INCARNATION_SCN) FROM V$PDB_INCARNATION \
+    WHERE STATUS = 'CURRENT' AND CON_ID = SYS_CONTEXT('USERENV', 'CON_ID')";
+
+/// Whether the session is inside a pluggable database, from [`CONTAINER_SQL`].
+pub(crate) fn in_pdb(cdb: &str, container: &str) -> bool {
+    cdb.eq_ignore_ascii_case("YES") && !container.eq_ignore_ascii_case("CDB$ROOT")
+}
+
 /// CDB / container detection.
 pub(crate) const CONTAINER_SQL: &str =
     "SELECT d.CDB, SYS_CONTEXT('USERENV', 'CON_NAME') FROM V$DATABASE d";
@@ -236,6 +246,10 @@ mod tests {
     #[test]
     fn container_modes() {
         assert!(!needs_logfiles("YES", "FREEPDB1"));
+        assert!(in_pdb("YES", "FREEPDB1"));
+        assert!(!in_pdb("YES", "CDB$ROOT"));
+        assert!(!in_pdb("NO", "ORCL"));
+        assert!(PDB_INCARNATION_SQL.contains("STATUS = 'CURRENT'"));
         assert!(needs_logfiles("YES", "CDB$ROOT"));
         assert!(needs_logfiles("NO", "ORCL"));
     }

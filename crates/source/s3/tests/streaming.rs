@@ -428,10 +428,13 @@ async fn discover_falls_back_to_objects_under_leaf_prefix() {
         &[
             ("raw/orders/part-1.jsonl".to_string(), jsonl_body(1, 3)),
             ("raw/orders/part-2.jsonl".to_string(), jsonl_body(4, 6)),
+            ("raw/orders/_SUCCESS".to_string(), String::new()),
+            ("raw/orders/day=1_$folder$".to_string(), String::new()),
         ],
     )
     .await;
 
+    // Markers the run would skip are not offered as datasets (#862 L-161).
     let config = S3SourceConfig::new(TEST_BUCKET).prefix("raw/orders/");
     let source = build_source(&endpoint, config).await;
 

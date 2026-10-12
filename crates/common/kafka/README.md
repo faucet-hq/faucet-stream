@@ -91,6 +91,8 @@ require the `schema-registry` feature.
 | `confluent_protobuf` | `schema-registry` | Confluent wire envelope + single-message `.proto` compiled in-process; every field is emitted (proto3 defaults included) under its `.proto` name |
 | `confluent_json_schema` | `schema-registry` | Confluent wire envelope; optional `validate: true` checks decoded JSON against the schema |
 
+Schema Registry **schema references** (a schema that imports, or names types from, other subjects) are not resolved: such an Avro or Protobuf schema fails to compile. Register self-contained schemas, or use `bytes` and decode downstream.
+
 ```yaml
 value_format:
   type: confluent_avro

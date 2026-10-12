@@ -346,6 +346,10 @@ impl Sink for KafkaSink {
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let base = crate::idempotent::client_config_base(&self.config)?;
         crate::idempotent::ensure_commit_topic(&self.config, &base).await?;
+        // init_transactions fences and aborts this scope's own transaction
+        // left open by a crash, which would otherwise hold the side-topic's
+        // stable offset until the broker's timeout sweep.
+        self.txn_producer(scope).await?;
         crate::idempotent::read_last_token(&self.config, &base, scope).await
     }
 

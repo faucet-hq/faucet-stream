@@ -1125,12 +1125,18 @@ impl faucet_core::Source for S3Source {
             })
             .map(str::to_string)
             .collect();
+        let prefix = self.config.prefix.as_deref().unwrap_or("");
         let objects: Vec<String> = response
             .contents()
             .iter()
-            .filter_map(|o| o.key())
-            .filter(|k| !k.is_empty() && !faucet_common_file::write::is_unfinished_output_key(k))
-            .map(str::to_string)
+            .filter_map(|o| {
+                let k = o.key()?;
+                let size = o.size().and_then(|s| u64::try_from(s).ok());
+                (!k.is_empty()
+                    && !faucet_common_file::write::is_unfinished_output_key(k)
+                    && self.filter.keep(k, size, prefix))
+                .then(|| k.to_string())
+            })
             .collect();
 
         Ok(descriptors_from_listing(prefixes, objects))

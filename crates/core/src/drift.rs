@@ -119,11 +119,7 @@ fn fits(dest: &Value, page: &Value) -> bool {
     if pnull && !dnull {
         return false;
     }
-    let also: Vec<&str> = dest
-        .get(DRIFT_ALSO_ACCEPTS)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    let also = also_accepts(dest);
     // Every page base type must be accepted by the destination.
     pn.iter().all(|t| {
         dn.contains(t)
@@ -138,6 +134,41 @@ fn fits(dest: &Value, page: &Value) -> bool {
 /// for a column the sink itself creates for booleans. Such page types fit the
 /// column; they never take part in widening.
 pub const DRIFT_ALSO_ACCEPTS: &str = "x-faucet-also-accepts";
+
+fn also_accepts(dest: &Value) -> Vec<&str> {
+    dest.get(DRIFT_ALSO_ACCEPTS)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// `page` without the base types `dest` lists under [`DRIFT_ALSO_ACCEPTS`]
+/// (and does not declare), so they stay out of widening.
+fn without_also_accepted(dest: &Value, page: &Value) -> Value {
+    let also = also_accepts(dest);
+    if also.is_empty() {
+        return page.clone();
+    }
+    let (dn, _) = type_set(dest);
+    let (pn, pnull) = type_set(page);
+    let mut kept: Vec<Value> = pn
+        .into_iter()
+        .filter(|t| dn.contains(t) || !also.contains(&t.as_str()))
+        .map(Value::String)
+        .collect();
+    if pnull {
+        kept.push(Value::String("null".into()));
+    }
+    let mut out = page.clone();
+    if let Some(obj) = out.as_object_mut() {
+        let ty = match kept.len() {
+            1 => kept.remove(0),
+            _ => Value::Array(kept),
+        };
+        obj.insert("type".into(), ty);
+    }
+    out
+}
 
 /// Can the destination column losslessly evolve to accept the page?
 ///
@@ -220,6 +251,7 @@ pub fn diff_schema(destination: &Value, page: &Value, allow_widening: bool) -> S
                 if fits(dest_ty, page_ty) {
                     continue; // page values already acceptable — no drift
                 }
+                let page_ty = &without_also_accepted(dest_ty, page_ty);
                 let change = ColumnChange {
                     name: name.clone(),
                     from: Some(dest_ty.clone()),
@@ -405,6 +437,24 @@ mod tests {
         let page = schema(json!({"flag": {"type": "number"}}));
         let d = diff_schema(&dest, &page, true);
         assert_eq!(d.widenings.len(), 1);
+        let page = schema(json!({"flag": {"type": ["boolean", "number"]}}));
+        let d = diff_schema(&dest, &page, true);
+        assert_eq!(d.widenings.len(), 1, "{d:?}");
+        assert_eq!(d.widenings[0].to, json!({"type": "number"}));
+        assert!(base_widened(
+            d.widenings[0].from.as_ref().unwrap(),
+            &d.widenings[0].to
+        ));
+        let strict = schema(json!({
+            "flag": {"type": "integer", DRIFT_ALSO_ACCEPTS: ["boolean"]},
+        }));
+        let page = schema(json!({"flag": {"type": ["boolean", "null"]}}));
+        let d = diff_schema(&strict, &page, true);
+        assert_eq!(d.widenings[0].to, json!({"type": "null"}));
+        assert!(adds_null(
+            d.widenings[0].from.as_ref().unwrap(),
+            &d.widenings[0].to
+        ));
         let plain = schema(json!({"flag": {"type": ["integer", "null"]}}));
         let page = schema(json!({"flag": {"type": "boolean"}}));
         assert_eq!(diff_schema(&plain, &page, true).incompatible.len(), 1);

@@ -75,7 +75,7 @@ JSON parse errors, 4xx other than 429) fails fast and is **never** retried.
 | `http_5xx` | HTTP 5xx server errors |
 | `rate_limited` | HTTP 429 / rate-limit signals |
 | `connection` | connection-level failures (DNS, refused, reset) |
-| `timeout` | request timeouts |
+| `timeout` | request timeouts, and a sink operation that outlived its own bound (`FaucetError::Timeout` — a NATS or RabbitMQ publish waiting for confirms) |
 
 Default (omit `retry_on`) = all four. An empty list is rejected at config load.
 

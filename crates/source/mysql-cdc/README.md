@@ -377,7 +377,7 @@ To build a true table mirror (rather than an append-only change log), pair the `
 
 ## Snapshot → CDC handoff
 
-This source implements `capture_resume_position()`, which reads the server's **current binlog coordinates** (`{ file, pos }`) as a resume bookmark — without consuming any changes. The `faucet replicate` command uses it to anchor the binlog stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink.
+This source implements `capture_resume_position()`, which reads the server's **current binlog coordinates** (`{ file, pos }`) as a resume bookmark — without consuming any changes. The `faucet replicate` command uses it to anchor the binlog stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink. The capture refuses while an XA transaction is prepared (listed by `XA RECOVER`): the snapshot cannot see its rows and the stream would start after them. Commit or roll it back and retry. Without the `XA_RECOVER_ADMIN` privilege the check cannot run and the capture only warns.
 
 There is no slot to pin; binlog retention is **time-based**, so keep your binlog retention window comfortably larger than the expected snapshot duration. If the captured position is purged before CDC starts, the stream errors that its start position is unavailable. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
 

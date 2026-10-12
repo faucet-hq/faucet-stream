@@ -103,6 +103,7 @@ pub async fn verify(
     let all = nodes.clone();
     let node = crate::dlq_replay::plan::select_replay_node(nodes, inputs.row.as_deref())?;
     crate::destination::check_owns_destination(&node, &all)?;
+    crate::destination::check_owns_destination_resolved(&node, &all, &inputs.auth).await?;
     verify_node(&node, spec, &inputs).await
 }
 

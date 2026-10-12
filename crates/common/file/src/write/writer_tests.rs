@@ -1202,6 +1202,29 @@ mod in_place {
         );
     }
 
+    /// #862 L-156: pretty records span lines, so a torn one is cut back to
+    /// the end of the last whole record.
+    #[tokio::test]
+    async fn appending_to_pretty_output_cuts_a_torn_multi_line_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.jsonl"),
+            "{\n  \"i\": 7\n}\n{\n  \"i\": 8,\n  \"o\": [\n",
+        )
+        .unwrap();
+        let mut s = jsonl();
+        s.if_exists = IfExists::Append;
+        s.json_lines.pretty = true;
+        let w = local(dir.path(), "p.jsonl", s);
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("p.jsonl")).unwrap(),
+            "{\n  \"i\": 7\n}\n{\n  \"i\": 0\n}\n"
+        );
+        assert_eq!(crate::write::encode::pretty_record_end(b"[]\n{\n"), 3);
+    }
+
     #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn a_sealed_file_extended_in_place_verifies_and_recovers_a_crash_tail() {

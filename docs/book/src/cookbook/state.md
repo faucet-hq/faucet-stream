@@ -275,8 +275,8 @@ encryption. To seal a **file-backed DLQ** the same way, see
 
 The pipeline reads the bookmark before fetching, and persists a new one **only
 after the sink confirms** the page. Most sources emit a bookmark on the final
-page; CDC-style sources emit one per committed transaction and get
-per-transaction durability automatically. Either way, a crash can never advance
+page; CDC-style sources emit one per page of committed transactions (a page
+never ends inside a transaction), so durability follows each page. Either way, a crash can never advance
 the bookmark past data that wasn't written — the next run re-fetches from the
 last confirmed point.
 

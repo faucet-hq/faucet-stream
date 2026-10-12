@@ -196,3 +196,36 @@ async fn a_message_the_response_never_mentions_is_not_counted_delivered() {
         .to_string();
     assert!(whole.contains("1 of 2 record(s) failed"), "{whole}");
 }
+
+#[tokio::test]
+async fn check_fails_a_fifo_queue_without_a_deduplication_source() {
+    let server = MockServer::start().await;
+    let attrs = |cbd: &str| {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/x-amz-json-1.0")
+            .set_body_json(json!({
+                "Attributes": {"FifoQueue": "true", "ContentBasedDeduplication": cbd}
+            }))
+    };
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "AmazonSQS.GetQueueAttributes"))
+        .respond_with(attrs("false"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "AmazonSQS.GetQueueAttributes"))
+        .respond_with(attrs("true"))
+        .mount(&server)
+        .await;
+    let ctx = faucet_core::CheckContext {
+        timeout: std::time::Duration::from_secs(5),
+    };
+    let sink = SqsSink::new(config(&server.uri(), "orders.fifo", 10))
+        .await
+        .unwrap();
+    let report = sink.check(&ctx).await.unwrap();
+    assert_eq!(report.failed_count(), 1, "{report:?}");
+    let report = sink.check(&ctx).await.unwrap();
+    assert_eq!(report.failed_count(), 0, "{report:?}");
+}

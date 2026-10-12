@@ -331,6 +331,10 @@ impl Source for TransformingSource {
     fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
         self.inner.set_run_clock(now);
     }
+
+    fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
+        self.inner.set_cancel(cancel)
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +905,23 @@ mod tests {
         fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {
             self.0.store(true, Ordering::Relaxed);
         }
+        fn set_cancel(&self, _cancel: tokio_util::sync::CancellationToken) -> bool {
+            self.0.store(true, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[test]
+    fn cancel_reaches_the_wrapped_source_and_its_answer_comes_back() {
+        let got = Arc::new(AtomicBool::new(false));
+        let wrapped = TransformingSource::new(
+            Box::new(RecorderProbe(got.clone())),
+            vec![],
+            Labels::for_named("test"),
+        )
+        .unwrap();
+        assert!(wrapped.set_cancel(tokio_util::sync::CancellationToken::new()));
+        assert!(got.load(Ordering::Relaxed));
     }
 
     #[test]

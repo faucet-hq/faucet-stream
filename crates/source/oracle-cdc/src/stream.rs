@@ -26,9 +26,10 @@ use crate::logs::{LogFile, oldest_available_scn, plan_log_files};
 use crate::miner::{Assembler, LogRow, Miner, TableMeta, to_envelope};
 use crate::sql::{
     ADD_LOGFILE_SQL, ARCHIVED_LOGS_SQL, CONTAINER_SQL, CURRENT_SCN_SQL, DatabaseLogging,
-    END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, POSITION_SQL,
-    RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, THREADS_SQL, columns_sql,
-    contents_sql, flush_sql, flush_table_ddl, log_groups_sql, logging_report, needs_logfiles,
+    END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, PDB_INCARNATION_SQL,
+    POSITION_SQL, RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, THREADS_SQL,
+    columns_sql, contents_sql, flush_sql, flush_table_ddl, in_pdb, log_groups_sql, logging_report,
+    needs_logfiles,
 };
 use crate::state::Position;
 
@@ -50,6 +51,28 @@ struct Shared {
 
 fn src_err(context: &str, e: &faucet_common_oracle::oracle::Error) -> FaucetError {
     ora_err(Side::Source, context, e)
+}
+
+/// The current PDB incarnation SCN when the session is in a pluggable
+/// database. A view the user may not read degrades to no check, with a warning.
+fn pdb_incarnation(conn: &Connection) -> Option<u64> {
+    let read = || -> Result<Option<u64>, faucet_common_oracle::oracle::Error> {
+        let (cdb, container): (String, String) = conn.query_row_as(CONTAINER_SQL, &[])?;
+        if !in_pdb(&cdb, &container) {
+            return Ok(None);
+        }
+        let (scn,): (Option<u64>,) = conn.query_row_as(PDB_INCARNATION_SQL, &[])?;
+        Ok(scn)
+    };
+    read().unwrap_or_else(|e| {
+        tracing::warn!(
+            connector = "oracle-cdc",
+            error = %e,
+            "V$PDB_INCARNATION is not readable, so a PDB point-in-time recovery or flashback \
+             cannot be detected; grant SELECT on it to enable the check"
+        );
+        None
+    })
 }
 
 /// A LogMiner start failure; a missing log (ORA-01291) is lost redo.
@@ -265,14 +288,17 @@ impl Shared {
         let (resetlogs,): (u64,) = conn
             .query_row_as(RESETLOGS_SQL, &[])
             .map_err(|e| src_err("incarnation check", &e))?;
+        let pdb = pdb_incarnation(&conn);
         let mut position = match start {
             Some(mut p) => {
                 p.bind_incarnation(resetlogs)?;
+                p.bind_pdb_incarnation(pdb)?;
                 p
             }
             None => {
                 let mut p = self.initial_position(&conn)?;
                 p.bind_incarnation(resetlogs)?;
+                p.bind_pdb_incarnation(pdb)?;
                 if per_txn
                     && !send(StreamPage {
                         records: Vec::new(),

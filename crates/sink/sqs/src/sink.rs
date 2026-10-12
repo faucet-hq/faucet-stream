@@ -541,14 +541,31 @@ impl faucet_core::Sink for SqsSink {
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
+        use aws_sdk_sqs::types::QueueAttributeName;
         let fut = self
             .client
             .get_queue_attributes()
             .queue_url(&self.config.queue_url)
+            .attribute_names(QueueAttributeName::FifoQueue)
+            .attribute_names(QueueAttributeName::ContentBasedDeduplication)
             .send();
         let probe = match tokio::time::timeout(ctx.timeout, fut).await {
             Err(_) => Probe::fail("get_queue_attributes", start.elapsed(), "timed out"),
-            Ok(Ok(_)) => Probe::pass("get_queue_attributes", start.elapsed()),
+            Ok(Ok(out)) => {
+                let attr = |name: QueueAttributeName| {
+                    out.attributes()
+                        .and_then(|a| a.get(&name))
+                        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                };
+                match fifo_dedup_problem(
+                    attr(QueueAttributeName::FifoQueue),
+                    attr(QueueAttributeName::ContentBasedDeduplication),
+                    self.config.message_deduplication_id_field.is_some(),
+                ) {
+                    Some(problem) => Probe::fail("get_queue_attributes", start.elapsed(), problem),
+                    None => Probe::pass("get_queue_attributes", start.elapsed()),
+                }
+            }
             Ok(Err(e)) => Probe::fail(
                 "get_queue_attributes",
                 start.elapsed(),
@@ -559,10 +576,28 @@ impl faucet_core::Sink for SqsSink {
     }
 }
 
+/// Why a FIFO queue would reject every message: it needs a deduplication id
+/// per message unless the queue derives one from the body.
+fn fifo_dedup_problem(fifo: bool, content_dedup: bool, dedup_field: bool) -> Option<String> {
+    (fifo && !content_dedup && !dedup_field).then(|| {
+        "the FIFO queue has ContentBasedDeduplication off and no \
+         message_deduplication_id_field is set, so every message would be rejected"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_fifo_queue_needs_a_deduplication_source() {
+        assert!(fifo_dedup_problem(true, false, false).is_some());
+        assert!(fifo_dedup_problem(true, true, false).is_none());
+        assert!(fifo_dedup_problem(true, false, true).is_none());
+        assert!(fifo_dedup_problem(false, false, false).is_none());
+    }
 
     #[test]
     fn only_transient_request_failures_are_retried() {

@@ -35,7 +35,7 @@ sink:
 | `endpoint_url` | — | LocalStack / VPC endpoint override. |
 | `credentials` | `{ type: default }` | `default` \| `profile` \| `access_key` \| `assume_role` \| `web_identity` — see `faucet-common-sqs`. |
 | `message_group_id` | — | Applied to every message. Required (validated) for a FIFO queue — a `queue_url` ending in `.fifo`. |
-| `message_deduplication_id_field` | — | Record field whose stringified value is the `MessageDeduplicationId`. Missing / non-scalar → per-record failure (DLQ-routable). |
+| `message_deduplication_id_field` | — | Record field whose stringified value is the `MessageDeduplicationId`. Missing / non-scalar → per-record failure (DLQ-routable). A FIFO queue needs this or the queue's `ContentBasedDeduplication`; `faucet doctor` fails the queue probe when it has neither. |
 | `batch_size` | `10` | Entries per `SendMessageBatch` (1–10, the API cap). The house `batch_size: 0` "no batching" sentinel does **not** apply — `0` is rejected at config load, since a whole-page request cannot exceed the 10-entry API cap. |
 | `concurrency` | `4` | Bounded concurrent in-flight requests. A FIFO queue always sends one request at a time, so a group's messages arrive in order. |
 | `retry` | `{}` | Per-record partial-failure retry, grouped: `max_attempts` (`5`), `initial_backoff_ms` (`100`), `max_backoff_ms` (`30000`). The flat `retry_max_attempts` / `retry_initial_backoff_ms` / `retry_max_backoff_ms` keys are still accepted (**deprecated** since #654) and are superseded wholesale when `retry:` is present. |

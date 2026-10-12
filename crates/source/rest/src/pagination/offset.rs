@@ -53,10 +53,44 @@ pub fn advance(
     Ok(true)
 }
 
+/// Whether an opted-in `stop_when_short` ends paging on this page: it is
+/// shorter than `limit` and no readable total decides instead.
+pub fn stops_short(
+    stop_when_short: bool,
+    record_count: usize,
+    limit: usize,
+    body: &Value,
+    total_path: Option<&str>,
+) -> bool {
+    let total_readable = total_path.is_some_and(|tp| {
+        body.query(tp)
+            .ok()
+            .and_then(|r| r.first().and_then(|v| v.as_u64()))
+            .is_some()
+    });
+    stop_when_short && record_count < limit && !total_readable
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stop_when_short_ends_on_a_short_page_unless_a_total_decides() {
+        let body = json!({ "total": 100 });
+        assert!(stops_short(true, 5, 20, &json!({}), None));
+        assert!(!stops_short(false, 5, 20, &json!({}), None));
+        assert!(!stops_short(true, 20, 20, &json!({}), None));
+        assert!(!stops_short(true, 5, 20, &body, Some("$.total")));
+        assert!(stops_short(
+            true,
+            5,
+            20,
+            &json!({"total": "x"}),
+            Some("$.total")
+        ));
+    }
 
     #[test]
     fn zero_record_page_stops_even_when_offset_below_total() {

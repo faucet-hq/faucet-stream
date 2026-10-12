@@ -364,6 +364,7 @@ pub(crate) async fn execute(
     let all_nodes = nodes.clone();
     let nodes = crate::select::select_nodes(nodes, &selection, !cfg.matrix.is_empty())?;
     crate::destination::check_overwrite_selection(&all_nodes, &nodes)?;
+    crate::destination::check_overwrite_selection_resolved(&all_nodes, &nodes, &auth).await?;
     drop(all_nodes);
     // Data-flow policy static gate (#702): a labelled column heading for a
     // sink its rules forbid refuses the whole run before any connector is
@@ -525,7 +526,8 @@ pub(crate) async fn execute(
                     row = %i.row_id,
                     records_written = i.records_written,
                     duration_ms = i.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
-                    failed = i.error.is_some(),
+                    failed = i.error.is_some() && !is_skipped(i),
+                    skipped = is_skipped(i),
                     "row completed"
                 );
             }
@@ -722,6 +724,8 @@ pub(crate) struct RunTotals {
     pub dlq_count: u64,
     pub ok: usize,
     pub failed: usize,
+    /// Rows that never ran because a parent or `depends_on` row failed.
+    pub skipped: usize,
 }
 
 /// The full `--output json` document.
@@ -739,6 +743,11 @@ pub(crate) struct RunSummaryDocument {
     pub log_export: Option<crate::logship::LogExportView>,
 }
 
+/// Whether an invocation never ran because a parent or `depends_on` row failed.
+fn is_skipped(o: &crate::executor::InvocationOutcome) -> bool {
+    o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped)
+}
+
 /// Project one invocation outcome into its summary row.
 pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
     summary
@@ -752,7 +761,13 @@ pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
                 run_id: o.run_id.clone(),
                 source: m.source_kind,
                 sink: m.sink_kind,
-                status: if o.error.is_some() { "failed" } else { "ok" },
+                status: if is_skipped(o) {
+                    "skipped"
+                } else if o.error.is_some() {
+                    "failed"
+                } else {
+                    "ok"
+                },
                 rows_in: m.records_read,
                 rows_out: o.records_written as u64,
                 duration_ms: m.duration_ms,
@@ -776,12 +791,14 @@ pub(crate) fn summary_document(
 ) -> RunSummaryDocument {
     let rows = summary_rows(summary);
     let failed = rows.iter().filter(|r| r.status == "failed").count();
+    let skipped = rows.iter().filter(|r| r.status == "skipped").count();
     let totals = RunTotals {
         rows: rows.len(),
         rows_out: rows.iter().map(|r| r.rows_out).sum(),
         dlq_count: rows.iter().map(|r| r.dlq_count).sum(),
-        ok: rows.len() - failed,
+        ok: rows.len() - failed - skipped,
         failed,
+        skipped,
     };
     RunSummaryDocument {
         pipeline: pipeline.to_string(),
@@ -1023,9 +1040,35 @@ mod tests {
         assert_eq!(doc.rows[0].rows_in, Some(3));
         assert_eq!(doc.rows[1].status, "failed");
         assert_eq!(doc.rows[1].error.as_deref(), Some("boom"));
+        assert_eq!(doc.totals.skipped, 0);
         // Serializes cleanly.
         let json = serde_json::to_string(&doc).unwrap();
         assert!(json.contains("\"pipeline\":\"demo\""), "{json}");
+    }
+
+    /// #862 L-037: a row skipped under a failed parent is reported as
+    /// skipped, not as a second failure.
+    #[test]
+    fn skipped_rows_are_reported_as_skipped() {
+        let mut child = outcome("c", 0, Some("skipped: parent row 'a' failed"));
+        child.error_kind = Some(crate::executor::InvocationErrorKind::Skipped);
+        let summary = RunSummary {
+            invocations: vec![outcome("a", 0, Some("boom")), child],
+        };
+        let now = Utc::now();
+        let doc = summary_document("demo", now, now, &summary);
+        assert_eq!(doc.status, "failed");
+        assert_eq!(doc.rows[1].status, "skipped");
+        assert_eq!(
+            (doc.totals.ok, doc.totals.failed, doc.totals.skipped),
+            (0, 1, 1)
+        );
+        #[cfg(feature = "serve")]
+        {
+            use crate::serve::history::InvocationRecord;
+            assert!(InvocationRecord::from(&summary.invocations[1]).skipped);
+            assert!(!InvocationRecord::from(&summary.invocations[0]).skipped);
+        }
     }
 
     #[test]

@@ -320,6 +320,10 @@ impl faucet_core::Source for BoundedSource {
     fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
         self.inner.set_run_clock(now);
     }
+
+    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
+        self.inner.set_cancel(cancel)
+    }
 }
 
 /// Build a fresh `ExecuteOptions` for one unit run.
@@ -1195,5 +1199,6 @@ matrix:
             ),
         ));
         bounded.set_run_clock(chrono::Utc::now());
+        assert!(!bounded.set_cancel(faucet_core::CancellationToken::new()));
     }
 }

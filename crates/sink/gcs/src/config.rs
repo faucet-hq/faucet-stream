@@ -168,7 +168,8 @@ pub struct GcsSinkConfig {
     pub storage_host: Option<String>,
     /// Compression codec applied to each uploaded object body. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —
-    /// resolves against `file_extension` (so `.jsonl.gz` triggers gzip).
+    /// resolves against the object name (`path`'s, else `file_extension`, so
+    /// `.jsonl.gz` triggers gzip).
     /// Requires the crate-local `compression` feature. Note: this sink does
     /// **not** set the GCS `Content-Encoding` metadata, so consumers must
     /// decompress explicitly.

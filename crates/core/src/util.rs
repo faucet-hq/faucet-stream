@@ -98,12 +98,27 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Du
     if let Ok(secs) = raw.parse::<u64>() {
         return Some(std::time::Duration::from_secs(secs));
     }
-    let when = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
-    Some(
-        (when.with_timezone(&chrono::Utc) - chrono::Utc::now())
-            .to_std()
-            .unwrap_or_default(),
-    )
+    if let Ok(secs) = raw.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some(std::time::Duration::from_secs(secs.ceil() as u64));
+    }
+    let when = parse_http_date(raw)?;
+    Some((when - chrono::Utc::now()).to_std().unwrap_or_default())
+}
+
+/// An HTTP date in any of the three forms RFC 9110 §5.6.7 requires a recipient
+/// to accept: IMF-fixdate, the obsolete RFC 850 form and asctime.
+fn parse_http_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(when) = chrono::DateTime::parse_from_rfc2822(raw) {
+        return Some(when.with_timezone(&chrono::Utc));
+    }
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(&collapsed, f).ok())
+        .map(|n| n.and_utc())
 }
 
 /// `FaucetError::RateLimited(wait)` when `wait` is at most `max`; above it a
@@ -518,6 +533,21 @@ fn is_secret_kv_key(key: &str) -> bool {
 /// to identify the userinfo→host `@` delimiter when redacting credentials.
 /// Accepts letters, digits, `.`, `-`, `:`, `_`, bracketed IPv6 forms, and `,`
 /// for a multi-host seed list (`h1:27017,h2:27017`).
+/// `scheme://host[:port][,host…]` of a connection URI with its credentials,
+/// path, query and fragment removed — a base for dataset URIs that must not
+/// carry connection options. Input without `://` is returned redacted only.
+pub fn redacted_uri_authority(uri: &str) -> String {
+    let redacted = redact_uri_credentials(uri);
+    match redacted.find("://") {
+        Some(i) => {
+            let rest = &redacted[i + 3..];
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            redacted[..i + 3 + end].to_string()
+        }
+        None => redacted,
+    }
+}
+
 fn is_host_shaped(s: &str) -> bool {
     s.bytes().all(|b| {
         b.is_ascii_alphanumeric()
@@ -724,6 +754,18 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redacted_uri_authority_keeps_only_scheme_and_hosts() {
+        assert_eq!(
+            super::redacted_uri_authority("mongodb://u:p@h1:27017,h2/admin?replicaSet=rs#x"),
+            "mongodb://h1:27017,h2"
+        );
+        assert_eq!(
+            super::redacted_uri_authority("mongodb+srv://cluster.example.net"),
+            "mongodb+srv://cluster.example.net"
+        );
+        assert_eq!(super::redacted_uri_authority("localhost"), "localhost");
+    }
 
     /// Serve one response: `head` then `body`, then hold the socket open.
     fn serve_once(head: String, body: Vec<u8>) -> String {
@@ -791,6 +833,26 @@ mod tests {
             w > std::time::Duration::from_secs(100) && w <= std::time::Duration::from_secs(120)
         );
         h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_obsolete_date_forms_and_fractional_seconds() {
+        let mut h = reqwest::header::HeaderMap::new();
+        for past in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
+            h.insert(reqwest::header::RETRY_AFTER, past.parse().unwrap());
+            assert_eq!(retry_after(&h), Some(std::time::Duration::ZERO), "{past}");
+        }
+        let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+        for f in ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"] {
+            let v = future.format(f).to_string();
+            h.insert(reqwest::header::RETRY_AFTER, v.parse().unwrap());
+            let w = retry_after(&h).unwrap();
+            assert!(w > std::time::Duration::from_secs(250), "{v}: {w:?}");
+        }
+        h.insert(reqwest::header::RETRY_AFTER, "1.2".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(std::time::Duration::from_secs(2)));
+        h.insert(reqwest::header::RETRY_AFTER, "-3".parse().unwrap());
         assert_eq!(retry_after(&h), None);
     }
 

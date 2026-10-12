@@ -417,14 +417,6 @@ pub trait Source: Send + Sync {
         None
     }
 
-    /// The earliest stream position every one of `positions` can resume from
-    /// (#731): the shared change stream restarts there and each table skips
-    /// what it has already applied. The default picks the position that
-    /// [`position_le`](Self::position_le) orders at or before all the others,
-    /// and `None` when there is none (an empty slice, or positions this source
-    /// cannot order). Sources whose positions are only partially ordered (one
-    /// cursor per capture instance, say) override it with a component-wise
-    /// minimum.
     /// Whether the stream had already delivered `record`'s change at stream
     /// position `position` (#854): `Some(true)` when a run resumed from
     /// `position` would not deliver it again, `Some(false)` when it would, and
@@ -438,6 +430,14 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// The earliest stream position every one of `positions` can resume from
+    /// (#731): the shared change stream restarts there and each table skips
+    /// what it has already applied. The default picks the position that
+    /// [`position_le`](Self::position_le) orders at or before all the others,
+    /// and `None` when there is none (an empty slice, or positions this source
+    /// cannot order). Sources whose positions are only partially ordered (one
+    /// cursor per capture instance, say) override it with a component-wise
+    /// minimum.
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         let first = positions.first()?;
         if positions.iter().all(|p| p == first) {
@@ -491,6 +491,20 @@ pub trait Source: Send + Sync {
     /// Called once before streaming. Defaulted to a no-op; a connector opts in
     /// by storing the instant behind interior mutability.
     fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {}
+
+    /// Receive the run's cancellation token ([`Pipeline::with_cancel`](crate::Pipeline::with_cancel)),
+    /// installed once before streaming.
+    ///
+    /// Return `true` when the source handles the cancel itself: it stops
+    /// reading, yields the records it has buffered and ends its stream
+    /// promptly. The pipeline then keeps polling the stream to its end instead
+    /// of stopping at the next page boundary, so that buffered tail is
+    /// written. A source that buffers records it cannot re-read (a live feed)
+    /// opts in; the default ignores the token and returns `false`. A wrapping
+    /// source forwards the call and returns the inner source's answer.
+    fn set_cancel(&self, _cancel: tokio_util::sync::CancellationToken) -> bool {
+        false
+    }
 
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).

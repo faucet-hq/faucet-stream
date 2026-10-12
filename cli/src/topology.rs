@@ -114,6 +114,7 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
     }
     refuse_graph_blocks(cfg)?;
     refuse_destructive_sources(cfg)?;
+    refuse_stateless_cdc_sources(cfg)?;
     refuse_unresolved_node_refs(cfg)?;
     crate::expand::check_sla_and_profiling(
         "topology",
@@ -269,6 +270,39 @@ fn refuse_destructive_sources(cfg: &PipelineConfig) -> CliResult<()> {
                  pipeline instead"
             )));
         }
+    }
+    Ok(())
+}
+
+/// The matrix-row postgres-cdc `state:` gate, applied to every source node.
+fn refuse_stateless_cdc_sources(cfg: &PipelineConfig) -> CliResult<()> {
+    let mut ids: Vec<&String> = cfg.pipeline.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let NodeSpec::Source {
+            template,
+            kind,
+            config,
+        } = &cfg.pipeline.nodes[id]
+        else {
+            continue;
+        };
+        let Ok((kind, _)) = resolve_connector(
+            &cfg.pipeline.sources,
+            &cfg.pipeline.source,
+            template.as_deref(),
+            kind.as_deref(),
+            config.as_ref(),
+            id,
+            "source",
+        ) else {
+            continue;
+        };
+        crate::expand::check_postgres_cdc_state(
+            &format!("topology source node '{id}'"),
+            &kind,
+            cfg.pipeline.state.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -1294,6 +1328,8 @@ pub async fn preview_records(
                 id,
                 "source",
             )?;
+            let mut c = c;
+            crate::preview_sample::bound_batch_size(&k, &mut c, limit);
             let source = build_source(&k, c, auth, None).await?;
             let sample = crate::preview_sample::sample(
                 source.as_ref(),
@@ -2758,6 +2794,37 @@ pipeline:
         let err = validate_topology_spec(&c).unwrap_err().to_string();
         assert!(err.contains("sink node 'w'"), "{err}");
         assert!(err.contains("write_mode: overwrite"), "{err}");
+    }
+
+    #[test]
+    fn a_postgres_cdc_source_node_needs_a_state_block() {
+        let graph = r#"name: p
+pipeline:
+  sources:
+    a: { type: postgres-cdc, config: {} }
+  sinks:
+    o: { type: stdout, config: {} }
+  nodes:
+    s: { kind: source, ref: a }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: s, to: w }
+"#;
+        let err = validate_topology_spec(&cfg(&format!("version: 1\n{graph}")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("topology source node 's': postgres-cdc needs a `state:` block"),
+            "{err}"
+        );
+        let with = |kind: &str| {
+            graph.replace(
+                "pipeline:\n",
+                &format!("pipeline:\n  state: {{ type: {kind}, config: {{ path: ./st }} }}\n"),
+            )
+        };
+        validate_topology_spec(&cfg(&format!("version: 1\n{}", with("file")))).unwrap();
+        validate_topology_spec(&cfg(&format!("version: 1\n{}", with("memory")))).unwrap();
     }
 
     #[test]

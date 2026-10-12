@@ -118,7 +118,8 @@ All fields are keys under `source.config`.
 | `sasl_plain` | `{ username, password }` | Confluent Cloud, MSK with SASL/PLAIN. |
 | `sasl_scram` | `{ mechanism: sha256\|sha512, username, password }` | Brokers configured for SCRAM. |
 | `ssl` | `{ ca_path, cert_path, key_path, key_password? }` | Mutual-TLS client certificates. |
-| `sasl_ssl` | `{ sasl: {…}, ssl: {…} }` | SASL over a TLS transport. |
+| `tls` | `{ ca_path? }` | TLS with server authentication only — no client certificate (managed clusters). |
+| `sasl_ssl` | `{ sasl: {…}, ssl: {…} }` | SASL over a TLS transport; `ssl` is a `tls`, `ssl` or `none` block (`tls` for a managed cluster without client certificates). |
 
 ```yaml
 # SASL/PLAIN — env indirection keeps secrets out of the YAML
@@ -469,6 +470,7 @@ In the CLI / umbrella, enable the connector with `source-kafka`, and the registr
 | SASL / SSL handshake failure | Wrong `auth` type or credentials, or a `key_path` / `cert_path` / `ca_path` that doesn't exist (paths are validated at config time). Confirm the broker's `security.protocol` matches. |
 | Messages fail to decode | The `value_format` doesn't match the wire data (e.g. `json` against Avro). Match the producer's format; use `on_decode_error: skip` to drop bad messages instead of aborting. |
 | `confluent_protobuf` fails with "only supports single-message schemas" | The record's `message_indexes` names a message other than the first in the `.proto`. Only single-message schemas are supported; use `bytes` and decode downstream. |
+| A `confluent_avro` / `confluent_protobuf` schema fails to compile | The subject uses Schema Registry schema references (it imports or names types from other subjects); references are not resolved. Register a self-contained schema, or use `bytes` and decode downstream. |
 | Confluent format rejected as unknown `type` | Build with the `schema-registry` feature (CLI: `kafka-schema-registry`). |
 | Throughput lower than expected | Partition the topic and run multiple instances with the same `group_id`, and/or tune `fetch.max.bytes` / `max.partition.fetch.bytes` via `extra_client_config`. |
 

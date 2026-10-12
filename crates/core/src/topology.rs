@@ -1213,7 +1213,20 @@ fn track_failure(
     failed: FailedNodes,
 ) -> Pin<Box<dyn Future<Output = Result<NodeOutcome, FaucetError>> + Send>> {
     Box::pin(async move {
-        let result = fut.await;
+        use futures::FutureExt;
+        let result = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".into());
+                Err(FaucetError::Source(format!(
+                    "topology node '{id}' panicked: {msg}"
+                )))
+            }
+        };
         if let Err(e) = &result {
             failed
                 .lock()
@@ -4888,6 +4901,42 @@ mod graph_safety_tests {
         let err = k.error.as_deref().unwrap_or_default();
         assert!(err.contains("upstream node 'src' failed"), "{err}");
         assert_eq!(k.error_kind, Some(NodeErrorKind::Other));
+    }
+
+    /// #862 L-030: a panicking node is recorded as failed before its outputs
+    /// close, so a downstream sink does not report its cut-short input as a
+    /// complete run.
+    #[tokio::test]
+    async fn a_sink_fed_by_a_panicking_transform_is_reported_failed() {
+        let boom: crate::stage::PageFnBox = Arc::new(|_records: Vec<Value>| panic!("boom"));
+        let (source, _) = LogSource::new(1, 1, false);
+        let (sink, _) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("s", Box::new(source))
+            .transform("x", vec![CompiledStage::PageFn(boom)])
+            .sink("k", Box::new(sink))
+            .edge("s", "x")
+            .edge("x", "k")
+            .build()
+            .unwrap();
+        let run = topo
+            .run_reported(
+                TopologyOptions::new("p").with_on_error(TopologyOnError::Continue),
+                TopologyGovernance::new(),
+            )
+            .await
+            .unwrap();
+        let k = run.nodes.iter().find(|n| n.node_id == "k").unwrap();
+        let err = k.error.as_deref().unwrap_or_default();
+        assert!(err.contains("upstream node 'x' failed"), "{err}");
+        assert!(
+            run.result
+                .errors
+                .iter()
+                .any(|e| e.contains("topology node 'x' panicked: boom")),
+            "{:?}",
+            run.result.errors
+        );
     }
 
     #[tokio::test]

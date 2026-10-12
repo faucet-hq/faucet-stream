@@ -983,7 +983,10 @@ impl StateStore for FileStateStore {
 
     /// Atomic across processes sharing the directory: the read-compare-write
     /// runs while holding an exclusive OS lock on `<key>.json.lock`, which the
-    /// OS releases if the writer dies.
+    /// OS releases if the writer dies. The lock serializes compare-and-puts
+    /// only: a plain [`put`](StateStore::put) or [`delete`](StateStore::delete)
+    /// of the same key does not take it, so a key managed by compare-and-put
+    /// must not also be written with them.
     async fn compare_and_put(
         &self,
         key: &str,

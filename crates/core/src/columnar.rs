@@ -456,9 +456,40 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
     }
 }
 
+/// Bytes the rows of `batch` occupy — its own slice of each column, so a
+/// sliced batch is not charged for the whole parent buffers.
+pub(crate) fn batch_slice_bytes(batch: &RecordBatch) -> u64 {
+    use arrow::array::Array;
+    batch
+        .columns()
+        .iter()
+        .map(|c| {
+            c.to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| c.get_array_memory_size()) as u64
+        })
+        .sum()
+}
+
 /// Compare two schemas for field-level equality (name + data-type + nullability).
 pub fn schema_eq(a: &Schema, b: &Schema) -> bool {
     a.fields() == b.fields()
+}
+
+#[cfg(test)]
+mod slice_bytes_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    #[test]
+    fn a_sliced_batch_is_charged_for_its_rows_only() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let col = Arc::new(Int64Array::from_iter_values(0..1000));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+        assert_eq!(batch_slice_bytes(&batch), 8000);
+        assert_eq!(batch_slice_bytes(&batch.slice(0, 10)), 80);
+        assert!(batch.slice(0, 10).get_array_memory_size() >= 8000);
+    }
 }
 
 #[cfg(test)]

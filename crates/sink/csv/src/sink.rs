@@ -382,6 +382,58 @@ fn unknown_fields(columns: &[String], records: &[Value]) -> Vec<String> {
     out
 }
 
+/// Cut a torn last row (an interrupted write) from an uncompressed CSV file
+/// before appending to it: everything after the last newline that ends a
+/// record, i.e. one outside a quoted field. A file that ends in a newline is
+/// left alone without being read.
+fn cut_torn_row(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1))?;
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, &file);
+    let (mut quoted, mut keep, mut pos) = (false, 0u64, 0u64);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            pos += 1;
+            match b {
+                b'"' => quoted = !quoted,
+                b'\n' if !quoted => keep = pos,
+                _ => {}
+            }
+        }
+    }
+    drop(reader);
+    if keep < len {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = len - keep,
+            "csv sink: cutting a partial last row left by an interrupted write"
+        );
+        file.set_len(keep)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
 /// The header row of the file an `append: true` run continues, or `None`
 /// when the file is missing or empty (the run then writes one).
 fn read_existing_header(config: &CsvSinkConfig) -> Result<Option<Vec<String>>, FaucetError> {
@@ -586,6 +638,19 @@ fn open_writer(
             // (audit #146 H2). (A later flush-segment cannot change the
             // already-written header — that is a separate, documented limitation.)
             let mut columns: Vec<String> = Vec::new();
+            #[cfg(feature = "compression")]
+            let plain = config.compression.resolve(&config.path)
+                == faucet_core::compression::Compression::None;
+            #[cfg(not(feature = "compression"))]
+            let plain = true;
+            if (opened_before || config.append) && plain {
+                cut_torn_row(std::path::Path::new(&config.path)).map_err(|e| {
+                    FaucetError::Sink(format!(
+                        "failed to repair CSV file '{}' before appending: {e}",
+                        config.path
+                    ))
+                })?;
+            }
             let existing_header = if opened_before || !config.append || !config.write_headers {
                 None
             } else {
@@ -762,6 +827,42 @@ mod tests {
     use faucet_core::Sink;
     use serde_json::json;
     use tempfile::NamedTempFile;
+
+    /// #862 L-155: a torn last row is cut back to the last record boundary,
+    /// which a newline inside a quoted field is not.
+    #[test]
+    fn cut_torn_row_respects_quoted_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.csv");
+        let cases: [(&str, &str); 5] = [
+            ("a,b\n1,2\n3,\"x\ny", "a,b\n1,2\n"),
+            ("a,b\n1,\"p\nq\"\n4,", "a,b\n1,\"p\nq\"\n"),
+            ("a,b\n1,2\n", "a,b\n1,2\n"),
+            ("a,b", ""),
+            ("", ""),
+        ];
+        for (before, after) in cases {
+            std::fs::write(&p, before).unwrap();
+            cut_torn_row(&p).unwrap();
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), after, "{before:?}");
+        }
+        cut_torn_row(&dir.path().join("missing.csv")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_append_run_cuts_a_torn_last_row_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("out.csv");
+        std::fs::write(&p, "id,name\n1,a\n2,\"tor").unwrap();
+        let mut cfg = CsvSinkConfig::new(p.to_str().unwrap());
+        cfg.append = true;
+        let sink = CsvSink::new(cfg);
+        sink.write_batch(&[json!({"id": 3, "name": "c"})])
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "id,name\n1,a\n3,c\n");
+    }
 
     struct FailAfter(usize);
 

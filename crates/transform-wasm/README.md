@@ -39,7 +39,8 @@ access in v1. A module may declare one linear memory and one table (at most
 fuel/memory exhaustion, ABI violation, or non-JSON output is routed by
 `on_error`; after a trap the instance is discarded and the next record runs on
 a fresh one, so a half-updated heap never shapes later output. `log` forwards at
-most 100 messages of up to 4 KiB per instance; the rest are counted in one warning.
+most 100 messages of up to 4 KiB per run (shared by every page and every instance
+rebuilt after a trap); the rest are counted and reported once.
 
 ## ABI (v1)
 

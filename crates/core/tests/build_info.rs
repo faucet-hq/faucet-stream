@@ -33,11 +33,16 @@ fn the_application_version_replaces_cores_and_the_first_one_wins() {
         vec![env!("CARGO_PKG_VERSION").to_string()]
     );
 
-    // Setting the version re-registers the gauge under the current recorder.
-    let on_set = DebuggingRecorder::new();
+    // Setting the version re-registers the gauge under the current recorder,
+    // and a recorder that already held core's series sees it drop to 0
+    // (#862 L-032).
+    let shared = DebuggingRecorder::new();
     let mut first = false;
     assert_eq!(
-        reported_versions(&on_set, || first = faucet_core::set_build_version("98.7.6")),
+        reported_versions(&shared, || {
+            faucet_core::register_build_info();
+            first = faucet_core::set_build_version("98.7.6");
+        }),
         vec!["98.7.6".to_string()]
     );
     assert!(first);

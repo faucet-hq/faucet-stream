@@ -66,11 +66,12 @@ pub struct Client {
 /// while the pipeline is busy writing a page. Without it, a sink write longer
 /// than the server's `wal_sender_timeout` during catch-up got the replication
 /// connection killed (#789 SQL-88). The buffer holds at most
-/// `max_buffered_events`; past that the pump stops reading until the consumer
-/// catches up.
+/// `max_buffered_events` events and `max_buffered_bytes` of change data; past
+/// either limit the pump stops reading until the consumer catches up.
 pub struct Duplex {
-    events: tokio::sync::mpsc::UnboundedReceiver<Result<Option<ReplicationEvent>, FaucetError>>,
-    buffered: std::sync::Arc<tokio::sync::Semaphore>,
+    events:
+        tokio::sync::mpsc::UnboundedReceiver<(Result<Option<ReplicationEvent>, FaucetError>, u32)>,
+    budget: ReadAhead,
     applied: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pump: tokio::task::JoinHandle<()>,
 }
@@ -81,48 +82,110 @@ impl Drop for Duplex {
     }
 }
 
+trait EventSource: Send + 'static {
+    fn update_applied(&mut self, lsn: u64);
+    fn recv(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<ReplicationEvent>, FaucetError>> + Send;
+}
+
+impl EventSource for ReplicationClient {
+    fn update_applied(&mut self, lsn: u64) {
+        self.update_applied_lsn(Lsn::from_u64(lsn));
+    }
+
+    async fn recv(&mut self) -> Result<Option<ReplicationEvent>, FaucetError> {
+        ReplicationClient::recv(self)
+            .await
+            .map_err(|e| pgwire_err("postgres-cdc recv", e))
+    }
+}
+
+/// Event-count and byte budget of the read-ahead buffer.
+#[derive(Clone)]
+struct ReadAhead {
+    events: std::sync::Arc<tokio::sync::Semaphore>,
+    bytes: std::sync::Arc<tokio::sync::Semaphore>,
+    max_bytes: u32,
+}
+
+impl ReadAhead {
+    fn new(max_events: usize, max_bytes: usize) -> Self {
+        let max_bytes = u32::try_from(max_bytes.max(1)).unwrap_or(u32::MAX);
+        Self {
+            events: std::sync::Arc::new(tokio::sync::Semaphore::new(max_events.max(1))),
+            bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(max_bytes as usize)),
+            max_bytes,
+        }
+    }
+
+    fn charge(&self, event: &Result<Option<ReplicationEvent>, FaucetError>) -> u32 {
+        let size = match event {
+            Ok(Some(ReplicationEvent::XLogData { data, .. })) => data.len(),
+            _ => 0,
+        };
+        u32::try_from(size).unwrap_or(u32::MAX).min(self.max_bytes)
+    }
+
+    fn release(&self, bytes: u32) {
+        self.events.add_permits(1);
+        self.bytes.add_permits(bytes as usize);
+    }
+}
+
 impl Duplex {
-    fn spawn(mut client: ReplicationClient, max_buffered: usize) -> Self {
+    fn spawn(client: ReplicationClient, max_buffered: usize, max_bytes: usize) -> Self {
+        Self::spawn_source(client, ReadAhead::new(max_buffered, max_bytes))
+    }
+
+    fn spawn_source<S: EventSource>(mut client: S, budget: ReadAhead) -> Self {
         let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-        let buffered = std::sync::Arc::new(tokio::sync::Semaphore::new(max_buffered.max(1)));
         let applied = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (permits, lsn) = (buffered.clone(), applied.clone());
+        let (pump_budget, lsn) = (budget.clone(), applied.clone());
         let pump = tokio::spawn(async move {
             loop {
-                let Ok(permit) = permits.clone().acquire_owned().await else {
+                let Ok(permit) = pump_budget.events.clone().acquire_owned().await else {
                     return;
                 };
                 permit.forget();
                 let current = lsn.load(std::sync::atomic::Ordering::Acquire);
                 if current > 0 {
-                    client.update_applied_lsn(Lsn::from_u64(current));
+                    client.update_applied(current);
                 }
-                let next = client
-                    .recv()
-                    .await
-                    .map_err(|e| pgwire_err("postgres-cdc recv", e));
+                let next = client.recv().await;
+                let size = pump_budget.charge(&next);
+                if size > 0 {
+                    let Ok(bytes) = pump_budget.bytes.clone().acquire_many_owned(size).await else {
+                        return;
+                    };
+                    bytes.forget();
+                }
                 let last = !matches!(next, Ok(Some(_)));
-                if tx.send(next).is_err() || last {
+                if tx.send((next, size)).is_err() || last {
                     return;
                 }
             }
         });
         Self {
             events,
-            buffered,
+            budget,
             applied,
             pump,
         }
     }
 
     async fn next_event(&mut self) -> Result<Option<ReplicationEvent>, FaucetError> {
-        let next = self.events.recv().await;
-        self.buffered.add_permits(1);
-        match next {
-            Some(event) => event,
-            None => Err(FaucetError::Source(
-                "postgres-cdc: replication reader stopped unexpectedly".into(),
-            )),
+        match self.events.recv().await {
+            Some((event, size)) => {
+                self.budget.release(size);
+                event
+            }
+            None => {
+                self.budget.release(0);
+                Err(FaucetError::Source(
+                    "postgres-cdc: replication reader stopped unexpectedly".into(),
+                ))
+            }
         }
     }
 }
@@ -159,6 +222,8 @@ pub struct ReplicationParams<'a> {
     pub tls: &'a crate::config::CdcTls,
     /// Events read ahead of the consumer while it is busy (see [`Duplex`]).
     pub max_buffered_events: usize,
+    /// Bytes of change data read ahead of the consumer (see [`Duplex`]).
+    pub max_buffered_bytes: usize,
 }
 
 // ── Helper: parse a postgres URL into (host, port, user, password, dbname) ─
@@ -382,6 +447,7 @@ pub(crate) fn apply_cdc_tls(
     use sqlx::postgres::PgSslMode;
     match tls {
         CdcTls::FromUrl | CdcTls::Disable => opts.ssl_mode(PgSslMode::Disable),
+        CdcTls::Prefer => opts.ssl_mode(PgSslMode::Prefer),
         CdcTls::Require => opts.ssl_mode(PgSslMode::Require),
         CdcTls::VerifyCa { ca_path } => {
             let o = opts.ssl_mode(PgSslMode::VerifyCa);
@@ -407,6 +473,10 @@ fn tls_config(tls: &crate::config::CdcTls) -> TlsConfig {
     use std::path::PathBuf;
     match tls {
         CdcTls::FromUrl | CdcTls::Disable => TlsConfig::disabled(),
+        CdcTls::Prefer => TlsConfig {
+            mode: pgwire_replication::SslMode::Prefer,
+            ..TlsConfig::disabled()
+        },
         CdcTls::Require => TlsConfig::require(),
         CdcTls::VerifyCa { ca_path } => TlsConfig::verify_ca(ca_path.clone().map(PathBuf::from)),
         CdcTls::VerifyFull { ca_path } => {
@@ -765,7 +835,11 @@ pub async fn start_replication(
         .await
         .map_err(|e| pgwire_err("postgres-cdc start_replication", e))?;
 
-    Ok(Duplex::spawn(inner, params.max_buffered_events))
+    Ok(Duplex::spawn(
+        inner,
+        params.max_buffered_events,
+        params.max_buffered_bytes,
+    ))
 }
 
 /// Report progress to the server (Standby Status Update).
@@ -1014,6 +1088,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeSource {
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        size: usize,
+    }
+
+    impl EventSource for FakeSource {
+        fn update_applied(&mut self, _lsn: u64) {}
+
+        async fn recv(&mut self) -> Result<Option<ReplicationEvent>, FaucetError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(ReplicationEvent::XLogData {
+                wal_start: Lsn::from_u64(1),
+                wal_end: Lsn::from_u64(1),
+                server_time_micros: 0,
+                data: vec![0u8; self.size].into(),
+            }))
+        }
+    }
+
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn read_ahead_pauses_at_the_byte_budget() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut duplex = Duplex::spawn_source(
+            FakeSource {
+                reads: reads.clone(),
+                size: 100,
+            },
+            ReadAhead::new(1_000, 250),
+        );
+        settle().await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(matches!(
+            duplex.next_event().await,
+            Ok(Some(ReplicationEvent::XLogData { .. }))
+        ));
+        settle().await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn read_ahead_pauses_at_the_event_budget_and_clamps_oversized_events() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut duplex = Duplex::spawn_source(
+            FakeSource {
+                reads: reads.clone(),
+                size: 10_000,
+            },
+            ReadAhead::new(2, 100),
+        );
+        settle().await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        duplex.next_event().await.unwrap();
+        duplex.next_event().await.unwrap();
+        settle().await;
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
     use crate::config::CdcTls;
     use chrono::{TimeZone, Utc};
     use pgwire_replication::SslMode;
@@ -1162,6 +1300,7 @@ mod tests {
     fn tls_config_maps_each_mode() {
         assert_eq!(tls_config(&CdcTls::Disable).mode, SslMode::Disable);
         assert_eq!(tls_config(&CdcTls::Require).mode, SslMode::Require);
+        assert_eq!(tls_config(&CdcTls::Prefer).mode, SslMode::Prefer);
         assert_eq!(
             tls_config(&CdcTls::VerifyCa { ca_path: None }).mode,
             SslMode::VerifyCa
