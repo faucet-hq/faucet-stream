@@ -6,7 +6,7 @@
 |---|---|
 | **RFC** | 0001 |
 | **Title** | Capability descriptors for connectors |
-| **Status** | Draft (proposal) |
+| **Status** | Superseded by [RFC 0013](./0013-structural-core-guarantees.md) (#876) |
 | **Authors** | faucet-stream maintainers |
 | **Related issues** | epic #38 |
 | **Related ADRs** | [0003 builder pattern](../docs/adr/0003-builder-pattern.md), [0010 pipeline runtime](../docs/adr/0010-pipeline-runtime.md) |

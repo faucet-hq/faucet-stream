@@ -6,7 +6,7 @@
 |---|---|
 | **RFC** | 0005 |
 | **Title** | Shared async connector-runtime primitives |
-| **Status** | Draft (proposal) |
+| **Status** | Superseded by [RFC 0013](./0013-structural-core-guarantees.md) (#880) |
 | **Authors** | faucet-stream maintainers |
 | **Related issues** | epic #38 |
 | **Related ADRs** | [0007 retries](../docs/adr/0007-retries.md), [0005 runtime recovery](../docs/adr/0005-runtime-recovery.md) |

@@ -46,7 +46,13 @@ runtime surface.
   defaulted capability methods (`supports_exactly_once`, `enumerate_shards`,
   `supports_discover`, `current_schema`, …). Grouping these into coherent,
   documented capability sets reduces the cognitive load without breaking object
-  safety. Design in [RFC 0001](../rfcs/0001-capability-traits.md).
+  safety. Design in [RFC 0013](../rfcs/0013-structural-core-guarantees.md)
+  (#876), which supersedes RFC 0001.
+- **Structural core guarantees.** Governance assembled by core for every entry
+  point, mandatory I/O primitives, row accounting, one trust resolver, typed
+  state keys and per-family engines (SQL, remote files, value fidelity), so a
+  connector cannot bypass masking, policy, budgets or exactly-once by omission.
+  Design and phasing in [RFC 0013](../rfcs/0013-structural-core-guarantees.md).
 - **Connector SDK ergonomics.** Reduce the boilerplate checklist a new connector
   must satisfy (feature flags in three places, `cli/connectors/registry.json`, the CI
   matrix, the docs capability table). Candidate direction: a proc-macro or code
@@ -95,8 +101,9 @@ explicitly speculative.
   and multi-source joins push against the current single-source → single-sink
   page model. Whether this belongs in `faucet-core` or a separate runtime crate
   is itself a design question. Exploration in
-  [RFC 0004](../rfcs/0004-streaming-improvements.md) and
-  [RFC 0005](../rfcs/0005-async-connector-runtime.md).
+  [RFC 0004](../rfcs/0004-streaming-improvements.md); the shared runtime
+  primitives first proposed in RFC 0005 are now part of
+  [RFC 0013](../rfcs/0013-structural-core-guarantees.md).
 
 ---
 
