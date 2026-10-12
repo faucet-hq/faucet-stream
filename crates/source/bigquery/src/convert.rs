@@ -107,7 +107,10 @@ fn scalar_or_record(payload: &Value, field: &TableFieldSchema) -> Value {
         FieldType::Integer | FieldType::Int64 => parse_integer(s),
         FieldType::Float | FieldType::Float64 => parse_float(s),
         FieldType::Boolean | FieldType::Bool => parse_bool(s),
-        FieldType::Json => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned())),
+        // A number an f64 cannot hold exactly is kept as a string of its digits.
+        FieldType::Json => faucet_core::parse_json_exact(s, faucet_core::JsonBigNumbers::String)
+            .map(|(v, _)| v)
+            .unwrap_or_else(|_| Value::String(s.to_owned())),
         FieldType::Timestamp => {
             Value::String(timestamp_to_rfc3339(s).unwrap_or_else(|| s.to_owned()))
         }
@@ -341,6 +344,16 @@ mod tests {
         let row = cells(vec![json!(r#"{"k": 1}"#)]);
         let fields = vec![field("payload", FieldType::Json)];
         assert_eq!(row_to_json(&row, &fields), json!({"payload": {"k": 1}}));
+    }
+
+    #[test]
+    fn json_field_keeps_numbers_an_f64_cannot_hold_as_strings() {
+        let row = cells(vec![json!(r#"{"big": 12345678901234567890123, "n": 1.5}"#)]);
+        let fields = vec![field("payload", FieldType::Json)];
+        assert_eq!(
+            row_to_json(&row, &fields),
+            json!({"payload": {"big": "12345678901234567890123", "n": 1.5}})
+        );
     }
 
     #[test]
