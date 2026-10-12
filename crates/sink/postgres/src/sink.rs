@@ -257,6 +257,12 @@ pub(crate) fn derived_table_name(table: &str, suffix: &str) -> String {
     format!("{}{tag}{suffix}", &table[..cut])
 }
 
+/// The staging table an overwrite of `table` loads into: `<table>__faucet_ovw`,
+/// shortened with a hash tag when that would exceed PostgreSQL's 63-byte limit.
+pub fn overwrite_staging_table_name(table: &str) -> String {
+    derived_table_name(table, faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX)
+}
+
 /// How a table's columns may be written: every non-generated column, and
 /// which of them are identity columns (`'a'` = `GENERATED ALWAYS`,
 /// `'d'` = `BY DEFAULT`).
@@ -753,10 +759,7 @@ impl PostgresSink {
     /// Staging table name used while an overwrite run is in flight (same schema
     /// as the target).
     fn staging_table_name(&self) -> String {
-        derived_table_name(
-            &self.config.table_name,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX,
-        )
+        overwrite_staging_table_name(&self.config.table_name)
     }
 
     /// The base table name the data-write path targets. For `write_mode:
@@ -2181,6 +2184,7 @@ mod tests {
         assert_ne!(ovw, other, "the hash keeps similar long names apart");
         let multibyte = derived_table_name(&"é".repeat(40), "__faucet_prev");
         assert!(multibyte.len() <= 63);
+        assert_eq!(super::overwrite_staging_table_name(&long), ovw);
     }
 
     #[test]

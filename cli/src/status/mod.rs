@@ -466,6 +466,19 @@ async fn rollback_status(
     }
 }
 
+/// The staging object an overwrite of `table` uses on a `kind` sink.
+fn staging_object(kind: &str, table: &str) -> String {
+    #[cfg(feature = "sink-postgres")]
+    if kind == "postgres" {
+        return faucet_sink_postgres::sink::overwrite_staging_table_name(table);
+    }
+    let _ = kind;
+    format!(
+        "{table}{}",
+        faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+    )
+}
+
 /// Probe (with `--probe`) or infer the row's overwrite staging state.
 async fn staging_status(
     row: &RowTarget,
@@ -476,10 +489,7 @@ async fn staging_status(
         .iter()
         .find_map(|k| row.sink_config.get(*k).and_then(Value::as_str))
         .unwrap_or("<target>");
-    let object = format!(
-        "{table}{}",
-        faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
-    );
+    let object = staging_object(&row.sink_kind, table);
     if !inputs.probe {
         return failing.then(|| StagingStatus {
             state: "unknown",
