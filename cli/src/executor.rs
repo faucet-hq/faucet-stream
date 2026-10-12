@@ -1364,6 +1364,7 @@ fn mark_overwrite_staging(kind: &str, cfg: &mut Value, grouped: bool) {
 fn inject_singer_defaults(
     node: &ExpandedNode,
     pipeline_name: &str,
+    run_id: Option<&str>,
     clock: DateTime<FixedOffset>,
     cfg: &mut Value,
 ) {
@@ -1394,34 +1395,65 @@ fn inject_singer_defaults(
             faucet_core::contract::to_json_schema(contract),
         );
     }
-    map.entry("_activate_version")
-        .or_insert_with(|| Value::from(activate_version_for(clock.timestamp_millis())));
+    map.entry("_activate_version").or_insert_with(|| {
+        Value::from(activate_version_for(
+            pipeline_name,
+            run_id,
+            clock.timestamp_millis(),
+        ))
+    });
 }
 
 /// The Singer `ACTIVATE_VERSION` for a run whose clock is `clock_ms`: never
 /// below the wall clock at the run's first sink, so rerunning with a past
 /// `--clock` (a backfill unit, an old schedule tick) still activates a version
-/// newer than the live one (API-59). Memoised per clock value, so every sink
-/// instance of one run — the writers and the overwrite-lifecycle sink —
-/// agrees on it.
-fn activate_version_for(clock_ms: i64) -> i64 {
+/// newer than the live one (API-59). Memoised per (pipeline, submitted run id,
+/// clock), so every sink instance of one run — the writers and the
+/// overwrite-lifecycle sink — agrees on it, and each new run in a long-running
+/// process is issued a version above every earlier one, even on the same clock.
+fn activate_version_for(pipeline: &str, run_id: Option<&str>, clock_ms: i64) -> i64 {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
-    static VERSIONS: OnceLock<Mutex<BTreeMap<i64, i64>>> = OnceLock::new();
+    type Key = (String, Option<String>, i64);
+    struct Versions {
+        issued: BTreeMap<Key, (u64, i64)>,
+        seq: u64,
+        last: i64,
+    }
+    static VERSIONS: OnceLock<Mutex<Versions>> = OnceLock::new();
     let wall_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(clock_ms);
-    let mut versions = VERSIONS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
+    let mut v = VERSIONS
+        .get_or_init(|| {
+            Mutex::new(Versions {
+                issued: BTreeMap::new(),
+                seq: 0,
+                last: i64::MIN,
+            })
+        })
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if versions.len() >= 4096
-        && let Some(oldest) = versions.keys().next().copied()
-    {
-        versions.remove(&oldest);
+    let key = (pipeline.to_string(), run_id.map(str::to_string), clock_ms);
+    if let Some((_, version)) = v.issued.get(&key) {
+        return *version;
     }
-    *versions.entry(clock_ms).or_insert(clock_ms.max(wall_ms))
+    if v.issued.len() >= 4096
+        && let Some(oldest) = v
+            .issued
+            .iter()
+            .min_by_key(|(_, (seq, _))| *seq)
+            .map(|(k, _)| k.clone())
+    {
+        v.issued.remove(&oldest);
+    }
+    let version = clock_ms.max(wall_ms).max(v.last.saturating_add(1));
+    v.seq += 1;
+    v.last = version;
+    let seq = v.seq;
+    v.issued.insert(key, (seq, version));
+    version
 }
 
 /// Whether a node's sink is configured for `write_mode: overwrite`. The write
@@ -1454,7 +1486,13 @@ fn describe_sink_dest(kind: &str, cfg: &Value) -> String {
 /// a distinct destination per parent, and stays a single-member group).
 fn resolved_sink_destination(unit: &Unit, opts: &ExecuteOptions) -> CliResult<Value> {
     let mut sink_cfg = unit.node.sink.config.clone();
-    inject_singer_defaults(&unit.node, &opts.pipeline_name, opts.clock, &mut sink_cfg);
+    inject_singer_defaults(
+        &unit.node,
+        &opts.pipeline_name,
+        opts.run_id.as_deref(),
+        opts.clock,
+        &mut sink_cfg,
+    );
     resolve_now_inplace(&mut sink_cfg, opts.clock)?;
     let mut ctx: HashMap<String, Value> = HashMap::new();
     if let (Some(record), NodeRole::Child { parent_id, .. }) =
@@ -2471,7 +2509,13 @@ async fn run_one_invocation(
     // can't coordinate a direct WRITE_TRUNCATE. A solo overwrite is left to load
     // directly into the target. No-op for non-bigquery kinds and non-overwrite.
     mark_overwrite_staging(&node.sink.kind, &mut sink_cfg, overwrite_grouped);
-    inject_singer_defaults(node, &opts.pipeline_name, opts.clock, &mut sink_cfg);
+    inject_singer_defaults(
+        node,
+        &opts.pipeline_name,
+        opts.run_id.as_deref(),
+        opts.clock,
+        &mut sink_cfg,
+    );
 
     // Resolve `${now.*}` run-clock tokens for every invocation (root + child),
     // before the parent-record pass. Leaves all other tokens verbatim.
@@ -4037,6 +4081,73 @@ impl Source for BindContextSource {
     > {
         self.inner.stream_batches(&self.ctx, batch_size)
     }
+    fn native_output_formats(&self) -> &'static [faucet_core::native::NativeFormat] {
+        self.inner.native_output_formats()
+    }
+    fn stream_native<'a>(
+        &'a self,
+        _ctx: &'a HashMap<String, Value>,
+        format: faucet_core::native::NativeFormat,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::native::NativeBatch, FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.inner.stream_native(&self.ctx, format, batch_size)
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
+    }
+    async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
+        self.inner.capture_resume_position().await
+    }
+    fn is_shardable(&self) -> bool {
+        self.inner.is_shardable()
+    }
+    async fn enumerate_shards(
+        &self,
+        target: usize,
+    ) -> Result<Vec<faucet_core::ShardSpec>, FaucetError> {
+        self.inner.enumerate_shards(target).await
+    }
+    async fn apply_shard(&self, shard: &faucet_core::ShardSpec) -> Result<(), FaucetError> {
+        self.inner.apply_shard(shard).await
+    }
+    async fn range_digest(
+        &self,
+        range: &faucet_core::diff::KeyRange,
+        key: &str,
+        columns: &[String],
+    ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
+        self.inner.range_digest(range, key, columns).await
+    }
+    fn supports_discover(&self) -> bool {
+        self.inner.supports_discover()
+    }
+    async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
+        self.inner.discover().await
+    }
+    fn record_table(&self, record: &Value) -> Option<String> {
+        self.inner.record_table(record)
+    }
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        self.inner.position_le(a, b)
+    }
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        self.inner.record_covered(record, position)
+    }
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        self.inner.position_min(positions)
+    }
+    async fn check(
+        &self,
+        ctx: &faucet_core::CheckContext,
+    ) -> Result<faucet_core::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
+    }
 }
 
 /// Forwards each record to an inner sink while also capturing a **projected**
@@ -5009,21 +5120,27 @@ mod tests {
             "version: 1\nname: people\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: singer, config: { target_command: target-jsonl } }\n",
         );
         let mut cfg = single[0].sink.config.clone();
-        inject_singer_defaults(&single[0], "people", clock, &mut cfg);
+        inject_singer_defaults(&single[0], "people", None, clock, &mut cfg);
         assert_eq!(cfg["stream"], json!("people"));
         // A past clock activates a version at or after now, the same for
         // every sink instance of the run (API-59).
         let version = cfg["_activate_version"].as_i64().unwrap();
         assert!(version >= chrono::Utc::now().timestamp_millis() - 60_000);
         let mut again = single[0].sink.config.clone();
-        inject_singer_defaults(&single[0], "people", clock, &mut again);
+        inject_singer_defaults(&single[0], "people", None, clock, &mut again);
         assert_eq!(again["_activate_version"], json!(version));
         let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
-        assert_eq!(activate_version_for(future), future);
+        assert_eq!(activate_version_for("people", None, future), future);
+        // #862 L-024: two runs on one clock in one process get distinct,
+        // increasing versions; each run's sinks agree on its own.
+        let first = activate_version_for("people", Some("run-a"), future);
+        let second = activate_version_for("people", Some("run-b"), future);
+        assert!(second > first && first >= future, "{first} {second}");
+        assert_eq!(activate_version_for("people", Some("run-a"), future), first);
         assert!(cfg.get("schema").is_none());
 
         let mut cfg = single[0].sink.config.clone();
-        inject_singer_defaults(&single[0], "", clock, &mut cfg);
+        inject_singer_defaults(&single[0], "", None, clock, &mut cfg);
         assert_eq!(
             cfg["stream"],
             json!("row-0"),
@@ -5034,12 +5151,12 @@ mod tests {
             "version: 1\nname: p\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: singer, config: { target_command: t } }\n  contract:\n    version: \"1\"\n    fields:\n      - { name: id, type: integer, required: true }\nmatrix:\n  - id: orders\n  - id: users\n    sink: { config: { stream: members, schema: { type: object } } }\n",
         );
         let mut cfg = rows[0].sink.config.clone();
-        inject_singer_defaults(&rows[0], "p", clock, &mut cfg);
+        inject_singer_defaults(&rows[0], "p", None, clock, &mut cfg);
         assert_eq!(cfg["stream"], json!("orders"));
         assert_eq!(cfg["schema"]["properties"]["id"]["type"], json!("integer"));
         let mut cfg = rows[1].sink.config.clone();
         cfg["_activate_version"] = json!(5);
-        inject_singer_defaults(&rows[1], "p", clock, &mut cfg);
+        inject_singer_defaults(&rows[1], "p", None, clock, &mut cfg);
         assert_eq!(cfg["stream"], json!("members"));
         assert_eq!(cfg["schema"], json!({"type": "object"}));
         assert_eq!(cfg["_activate_version"], json!(5));
@@ -5048,10 +5165,10 @@ mod tests {
             "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n",
         );
         let mut cfg = other[0].sink.config.clone();
-        inject_singer_defaults(&other[0], "x", clock, &mut cfg);
+        inject_singer_defaults(&other[0], "x", None, clock, &mut cfg);
         assert_eq!(cfg, other[0].sink.config);
         let mut not_object = json!(null);
-        inject_singer_defaults(&single[0], "x", clock, &mut not_object);
+        inject_singer_defaults(&single[0], "x", None, clock, &mut not_object);
         assert_eq!(not_object, json!(null));
     }
 
@@ -7790,6 +7907,120 @@ mod bind_and_dlq_tests {
             let _ = src.supports_columnar();
             let _ = src.stream_batches(&empty, 10).next().await;
         }
+    }
+
+    /// #862 L-045: every defaulted `Source` hook reaches the wrapped source.
+    #[tokio::test]
+    async fn bind_context_source_forwards_every_defaulted_hook() {
+        struct Probe;
+        #[async_trait]
+        impl Source for Probe {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            fn native_output_formats(&self) -> &'static [faucet_core::native::NativeFormat] {
+                &[faucet_core::native::NativeFormat::Csv]
+            }
+            fn stream_native<'a>(
+                &'a self,
+                ctx: &'a HashMap<String, Value>,
+                _format: faucet_core::native::NativeFormat,
+                _batch_size: usize,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn faucet_core::Stream<
+                            Item = Result<faucet_core::native::NativeBatch, FaucetError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                let bound = ctx.contains_key("faucet_bind_0");
+                Box::pin(futures::stream::once(async move {
+                    Err(FaucetError::Source(format!("native bound={bound}")))
+                }))
+            }
+            fn config_schema(&self) -> Value {
+                json!({"probe": true})
+            }
+            async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
+                Ok(Some(json!("pos")))
+            }
+            fn is_shardable(&self) -> bool {
+                true
+            }
+            async fn enumerate_shards(
+                &self,
+                _target: usize,
+            ) -> Result<Vec<faucet_core::ShardSpec>, FaucetError> {
+                Ok(vec![faucet_core::ShardSpec::whole(), faucet_core::ShardSpec::whole()])
+            }
+            async fn apply_shard(&self, _: &faucet_core::ShardSpec) -> Result<(), FaucetError> {
+                Err(FaucetError::Source("shard applied".into()))
+            }
+            async fn range_digest(
+                &self,
+                _: &faucet_core::diff::KeyRange,
+                _: &str,
+                _: &[String],
+            ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
+                Err(FaucetError::Source("digest".into()))
+            }
+            fn supports_discover(&self) -> bool {
+                true
+            }
+            async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
+                Err(FaucetError::Source("discovered".into()))
+            }
+            fn record_table(&self, _: &Value) -> Option<String> {
+                Some("t".into())
+            }
+            fn position_le(&self, _: &Value, _: &Value) -> Option<bool> {
+                Some(true)
+            }
+            fn record_covered(&self, _: &Value, _: &Value) -> Option<bool> {
+                Some(false)
+            }
+            fn position_min(&self, _: &[Value]) -> Option<Value> {
+                Some(json!("min"))
+            }
+            async fn check(
+                &self,
+                _: &faucet_core::CheckContext,
+            ) -> Result<faucet_core::CheckReport, FaucetError> {
+                Err(FaucetError::Source("checked".into()))
+            }
+        }
+        let src = BindContextSource {
+            inner: Box::new(Probe),
+            ctx: HashMap::from([("faucet_bind_0".to_string(), json!(1))]),
+        };
+        let empty = HashMap::new();
+        assert_eq!(src.native_output_formats().len(), 1);
+        let first = src
+            .stream_native(&empty, faucet_core::native::NativeFormat::Csv, 10)
+            .next()
+            .await
+            .unwrap();
+        assert!(first.err().unwrap().to_string().contains("native bound=true"));
+        assert_eq!(src.config_schema(), json!({"probe": true}));
+        assert_eq!(src.capture_resume_position().await.unwrap(), Some(json!("pos")));
+        assert!(src.is_shardable());
+        assert_eq!(src.enumerate_shards(4).await.unwrap().len(), 2);
+        let whole = faucet_core::ShardSpec::whole();
+        assert!(src.apply_shard(&whole).await.is_err());
+        let range = faucet_core::diff::KeyRange::ALL;
+        assert!(src.range_digest(&range, "id", &[]).await.is_err());
+        assert!(src.supports_discover());
+        assert!(src.discover().await.is_err());
+        assert_eq!(src.record_table(&json!({})), Some("t".into()));
+        assert_eq!(src.position_le(&json!(1), &json!(2)), Some(true));
+        assert_eq!(src.record_covered(&json!({}), &json!(1)), Some(false));
+        assert_eq!(src.position_min(&[]), Some(json!("min")));
+        let ctx = faucet_core::CheckContext::default();
+        assert!(src.check(&ctx).await.is_err());
     }
 
     #[cfg(feature = "sink-jsonl")]
