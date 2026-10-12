@@ -1529,7 +1529,7 @@ mod tests {
         assert_eq!(shards.len(), 1);
         let b = ShardBounds::from_spec(&shards[0]).unwrap();
         let sql = b.wrap("SELECT * FROM t", quote_ident);
-        assert!(sql.contains("WHERE TRUE"), "whole-dataset predicate: {sql}");
+        assert!(sql.contains("WHERE 1=1"), "whole-dataset predicate: {sql}");
         assert!(!sql.contains(">="), "no bounds on a lone shard: {sql}");
     }
 
