@@ -52,10 +52,18 @@ async fn pull_messages(
     subscription: &Subscription,
     max: usize,
 ) -> Result<Vec<ReceivedMessage>, FaucetError> {
-    subscription
-        .pull(max as i32, None)
-        .await
-        .map_err(|e| FaucetError::Source(format!("pubsub: pull failed: {e}")))
+    match subscription.pull(max as i32, None).await {
+        Ok(messages) => Ok(messages),
+        // A long-poll parked on a quiet subscription past the client's RPC
+        // deadline is an empty pull, not a failure.
+        Err(e) if pull_timed_out(e.code() as i32) => Ok(Vec::new()),
+        Err(e) => Err(FaucetError::Source(format!("pubsub: pull failed: {e}"))),
+    }
+}
+
+/// gRPC `DEADLINE_EXCEEDED`.
+fn pull_timed_out(code: i32) -> bool {
+    code == 4
 }
 
 /// Return messages to the subscription for immediate redelivery (a pull
@@ -399,6 +407,13 @@ impl faucet_core::Source for PubsubSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_deadline_exceeded_is_an_empty_pull() {
+        assert!(pull_timed_out(4));
+        assert!(!pull_timed_out(14));
+        assert!(!pull_timed_out(0));
+    }
 
     // Constructing a live client needs the emulator or real GCP, so the
     // network-bound trait methods are exercised by `tests/integration.rs`
