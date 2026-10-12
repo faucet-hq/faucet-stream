@@ -47,7 +47,7 @@ flattened in alongside these fields:
 | `value_format`         | `json`/`string`/`bytes` | `json`  | body encoding (`string` needs string records, `bytes` base64 strings) |
 | `persistent`           | `bool`                  | `true`  | delivery mode 2 (persisted on durable queues) |
 | `mandatory`            | `bool`                  | `true`  | return unroutable messages as row errors (takes effect with `confirm`; ignored without it) |
-| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; on a timeout the rows not yet confirmed fail as row errors (DLQ-routable) and earlier groups keep their outcomes — not retried by `resilience.retry` |
+| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; on a timeout the rows not yet confirmed fail with a `timeout`-class row error — a `resilience.poison` policy resubmits them, otherwise they go to the DLQ — and earlier groups keep their outcomes |
 | `confirm`              | `bool`                  | `true`  | wait for publisher confirms |
 | `batch_size`           | `usize`                 | `1000`  | messages published before awaiting their confirms (`0` = whole batch) |
 

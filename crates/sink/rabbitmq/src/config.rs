@@ -77,9 +77,9 @@ pub struct RabbitMqSinkConfig {
 
     /// Seconds one publish group (its publishes and their confirms) may take
     /// — a broker under a memory or disk alarm blocks publishers indefinitely.
-    /// On a timeout the rows not yet confirmed fail as row errors
-    /// (DLQ-routable); earlier groups keep their outcomes. Not retried by
-    /// `resilience.retry`. Default `60`.
+    /// On a timeout the rows not yet confirmed fail with a `timeout`-class row
+    /// error: a `resilience.poison` policy resubmits them, otherwise they go
+    /// to the DLQ; earlier groups keep their outcomes. Default `60`.
     #[serde(default = "default_publish_timeout_secs")]
     pub publish_timeout_secs: u64,
 

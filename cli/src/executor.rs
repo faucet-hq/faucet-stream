@@ -3706,6 +3706,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::ProfileDrift { .. } => "profile_drift",
         FaucetError::PolicyViolation { .. } => "policy",
         FaucetError::BudgetExceeded { .. } => "budget_exceeded",
+        FaucetError::Timeout { .. } => "timeout",
         _ => "error",
     }
 }

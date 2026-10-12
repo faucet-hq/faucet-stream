@@ -87,6 +87,7 @@ pub fn classify(err: &FaucetError) -> Option<RetryClass> {
         FaucetError::HttpStatus { status, .. } if *status == 429 => Some(RetryClass::RateLimited),
         FaucetError::HttpStatus { status, .. } if *status >= 500 => Some(RetryClass::Http5xx),
         FaucetError::RateLimited(_) => Some(RetryClass::RateLimited),
+        FaucetError::Timeout { .. } => Some(RetryClass::Timeout),
         FaucetError::Http(e) => classify_transport(
             e.is_timeout(),
             e.status().map(|s| s.as_u16()),
@@ -155,6 +156,17 @@ mod tests {
         assert_eq!(
             classify(&FaucetError::RateLimited(Duration::from_secs(1))),
             Some(RetryClass::RateLimited)
+        );
+    }
+
+    #[test]
+    fn a_typed_timeout_is_the_timeout_class() {
+        assert_eq!(
+            classify(&FaucetError::Timeout {
+                operation: "rabbitmq publish".into(),
+                after: Duration::from_secs(60),
+            }),
+            Some(RetryClass::Timeout)
         );
     }
 

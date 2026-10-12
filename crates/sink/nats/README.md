@@ -29,7 +29,7 @@ in alongside these fields:
 | `subject_field` | `Option<String>` | —       | top-level record field whose string value overrides `subject` per record. |
 | `batch_size`    | `usize`          | `1000`  | records per publish batch: the client is flushed (or the JetStream acks awaited) after each batch. `0` = one batch per page. |
 | `jetstream`     | `bool`           | `false` | publish through JetStream and await each acknowledgement; per-row outcomes (`write_batch_partial`, DLQ-routable). |
-| `publish_timeout_secs` | `u64`     | `30`    | bound on one publish batch (publishes + flush, or the acks); on a timeout the rows not yet confirmed fail as row errors (DLQ-routable) and earlier batches keep their outcomes — not retried by `resilience.retry`. |
+| `publish_timeout_secs` | `u64`     | `30`    | bound on one publish batch (publishes + flush, or the acks); on a timeout the rows not yet confirmed fail with a `timeout`-class row error — a `resilience.poison` policy resubmits them, otherwise they go to the DLQ — and earlier batches keep their outcomes; a timed-out flush is retried by `resilience.retry`. |
 
 A record whose `subject_field` is missing or not a string fails on its own row.
 

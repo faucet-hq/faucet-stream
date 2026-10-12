@@ -134,13 +134,8 @@ impl RabbitMqSink {
             match done {
                 Ok(published) => published?,
                 Err(_) => {
-                    let cause = format!(
-                        "rabbitmq sink: a publish batch did not complete within {}s \
-                         (broker blocked by a resource alarm?)",
-                        self.config.publish_timeout_secs
-                    );
                     let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
-                    fail_unconfirmed(&mut outcomes, unconfirmed, &cause);
+                    fail_unconfirmed(&mut outcomes, unconfirmed, limit);
                     return Ok(outcomes);
                 }
             }
@@ -366,14 +361,19 @@ impl Sink for RabbitMqSink {
 /// A publish group that timed out leaves its rows, and every row of the
 /// groups after it, failed with the timeout unless already decided (earlier
 /// groups' confirms, rows that failed on their own).
+/// The error is the typed, retriable [`FaucetError::Timeout`] (a broker
+/// resource alarm blocking publishers is the usual cause).
 fn fail_unconfirmed(
     outcomes: &mut [faucet_core::RowOutcome],
     rows: impl Iterator<Item = usize>,
-    cause: &str,
+    after: std::time::Duration,
 ) {
     for i in rows {
         if outcomes[i].is_ok() {
-            outcomes[i] = Err(FaucetError::Sink(cause.to_string()));
+            outcomes[i] = Err(FaucetError::Timeout {
+                operation: "rabbitmq publish (broker blocked by a resource alarm?)".into(),
+                after,
+            });
         }
     }
 }
@@ -390,7 +390,11 @@ mod tests {
             Ok(()),
             Ok(()),
         ];
-        fail_unconfirmed(&mut outcomes, [1usize, 3].into_iter(), "timed out");
+        fail_unconfirmed(
+            &mut outcomes,
+            [1usize, 3].into_iter(),
+            std::time::Duration::from_secs(60),
+        );
         assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
         assert!(
             outcomes[1]
@@ -404,7 +408,11 @@ mod tests {
                 .as_ref()
                 .unwrap_err()
                 .to_string()
-                .contains("timed out")
+                .contains("timed out after 60s")
+        );
+        assert_eq!(
+            faucet_core::resilience::classify(outcomes[3].as_ref().unwrap_err()),
+            Some(faucet_core::resilience::RetryClass::Timeout)
         );
     }
     use lapin::message::{BasicReturnMessage, Delivery};

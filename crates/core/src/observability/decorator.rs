@@ -398,6 +398,7 @@ pub(crate) fn error_kind(e: &FaucetError) -> &'static str {
         FaucetError::State(_) => "State",
         FaucetError::StateIncompatible { .. } => "StateIncompatible",
         FaucetError::CircuitOpen { .. } => "CircuitOpen",
+        FaucetError::Timeout { .. } => "Timeout",
         FaucetError::Custom(_) => "Custom",
     }
 }
@@ -1238,6 +1239,13 @@ pub(crate) mod source_tests {
                     cooldown: Duration::from_secs(60),
                 },
                 "CircuitOpen",
+            ),
+            (
+                FaucetError::Timeout {
+                    operation: "op".into(),
+                    after: Duration::from_secs(1),
+                },
+                "Timeout",
             ),
             (
                 FaucetError::Custom(Box::new(std::io::Error::other("boom"))),

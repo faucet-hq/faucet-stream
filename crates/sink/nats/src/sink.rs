@@ -49,14 +49,10 @@ impl NatsSink {
         fut: F,
         what: &str,
     ) -> Result<F::Output, FaucetError> {
-        tokio::time::timeout(Duration::from_secs(self.config.publish_timeout_secs), fut)
+        let after = Duration::from_secs(self.config.publish_timeout_secs);
+        tokio::time::timeout(after, fut)
             .await
-            .map_err(|_| {
-                FaucetError::Sink(format!(
-                    "nats {what} did not complete within {}s (server unreachable?)",
-                    self.config.publish_timeout_secs
-                ))
-            })
+            .map_err(|_| timeout_error(what, after))
     }
 
     /// Publish every record in `batch_size` groups and return one outcome
@@ -126,8 +122,9 @@ impl NatsSink {
             };
             match self.bounded(work, "publish").await {
                 Ok(done) => done?,
-                Err(timeout) => {
-                    fail_unconfirmed(&mut outcomes[base..], &timeout);
+                Err(_) => {
+                    let after = Duration::from_secs(self.config.publish_timeout_secs);
+                    fail_unconfirmed(&mut outcomes[base..], "publish", after);
                     return Ok(outcomes);
                 }
             }
@@ -156,12 +153,20 @@ impl NatsSink {
     }
 }
 
+/// The typed, retriable error for a `what` that outlived `after`.
+fn timeout_error(what: &str, after: Duration) -> FaucetError {
+    FaucetError::Timeout {
+        operation: format!("nats {what}"),
+        after,
+    }
+}
+
 /// A publish group that timed out leaves its unconfirmed rows, and every row
 /// of the groups after it, failed with the timeout; outcomes already decided
 /// (earlier groups, rows that failed on their own) are kept.
-fn fail_unconfirmed(outcomes: &mut [faucet_core::RowOutcome], cause: &FaucetError) {
+fn fail_unconfirmed(outcomes: &mut [faucet_core::RowOutcome], what: &str, after: Duration) {
     for outcome in outcomes.iter_mut().filter(|o| o.is_ok()) {
-        *outcome = Err(FaucetError::Sink(cause.to_string()));
+        *outcome = Err(timeout_error(what, after));
     }
 }
 
@@ -215,12 +220,28 @@ impl Sink for NatsSink {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn an_operation_past_its_bound_is_a_typed_timeout() {
+        let mut cfg = NatsSinkConfig::new("subj");
+        cfg.publish_timeout_secs = 1;
+        let sink = NatsSink::new(cfg).await.unwrap();
+        let err = sink
+            .bounded(std::future::pending::<()>(), "flush")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Timeout { operation, after }
+                if operation == "nats flush" && *after == Duration::from_secs(1)),
+            "{err:?}"
+        );
+        assert!(err.is_retriable());
+    }
+
     #[test]
     fn a_timeout_fails_only_rows_not_yet_decided() {
         let mut outcomes: Vec<faucet_core::RowOutcome> =
             vec![Ok(()), Err(FaucetError::Sink("bad subject".into())), Ok(())];
-        let cause = FaucetError::Sink("nats publish did not complete within 30s".into());
-        fail_unconfirmed(&mut outcomes[1..], &cause);
+        fail_unconfirmed(&mut outcomes[1..], "publish", Duration::from_secs(30));
         assert!(outcomes[0].is_ok());
         assert!(
             outcomes[1]
@@ -229,12 +250,15 @@ mod tests {
                 .to_string()
                 .contains("bad subject")
         );
+        let timed_out = outcomes[2].as_ref().unwrap_err();
         assert!(
-            outcomes[2]
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("within 30s")
+            matches!(timed_out, FaucetError::Timeout { operation, after }
+                if operation == "nats publish" && *after == Duration::from_secs(30)),
+            "{timed_out:?}"
+        );
+        assert_eq!(
+            faucet_core::resilience::classify(timed_out),
+            Some(faucet_core::resilience::RetryClass::Timeout)
         );
     }
     use serde_json::json;
