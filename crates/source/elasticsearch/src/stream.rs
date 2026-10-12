@@ -191,7 +191,8 @@ impl faucet_core::Source for ElasticsearchSource {
 
         Box::pin(async_stream::try_stream! {
             let (index, query) = self.resolve_index_and_query(context)?;
-            // Auth is resolved per request, so a token that expires during a
+            // Auth is resolved again before every scroll request (and the
+            // clear-scroll uses the latest), so a token that expires during a
             // long scroll is refreshed by its provider (#789 MSG-90).
             let auth = self.resolve_auth().await?;
 

@@ -44,8 +44,8 @@ pub struct ElasticsearchSourceConfig {
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
     /// Seconds one search or scroll request may take end to end before it
-    /// fails as retriable. Default `300`, so a half-open connection or a
-    /// wedged node cannot hang a run forever.
+    /// fails the run (the source does not retry it). Default `300`, so a
+    /// half-open connection or a wedged node cannot hang a run forever.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
 }

@@ -67,7 +67,7 @@ faucet run pipeline.yaml
 | `query` | object | `{ "match_all": {} }` | Elasticsearch query DSL, sent verbatim as the `query` of the search body. Supports `${field.path}` placeholders resolved against the parent-record context. |
 | `scroll_timeout` | string | `"5m"` | Scroll-context keep-alive sent on the initial and every follow-up scroll request (e.g. `"1m"`, `"5m"`). Must exceed the time taken to process one page downstream. |
 | `connect_timeout_secs` | int | `10` | Seconds to wait for a connection to the cluster. |
-| `request_timeout_secs` | int | `300` | Seconds one search or scroll request may take; a half-open connection or wedged node fails the request instead of hanging the run. |
+| `request_timeout_secs` | int | `300` | Seconds one search or scroll request may take; a half-open connection or wedged node fails the run (the request is not retried) instead of hanging it. |
 | `auth` | `ElasticsearchAuth` | `{ type: none }` | Authentication — inline `{ type, config }` or `{ ref: <name> }`. See [Authentication](#authentication). |
 | `max_pages` | int | *(unset = no limit)* | Maximum number of scroll responses to emit. The cap applies *after* a page is yielded. |
 | `batch_size` | int | `1000` | Docs per emitted `StreamPage`, also the scroll API `size` parameter. **`0` = no batching**: the whole result set is drained through the scroll API (10 000 docs per request) and emitted as one page. Validated against `MAX_BATCH_SIZE` (1,000,000) at construction (an empty `base_url` / `index` is likewise rejected with `FaucetError::Config`). |
@@ -235,9 +235,9 @@ The Elasticsearch search source is **stateless** — it does not implement `stat
 
 The source implements [`Source::discover`](https://docs.rs/faucet-core/latest/faucet_core/trait.Source.html#method.discover) (#211): it lists the cluster's indices via `GET _cat/indices?format=json` (skipping system indices whose name starts with `.`) and its data streams via `GET _data_stream` (kind `data_stream`; their `.ds-*` backing indices are hidden), and returns one `DatasetDescriptor` per index or stream with
 
-- `name` — the index name; `kind` — `"index"`;
-- `config_patch` — `{"index": "<name>"}`, ready to deep-merge over the connection config (one matrix row per index);
-- `estimated_rows` — parsed from the `_cat` `docs.count` column (`None` when unavailable);
+- `name` — the index or data stream name; `kind` — `"index"` or `"data_stream"`;
+- `config_patch` — `{"index": "<name>"}`, ready to deep-merge over the connection config (one matrix row per index or stream);
+- `estimated_rows` — parsed from the `_cat` `docs.count` column for an index (`None` when unavailable, and always for a data stream);
 - `schema` — top-level columns from `GET /<index>/_mapping`: `long`/`integer`/`short`/`byte` → `integer`; `double`/`float`/`half_float`/`scaled_float` → `number`; `boolean` → `boolean`; `object`/`nested` (or a type-less field with nested `properties`) → `object`; everything else (`text`, `keyword`, `date`, `ip`, …) → `string`. Mappings carry no nullability, so types stay scalar.
 
 Discovery is catalog metadata only — no document scan. Every request uses the configured `auth`. An index whose mapping cannot be read (closed, no permission) is skipped with a `WARN` instead of failing discovery for the whole cluster.

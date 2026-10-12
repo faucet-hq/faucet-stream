@@ -106,7 +106,7 @@ listing, never a data scan.
 | `mssql` | base tables | `INFORMATION_SCHEMA.COLUMNS` | `sys.partitions` | `query` |
 | `sqlite` | tables (`sqlite_master`) | `pragma_table_info` | — | `query` |
 | `mongodb` | collections (non-`system.*`) | inferred from a 10-doc sample | `estimated_document_count` | `collection` |
-| `elasticsearch` | indices (non-`.`-system) | `_mapping` field types | `_cat/indices` docs.count | `index` |
+| `elasticsearch` | indices (non-`.`-system) and data streams | `_mapping` field types | `_cat/indices` docs.count (indices only) | `index` |
 | `bigquery` | `dataset.table` (physical tables; capped at 500 enumerated / 100 schema fetches, warned) | `tables.get` | `numRows` | `query` |
 | `snowflake` | `schema.table` (base tables) | `information_schema.columns` | `row_count` | `query` |
 | `spanner` | base tables (default schema) | `INFORMATION_SCHEMA.COLUMNS` | — | `query` |

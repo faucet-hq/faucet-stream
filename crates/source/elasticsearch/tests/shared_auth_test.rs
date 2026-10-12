@@ -108,3 +108,85 @@ async fn unresolved_auth_reference_errors() {
         "expected Auth error, got {err:?}"
     );
 }
+
+/// A provider handing out `token-1`, `token-2`, … on successive calls, like a
+/// short-lived token being refreshed.
+#[derive(Debug, Default)]
+struct RotatingBearer(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl AuthProvider for RotatingBearer {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(Credential::Bearer(format!("token-{n}")))
+    }
+    fn provider_name(&self) -> &'static str {
+        "rotating-bearer"
+    }
+}
+
+/// The scroll request and the clear-scroll DELETE re-resolve auth, so a token
+/// refreshed during a long scroll is used (#862 L-107).
+#[tokio::test]
+async fn scroll_requests_use_a_refreshed_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/my_index/_search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(scroll_response(json!([{"_source": {"id": 1}}]), "scroll1")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_search/scroll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_scroll_id": "scroll2",
+            "hits": {"total": {"value": 0}, "hits": []}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/_search/scroll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded": true})))
+        .mount(&server)
+        .await;
+
+    let provider: faucet_core::SharedAuthProvider = Arc::new(RotatingBearer::default());
+    let source = ElasticsearchSource::new(
+        ElasticsearchSourceConfig::new(server.uri(), "my_index").with_batch_size(10),
+    )
+    .unwrap()
+    .with_auth_provider(provider);
+    assert_eq!(source.fetch_all().await.unwrap().len(), 1);
+
+    let auth_of = |r: &wiremock::Request| {
+        r.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let mut delete = None;
+    for _ in 0..50 {
+        let requests = server.received_requests().await.unwrap();
+        if let Some(r) = requests.iter().find(|r| r.method.as_str() == "DELETE") {
+            delete = Some(auth_of(r));
+            let search = requests
+                .iter()
+                .find(|r| r.url.path() == "/my_index/_search")
+                .unwrap();
+            assert_eq!(auth_of(search).as_deref(), Some("Bearer token-1"));
+            let scroll = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST" && r.url.path() == "/_search/scroll")
+                .unwrap();
+            assert_eq!(auth_of(scroll).as_deref(), Some("Bearer token-2"));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        delete.expect("the scroll is cleared").as_deref(),
+        Some("Bearer token-2")
+    );
+}
