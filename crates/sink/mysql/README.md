@@ -7,6 +7,13 @@
 
 **MySQL** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records to a MySQL (or MariaDB) table using a pooled `sqlx` connection and efficient multi-row `INSERT` statements with backtick-quoted identifiers.
 
+> **Upgrading from 1.8.1 or earlier — `binary_encoding` now defaults to `base64`.**
+> A string written to a `BINARY` / `VARBINARY` / `BLOB` column is decoded from base64 (how every faucet
+> source emits binary). Plain text written there used to be stored as is; it now
+> fails its row — routed to the DLQ when a `dlq:` block is configured, otherwise
+> failing the write. Set `binary_encoding: text` for columns fed plain text, or
+> `binary_encoding: auto` for the previous per-value behaviour.
+
 Reach for it when you want to land any faucet-stream source — a REST API, a CSV file, a CDC stream, a queue — into MySQL with one declarative config and no glue code. Store records as opaque JSON blobs, or map their keys straight onto real table columns; mirror a source table with `write_mode: upsert`; or run end-to-end effectively-once from a CDC source.
 
 ## Feature highlights

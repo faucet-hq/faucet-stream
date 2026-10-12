@@ -7,6 +7,13 @@
 
 PostgreSQL **sink** connector for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records to a Postgres table over a pooled `sqlx` connection, batching them into multi-row `INSERT` statements for high throughput.
 
+> **Upgrading from 1.8.1 or earlier — `binary_encoding` now defaults to `base64`.**
+> A string written to a `bytea` column is decoded from base64 (how every faucet
+> source emits binary). Plain text written there used to be stored as is; it now
+> fails its row — routed to the DLQ when a `dlq:` block is configured, otherwise
+> failing the write. Set `binary_encoding: text` for columns fed plain text, or
+> `binary_encoding: auto` for the previous per-value behaviour.
+
 Reach for it whenever you want to land a faucet-stream source — a REST API, a CDC stream, a file, a queue — into Postgres with one declarative config and no glue code. Store records verbatim as a single `jsonb` column for schemaless ingestion, or map JSON keys straight onto typed table columns. With `write_mode: upsert` and a CDC source it becomes a live mirror; with `delivery: exactly_once` it commits records and a watermark in one transaction.
 
 ## Feature highlights

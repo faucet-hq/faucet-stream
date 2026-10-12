@@ -515,28 +515,43 @@ fn no_matching_column_message(
     )
 }
 
-/// Split a page into per-row outcomes and the records to write: a record that
-/// matches no column fails on its own row instead of failing the page.
-fn split_unmatched(
+/// Split a page into per-row outcomes, the records to write, and each written
+/// record's position in `records`. A record whose binary-column value
+/// `binary_encoding` refuses — or, with `require_match`, that matches no
+/// column — fails on its own row instead of failing the page.
+fn split_writable(
     records: &[Value],
     columns: &[(String, String)],
-) -> (Vec<faucet_core::RowOutcome>, Vec<Value>) {
+    binary: BinaryEncoding,
+    require_match: bool,
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
     let mut outcomes = Vec::with_capacity(records.len());
     let mut writable = Vec::with_capacity(records.len());
+    let mut positions = Vec::with_capacity(records.len());
     for (idx, record) in records.iter().enumerate() {
-        match record.as_object() {
-            Some(obj) if match_columns(columns, obj).is_empty() => {
-                outcomes.push(Err(FaucetError::Sink(no_matching_column_message(
-                    idx, obj, columns,
-                ))));
+        let failure = record.as_object().and_then(|obj| {
+            let matched = match_columns(columns, obj);
+            if require_match && matched.is_empty() {
+                return Some(no_matching_column_message(idx, obj, columns));
             }
-            _ => {
+            matched.iter().find_map(|(col, ty, v)| match v {
+                Value::String(s) if is_binary_type(ty) => binary
+                    .resolve(s)
+                    .err()
+                    .map(|e| format!("mysql: row {idx}: column {col}: {e}")),
+                _ => None,
+            })
+        });
+        match failure {
+            Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
+            None => {
                 outcomes.push(Ok(()));
                 writable.push(record.clone());
+                positions.push(idx);
             }
         }
     }
-    (outcomes, writable)
+    (outcomes, writable, positions)
 }
 
 /// Whether a MySQL `DATA_TYPE` stores raw bytes.
@@ -1749,21 +1764,30 @@ impl MysqlSink {
                 })?;
             let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
             drop(conn);
-            let (outcomes, writable) = split_unmatched(records, &columns);
+            let (outcomes, writable, _) =
+                split_writable(records, &columns, self.config.binary_encoding, true);
             self.write_batch_unbounded(&writable).await?;
             return Ok(outcomes);
         }
 
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL connection acquire failed: {e}")))?;
+        let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
+        drop(conn);
+        let (mut outcomes, writable, positions) =
+            split_writable(records, &columns, self.config.binary_encoding, false);
+        let plan = faucet_core::plan_writes(&writable, &self.config.write);
         self.apply_plans(&faucet_core::plan_writes_ordered(
-            records,
+            &writable,
             &self.config.write,
         ))
         .await?;
 
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
-            outcomes[*idx] = Err(FaucetError::Sink(format!(
+            outcomes[positions[*idx]] = Err(FaucetError::Sink(format!(
                 "mysql {}: {msg}",
                 self.config.write.write_mode.as_str()
             )));
@@ -2615,18 +2639,42 @@ mod tests {
         let obj = serde_json::json!({"USERID": 1, "Kind": "a"});
         let matched = match_columns(&cols, obj.as_object().unwrap());
         assert_eq!(matched.len(), 2);
-        let (outcomes, writable) = split_unmatched(
+        let (outcomes, writable, _) = split_writable(
             &[
                 obj.clone(),
                 serde_json::json!({"other": 1}),
                 serde_json::json!(1),
             ],
             &cols,
+            BinaryEncoding::Auto,
+            true,
         );
         assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
         let err = outcomes[1].as_ref().unwrap_err().to_string();
         assert!(err.contains("record 1 has no field matching"), "{err}");
         assert_eq!(writable.len(), 2);
+    }
+
+    #[test]
+    fn a_binary_value_the_encoding_refuses_fails_only_its_row() {
+        let cols = vec![
+            ("id".to_string(), "int".to_string()),
+            ("Blob".to_string(), "varbinary".to_string()),
+        ];
+        let page = [
+            serde_json::json!({"id": 1, "blob": "SGVsbG8="}),
+            serde_json::json!({"id": 2, "blob": "plain token!"}),
+            serde_json::json!({"id": 3, "blob": 7}),
+        ];
+        let (outcomes, writable, positions) =
+            split_writable(&page, &cols, BinaryEncoding::Base64, false);
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("row 1: column Blob"), "{err}");
+        assert_eq!(writable.len(), 2);
+        assert_eq!(positions, vec![0, 2]);
+        let (outcomes, _, _) = split_writable(&page, &cols, BinaryEncoding::Text, false);
+        assert!(outcomes.iter().all(Result::is_ok));
     }
 
     #[test]

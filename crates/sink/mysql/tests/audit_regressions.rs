@@ -489,6 +489,32 @@ async fn mysql_review_862_regressions() {
         texts(&pool, "SELECT HEX(t) FROM tok ORDER BY id").await,
         vec!["61626364", "01"]
     );
+    // review 868 sql 2: on the DLQ path a refused value fails only its row.
+    let out = strict
+        .write_batch_partial(&[json!({"id": 4, "t": "AQI="}), json!({"id": 5, "t": "abc"})])
+        .await
+        .unwrap();
+    assert!(out[0].is_ok());
+    assert!(out[1].as_ref().unwrap_err().to_string().contains("not base64"));
+    let upsert = MysqlSink::new(
+        config(&url, "tok", WriteMode::Upsert, &["id"])
+            .with_binary_encoding(faucet_sink_mysql::BinaryEncoding::Base64),
+    )
+    .await
+    .unwrap();
+    let out = upsert
+        .write_batch_partial(&[
+            json!({"id": 6, "t": "nope!"}),
+            json!({"id": 7, "t": "AQI="}),
+            json!({"t": "AQI="}),
+        ])
+        .await
+        .unwrap();
+    assert!(out[0].is_err() && out[1].is_ok() && out[2].is_err());
+    assert_eq!(
+        texts(&pool, "SELECT CAST(id AS CHAR) FROM tok ORDER BY id").await,
+        vec!["1", "2", "4", "7"]
+    );
 
     // M-042: overwriting a self-referencing table, children before parents.
     exec(
