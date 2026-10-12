@@ -475,17 +475,47 @@ fn write_csv_blocking(
             Err(e) => return (None, Err(Failure::Clean(e))),
         },
     };
+    let mark = match batch_start(&config, &mut state) {
+        Ok(mark) => mark,
+        Err(e) => return (None, Err(repair(&config, state, e, None))),
+    };
     match write_rows(&config, &mut state, records, already_warned) {
         Ok(outcome) => (Some(state), Ok(outcome)),
         Err(RowsError::Clean(e)) => (Some(state), Err(Failure::Clean(e))),
-        Err(RowsError::Dirty(e)) => (None, Err(repair(&config, state, e))),
+        Err(RowsError::Dirty(e)) => (None, Err(repair(&config, state, e, mark))),
     }
 }
 
-/// Recover from a write cut part-way: flush what the writer holds (earlier
-/// rows, already reported written) and cut the file back to its last complete
-/// row. A compressed stream cannot be cut, so it is lost.
-fn repair(config: &CsvSinkConfig, state: WriterState, cause: FaucetError) -> Failure {
+/// The file length before this batch's first row, with every earlier row
+/// flushed to it — the point a failed batch is cut back to. `None` for a
+/// compressed stream, which cannot be cut.
+fn batch_start(
+    config: &CsvSinkConfig,
+    state: &mut WriterState,
+) -> Result<Option<u64>, FaucetError> {
+    #[cfg(feature = "compression")]
+    if config.compression.resolve(&config.path) != faucet_core::Compression::None {
+        return Ok(None);
+    }
+    state
+        .writer
+        .flush()
+        .map_err(|e| FaucetError::Sink(format!("CSV flush error: {e}")))?;
+    std::fs::metadata(&config.path)
+        .map(|m| Some(m.len()))
+        .map_err(|e| FaucetError::Sink(format!("CSV sink: reading {}: {e}", config.path)))
+}
+
+/// Recover from a write cut part-way: flush what the writer holds and cut the
+/// file back to `mark`, its length before the failed batch — a newline search
+/// could stop inside a quoted multi-line field. A compressed stream cannot be
+/// cut, so it is lost.
+fn repair(
+    config: &CsvSinkConfig,
+    state: WriterState,
+    cause: FaucetError,
+    mark: Option<u64>,
+) -> Failure {
     let lost = |why: String| {
         Failure::Lost(format!(
             "CSV sink: a write failed part-way ({cause}) and {why}; rows reported written may \
@@ -511,22 +541,20 @@ fn repair(config: &CsvSinkConfig, state: WriterState, cause: FaucetError) -> Fai
         return lost(format!("syncing the file: {e}"));
     }
     drop(file);
-    match cut_partial_row(std::path::Path::new(&config.path)) {
+    let Some(mark) = mark else {
+        return lost("the length before the batch is unknown".into());
+    };
+    match truncate_to(std::path::Path::new(&config.path), mark) {
         Ok(()) => Failure::Repaired(cause),
-        Err(e) => lost(format!("cutting the partial row: {e}")),
+        Err(e) => lost(format!("cutting the partial batch: {e}")),
     }
 }
 
-/// Truncate `path` after its last newline, dropping a row cut part-way.
-fn cut_partial_row(path: &std::path::Path) -> std::io::Result<()> {
-    let bytes = std::fs::read(path)?;
-    let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    if keep < bytes.len() {
-        let f = OpenOptions::new().write(true).open(path)?;
-        f.set_len(keep as u64)?;
-        f.sync_all()?;
-    }
-    Ok(())
+/// Truncate `path` to `len` bytes.
+fn truncate_to(path: &std::path::Path, len: u64) -> std::io::Result<()> {
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_len(len)?;
+    f.sync_all()
 }
 
 /// How [`write_rows`] failed.
@@ -786,16 +814,37 @@ mod tests {
     fn a_dirty_failure_cuts_the_partial_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.csv");
-        std::fs::write(&path, "a\n1\npart").unwrap();
+        std::fs::write(&path, "a\n1\n\"line one\nline").unwrap();
         let config = CsvSinkConfig::new(path.to_str().unwrap());
-        let failure = repair(&config, state_over(&path), FaucetError::Sink("io".into()));
+        let failure = repair(
+            &config,
+            state_over(&path),
+            FaucetError::Sink("io".into()),
+            Some(4),
+        );
         assert!(matches!(failure, Failure::Repaired(_)), "{failure:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n1\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a\n1\n",
+            "cut to the batch start, not into the open quoted field"
+        );
         assert!(failure.into_error().to_string().contains("io"));
-        std::fs::write(&path, "no newline").unwrap();
-        cut_partial_row(&path).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
-        assert!(cut_partial_row(&dir.path().join("missing.csv")).is_err());
+        assert!(truncate_to(&dir.path().join("missing.csv"), 0).is_err());
+        let failure = repair(&config, state_over(&path), FaucetError::Sink("io".into()), None);
+        assert!(matches!(failure, Failure::Lost(_)), "{failure:?}");
+    }
+
+    #[test]
+    fn batch_start_flushes_earlier_rows_and_reads_the_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        std::fs::write(&path, "a\n").unwrap();
+        let config = CsvSinkConfig::new(path.to_str().unwrap());
+        let mut state = state_over(&path);
+        state.writer.write_record(["1"]).unwrap();
+        assert_eq!(batch_start(&config, &mut state).unwrap(), Some(4));
+        std::fs::remove_file(&path).unwrap();
+        assert!(batch_start(&config, &mut state).is_err());
     }
 
     #[cfg(feature = "compression")]
@@ -805,7 +854,9 @@ mod tests {
         let path = dir.path().join("out.csv.gz");
         std::fs::write(&path, "").unwrap();
         let config = CsvSinkConfig::new(path.to_str().unwrap());
-        let failure = repair(&config, state_over(&path), FaucetError::Sink("io".into()));
+        let mut state = state_over(&path);
+        assert_eq!(batch_start(&config, &mut state).unwrap(), None);
+        let failure = repair(&config, state, FaucetError::Sink("io".into()), None);
         let Failure::Lost(msg) = failure else {
             panic!("{failure:?}")
         };
