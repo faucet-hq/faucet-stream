@@ -7480,6 +7480,9 @@
       ]
     },
     "source_sftp__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -7489,7 +7492,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -7634,6 +7637,9 @@
       ]
     },
     "source_s3__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -7643,7 +7649,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -8493,6 +8499,9 @@
       ]
     },
     "source_azure-blob__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -8502,7 +8511,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -9992,6 +10001,9 @@
       ]
     },
     "source_gcs__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -10001,7 +10013,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -11938,6 +11950,9 @@
       ]
     },
     "sink_sftp__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -11947,7 +11962,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -12092,6 +12107,9 @@
       ]
     },
     "sink_s3__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -12101,7 +12119,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -13888,6 +13906,9 @@
       ]
     },
     "sink_gcs__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -13897,7 +13918,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -14595,6 +14616,9 @@
       ]
     },
     "sink_azure-blob__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -14604,7 +14628,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -27827,7 +27851,8 @@
               "anyOf": [
                 {
                   "x-faucet-aliases": [
-                    "mode"
+                    "mode",
+                    "max_rows_per_file"
                   ],
                   "title": "FileSinkConfig",
                   "description": "Configuration for the local file sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
@@ -27853,7 +27878,7 @@
                       "default": "append"
                     },
                     "max_records_per_file": {
-                      "description": "Roll to a new file after this many records.",
+                      "description": "Roll to a new file after this many records. `max_rows_per_file` is a\ndeprecated name for it.",
                       "type": [
                         "integer",
                         "null",
@@ -31739,6 +31764,9 @@
       ]
     },
     "source_file__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -31748,7 +31776,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -32301,6 +32329,9 @@
       ]
     },
     "sink_file__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -32310,7 +32341,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -32468,7 +32499,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -33968,7 +33999,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -34214,7 +34245,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -34460,7 +34491,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -34724,7 +34755,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },

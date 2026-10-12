@@ -573,9 +573,11 @@ is listed here. Renamed keys and values keep working as aliases, and
 
 - **`mode` is now `if_exists`**, with the values `replace` (default), `append`
   and `error`. `mode:` and the values `overwrite` / `error_if_exists` still work.
-- **Removed aliases:** `csv.write_headers` (use `csv.has_headers`),
-  `max_rows_per_file` (use `max_records_per_file`) and the Parquet codec
-  `uncompressed` (use `none`).
+- **Deprecated names:** `csv.write_headers` (use `csv.has_headers`),
+  `max_rows_per_file` on the `file` sink (use `max_records_per_file`) and the
+  Parquet codec `uncompressed` (use `none`). A patch release once refused
+  them; they load again, with the one-line warning, until the next major
+  release.
 - **One `parquet:` block** on every file-writing sink. Only the default codec
   differs: `snappy` on the `file` sink, `zstd` on the object-store sinks.
 - **SFTP rollover** caps each file at `min(batch_size, max_records_per_file)`,

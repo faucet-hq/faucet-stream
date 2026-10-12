@@ -171,6 +171,47 @@ fn file_sink_spellings(doc: &Value, out: &mut BTreeSet<String>) {
                 "{kind} sink: `if_exists: {old}` is now `if_exists: {new}` (the old value still works)"
             ));
         }
+        if kind == "file" && cfg.contains_key("max_rows_per_file") {
+            out.insert(
+                "file sink: `max_rows_per_file` is now `max_records_per_file` (the old key still \
+                 works until the next major release)"
+                    .into(),
+            );
+        }
+    }
+    format_option_spellings(doc, out);
+}
+
+/// Format-option names #788 retired, accepted again until the next major
+/// (#862 L-166): `csv.write_headers` and the Parquet codec `uncompressed`.
+fn format_option_spellings(v: &Value, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            if m.get("csv")
+                .and_then(Value::as_object)
+                .is_some_and(|c| c.contains_key("write_headers"))
+            {
+                out.insert(
+                    "`csv.write_headers` is now `csv.has_headers` (the old key still works until \
+                     the next major release)"
+                        .into(),
+                );
+            }
+            if m.get("parquet")
+                .and_then(|p| p.get("compression"))
+                .and_then(Value::as_str)
+                == Some("uncompressed")
+            {
+                out.insert(
+                    "`parquet.compression: uncompressed` is now `parquet.compression: none` (the \
+                     old value still works until the next major release)"
+                        .into(),
+                );
+            }
+            m.values().for_each(|c| format_option_spellings(c, out));
+        }
+        Value::Array(a) => a.iter().for_each(|c| format_option_spellings(c, out)),
+        _ => {}
     }
 }
 
@@ -320,6 +361,38 @@ mod tests {
             );
         }
         assert!(deprecated_spellings(&json!({"a": {"type": "csv"}})).is_empty());
+    }
+
+    #[test]
+    fn the_names_removed_in_a_patch_release_warn() {
+        let doc = json!({
+            "pipeline": {
+                "source": { "type": "file", "config": { "csv": { "write_headers": true } } },
+                "sink": { "type": "file", "config": {
+                    "max_rows_per_file": 5,
+                    "parquet": { "compression": "uncompressed" }
+                } }
+            },
+            "matrix": [{ "id": "a", "sink": { "type": "parquet", "config": { "max_rows_per_file": 5, "compression": "uncompressed" } } }]
+        });
+        let got = deprecated_spellings(&doc);
+        assert_eq!(
+            got.iter()
+                .filter(|m| m.contains("max_rows_per_file")
+                    || m.contains("write_headers")
+                    || m.contains("uncompressed"))
+                .count(),
+            3,
+            "{got:?}"
+        );
+        let clean = json!({
+            "pipeline": { "sink": { "type": "file", "config": {
+                "max_records_per_file": 5,
+                "csv": { "has_headers": true },
+                "parquet": { "compression": "none" }
+            } } }
+        });
+        assert!(deprecated_spellings(&clean).is_empty());
     }
 
     #[test]

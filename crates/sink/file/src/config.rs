@@ -21,7 +21,7 @@ pub use faucet_common_file::FileFormatChoice as FileSinkFormat;
 /// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("x-faucet-aliases" = ["mode"]))]
+#[schemars(extend("x-faucet-aliases" = ["mode", "max_rows_per_file"]))]
 pub struct FileSinkConfig {
     /// The file to write, as a template. `{part}` is replaced by the rollover
     /// part number (`00001`, `00002`, …); with a rollover cap and no `{part}`,
@@ -52,8 +52,13 @@ pub struct FileSinkConfig {
     /// output set when the run succeeds.
     #[serde(default)]
     pub write_mode: FileWriteMode,
-    /// Roll to a new file after this many records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Roll to a new file after this many records. `max_rows_per_file` is a
+    /// deprecated name for it.
+    #[serde(
+        default,
+        alias = "max_rows_per_file",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_records_per_file: Option<usize>,
     /// Roll to a new file once the current one reaches about this many
     /// bytes, counted on the records' JSON length before compression (on the
@@ -295,6 +300,22 @@ mod tests {
 
     fn cfg(v: serde_json::Value) -> FileSinkConfig {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn deprecated_names_from_1_13_still_load() {
+        let c = cfg(json!({
+            "path": "out/x.parquet",
+            "max_rows_per_file": 7,
+            "csv": {"write_headers": false},
+            "parquet": {"compression": "uncompressed"}
+        }));
+        assert_eq!(c.max_records_per_file, Some(7));
+        assert!(!c.csv.has_headers);
+        assert_eq!(
+            c.parquet.compression,
+            Some(faucet_common_file::write::ParquetCodec::None)
+        );
     }
 
     #[test]

@@ -442,10 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn has_headers_has_one_name() {
+    fn has_headers_accepts_its_deprecated_name() {
         let o: CsvOptions = serde_json::from_value(json!({"has_headers": false})).unwrap();
         assert!(!o.has_headers);
         assert_eq!(o.on_unknown_field, super::super::CsvUnknownField::Widen);
-        assert!(serde_json::from_value::<CsvOptions>(json!({"write_headers": false})).is_err());
+        let old: CsvOptions = serde_json::from_value(json!({"write_headers": false})).unwrap();
+        assert!(!old.has_headers);
     }
 }
