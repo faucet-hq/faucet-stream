@@ -76,7 +76,6 @@ fn avro_to_json(v: &AvroValue, schema: &Schema) -> Result<Value, FaucetError> {
 /// back unchanged.
 fn json_to_avro(v: &Value, schema: &Schema, bytes: BytesText) -> Result<AvroValue, FaucetError> {
     datum_from_json_with(v, schema, bytes)
-        .map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
 }
 
 #[cfg(test)]
