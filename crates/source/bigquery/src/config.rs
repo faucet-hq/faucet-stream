@@ -59,8 +59,9 @@ pub struct BigQuerySourceConfig {
     /// Positional bind parameters for the query, sent as
     /// [`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)
     /// query parameters in declaration order before any context-derived
-    /// values. Each value is shipped as a STRING parameter; BigQuery casts
-    /// as needed at execution time.
+    /// values. Each value is typed from its JSON form: an integer as
+    /// `INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and
+    /// everything else (strings, arrays, objects, null) as `STRING`.
     #[serde(default)]
     pub params: Vec<Value>,
     /// Per-statement server-side timeout. Forwarded to the
@@ -144,8 +145,10 @@ pub struct BigQuerySourceConfig {
     pub stream_concurrency: usize,
     /// BigQuery API host for requests made outside the typed client (the
     /// schema-tolerant fallback, SQL-172). Defaults to the real endpoint;
-    /// overridden in tests to point at a mock server. Not user-facing.
-    #[serde(default, skip_serializing)]
+    /// overridden in tests to point at a mock server. Not user-facing, and
+    /// never read from a config: it would receive the bearer token.
+    #[doc(hidden)]
+    #[serde(skip)]
     #[schemars(skip)]
     pub api_host: Option<String>,
 }
