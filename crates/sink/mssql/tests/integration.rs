@@ -449,6 +449,23 @@ async fn review_862_unmatched_fields_widening_and_nested_text() {
     assert_eq!(r[0].get::<i32, _>("n"), Some(0));
     drop(conn);
 
+    // review 868 sql 1: a widening that gains null relaxes NOT NULL, so the
+    // null row of the page that drove it is accepted.
+    sink.evolve_schema(&faucet_core::SchemaEvolution {
+        widenings: vec![faucet_core::ColumnChange {
+            name: "id".into(),
+            from: Some(json!({"type": "integer"})),
+            to: json!({"type": ["number", "null"]}),
+        }],
+        ..Default::default()
+    })
+    .await
+    .expect("widen with null");
+    sink.write_batch(&[json!({"id": null, "v": 2})])
+        .await
+        .expect("a null id is accepted after the evolve");
+    assert_eq!(count(&pool, "dbo.w").await, 2);
+
     // M-046: a nested field in an NVARCHAR(MAX) column is not drift.
     exec(
         &pool,
