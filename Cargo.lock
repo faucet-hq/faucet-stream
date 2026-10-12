@@ -4841,6 +4841,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "faucet-auth",
+ "faucet-common-file",
  "faucet-common-nats",
  "faucet-common-rabbitmq",
  "faucet-common-sftp",

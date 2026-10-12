@@ -71,7 +71,7 @@ policy = ["faucet-core/policy", "masking", "lineage", "dep:regex"]
 # `gcs`, `azure-blob`, `sftp`, the deprecated `jsonl`; per-line sealing for
 # uncompressed JSON Lines — the encrypted DLQ shape), plus decryption on the
 # `file` source and in `faucet dlq inspect/replay/discard`. Opt-in; in `full`.
-encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "faucet-sink-s3?/encryption", "faucet-sink-gcs?/encryption", "faucet-sink-azure-blob?/encryption", "faucet-sink-sftp?/encryption", "dep:base64"]
+encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "faucet-sink-s3?/encryption", "faucet-sink-gcs?/encryption", "faucet-sink-azure-blob?/encryption", "faucet-sink-sftp?/encryption", "dep:base64", "dep:faucet-common-file", "faucet-common-file/encryption"]
 
 source = [
     "source-rest",
@@ -568,6 +568,7 @@ faucet-source-sqlite = { workspace = true, optional = true }
 faucet-source-duckdb = { workspace = true, optional = true }
 faucet-source-sqs = { workspace = true, optional = true }
 faucet-common-sqs = { workspace = true, optional = true }
+faucet-common-file = { workspace = true, optional = true }
 faucet-source-nats = { workspace = true, optional = true }
 faucet-common-nats = { workspace = true, optional = true }
 faucet-source-rabbitmq = { workspace = true, optional = true }

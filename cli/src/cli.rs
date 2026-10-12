@@ -1780,7 +1780,7 @@ pub struct DlqDiscardArgs {
     pub delete: bool,
     /// Physically remove every discarded envelope from the DLQ files
     /// (implies `--delete`). Rewrites each file; run it while nothing writes
-    /// the DLQ.
+    /// the DLQ. An encrypted file is re-sealed, which needs the key.
     #[arg(long)]
     pub purge: bool,
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
