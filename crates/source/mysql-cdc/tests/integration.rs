@@ -716,3 +716,71 @@ async fn savepoints_xa_truncate_binary_and_batched_pages() {
     );
     assert!(pages.last().unwrap().bookmark.is_some());
 }
+
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// An XA transaction left prepared when the cycle ends is held back, and the
+/// warning names it in the form `XA COMMIT` / `XA ROLLBACK` accept.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cycle_ending_on_an_undecided_xa_names_it_for_xa_commit() {
+    let logs = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (_container, url) = start_mysql_cdc().await;
+    connect(&url)
+        .await
+        .query_drop("CREATE TABLE test.t (id INT PRIMARY KEY)")
+        .await
+        .expect("create");
+    let source = MysqlCdcSource::new(build_config(&url))
+        .await
+        .expect("source new");
+
+    let writer_url = url.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut c = connect(&writer_url).await;
+        for sql in [
+            "INSERT INTO test.t VALUES (1)",
+            "XA START 'held'",
+            "INSERT INTO test.t VALUES (2)",
+            "XA END 'held'",
+            "XA PREPARE 'held'",
+        ] {
+            c.query_drop(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    });
+    let (records, _) = drain(&source).await;
+    writer.await.expect("writer");
+
+    let ids: Vec<Value> = records.iter().map(|r| r["after"]["id"].clone()).collect();
+    assert_eq!(ids, vec![json!(1)], "the prepared row is held: {records:?}");
+    let out = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(out.contains("undecided XA transaction"), "{out}");
+    assert!(out.contains("xid=X'68656c64',X'',1"), "{out}");
+}

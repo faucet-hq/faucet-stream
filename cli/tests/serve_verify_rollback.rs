@@ -79,10 +79,18 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
 }
 
 async fn spawn_server(port: u16, dir: &std::path::Path) {
+    spawn_server_with(port, dir, None).await
+}
+
+async fn spawn_server_with(port: u16, dir: &std::path::Path, cluster_history: Option<String>) {
     let auth_path = dir.join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
-    let mut config =
-        faucet_cli::serve::ServeConfig::from_args(serve_args(port, auth_path)).unwrap();
+    let mut args = serve_args(port, auth_path);
+    if let Some(history) = cluster_history {
+        args.history = Some(history);
+        args.cluster = true;
+    }
+    let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;
@@ -463,4 +471,70 @@ async fn rollback_finds_a_run_whose_config_has_no_name() {
         .unwrap();
     assert_eq!(undone.status(), 200, "{}", undone.text().await.unwrap());
     assert_eq!(count(&dst, "SELECT count(*) FROM dst").await, 0);
+}
+
+/// In cluster mode the run's config is stored with it, so rollback needs no
+/// `config` in the request: it loads the stored body as the run was executed.
+#[cfg(feature = "serve-history-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_rollback_uses_the_stored_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!("sqlite://{}?mode=rwc", dir.path().join("src.db").display());
+    let dst = format!("sqlite://{}?mode=rwc", dir.path().join("dst.db").display());
+    exec(&src, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)").await;
+    exec(&src, "INSERT INTO src VALUES (1, 'one'), (2, 'two')").await;
+    exec(
+        &dst,
+        "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    exec(&dst, "INSERT INTO dst VALUES (1, 'old-one', 'r0')").await;
+    let state = dir.path().join("state");
+    let cfg = config_yaml(&src, &dst, &state, "rollback: {}");
+    let port = free_port();
+    let history = format!("sqlite:{}", dir.path().join("history.db").display());
+    spawn_server_with(port, dir.path(), Some(history)).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let submitted: Value = client
+        .post(format!("{base}/v1/runs"))
+        .bearer_auth("op-tok")
+        .json(&json!({ "config": cfg }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = submitted["run_id"].as_str().unwrap().to_string();
+    let rec = wait_terminal(&client, &base, &run_id).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(count(&dst, "SELECT count(*) FROM dst").await, 2);
+
+    let undone = client
+        .post(format!("{base}/v1/runs/{run_id}/rollback"))
+        .bearer_auth("admin-tok")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    let status = undone.status();
+    let body = undone.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let report: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["applied"], true, "{report}");
+    assert_eq!(
+        count(&dst, "SELECT count(*) FROM dst WHERE id = 2").await,
+        0,
+        "the run's insert is undone"
+    );
+    assert_eq!(
+        count(
+            &dst,
+            "SELECT count(*) FROM dst WHERE id = 1 AND name = 'old-one'"
+        )
+        .await,
+        1,
+        "the row it overwrote is restored"
+    );
 }

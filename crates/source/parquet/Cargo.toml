@@ -36,7 +36,11 @@ bytes.workspace = true
 
 [dev-dependencies]
 arrow-json.workspace = true
-faucet-conformance.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["minio"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "fs", "io-util"] }
 serde_json.workspace = true
 schemars.workspace = true
