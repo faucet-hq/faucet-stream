@@ -119,7 +119,7 @@ pub fn authorization_header(auth: &SnowflakeAuth, account: &str) -> Result<Strin
 /// part before the first hyphen; the organization form (`org-acct`) passes
 /// through. The result is upper-cased.
 pub fn jwt_account(account: &str) -> String {
-    let base = if account.contains(".global") {
+    let base = if account.to_ascii_lowercase().contains(".global") {
         account.split('-').next().unwrap_or(account)
     } else {
         account.split('.').next().unwrap_or(account)
@@ -350,6 +350,7 @@ mod tests {
         assert_eq!(jwt_account("myorg-myacct"), "MYORG-MYACCT");
         assert_eq!(jwt_account("xy12345-abcdef.global"), "XY12345");
         assert_eq!(jwt_account("acct"), "ACCT");
+        assert_eq!(jwt_account("XY12345-ABCDEF.GLOBAL"), "XY12345");
     }
 
     #[test]
