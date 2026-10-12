@@ -175,6 +175,7 @@ async fn an_offset_ignoring_server_with_changing_metadata_still_stops() {
                 limit: 100,
                 total_path: None,
                 rows_path: None,
+                stop_when_short: false,
             }),
     )
     .unwrap();
@@ -216,6 +217,7 @@ async fn test_offset_pagination_terminates_when_server_ignores_offset() {
                 limit: 2,
                 total_path: None,
                 rows_path: None,
+                stop_when_short: false,
             }),
     )
     .unwrap();
@@ -287,6 +289,7 @@ async fn test_offset_pagination_paginates_to_completion_when_pages_differ() {
                 limit: 2,
                 total_path: None,
                 rows_path: None,
+                stop_when_short: false,
             }),
     )
     .unwrap();
@@ -952,6 +955,24 @@ async fn a_200_error_body_mid_pagination_fails_instead_of_ending_green() {
     lenient.allow_missing_records_path = true;
     let records = RestStream::new(lenient).unwrap().fetch_all().await.unwrap();
     assert_eq!(records.len(), 1);
+}
+
+#[tokio::test]
+async fn a_nested_records_path_with_no_children_is_an_empty_page() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"orders": [{"id": 1}]})))
+        .mount(&server)
+        .await;
+    let records = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/api/orders").records_path("$.orders[*].lines[*]"),
+    )
+    .unwrap()
+    .fetch_all()
+    .await
+    .expect("orders without lines are a page with no records");
+    assert!(records.is_empty());
 }
 
 // ── Tolerated HTTP errors ─────────────────────────────────────────────────────

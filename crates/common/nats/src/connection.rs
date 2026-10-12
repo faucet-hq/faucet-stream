@@ -14,7 +14,7 @@ fn default_servers() -> Vec<String> {
 ///
 /// This struct is `#[serde(flatten)]`ed into each connector's config so a
 /// single `servers` / `auth` / `tls` / `name` surface is presented to users.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NatsConnectionConfig {
     /// One or more NATS server URLs, e.g. `["nats://127.0.0.1:4222"]`. The
     /// client connects to the first reachable server and uses the rest for
@@ -30,6 +30,23 @@ pub struct NatsConnectionConfig {
     /// Optional client connection name (surfaced in NATS server monitoring).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Server URLs may carry `user:pass@`, so they are printed redacted.
+impl std::fmt::Debug for NatsConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let servers: Vec<String> = self
+            .servers
+            .iter()
+            .map(|s| faucet_core::redact_uri_credentials(s))
+            .collect();
+        f.debug_struct("NatsConnectionConfig")
+            .field("servers", &servers)
+            .field("auth", &self.auth)
+            .field("tls", &self.tls)
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 impl Default for NatsConnectionConfig {
@@ -116,6 +133,19 @@ pub async fn connect(cfg: &NatsConnectionConfig) -> Result<async_nats::Client, F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_credentials_in_server_urls() {
+        let cfg = NatsConnectionConfig {
+            servers: vec!["nats://app:s3cret@nats:4222".into()],
+            ..Default::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("s3cret") && dbg.contains("nats:4222"),
+            "{dbg}"
+        );
+    }
     use serde_json::json;
 
     #[test]

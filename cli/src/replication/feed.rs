@@ -263,6 +263,7 @@ pub async fn run_demux(
     let ctx = HashMap::new();
     let mut pages = source.stream_pages(&ctx, faucet_core::DEFAULT_BATCH_SIZE);
     let mut last_bookmark: Option<Value> = None;
+    let mut uncovered_warned = false;
     let mut result: Result<(), FaucetError> = Ok(());
     loop {
         let next = tokio::select! {
@@ -304,7 +305,22 @@ pub async fn run_demux(
                 continue;
             }
             if let Some(p) = &st.position {
-                records.retain(|r| source.record_covered(r, p) != Some(true));
+                records.retain(|r| match source.record_covered(r, p) {
+                    Some(covered) => !covered,
+                    None => {
+                        if !uncovered_warned {
+                            uncovered_warned = true;
+                            tracing::warn!(
+                                table = %st.table,
+                                "the CDC source cannot tell whether a replayed change was already \
+                                 applied (`record_covered` is not implemented); a page that \
+                                 straddles this table's committed position is delivered again — \
+                                 duplicates on an append destination"
+                            );
+                        }
+                        true
+                    }
+                });
             }
             let due = page.bookmark.is_some() && st.last_sent_at.elapsed() >= IDLE_FLUSH;
             if records.is_empty() && !due {

@@ -7,16 +7,16 @@
 
 A **Redis** source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Reads records from a Redis **list**, **stream**, or a set of keys matched by a **glob pattern**, yielding each record as a `serde_json::Value`.
 
-Built on a lazily-opened, reused `MultiplexedConnection` and each mode's native paging primitive (`LRANGE`, `XRANGE`, `SCAN` + `MGET`), so it streams page-by-page without buffering the whole dataset in memory. Reach for it to drain a work queue, replay a stream's history, or load a keyspace into any faucet-stream sink.
+Built on a lazily-opened, reconnecting `ConnectionManager` and each mode's native paging primitive (`LRANGE`, `XRANGE`, `SCAN` + `MGET`), so it streams page-by-page without buffering the whole dataset in memory. Reach for it to drain a work queue, replay a stream's history, or load a keyspace into any faucet-stream sink.
 
 ## Feature highlights
 
 - **Three source modes** — `List` (FIFO list elements), `Stream` (entries with IDs + fields), and `Keys` (glob-matched keys with their values).
 - **Native streaming in all three modes** — `stream_pages` walks the list, stream, or keyspace in pages so the sink writes as data arrives.
-- **Server-side cursoring** — `Keys` drives the `SCAN` cursor manually and `MGET`s a page at a time, so a million-key namespace never materializes in memory at once.
+- **Server-side cursoring** — `Keys` drives the `SCAN` cursor manually and `MGET`s a page at a time, so a million-key namespace's values never materialize in memory at once.
 - **Never touches consumer groups** — every read is `XRANGE`, so a preview or run never claims entries into a group's pending list.
 - **Faithful values** — values that are valid JSON are parsed (`parse_json`; `containers` keeps scalars the strings Redis holds), and binary values are base64-encoded (`binary`) instead of failing the read.
-- **Connection reuse** — one multiplexed connection is opened on first use and cheaply cloned across every call (no per-call TCP/AUTH handshake).
+- **Connection reuse** — one reconnecting connection (`ConnectionManager`) is opened on first use and cheaply cloned across every call (no per-call TCP/AUTH handshake); after the server drops it, the next command reconnects instead of every later call failing.
 - **Secrets-safe** — the connection URL is masked in `Debug` output and credentials are stripped from the lineage dataset URI.
 
 ## Installation
@@ -108,7 +108,7 @@ Each entry is returned as:
 
 #### `Keys`
 
-Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
+Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once — the run keeps a 16-byte fingerprint of every matched key name, so memory grows with the number of keys matched, not their length. A key name that is not valid UTF-8 is rendered into the record's `key` per `binary`. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -273,7 +273,7 @@ for event in &events {
 
 ## How it works
 
-The multiplexed connection is opened **once** on first use (`OnceCell`) and cloned per call — `MultiplexedConnection` shares a single underlying socket, so there is no repeated TCP/AUTH handshake. List and stream pages advance a server-side cursor (a sliding `LRANGE` window; the immediate-successor stream ID via `next_stream_id`) so no entry is re-emitted across page boundaries. `Keys` drives the `SCAN` cursor manually and `MGET`s a page as soon as `batch_size` keys accumulate, rather than materializing the whole matched keyset first; keys deleted between `SCAN` and `MGET` are dropped.
+The connection is opened **once** on first use (`OnceCell`) and cloned per call — a `ConnectionManager` multiplexes commands over one socket, so there is no repeated TCP/AUTH handshake, and it reconnects in the background when the server drops the connection (a command in flight at that moment fails; later ones use the new connection). List and stream pages advance a server-side cursor (a sliding `LRANGE` window; the immediate-successor stream ID via `next_stream_id`) so no entry is re-emitted across page boundaries. `Keys` drives the `SCAN` cursor manually and `MGET`s a page as soon as `batch_size` keys accumulate, rather than materializing the whole matched keyset first; keys deleted between `SCAN` and `MGET` are dropped.
 
 **List paging consistency caveat:** index-based `LRANGE` paging is only stable if the list is not mutated mid-scan. A concurrent `LPUSH`/`LPOP` shifts every element's index, so a writer pushing/popping while the source drains can skip or duplicate elements across page boundaries. For a queue being consumed concurrently, prefer a Redis Stream (`XRANGE` / consumer groups) over a list.
 

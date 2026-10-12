@@ -533,6 +533,21 @@ fn is_secret_kv_key(key: &str) -> bool {
 /// to identify the userinfo→host `@` delimiter when redacting credentials.
 /// Accepts letters, digits, `.`, `-`, `:`, `_`, bracketed IPv6 forms, and `,`
 /// for a multi-host seed list (`h1:27017,h2:27017`).
+/// `scheme://host[:port][,host…]` of a connection URI with its credentials,
+/// path, query and fragment removed — a base for dataset URIs that must not
+/// carry connection options. Input without `://` is returned redacted only.
+pub fn redacted_uri_authority(uri: &str) -> String {
+    let redacted = redact_uri_credentials(uri);
+    match redacted.find("://") {
+        Some(i) => {
+            let rest = &redacted[i + 3..];
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            redacted[..i + 3 + end].to_string()
+        }
+        None => redacted,
+    }
+}
+
 fn is_host_shaped(s: &str) -> bool {
     s.bytes().all(|b| {
         b.is_ascii_alphanumeric()
@@ -739,6 +754,18 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redacted_uri_authority_keeps_only_scheme_and_hosts() {
+        assert_eq!(
+            super::redacted_uri_authority("mongodb://u:p@h1:27017,h2/admin?replicaSet=rs#x"),
+            "mongodb://h1:27017,h2"
+        );
+        assert_eq!(
+            super::redacted_uri_authority("mongodb+srv://cluster.example.net"),
+            "mongodb+srv://cluster.example.net"
+        );
+        assert_eq!(super::redacted_uri_authority("localhost"), "localhost");
+    }
 
     /// Serve one response: `head` then `body`, then hold the socket open.
     fn serve_once(head: String, body: Vec<u8>) -> String {

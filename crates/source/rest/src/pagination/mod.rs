@@ -106,6 +106,13 @@ pub enum PaginationStyle {
         /// elements, an object 1, null or no match 0 (which ends pagination).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rows_path: Option<String>,
+        /// Stop on a page shorter than `limit` (default `false`). Only for
+        /// servers that never cap a page below `limit` — a capped page would
+        /// end the run with rows unread — but reject an offset past the end
+        /// (a `400`/`416` on the extra request) instead of returning an empty
+        /// page. A readable `total_path` still wins.
+        #[serde(default)]
+        stop_when_short: bool,
     },
     /// Offset/limit pagination that writes the offset and limit into the JSON
     /// **request body** (POST-query APIs), rather than the query string
@@ -413,6 +420,7 @@ impl PaginationStyle {
                 limit,
                 total_path,
                 rows_path,
+                stop_when_short,
                 ..
             } => {
                 let count = match rows_path {
@@ -425,7 +433,13 @@ impl PaginationStyle {
                     count,
                     *limit,
                     total_path.as_deref(),
-                )?;
+                )? && !offset::stops_short(
+                    *stop_when_short,
+                    count,
+                    *limit,
+                    body,
+                    total_path.as_deref(),
+                );
                 // Content-stagnation guard (#264 F18): a server that ignores
                 // the `offset` parameter re-returns the identical first page
                 // forever. With `total_path` absent (commonly omitted) the

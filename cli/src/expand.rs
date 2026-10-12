@@ -1012,31 +1012,11 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             state.as_ref(),
         )?;
 
-        // postgres-cdc gate (#789 SQL-131): the replication slot only advances
-        // from a persisted bookmark, so without state every run replays from
-        // the slot's original position and the primary keeps the WAL.
-        if merged_source.kind == "postgres-cdc" {
-            match state.as_ref() {
-                None => {
-                    return Err(CliError::Config(format!(
-                        "row '{row_id}': postgres-cdc needs a `state:` block — the slot only \
-                         advances from a persisted bookmark, so without one every run \
-                         replays from the slot's start and the server retains WAL \
-                         (use `file`, `redis`, or `postgres`)"
-                    )));
-                }
-                Some(s) if s.kind == "memory" => {
-                    tracing::warn!(
-                        row = %row_id,
-                        "postgres-cdc: the `memory` state store resets on process exit — the \
-                         slot only advances within one `faucet schedule`/`serve` process and \
-                         a restart replays from the slot's start; use `file`, `redis`, or \
-                         `postgres`"
-                    );
-                }
-                Some(_) => {}
-            }
-        }
+        check_postgres_cdc_state(
+            &format!("row '{row_id}'"),
+            &merged_source.kind,
+            state.as_ref(),
+        )?;
 
         // Rollback gate (#706): an undoable run needs a durable state store
         // (the pre-run marker and bookmark live there), a sink that can undo
@@ -2327,6 +2307,38 @@ fn check_cleanup_completeness(
         )));
     }
     Ok(())
+}
+
+/// postgres-cdc gate (#789 SQL-131): the replication slot only advances from a
+/// persisted bookmark, so without state every run replays from the slot's
+/// original position and the primary keeps the WAL.
+pub(crate) fn check_postgres_cdc_state(
+    label: &str,
+    source_kind: &str,
+    state: Option<&StateStoreSpec>,
+) -> CliResult<()> {
+    if source_kind != "postgres-cdc" {
+        return Ok(());
+    }
+    match state {
+        None => Err(CliError::Config(format!(
+            "{label}: postgres-cdc needs a `state:` block — the slot only \
+             advances from a persisted bookmark, so without one every run \
+             replays from the slot's start and the server retains WAL \
+             (use `file`, `redis`, or `postgres`)"
+        ))),
+        Some(s) if s.kind == "memory" => {
+            tracing::warn!(
+                owner = %label,
+                "postgres-cdc: the `memory` state store resets on process exit — the \
+                 slot only advances within one `faucet schedule`/`serve` process and \
+                 a restart replays from the slot's start; use `file`, `redis`, or \
+                 `postgres`"
+            );
+            Ok(())
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// SLA (#202) and profiling (#708) gates, shared by matrix rows and topology

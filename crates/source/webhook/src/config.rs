@@ -135,6 +135,19 @@ pub fn validate_path(path: &str) -> Result<(), faucet_core::FaucetError> {
     Ok(())
 }
 
+/// [`validate_path`] for the path the server actually serves: a `{name}` left
+/// over after context substitution would become a route capture matching any
+/// segment, so it is refused.
+pub(crate) fn validate_resolved_path(path: &str) -> Result<(), faucet_core::FaucetError> {
+    validate_path(path)?;
+    if path.contains(['{', '}']) {
+        return Err(faucet_core::FaucetError::Config(format!(
+            "webhook source: `path` {path:?} has a `{{name}}` placeholder the context did not fill"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for WebhookSourceConfig {
     fn default() -> Self {
         Self {
@@ -159,6 +172,12 @@ impl WebhookSourceConfig {
     /// Validate the path and signature settings.
     pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
         validate_path(&self.path)?;
+        self.validate_settings()
+    }
+
+    /// Everything [`validate`](Self::validate) checks except the path, for a
+    /// path template that is resolved against a context first.
+    pub(crate) fn validate_settings(&self) -> Result<(), faucet_core::FaucetError> {
         if let Some(sig) = &self.signature
             && (sig.header.trim().is_empty() || sig.secret.is_empty())
         {
@@ -228,6 +247,16 @@ impl WebhookSourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resolved_path_may_not_keep_a_placeholder() {
+        assert!(validate_resolved_path("/hooks/user-7").is_ok());
+        let err = validate_resolved_path("/hooks/{id}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not fill"), "{err}");
+        assert!(validate_resolved_path("hooks").is_err());
+    }
 
     #[test]
     fn default_config() {

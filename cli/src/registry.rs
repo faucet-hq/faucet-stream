@@ -1806,7 +1806,12 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         #[cfg(feature = "source-redis")]
         "redis" => check::<faucet_source_redis::RedisSourceConfig>("redis", name, config),
         #[cfg(feature = "source-webhook")]
-        "webhook" => check::<faucet_source_webhook::WebhookSourceConfig>("webhook", name, config),
+        "webhook" => check_with::<faucet_source_webhook::WebhookSourceConfig, _, _>(
+            "webhook",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-websocket")]
         "websocket" => check_with::<faucet_source_websocket::WebsocketSourceConfig, _, _>(
             "websocket",
@@ -3777,6 +3782,23 @@ mod tests {
             serde_json::json!({"table_name": "t", "mode": "scan"}),
         )
         .expect("scan config is valid");
+    }
+
+    #[cfg(feature = "source-webhook")]
+    #[test]
+    fn validate_runs_the_webhook_config_checks() {
+        let err = validate_source_config("webhook", "row", serde_json::json!({"path": "webhook"}))
+            .expect_err("a path without a leading slash is refused");
+        assert!(err.to_string().contains("must start with `/`"), "{err}");
+        let err = validate_source_config(
+            "webhook",
+            "row",
+            serde_json::json!({"path": "/w", "signature": {"header": "", "secret": ""}}),
+        )
+        .expect_err("an empty signature is refused");
+        assert!(err.to_string().contains("signature.header"), "{err}");
+        validate_source_config("webhook", "row", serde_json::json!({"path": "/w"}))
+            .expect("a plain path is valid");
     }
 
     #[test]

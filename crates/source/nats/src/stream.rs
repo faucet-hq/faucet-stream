@@ -55,6 +55,24 @@ impl NatsSource {
 
 /// Decode a raw NATS payload per `format`. Never lossy: a payload the format
 /// cannot represent is an error naming the subject (#789 MSG-39).
+/// [`payload_to_value`] under the configured decode-error policy: `None`
+/// when a payload that cannot be decoded is skipped.
+fn decode_payload(
+    payload: &[u8],
+    format: NatsValueFormat,
+    subject: &str,
+    on_error: crate::config::NatsOnDecodeError,
+) -> Result<Option<Value>, FaucetError> {
+    match payload_to_value(payload, format, subject) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if on_error == crate::config::NatsOnDecodeError::Skip => {
+            tracing::warn!(subject = %subject, error = %e, "nats source: skipping a payload that cannot be decoded");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn payload_to_value(
     payload: &[u8],
     format: NatsValueFormat,
@@ -98,6 +116,8 @@ enum Polled {
     Closed,
     /// The poll budget elapsed with no message.
     Idle,
+    /// A message was received and dropped under `on_decode_error: skip`.
+    Skipped,
 }
 
 #[async_trait]
@@ -139,6 +159,7 @@ impl Source for NatsSource {
         let poll_fallback = Duration::from_millis(500);
 
         let with_meta = self.config.include_metadata;
+        let on_decode_error = self.config.on_decode_error;
 
         Box::pin(async_stream::try_stream! {
             let client = self.client().await?;
@@ -210,7 +231,12 @@ impl Source for NatsSource {
                     let mut got = 0usize;
                     while let Some(item) = batch.next().await {
                         let msg = item.map_err(|e| FaucetError::Source(format!("nats jetstream recv: {e}")))?;
-                        let mut record = payload_to_value(&msg.payload, format, &msg.subject)?;
+                        let Some(mut record) = decode_payload(&msg.payload, format, &msg.subject, on_decode_error)? else {
+                            if let Err(e) = msg.ack_with(async_nats::jetstream::AckKind::Term).await {
+                                tracing::warn!(error = %e, "nats source: terminating an undecodable message failed (it may be redelivered)");
+                            }
+                            continue;
+                        };
                         if with_meta {
                             let seq = msg.info().ok().map(|i| i.stream_sequence);
                             record = with_metadata(record, &msg.subject, seq, message_id(msg.headers.as_ref()));
@@ -278,11 +304,15 @@ impl Source for NatsSource {
                     let polled = match tokio::time::timeout(budget, sub.next()).await {
                         Ok(Some(msg)) => {
                             last_at = Instant::now();
-                            let mut record = payload_to_value(&msg.payload, format, &msg.subject)?;
-                            if with_meta {
-                                record = with_metadata(record, &msg.subject, None, message_id(msg.headers.as_ref()));
+                            match decode_payload(&msg.payload, format, &msg.subject, on_decode_error)? {
+                                Some(mut record) => {
+                                    if with_meta {
+                                        record = with_metadata(record, &msg.subject, None, message_id(msg.headers.as_ref()));
+                                    }
+                                    Polled::Record(record)
+                                }
+                                None => Polled::Skipped,
                             }
-                            Polled::Record(record)
                         }
                         Ok(None) => Polled::Closed,
                         Err(_elapsed) => Polled::Idle,
@@ -298,6 +328,7 @@ impl Source for NatsSource {
                             }
                         }
                         Polled::Closed => stop = true,
+                        Polled::Skipped => {}
                         Polled::Idle => {
                             if idle_expired(deadline) {
                                 stop = true;
@@ -341,8 +372,8 @@ impl Source for NatsSource {
 }
 
 /// Compute the poll timeout for this iteration and the idle deadline (if any).
-/// With no idle timeout configured we poll in short bursts so `ctrl_c` and
-/// `max_messages` termination stay responsive.
+/// With no idle timeout configured we poll in short bursts so cancellation
+/// and `max_messages` termination stay responsive.
 fn poll_budget(
     idle: Option<Duration>,
     last_at: Instant,
@@ -445,6 +476,21 @@ fn with_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_drops_an_undecodable_payload_and_fail_keeps_the_error() {
+        use crate::config::NatsOnDecodeError;
+        let bin = [0xff_u8, 0xfe];
+        assert_eq!(
+            decode_payload(&bin, NatsValueFormat::Auto, "s", NatsOnDecodeError::Skip).unwrap(),
+            None
+        );
+        assert!(decode_payload(&bin, NatsValueFormat::Auto, "s", NatsOnDecodeError::Fail).is_err());
+        assert_eq!(
+            decode_payload(b"1", NatsValueFormat::Auto, "s", NatsOnDecodeError::Skip).unwrap(),
+            Some(serde_json::json!(1))
+        );
+    }
 
     #[test]
     fn pulls_never_exceed_the_page_the_run_or_max_ack_pending() {

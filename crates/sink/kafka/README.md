@@ -18,7 +18,7 @@ Reach for it when you want to land any faucet-stream source — a REST API, a da
 - **Per-record key / partition / headers** — JSONPath-driven `key_path`, `partition_path` and `headers_path`, with a configurable `on_key_error` policy (`fail` / `skip` / `round_robin`).
 - **Producer compression** — `none` / `gzip` / `snappy` / `lz4` / `zstd`.
 - **Value & key encoding** — JSON, raw UTF-8 string, or base64 bytes out of the box; Confluent **Avro / Protobuf / JSON Schema** behind the `schema-registry` feature.
-- **SASL / SSL auth** — `none`, `sasl_plain`, `sasl_scram` (SHA-256/512), `ssl` (mTLS), and `sasl_ssl`, shared verbatim with the Kafka **source** via [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka).
+- **SASL / SSL auth** — `none`, `sasl_plain`, `sasl_scram` (SHA-256/512), `ssl` (mTLS), `tls` (server-authenticated TLS), and `sasl_ssl`, shared verbatim with the Kafka **source** via [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka).
 - **Producer built once** — the authenticated `FutureProducer` is constructed in `new()` and reused for every batch.
 
 ## Installation
@@ -157,7 +157,7 @@ For `from_path`, the path must resolve to a non-empty string for **every** recor
 | `raw_string` | — | Write the record's string representation as UTF-8 bytes. |
 | `bytes` | — | Expect a base64-encoded string; decode and write the raw bytes. |
 | `confluent_avro` | `schema-registry` | Confluent wire-format Avro (`[0x00][be u32 schema_id][Avro]`). Subject `{topic}-value`. |
-| `confluent_protobuf` | `schema-registry` | Present for API symmetry; v1 returns `FaucetError::Config` on encode (full descriptor support tracked in [#44](https://github.com/faucet-hq/faucet-stream/issues/44)). |
+| `confluent_protobuf` | `schema-registry` | Confluent wire-format Protobuf against the subject's registered schema (single-message schemas only; schema references are not resolved). |
 | `confluent_json_schema` | `schema-registry` | Confluent wire-format JSON (`[0x00][be u32 schema_id][JSON]`). |
 
 The three Confluent formats need the `schema-registry` feature (CLI: `kafka-schema-registry`) and a `schema_registry` block. On the **sink** side you must also supply the schema text to register and encode against — `value_schema` for the value, `key_schema` for the key — or the config is rejected at load time. See the [`faucet-common-kafka` README](https://crates.io/crates/faucet-common-kafka) for `SchemaRegistryConfig` options.
@@ -187,38 +187,56 @@ A JSON string written to an Avro `bytes` or `fixed` field is read as **lowercase
 
 ## Authentication
 
-`auth` uses the shared `KafkaAuth` enum (the project-wide `{ type, config }` discriminated shape; SASL/SSL fields sit alongside `type`):
+`auth` uses the shared `KafkaAuth` enum (the project-wide `{ type, config }` discriminated shape):
 
-| `type` | Required fields | Use when |
-|--------|-----------------|----------|
+| `type` | `config` | Use when |
+|--------|----------|----------|
 | `none` | — | Plaintext brokers (default; `security.protocol = PLAINTEXT`). |
 | `sasl_plain` | `username`, `password` | SASL/PLAIN over plaintext (e.g. dev clusters). |
 | `sasl_scram` | `mechanism` (`sha256`/`sha512`), `username`, `password` | SASL/SCRAM over plaintext. |
 | `ssl` | `ca_path`, `cert_path`, `key_path` (+ optional `key_password`) | Mutual TLS. Paths are validated to exist at config time. |
-| `sasl_ssl` | `sasl` (a `sasl_plain`/`sasl_scram` block), `ssl` (an `ssl` block) | SASL over TLS — Confluent Cloud, Amazon MSK. |
+| `tls` | `ca_path?` | TLS with server authentication only (no client certificate); the system trust store unless `ca_path` is set. |
+| `sasl_ssl` | `sasl` (a `sasl_plain`/`sasl_scram` block), `ssl` (a `tls`, `ssl` or `none` block) | SASL over TLS — Confluent Cloud, Amazon MSK. |
 
 ```yaml
 # SASL/PLAIN
 auth:
   type: sasl_plain
-  username: ${env:KAFKA_USERNAME}
-  password: ${env:KAFKA_PASSWORD}
+  config:
+    username: ${env:KAFKA_USERNAME}
+    password: ${env:KAFKA_PASSWORD}
 ```
 
 ```yaml
-# SASL/SCRAM-SHA-512 over TLS
+# SASL/SCRAM-SHA-512 over TLS without client certificates (managed clusters)
 auth:
   type: sasl_ssl
-  sasl:
-    type: sasl_scram
-    mechanism: sha512
-    username: ${env:KAFKA_USERNAME}
-    password: ${env:KAFKA_PASSWORD}
-  ssl:
-    type: ssl
-    ca_path: /etc/kafka/certs/ca.pem
-    cert_path: /etc/kafka/certs/client.pem
-    key_path: /etc/kafka/certs/client.key
+  config:
+    sasl:
+      type: sasl_scram
+      config:
+        mechanism: sha512
+        username: ${env:KAFKA_USERNAME}
+        password: ${env:KAFKA_PASSWORD}
+    ssl:
+      type: tls
+      config: {}          # or { ca_path: /etc/kafka/certs/ca.pem }
+```
+
+```yaml
+# SASL over mutual TLS
+auth:
+  type: sasl_ssl
+  config:
+    sasl:
+      type: sasl_plain
+      config: { username: ${env:KAFKA_USERNAME}, password: ${env:KAFKA_PASSWORD} }
+    ssl:
+      type: ssl
+      config:
+        ca_path: /etc/kafka/certs/ca.pem
+        cert_path: /etc/kafka/certs/client.pem
+        key_path: /etc/kafka/certs/client.key
 ```
 
 Use `${env:VAR}` / `${secret:…}` interpolation so credentials never land in the YAML file. The full auth reference lives in the [`faucet-common-kafka` README](https://crates.io/crates/faucet-common-kafka).
@@ -331,7 +349,7 @@ The producer's `transactional.id` is auto-derived from the pipeline scope — st
 
 A transaction enqueues the whole page plus its token before awaiting anything, so the transactional producer's queue is not capped at `batch_size` (librdkafka's 100 000-message default, or `batch_size + 1` when larger; `extra_client_config` still wins), and a full queue waits for room for up to `message_timeout` instead of `queue_full_max_retries`.
 
-Scopes share the side-topic, so another pipeline's open transaction holds its Last Stable Offset below this scope's newer tokens. `last_committed_token` waits until every transaction open when it started has committed or aborted (bounded by `max(message_timeout, 60 s) + 10 s`, then the run fails) rather than resuming from an older token. Downstream consumers of the destination topic should set `isolation.level=read_committed` so they only ever observe committed transactions.
+Scopes share the side-topic, so another pipeline's open transaction holds its Last Stable Offset below this scope's newer tokens. `last_committed_token` waits until every transaction open when it started has committed or aborted (bounded by `max(message_timeout, 60 s) + 10 s`, then the run fails) rather than resuming from an older token. Its own scope's transaction left open by a crash is fenced and aborted first (the transactional producer is initialised before the read), so it never holds the wait. A peer's transaction lasts up to the peer's transaction timeout, so give every pipeline sharing a commit-token topic the same or a lower `message_timeout` — or its own `commit_token_topic`. Downstream consumers of the destination topic should set `isolation.level=read_committed` so they only ever observe committed transactions.
 
 To use effectively-once delivery, set `delivery: exactly_once` and pair this sink with a CDC source (`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus a `state:` block. A DLQ is not permitted in effectively-once mode. All four requirements are validated at config-load time (`faucet validate`) before any run starts.
 
@@ -436,7 +454,7 @@ In a full pipeline, wire the sink into `faucet_core::Pipeline` (or `run_stream`)
 | `kafka sink: max_in_flight must be at least 1` | `max_in_flight` is `0`. Set it to ≥ 1. |
 | `kafka sink: value_schema is not set` | A Confluent `value_format` was selected without `value_schema`. Supply the schema text (and likewise `key_schema` for a Confluent `key_format`). |
 | Confluent format compiles but won't build | The `schema-registry` feature isn't enabled. Install with `--features sink-kafka,kafka-schema-registry`. |
-| `confluent_protobuf` returns a `Config` error | Protobuf encode is not implemented in v1 (issue #44). Use `confluent_avro` or `confluent_json_schema`. |
+| `confluent_protobuf` encodes against the wrong message, or fails to compile the schema | Only single-message schemas are supported: the first `message` in the subject's `.proto` is used, and a schema that imports others through Schema Registry references does not compile (references are not resolved). Use `confluent_avro`, `confluent_json_schema`, or `bytes` with an external encoder. |
 | `QueueFull` errors surface despite retries | The producer queue is saturating faster than the broker drains. Raise `queue_full_max_retries` / `queue_full_backoff`, lower `batch_size`/`max_in_flight`, or enable `compression`. |
 | `from_path` routing aborts mid-batch | A record's topic path was missing or non-string. `from_path` is always fatal — ensure every record carries the field, or use a `fixed` topic. |
 | Records dropped unexpectedly | `on_key_error: skip` silently drops records whose key/partition extraction fails. Use `fail` to surface the error or `round_robin` to keep them keyless. |

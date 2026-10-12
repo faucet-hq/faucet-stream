@@ -270,6 +270,7 @@ impl ConsumerContext for BookmarkContext {
                 .or_else(|| self.reassign_bookmark());
 
                 let mut applied: Vec<(String, i32, i64)> = Vec::new();
+                let lookups = LookupBudget::new(WATERMARK_LOOKUP_BUDGET);
                 if let Some(bookmark) = bookmark {
                     let lookup: HashMap<(&str, i32), i64> = bookmark
                         .partition_offsets
@@ -309,9 +310,9 @@ impl ConsumerContext for BookmarkContext {
                     }
 
                     for (topic, partition, offset) in &mut seeks {
-                        let low = base_consumer
-                            .fetch_watermarks(topic, *partition, COMMITTED_LOOKUP_TIMEOUT)
-                            .ok()
+                        let low = lookups
+                            .remaining()
+                            .and_then(|t| base_consumer.fetch_watermarks(topic, *partition, t).ok())
                             .map(|(low, _)| low);
                         let (clamped, lost) = clamp_to_log_start(*offset, low);
                         if lost > 0 {
@@ -352,7 +353,7 @@ impl ConsumerContext for BookmarkContext {
                 }
 
                 let (mut seeds, clamps) = if self.member_mode.load(Ordering::Acquire) {
-                    self.member_seed_offsets(base_consumer, tpl, &applied)
+                    self.member_seed_offsets(base_consumer, tpl, &applied, &lookups)
                 } else {
                     (Vec::new(), Vec::new())
                 };
@@ -367,9 +368,18 @@ impl ConsumerContext for BookmarkContext {
                     );
                     seeds.push((topic, partition, start));
                 }
-                for (topic, partition, offset) in &seeds {
-                    let _ = tpl.set_partition_offset(topic, *partition, Offset::Offset(*offset));
-                }
+                seeds.retain(|(topic, partition, offset)| {
+                    match tpl.set_partition_offset(topic, *partition, Offset::Offset(*offset)) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            self.record_error(FaucetError::State(format!(
+                                "kafka set_partition_offset topic={topic} partition={partition} \
+                                 offset={offset}: {e}"
+                            )));
+                            false
+                        }
+                    }
+                });
 
                 match base_consumer.rebalance_protocol() {
                     RebalanceProtocol::Cooperative => {
@@ -448,6 +458,7 @@ impl BookmarkContext {
         consumer: &BaseConsumer<BookmarkContext>,
         tpl: &TopicPartitionList,
         applied: &[(String, i32, i64)],
+        lookups: &LookupBudget,
     ) -> (Vec<(String, i32, i64)>, Vec<Clamp>) {
         let assigned: Vec<(String, i32)> = tpl
             .elements()
@@ -472,7 +483,8 @@ impl BookmarkContext {
         let mut watermarks = HashMap::new();
         for tp in &assigned {
             if !seeks.contains_key(tp)
-                && let Ok(w) = consumer.fetch_watermarks(&tp.0, tp.1, COMMITTED_LOOKUP_TIMEOUT)
+                && let Some(t) = lookups.remaining()
+                && let Ok(w) = consumer.fetch_watermarks(&tp.0, tp.1, t)
             {
                 watermarks.insert(tp.clone(), w);
             }
@@ -492,6 +504,33 @@ impl BookmarkContext {
             seeds,
             committed_clamps(&assigned, &committed, &seeks, &lows),
         )
+    }
+}
+
+/// Total time the watermark lookups of one assignment may take: they run in
+/// the rebalance callback, one broker round trip per partition, so a large
+/// assignment on a slow broker must not stall the poll thread for minutes.
+/// A partition looked up after it runs out keeps the default start (no
+/// retention clamp, no seed) — `auto.offset.reset` decides.
+const WATERMARK_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+struct LookupBudget {
+    deadline: std::time::Instant,
+}
+
+impl LookupBudget {
+    fn new(budget: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + budget,
+        }
+    }
+
+    /// The timeout for the next lookup, or `None` once the budget is spent.
+    fn remaining(&self) -> Option<std::time::Duration> {
+        let left = self
+            .deadline
+            .checked_duration_since(std::time::Instant::now())?;
+        (!left.is_zero()).then(|| left.min(COMMITTED_LOOKUP_TIMEOUT))
     }
 }
 
@@ -560,6 +599,18 @@ fn filter_seeks_by_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lookup_budget_caps_each_lookup_and_runs_out() {
+        let fresh = LookupBudget::new(std::time::Duration::from_secs(60));
+        assert_eq!(fresh.remaining(), Some(COMMITTED_LOOKUP_TIMEOUT));
+        let short = LookupBudget::new(std::time::Duration::from_millis(50));
+        assert!(short.remaining().unwrap() <= std::time::Duration::from_millis(50));
+        assert_eq!(
+            LookupBudget::new(std::time::Duration::ZERO).remaining(),
+            None
+        );
+    }
     use crate::state::{Bookmark, PartitionOffset};
 
     #[test]

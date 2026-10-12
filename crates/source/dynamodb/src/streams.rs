@@ -260,6 +260,7 @@ pub(crate) async fn read_slice(
                     );
                 }
                 let empty = decoded.is_empty();
+                let raw_empty = out.records().is_empty();
                 if let Some((seq, _)) = decoded.last() {
                     lease.position = StartAt::After(seq.clone());
                 }
@@ -275,7 +276,7 @@ pub(crate) async fn read_slice(
                     return;
                 }
                 lease.iterator = out.next_shard_iterator().map(str::to_string);
-                if empty && lease.iterator.is_some() {
+                if raw_empty && lease.iterator.is_some() {
                     let delay = config.poll_interval();
                     let _ = tx
                         .send(ShardEvent::Yielded {
@@ -891,6 +892,61 @@ mod tests {
         }
         assert_eq!(seqs, vec!["2".to_string()]);
         assert!(done);
+    }
+
+    #[tokio::test]
+    async fn a_batch_filtered_to_nothing_is_not_reported_as_caught_up() {
+        use wiremock::Mock;
+        use wiremock::matchers::{body_partial_json, header, method};
+        let server = MockServer::start().await;
+        let iter = |kind: &str, it: &str| {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", ITER))
+                .and(body_partial_json(json!({"ShardIteratorType": kind})))
+                .respond_with(ok(json!({"ShardIterator": it})))
+        };
+        iter("LATEST", "it-latest")
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        iter("TRIM_HORIZON", "it-th").mount(&server).await;
+        let records = |it: &str| {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", RECORDS))
+                .and(body_partial_json(json!({"ShardIterator": it})))
+        };
+        records("it-latest")
+            .respond_with(err(400, "ExpiredIteratorException"))
+            .mount(&server)
+            .await;
+        let mut old = record("1");
+        old["dynamodb"]["ApproximateCreationDateTime"] = json!(1_000_000_000);
+        records("it-th")
+            .respond_with(ok(json!({"Records": [old], "NextShardIterator": "it-2"})))
+            .mount(&server)
+            .await;
+        records("it-2")
+            .respond_with(ok(json!({"Records": [], "NextShardIterator": "it-3"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        read_slice(
+            streams(&server.uri()),
+            cfg(),
+            "arn".into(),
+            Lease::new("s1", StartAt::Latest),
+            tx,
+        )
+        .await;
+        let mut caught_up = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ShardEvent::Yielded { caught_up: c, .. } => caught_up = Some(c),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(caught_up, Some(true));
     }
 
     #[tokio::test]

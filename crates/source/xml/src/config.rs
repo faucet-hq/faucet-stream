@@ -170,12 +170,22 @@ pub enum XmlPagination {
         start_page: usize,
         page_size: Option<usize>,
         page_size_param: Option<String>,
+        /// Stop on a page shorter than `page_size` (default `false`). Only for
+        /// servers that never clamp the page size and reject a page past the
+        /// end; a clamped page would end the run with rows unread.
+        #[serde(default)]
+        stop_when_short: bool,
     },
     /// Offset/limit pagination.
     Offset {
         offset_param: String,
         limit_param: String,
         limit: usize,
+        /// Stop on a page shorter than `limit` (default `false`). Only for
+        /// servers that never clamp `limit` and reject an offset past the end;
+        /// a clamped page would end the run with rows unread.
+        #[serde(default)]
+        stop_when_short: bool,
     },
     /// Body-cursor pagination (#544): read a continuation token from the
     /// response via a dot-path (namespace-insensitive, trailing-match), and on

@@ -56,10 +56,27 @@ impl Position {
                  and reset the bookmark"
             ))),
             _ => {
+                if self.legacy_incarnation_unverified(current) {
+                    tracing::warn!(
+                        connector = "oracle-cdc",
+                        commit_scn = self.commit_scn,
+                        resetlogs_scn = current,
+                        "the bookmark predates incarnation tracking and lies after the current \
+                         RESETLOGS SCN, so a RESETLOGS before the upgrade cannot be detected; it is \
+                         bound to the current incarnation from now on"
+                    );
+                }
                 self.resetlogs_scn = Some(current);
                 Ok(())
             }
         }
+    }
+
+    /// True for a bookmark with no recorded incarnation whose position lies
+    /// at or after the current incarnation's branch point, where it may have
+    /// been taken in an earlier incarnation.
+    fn legacy_incarnation_unverified(&self, current: u64) -> bool {
+        self.resetlogs_scn.is_none() && self.commit_scn >= current
     }
 
     /// Where to anchor a fresh capture: at `current_scn`, reaching back to the
@@ -192,6 +209,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.resetlogs_scn, None);
+        assert!(legacy.legacy_incarnation_unverified(1));
+        assert!(!legacy.legacy_incarnation_unverified(2));
+        assert!(!p.legacy_incarnation_unverified(1));
         assert!(
             super::Position::from_value(&serde_json::json!({
                 "commit_scn": 1, "restart_scn": 1, "resetlogs_scn": "x"

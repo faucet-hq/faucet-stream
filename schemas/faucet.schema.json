@@ -4782,6 +4782,14 @@
                 "string",
                 "null"
               ]
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `limit` (default `false`). Only for\nservers that never cap a page below `limit` — a capped page would\nend the run with rows unread — but reject an offset past the end\n(a `400`/`416` on the extra request) instead of returning an empty\npage. A readable `total_path` still wins.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6411,6 +6419,14 @@
             "type": {
               "type": "string",
               "const": "PageNumber"
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `page_size` (default `false`). Only for\nservers that never clamp the page size and reject a page past the\nend; a clamped page would end the run with rows unread.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6435,6 +6451,14 @@
             "type": {
               "type": "string",
               "const": "Offset"
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `limit` (default `false`). Only for\nservers that never clamp `limit` and reject an offset past the end;\na clamped page would end the run with rows unread.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6793,6 +6817,16 @@
             "mode": {
               "type": "string",
               "const": "disable"
+            }
+          }
+        },
+        {
+          "description": "TLS when the server offers it, else plaintext, without verifying the\ncertificate (libpq's `prefer`; open to downgrade).",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "prefer"
             }
           }
         },
@@ -16073,7 +16107,7 @@
                       "default": null
                     },
                     "max_cycle_duration": {
-                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. A\nlong-running runtime (`faucet schedule`, `faucet serve`, `faucet\nmirror`) starts the next cycle straight away.",
+                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. `faucet\nmirror` starts the next cycle straight away; under `faucet schedule`\nthe next tick resumes; a one-shot `faucet run` (or `serve` run) ends.",
                       "type": [
                         "integer",
                         "string"
@@ -16102,6 +16136,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 100000
+                    },
+                    "max_buffered_bytes": {
+                      "description": "Upper bound, in bytes of decoded change data, on the read-ahead\nbuffer described under `max_buffered_events`; reading pauses at\nwhichever limit is reached first. This memory is held in addition to\n`max_staged_records`. Default 268 435 456 (256 MiB).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 268435456
                     },
                     "status_update_interval": {
                       "description": "Interval at which Standby Status Update keepalives are sent to the\nserver. Must be shorter than `idle_timeout` and well under the\nserver's `wal_sender_timeout` (default 60 s). Default: 10 s.",
@@ -17032,6 +17076,11 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "on_decode_error": {
+                      "description": "What a payload `value_format` cannot decode does: `fail` (default)\nfails the run; `skip` logs a warning and drops it — a JetStream message\nis terminated so it is not redelivered.",
+                      "$ref": "#/$defs/source_nats__NatsOnDecodeError",
+                      "default": "fail"
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -25309,7 +25358,7 @@
                       "default": false
                     },
                     "publish_timeout_secs": {
-                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take before the write fails as retriable, so a server outage\ncannot wedge the run. Default `30`.",
+                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take, so a server outage cannot wedge the run. On a timeout\nthe rows not yet confirmed fail as row errors (DLQ-routable); earlier\nbatches keep their outcomes. Not retried by `resilience.retry`.\nDefault `30`.",
                       "type": [
                         "integer",
                         "string"
@@ -25540,7 +25589,7 @@
                       "default": 1000
                     },
                     "publish_timeout_secs": {
-                      "description": "Seconds one publish group (its publishes and their confirms) may take\nbefore the write fails as retriable — a broker under a memory or disk\nalarm blocks publishers indefinitely. Default `60`.",
+                      "description": "Seconds one publish group (its publishes and their confirms) may take\n— a broker under a memory or disk alarm blocks publishers indefinitely.\nOn a timeout the rows not yet confirmed fail as row errors\n(DLQ-routable); earlier groups keep their outcomes. Not retried by\n`resilience.retry`. Default `60`.",
                       "type": [
                         "integer",
                         "string"
@@ -35054,6 +35103,21 @@
           "description": "The raw bytes, base64-encoded into a JSON string.",
           "type": "string",
           "const": "bytes"
+        }
+      ]
+    },
+    "source_nats__NatsOnDecodeError": {
+      "description": "[`NatsSourceConfig::on_decode_error`].",
+      "oneOf": [
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Warn and drop the message (JetStream: terminate it).",
+          "type": "string",
+          "const": "skip"
         }
       ]
     },

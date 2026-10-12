@@ -14,7 +14,7 @@ Reach for it when the upstream system only speaks XML or SOAP: legacy enterprise
 - **Automatic XML → JSON conversion** — every response is parsed into a `serde_json::Value` tree; attributes, text nodes, and repeated elements all map to predictable JSON shapes. Attribute values and text are unescaped (`&amp;` → `&`, `&#65;` → `A`); text split by CDATA or comments is joined as written and trimmed once. An undefined entity (`&nbsp;`) or a repeated attribute name fails the page rather than dropping the value.
 - **Element-path record extraction** — `records_element_path` walks a dot-separated path (e.g. `Envelope.Body.GetUsersResponse.Users.User`) to the repeating element and emits one record per match. A single element collapses to one record; a repeated element fans out to many.
 - **First-class SOAP** — a `soap:` block assembles the envelope, injects the version-correct headers (SOAPAction for 1.1, `Content-Type` action param for 1.2), resolves `records_element_path` relative to `Envelope.Body`, and surfaces SOAP `<Fault>` responses as errors. Or drop down to the raw-envelope path (`method: POST` + `body`) any time.
-- **Two pagination styles** — page-number and offset/limit, each with a built-in loop guard so a misbehaving endpoint can't spin forever; `max_pages` is a hard cap across both.
+- **Three pagination styles** — page-number, offset/limit and body-cursor, each with a built-in loop guard so a misbehaving endpoint can't spin forever; `max_pages` is a hard cap across all of them.
 - **Pluggable authentication** — `none`, `bearer`, `basic`, or fully custom headers — inline or via a shared provider from the CLI `auth:` catalog (OAuth2 token reuse across matrix rows).
 - **Retry with backoff** — transient HTTP failures (5xx / connection resets) are retried up to **3 attempts** with exponential backoff (base 500 ms) via the shared `faucet_core::execute_with_retry`.
 - **Bounded-memory streaming** — `Source::stream_pages` accumulates matched subtrees and yields a `StreamPage` every `batch_size` records; `batch_size: 0` drains the whole document into one page.
@@ -298,8 +298,8 @@ pipeline:
 
 | Style (`type`) | Fields | Stops when |
 |----------------|--------|------------|
-| `PageNumber` | `param_name`, `start_page`, `page_size` *(optional)*, `page_size_param` *(optional)* | A page returns zero records, or a loop is detected. A short page does not stop paging — the server may clamp `page_size` to its own maximum. |
-| `Offset` | `offset_param`, `limit_param`, `limit` | A page returns zero records, or a loop is detected. The offset advances by the records received, so a server that clamps `limit` is still read in full. |
+| `PageNumber` | `param_name`, `start_page`, `page_size` *(optional)*, `page_size_param` *(optional)*, `stop_when_short` *(optional)* | A page returns zero records, or a loop is detected. A short page does not stop paging — the server may clamp `page_size` to its own maximum — unless `stop_when_short: true` (with `page_size`), for a server that never clamps but rejects a page past the end. |
+| `Offset` | `offset_param`, `limit_param`, `limit`, `stop_when_short` *(optional)* | A page returns zero records, or a loop is detected. The offset advances by the records received, so a server that clamps `limit` is still read in full. `stop_when_short: true` also stops on a page shorter than `limit`, for a server that never clamps but rejects an offset past the end. |
 | `BodyCursor` | `next_token_path`, `next_body` | The continuation token is absent/empty, or repeats (loop guard). |
 
 `max_pages` caps the total number of pages for all styles. With no `pagination` block, exactly one request is made. Every style — including `BodyCursor` and a `decode:` pipeline — emits each HTTP response's records as it arrives, so memory stays bounded by one response plus `batch_size`.
@@ -393,6 +393,7 @@ let config = XmlStreamConfig::new("https://feeds.example.com", "/catalog")
         offset_param: "offset".into(),
         limit_param: "limit".into(),
         limit: 250,
+        stop_when_short: false,
     })
     .with_batch_size(500);
 
@@ -449,4 +450,4 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 Metrics emitted by this source are labelled `connector="xml"`.
 
 - `faucet_source_roundtrips_total{op="request"}` — one per HTTP request, retries included (#638).
-- `faucet_source_throttled_total` — `429` responses received; `faucet_source_throttle_wait_seconds` — the backoff actually slept after each; `faucet_source_retries_total{class}` — every retry by class (#734). The totals also appear on the run's usage record (`throttled 2× · waited 1.2 s` in `faucet run` / `faucet usage`). After a `429` (or a `503` with `Retry-After`) the source sleeps the server's `Retry-After` (seconds or an HTTP date), else the retry policy's backoff; a stated wait over 3600 s fails the run instead.
+- `faucet_source_throttled_total` — `429` responses received; `faucet_source_throttle_wait_seconds` — the backoff actually slept after each; `faucet_source_retries_total{class}` — every retry by class (#734). The totals also appear on the run's usage record (`throttled 2× · waited 1.2 s` in `faucet run` / `faucet usage`). After a `429` (or a `503` with `Retry-After`) the source sleeps the server's `Retry-After` (seconds or an HTTP date), else the retry policy's backoff — a few seconds by default, where the REST source assumes 60 s for a bare `429`, so lengthen `resilience.retry` for an API that rate-limits without `Retry-After`; a stated wait over 3600 s fails the run instead.

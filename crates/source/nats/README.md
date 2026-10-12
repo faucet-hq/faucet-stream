@@ -44,6 +44,7 @@ leaves a prefetched tail leased and unacked until `ack_wait`, and a page never
 exceeds the consumer's `max_ack_pending` (which would stall the run on its own
 unacked page). The final page's acks are flushed before the run ends. Keep it below the consumer's `ack_wait`. `0` disables. |
 | `value_format`      | `auto` \| `json` \| `string` \| `bytes` | `auto` | how a payload becomes a record: `auto` (JSON, else UTF-8 text), `json` (must parse), `string` (UTF-8 text), `bytes` (base64). Non-UTF-8 under `auto` / `string` fails the run. |
+| `on_decode_error`   | `fail` \| `skip` | `fail` | what a payload `value_format` cannot decode does: `fail` the run, or `skip` it with a warning (a JetStream message is terminated so it is not redelivered and cannot wedge later runs). |
 | `include_metadata`  | `bool`           | `false` | wrap each record as `{subject, sequence, message_id, payload}` — the JetStream stream sequence (`null` in core mode) and the `Nats-Msg-Id` header — so a downstream consumer can deduplicate redeliveries. |
 
 At least one of `max_messages` / `idle_timeout_secs` must be set so the run

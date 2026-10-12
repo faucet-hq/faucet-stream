@@ -48,6 +48,25 @@ impl Decoding {
         Ok(self.text(&text))
     }
 
+    /// A key name as the record's `key`: text when it is UTF-8, else per
+    /// `binary` (a non-UTF-8 key used to fail the whole read).
+    fn key_name(self, key: &[u8]) -> Result<Value, FaucetError> {
+        match std::str::from_utf8(key) {
+            Ok(t) => Ok(Value::String(t.to_string())),
+            Err(_) => match self.binary {
+                RedisBinary::Base64 => Ok(Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(key),
+                )),
+                RedisBinary::Lossy => Ok(Value::String(String::from_utf8_lossy(key).into_owned())),
+                RedisBinary::Error => Err(FaucetError::Source(format!(
+                    "Redis key '{}' is not valid UTF-8 (set `binary: base64` or `binary: lossy` \
+                     to read binary key names)",
+                    String::from_utf8_lossy(key)
+                ))),
+            },
+        }
+    }
+
     fn text(self, text: &str) -> Value {
         let parse = match self.parse_json {
             RedisJsonParsing::None => false,
@@ -507,14 +526,15 @@ fn stream_keys<'a>(
         let cap = max_records.unwrap_or(usize::MAX);
 
         let mut cursor: u64 = 0;
-        let mut buffer: Vec<String> = Vec::new();
+        let mut buffer: Vec<Vec<u8>> = Vec::new();
         let mut emitted: usize = 0;
         // SCAN may return a key more than once; emit each once (#789 MSG-85).
-        let mut seen: HashSet<String> = HashSet::new();
+        // A 16-byte fingerprint per key bounds the set however long the names.
+        let mut seen: HashSet<u128> = HashSet::new();
         let mut skipped: usize = 0;
 
         'scan: loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            let (next_cursor, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
                 .arg(pattern)
@@ -524,12 +544,12 @@ fn stream_keys<'a>(
                 .await
                 .map_err(|e| FaucetError::Source(format!("SCAN failed with pattern '{pattern}': {e}")))?;
             cursor = next_cursor;
-            buffer.extend(keys.into_iter().filter(|k| seen.insert(k.clone())));
+            buffer.extend(keys.into_iter().filter(|k| seen.insert(key_fingerprint(k))));
 
             // Flush as many full pages as the buffer now holds.
             while emitted < cap && buffer.len() >= chunk_size {
                 let take = chunk_size.min(cap - emitted);
-                let page_keys: Vec<String> = buffer.drain(..take).collect();
+                let page_keys: Vec<Vec<u8>> = buffer.drain(..take).collect();
                 let (records, other) = mget_records(conn, &page_keys, decoding).await?;
                 skipped += other;
                 emitted += records.len();
@@ -544,7 +564,7 @@ fn stream_keys<'a>(
         // Trailing partial page (and the single page in the batch_size==0 case).
         if emitted < cap && !buffer.is_empty() {
             let take = (cap - emitted).min(buffer.len());
-            let page_keys: Vec<String> = buffer.drain(..take).collect();
+            let page_keys: Vec<Vec<u8>> = buffer.drain(..take).collect();
             let (records, other) = mget_records(conn, &page_keys, decoding).await?;
             skipped += other;
             yield StreamPage { records, bookmark: None };
@@ -567,7 +587,7 @@ fn stream_keys<'a>(
 /// MSG-30).
 async fn mget_records(
     conn: &mut ConnectionManager,
-    keys: &[String],
+    keys: &[Vec<u8>],
     decoding: Decoding,
 ) -> Result<(Vec<Value>, usize), FaucetError> {
     let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
@@ -575,7 +595,7 @@ async fn mget_records(
         .query_async(conn)
         .await
         .map_err(|e| FaucetError::Source(format!("MGET failed: {e}")))?;
-    let missing: Vec<&String> = keys
+    let missing: Vec<&Vec<u8>> = keys
         .iter()
         .zip(&values)
         .filter(|(_, v)| v.is_none())
@@ -608,17 +628,31 @@ fn count_non_strings(types: &[String]) -> usize {
 /// records. Missing values (deleted between `SCAN` and `MGET`, or not
 /// strings) are dropped.
 fn collect_kv_records(
-    keys: &[String],
+    keys: &[Vec<u8>],
     values: Vec<Option<Vec<u8>>>,
     decoding: Decoding,
 ) -> Result<Vec<Value>, FaucetError> {
     let mut out = Vec::new();
     for (key, value) in keys.iter().zip(values) {
         if let Some(v) = value {
-            out.push(json!({ "key": key, "value": decoding.value(&v, key)? }));
+            let name = decoding.key_name(key)?;
+            let label = String::from_utf8_lossy(key);
+            out.push(json!({ "key": name, "value": decoding.value(&v, &label)? }));
         }
     }
     Ok(out)
+}
+
+/// A collision-resistant 128-bit fingerprint of a key name for the `SCAN`
+/// de-duplication set.
+fn key_fingerprint(key: &[u8]) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut a);
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    0xa5u8.hash(&mut b);
+    key.hash(&mut b);
+    (u128::from(a.finish()) << 64) | u128::from(b.finish())
 }
 
 /// `true` when a Redis Stream source has a consumer group/consumer configured
@@ -708,8 +742,35 @@ mod tests {
     }
 
     #[test]
+    fn binary_key_names_follow_the_binary_policy() {
+        let key = vec![0xff_u8, b'k'];
+        let mut config = cfg();
+        let out = collect_kv_records(
+            std::slice::from_ref(&key),
+            vec![Some(b"1".to_vec())],
+            Decoding::of(&config),
+        )
+        .unwrap();
+        assert_eq!(out, vec![json!({"key": "/2s=", "value": 1})]);
+        config.binary = RedisBinary::Lossy;
+        let out = collect_kv_records(
+            std::slice::from_ref(&key),
+            vec![Some(b"1".to_vec())],
+            Decoding::of(&config),
+        )
+        .unwrap();
+        assert_eq!(out[0]["key"], json!("\u{fffd}k"));
+        config.binary = RedisBinary::Error;
+        let err = collect_kv_records(&[key], vec![Some(b"1".to_vec())], Decoding::of(&config))
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        assert_ne!(key_fingerprint(b"a"), key_fingerprint(b"b"));
+        assert_eq!(key_fingerprint(b"a"), key_fingerprint(b"a"));
+    }
+
+    #[test]
     fn kv_records_drop_missing_values() {
-        let keys = vec!["a".to_string(), "b".to_string()];
+        let keys = vec![b"a".to_vec(), b"b".to_vec()];
         let out = collect_kv_records(
             &keys,
             vec![Some(b"{\"x\":1}".to_vec()), None],

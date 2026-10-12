@@ -465,13 +465,15 @@ impl XmlStream {
                 // page/offset paging: a short page may just be the server
                 // clamping the requested size (API-15).
                 let more = match &self.config.pagination {
-                    Some(XmlPagination::PageNumber { .. }) => {
+                    Some(XmlPagination::PageNumber { page_size, stop_when_short, .. }) => {
                         page_number = page_number.map(|p| p + 1);
                         record_count > 0
+                            && !short_page(*stop_when_short, record_count, *page_size)
                     }
-                    Some(XmlPagination::Offset { .. }) => {
+                    Some(XmlPagination::Offset { limit, stop_when_short, .. }) => {
                         offset += record_count;
                         record_count > 0
+                            && !short_page(*stop_when_short, record_count, Some(*limit))
                     }
                     Some(XmlPagination::BodyCursor { next_token_path, .. }) => {
                         match crate::decode::xml_extract_text(xml_text.as_bytes(), next_token_path)? {
@@ -518,6 +520,7 @@ impl XmlStream {
                 offset_param,
                 limit_param,
                 limit,
+                ..
             }) => {
                 params.insert(offset_param.clone(), offset.to_string());
                 params.insert(limit_param.clone(), limit.to_string());
@@ -864,9 +867,23 @@ impl faucet_core::Source for XmlStream {
     }
 }
 
+/// Whether an opted-in `stop_when_short` ends paging: the page holds fewer
+/// records than the requested size. Without a known size it never stops.
+fn short_page(stop_when_short: bool, record_count: usize, size: Option<usize>) -> bool {
+    stop_when_short && size.is_some_and(|n| record_count < n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_page_stops_only_when_opted_in_with_a_known_size() {
+        assert!(short_page(true, 2, Some(5)));
+        assert!(!short_page(true, 5, Some(5)));
+        assert!(!short_page(false, 2, Some(5)));
+        assert!(!short_page(true, 2, None));
+    }
     use crate::config::{SoapConfig, SoapVersion};
     use faucet_core::Source;
 

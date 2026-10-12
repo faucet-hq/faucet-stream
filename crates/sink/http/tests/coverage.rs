@@ -364,3 +364,24 @@ async fn a_429_retry_after_is_honoured() {
         .unwrap();
     assert!(started.elapsed() >= std::time::Duration::from_millis(900));
 }
+
+/// A wait above the ceiling fails the write as a sink error (#862 L-121).
+#[tokio::test]
+async fn an_over_ceiling_retry_after_is_a_sink_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "999999"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = HttpSinkConfig::new(url(&server));
+    cfg.max_retries = 3;
+    let err = HttpSink::new(cfg)
+        .write_batch(&[json!({"a": 1})])
+        .await
+        .unwrap_err();
+    match err {
+        FaucetError::Sink(m) => assert!(m.contains("ceiling"), "{m}"),
+        other => panic!("expected a sink error, got {other:?}"),
+    }
+}

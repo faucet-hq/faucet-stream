@@ -42,6 +42,16 @@ pub(crate) fn resolve_start(
     pending: Option<&Bookmark>,
 ) -> Result<StartPosition, FaucetError> {
     if let Some(b) = pending {
+        if matches!(
+            start_from,
+            StartFrom::ResumeToken { .. } | StartFrom::Timestamp { .. }
+        ) {
+            tracing::info!(
+                connector = "mongodb-cdc",
+                "the explicit start_from is ignored because a bookmark exists; reset the row's \
+                 state to start from it"
+            );
+        }
         // A bookmark captured from an invalidate event must resume with
         // `start_after` — `resume_after` on an invalidate token is rejected by
         // MongoDB and would wedge the pipeline (#321 M3).
@@ -335,18 +345,7 @@ impl Source for MongoCdcSource {
     }
 
     fn dataset_uri(&self) -> String {
-        use crate::config::Scope;
-        let base = faucet_core::redact_uri_credentials(&self.config.connection_uri);
-        match &self.config.scope {
-            Scope::Collection {
-                database,
-                collection,
-            } => {
-                format!("{base}/{database}/{collection}")
-            }
-            Scope::Database { database } => format!("{base}/{database}"),
-            Scope::Cluster => base,
-        }
+        dataset_uri_for(&self.config)
     }
 
     async fn check(
@@ -511,12 +510,10 @@ impl MongoCdcSource {
 
             let pending = self.pending_bookmark.lock().await.take();
             let mut start = resolve_start(&self.config.start_from, pending.as_ref())?;
-            let mut anchor = None;
-            if start == StartPosition::Now {
-                let token = self.capture_now_token().await?;
-                anchor = Some(Bookmark::from_token(&token)?.to_value()?);
-                start = StartPosition::ResumeAfter(token);
-            }
+            // A fresh `now` start opens the real stream at the present and
+            // anchors at its initial post-batch token; a separate capture
+            // stream could consume the first event (#862 L-070).
+            let anchor_now = start == StartPosition::Now;
             if start == StartPosition::Earliest {
                 start = StartPosition::AtOperationTime(self.oldest_oplog_time().await);
             }
@@ -599,8 +596,11 @@ impl MongoCdcSource {
                 }
             };
             let mut change_stream = change_stream;
-            if anchor.is_some() {
-                yield StreamPage { records: Vec::new(), bookmark: anchor };
+            if let Some(tok) = change_stream.resume_token().filter(|_| anchor_now) {
+                yield StreamPage {
+                    records: Vec::new(),
+                    bookmark: Some(Bookmark::from_token(&tok)?.to_value()?),
+                };
             }
 
             let chunk = if per_batch { batch_size } else { usize::MAX };
@@ -612,6 +612,10 @@ impl MongoCdcSource {
             // until that transaction's events are all buffered, so a reader
             // never sees half of a source transaction (#789 MSG-92).
             let mut buffered_txn: Option<(String, i64)> = None;
+            // Where the buffered transaction began in `buffer`, and the
+            // bookmark before it: a cycle that ends abruptly flushes only what
+            // precedes it (#862 L-062).
+            let mut open_txn: Option<(usize, Option<Value>)> = None;
             let mut last_event_at = std::time::Instant::now();
             // A getMore waits at most `max_await` server-side; the client-side
             // bound only guards a dead connection.
@@ -629,11 +633,8 @@ impl MongoCdcSource {
                         connector = "mongodb-cdc",
                         "the server closed the change stream; ending the fetch cycle"
                     );
-                    if !buffer.is_empty() {
-                        yield StreamPage {
-                            records: std::mem::take(&mut buffer),
-                            bookmark: last_bookmark.take(),
-                        };
+                    if let Some(page) = complete_prefix(&mut buffer, last_bookmark.take(), open_txn.take()) {
+                        yield page;
                     }
                     break;
                 }
@@ -645,10 +646,16 @@ impl MongoCdcSource {
                         }
                         let txn = txn_key(event.lsid.as_ref(), event.txn_number);
                         if per_batch && buffer.len() >= chunk && txn != buffered_txn {
+                            open_txn = None;
                             yield StreamPage {
                                 records: std::mem::take(&mut buffer),
                                 bookmark: last_bookmark.take(),
                             };
+                        }
+                        if txn.is_none() {
+                            open_txn = None;
+                        } else if txn != buffered_txn {
+                            open_txn = Some((buffer.len(), last_bookmark.clone()));
                         }
                         let bookmark = Bookmark::from_token(&event.id)?;
                         let is_invalidate = matches!(
@@ -682,6 +689,7 @@ impl MongoCdcSource {
                             break;
                         }
                         if per_batch && buffer.len() >= chunk && buffered_txn.is_none() {
+                            open_txn = None;
                             yield StreamPage {
                                 records: std::mem::take(&mut buffer),
                                 bookmark: last_bookmark.take(),
@@ -697,6 +705,7 @@ impl MongoCdcSource {
                             // A held-back page's transaction is complete.
                             if per_batch && buffer.len() >= chunk {
                                 buffered_txn = None;
+                                open_txn = None;
                                 yield StreamPage {
                                     records: std::mem::take(&mut buffer),
                                     bookmark: last_bookmark.take(),
@@ -725,11 +734,8 @@ impl MongoCdcSource {
                     // what was read with its own bookmark. The driver's resume
                     // token must not be read here — the poll is mid-flight.
                     Err(_) => {
-                        if !buffer.is_empty() {
-                            yield StreamPage {
-                                records: std::mem::take(&mut buffer),
-                                bookmark: last_bookmark.take(),
-                            };
+                        if let Some(page) = complete_prefix(&mut buffer, last_bookmark.take(), open_txn.take()) {
+                            yield page;
                         }
                         break;
                     }
@@ -745,29 +751,30 @@ impl MongoCdcSource {
     /// oplog has rolled over (#789 MSG-74). Without read access to
     /// `local.oplog.rs` it falls back to `{1, 1}` with a warning.
     async fn oldest_oplog_time(&self) -> Timestamp {
-        let found = self
+        let sharded = self
             .client
-            .database("local")
-            .collection::<Document>("oplog.rs")
-            .find_one(Document::new())
-            .sort(bson::doc! { "$natural": 1 })
-            .projection(bson::doc! { "ts": 1 })
-            .await;
-        match found {
-            Ok(Some(doc)) => match doc.get_timestamp("ts") {
-                Ok(ts) => ts,
-                Err(_) => EARLIEST_FALLBACK,
-            },
-            Ok(None) => EARLIEST_FALLBACK,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "mongodb-cdc: start_from: earliest could not read the oldest oplog entry; \
-                     starting at the beginning of time, which fails once the oplog has rolled"
-                );
-                EARLIEST_FALLBACK
-            }
+            .database("admin")
+            .run_command(bson::doc! { "hello": 1 })
+            .await
+            .ok()
+            .is_some_and(|hello| hello.get_str("msg") == Ok("isdbgrid"));
+        let found = if sharded {
+            Ok(None)
+        } else {
+            self.client
+                .database("local")
+                .collection::<Document>("oplog.rs")
+                .find_one(Document::new())
+                .sort(bson::doc! { "$natural": 1 })
+                .projection(bson::doc! { "ts": 1 })
+                .await
+                .map_err(|e| e.to_string())
+        };
+        let (ts, warning) = earliest_from(found, sharded);
+        if let Some(warning) = warning {
+            tracing::warn!(connector = "mongodb-cdc", "{warning}");
         }
+        ts
     }
 
     /// Open a change stream at "now", read its `postBatchResumeToken` without
@@ -852,6 +859,68 @@ fn token_le(a: &Value, b: &Value) -> Option<bool> {
             .map(str::to_ascii_uppercase)
     };
     Some(data(a)? <= data(b)?)
+}
+
+/// The dataset URI for a config: the host-only connection base (no
+/// credentials, path or options) followed by the scope's database/collection.
+fn dataset_uri_for(config: &MongoCdcSourceConfig) -> String {
+    use crate::config::Scope;
+    let base = faucet_core::redacted_uri_authority(&config.connection_uri);
+    match &config.scope {
+        Scope::Collection {
+            database,
+            collection,
+        } => format!("{base}/{database}/{collection}"),
+        Scope::Database { database } => format!("{base}/{database}"),
+        Scope::Cluster => base,
+    }
+}
+
+/// Where `start_from: earliest` opens given the oldest-oplog lookup, and the
+/// warning to log when it has to fall back to the beginning of time.
+fn earliest_from(
+    found: Result<Option<Document>, String>,
+    sharded: bool,
+) -> (Timestamp, Option<String>) {
+    const TAIL: &str = "starting at the beginning of time, which fails once the oplog has rolled";
+    let reason = match found {
+        Ok(Some(doc)) => match doc.get_timestamp("ts") {
+            Ok(ts) => return (ts, None),
+            Err(_) => "the oldest oplog entry has no timestamp `ts`".to_string(),
+        },
+        Ok(None) if sharded => "through mongos each shard keeps its own oplog, so `earliest` \
+                                cannot be resolved on a sharded cluster"
+            .to_string(),
+        Ok(None) => "the oplog is empty".to_string(),
+        Err(e) => format!("could not read the oldest oplog entry ({e})"),
+    };
+    (
+        EARLIEST_FALLBACK,
+        Some(format!(
+            "mongodb-cdc: start_from: earliest — {reason}; {TAIL}"
+        )),
+    )
+}
+
+/// The page to flush when a cycle ends before the buffered transaction is
+/// known to be complete: everything before that transaction with the bookmark
+/// preceding it. The transaction's own events are left for the next run.
+fn complete_prefix(
+    buffer: &mut Vec<Value>,
+    last_bookmark: Option<Value>,
+    open_txn: Option<(usize, Option<Value>)>,
+) -> Option<StreamPage> {
+    let bookmark = match open_txn {
+        Some((start, before)) => {
+            buffer.truncate(start);
+            before
+        }
+        None => last_bookmark,
+    };
+    (!buffer.is_empty()).then(|| StreamPage {
+        records: std::mem::take(buffer),
+        bookmark,
+    })
 }
 
 #[cfg(test)]
@@ -1188,42 +1257,69 @@ mod tests {
     // MongoDB async constructor, so we verify the logic directly using config
     // deserialization (which is sync).
     #[test]
+    fn an_abrupt_end_flushes_only_what_precedes_the_open_transaction() {
+        let mut buffer = vec![json!(1), json!(2), json!(3)];
+        let page =
+            complete_prefix(&mut buffer, Some(json!("b3")), Some((1, Some(json!("b1"))))).unwrap();
+        assert_eq!(page.records, vec![json!(1)]);
+        assert_eq!(page.bookmark, Some(json!("b1")));
+        assert!(buffer.is_empty());
+
+        let mut buffer = vec![json!(1)];
+        assert!(complete_prefix(&mut buffer, Some(json!("b1")), Some((0, None))).is_none());
+
+        let mut buffer = vec![json!(1), json!(2)];
+        let page = complete_prefix(&mut buffer, Some(json!("b2")), None).unwrap();
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(page.bookmark, Some(json!("b2")));
+
+        assert!(complete_prefix(&mut Vec::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn earliest_falls_back_with_a_warning_for_each_reason() {
+        let ts = Timestamp {
+            time: 7,
+            increment: 2,
+        };
+        assert_eq!(
+            earliest_from(Ok(Some(bson::doc! { "ts": ts })), false),
+            (ts, None)
+        );
+        for (found, sharded, reason) in [
+            (Ok(Some(bson::doc! { "ts": 1 })), false, "has no timestamp"),
+            (Ok(None), true, "sharded cluster"),
+            (Ok(None), false, "oplog is empty"),
+            (Err("denied".to_string()), false, "(denied)"),
+        ] {
+            let (got, warning) = earliest_from(found, sharded);
+            assert_eq!(got, EARLIEST_FALLBACK);
+            let warning = warning.unwrap();
+            assert!(warning.contains(reason), "{warning}");
+        }
+    }
+
+    #[test]
     fn dataset_uri_cluster_scope() {
         let c: MongoCdcSourceConfig = serde_json::from_value(json!({
             "connection_uri": "mongodb://u:p@h:27017/?replicaSet=rs0",
             "scope": { "type": "cluster" }
         }))
         .unwrap();
-        use crate::config::Scope;
-        let base = faucet_core::redact_uri_credentials(&c.connection_uri);
-        let uri = match &c.scope {
-            Scope::Collection {
-                database,
-                collection,
-            } => format!("{base}/{database}/{collection}"),
-            Scope::Database { database } => format!("{base}/{database}"),
-            Scope::Cluster => base,
-        };
-        assert_eq!(uri, "mongodb://h:27017/?replicaSet=rs0");
+        assert_eq!(dataset_uri_for(&c), "mongodb://h:27017");
     }
 
     #[test]
-    fn dataset_uri_collection_scope() {
-        let c: MongoCdcSourceConfig = serde_json::from_value(json!({
-            "connection_uri": "mongodb://u:p@h:27017/?replicaSet=rs0",
+    fn dataset_uri_collection_and_database_scope() {
+        let mut c: MongoCdcSourceConfig = serde_json::from_value(json!({
+            "connection_uri": "mongodb://u:p@h:27017/admin?replicaSet=rs0",
             "scope": { "type": "collection", "database": "mydb", "collection": "orders" }
         }))
         .unwrap();
-        use crate::config::Scope;
-        let base = faucet_core::redact_uri_credentials(&c.connection_uri);
-        let uri = match &c.scope {
-            Scope::Collection {
-                database,
-                collection,
-            } => format!("{base}/{database}/{collection}"),
-            Scope::Database { database } => format!("{base}/{database}"),
-            Scope::Cluster => base,
+        assert_eq!(dataset_uri_for(&c), "mongodb://h:27017/mydb/orders");
+        c.scope = crate::config::Scope::Database {
+            database: "mydb".into(),
         };
-        assert_eq!(uri, "mongodb://h:27017/?replicaSet=rs0/mydb/orders");
+        assert_eq!(dataset_uri_for(&c), "mongodb://h:27017/mydb");
     }
 }

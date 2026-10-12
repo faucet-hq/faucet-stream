@@ -119,21 +119,42 @@ pub enum DecodeStep {
 pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>, FaucetError> {
     let body = body.to_vec();
     let owned_steps = steps.to_vec();
-    // Base64 / gunzip / unzip are CPU-bound and can be large: run them off the
-    // async runtime (API-42).
-    let (buf, parse) = tokio::task::spawn_blocking(move || decode_bytes(body, &owned_steps))
-        .await
-        .map_err(|e| FaucetError::Source(format!("decode: worker failed: {e}")))??;
-    // No explicit `parse` → default to JSON.
-    let parse = parse.unwrap_or(ParseSpec {
-        format: ParseFormat::Json,
-        records_path: None,
-        delimiter: None,
-        has_headers: true,
-        sheet: None,
-        header_row: 0,
-    });
-    parse_records(&buf, &parse).await
+    // The byte steps and every synchronous parse (json / xml / xlsx, up to
+    // 1 GiB) are CPU-bound: run them off the async runtime (API-42). Only the
+    // async csv reader stays on it.
+    let decoded = tokio::task::spawn_blocking(move || -> Result<Decoded, FaucetError> {
+        let (buf, parse) = decode_bytes(body, &owned_steps)?;
+        // No explicit `parse` → default to JSON.
+        let parse = parse.unwrap_or(ParseSpec {
+            format: ParseFormat::Json,
+            records_path: None,
+            delimiter: None,
+            has_headers: true,
+            sheet: None,
+            header_row: 0,
+        });
+        match parse.format {
+            ParseFormat::Csv => Ok(Decoded::Csv(buf, parse)),
+            _ => parse_records_sync(&buf, &parse).map(Decoded::Records),
+        }
+    })
+    .await
+    .map_err(|e| FaucetError::Source(format!("decode: worker failed: {e}")))??;
+    match decoded {
+        Decoded::Records(records) => Ok(records),
+        Decoded::Csv(buf, parse) => {
+            crate::format::parse_csv(&buf, parse.delimiter.unwrap_or(b','), parse.has_headers)
+                .await
+                .map_err(|e| FaucetError::Source(format!("decode `parse` csv: {e}")))
+        }
+    }
+}
+
+/// What the blocking decode worker hands back: parsed records, or the bytes
+/// the async csv reader still has to parse.
+enum Decoded {
+    Records(Vec<Value>),
+    Csv(Vec<u8>, ParseSpec),
 }
 
 /// Largest buffer a decompression step may produce (1 GiB); a bigger member
@@ -347,17 +368,13 @@ fn unzip_member(bytes: &[u8], member: Option<&str>) -> Result<Vec<u8>, FaucetErr
     read_capped(f, MAX_DECODED_BYTES, "unzip")
 }
 
-async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, FaucetError> {
+/// Parse a decoded buffer into records for every synchronous format.
+fn parse_records_sync(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, FaucetError> {
     match spec.format {
         ParseFormat::Json => {
             let v: Value = serde_json::from_slice(bytes)
                 .map_err(|e| FaucetError::Source(format!("decode `parse` json: {e}")))?;
             records_from_value(v, spec.records_path.as_deref())
-        }
-        ParseFormat::Csv => {
-            crate::format::parse_csv(bytes, spec.delimiter.unwrap_or(b','), spec.has_headers)
-                .await
-                .map_err(|e| FaucetError::Source(format!("decode `parse` csv: {e}")))
         }
         ParseFormat::Xlsx => {
             crate::format::parse_excel(bytes, spec.sheet.as_deref(), spec.header_row)
@@ -367,6 +384,9 @@ async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, Fau
             let v = xml_to_json(bytes)?;
             records_from_value(v, spec.records_path.as_deref())
         }
+        ParseFormat::Csv => Err(FaucetError::Source(
+            "decode `parse` csv is parsed by the async reader".into(),
+        )),
     }
 }
 
@@ -506,6 +526,19 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn csv_is_left_to_the_async_reader() {
+        let spec = ParseSpec {
+            format: ParseFormat::Csv,
+            records_path: None,
+            delimiter: None,
+            has_headers: true,
+            sheet: None,
+            header_row: 0,
+        };
+        assert!(parse_records_sync(b"a\n1\n", &spec).is_err());
+    }
 
     #[test]
     fn a_truncated_xml_body_fails_to_parse() {

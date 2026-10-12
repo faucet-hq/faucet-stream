@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use faucet_common_singer::{Redactor, SingerMessage, parse_line, write_private_json};
 use faucet_core::{FaucetError, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -116,6 +116,12 @@ impl TargetProcess {
                         // bounded chunks rather than buffer it whole (API-44),
                         // and keep draining so the target never blocks.
                         tracing::warn!(target: "faucet_sink_singer::target", "skipping a stdout line longer than {max_line} bytes");
+                        if faucet_common_singer::skip_line_rest(&mut reader)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                         continue;
                     }
                     _ => break,
@@ -138,8 +144,13 @@ impl TargetProcess {
             let tail = Arc::clone(&stderr_tail);
             let redactor = redactor.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                while let Ok(Some(line)) = faucet_common_singer::read_log_line(
+                    &mut reader,
+                    faucet_common_singer::MAX_LOG_LINE_BYTES,
+                )
+                .await
+                {
                     let redacted = faucet_core::redact::redact(&redactor.redact(&line));
                     tracing::debug!(target: "faucet_sink_singer::target", "{redacted}");
                     let mut tail = tail.lock().unwrap();

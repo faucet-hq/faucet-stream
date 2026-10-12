@@ -78,7 +78,7 @@ impl WebhookSource {
     /// ones are answered `503` + `Retry-After`), let in-flight requests finish,
     /// and return what was stored (API-14).
     async fn receive(&self, path: &str) -> Result<Vec<Value>, FaucetError> {
-        crate::config::validate_path(path)?;
+        crate::config::validate_resolved_path(path)?;
         let state = self.new_state();
         let app = self.build_router(path, Arc::clone(&state));
 
@@ -371,8 +371,8 @@ impl faucet_core::Source for WebhookSource {
                 )
             })
             .collect();
+        self.config.validate_settings()?;
         let resolved_path = faucet_core::util::substitute_context(&self.config.path, &encoded);
-        self.config.validate()?;
         self.receive(&resolved_path).await
     }
 
@@ -422,6 +422,50 @@ impl faucet_core::Source for WebhookSource {
 
 #[cfg(test)]
 mod tests {
+    fn state(max_payloads: Option<usize>, closed: bool) -> std::sync::Arc<super::AppState> {
+        std::sync::Arc::new(super::AppState {
+            inbox: tokio::sync::Mutex::new(super::Inbox {
+                records: Vec::new(),
+                closed,
+            }),
+            max_payloads,
+            done: tokio::sync::Notify::new(),
+            auth_token: None,
+            signature: None,
+        })
+    }
+
+    async fn send_payload(state: std::sync::Arc<super::AppState>) -> axum::response::Response {
+        super::webhook_handler(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"{\"a\":1}"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_closed_window_refuses_with_retry_after() {
+        let closed = state(None, true);
+        let resp = send_payload(closed.clone()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "60");
+        assert!(closed.inbox.lock().await.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_inbox_refuses_while_the_window_is_open() {
+        let open = state(Some(1), false);
+        assert_eq!(
+            send_payload(open.clone()).await.status(),
+            axum::http::StatusCode::OK
+        );
+        let resp = send_payload(open.clone()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "60");
+        assert_eq!(open.inbox.lock().await.records.len(), 1);
+    }
+
     #[tokio::test]
     async fn server_results_map_io_and_task_failures() {
         assert!(super::server_result(Ok(Ok(()))).is_ok());

@@ -214,7 +214,8 @@ async fn instance_metadata_methods() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dataset_uri_database_and_cluster_scopes() {
     let (_container, uri) = start_repl_set().await;
-    let base = faucet_core::redact_uri_credentials(&uri);
+    let base = faucet_core::redacted_uri_authority(&uri);
+    assert!(!base.contains('?') && !base.ends_with('/'), "{base}");
 
     // Database scope → base/<db>; state key is mongodb-cdc:db:<db>.
     let db_cfg: MongoCdcSourceConfig = serde_json::from_value(json!({

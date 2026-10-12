@@ -188,6 +188,38 @@ mod docker {
         );
     }
 
+    /// #862 L-153: `on_decode_error: skip` drops an undecodable payload and
+    /// keeps reading instead of failing the run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skip_drops_an_undecodable_payload() {
+        let (_container, server) = start_nats().await;
+        let mut cfg = NatsSourceConfig::new("bin.skip");
+        cfg.connection.servers = vec![server.clone()];
+        cfg.max_messages = Some(1);
+        cfg.idle_timeout_secs = Some(10);
+        cfg.on_decode_error = faucet_source_nats::NatsOnDecodeError::Skip;
+        let source = NatsSource::new(cfg).await.expect("source new");
+        let publisher = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let client = async_nats::connect(&server).await.expect("connect");
+            for payload in [vec![0xff_u8, 0xfe], br#"{"ok":1}"#.to_vec()] {
+                client
+                    .publish("bin.skip".to_string(), payload.into())
+                    .await
+                    .expect("publish");
+            }
+            client.flush().await.expect("flush");
+        });
+        let ctx = std::collections::HashMap::new();
+        let mut stream = source.stream_pages(&ctx, 10);
+        let mut out = Vec::new();
+        while let Some(page) = stream.next().await {
+            out.extend(page.expect("page").records);
+        }
+        publisher.await.expect("publisher");
+        assert_eq!(out, vec![serde_json::json!({"ok": 1})]);
+    }
+
     async fn start_jetstream() -> (testcontainers::ContainerAsync<Nats>, String) {
         use testcontainers::ImageExt;
         use testcontainers_modules::nats::NatsServerCmd;

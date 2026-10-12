@@ -94,6 +94,64 @@ impl StateStore for PrivateFileStore {
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         self.reader.delete(key).await
     }
+
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    /// Atomic across processes sharing the directory: the read-compare-write
+    /// runs under an exclusive OS lock on `<entry>.lock` (the lock file
+    /// [`FileStateStore`] uses), released by the OS if the writer dies.
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        faucet_core::state::validate_state_key(key)?;
+        self.ensure_root().await?;
+        let mut lock = self.entry_path(key).into_os_string();
+        lock.push(".lock");
+        let _held = lock_exclusive(PathBuf::from(lock)).await?;
+        if self.get(key).await?.as_ref() != expected {
+            return Ok(false);
+        }
+        self.put(key, value).await?;
+        Ok(true)
+    }
+}
+
+/// How long a writer waits for another process's rotation to finish.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hold an exclusive OS lock on `path` until the returned file is dropped.
+async fn lock_exclusive(path: PathBuf) -> Result<std::fs::File, FaucetError> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let file = opts
+        .open(&path)
+        .await
+        .map_err(|e| io_error("create", &path, e))?
+        .into_std()
+        .await;
+    let started = tokio::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(FaucetError::State(format!(
+                    "'{}' is held by another writer",
+                    path.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(io_error("lock", &path, e)),
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -157,6 +215,57 @@ mod tests {
 mod key_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn compare_and_put_lets_exactly_one_concurrent_rotation_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(PrivateFileStore::new(dir.path().join("auth")));
+        assert!(store.supports_compare_and_put());
+        store.put("grant", &json!({"rt": "old"})).await.unwrap();
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .compare_and_put("grant", Some(&json!({"rt": "old"})), &json!({"rt": i}))
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut won = 0;
+        for t in tasks {
+            won += usize::from(t.await.unwrap());
+        }
+        assert_eq!(won, 1);
+        assert!(
+            !store
+                .compare_and_put("grant", None, &json!({"rt": "x"}))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_put("fresh", None, &json!({"rt": "new"}))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_put("bad key", None, &json!(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_that_cannot_be_created_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = lock_exclusive(dir.path().join("missing").join("x.lock"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot create"), "{err}");
+    }
 
     #[tokio::test]
     async fn uppercase_and_long_keys_round_trip() {
