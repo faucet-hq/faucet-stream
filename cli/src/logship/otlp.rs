@@ -210,12 +210,24 @@ impl OtlpLogExporter {
     }
 
     /// Export `lines` (one run's batch). `Ok` means the collector acknowledged
-    /// it; the number of records it rejected outright is returned.
+    /// it; the number of records it rejected outright is returned. The error
+    /// is the sanitized message ([`ExportError::message`]).
     pub async fn export(
         &self,
         run_attrs: &BTreeMap<String, String>,
         lines: &[ShipLine],
     ) -> Result<u64, String> {
+        self.export_classified(run_attrs, lines)
+            .await
+            .map_err(|e| e.message)
+    }
+
+    /// [`export`](Self::export), with the failure classified.
+    pub async fn export_classified(
+        &self,
+        run_attrs: &BTreeMap<String, String>,
+        lines: &[ShipLine],
+    ) -> Result<u64, ExportError> {
         if lines.is_empty() {
             return Ok(0);
         }
@@ -236,8 +248,10 @@ impl OtlpLogExporter {
                 client
                     .export(request)
                     .await
-                    .map_err(|s| {
-                        format!("OTLP gRPC export failed: {} ({})", s.message(), s.code())
+                    .map_err(|s| ExportError {
+                        payload_rejected: s.code() == tonic_otlp::Code::InvalidArgument,
+                        message: format!("OTLP gRPC export failed: {}", s.code()),
+                        detail: format!("OTLP gRPC export failed: {} ({})", s.message(), s.code()),
                     })?
                     .into_inner()
             }
@@ -249,17 +263,22 @@ impl OtlpLogExporter {
                 for (k, v) in &self.headers {
                     rb = rb.header(k.as_str(), v.as_str());
                 }
-                let r = rb
-                    .send()
-                    .await
-                    .map_err(|e| format!("OTLP HTTP export to {url} failed: {e}"))?;
+                let r = rb.send().await.map_err(|e| ExportError {
+                    payload_rejected: false,
+                    message: format!("OTLP HTTP export failed: {}", transport_failure(&e)),
+                    detail: format!("OTLP HTTP export to {url} failed: {e}"),
+                })?;
                 let status = r.status();
                 let body = r.bytes().await.unwrap_or_default();
                 if !status.is_success() {
-                    return Err(format!(
-                        "OTLP HTTP export to {url} returned {status}: {}",
-                        String::from_utf8_lossy(&body[..body.len().min(256)])
-                    ));
+                    return Err(ExportError {
+                        payload_rejected: payload_rejected_status(status.as_u16()),
+                        message: format!("OTLP HTTP export returned {status}"),
+                        detail: format!(
+                            "OTLP HTTP export to {url} returned {status}: {}",
+                            String::from_utf8_lossy(&body[..body.len().min(256)])
+                        ),
+                    });
                 }
                 ExportLogsServiceResponse::decode(body.as_ref()).unwrap_or_default()
             }
@@ -272,6 +291,59 @@ impl OtlpLogExporter {
             crate::logship::metrics::export_error();
         }
         Ok(rejected)
+    }
+
+    /// Export `lines`, isolating a line the collector rejects as malformed:
+    /// a rejected batch is split in halves and retried, down to the single
+    /// line, which is dropped (so one poisoned line never blocks the run).
+    /// Any other failure stops at the first line it could not deliver.
+    pub async fn export_isolating(
+        &self,
+        run_attrs: &BTreeMap<String, String>,
+        lines: &[ShipLine],
+    ) -> ExportOutcome {
+        let mut out = ExportOutcome::default();
+        let mut stack: Vec<&[ShipLine]> = vec![lines];
+        while let Some(part) = stack.pop() {
+            if part.is_empty() {
+                continue;
+            }
+            match self.export_classified(run_attrs, part).await {
+                Ok(_) => out.handled += part.len(),
+                Err(e) if e.payload_rejected && part.len() > 1 => {
+                    let (a, b) = part.split_at(part.len() / 2);
+                    stack.push(b);
+                    stack.push(a);
+                }
+                Err(e) if e.payload_rejected => {
+                    out.handled += 1;
+                    out.dropped += 1;
+                }
+                Err(e) => {
+                    out.error = Some(e);
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+pub use super::{ExportError, ExportOutcome};
+
+/// An HTTP status the collector answers when the payload itself is bad.
+fn payload_rejected_status(status: u16) -> bool {
+    matches!(status, 400 | 413 | 422)
+}
+
+/// A transport failure, without the URL `reqwest` puts in its message.
+fn transport_failure(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "could not connect"
+    } else {
+        "request error"
     }
 }
 
@@ -402,6 +474,105 @@ mod tests {
             ..Default::default()
         };
         assert!(OtlpLogExporter::new(&grpc).is_err());
+    }
+
+    #[test]
+    fn only_a_malformed_payload_is_classified_as_rejected() {
+        for st in [400, 413, 422] {
+            assert!(payload_rejected_status(st), "{st}");
+        }
+        for st in [401, 403, 404, 408, 429, 500, 503] {
+            assert!(!payload_rejected_status(st), "{st}");
+        }
+    }
+
+    /// A collector that answers 400 to any batch containing `line 3`.
+    async fn picky_collector() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(h) = text.find("\r\n\r\n") {
+                            let len = text[..h]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= h + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let poisoned = buf.windows(6).any(|w| w == b"line 3");
+                    let resp: &[u8] = if poisoned {
+                        b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 7\r\n\r\nbad req"
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                    };
+                    let _ = sock.write_all(resp).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_rejected_line_is_isolated_and_dropped_and_the_rest_delivered() {
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint: picky_collector().await,
+            protocol: OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let lines: Vec<ShipLine> = (1..=5).map(|i| line(i, &[])).collect();
+        let e = ex
+            .export_classified(&BTreeMap::new(), &lines)
+            .await
+            .unwrap_err();
+        assert!(e.payload_rejected);
+        assert_eq!(e.message, "OTLP HTTP export returned 400 Bad Request");
+        assert!(e.detail.contains("bad req"));
+        let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
+        assert_eq!((out.handled, out.dropped), (5, 1));
+        assert!(out.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dead_collector_error_names_neither_the_url_nor_a_body() {
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint: "http://127.0.0.1:1/secret-path".into(),
+            protocol: OtelProtocol::Http,
+            timeout_secs: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let e = ex
+            .export_classified(&BTreeMap::new(), &[line(1, &[])])
+            .await
+            .unwrap_err();
+        assert!(!e.payload_rejected);
+        assert!(!e.message.contains("secret-path"), "{}", e.message);
+        assert!(e.detail.contains("secret-path"), "{}", e.detail);
+        let out = ex
+            .export_isolating(&BTreeMap::new(), &[line(1, &[]), line(2, &[])])
+            .await;
+        assert_eq!((out.handled, out.dropped), (0, 0));
+        assert!(out.error.is_some());
     }
 
     #[tokio::test]

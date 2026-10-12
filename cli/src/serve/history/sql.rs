@@ -26,6 +26,13 @@ use std::time::Duration;
 /// its columns.
 pub const SCHEMA_VERSION: u32 = 6;
 
+/// The oldest binary schema version that can still read a database this
+/// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
+/// Raised only by a migration an older binary cannot read past (a column
+/// rename, a changed body shape) — never by an additive one — so a release
+/// can be rolled back onto a database a newer one already migrated.
+pub const MIN_READABLE_SCHEMA: u32 = 6;
+
 /// Columns added to a table after it first shipped, with the schema version
 /// that added them. `CREATE TABLE IF NOT EXISTS` never alters an existing
 /// table, so the connect-time migration adds each missing one with `ALTER TABLE`.
@@ -124,6 +131,13 @@ pub fn newer_schema_error(found: u32) -> HistoryError {
     ))
 }
 
+/// Whether a database stamped newer than this binary can still be read by it:
+/// it records a `min_readable` version this binary meets. A newer database
+/// without that row is refused.
+pub fn readable_by_this_binary(min_readable: Option<u32>) -> bool {
+    min_readable.is_some_and(|m| m <= SCHEMA_VERSION)
+}
+
 /// Bring a database up to [`SCHEMA_VERSION`]: create every table, add the
 /// columns later versions introduced, backfill the tenant columns from each
 /// row's body, create their indexes and stamp the version. Idempotent and
@@ -133,7 +147,7 @@ macro_rules! migrate {
     ($pool:expr) => {{
         use sqlx::Row as _;
         use $crate::serve::history::sql::{
-            ADDED_COLUMNS, DDL, POST_MIGRATION_DDL, SCHEMA_VERSION,
+            ADDED_COLUMNS, DDL, MIN_READABLE_SCHEMA, POST_MIGRATION_DDL, SCHEMA_VERSION,
             classify_backend_error_with_context as ctx,
         };
         async {
@@ -153,7 +167,17 @@ macro_rules! migrate {
                     .map_err(|e| ctx("reading the run-history schema version", e))?;
             let found: u32 = found.and_then(|v| v.parse().ok()).unwrap_or(0);
             if found > SCHEMA_VERSION {
-                return Err($crate::serve::history::sql::newer_schema_error(found));
+                let readable: Option<u32> = sqlx::query(
+                    "SELECT version FROM faucet_serve_schema WHERE id='min_readable'",
+                )
+                .fetch_optional($pool)
+                .await
+                .map_err(|e| ctx("reading the run-history schema version", e))?
+                .and_then(|r| r.try_get::<String, _>("version").ok())
+                .and_then(|v| v.parse().ok());
+                if !$crate::serve::history::sql::readable_by_this_binary(readable) {
+                    return Err($crate::serve::history::sql::newer_schema_error(found));
+                }
             }
             for (_, table, column) in ADDED_COLUMNS {
                 let probe = format!("SELECT {column} FROM {table} WHERE 1=0");
@@ -223,13 +247,19 @@ macro_rules! migrate {
                     .await
                     .map_err(|e| ctx("creating run-history schema", e))?;
             }
-            if found < SCHEMA_VERSION {
+            // Both stamps only ever rise, so an older binary racing a newer
+            // one cannot lower them.
+            for (id, version) in [("schema", SCHEMA_VERSION), ("min_readable", MIN_READABLE_SCHEMA)] {
                 sqlx::query(&format!(
-                    "INSERT INTO faucet_serve_schema (id, version) VALUES ('schema', {}) \
-                     ON CONFLICT (id) DO UPDATE SET version=excluded.version",
-                    $crate::serve::history::sql::bind_mark(&*$pool, 1)
+                    "INSERT INTO faucet_serve_schema (id, version) VALUES ({}, {}) \
+                     ON CONFLICT (id) DO UPDATE SET version = CASE \
+                     WHEN CAST(faucet_serve_schema.version AS INTEGER) < CAST(excluded.version AS INTEGER) \
+                     THEN excluded.version ELSE faucet_serve_schema.version END",
+                    $crate::serve::history::sql::bind_mark(&*$pool, 1),
+                    $crate::serve::history::sql::bind_mark(&*$pool, 2)
                 ))
-                .bind(SCHEMA_VERSION.to_string())
+                .bind(id)
+                .bind(version.to_string())
                 .execute($pool)
                 .await
                 .map_err(|e| ctx("stamping the run-history schema version", e))?;
@@ -816,6 +846,7 @@ pub struct Stmts {
     pub change_upsert: String,
     pub change_select: String,
     pub change_transition: String,
+    pub change_transition_from: String,
     pub change_delete: String,
     pub usage_delete_run: String,
     pub usage_delete_tenant: String,
@@ -1419,7 +1450,8 @@ impl Stmts {
             log_ship_ack: "UPDATE faucet_serve_log_ship SET delivered_seq = $1, \
                 delivered_at = $2, last_attempt_at = $3, last_error = NULL, \
                 failing_since = NULL, notified = REPLACE(COALESCE(notified, ''), 'f', '') \
-                WHERE run_id = $4 AND owner = $5"
+                WHERE run_id = $4 AND owner = $5 \
+                AND (delivered_seq IS NULL OR delivered_seq < $6)"
                 .into(),
             log_ship_fail: "UPDATE faucet_serve_log_ship SET last_error = $1, \
                 last_attempt_at = $2, failing_since = COALESCE(failing_since, $3) \
@@ -1484,6 +1516,9 @@ impl Stmts {
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
             change_transition: "UPDATE faucet_serve_changes SET status=$1, expires_at=$2, \
                 body=$3 WHERE id=$4 AND status=$5"
+                .into(),
+            change_transition_from: "UPDATE faucet_serve_changes SET status=$1, expires_at=$2, \
+                body=$3 WHERE id=$4 AND status=$5 AND body=$6"
                 .into(),
             change_delete: "DELETE FROM faucet_serve_changes WHERE id=$1".into(),
             usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=$1".into(),
@@ -1963,7 +1998,8 @@ impl Stmts {
             log_ship_ack: "UPDATE faucet_serve_log_ship SET delivered_seq = ?, \
                 delivered_at = ?, last_attempt_at = ?, last_error = NULL, \
                 failing_since = NULL, notified = REPLACE(COALESCE(notified, ''), 'f', '') \
-                WHERE run_id = ? AND owner = ?"
+                WHERE run_id = ? AND owner = ? \
+                AND (delivered_seq IS NULL OR delivered_seq < ?)"
                 .into(),
             log_ship_fail: "UPDATE faucet_serve_log_ship SET last_error = ?, \
                 last_attempt_at = ?, failing_since = COALESCE(failing_since, ?) \
@@ -2028,6 +2064,9 @@ impl Stmts {
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
             change_transition: "UPDATE faucet_serve_changes SET status=?, expires_at=?, \
                 body=? WHERE id=? AND status=?"
+                .into(),
+            change_transition_from: "UPDATE faucet_serve_changes SET status=?, expires_at=?, \
+                body=? WHERE id=? AND status=? AND body=?"
                 .into(),
             change_delete: "DELETE FROM faucet_serve_changes WHERE id=?".into(),
             usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=?".into(),
@@ -4065,6 +4104,7 @@ macro_rules! impl_sql_history {
                     .bind(&now)
                     .bind(run_id)
                     .bind(&self.instance_id)
+                    .bind(sql::pad_seq(delivered_seq))
                     .execute(&self.pool)
                     .await
                     .map_err(sql::classify_backend_error)?;
@@ -5097,6 +5137,28 @@ macro_rules! impl_sql_history {
                 Ok(done.rows_affected() == 1)
             }
 
+            async fn change_transition_from(
+                &self,
+                change: &$crate::serve::changes::ChangeRequest,
+                before: &$crate::serve::changes::ChangeRequest,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                // The stored body is the encoding of the version the caller
+                // read, so comparing it is a compare-and-set on the whole row.
+                let done = sqlx::query(&self.stmts.change_transition_from)
+                    .bind(change.status.as_str())
+                    .bind(sql::fmt_ts(change.expires_at))
+                    .bind(sql::encode_json(change, "change request")?)
+                    .bind(&change.id)
+                    .bind(before.status.as_str())
+                    .bind(sql::encode_json(before, "change request")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
+            }
+
             async fn change_get(
                 &self,
                 id: &str,
@@ -6076,6 +6138,14 @@ pub(crate) use impl_sql_history;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_newer_database_is_readable_only_when_it_says_so() {
+        assert!(!readable_by_this_binary(None));
+        assert!(readable_by_this_binary(Some(MIN_READABLE_SCHEMA)));
+        assert!(readable_by_this_binary(Some(SCHEMA_VERSION)));
+        assert!(!readable_by_this_binary(Some(SCHEMA_VERSION + 1)));
+    }
 
     #[test]
     fn edge_ordinals_parse_or_name_the_bad_value() {

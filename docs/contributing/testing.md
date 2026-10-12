@@ -20,14 +20,20 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   [Starting a test container](#starting-a-test-container). A test whose
   backend cannot start (no Docker, an image that will not come up, a missing
   client library) may skip locally, but must **panic** when
-  `FAUCET_REQUIRE_BACKENDS` is set — the `Test`, `Coverage` and Kafka CI jobs
+  `FAUCET_REQUIRE_BACKENDS` is set (to anything but empty, `0`, `false`, `no`
+  or `off`; a stopped Docker daemon counts as unavailable, not as a start
+  failure to retry) — the `Test`, `Coverage` and Kafka CI jobs
   set it, so an unavailable backend fails CI instead of passing silently. Suites too heavy for every PR stay `#[ignore]`d
   and run nightly in `.github/workflows/integration-heavy.yml` (SQL Server CDC,
   the secrets managers, the scaffold build). The Oracle Free container is
   the one exception on PRs: it does not start on the hosted runners, so its
   start failure is fatal only under `FAUCET_REQUIRE_ORACLE`, which the nightly
   job sets (the Instant Client check still honours
-  `FAUCET_REQUIRE_BACKENDS`).
+  `FAUCET_REQUIRE_BACKENDS`). A failing nightly opens or comments on a
+  "Nightly heavy integration suite failed" issue. The Marquez lineage test
+  (`crates/lineage/tests/marquez_integration.rs`, `FAUCET_MARQUEZ_URL`) is
+  manual-only: no CI job runs it, so run it against a local Marquez when
+  changing the HTTP lineage transport.
 - **Cross-connector tests** (a source↔sink round trip, a parity check against
   an older connector, a sink test that reads its output back with a source)
   live in `crates/interop-tests/tests/`, which is never published. A connector

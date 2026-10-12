@@ -106,6 +106,11 @@ class Observe(unittest.TestCase):
         self.assertEqual(seen["replication_method"], {"Incremental"})
         self.assertEqual(seen["config_key"], {"version", "mirror", "pipeline", "matrix"})
 
+    def test_counts_only_the_examples_the_validate_test_validates(self):
+        # cli_end_to_end.rs validates top-level cli/examples/*.yaml only.
+        self.assertNotIn("**", ec.EXAMPLES)
+        self.assertEqual(Path(ec.EXAMPLES).parent, Path("cli/examples"))
+
     def test_unparseable_files_are_skipped(self):
         d = tempfile.mkdtemp()
         self.assertEqual(ec.observed([write(d, "bad.yaml", "pipeline: [\n")])["source"], set())

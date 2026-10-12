@@ -6,7 +6,7 @@ name: Docker images
 # profile your deployment needs.
 #
 # Triggers:
-#   - manual (workflow_dispatch), optional push
+#   - manual (workflow_dispatch), optional push: `:<profile>-<sha>` only
 #   - on a published `faucet-cli-v*` GitHub release (pushes :<profile> and
 #     :<version>-<profile>). release-plz publishes a GitHub release per crate
 #     tag, so both jobs gate on the faucet-cli tag to build ONCE per app
@@ -60,6 +60,8 @@ jobs:
     env:
       PUSH: ${{ github.event_name == 'release' || inputs.push }}
       RELEASE: ${{ inputs.release }}
+      # Optional read-only Docker Hub login for pulls past the mirror.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,22 +122,49 @@ jobs:
         id: tags
         run: |
           base="${{ steps.img.outputs.name }}"
-          tags="${base}:${{ matrix.profile }}"
+          profile="${{ matrix.profile }}"
           v=""
           if [ "${{ github.event_name }}" = "release" ]; then
             v="${GITHUB_REF_NAME#faucet-cli-v}"; v="${v#v}"
           elif [ -n "$RELEASE" ]; then
             v="$RELEASE"
           fi
+          # Floating tags (:<profile>, :latest) only ever move to the newest
+          # faucet-cli release; anything else gets an immutable tag.
+          newest="$(git tag --list 'faucet-cli-v[0-9]*' | sed 's/^faucet-cli-v//' | sort -V | tail -1)"
+          tags=""
           if [ -n "$v" ]; then
-            tags="${tags},${base}:${v}-${{ matrix.profile }}"
-            if [ "${{ matrix.profile }}" = "full" ]; then
-              tags="${tags},${base}:latest,${base}:${v}"
+            tags="${base}:${v}-${profile}"
+            if [ "$profile" = "full" ]; then
+              tags="${tags},${base}:${v}"
             fi
+            if [ "$v" = "$newest" ]; then
+              tags="${tags},${base}:${profile}"
+              if [ "$profile" = "full" ]; then
+                tags="${tags},${base}:latest"
+              fi
+            else
+              echo "::notice::$v is not the newest faucet-cli release ($newest); floating tags stay put"
+            fi
+          else
+            tags="${base}:${profile}-${GITHUB_SHA::12}"
           fi
           echo "tags=${tags}" >>"$GITHUB_OUTPUT"
 
+      # Base-image pulls go through the Docker Hub mirror the test jobs use
+      # (scripts/docker-hub-mirror.sh), so builds avoid the anonymous rate limit.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
         if: env.PUSH == 'true'

@@ -794,6 +794,23 @@ pub fn sticky_newest(
 
 /// The version numbers to delete so at most [`VERSION_RETAIN`] remain for an id,
 /// never including a `protected` one.
+/// The versions pending launch requests for template `id` pin by number:
+/// pruning must keep them, or the approved launch would find nothing.
+pub fn launch_request_pins<'a>(
+    payloads: impl IntoIterator<Item = &'a serde_json::Value>,
+    id: &str,
+) -> Vec<u32> {
+    payloads
+        .into_iter()
+        .filter(|p| p.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        .filter_map(|p| match p.get("version")? {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn versions_to_prune(
     mut versions: Vec<u32>,
     protected: &std::collections::BTreeSet<u32>,
@@ -812,6 +829,18 @@ pub fn versions_to_prune(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_launch_requests_pin_numbered_versions_of_their_template() {
+        let payloads = [
+            serde_json::json!({"id": "orders", "version": 3}),
+            serde_json::json!({"id": "orders", "version": "4"}),
+            serde_json::json!({"id": "orders", "version": "stable"}),
+            serde_json::json!({"id": "orders"}),
+            serde_json::json!({"id": "other", "version": 9}),
+        ];
+        assert_eq!(launch_request_pins(&payloads, "orders"), vec![3, 4]);
+    }
 
     fn rec(id: &str, version: u32, secs: i64) -> TemplateRecord {
         TemplateRecord {

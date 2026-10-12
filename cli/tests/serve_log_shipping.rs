@@ -179,6 +179,13 @@ async fn delivery_contract(h: &dyn RunHistory) {
         !row.notified_failure,
         "a success re-arms the failure notification"
     );
+    // The watermark only moves forward: a stale ack never rewinds delivery.
+    assert!(!h.log_ship_ack("r", lines[0].seq).await.unwrap());
+    assert!(!h.log_ship_ack("r", lines[1].seq).await.unwrap());
+    assert_eq!(
+        h.log_ship_row("r").await.unwrap().unwrap().delivered_seq,
+        Some(lines[1].seq)
+    );
     h.log_ship_release("r").await.unwrap();
     assert!(h.log_ship_row("r").await.unwrap().unwrap().owner.is_none());
 

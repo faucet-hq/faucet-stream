@@ -149,9 +149,11 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
 
 - `run`: `POST /v1/runs` and template triggers answer with a pending change
   request instead of starting a run; `POST /v1/backfill`, a `POST /v1/verify`
-  with `repair` and a `POST /v1/dlq/replay` (each writes to the destination;
-  their `dry_run` forms still answer) are refused with `403` (propose the run
-  as a `run` change); the MCP `run_pipeline` tool points the agent at
+  with `repair`, a `POST /v1/dlq/replay` and a `POST /v1/runs/{id}/rollback`
+  (each writes to the destination outside the run queue; their `dry_run` forms
+  still answer) are refused with `403` — no change-request kind expresses them,
+  so they are disabled on such a server (run them from the CLI or a server
+  without `--require-approval run`); the MCP `run_pipeline` tool points the agent at
   `propose_run`, and the MCP `run_template` tool answers with the pending
   change request, as `POST /v1/templates/{id}/runs` does.
 - A trigger declared in the server's `--triggers` file is a **standing

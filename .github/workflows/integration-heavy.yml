@@ -80,6 +80,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: scripts/docker-hub-mirror.sh
       - name: Run the Oracle container suites
         run: >-
@@ -158,3 +161,28 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run the ignored scaffold build tests
         run: cargo test -p faucet-cli --test scaffold_build -- --ignored
+
+  # A failing nightly opens (or comments on) one tracking issue, so a broken
+  # heavy suite is noticed without anyone watching the Actions tab.
+  report:
+    name: Report a failed nightly
+    needs: [mssql-cdc, oracle, secrets, scaffold]
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly heavy integration suite failed"
+          body="The nightly \`Integration (heavy)\` run failed: ${RUN_URL}"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label bug --label tier-1 --body "$body"
+          fi

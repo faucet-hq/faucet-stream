@@ -851,6 +851,28 @@ async fn transition(
     }
 }
 
+/// Write `c` only if the stored request is still exactly `before` (what this
+/// call read): a concurrent approval elsewhere makes this one reload.
+async fn transition_from(
+    state: &ServerState,
+    c: &ChangeRequest,
+    before: &ChangeRequest,
+) -> Result<(), ServeError> {
+    if state
+        .history()
+        .change_transition_from(c, before)
+        .await
+        .map_err(store_err)?
+    {
+        Ok(())
+    } else {
+        Err(ServeError::Conflict(format!(
+            "change {} was changed concurrently; reload it",
+            c.id
+        )))
+    }
+}
+
 /// Serializes every transition of one change request within this process.
 fn change_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<
@@ -1040,6 +1062,7 @@ pub async fn approve(
             change.status.as_str()
         )));
     }
+    let before = change.clone();
     state
         .approvals()
         .may_approve(change.kind, actor, &change.requester)
@@ -1064,6 +1087,11 @@ pub async fn approve(
         comment: comment.filter(|c| !c.trim().is_empty()),
     });
     change.touch();
+    let quorum = change.approvals.len() as u32 >= change.required_approvals;
+    if quorum {
+        change.status = ChangeStatus::Approved;
+    }
+    transition_from(state, &change, &before).await?;
     record_metric(change.kind, "approved");
     crate::serve::audit::write(
         state,
@@ -1074,12 +1102,9 @@ pub async fn approve(
         "ok",
     )
     .await;
-    if (change.approvals.len() as u32) < change.required_approvals {
-        transition(state, &change, ChangeStatus::Pending).await?;
+    if !quorum {
         return Ok(change);
     }
-    change.status = ChangeStatus::Approved;
-    transition(state, &change, ChangeStatus::Pending).await?;
     let change = execute(state, actor, change).await?;
     refresh_pending_gauge(state).await;
     Ok(change)
@@ -1217,7 +1242,9 @@ async fn execute(
                     Ok(b) => b,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            crate::templates::register_tested(
+            // The version is stored even when its test run, a channel or the
+            // launch is then refused; the request records it either way.
+            match crate::templates::register_staged(
                 &state.history(),
                 crate::templates::RegisterRequest {
                     id: body.id,
@@ -1230,16 +1257,22 @@ async fn execute(
                 },
             )
             .await
-            .map(|r| {
-                (
-                    None,
-                    Some(TemplateOutcome {
-                        id: r.record.id,
+            {
+                Ok(mut r) => {
+                    let registered = TemplateOutcome {
+                        id: r.record.id.clone(),
                         version: r.record.version,
-                    }),
-                )
-            })
-            .map_err(template_err)
+                    };
+                    match r.after.take() {
+                        None => Ok((None, Some(registered))),
+                        Some(e) => {
+                            change.template = Some(registered);
+                            Err(template_err(e))
+                        }
+                    }
+                }
+                Err(e) => Err(template_err(e)),
+            }
         }
         #[cfg(feature = "templates")]
         ChangeKind::TemplateLaunch => {
@@ -1986,6 +2019,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ServeError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn a_partial_approval_from_a_stale_read_does_not_drop_another() {
+        use crate::serve::history::RunHistory as _;
+        let store =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let mut c = ChangeRequest {
+            id: "chg-x".into(),
+            kind: ChangeKind::Run,
+            status: ChangeStatus::Pending,
+            requester: "bob".into(),
+            requester_role: Role::Operator,
+            reason: None,
+            payload: json!({}),
+            plan: None,
+            budget: None,
+            required_approvals: 3,
+            approvals: Vec::new(),
+            rejection: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            run_id: None,
+            template: None,
+            error: None,
+            tenant: None,
+            trusted_config: false,
+        };
+        store.change_upsert(&c).await.unwrap();
+        let read = c.clone();
+        let approval = |who: &str| Approval {
+            principal: who.into(),
+            role: Role::Admin,
+            at: Utc::now(),
+            comment: None,
+        };
+        let mut first = read.clone();
+        first.approvals.push(approval("alice"));
+        first.updated_at = read.updated_at + chrono::Duration::seconds(1);
+        assert!(store.change_transition_from(&first, &read).await.unwrap());
+        c.approvals.push(approval("carol"));
+        c.updated_at = read.updated_at + chrono::Duration::seconds(2);
+        assert!(
+            !store.change_transition_from(&c, &read).await.unwrap(),
+            "carol's write from the stale read would drop alice's approval"
+        );
+        let stored = store.change_get("chg-x").await.unwrap().unwrap();
+        assert_eq!(stored.approvals.len(), 1);
+        assert_eq!(stored.approvals[0].principal, "alice");
     }
 
     #[tokio::test]

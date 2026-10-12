@@ -110,13 +110,14 @@ pub fn estimate(
         }
         let reads: u64 = trips
             .iter()
-            .filter(|(op, _)| matches!(op.as_str(), "list" | "get" | "head"))
+            .filter(|(op, _)| matches!(op.as_str(), "get" | "head"))
             .map(|(_, n)| n)
             .sum();
-        // A server-side copy is billed like a put; a delete is free.
+        // A listing and a server-side copy are billed like a put (S3 / GCS
+        // class A, Azure write operations); a delete is free.
         let writes: u64 = trips
             .iter()
-            .filter(|(op, _)| matches!(op.as_str(), "put" | "post" | "copy"))
+            .filter(|(op, _)| matches!(op.as_str(), "put" | "post" | "copy" | "list"))
             .map(|(_, n)| n)
             .sum();
         let deletes: u64 = trips
@@ -514,12 +515,15 @@ mod tests {
         assert_eq!(item("bigquery_bytes_billed").unwrap().amount, 6.25);
         assert_eq!(item("bigquery_bytes_streamed").unwrap().amount, 0.1);
         let reads = item("s3_requests_read_source").unwrap();
-        assert_eq!(reads.quantity, 2.0);
-        assert!((reads.amount - 0.0008).abs() < 1e-9);
+        assert_eq!(reads.quantity, 1.5, "gets");
+        assert!((reads.amount - 0.0006).abs() < 1e-9);
+        let lists = item("s3_requests_write_source").unwrap();
+        assert_eq!(lists.quantity, 0.5, "a listing is billed like a put");
+        assert!((lists.amount - 0.0025).abs() < 1e-9);
         assert!(item("egress").is_none(), "egress is not charged by default");
         assert!(e.not_reported.is_empty(), "{e:?}");
         assert_eq!(e.hosted_equivalent, 30.0);
-        assert!((e.total - 6.3508).abs() < 1e-9, "{}", e.total);
+        assert!((e.total - 6.3531).abs() < 1e-9, "{}", e.total);
 
         // An egress rate charges the bytes read across clouds, not local→local.
         let p2 = PricingSpec {
@@ -701,10 +705,10 @@ mod tests {
         let e = estimate(&s, "csv", "s3", &p);
         let item = |name: &str| e.lines.iter().find(|l| l.item == name).cloned();
         let writes = item("s3_requests_write_sink").unwrap();
-        assert_eq!(writes.quantity, 1.0, "put + copy");
-        assert!((writes.amount - 0.005).abs() < 1e-9);
+        assert_eq!(writes.quantity, 1.2, "put + copy + list");
+        assert!((writes.amount - 0.006).abs() < 1e-9);
         let reads = item("s3_requests_read_sink").unwrap();
-        assert_eq!(reads.quantity, 1.0, "list + head");
+        assert_eq!(reads.quantity, 0.8, "head");
         assert!(!e.not_reported.contains(&"s3".to_string()), "{e:?}");
 
         let mut only_deletes = snap(10, 1000);

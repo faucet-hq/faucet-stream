@@ -355,7 +355,8 @@ Override via `podSecurityContext` / `securityContext`.
 - `/healthz` (liveness) and `/readyz` (readiness) back the probes.
 - **Log shipping (#806):** `otel.logs.enabled=true` + `otel.logs.endpoint`
   ships every run's log lines over OTLP. For `serve` the chart renders the
-  `--otel-config` file and the buffer bounds / link template as env; the
+  `--otel-config` file into a Secret (`otel.logs.headers` may carry collector
+  credentials) and the buffer bounds / link template as env; the
   run-history backend is the buffer, so pair it with `serve.history.backend:
   sqlite` + `serve.persistence.enabled` (or postgres) to survive restarts.
   `job` / `cronjob` pods get a spool volume at `otel.logs.spoolDir`

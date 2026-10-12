@@ -32,7 +32,7 @@ CONFIG = "cli/src/config.rs"
 WRITE_MODE = "crates/core/src/write_mode.rs"
 MIRROR_SPEC = "cli/src/replication/spec.rs"
 REPLICATION = "crates/core/src/replication.rs"
-EXAMPLES = "cli/examples/**/*.yaml"
+EXAMPLES = "cli/examples/*.yaml"
 ALLOWLIST = "scripts/example-coverage-allow.txt"
 
 CONNECTOR_KEYS = {"source": "source", "sources": "source", "sink": "sink", "sinks": "sink"}
@@ -190,7 +190,7 @@ def gaps(want, seen, allowed):
 
 def main():
     want = required()
-    seen = observed(sorted(glob.glob(EXAMPLES, recursive=True)))
+    seen = observed(sorted(glob.glob(EXAMPLES)))
     missing, stale = gaps(want, seen, allowlist())
     total = sum(len(v) for v in want.values())
     if missing or stale:

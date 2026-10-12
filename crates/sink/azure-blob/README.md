@@ -209,6 +209,21 @@ request that still fails after that is a sink error; the client does not
 expose the final status, so a pipeline `resilience:` policy does not retry
 it again.
 
+## Usage signals (#704)
+
+Every request is reported to faucet's usage meter as a sink round trip, by op:
+
+| Op | Requests | Priced as |
+|---|---|---|
+| `put` | each `Put Blob`, each `Put Block` and the `Put Block List` that commits a block blob | write (`usage.pricing.object_storage.write_per_1k_requests`) |
+| `copy` | each server-side copy of an overwrite commit's promote | write |
+| `list` | each blob listing (append, overwrite pruning and commit) | write |
+| `head` | each property read (existence checks) | read (`read_per_1k_requests`) |
+| `get` | each blob read back | read |
+| `delete` | each blob delete | free |
+
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
 ## License
 
 MIT

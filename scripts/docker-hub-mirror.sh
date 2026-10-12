@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Pull Docker Hub images through a registry mirror so the container-backed
 # tests do not hit Docker Hub's anonymous pull rate limit on shared runners
-# (`toomanyrequests`). An image the mirror lacks falls back to Docker Hub.
+# (`toomanyrequests`). An image the mirror lacks falls back to Docker Hub,
+# authenticated when DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are set.
 #   scripts/docker-hub-mirror.sh [mirror-url]
 set -euo pipefail
 
@@ -25,3 +26,7 @@ if ! docker info --format '{{json .RegistryConfig.Mirrors}}' | grep -qF "$mirror
   exit 1
 fi
 echo "Docker Hub pulls go through $mirror"
+# An optional read-only login covers images the mirror lacks.
+if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+  echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+fi

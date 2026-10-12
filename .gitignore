@@ -53,6 +53,9 @@ docs/superpowers/
 !/scripts/vendor-names.py
 !/scripts/test_vendor_names.py
 !/scripts/connector-deps.py
+!/scripts/add-crate-team.sh
+!/scripts/advisory-scope.py
+!/scripts/test_advisory_scope.py
 !/scripts/test_connector_deps.py
 !/scripts/packaged-keys.py
 !/scripts/helm-app-version.py

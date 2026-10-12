@@ -745,7 +745,9 @@ pub struct TemplateStoreArgs {
     pub json: bool,
 }
 
-/// `faucet template register <config>` arguments.
+/// `faucet template register <config>` arguments. Registering always runs the
+/// version's `tests:` bundle and records the result; a launch or channel then
+/// needs it to pass.
 #[cfg(feature = "templates")]
 #[derive(Debug, Parser)]
 pub struct TemplateRegisterArgs {
@@ -2104,10 +2106,12 @@ pub struct ServeArgs {
     /// lines are kept until delivered, bounded by `--log-buffer-max-age-secs`
     /// and `--log-buffer-max-bytes`. Requires a persistent `--history` backend
     /// unless shipping is on; `0` disables durable log persistence (ephemeral
-    /// SSE only). Default: 24 hours.
+    /// SSE only). Default (`auto`): 24 hours with log shipping on, 7 days
+    /// otherwise.
     #[arg(
         long,
-        default_value_t = 86_400,
+        default_value = "auto",
+        value_parser = parse_log_retention,
         env = "FAUCET_SERVE_LOG_RETENTION_SECS"
     )]
     pub log_retention_secs: u64,
@@ -3164,4 +3168,16 @@ pub struct NewConnectorArgs {
     /// Overwrite any existing files.
     #[arg(long)]
     pub force: bool,
+}
+/// `--log-retention-secs` value meaning "pick by whether logs are shipped".
+pub const LOG_RETENTION_AUTO: u64 = u64::MAX;
+
+/// Parse `--log-retention-secs`: seconds, or `auto` ([`LOG_RETENTION_AUTO`]).
+pub fn parse_log_retention(raw: &str) -> Result<u64, String> {
+    if raw.trim().eq_ignore_ascii_case("auto") {
+        return Ok(LOG_RETENTION_AUTO);
+    }
+    raw.trim()
+        .parse()
+        .map_err(|e| format!("expected seconds or `auto`: {e}"))
 }

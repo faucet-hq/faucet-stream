@@ -44,8 +44,9 @@ ignore = [
     # parquet 58) and opendal 0.57 (pinned by iceberg 0.10), which parse only
     # the configured storage endpoint's list responses and never use NsReader;
     # 0.31 from azure_core 0.21, a dev-dependency of the azure-blob sink tests.
-    # cargo-deny cannot scope an advisory ignore to one version, so drop these
-    # two ids once object_store/opendal/azure_core move past quick-xml 0.41.
+    # cargo-deny cannot scope an advisory ignore to one version, so
+    # scripts/advisory-scope.py (CI) fails on any other affected quick-xml copy;
+    # drop these two ids once object_store/opendal/azure_core move past 0.41.
     { id = "RUSTSEC-2026-0194", reason = "only transitive quick-xml 0.39 (object_store/opendal) and 0.31 (azure dev-dep) remain (2026-10-07)" },
     { id = "RUSTSEC-2026-0195", reason = "only transitive quick-xml 0.39 / 0.31 remain; NsReader unused (2026-10-07)" },
 ]

@@ -348,6 +348,8 @@ Request body:
   submit returns `422` with the doctor report in `error.details`.
 - **`idempotency_key`** — replay protection (see cookbook). Keys are scoped to
   the tenant a run is for, so two tenants sending the same key start two runs.
+  The prefixes `tenant:`, `trig:`, `backfill:` and `change:` are reserved for
+  the keys the server derives itself; a caller's key starting with one is a `400`.
 - **`clock`** — overrides the `${now.*}` clock for backfills (default: submit time).
 - **`concurrency`** — overrides this run's **connector** concurrency: how many
   concurrent connections/fetches the source and sink may use, whatever the
@@ -471,7 +473,8 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/v1/runs/0192…/logs?format=jsonl&after=500"
 ```
 
-Retention is governed by **`--log-retention-secs`** (default `86400` = 24 h),
+Retention is governed by **`--log-retention-secs`** (default `auto`: 24 h when
+logs are shipped, 7 days when the server is their only copy),
 independent of run-record retention; `0` disables durable log persistence
 (ephemeral SSE only). **`--log-max-lines-per-run`** (default `100000`) caps how
 many lines are stored per run. The in-memory `--history` backend stays ephemeral
@@ -537,6 +540,10 @@ and `budget`); when it is set, or the server runs with
 of a run. `budget` on a run or a change request (`max_records`, `max_bytes`,
 `max_duration_secs`, `allowed_sinks`) is merged with the config's own
 `budget:` block, the stricter of each ceiling winning.
+Under `--require-approval run`, the writes that bypass the run queue —
+`POST /v1/backfill`, `POST /v1/verify` with `repair`, `POST /v1/dlq/replay` and
+`POST /v1/runs/{id}/rollback` — answer `403`: no change-request kind expresses
+them, so they are disabled on that server (their `dry_run` forms still answer).
 
 A template trigger that becomes a change request stores the template body
 unresolved (`${env:}` / `${file:}` / secret references stay tokens and resolve
@@ -967,8 +974,10 @@ The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
 `doctor_first`, `idempotency_key`, `clock`, `concurrency`) behaves exactly as in
 `POST /v1/runs`, because the run is submitted through the same path. The run is
 labelled `template` and `template_version` (plus `sink_template` /
-`sink_template_version` for a composed run, and `overlay` / `overlay_version`
-when an overlay applied).
+`sink_template_version` for a composed run, `overlay` / `overlay_version`
+when an overlay applied, `allow_untested` for a run of a non-`passing` version
+and `selection` for a row selection). Only the server sets these: a caller's
+`labels` entry under any of those keys is dropped.
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing
 `required` param or a type mismatch, naming the param; `429` when the queue is
@@ -1199,6 +1208,17 @@ Every error is a JSON `ApiError`:
 | `422` | Expand/validation failure; `doctor_first` failed (report in `details`); a [subprocess connector](#subprocess-connectors) without `--allow-subprocess-connectors` |
 | `429` | Run queue full (carries `Retry-After`) |
 | `500` | Internal error |
+
+**A row that is already running.** Every run takes a lease on each row in the
+config's durable `state:` store, and the server never overrides a live one
+(there is no `--force` over HTTP). A second run of the same row — another
+`POST /v1/runs`, a trigger or template fire, a backfill unit, or a `faucet run`
+/ `faucet schedule` process on the same store — is accepted (`202`) but its
+invocation **fails** with an error naming the holder's run id, pid and lease
+expiry. Recovery: wait for the holder to finish, cancel it
+(`POST /v1/runs/{id}/cancel`, which releases the lease as it stops), or, if its
+process crashed on another host, wait for the lease to expire about a minute
+after it stopped renewing.
 
 ## Metrics
 

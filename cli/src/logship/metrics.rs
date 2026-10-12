@@ -11,6 +11,8 @@ pub enum DropReason {
     MaxLines,
     /// The capture queue was full (the writer could not keep up).
     QueueFull,
+    /// The collector refused the line itself as malformed.
+    Rejected,
 }
 
 impl DropReason {
@@ -20,6 +22,7 @@ impl DropReason {
             Self::MaxBytes => "max_bytes",
             Self::MaxLines => "max_lines",
             Self::QueueFull => "queue_full",
+            Self::Rejected => "rejected",
         }
     }
 }

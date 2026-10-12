@@ -256,7 +256,7 @@ impl ServeConfig {
 
         let auth = if let Some(rbac) = token_trio {
             for token in rbac.tokens() {
-                crate::secrets::registry::register(token);
+                crate::secrets::registry::register_pinned(token);
             }
             AuthMode::Rbac(Arc::new(rbac))
         } else if let Some(path) = args.auth_config {
@@ -264,7 +264,7 @@ impl ServeConfig {
             // Register every principal token so the RedactingWriter scrubs it
             // from any tracing/log/error output for the process lifetime.
             for token in rbac.tokens() {
-                crate::secrets::registry::register(token);
+                crate::secrets::registry::register_pinned(token);
             }
             AuthMode::Rbac(Arc::new(rbac))
         } else {
@@ -279,7 +279,7 @@ impl ServeConfig {
                 (Some(t), _) => {
                     // Register so the RedactingWriter scrubs the token from any
                     // tracing/log/error output for the lifetime of the process.
-                    crate::secrets::registry::register(&t);
+                    crate::secrets::registry::register_pinned(&t);
                     AuthMode::Token(t)
                 }
                 (None, true) => AuthMode::None,
@@ -306,7 +306,7 @@ impl ServeConfig {
                     .into(),
             ));
         }
-        if matches!(auth, AuthMode::None) && !listen.ip().is_loopback() {
+        if matches!(auth, AuthMode::None) && !is_loopback(listen.ip()) {
             if !args.allow_unauthenticated_network {
                 return Err(CliError::Serve(format!(
                     "refusing to serve without authentication on {listen}: anyone who can reach \
@@ -417,6 +417,12 @@ impl ServeConfig {
             .max_queued_runs
             .unwrap_or_else(|| max_concurrent_runs.saturating_mul(8))
             .max(1);
+        let otel = args
+            .otel_config
+            .as_deref()
+            .map(load_otel_config)
+            .transpose()?;
+        let log_retention = resolve_log_retention(args.log_retention_secs, otel.as_ref());
 
         Ok(Self {
             listen,
@@ -430,7 +436,7 @@ impl ServeConfig {
             shutdown_grace: Duration::from_secs(args.shutdown_grace_secs),
             retain_terminal_runs: Duration::from_secs(args.retain_terminal_runs_secs),
             idempotency_retention: Duration::from_secs(args.idempotency_retention_secs),
-            log_retention: Duration::from_secs(args.log_retention_secs),
+            log_retention,
             log_max_lines_per_run: args.log_max_lines_per_run,
             log_buffer: LogBufferSettings::from(&args.log_buffer),
             local_output_retention_days: args.local_output_retention_days,
@@ -453,18 +459,14 @@ impl ServeConfig {
             triggers_path: args.triggers,
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
-            otel: args
-                .otel_config
-                .as_deref()
-                .map(load_otel_config)
-                .transpose()?,
+            otel,
             callback_allow_hosts: args.callback_allow_host,
             require_approval,
             approval_expiry: Duration::from_secs(args.approval_expiry_secs),
             vault: args.vault_key.filter(|k| !k.is_empty()).map(|key| {
-                crate::secrets::registry::register(&key);
+                crate::secrets::registry::register_pinned(&key);
                 for k in &args.vault_previous_key {
-                    crate::secrets::registry::register(k);
+                    crate::secrets::registry::register_pinned(k);
                 }
                 VaultKeys {
                     key,
@@ -491,9 +493,30 @@ pub fn load_otel_config(path: &std::path::Path) -> CliResult<faucet_core::OtelCo
         serde_json::from_value(doc).map_err(|e| bad(e.to_string()))?;
     let cfg = spec.to_core().map_err(bad)?;
     for v in cfg.headers.values() {
-        crate::secrets::registry::register(v);
+        crate::secrets::registry::register_pinned(v);
     }
     Ok(cfg)
+}
+
+/// `--log-retention-secs`, with `auto` resolved: lines are kept a day after
+/// delivery when they are shipped, and a week when the server is their only
+/// copy.
+fn resolve_log_retention(secs: u64, otel: Option<&faucet_core::OtelConfig>) -> Duration {
+    if secs != crate::cli::LOG_RETENTION_AUTO {
+        return Duration::from_secs(secs);
+    }
+    let shipping = otel.is_some_and(|o| o.exports(faucet_core::OtelSignal::Logs));
+    Duration::from_secs(if shipping { 86_400 } else { 604_800 })
+}
+
+/// Loopback, counting an IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
+fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        v4 => v4.is_loopback(),
+    }
 }
 
 #[cfg(test)]
@@ -776,6 +799,27 @@ mod tests {
     }
 
     #[test]
+    fn log_retention_defaults_by_whether_logs_are_shipped() {
+        use crate::cli::{LOG_RETENTION_AUTO, parse_log_retention};
+        assert_eq!(parse_log_retention("auto"), Ok(LOG_RETENTION_AUTO));
+        assert_eq!(parse_log_retention(" 60 "), Ok(60));
+        assert!(parse_log_retention("soon").is_err());
+        assert_eq!(resolve_log_retention(60, None), Duration::from_secs(60));
+        assert_eq!(
+            resolve_log_retention(LOG_RETENTION_AUTO, None),
+            Duration::from_secs(604_800)
+        );
+        let otel = faucet_core::OtelConfig {
+            export: vec![faucet_core::OtelSignal::Logs],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_log_retention(LOG_RETENTION_AUTO, Some(&otel)),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
     fn the_opt_in_without_no_auth_is_refused() {
         let mut a = base_args();
         a.auth_token = Some("t".into());
@@ -786,7 +830,12 @@ mod tests {
 
     #[test]
     fn no_auth_on_loopback_or_an_authenticated_network_server_needs_no_opt_in() {
-        for listen in ["127.0.0.1:8080", "127.9.9.9:8080", "[::1]:8080"] {
+        for listen in [
+            "127.0.0.1:8080",
+            "127.9.9.9:8080",
+            "[::1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
             let mut a = base_args();
             a.no_auth = true;
             a.listen = listen.into();

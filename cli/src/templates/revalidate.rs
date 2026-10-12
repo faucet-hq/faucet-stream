@@ -20,6 +20,15 @@ use crate::templates::store::registry_err;
 /// were last revalidated under.
 pub const META_KEY: &str = "template_tests.revalidated_line";
 
+/// The setting holding an in-progress revalidation's claim:
+/// `<line>@<unix expiry>`. The completed line is written to [`META_KEY`] only
+/// once a run has finished.
+pub const CLAIM_KEY: &str = "template_tests.revalidation_claim";
+
+/// How long a revalidation claim holds. An instance that dies mid-run leaves
+/// its claim behind; once it expires the next start revalidates again.
+pub const CLAIM_TTL_SECS: i64 = 2 * 60 * 60;
+
 /// One re-tested version.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Revalidated {
@@ -148,11 +157,13 @@ pub async fn revalidate(
 /// [`revalidate`] when the registry was last revalidated under an older faucet
 /// release line (or never). `None` when nothing was due.
 ///
-/// The marker is claimed with a compare-and-set before the run, so of several
-/// instances starting on the same new line only one revalidates; an instance
-/// on an older line never claims it back, so a mixed-line cluster does not
-/// re-run on every restart. When any version could not be tested (`error`)
-/// the claim is released, and the next start tries again.
+/// A run is claimed first with a compare-and-set on [`CLAIM_KEY`] that holds
+/// for [`CLAIM_TTL_SECS`], so of several instances starting on the same new
+/// line only one revalidates; the completed line is written to [`META_KEY`]
+/// only after the run, and an instance on an older line never claims a newer
+/// one back. A run in which any version could not be tested (`error`) records
+/// no line, and an instance that dies mid-run leaves a claim that expires, so
+/// either way a later start tries again.
 pub async fn revalidate_if_new_release(
     store: &TemplateStore,
 ) -> CliResult<Option<RevalidateReport>> {
@@ -164,8 +175,17 @@ pub async fn revalidate_if_new_release(
     if !is_newer(&line, marker.as_deref()) {
         return Ok(None);
     }
+    let claim = store
+        .meta_get(CLAIM_KEY)
+        .await
+        .map_err(|e| registry_err("server setting read", e))?;
+    let now = chrono::Utc::now().timestamp();
+    if claim_blocks(&line, claim.as_deref(), now) {
+        return Ok(None);
+    }
+    let mine = format!("{line}@{}", now + CLAIM_TTL_SECS);
     let claimed = store
-        .meta_compare_and_set(META_KEY, marker.as_deref(), &line)
+        .meta_compare_and_set(CLAIM_KEY, claim.as_deref(), &mine)
         .await
         .map_err(|e| registry_err("server setting write", e))?;
     if !claimed {
@@ -176,16 +196,29 @@ pub async fn revalidate_if_new_release(
         Ok(r) => r.versions.iter().any(|v| v.outcome == "error"),
         Err(_) => true,
     };
-    if errored {
-        let restored = match marker.as_deref() {
-            Some(old) => store.meta_compare_and_set(META_KEY, Some(&line), old).await,
-            None => store.meta_put(META_KEY, "").await.map(|_| true),
-        };
-        if let Err(e) = restored {
-            tracing::warn!(error = %e, "could not release the revalidation marker");
-        }
+    if !errored
+        && let Err(e) = store
+            .meta_compare_and_set(META_KEY, marker.as_deref(), &line)
+            .await
+    {
+        tracing::warn!(error = %e, "could not record the revalidated release line");
+    }
+    if let Err(e) = store.meta_compare_and_set(CLAIM_KEY, Some(&mine), "").await {
+        tracing::warn!(error = %e, "could not release the revalidation claim");
     }
     report.map(Some)
+}
+
+/// Whether a stored claim stops a run of `line` at `now`: a live claim for
+/// the same or a newer line. An expired, empty or unreadable claim does not.
+fn claim_blocks(line: &str, claim: Option<&str>, now: i64) -> bool {
+    let Some((claimed_line, expiry)) = claim.and_then(|c| c.rsplit_once('@')) else {
+        return false;
+    };
+    let Ok(expiry) = expiry.parse::<i64>() else {
+        return false;
+    };
+    expiry > now && !is_newer(line, Some(claimed_line))
 }
 
 /// After a revalidation run outside the server's start-up claim: record its
@@ -219,5 +252,22 @@ pub fn is_newer(line: &str, marker: Option<&str>) -> bool {
         (Some(l), Some(m)) => l > m,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_claim_for_this_or_a_newer_line_blocks_and_anything_else_does_not() {
+        assert!(!claim_blocks("1.14", None, 100));
+        assert!(!claim_blocks("1.14", Some(""), 100));
+        assert!(!claim_blocks("1.14", Some("garbage"), 100));
+        assert!(!claim_blocks("1.14", Some("1.14@soon"), 100));
+        assert!(claim_blocks("1.14", Some("1.14@200"), 100));
+        assert!(claim_blocks("1.14", Some("1.15@200"), 100));
+        assert!(!claim_blocks("1.14", Some("1.14@100"), 100), "expired");
+        assert!(!claim_blocks("1.15", Some("1.14@200"), 100), "older line");
     }
 }

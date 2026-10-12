@@ -429,7 +429,10 @@ impl RunHistory for MemoryHistory {
         let now = Utc::now();
         let mut ship = self.log_ship_guard()?;
         match ship.get_mut(run_id) {
-            Some(row) if row.owner.as_deref() == Some(MEMORY_OWNER) => {
+            Some(row)
+                if row.owner.as_deref() == Some(MEMORY_OWNER)
+                    && row.delivered_seq.is_none_or(|d| d < delivered_seq) =>
+            {
                 row.delivered_seq = Some(delivered_seq);
                 row.delivered_at = Some(now);
                 row.last_attempt_at = Some(now);
@@ -1059,6 +1062,25 @@ impl RunHistory for MemoryHistory {
             .lock()
             .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?;
         if map.get(&change.id).map(|c| c.status) != Some(from) {
+            return Ok(false);
+        }
+        map.insert(change.id.clone(), change.clone());
+        Ok(true)
+    }
+
+    async fn change_transition_from(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        before: &crate::serve::changes::ChangeRequest,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?;
+        let unchanged = map
+            .get(&change.id)
+            .is_some_and(|c| c.status == before.status && c.updated_at == before.updated_at);
+        if !unchanged {
             return Ok(false);
         }
         map.insert(change.id.clone(), change.clone());

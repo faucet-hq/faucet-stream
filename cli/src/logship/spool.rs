@@ -225,24 +225,45 @@ impl Spool {
 
     /// Complete lines after `offset` and the first one's timestamp.
     pub fn count_from(&self, run_id: &str, offset: u64) -> (u64, Option<String>) {
+        let (n, _, ts) = self.scan_from(run_id, offset);
+        (n, ts)
+    }
+
+    /// Complete lines after `offset`, the byte offset just past the last of
+    /// them (a partial line a writer is still appending is not counted), and
+    /// the first one's timestamp. Reads in fixed-size chunks.
+    pub fn scan_from(&self, run_id: &str, offset: u64) -> (u64, u64, Option<String>) {
         let Ok(mut f) = File::open(self.segment(run_id)) else {
-            return (0, None);
+            return (0, offset, None);
         };
         if f.seek(SeekFrom::Start(offset)).is_err() {
-            return (0, None);
+            return (0, offset, None);
         }
         let mut r = BufReader::new(f);
         let mut first = Vec::new();
         if r.read_until(b'\n', &mut first).unwrap_or(0) == 0 || first.last() != Some(&b'\n') {
-            return (0, None);
+            return (0, offset, None);
         }
         let ts = serde_json::from_slice::<ShipLine>(&first)
             .ok()
             .map(|l| l.ts);
-        let mut rest = Vec::new();
-        let _ = r.read_to_end(&mut rest);
-        let n = 1 + rest.iter().filter(|b| **b == b'\n').count() as u64;
-        (n, ts)
+        let mut pos = offset + first.len() as u64;
+        let (mut n, mut end) = (1u64, pos);
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let read = match r.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            for (i, b) in chunk[..read].iter().enumerate() {
+                if *b == b'\n' {
+                    n += 1;
+                    end = pos + i as u64 + 1;
+                }
+            }
+            pos += read as u64;
+        }
+        (n, end, ts)
     }
 }
 
@@ -529,6 +550,15 @@ impl PassReport {
             .filter(|r| !r.removed && r.view.pending_lines > 0)
             .count()
     }
+
+    /// Undelivered runs this pass was responsible for: those a live faucet
+    /// process elsewhere is still writing (and shipping) are its business.
+    pub fn undelivered_here(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|r| !r.removed && !r.locked_elsewhere && r.view.pending_lines > 0)
+            .count()
+    }
 }
 
 fn delivery_state(meta: &RunMeta, c: &Cursor, pending: u64) -> DeliveryState {
@@ -638,16 +668,17 @@ async fn process_run(
         let _ = spool.write_meta(&meta);
     }
     let mut c = spool.read_cursor(id);
-    let len = spool.segment_len(id);
     let ended = meta.ended_at.is_some();
 
     if let Some(settled) = bytes_drop.get(id) {
         if *settled {
             let _ = std::fs::remove_file(spool.segment(id));
         } else {
-            let (n, _) = spool.count_from(id, c.offset);
+            // Drop through the last complete line, never into one a writer is
+            // still appending.
+            let (n, end, _) = spool.scan_from(id, c.offset);
             c.dropped += n;
-            c.offset = len;
+            c.offset = end;
             metrics::dropped(DropReason::MaxBytes, n);
             if ended {
                 let _ = std::fs::remove_file(spool.segment(id));
@@ -684,30 +715,46 @@ async fn process_run(
         let pending: Vec<(ShipLine, u64)> = spool
             .read_lines(id, c.offset, MAX_LINES_PER_PASS)
             .unwrap_or_default();
-        let ends: HashMap<u64, u64> = pending.iter().map(|(l, e)| (l.seq, *e)).collect();
-        let lines: Vec<ShipLine> = pending.into_iter().map(|(l, _)| l).collect();
+        // Offsets go by position: an unreadable line has no sequence of its
+        // own, so a sequence cannot locate its end.
+        let (lines, ends): (Vec<ShipLine>, Vec<u64>) = pending.into_iter().unzip();
+        let mut consumed = 0usize;
         for batch in batches(lines) {
             c.last_attempt_at = Some(now);
-            match exporter.export(&meta.attrs, &batch).await {
-                Ok(_) => {
-                    let last = batch.last().map(|l| l.seq).unwrap_or(0);
-                    if let Some(end) = ends.get(&last) {
-                        c.offset = *end;
-                    }
-                    c.delivered_seq = Some(last);
-                    c.delivered_lines += batch.len() as u64;
-                    c.delivered_at = Some(now);
+            let out = exporter.export_isolating(&meta.attrs, &batch).await;
+            if out.handled > 0 {
+                consumed += out.handled;
+                if let Some(end) = consumed.checked_sub(1).and_then(|i| ends.get(i)) {
+                    c.offset = *end;
+                }
+                let last = batch[..out.handled]
+                    .iter()
+                    .map(|l| l.seq)
+                    .max()
+                    .unwrap_or(0);
+                c.delivered_seq = c.delivered_seq.max(Some(last));
+                let delivered = out.handled as u64 - out.dropped;
+                c.delivered_lines += delivered;
+                c.dropped += out.dropped;
+                c.delivered_at = Some(now);
+                report.shipped += delivered;
+                metrics::shipped(delivered);
+                if out.dropped > 0 {
+                    metrics::dropped(DropReason::Rejected, out.dropped);
+                }
+            }
+            match out.error {
+                None => {
                     c.last_error = None;
                     c.failing_since = None;
                     c.notified_failure = false;
-                    report.shipped += batch.len() as u64;
-                    metrics::shipped(batch.len() as u64);
                     if let Err(e) = spool.write_cursor(id, &c) {
                         tracing::warn!(run_id = id, error = %e, "writing the log-delivery cursor failed");
                     }
                 }
-                Err(e) => {
-                    c.last_error = Some(e);
+                Some(e) => {
+                    tracing::warn!(run_id = id, error = %e.detail, "shipping run logs failed");
+                    c.last_error = Some(crate::secrets::registry::redact(&e.message).into_owned());
                     c.failing_since.get_or_insert(now);
                     report.failed = true;
                     metrics::export_error();
@@ -860,6 +907,26 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_counts_complete_lines_and_ends_before_a_partial_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        let mut body =
+            String::from("{\"seq\":1,\"ts\":\"t1\",\"level\":\"INFO\",\"body\":\"a\"}\n");
+        for i in 0..20_000 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        let complete = body.len() as u64;
+        body.push_str("{\"seq\":9");
+        std::fs::write(spool.segment("r"), &body).unwrap();
+        let (n, end, ts) = spool.scan_from("r", 0);
+        assert_eq!(n, 20_001);
+        assert_eq!(end, complete, "never past the partial line");
+        assert_eq!(ts.as_deref(), Some("t1"));
+        assert_eq!(spool.scan_from("r", complete), (0, complete, None));
+        assert_eq!(spool.scan_from("absent", 7), (0, 7, None));
+    }
+
+    #[test]
     fn locks_are_shared_in_process() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.lock");
@@ -970,6 +1037,40 @@ mod tests {
         assert!(!spool.segment("b").exists());
         assert_eq!(r.run("c").unwrap().view.dropped_lines, 0);
         assert_eq!(r.run("c").unwrap().view.pending_lines, 10);
+    }
+
+    #[tokio::test]
+    async fn a_bytes_drop_on_a_live_run_stops_before_a_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        w.begin(
+            RunMeta {
+                run_id: "live".into(),
+                ..Default::default()
+            },
+            100,
+        );
+        for _ in 0..5 {
+            w.append("live", line(&"x".repeat(100), &now_ts()));
+        }
+        w.flush(true);
+        let complete = spool.segment_len("live");
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(spool.segment("live"))
+                .unwrap();
+            f.write_all(b"{\"seq\":6,\"ts\"").unwrap();
+        }
+        let o = ShipOptions {
+            max_bytes: 10,
+            ..opts()
+        };
+        let r = ship_pass(&spool, None, o, Utc::now()).await;
+        assert_eq!(r.run("live").unwrap().view.dropped_lines, 5);
+        assert_eq!(spool.read_cursor("live").offset, complete);
+        w.end("live");
     }
 
     #[test]

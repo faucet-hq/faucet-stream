@@ -448,9 +448,11 @@ optional fields are commented out so connector defaults apply. The interactive
 mode (`--interactive`) is gated behind the `cli-interactive` feature.
 
 The scaffold sets `requires_faucet: ">=<major>.<minor>"` for the binary that
-wrote it, and `faucet init` pins that exact version in the `mise.toml` next to
-the output file: it creates the file, or adds the faucet entry to an existing
-one, and leaves an existing faucet pin alone. `--no-pin` skips the pin. See
+wrote it, and `faucet init` pins that exact version in the project's
+`mise.toml`: the nearest `mise.toml` / `.mise.toml` from the output's directory
+up to the project root (the directory holding `.git`), else a new `mise.toml`
+at that root, else one beside the output. It adds the faucet entry to an
+existing file and leaves an existing faucet pin alone. `--no-pin` skips the pin. See
 [Pinning the faucet version](../operations/pinning.md).
 
 **Singer discovery.** For the [Singer bridge](connectors.md) source, add
@@ -1222,8 +1224,9 @@ using the config's `observability.otel` collector and `observability.logs`
 settings; `--endpoint` / `--protocol` / `--spool` override them (with no config,
 `--endpoint` is required). Runs another process is shipping (its `.lock` is
 held) are left alone. Stops after `--timeout-secs` (default 60). The exit code
-is the number of runs still undelivered (0 = everything shipped) — suitable for
-a cron job or a sidecar.
+is the number of runs this pass left undelivered (0 = everything shipped);
+runs a live process is still writing are reported (`in_progress_elsewhere` in
+`--json`) but not counted — suitable for a cron job or a sidecar.
 
 ## `mirror`
 

@@ -301,7 +301,8 @@ history log store under `serve`, a spool directory (`observability.logs`) under
 `GET /v1/runs/{id}` and the console report `log_export`; `faucet run` prints a
 `logs:` line and adds `log_export` to `--output json`; `faucet logs ship
 [--spool DIR]` drains a spool (exit code = runs still undelivered). Serve
-flags: `--log-retention-secs` (default 24 h, kept *after* delivery),
+flags: `--log-retention-secs` (default 24 h kept *after* delivery; 7 days
+when logs are not shipped),
 `--log-buffer-max-age-secs`, `--log-buffer-max-bytes`, `--log-link-template`,
 `--log-export-notify-after-secs`. See the observability guide's *Shipping logs*.
 

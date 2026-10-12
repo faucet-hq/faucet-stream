@@ -270,6 +270,31 @@ pub fn severity_number(level: &str) -> i32 {
     }
 }
 
+/// A failed export, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportError {
+    /// The collector refused the payload itself (malformed / too large):
+    /// resending it unchanged can never succeed. Everything else — the
+    /// collector down, throttling, a credential problem — is retried.
+    pub payload_rejected: bool,
+    /// What may be stored and shown on a run: the status, never the
+    /// collector URL or response body.
+    pub message: String,
+    /// The full error, for the server log.
+    pub detail: String,
+}
+
+/// What `OtlpLogExporter::export_isolating` did with a batch.
+#[derive(Debug, Default)]
+pub struct ExportOutcome {
+    /// Leading lines delivered or dropped: the watermark may move past them.
+    pub handled: usize,
+    /// Of those, lines the collector rejected as malformed and were dropped.
+    pub dropped: u64,
+    /// Why the rest was not delivered.
+    pub error: Option<ExportError>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

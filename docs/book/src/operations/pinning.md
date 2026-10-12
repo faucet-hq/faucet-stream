@@ -61,8 +61,9 @@ added; `faucet validate` on the older release tells you whether you have to.
 ## The project pin
 
 `faucet init` also pins the exact version in the project's
-[`mise.toml`](https://mise.jdx.dev/configuration.html), next to the config it
-writes. It creates the file or adds the entry to an existing one (other tools
+[`mise.toml`](https://mise.jdx.dev/configuration.html): the nearest
+`mise.toml` / `.mise.toml` from the config's directory up to the project root
+(the directory holding `.git`), else a new one at that root. It creates the file or adds the entry to an existing one (other tools
 and comments are kept), and never replaces a faucet pin that is already there;
 `faucet init --no-pin` skips it. mise installs faucet straight from the GitHub
 release archives, verifying their build attestations:

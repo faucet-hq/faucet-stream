@@ -470,6 +470,32 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
     let (_, t) = api.get("viewer-tok", "/v1/templates/tpl-a").await;
     assert_eq!(t["stable"], 1, "{t}");
 
+    // A register whose launch is refused still stored the version, and the
+    // failed request says which one.
+    let failing = "kind: pipeline\nversion: 1\nname: tpl-b\npipeline:\n  source: { type: rest, config: { base_url: \"https://example.com\", path: /rows } }\n  sink: { type: jsonl, config: { path: ./out-b.jsonl } }\ntests:\n  fixtures:\n    - name: rows\n      input: [{ \"id\": 1 }]\n      expect: { records_written: 5 }\n";
+    let (code, change) = api
+        .post(
+            "bob-tok",
+            "/v1/changes",
+            json!({ "kind": "template_register", "payload": { "config": failing, "launch": true }, "reason": "new" }),
+        )
+        .await;
+    assert_eq!(code, 201, "{change}");
+    let fid = change["id"].as_str().unwrap().to_string();
+    let (code, failed) = api
+        .post(
+            "admin-tok",
+            &format!("/v1/changes/{fid}/approve"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(code, 200, "{failed}");
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["template"]["id"], "tpl-b", "{failed}");
+    assert_eq!(failed["template"]["version"], 1, "{failed}");
+    let (code, _) = api.get("viewer-tok", "/v1/templates/tpl-b?version=1").await;
+    assert_eq!(code, 200);
+
     // The MCP `propose_run` tool files a request as the caller.
     let (code, r) = api
         .post(

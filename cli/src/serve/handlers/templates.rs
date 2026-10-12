@@ -173,6 +173,7 @@ pub async fn register_template(
     .await
     .map_err(map_err)?;
     let after = registered.after.take();
+    let after_stage = registered.after_stage;
     let record = registered.record;
 
     // `config_fingerprint` carries the sha256 of the registered document — a
@@ -202,13 +203,8 @@ pub async fn register_template(
     // Stored and audited; a refused test run, channel or launch is still the
     // answer.
     if let Some(e) = after {
-        let action = match &e {
-            crate::error::CliError::VersionNotPassing { action, .. } if action == "launch" => {
-                "template.launch"
-            }
-            _ => "template.promote",
-        };
-        return Err(refused(&state, &actor, &record.id, action, e).await);
+        let stage = after_stage.unwrap_or(crate::templates::RegistrationStage::Channel);
+        return Err(refused_after_register(&state, &actor, &record, stage, e).await);
     }
     let mut summary = record.summary();
     // Data-flow policy (#702): a registered pipeline that would violate the
@@ -847,6 +843,54 @@ async fn refused(
     map_err(e)
 }
 
+/// A step after a registration failed: audit it under that step's action and
+/// say in the error that the version was stored.
+async fn refused_after_register(
+    state: &ServerState,
+    actor: &AuthContext,
+    record: &crate::serve::history::templates::TemplateRecord,
+    stage: crate::templates::RegistrationStage,
+    e: crate::error::CliError,
+) -> ServeError {
+    let outcome = if matches!(e, crate::error::CliError::VersionNotPassing { .. }) {
+        "refused"
+    } else {
+        "error"
+    };
+    crate::serve::audit::write_target(
+        state,
+        actor,
+        stage.audit_action(),
+        format!("template:{}@{}", record.id, record.version),
+        outcome,
+    )
+    .await;
+    registered_note(map_err(e), record.version)
+}
+
+/// Prefix an error's message with the version a registration stored, unless
+/// it already says so.
+fn registered_note(err: ServeError, version: u32) -> ServeError {
+    let note = |m: String| {
+        if m.contains(&format!("registered as v{version}")) {
+            m
+        } else {
+            format!("registered as v{version}, but {m}")
+        }
+    };
+    match err {
+        ServeError::Unprocessable { message, details } => ServeError::Unprocessable {
+            message: note(message),
+            details,
+        },
+        ServeError::Internal(m) => ServeError::Internal(note(m)),
+        ServeError::Unavailable(m) => ServeError::Unavailable(note(m)),
+        ServeError::BadConfig(m) => ServeError::BadConfig(note(m)),
+        ServeError::Conflict(m) => ServeError::Conflict(note(m)),
+        other => other,
+    }
+}
+
 /// `POST /v1/templates/{id}/rollback` → 200 / 404 / 422. Re-launches `previous`.
 pub async fn rollback_template(
     State(state): State<ServerState>,
@@ -1227,6 +1271,17 @@ const LABEL_SINK_TEMPLATE: &str = "sink_template";
 const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
 const LABEL_OVERLAY: &str = "overlay";
 const LABEL_OVERLAY_VERSION: &str = "overlay_version";
+/// Labels only the server stamps on a template-triggered run.
+const RESERVED_LABELS: &[&str] = &[
+    LABEL_TEMPLATE,
+    LABEL_TEMPLATE_VERSION,
+    LABEL_ALLOW_UNTESTED,
+    LABEL_SINK_TEMPLATE,
+    LABEL_SINK_TEMPLATE_VERSION,
+    LABEL_OVERLAY,
+    LABEL_OVERLAY_VERSION,
+    crate::select::LABEL_SELECTION,
+];
 
 /// `POST /v1/templates/{id}/runs` → 202 / 404 / 422 / 429.
 pub async fn trigger_template(
@@ -1236,6 +1291,9 @@ pub async fn trigger_template(
     Json(body): Json<TriggerBody>,
 ) -> Result<axum::response::Response, ServeError> {
     use axum::response::IntoResponse;
+    if actor.tenant.is_none() {
+        runner::refuse_reserved_idempotency_key(body.idempotency_key.as_deref())?;
+    }
     match trigger_template_outcome(state, actor, id, body).await? {
         TriggerOutcome::Run(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         // Approval first (#703): the trigger became a change request.
@@ -1385,6 +1443,9 @@ pub async fn trigger_template_outcome(
     }
 
     let mut labels = body.labels;
+    // Provenance labels are the server's to set: a caller's value never stands
+    // in for one this run did not earn.
+    labels.retain(|k, _| !RESERVED_LABELS.contains(&k.as_str()));
     labels.insert(LABEL_TEMPLATE.into(), materialized.template_id.clone());
     if let Some(status) = materialized.untested {
         labels.insert(LABEL_ALLOW_UNTESTED.into(), "true".into());
@@ -1956,6 +2017,90 @@ tests:
     }
 
     #[tokio::test]
+    async fn a_refused_launch_at_registration_is_audited_as_a_launch_and_names_the_version() {
+        let state = test_state();
+        let failing = "kind: pipeline\nversion: 1\nname: gated\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"https://example.com\"\n      path: /rows\n  sink:\n    type: jsonl\n    config:\n      path: ./out.jsonl\ntests:\n  fixtures:\n    - name: rows\n      input: [{ \"id\": 1 }]\n      expect: { records_written: 5 }\n";
+        let err = register_template(
+            State(state.clone()),
+            Extension(actor()),
+            Json(RegisterBody {
+                id: None,
+                config: failing.into(),
+                config_format: ConfigFormatWire::Yaml,
+                description: None,
+                tags: vec![],
+                launch: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let ServeError::Unprocessable { message, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains("registered as v1"), "{message}");
+        let entries = state
+            .history()
+            .list_audit(&AuditFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == "template.launch" && e.result == "refused"),
+            "{entries:?}"
+        );
+        assert!(!entries.iter().any(|e| e.action == "template.promote"));
+    }
+
+    #[test]
+    fn a_registration_error_names_the_stored_version_once() {
+        let note = |e| match registered_note(e, 3) {
+            ServeError::Internal(m) | ServeError::Unavailable(m) | ServeError::Conflict(m) => m,
+            ServeError::BadConfig(m) => m,
+            ServeError::Unprocessable { message, .. } => message,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            note(ServeError::Internal("boom".into())),
+            "registered as v3, but boom"
+        );
+        assert_eq!(
+            note(ServeError::Unavailable("db".into())),
+            "registered as v3, but db"
+        );
+        assert_eq!(
+            note(ServeError::Conflict("c".into())),
+            "registered as v3, but c"
+        );
+        assert_eq!(
+            note(ServeError::BadConfig("b".into())),
+            "registered as v3, but b"
+        );
+        assert_eq!(
+            note(ServeError::Unprocessable {
+                message: "registered as v3, but not labelled".into(),
+                details: None
+            }),
+            "registered as v3, but not labelled"
+        );
+        assert!(matches!(
+            registered_note(ServeError::NotFound, 3),
+            ServeError::NotFound
+        ));
+        assert_eq!(
+            crate::templates::RegistrationStage::Test.audit_action(),
+            "template.test"
+        );
+        assert_eq!(
+            crate::templates::RegistrationStage::Channel.audit_action(),
+            "template.promote"
+        );
+    }
+
+    #[tokio::test]
     async fn a_trigger_under_require_approval_becomes_a_change_request() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::serve::test_support::test_config();
@@ -2089,6 +2234,48 @@ tests:
         let state = test_state();
         register_demo(&state, &dir.path().join("o2.jsonl")).await;
         state
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_preset_provenance_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        register_demo(&state, &dir.path().join("o.jsonl")).await;
+        let labels = [
+            (LABEL_ALLOW_UNTESTED, "true"),
+            (LABEL_OVERLAY, "forged"),
+            (LABEL_TEMPLATE_VERSION, "99"),
+            ("team", "data"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let (_, resp) = trigger_pair(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                params: [("tag".to_string(), json!("alpha"))].into(),
+                labels,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger");
+        let rec = state
+            .history()
+            .get(&resp.0.run.run_id)
+            .await
+            .unwrap()
+            .expect("run record");
+        assert!(
+            !rec.labels.contains_key(LABEL_ALLOW_UNTESTED),
+            "{:?}",
+            rec.labels
+        );
+        assert!(!rec.labels.contains_key(LABEL_OVERLAY));
+        assert_eq!(rec.labels[LABEL_TEMPLATE_VERSION], "1");
+        assert_eq!(rec.labels["team"], "data");
     }
 
     #[tokio::test]

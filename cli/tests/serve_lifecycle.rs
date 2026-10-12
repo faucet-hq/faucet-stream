@@ -198,6 +198,15 @@ async fn idempotency_replays_and_conflicts() {
         409,
         "different payload with same idempotency key must return 409"
     );
+
+    // A key in a namespace the server derives keys in is refused.
+    let reserved = client
+        .post(format!("{base}/v1/runs"))
+        .json(&serde_json::json!({ "config": cfg, "idempotency_key": "tenant:acme:k1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reserved.status(), 400);
 }
 
 /// `doctor_first: true` with a source pointing at a nonexistent file must reject

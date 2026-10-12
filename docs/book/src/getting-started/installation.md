@@ -66,7 +66,9 @@ the catalog survive a restart). Not included — build from source for these:
 
 Every `faucet-cli` release publishes these images to
 `ghcr.io/faucet-hq/faucet-stream` (tags `:<profile>` and `:<version>-<profile>`;
-`:latest` and `:<version>` are `full`):
+`:latest` and `:<version>` are `full`). The floating `:<profile>` and
+`:latest` tags only ever point at the newest release; pin `:<version>-<profile>`
+for reproducible deploys:
 
 | Tag | What is compiled in |
 |---|---|

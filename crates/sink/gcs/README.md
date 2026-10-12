@@ -450,7 +450,7 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 |---|---|---|
 | `put` | each object upload | class A (`usage.pricing.object_storage.write_per_1k_requests`) |
 | `copy` | each `rewrite` call of an overwrite commit's promote | class A |
-| `list` | each object listing (append, overwrite pruning and commit) | read (`read_per_1k_requests`) |
+| `list` | each object listing (append, overwrite pruning and commit) | class A (`write_per_1k_requests`) |
 | `head` | each metadata read (existence checks) | read |
 | `delete` | each object delete | free (GCS does not bill deletes) |
 

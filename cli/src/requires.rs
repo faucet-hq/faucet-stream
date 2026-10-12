@@ -21,6 +21,19 @@ pub fn default_requirement() -> String {
     format!(">={}.{}", v.major, v.minor)
 }
 
+/// The conjunction of several requirements (semver's `, `), duplicates
+/// dropped; `None` when none is given. A document composed from several
+/// templates requires everything each of them requires.
+pub fn conjoin<'a>(reqs: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for r in reqs.into_iter().map(str::trim).filter(|r| !r.is_empty()) {
+        if !parts.contains(&r) {
+            parts.push(r);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 /// Check `doc`'s top-level `requires_faucet`, if any, against this binary.
 pub fn check_document(doc: &Value, what: &str) -> CliResult<()> {
     match doc.get(KEY) {
@@ -115,6 +128,17 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn requirements_conjoin_without_duplicates() {
+        assert_eq!(conjoin([]), None);
+        assert_eq!(conjoin([" ", ""]), None);
+        assert_eq!(conjoin([">=1.13"]).as_deref(), Some(">=1.13"));
+        let both = conjoin([">=1.13", " >=1.13 ", "<2"]).unwrap();
+        assert_eq!(both, ">=1.13, <2");
+        assert!(check_against(&both, &v("1.14.0"), "pipeline").is_ok());
+        assert!(check_against(&both, &v("2.0.0"), "pipeline").is_err());
     }
 
     #[test]

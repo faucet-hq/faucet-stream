@@ -178,14 +178,16 @@ pub async fn submit_gated(
 pub(crate) const IDEMPOTENCY_CONFLICT: &str = "idempotency key reused with a different payload";
 
 /// Refuse a write that would bypass `--require-approval run` (#789
-/// SERVE-18): verify repair and DLQ replay write to a sink outside the run
-/// queue, so under approval they must be proposed as a `run` change instead.
+/// SERVE-18): verify repair, DLQ replay and run rollback write to a sink
+/// outside the run queue, and no change-request kind expresses them, so under
+/// approval they are disabled (a dry run still works).
 pub(crate) fn refuse_unapproved_write(state: &ServerState, what: &str) -> Result<(), ServeError> {
     if state.requires_approval(crate::serve::changes::ChangeKind::Run) {
         return Err(ServeError::Forbidden(format!(
             "this server requires an approved change request for runs (--require-approval run); \
-             {what} writes to the destination, so propose the run through POST /v1/changes \
-             (or use dry_run)"
+             {what} writes to the destination outside the run queue and cannot be proposed as a \
+             change request, so it is disabled on this server — use dry_run to see what it \
+             would do, or run it from the CLI or a server without --require-approval run"
         )));
     }
     Ok(())
@@ -1272,7 +1274,8 @@ pub async fn submit(
         // direction; either retries.
         #[cfg(feature = "tenants")]
         if let Some(t) = rec.tenant.as_deref()
-            && let Some(msg) = crate::serve::tenants::over_limit(&state, t).await?
+            && let Some(msg) =
+                recount_refusal(t, crate::serve::tenants::over_limit(&state, t).await)
             && state
                 .history()
                 .cancel_pending(&run_id)
@@ -1482,6 +1485,31 @@ async fn replay_response(
         status: rec.status,
         submitted_at: rec.submitted_at,
     })
+}
+
+/// Prefixes of the idempotency keys the server derives itself (tenant
+/// namespaces, trigger fires, backfill units, approved changes).
+pub(crate) const RESERVED_IDEMPOTENCY_PREFIXES: &[&str] =
+    &["tenant:", "trig:", "backfill:", "change:"];
+
+/// Refuse a caller's idempotency key in a namespace the server derives keys
+/// in: an unscoped caller could otherwise occupy a tenant's key or a
+/// trigger's fire and turn the real one into a replay of its run.
+pub(crate) fn refuse_reserved_idempotency_key(key: Option<&str>) -> Result<(), ServeError> {
+    match key {
+        Some(k)
+            if RESERVED_IDEMPOTENCY_PREFIXES
+                .iter()
+                .any(|p| k.starts_with(p)) =>
+        {
+            Err(ServeError::BadConfig(format!(
+                "idempotency_key '{k}' uses a prefix the server reserves for its own keys \
+                 ({}); choose another key",
+                RESERVED_IDEMPOTENCY_PREFIXES.join(", ")
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The key an idempotency claim is stored under: a tenant's keys live in
@@ -2288,9 +2316,55 @@ fn schedule_log_drop(state: ServerState, run_id: String) {
     });
 }
 
+/// The cluster re-count's verdict once the run is recorded: the refusal
+/// message when the tenant is over its limit. A failed re-count admits the run
+/// (logged) — the record already exists and a peer may have claimed it, so an
+/// error here must not report a failure for a run that will still execute.
+#[cfg(feature = "tenants")]
+fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) -> Option<String> {
+    match recount {
+        Ok(refusal) => refusal,
+        Err(e) => {
+            tracing::warn!(
+                tenant,
+                error = %e,
+                "could not re-count the tenant's runs after recording a clustered run; admitting it"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_idempotency_keys_stay_out_of_the_server_namespaces() {
+        assert!(refuse_reserved_idempotency_key(None).is_ok());
+        assert!(refuse_reserved_idempotency_key(Some("nightly-2026-10-12")).is_ok());
+        for k in ["tenant:acme:k", "trig:t:1", "backfill:h:u", "change:c1"] {
+            let err = refuse_reserved_idempotency_key(Some(k)).unwrap_err();
+            assert!(
+                matches!(err, ServeError::BadConfig(ref m) if m.contains(k)),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tenants")]
+    #[test]
+    fn a_failed_cluster_recount_admits_the_recorded_run() {
+        assert_eq!(recount_refusal("acme", Ok(None)), None);
+        assert_eq!(
+            recount_refusal("acme", Ok(Some("over".into()))).as_deref(),
+            Some("over")
+        );
+        assert_eq!(
+            recount_refusal("acme", Err(ServeError::Internal("db".into()))),
+            None
+        );
+    }
 
     /// A stand-in admin actor for the submit() tests.
     fn admin_actor() -> AuthContext {

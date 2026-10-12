@@ -121,7 +121,7 @@ The `lineage:` block deserializes into [`LineageConfig`]. Unknown top-level fiel
 |---------|------------------------------------------|-----------------|
 | `http`  | OpenLineage HTTP endpoint (e.g. Marquez) | `url` *(required)*, `timeout_secs` (default `10`), `auth` (optional — see below). `POST`s one event per call; a non-2xx response is logged and dropped. |
 | `file`  | Local JSON Lines file                    | `path` *(required)*. Appends one JSON object per line; parent directories are created. |
-| `kafka` | Kafka topic                              | `brokers` *(required)*, `topic` *(required)*. One JSON message per event; delivery is bounded at 10 s per event. **Requires the `transport-kafka` feature.** |
+| `kafka` | Kafka topic                              | `brokers` *(required)*, `topic` *(required)*. One JSON message per event; delivery takes at most 10 s per event (plus up to 10 s more when the producer queue is full). **Requires the `transport-kafka` feature.** |
 
 ```yaml
 # HTTP — POST to an OpenLineage endpoint

@@ -90,6 +90,30 @@ pub struct Registration {
     /// What failed after the version was stored — its test run, a channel or
     /// the launch. The version stays registered either way.
     pub after: Option<CliError>,
+    /// Which step `after` came from.
+    pub after_stage: Option<RegistrationStage>,
+}
+
+/// A step a registration runs after the version is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationStage {
+    /// The version's test bundle run.
+    Test,
+    /// Pointing a requested channel at the version.
+    Channel,
+    /// The requested launch.
+    Launch,
+}
+
+impl RegistrationStage {
+    /// The audit action a refusal at this step is recorded under.
+    pub fn audit_action(self) -> &'static str {
+        match self {
+            RegistrationStage::Test => "template.test",
+            RegistrationStage::Channel => "template.promote",
+            RegistrationStage::Launch => "template.launch",
+        }
+    }
 }
 
 /// A template rendered for one trigger: a config document with every
@@ -536,6 +560,7 @@ pub async fn register_staged(
         tests_inherited_from,
         launch: None,
         after: None,
+        after_stage: None,
     };
     if bundle.is_some() {
         match Box::pin(crate::templates::bundle::test_version(
@@ -546,9 +571,13 @@ pub async fn register_staged(
         ))
         .await
         {
-            Ok(t) => out.tests = Some(t),
+            Ok(t) => {
+                refuse_caseless_after_launch(store, &out.record, &t).await?;
+                out.tests = Some(t)
+            }
             Err(e) => {
                 out.after = Some(e);
+                out.after_stage = Some(RegistrationStage::Test);
                 return Ok(out);
             }
         }
@@ -584,6 +613,7 @@ pub async fn register_staged(
         .await
         {
             out.after = Some(registered(e));
+            out.after_stage = Some(RegistrationStage::Channel);
             return Ok(out);
         }
     }
@@ -598,7 +628,10 @@ pub async fn register_staged(
         .await
         {
             Ok(l) => out.launch = Some(l),
-            Err(e) => out.after = Some(registered(e)),
+            Err(e) => {
+                out.after = Some(registered(e));
+                out.after_stage = Some(RegistrationStage::Launch);
+            }
         }
     }
     Ok(out)
@@ -629,6 +662,37 @@ pub(crate) async fn refuse_if_launched_meanwhile(
         "template '{}' was launched while this version was being registered, and the \
          version carries no `tests:` block — register it again so it inherits the launched \
          template's tests",
+        record.id
+    )))
+}
+
+/// A launched template's new versions must be tested: a `tests:` block that
+/// generates no cases tests nothing, so the version just stored is deleted
+/// and the registration refused (an absent block inherits instead).
+pub(crate) async fn refuse_caseless_after_launch(
+    store: &TemplateStore,
+    record: &TemplateRecord,
+    result: &crate::serve::history::templates::TemplateTestResult,
+) -> CliResult<()> {
+    let caseless = result.cases.is_empty()
+        && result.error.as_deref() == Some(crate::template_tests::gate::NO_CASES);
+    if !caseless
+        || store
+            .template_launches(record.id.as_str())
+            .await
+            .map_err(|e| registry_err("template registry read", e))?
+            .is_empty()
+    {
+        return Ok(());
+    }
+    store
+        .template_delete(&record.id, Some(record.version))
+        .await
+        .map_err(|e| registry_err("template registry write", e))?;
+    Err(CliError::Config(format!(
+        "template '{}' is launched, and this version's `tests:` block generates no cases — \
+         every new version of a launched template must be tested: give the block a case, or \
+         drop it so the version inherits the launched template's tests",
         record.id
     )))
 }

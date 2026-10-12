@@ -196,7 +196,7 @@ impl ConnectProviders {
         let mut map = BTreeMap::new();
         for p in file.providers {
             p.validate()?;
-            crate::secrets::registry::register(&p.client_secret);
+            crate::secrets::registry::register_pinned(&p.client_secret);
             if map.contains_key(&p.name) {
                 return Err(format!("duplicate provider '{}'", p.name));
             }

@@ -283,7 +283,8 @@ observability:
 | `faucet schedule` | The same spool; every tick is a run. | A background task for the process lifetime, draining between ticks. |
 
 `faucet serve` reads its settings from flags (each also an env var):
-`--log-retention-secs` (default 86400), `--log-buffer-max-age-secs`,
+`--log-retention-secs` (default 86400 with shipping on, 604800 without),
+`--log-buffer-max-age-secs`,
 `--log-buffer-max-bytes`, `--log-link-template`,
 `--log-export-notify-after-secs`, with `export: [logs]` in `--otel-config`.
 
@@ -305,6 +306,11 @@ observability:
   `buffer_max_bytes` (or the per-run line cap) the oldest undelivered lines are
   dropped, counted in `faucet_logs_dropped_lines_total{reason}`, and the run is
   reported `partially_dropped`.
+- **A malformed line never blocks a run.** When the collector refuses a batch
+  as malformed (HTTP `400` / `413` / `422`, gRPC `InvalidArgument`), the batch
+  is split until the offending line is found; that line is dropped (`reason`
+  `rejected`) and the rest delivered. Every other failure — the collector down,
+  throttling, a credential problem — is retried and nothing is dropped.
 
 ### Was a run's log shipped?
 
@@ -312,13 +318,14 @@ observability:
 
 ```json
 { "status": "failed", "delivered_seq": 7338097199674630147, "pending_lines": 4,
-  "dropped_lines": 0, "last_error": "OTLP HTTP export … failed",
+  "dropped_lines": 0, "last_error": "OTLP HTTP export returned 503 Service Unavailable",
   "last_attempt_at": "2026-10-09T06:34:13Z",
   "link": "https://grafana.example/explore?q=01a11f5e-…" }
 ```
 
 `status` is one of `not_configured`, `pending`, `exported`, `failed`,
-`partially_dropped`. The console's run page shows it as a **Log export** panel,
+`partially_dropped`. `last_error` carries the status only — never the
+collector's URL or response body, which go to the server log. The console's run page shows it as a **Log export** panel,
 with **View logs ↗** built from the link template; once a run's local copy has
 aged out, the log endpoint returns that link (and the SSE stream opens with a
 `link` event) instead of nothing. `faucet run` prints `logs: exported` or
@@ -327,7 +334,7 @@ aged out, the log endpoint returns that link (and the SSE stream opens with a
 
 `faucet logs ship [CONFIG] [--spool DIR] [--endpoint URL] [--protocol grpc|http]`
 drains a spool once (a cron job or sidecar); its exit code is the number of runs
-still undelivered.
+it left undelivered, not counting runs a live process is still writing.
 
 A `log_export_failed` notification goes through the run's `notifications:`
 when its export has been failing for `notify_after_secs`, and when lines were
@@ -341,7 +348,7 @@ dropped.
 | `faucet_logs_buffered_bytes` | — | Bytes of those lines. |
 | `faucet_logs_oldest_undelivered_seconds` | — | Age of the oldest undelivered line. |
 | `faucet_logs_shipped_lines_total` | — | Lines the collector acknowledged. |
-| `faucet_logs_dropped_lines_total` | `reason` (`max_age`/`max_bytes`/`max_lines`/`queue_full`) | Lines dropped before delivery. |
+| `faucet_logs_dropped_lines_total` | `reason` (`max_age`/`max_bytes`/`max_lines`/`queue_full`/`rejected`) | Lines dropped before delivery. |
 | `faucet_logs_export_errors_total` | — | Failed export attempts (also `faucet_otel_export_failures_total{signal="logs"}`). |
 | `faucet_logs_local_write_failures_total` | — | Lines that could not be written to the local buffer. |
 

@@ -211,6 +211,8 @@ For `postgres-cdc`, position capture uses a **permanent** replication slot
 (`slot_type: permanent`, the default), which retains WAL across the snapshot.
 `slot_type: temporary` is refused at config load: a temporary slot is dropped
 with the session that creates it, before replication could start.
+The server must be **PostgreSQL 14 or newer** (the stream uses the pgoutput
+`messages` option).
 
 A `postgres-cdc` fetch cycle also ends at the first transaction boundary after
 `max_cycle_duration` (default 300 s), even under steady writes, because the
