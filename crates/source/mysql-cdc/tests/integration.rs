@@ -434,6 +434,41 @@ async fn capture_resume_position_returns_file_and_pos() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_refuses_while_an_xa_transaction_is_prepared() {
+    let (_container, url) = start_mysql_cdc().await;
+    let mut conn = connect(&url).await;
+    for sql in [
+        "CREATE TABLE test.xa (id INT PRIMARY KEY)",
+        "XA START 'pending'",
+        "INSERT INTO test.xa VALUES (1)",
+        "XA END 'pending'",
+        "XA PREPARE 'pending'",
+    ] {
+        conn.query_drop(sql).await.expect(sql);
+    }
+    let source = MysqlCdcSource::new(build_config(&url))
+        .await
+        .expect("source");
+    let err = source
+        .capture_resume_position()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("XA transaction(s) are prepared (pending)"),
+        "{err}"
+    );
+    conn.query_drop("XA COMMIT 'pending'")
+        .await
+        .expect("commit");
+    source
+        .capture_resume_position()
+        .await
+        .expect("capture after the XA commits")
+        .expect("position");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capture_resume_position_works_on_mysql_8_4() {
     // MySQL 8.4 removed `SHOW MASTER STATUS` (replaced by `SHOW BINARY LOG
     // STATUS`). The CDC source must capture the current binlog coordinates on

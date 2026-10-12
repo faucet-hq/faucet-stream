@@ -145,6 +145,9 @@ impl Source for MysqlCdcSource {
         let mut conn = Conn::new(self.opts.clone()).await.map_err(|e| {
             FaucetError::Source(format!("mysql-cdc: capture_position connect: {e}"))
         })?;
+        if let Some(xids) = prepared_xa(&mut conn).await {
+            refuse_prepared_xa(&xids)?;
+        }
         let (file, pos) = current_binlog_position(&mut conn).await?;
         drop(conn);
         Ok(Some(Bookmark::FilePos { file, pos }.to_value()?))
@@ -748,6 +751,46 @@ fn binlog_distance(logs: &[(String, u64)], from: (&str, u64), head: (&str, u64))
 ///
 /// A statement that *runs* but returns no rows means binary logging is disabled
 /// — that is a definitive answer, so we surface it rather than falling back.
+/// The XA transactions currently prepared, or `None` when the server refuses
+/// `XA RECOVER` (it needs `XA_RECOVER_ADMIN` on MySQL 8.0+).
+async fn prepared_xa(conn: &mut Conn) -> Option<Vec<String>> {
+    match conn.query::<Row, _>("XA RECOVER").await {
+        Ok(rows) => Some(
+            rows.into_iter()
+                .map(|r| {
+                    r.get::<Vec<u8>, _>(3)
+                        .map(|d| String::from_utf8_lossy(&d).into_owned())
+                        .unwrap_or_default()
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                connector = "mysql-cdc",
+                error = %e,
+                "cannot list prepared XA transactions (XA RECOVER needs XA_RECOVER_ADMIN); \
+                 one prepared before this capture would be missed"
+            );
+            None
+        }
+    }
+}
+
+/// A position captured while an XA transaction is prepared lies between its
+/// PREPARE and COMMIT: the snapshot cannot see its rows and the stream starts
+/// after them, so they would be lost.
+fn refuse_prepared_xa(xids: &[String]) -> Result<(), FaucetError> {
+    if xids.is_empty() {
+        return Ok(());
+    }
+    Err(FaucetError::Source(format!(
+        "mysql-cdc: {} XA transaction(s) are prepared ({}); a position captured now would miss \
+         their rows. Commit or roll them back (XA RECOVER lists them) and retry",
+        xids.len(),
+        xids.join(", ")
+    )))
+}
+
 async fn current_binlog_position(conn: &mut Conn) -> Result<(String, u64), FaucetError> {
     let (row, stmt): (Option<Row>, &str) = match conn.query_first("SHOW BINARY LOG STATUS").await {
         Ok(row) => (row, "SHOW BINARY LOG STATUS"),
@@ -1338,6 +1381,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_prepared_xa_refuses_the_capture() {
+        assert!(refuse_prepared_xa(&[]).is_ok());
+        let err = refuse_prepared_xa(&["a".into(), "b".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 XA transaction(s) are prepared (a, b)"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn events_inside_a_compressed_transaction_take_the_payload_end() {
