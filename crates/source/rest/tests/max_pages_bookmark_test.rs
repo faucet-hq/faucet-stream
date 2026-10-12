@@ -107,6 +107,38 @@ async fn an_ordered_truncated_pass_persists_the_largest_key_read() {
 }
 
 #[tokio::test]
+async fn an_ordered_truncated_requests_entry_fails_instead_of_stalling() {
+    let server = two_page_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .pagination(cursor())
+        .max_pages(1)
+        .assume_ordered(true)
+        .add_partition(HashMap::from([("region".to_string(), json!("eu"))]))
+        .add_partition(HashMap::from([("region".to_string(), json!("us"))]));
+    let (records, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
+
+    assert_eq!(records.len(), 4, "every entry's fetched page is delivered");
+    let err = outcome.expect_err("an unconsolidated bookmark must not be a silent stall");
+    assert!(err.contains("`requests:`"), "{err}");
+}
+
+#[tokio::test]
+async fn a_truncated_full_table_requests_run_persists_nothing_and_succeeds() {
+    let server = two_page_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .pagination(cursor())
+        .max_pages(1)
+        .add_partition(HashMap::from([("region".to_string(), json!("eu"))]));
+    let (records, bookmark) = drain(&RestStream::new(config).unwrap()).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(bookmark, None);
+}
+
+#[tokio::test]
 async fn a_truncated_pass_keeps_a_persisted_cursor() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
