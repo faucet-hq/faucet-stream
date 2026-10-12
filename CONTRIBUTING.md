@@ -237,6 +237,10 @@ release-plz release    --dry-run     # prints what it would publish, in order
   with `contents: write` + `pull-requests: write`. Without it the release PR
   is opened by the default `GITHUB_TOKEN`, which by GitHub policy does **not**
   trigger downstream workflow runs — CI won't run on the release PR.
+- `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` (optional) — a read-only Docker Hub
+  token. CI pulls Docker Hub images through `mirror.gcr.io`; with these set,
+  images the mirror lacks (and the image builds) pull authenticated instead of
+  hitting the anonymous rate limit.
 
 ## License
 
