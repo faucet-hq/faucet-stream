@@ -486,8 +486,47 @@ fn bind_bookmark(
 ) -> (String, Vec<Value>) {
     let mut context = context.clone();
     context.insert(BOOKMARK_KEY.into(), start.clone());
-    let query = query.replace(BOOKMARK_TOKEN, &format!("{{{BOOKMARK_KEY}}}"));
+    let query = replace_bookmark_token(query, &format!("{{{BOOKMARK_KEY}}}"));
     faucet_core::util::substitute_context_bind_params(&query, &context, 1, |_| "?".to_string())
+}
+
+/// `query` with every `@bookmark` token replaced by `with` — only where the
+/// token is not part of a longer identifier (`@bookmark_2`) and not inside a
+/// quoted string or identifier.
+fn replace_bookmark_token(query: &str, with: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    let mut quote: Option<char> = None;
+    let mut rest = query;
+    while let Some(c) = rest.chars().next() {
+        if let Some(q) = quote {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            if c == '\\' && q != '`' {
+                if let Some(n) = rest.chars().next() {
+                    out.push(n);
+                    rest = &rest[n.len_utf8()..];
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+        } else if let Some(after) = rest.strip_prefix(BOOKMARK_TOKEN)
+            && !after
+                .chars()
+                .next()
+                .is_some_and(|n| n.is_alphanumeric() || matches!(n, '_' | '$'))
+        {
+            out.push_str(with);
+            rest = after;
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 /// `inner` filtered to `column >= ?`.
@@ -1027,6 +1066,24 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bookmark_token_is_replaced_only_as_a_whole_unquoted_word() {
+        assert_eq!(
+            replace_bookmark_token(
+                "SELECT * FROM t WHERE a >= @bookmark AND b = @bookmark_2 AND c = '@bookmark' \
+                 AND `@bookmark` = 1 AND d = 'it\\'s @bookmark' AND e <= @bookmark",
+                "{B}"
+            ),
+            "SELECT * FROM t WHERE a >= {B} AND b = @bookmark_2 AND c = '@bookmark' \
+             AND `@bookmark` = 1 AND d = 'it\\'s @bookmark' AND e <= {B}"
+        );
+        assert_eq!(replace_bookmark_token("x=@bookmark", "?"), "x=?");
+        assert_eq!(
+            replace_bookmark_token("é @bookmark$x", "?"),
+            "é @bookmark$x"
+        );
+    }
 
     #[test]
     fn time_keeps_sign_and_long_hours() {
