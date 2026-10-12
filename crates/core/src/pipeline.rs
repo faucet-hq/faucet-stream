@@ -481,6 +481,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             &row,
             self.usage_meter.as_ref(),
         );
+        let source_drains_on_cancel = self
+            .cancel
+            .as_ref()
+            .is_some_and(|token| wrapped_source.set_cancel(token.clone()));
         let wrapped_state_store: Option<Arc<dyn StateStore>> = self.state_store.as_ref().map(|s| {
             Arc::new(InstrumentedStateStore::new(
                 Arc::clone(s),
@@ -882,6 +886,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             // shared staging table each parent — the silent data-loss bug.
             let extras = StreamExtras {
                 batch_outcomes: self.batch_outcomes.clone(),
+                source_drains_on_cancel,
             };
             let overwriting = wrapped_sink.is_overwrite() && !self.suppress_overwrite_lifecycle;
             if overwriting {
@@ -1387,6 +1392,9 @@ where
 #[derive(Default)]
 pub(crate) struct StreamExtras {
     pub(crate) batch_outcomes: Option<Arc<crate::dlq::BatchOutcomeCounters>>,
+    /// The source answered [`Source::set_cancel`] with `true`: on cancel it
+    /// yields what it buffered and ends, so the loop keeps polling to the end.
+    pub(crate) source_drains_on_cancel: bool,
 }
 
 pub(crate) async fn run_stream_with<S, Si>(
@@ -1408,6 +1416,7 @@ where
     let run_id = options.run_id.unwrap_or_default();
     let dlq = options.dlq.clone();
     let cancel = options.cancel.clone();
+    let source_drains = extras.source_drains_on_cancel;
 
     #[cfg(feature = "quality")]
     let quality = options.quality.clone();
@@ -1683,7 +1692,7 @@ where
             // so a cancel between pages stops the run promptly and cleanly
             // (#146 H16). `biased` checks cancellation first each iteration.
             let page = match &cancel {
-                Some(token) => tokio::select! {
+                Some(token) if !source_drains => tokio::select! {
                     biased;
                     _ = token.cancelled() => {
                         cancelled = true;
@@ -1691,7 +1700,7 @@ where
                     }
                     p = std::future::poll_fn(|cx| Pin::new(&mut pages).poll_next(cx)) => p,
                 },
-                None => std::future::poll_fn(|cx| Pin::new(&mut pages).poll_next(cx)).await,
+                _ => std::future::poll_fn(|cx| Pin::new(&mut pages).poll_next(cx)).await,
             };
             match page {
                 Some(Ok(page)) => {
@@ -2321,7 +2330,10 @@ where
                     }
                 }
                 Some(Err(e)) => return Err(e),
-                None => break,
+                None => {
+                    cancelled |= source_drains && cancel.as_ref().is_some_and(|t| t.is_cancelled());
+                    break;
+                }
             }
         }
         Ok(())
@@ -3272,6 +3284,76 @@ mod tests {
                 .unwrap()
                 .contains(&"complete".to_string())
         );
+    }
+
+    /// Buffers its tail until the run is cancelled, then yields it and ends.
+    struct DrainingSource {
+        drains: bool,
+        cancel: std::sync::Mutex<Option<crate::CancellationToken>>,
+    }
+
+    #[async_trait]
+    impl Source for DrainingSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn set_cancel(&self, cancel: crate::CancellationToken) -> bool {
+            *self.cancel.lock().unwrap() = Some(cancel);
+            self.drains
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _ctx: &'a std::collections::HashMap<String, Value>,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+            let token = self.cancel.lock().unwrap().clone().unwrap_or_default();
+            Box::pin(async_stream::stream! {
+                token.cancelled().await;
+                yield Ok(StreamPage { records: vec![json!({"tail": 1}), json!({"tail": 2})], bookmark: None });
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_drains_on_cancel_has_its_buffered_tail_written() {
+        let source = DrainingSource {
+            drains: true,
+            cancel: std::sync::Mutex::new(None),
+        };
+        let (sink, events) = OverwriteRecordingSink::new(false, false);
+        let token = crate::CancellationToken::new();
+        let pipeline = Pipeline::new(&source, &sink).with_cancel(token.clone());
+        let run = pipeline.run();
+        let cancel_soon = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(run, cancel_soon);
+        assert_eq!(result.unwrap().records_written, 2);
+        let log = events.lock().unwrap().clone();
+        assert!(log.contains(&"write:2".to_string()), "{log:?}");
+        assert!(!log.contains(&"complete".to_string()), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn a_source_that_ignores_cancel_is_stopped_at_the_page_boundary() {
+        let source = DrainingSource {
+            drains: false,
+            cancel: std::sync::Mutex::new(None),
+        };
+        let sink = MockSink::new();
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let result = Pipeline::new(&source, &sink)
+            .with_cancel(token)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(result.records_written, 0);
+        assert!(sink.written().is_empty());
     }
 
     #[tokio::test]
@@ -7650,6 +7732,7 @@ mod tests {
             ),
             StreamExtras {
                 batch_outcomes: Some(Arc::clone(&counters)),
+                ..StreamExtras::default()
             },
         )
         .await
@@ -7681,6 +7764,7 @@ mod tests {
                 .with_delivery(crate::idempotency::DeliveryMode::ExactlyOnce),
             StreamExtras {
                 batch_outcomes: Some(Arc::clone(&eo)),
+                ..StreamExtras::default()
             },
         )
         .await

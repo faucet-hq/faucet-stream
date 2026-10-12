@@ -6,8 +6,9 @@
 //! endpoint, optionally sends one or more subscription frames, and streams
 //! each incoming message as a record until `max_messages` or `idle_timeout`
 //! ends the run. A cancelled run (Ctrl-C under `faucet run`, a cancel in
-//! `schedule`/`serve`) stops at a page boundary: messages received since the
-//! last page are not written — size `batch_size` for what a live feed may lose.
+//! `schedule`/`serve`, any [`Pipeline::with_cancel`](faucet_core::Pipeline::with_cancel)
+//! token) stops reading and writes the messages buffered since the last page
+//! before it ends (the source opts in through `Source::set_cancel`).
 
 pub mod config;
 pub mod stream;

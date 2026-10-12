@@ -492,6 +492,20 @@ pub trait Source: Send + Sync {
     /// by storing the instant behind interior mutability.
     fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {}
 
+    /// Receive the run's cancellation token ([`Pipeline::with_cancel`](crate::Pipeline::with_cancel)),
+    /// installed once before streaming.
+    ///
+    /// Return `true` when the source handles the cancel itself: it stops
+    /// reading, yields the records it has buffered and ends its stream
+    /// promptly. The pipeline then keeps polling the stream to its end instead
+    /// of stopping at the next page boundary, so that buffered tail is
+    /// written. A source that buffers records it cannot re-read (a live feed)
+    /// opts in; the default ignores the token and returns `false`. A wrapping
+    /// source forwards the call and returns the inner source's answer.
+    fn set_cancel(&self, _cancel: tokio_util::sync::CancellationToken) -> bool {
+        false
+    }
+
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).
     ///

@@ -3906,6 +3906,12 @@ impl Source for StateKeyOverride {
     fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
         self.inner.set_run_clock(now);
     }
+
+    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
+
+        self.inner.set_cancel(cancel)
+
+    }
     fn state_key(&self) -> Option<String> {
         Some(self.key.clone())
     }
@@ -4039,6 +4045,9 @@ impl Source for BindContextSource {
     }
     fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
         self.inner.set_run_clock(now);
+    }
+    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
+        self.inner.set_cancel(cancel)
     }
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
@@ -4576,6 +4585,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl faucet_core::Source for RoutedSource {
+        fn set_cancel(&self, _cancel: faucet_core::CancellationToken) -> bool {
+            true
+        }
         async fn fetch_with_context(
             &self,
             _ctx: &std::collections::HashMap<String, serde_json::Value>,
@@ -4640,6 +4652,7 @@ mod tests {
         };
         assert_forwards_multi_table_hooks(&wrapped);
         wrapped.set_run_clock(chrono::Utc::now());
+        assert!(wrapped.set_cancel(faucet_core::CancellationToken::new()));
     }
 
     /// #644 — dispatch order.
@@ -7883,6 +7896,7 @@ mod bind_and_dlq_tests {
 
         assert_eq!(src.connector_name(), name);
         assert_eq!(src.dataset_uri(), uri);
+        assert!(!src.set_cancel(faucet_core::CancellationToken::new()));
         assert_eq!(src.state_key(), key);
         assert_eq!(src.state_schema(), schema);
         assert!(!src.consumes_destructively());

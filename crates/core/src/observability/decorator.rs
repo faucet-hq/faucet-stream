@@ -148,6 +148,12 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         self.inner.set_run_clock(now);
     }
 
+    fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
+
+        self.inner.set_cancel(cancel)
+
+    }
+
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
     }
@@ -934,6 +940,9 @@ pub(crate) mod source_tests {
 
     #[async_trait::async_trait]
     impl crate::Source for RoutedSource {
+        fn set_cancel(&self, _cancel: tokio_util::sync::CancellationToken) -> bool {
+            true
+        }
         async fn fetch_with_context(
             &self,
             _ctx: &std::collections::HashMap<String, serde_json::Value>,
@@ -996,6 +1005,7 @@ pub(crate) mod source_tests {
         let wrapped = InstrumentedSource::new(&inner, labels());
         assert_forwards_multi_table_hooks(&wrapped);
         wrapped.set_run_clock(chrono::Utc::now());
+        assert!(wrapped.set_cancel(tokio_util::sync::CancellationToken::new()));
     }
 
     // Process-global recorder shared across all observability tests in this

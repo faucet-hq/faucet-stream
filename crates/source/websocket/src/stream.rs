@@ -4,7 +4,8 @@ use crate::config::{WebsocketAuth, WebsocketSourceConfig, decode_frame, shape_re
 use async_trait::async_trait;
 use base64::Engine;
 use faucet_core::{
-    AuthSpec, Credential, FaucetError, SharedAuthProvider, Source, Stream, StreamPage,
+    AuthSpec, CancellationToken, Credential, FaucetError, SharedAuthProvider, Source, Stream,
+    StreamPage,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -67,6 +68,15 @@ fn rejecting_close(frame: Option<&CloseFrame>) -> Option<FaucetError> {
 /// ceiling field (#654 M6). [`faucet_core::retry::backoff_with_jitter`] supplies
 /// both the ceiling and the decorrelating jitter, so many clients watching one
 /// feed don't all redial on the same tick. Pure.
+/// Sleep `delay`, returning early when the run is cancelled.
+async fn sleep_or_cancel(delay: Duration, cancel: &CancellationToken) {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {}
+        () = tokio::time::sleep(delay) => {}
+    }
+}
+
 fn reconnect_delay(base: Duration, attempt: usize) -> Duration {
     faucet_core::retry::backoff_with_jitter(base, u32::try_from(attempt).unwrap_or(u32::MAX))
 }
@@ -129,6 +139,9 @@ pub struct WebsocketSource {
     /// resolved on every (re)connect so a freshly-rotated token is used after
     /// reconnect. Takes precedence over inline auth.
     auth_provider: Option<SharedAuthProvider>,
+    /// The run's cancellation token ([`Source::set_cancel`]): on cancel the
+    /// stream stops reading and yields what it has buffered.
+    cancel: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl WebsocketSource {
@@ -140,6 +153,7 @@ impl WebsocketSource {
         Ok(Self {
             config,
             auth_provider: None,
+            cancel: std::sync::Mutex::new(None),
         })
     }
 
@@ -263,6 +277,12 @@ impl Source for WebsocketSource {
         let format = self.config.message_format;
         let on_parse_error = self.config.on_parse_error;
         let envelope = self.config.envelope;
+        let cancel = self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
 
         Box::pin(async_stream::try_stream! {
             let mut buffer: Vec<Value> = Vec::new();
@@ -271,6 +291,9 @@ impl Source for WebsocketSource {
             let mut reconnect_attempts: usize = 0;
 
             'outer: loop {
+                if cancel.is_cancelled() {
+                    break 'outer;
+                }
                 // Idle cap also bounds connect-failure spins and reconnect gaps.
                 if let Some(t) = idle_timeout
                     && Instant::now() >= last_message_at + t
@@ -280,7 +303,15 @@ impl Source for WebsocketSource {
                 }
 
                 // (Re)connect.
-                let ws = match self.connect(&resolved_url).await {
+                let connected = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    r = self.connect(&resolved_url) => Some(r),
+                };
+                let Some(connected) = connected else {
+                    break 'outer;
+                };
+                let ws = match connected {
                     // The attempt counter resets on a data frame, not on a
                     // handshake: a server that accepts and then closes would
                     // otherwise never reach `max_reconnect_attempts` (API-33).
@@ -292,7 +323,7 @@ impl Source for WebsocketSource {
                             let delay = reconnect_delay(reconnect_backoff, reconnect_attempts);
                             reconnect_attempts += 1;
                             tracing::warn!(error = %e, attempt = reconnect_attempts, delay_ms = delay.as_millis() as u64, "websocket source: connect failed, retrying");
-                            tokio::time::sleep(delay).await;
+                            sleep_or_cancel(delay, &cancel).await;
                             continue 'outer;
                         }
                         Err(e)?;
@@ -351,10 +382,14 @@ impl Source for WebsocketSource {
                     };
 
                     // No signal handler here: a connector must not take over
-                    // the process's SIGINT (API-61). The caller cancels a run by
-                    // dropping this stream (`Pipeline::with_cancel`).
+                    // the process's SIGINT (API-61). The run's cancel token
+                    // (`Source::set_cancel`) stops the read and flushes the tail.
                     tokio::select! {
                         biased;
+                        () = cancel.cancelled() => {
+                            tracing::info!("websocket source: run cancelled, flushing buffered messages");
+                            stop = true;
+                        }
                         _ = async { ping_timer.as_mut().unwrap().tick().await }, if ping_timer.is_some() => {
                             if let Err(e) = write.send(Message::Ping(Vec::new().into())).await {
                                 tracing::warn!(error = %e, "websocket source: ping failed, treating as disconnect");
@@ -436,7 +471,7 @@ impl Source for WebsocketSource {
                             let delay = reconnect_delay(reconnect_backoff, reconnect_attempts);
                             reconnect_attempts += 1;
                             tracing::warn!(attempt = reconnect_attempts, delay_ms = delay.as_millis() as u64, "websocket source: reconnecting");
-                            tokio::time::sleep(delay).await;
+                            sleep_or_cancel(delay, &cancel).await;
                             continue 'outer;
                         } else if reconnect {
                             Err(FaucetError::Source(format!(
@@ -458,6 +493,14 @@ impl Source for WebsocketSource {
 
             tracing::info!(messages = total, "websocket source: stream complete");
         })
+    }
+
+    fn set_cancel(&self, cancel: CancellationToken) -> bool {
+        *self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel);
+        true
     }
 
     fn config_schema(&self) -> Value {

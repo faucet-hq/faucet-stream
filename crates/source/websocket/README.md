@@ -96,7 +96,7 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `max_messages` | int | *(unset)* | Stop after this many messages. |
 | `idle_timeout` | int (seconds) | *(unset)* | Stop after this long with no inbound frame. The idle clock keeps ticking across reconnect gaps, so it also caps a connection outage. Reset by **any** inbound frame — data, ping/pong, or a frame dropped by `on_parse_error: skip` — so a live server streaming skippable frames does not trip it. |
 
-> **At least one of `max_messages` / `idle_timeout` must be set** — a source with neither would never stop on its own and is rejected at config-load time. The source installs no signal handler: Ctrl-C reaches the host process as usual (`faucet run` exits; `schedule`/`serve` cancel the run at a page boundary). Messages received since the last emitted page are not written on cancel, and a live feed cannot replay them — a smaller `batch_size` bounds that loss.
+> **At least one of `max_messages` / `idle_timeout` must be set** — a source with neither would never stop on its own and is rejected at config-load time. The source installs no signal handler: Ctrl-C reaches the host process as usual, and `faucet run` / `schedule` / `serve` cancel the run cooperatively. On a cancel the source stops reading, emits the messages it has buffered since the last page (also mid-reconnect-wait) and ends, so they are written before the run stops. Topology-mode graphs still stop at a page boundary, and a run killed outright (a second Ctrl-C, `SIGKILL`) loses that buffer — a live feed cannot replay it, so a smaller `batch_size` bounds the loss.
 
 ### Batching
 
