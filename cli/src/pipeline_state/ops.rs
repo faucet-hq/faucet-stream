@@ -341,6 +341,7 @@ pub async fn show(
                     state.state_format = Some(state_format(r, &e.value));
                 }
                 (KeyKind::Bookmark, Some(_)) => state.sub_bookmarks.push(e.clone()),
+                (KeyKind::Lease, None) if e.value.is_null() => {}
                 (KeyKind::Lease, None) => {
                     state.running =
                         RunLease::from_value(e.value.clone()).filter(|l| l.is_live(now));
