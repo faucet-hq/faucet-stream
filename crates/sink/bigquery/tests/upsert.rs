@@ -505,6 +505,58 @@ async fn a_job_past_job_timeout_is_cancelled() {
     );
 }
 
+/// A job that finishes successfully after `job_timeout` fired but before the
+/// cancel took effect committed its changes, so the write succeeds instead of
+/// reporting a failure a retry would then duplicate (#862 L-094).
+#[tokio::test]
+async fn a_job_that_wins_the_cancel_race_counts_as_completed() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    let running = json!({
+        "kind": "bigquery#queryResponse",
+        "jobComplete": false,
+        "jobReference": {"projectId": PROJECT_ID, "jobId": "job-late"}
+    });
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-late")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-late/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#jobCancelResponse",
+            "job": {"jobReference": {"projectId": PROJECT_ID, "jobId": "job-late"}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-late")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-late"},
+            "status": {"state": "DONE"}
+        })))
+        .mount(&server)
+        .await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+        c.job_timeout = std::time::Duration::from_millis(300);
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("a job that completed before the cancel took effect succeeded");
+}
+
 /// A transaction BigQuery aborts for a concurrent update on the same table is
 /// re-submitted (it committed nothing) with a fresh `requestId`, so a second
 /// writer in the dataset does not fail the run (SQL-95).

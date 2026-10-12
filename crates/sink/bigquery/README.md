@@ -11,7 +11,7 @@ Reach for it when you want to land events, CDC streams, or query results into a 
 
 ## Feature highlights
 
-- **Bucket-free bulk load (default)** — appends and overwrites stream into a single resumable BigQuery load job (gzip-compressed newline-delimited JSON, no GCS bucket), so a run costs one job rather than one per page (after a mid-run flush, appends switch to `insertAll` — see [Streaming & batching](#streaming--batching)). Set `media_load: false` for the per-page `jobs.query` path, or `insert_id_field` for streaming `tabledata.insertAll`.
+- **Bucket-free bulk load (default)** — appends and overwrites stream into a single resumable BigQuery load job (gzip-compressed newline-delimited JSON, no GCS bucket), so a run costs one job rather than one per page (after a mid-run flush, appends switch to `insertAll` — see [Streaming & batching](#streaming--batching)). Set `media_load: false` (or `insert_id_field`, which adds BigQuery `insertId` de-duplication) to append through streaming `tabledata.insertAll` instead.
 - **Three credential modes** — Application Default Credentials, a service-account key file, or inline service-account JSON. The shared `BigQueryCredentials` enum is re-exported from [`faucet-common-bigquery`](https://crates.io/crates/faucet-common-bigquery) so it matches the BigQuery **source** byte-for-byte.
 - **Write modes** — `append` (default), `upsert`, and `delete` via an in-place `MERGE` over the target table; no staging table required.
 - **Effectively-once delivery** — pair with a CDC source for a multi-statement `MERGE`/`INSERT` transaction that commits records and a `_faucet_commit_token` watermark atomically.
@@ -95,8 +95,8 @@ These fields are flattened, so they appear at the sink `config` top level.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `job_timeout` | integer (seconds) | `3600` | Longest the sink waits for one BigQuery job it started (MERGE, overwrite swap, cleanup DELETE, DDL, load job). A job past the limit is cancelled before the write fails, so it cannot commit after the run was reported failed. `0` = no limit. |
-| `write_mode` | enum | `append` | `append` (bulk load by default; `insertAll` when `media_load: false` or `insert_id_field` is set), `upsert`, or `delete` (in-place `MERGE` / keyed `DELETE`), or `overwrite` (full refresh). An `upsert` updates only the columns a record carries: a column absent from the record keeps its current value on a matched row (an explicit `null` sets it to NULL). |
+| `job_timeout` | integer (seconds) | `3600` | Longest the sink waits for one BigQuery job it started (MERGE, overwrite swap, cleanup DELETE, DDL, load job). A job past the limit gets a cancellation request and up to 30 s to stop before the write fails; one that finished successfully before the cancel took effect counts as completed, and the error says when the job could not be confirmed stopped (it may still commit). A staged load object is kept while its job may still run. `0` = no limit. |
+| `write_mode` | enum | `append` | `append` (bulk load by default; `insertAll` when `media_load: false` or `insert_id_field` is set), `upsert`, or `delete` (in-place `MERGE` / keyed `DELETE`), or `overwrite` (full refresh). An `upsert` updates only the columns a record carries: a column absent from the record keeps its current value on a matched row (an explicit `null` sets it to NULL); on an **inserted** row it is written as `NULL`, not the column's `DEFAULT` value. |
 | `key` | array | `[]` | Key column(s). **Required and non-empty** for `upsert`/`delete`; must be real columns of the target table. |
 | `delete_marker` | object | *(none)* | `upsert` only — `{ field: <name>, values: [<str>, …] }`; rows whose `field` matches one of `values` become deletes instead of upserts. |
 
@@ -218,7 +218,7 @@ This is the default because the alternative is job-latency bound rather than vol
 
 `batch_size` does not chunk the load — pages feed one stream. Three things opt out of it:
 
-- `media_load: false` — the per-page `jobs.query` `INSERT … SELECT` path.
+- `media_load: false` — appends stream through `tabledata.insertAll`, one request per `batch_size` chunk.
 - `insert_id_field` — a load job cannot honour `insertId`, so asking for streaming de-duplication keeps appends on `insertAll` (logged at startup, never silent).
 - `write_mode: upsert` / `delete` and `delivery: exactly_once` — these commit a `MERGE` or a watermark in one transaction, which a load job cannot express, so they ignore `media_load` entirely.
 
@@ -239,7 +239,7 @@ Because only `insertAll` implements `insertId`, setting this field also **select
 
 ## Write modes (`upsert` / `delete`)
 
-In addition to the default `append` mode (streaming `insertAll`), the BigQuery sink supports `write_mode: upsert` and `write_mode: delete`. These use an in-place `MERGE … USING (SELECT … FROM UNNEST(JSON_QUERY_ARRAY(@payload)))` over the target table — **no staging table required**.
+In addition to the default `append` mode (a bulk load job; streaming `insertAll` with `media_load: false`), the BigQuery sink supports `write_mode: upsert` and `write_mode: delete`. These use an in-place `MERGE … USING (SELECT … FROM UNNEST(JSON_QUERY_ARRAY(@payload)))` over the target table — **no staging table required**.
 
 - **`upsert`** — insert-or-update by `key` via an in-place `MERGE`. If `delete_marker` is set (the standard CDC pattern), rows whose marker field matches are routed to a keyed `DELETE` instead, and the marker field is stripped from upserted rows.
 - **`delete`** — delete by `key` for every record in the batch (direct keyed `DELETE`, no MERGE).
@@ -257,9 +257,9 @@ The `key` columns must be real columns of the target BigQuery table (validated a
 - `write_batch_idempotent(records, scope, token)` — writes the page **and** records the `token` for `scope` in **one BigQuery multi-statement transaction**: a typed `INSERT INTO <target> SELECT … FROM UNNEST(JSON_QUERY_ARRAY(@payload))` (the page ships as a single bound JSON parameter; each column is cast per the target table's schema, fetched once via `tables.get`) followed by a `MERGE` into the `_faucet_commit_token` watermark table in the target dataset. Either both commit or neither does. Success is verified authoritatively via the job's `errorResult`, so a runtime failure (a bad `CAST`, a `NULL` into a `REQUIRED` column) aborts the page rather than advancing the bookmark over data that never landed.
 - `last_committed_token(scope)` — reads the watermark row for `scope` so the pipeline can skip already-committed pages on resume.
 
-On crash/resume the pipeline reads `last_committed_token` and skips any page whose token is already committed, so the target table never sees duplicates. This is **append-with-idempotency**, distinct from the default streaming `insertAll` path and from key-based upsert (`write_mode`).
+On crash/resume the pipeline reads `last_committed_token` and skips any page whose token is already committed, so the target table never sees duplicates. This is **append-with-idempotency**, distinct from the default append path (bulk load or `insertAll`) and from key-based upsert (`write_mode`).
 
-**Requirements & limits.** The sink reads the table schema to build the typed INSERT (a schemaless table is rejected with a clear error). The target table must exist with a defined schema, or `create_table: true` (the default) creates it from the first page's fields. A record field the table has no column for fails the write instead of being dropped: evolve the table (`schema: {on_drift: evolve}`) or drop the field explicitly (`schema: {on_drift: ignore}` or a `drop` transform). Because each page commits as one atomic transaction (one token per page, no `batch_size` re-chunking on this path), the page must serialize within BigQuery's ~10 MB `jobs.query` request limit — keep the CDC source's per-page size modest. A scalar column whose JSON value is an object/array is coerced to `NULL` (or, for a `REQUIRED` column, fails the INSERT). This path uses BigQuery DML, which has concurrency limits; it is intended for the opt-in effectively-once mode, not high-rate streaming (use the default streaming `insertAll` path for that).
+**Requirements & limits.** The sink reads the table schema to build the typed INSERT (a schemaless table is rejected with a clear error). The target table must exist with a defined schema, or `create_table: true` (the default) creates it from the first page's fields. A record field the table has no column for fails the write instead of being dropped: evolve the table (`schema: {on_drift: evolve}`) or drop the field explicitly (`schema: {on_drift: ignore}` or a `drop` transform). Because each page commits as one atomic transaction (one token per page, no `batch_size` re-chunking on this path), the page must serialize within BigQuery's ~10 MB `jobs.query` request limit — keep the CDC source's per-page size modest. A scalar column whose JSON value is an object/array is coerced to `NULL` (or, for a `REQUIRED` column, fails the INSERT). This path uses BigQuery DML, which has concurrency limits; it is intended for the opt-in effectively-once mode, not high-rate streaming (use the default append path for that).
 
 To use effectively-once delivery, set `delivery: exactly_once` in your pipeline config and pair this sink with one of the CDC sources (`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus a `state:` block. A DLQ is not permitted in effectively-once mode. All four requirements are validated at config-load time (`faucet validate`) before any run starts.
 
@@ -400,7 +400,7 @@ println!("Transferred {} records", result.records_written);
 ## How it works
 
 1. `new()` resolves `BigQueryCredentials` and builds an authenticated client **once**, validating credentials eagerly so failures surface immediately.
-2. `write_batch()` appends by feeding the page into the run's resumable load job (the default), finalized on `flush()`. With `media_load: false` it slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and issues a `jobs.query` `INSERT … SELECT` per chunk; with `insert_id_field` set it issues an `insertAll` per chunk instead.
+2. `write_batch()` appends by feeding the page into the run's resumable load job (the default), finalized on `flush()`. With `media_load: false`, with `insert_id_field` set, or after a mid-run flush committed the load, it slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and issues a `tabledata.insertAll` per chunk (carrying `insertId`s when `insert_id_field` is set).
 3. Per-row errors in the BigQuery response are detected and reported. If any rows fail, the batch returns an error with details about the first failure; `write_batch_partial` exposes them per-row for DLQ routing.
 4. `write_mode: upsert`/`delete` and the effectively-once path build pure-SQL `MERGE` / `INSERT` statements and execute them via `jobs.query`, verifying success against the job's `errorResult`.
 5. The client is reused across all calls — no re-authentication per request.
@@ -517,7 +517,7 @@ cast into such a column still fail loudly at BigQuery.
 
 Full-refresh: each run atomically **replaces** the whole table — and it is
 **bucket-free** (no GCS staging bucket required, unlike the `bulk_load`
-`WRITE_TRUNCATE` path). No `key` is needed; the target table must already exist.
+`WRITE_TRUNCATE` path). No `key` is needed; a missing target is created by the run when `create_table` is on (the default).
 
 By default (`media_load: true`) a solo overwrite streams every page into **one
 `WRITE_TRUNCATE` load job**: no staging table and no swap, because such a load
@@ -529,7 +529,8 @@ A truncating load replaces the table's schema with the load's, so the load runs
 with the **existing table's own schema** (types, modes, descriptions, policy
 tags) unless the config sets `schema:`; only a missing table is typed from the
 first page. Fields the schema does not have fail the load rather than being
-dropped (`ignoreUnknownValues` is off for a truncating load).
+dropped (`ignoreUnknownValues` is off for a truncating load): add the column to
+the table first, or drop the field with a transform.
 
 With `media_load: false` the page is loaded into a `LIKE` temp table via the
 query API, then swapped with a
@@ -555,3 +556,9 @@ bytes of each load job) and `bytes_billed` (`totalBytesBilled` of each query
 job). `faucet run`, `faucet usage` and `GET /v1/usage` price them with the
 `usage.pricing.warehouse.bigquery_*` rates; see the
 [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
+Load jobs are free; streaming inserts are billed. A source that bookmarks every
+page (CDC, Kafka, Kinesis) makes the first flush commit the run's load job, and
+later appends then stream through `tabledata.insertAll` (see
+[Streaming & batching](#streaming--batching)), so all but the first page of such
+a run is billed at the streaming-insert rate and reported as `bytes_streamed`.
