@@ -70,28 +70,14 @@ release_commits = "^(feat|fix|perf)"
 # uses APIs added to a dependency (e.g. faucet-core) that haven't been
 # published yet — the release PR is what bumps the dependency first.
 release_always = false
-# Recovery note (2026-07-10): if the publish job dies mid-release (e.g. the
-# versioned-dev-dep failure fixed in #296), the release-PR-merge event is
+# Recovery: if the publish job dies mid-release, the release commit's push is
 # consumed and no new release PR appears while main's versions are already
-# bumped. To resume, merge a trivial PR from a `release-plz-*` branch — the
-# publish job keys on that branch prefix and is idempotent (skips
-# already-published crates).
-# Recovery log (2026-07-18): the 1.5.0 release published every crate except
-# `faucet-cli` (last in dependency order) — its publish failed on the
-# `include_str!` path that read `connectors/registry.json` from outside the
-# crate (fixed in #329). With `faucet-cli` at 1.5.0 in Cargo.toml but 1.4.0 on
-# crates.io and no `faucet-cli-v1.5.0` tag, release-plz opened no new PR. This
-# trivial `release-plz-*` PR re-fires the idempotent publish job to ship the
-# missing `faucet-cli` 1.5.0.
-# Recovery log (2026-09-30): the release after #782 stalled on a versioned
-# dev-dependency again — `faucet-sink-oracle` needed `faucet-source-oracle` on
-# crates.io first (#784). #785 moved every cross-connector test into the
-# unpublished `crates/interop-tests` and added `scripts/connector-deps.py` to
-# CI so a connector crate can no longer depend on another connector. This
-# trivial `release-plz-*` PR re-fires the idempotent publish job for the crates
-# still missing: faucet-source-oracle, faucet-source-oracle-cdc,
-# faucet-sink-oracle, faucet-source-dynamodb, faucet-source-iceberg,
-# faucet-cli 1.13.0 and faucet-stream 1.9.0.
+# bumped. The publish job keys on the pushed commit's SUBJECT
+# (`chore: release …`, `chore(<crate>): release …` or `chore(release): …`),
+# not on the branch, so resume by merging a trivial PR whose squash subject is
+# `chore(release): …`; the job is idempotent (skips already-published
+# crates). Past incidents are logged in CONTRIBUTING.md ("Recovering a stalled
+# release").
 
 # Disable cargo-semver-checks for all packages. Semver-checks compiles each
 # crate's local and registry sources to compare API surface — for a 47-crate

@@ -266,6 +266,7 @@ jobs:
               selected=("${selected[@]// /}")
               ;;
           esac
+          echo "RELEASED_CRATES=${selected[*]}" >> "$GITHUB_ENV"
 
           # ── Sparse-index helpers ────────────────────────────────────────
           #
@@ -450,3 +451,13 @@ jobs:
         if: ${{ !inputs.dry_run && always() }}
         run: |
           git push --follow-tags origin HEAD
+
+      # A crate this run published for the first time is owned only by the
+      # publishing account; add the org team, as release-plz does.
+      - name: Add github:faucet-hq:owners to the selected crates
+        if: ${{ !inputs.dry_run && !cancelled() && env.RELEASED_CRATES != '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          read -ra crates <<< "$RELEASED_CRATES"
+          scripts/add-crate-team.sh "${crates[@]}"

@@ -257,28 +257,4 @@ jobs:
         run: |
           git fetch --quiet --force --tags origin
           mapfile -t crates < <(git tag --points-at "$GITHUB_SHA" | sed -nE 's/^(.+)-v[0-9]+\.[0-9]+\.[0-9]+.*$/\1/p' | sort -u)
-          if [ "${#crates[@]}" -eq 0 ]; then
-            echo "No crates released at $GITHUB_SHA."
-            exit 0
-          fi
-          failed=0
-          for crate in "${crates[@]}"; do
-            owners=$(curl -fsS -A "$UA" "https://crates.io/api/v1/crates/${crate}/owners" | jq -r '.users[].login') || {
-              echo "::error::${crate}: could not read its crates.io owners"
-              failed=$((failed + 1))
-              continue
-            }
-            if grep -qxF "$TEAM" <<<"$owners"; then
-              echo "${crate}: already owned by ${TEAM}"
-            elif cargo owner --add "$TEAM" "$crate"; then
-              echo "${crate}: added ${TEAM}"
-            else
-              echo "::error::${crate}: cargo owner --add ${TEAM} failed"
-              failed=$((failed + 1))
-            fi
-            sleep 1
-          done
-          if [ "$failed" -gt 0 ]; then
-            echo "::error::${failed} released crate(s) still lack ${TEAM}. CARGO_REGISTRY_TOKEN needs the change-owners scope and must belong to a member of that team."
-            exit 1
-          fi
+          scripts/add-crate-team.sh "${crates[@]}"
