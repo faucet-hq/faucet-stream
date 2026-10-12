@@ -51,13 +51,9 @@ pub async fn run(args: PreviewArgs) -> CliResult<()> {
         })?;
     tracing::info!(row = %first_root.id, "previewing first root row");
 
-    let source = build_source(
-        &first_root.source.kind,
-        first_root.source.config.clone(),
-        &auth,
-        None,
-    )
-    .await?;
+    let mut source_cfg = first_root.source.config.clone();
+    crate::preview_sample::bound_batch_size(&first_root.source.kind, &mut source_cfg, args.limit);
+    let source = build_source(&first_root.source.kind, source_cfg, &auth, None).await?;
     let compiled = compile_transforms(&first_root.transforms)?
         .iter()
         .map(compile_stage)

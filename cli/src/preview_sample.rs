@@ -45,6 +45,36 @@ pub fn mask(records: Vec<Value>, spec: Option<&faucet_core::MaskingSpec>) -> Cli
     Ok(faucet_core::apply_masking(records, &compiled).records)
 }
 
+/// Cap a source config's `batch_size` at the preview `limit` (an unset or `0`
+/// "no batching" size becomes `limit`), so a source that sizes its pages by
+/// its own config never reads more than the preview needs into one page.
+/// Configs of sources without a `batch_size` field are left alone.
+pub fn bound_batch_size(kind: &str, config: &mut Value, limit: usize) {
+    let limit = limit.max(1) as u64;
+    let declared = crate::registry::source_schema(kind).is_ok_and(|s| {
+        s.get("properties")
+            .and_then(|p| p.get("batch_size"))
+            .is_some()
+    });
+    let Value::Object(map) = config else {
+        return;
+    };
+    if !declared {
+        return;
+    }
+    let current = match map.get("batch_size") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+        Some(_) => return,
+    };
+    let bounded = match current {
+        None | Some(0) => limit,
+        Some(n) => n.min(limit),
+    };
+    map.insert("batch_size".into(), Value::from(bounded));
+}
+
 /// Read pages from `source`, transform each, and stop once `limit` records
 /// are collected or `timeout` passes. A source error ends the preview with
 /// that error. A source that consumes destructively is refused before any
@@ -88,6 +118,32 @@ pub async fn sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "source-elasticsearch")]
+    #[test]
+    fn bound_batch_size_caps_the_page_at_the_limit() {
+        let mut cfg = serde_json::json!({"batch_size": 0});
+        bound_batch_size("elasticsearch", &mut cfg, 20);
+        assert_eq!(cfg["batch_size"], 20);
+        let mut cfg = serde_json::json!({"batch_size": "5000"});
+        bound_batch_size("elasticsearch", &mut cfg, 20);
+        assert_eq!(cfg["batch_size"], 20);
+        let mut cfg = serde_json::json!({"batch_size": 7});
+        bound_batch_size("elasticsearch", &mut cfg, 20);
+        assert_eq!(cfg["batch_size"], 7);
+        let mut cfg = serde_json::json!({});
+        bound_batch_size("elasticsearch", &mut cfg, 0);
+        assert_eq!(cfg["batch_size"], 1);
+        let mut odd = serde_json::json!({"batch_size": [1]});
+        bound_batch_size("elasticsearch", &mut odd, 20);
+        assert_eq!(odd["batch_size"], serde_json::json!([1]));
+        let mut unknown = serde_json::json!({"a": 1});
+        bound_batch_size("no-such-kind", &mut unknown, 20);
+        assert_eq!(unknown, serde_json::json!({"a": 1}));
+        let mut scalar = serde_json::json!(3);
+        bound_batch_size("elasticsearch", &mut scalar, 20);
+        assert_eq!(scalar, serde_json::json!(3));
+    }
 
     #[cfg(feature = "masking")]
     #[test]
