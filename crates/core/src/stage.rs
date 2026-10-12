@@ -938,9 +938,14 @@ impl CompiledCdcUnwrap {
             CdcPartialRow::Fail => Err(FaucetError::Transform(format!(
                 "cdc_unwrap: a change event (op {op:?}){table} does not carry the current value \
                  of {} — the source did not re-send it (an unchanged out-of-line value) and the \
-                 `{}` image has no copy, so an upsert would replace or null it. Set \
-                 `ALTER TABLE … REPLICA IDENTITY FULL` on the source table, or \
-                 `on_partial_row: pass` when the sink appends or merges column-wise",
+                 `{}` image has no copy, so an upsert would replace or null it. \
+                 `ALTER TABLE … REPLICA IDENTITY FULL` on the source table prevents future \
+                 partial rows but not this one: the change is already captured and the \
+                 position does not advance past it, so every rerun fails here. Get past it \
+                 with `on_partial_row: pass` for one run (an upsert sink then replaces or \
+                 nulls these columns for the affected rows) or by resnapshotting the table; \
+                 keep `on_partial_row: pass` only when the sink appends or merges \
+                 column-wise",
                 missing.join(", "),
                 s.before_field
             ))),
@@ -2327,6 +2332,10 @@ mod tests {
         assert!(err.contains("public.docs"), "{err}");
         assert!(err.contains("body"), "{err}");
         assert!(err.contains("REPLICA IDENTITY FULL"), "{err}");
+        assert!(
+            err.contains("for one run") && err.contains("resnapshotting"),
+            "the message names how to get past an already-captured change: {err}"
+        );
 
         let bare = json!({
             "op": "update", "table": "docs",
