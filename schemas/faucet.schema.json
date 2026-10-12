@@ -18562,7 +18562,7 @@
                       ]
                     },
                     "tls_mode": {
-                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or the system roots),\nthe latter also its host name.",
+                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or, without one, the\nMozilla root store bundled into the binary — not the operating\nsystem's), the latter also its host name.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/source_redshift__RedshiftTlsMode"
@@ -20133,7 +20133,7 @@
                       "default": 10
                     },
                     "request_timeout_secs": {
-                      "description": "Seconds one search or scroll request may take end to end before it\nfails as retriable. Default `300`, so a half-open connection or a\nwedged node cannot hang a run forever.",
+                      "description": "Seconds one search or scroll request may take end to end before it\nfails the run (the source does not retry it). Default `300`, so a\nhalf-open connection or a wedged node cannot hang a run forever.",
                       "type": [
                         "integer",
                         "string"
@@ -21449,7 +21449,7 @@
                       "default": 1000
                     },
                     "params": {
-                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters in declaration order before any context-derived\nvalues. Each value is shipped as a STRING parameter; BigQuery casts\nas needed at execution time.",
+                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters in declaration order before any context-derived\nvalues. Each value is typed from its JSON form: an integer as\n`INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and\neverything else (strings, arrays, objects, null) as `STRING`.",
                       "type": "array",
                       "items": true,
                       "default": []
@@ -23691,7 +23691,7 @@
                       ]
                     },
                     "job_timeout": {
-                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\ncancelling it and failing the write. Default `3600`; `0` waits for as\nlong as the job runs. A job that times out is cancelled so it cannot\ncommit after the run has been reported failed.",
+                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\nrequesting its cancellation and failing the write. Default `3600`; `0`\nwaits for as long as the job runs. After the cancel the sink waits up\nto 30 s for the job to stop; a job that finished successfully before\nthe cancel took effect is treated as completed, and the error says\nwhen a job could not be confirmed stopped (it may still commit).",
                       "type": [
                         "integer",
                         "string"
@@ -28456,7 +28456,7 @@
                       "default": 5
                     },
                     "tls_mode": {
-                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or the system roots),\nthe latter also its host name.",
+                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or, without one, the\nMozilla root store bundled into the binary — not the operating\nsystem's), the latter also its host name.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_redshift__RedshiftTlsMode"
