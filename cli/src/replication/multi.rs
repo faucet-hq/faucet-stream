@@ -1184,8 +1184,6 @@ pipeline:
         assert!(clear.source_override.is_some());
     }
 
-    /// A driver error stops the running cycle through its token, giving it
-    /// time to flush, before the task is dropped (#789 CLI-87).
     #[test]
     fn a_one_shot_run_fails_while_a_table_did_not_complete() {
         assert!(one_shot_outcome(&BTreeMap::new()).is_ok());
@@ -1202,6 +1200,8 @@ pipeline:
         );
     }
 
+    /// A driver error stops the running cycle through its token, giving it
+    /// time to flush, before the task is dropped (#789 CLI-87).
     #[tokio::test]
     async fn a_driver_error_cancels_the_cycle_before_dropping_it() {
         let cancel = CancellationToken::new();

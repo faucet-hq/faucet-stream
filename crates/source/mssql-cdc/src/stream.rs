@@ -890,8 +890,6 @@ fn changes_sql(capture_instance: &str) -> String {
     )
 }
 
-/// `schema.table` of a change envelope, the name the `mssql` source's
-/// discovery reports for the same table.
 /// Whether every capture instance of the record's table that `position`
 /// tracks is consumed through the record's commit LSN.
 fn record_covered(
@@ -913,6 +911,8 @@ fn record_covered(
     (!tracked.is_empty()).then(|| tracked.iter().all(|have| lsn <= *have))
 }
 
+/// `schema.table` of a change envelope, the name the `mssql` source's
+/// discovery reports for the same table.
 fn schema_table(record: &Value) -> Option<String> {
     let schema = record.get("schema")?.as_str()?;
     let table = record.get("table")?.as_str()?;
