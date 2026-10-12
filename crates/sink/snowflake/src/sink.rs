@@ -697,6 +697,14 @@ impl SnowflakeSink {
     }
 }
 
+/// The bytes `row` adds to a payload: its serialized JSON (escapes included)
+/// plus one more for every `'` or `\` a SQL string literal doubles, so the
+/// bound is right for both the bound and the inlined form.
+fn payload_len(row: &Value) -> usize {
+    let text = serde_json::to_string(row).unwrap_or_default();
+    text.len() + text.bytes().filter(|b| matches!(b, b'\'' | b'\\')).count()
+}
+
 /// Split `rows` into consecutive ranges whose serialized JSON stays within
 /// `max_bytes` (a single row larger than that is a range of its own).
 fn size_chunks(rows: &[Value], max_bytes: usize) -> Vec<std::ops::Range<usize>> {
@@ -704,7 +712,7 @@ fn size_chunks(rows: &[Value], max_bytes: usize) -> Vec<std::ops::Range<usize>> 
     let mut start = 0;
     let mut bytes = 2;
     for (i, row) in rows.iter().enumerate() {
-        let len = faucet_core::estimate_json_bytes(row) as usize + 1;
+        let len = payload_len(row) + 1;
         if i > start && bytes + len > max_bytes {
             out.push(start..i);
             start = i;
@@ -1198,8 +1206,14 @@ mod tests {
         assert_eq!(size_chunks(&rows, usize::MAX), vec![0..5]);
         assert_eq!(size_chunks(&rows, 1), vec![0..1, 1..2, 2..3, 3..4, 4..5]);
         assert_eq!(size_chunks(&[], 10), vec![0..0]);
-        let one = faucet_core::estimate_json_bytes(&rows[0]) as usize + 3;
+        let one = payload_len(&rows[0]) + 3;
         assert_eq!(size_chunks(&rows, one * 2), vec![0..2, 2..4, 4..5]);
+        let escaped = json!({"s": "\u{1}'\\"});
+        assert_eq!(
+            serde_json::to_string(&escaped).unwrap(),
+            r#"{"s":"\u0001'\\"}"#
+        );
+        assert_eq!(payload_len(&escaped), 17 + 4);
     }
 
     #[test]
