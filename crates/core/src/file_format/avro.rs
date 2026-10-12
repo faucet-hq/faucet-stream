@@ -188,30 +188,35 @@ pub(crate) fn read_with<R: std::io::Read>(
     Ok(schema)
 }
 
-type Names<'a> = HashMap<String, &'a Schema>;
+/// Every named type of a schema by full and short name, owned so a prepared
+/// [`AvroDatumCodec`] can keep it next to its schema.
+type Names = HashMap<String, Schema>;
 
-fn named(schema: &Schema) -> Names<'_> {
+fn named(schema: &Schema) -> Names {
     let mut out = HashMap::new();
     collect_named(schema, &mut out);
     out
 }
 
-fn collect_named<'a>(s: &'a Schema, out: &mut Names<'a>) {
+fn collect_named(s: &Schema, out: &mut Names) {
     match s {
         Schema::Record(r) => {
-            out.insert(r.name.fullname(None), s);
-            out.entry(r.name.name().to_string()).or_insert(s);
+            out.insert(r.name.fullname(None), s.clone());
+            out.entry(r.name.name().to_string())
+                .or_insert_with(|| s.clone());
             for f in &r.fields {
                 collect_named(&f.schema, out);
             }
         }
         Schema::Enum(e) => {
-            out.insert(e.name.fullname(None), s);
-            out.entry(e.name.name().to_string()).or_insert(s);
+            out.insert(e.name.fullname(None), s.clone());
+            out.entry(e.name.name().to_string())
+                .or_insert_with(|| s.clone());
         }
         Schema::Fixed(x) | Schema::Duration(x) => {
-            out.insert(x.name.fullname(None), s);
-            out.entry(x.name.name().to_string()).or_insert(s);
+            out.insert(x.name.fullname(None), s.clone());
+            out.entry(x.name.name().to_string())
+                .or_insert_with(|| s.clone());
         }
         Schema::Array(a) => collect_named(&a.items, out),
         Schema::Map(m) => collect_named(&m.types, out),
@@ -220,12 +225,11 @@ fn collect_named<'a>(s: &'a Schema, out: &mut Names<'a>) {
     }
 }
 
-fn resolve<'a>(s: &'a Schema, names: &Names<'a>) -> Result<&'a Schema, FaucetError> {
+fn resolve<'a>(s: &'a Schema, names: &'a Names) -> Result<&'a Schema, FaucetError> {
     match s {
         Schema::Ref { name } => names
             .get(&name.fullname(None))
             .or_else(|| names.get(name.name()))
-            .copied()
             .ok_or_else(|| {
                 FaucetError::Source(format!(
                     "avro: unresolved schema reference `{}`",
@@ -251,6 +255,44 @@ pub(crate) fn is_complex_union(u: &UnionSchema) -> bool {
         .filter(|v| !matches!(v, Schema::Null))
         .count()
         > 1
+}
+
+/// [`datum_to_json`] / [`datum_from_json_with`] against one schema whose
+/// named types are indexed once, for a codec that converts many datums (a
+/// Kafka topic's messages) — the free functions re-index the schema per call.
+#[derive(Debug, Clone)]
+pub struct AvroDatumCodec {
+    schema: Schema,
+    names: Names,
+}
+
+impl AvroDatumCodec {
+    /// Index `schema`'s named types.
+    pub fn new(schema: Schema) -> Self {
+        let names = named(&schema);
+        Self { schema, names }
+    }
+
+    /// The schema this codec converts against.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// [`datum_to_json`] without re-indexing the schema.
+    pub fn to_json(&self, datum: &Av) -> Result<Value, FaucetError> {
+        to_json(
+            datum,
+            &self.schema,
+            &self.names,
+            Mode::Record,
+            &mut Vec::new(),
+        )
+    }
+
+    /// [`datum_from_json_with`] without re-indexing the schema.
+    pub fn from_json(&self, value: &Value, text: BytesText) -> Result<Av, String> {
+        from_json(value, &self.schema, &self.names, text, "")
+    }
 }
 
 /// Convert one decoded Avro datum to JSON with the logical-type mapping in the
@@ -297,12 +339,7 @@ pub fn datum_from_json_with(value: &Value, schema: &Schema, text: BytesText) -> 
     from_json(value, schema, &names, text, "")
 }
 
-fn root_to_json(
-    v: &Av,
-    schema: &Schema,
-    names: &Names<'_>,
-    mode: Mode,
-) -> Result<Value, FaucetError> {
+fn root_to_json(v: &Av, schema: &Schema, names: &Names, mode: Mode) -> Result<Value, FaucetError> {
     let mut stack = Vec::new();
     let resolved = resolve(schema, names)?;
     let j = to_json(v, schema, names, mode, &mut stack)?;
@@ -319,7 +356,7 @@ fn root_to_json(
 fn to_json(
     v: &Av,
     schema: &Schema,
-    names: &Names<'_>,
+    names: &Names,
     mode: Mode,
     stack: &mut Vec<String>,
 ) -> Result<Value, FaucetError> {
@@ -692,7 +729,7 @@ pub fn encode(records: &[Value], opts: &AvroOptions) -> Result<Vec<u8>, FaucetEr
         .map_err(|e| FaucetError::Sink(format!("avro writer: {e}")))
 }
 
-fn root_from_json(v: &Value, schema: &Schema, names: &Names<'_>) -> Result<Av, String> {
+fn root_from_json(v: &Value, schema: &Schema, names: &Names) -> Result<Av, String> {
     let resolved = resolve(schema, names).map_err(|e| e.to_string())?;
     match resolved {
         Schema::Record(_) => from_json(v, schema, names, BytesText::Hex, ""),
@@ -714,7 +751,7 @@ fn at(path: &str) -> String {
 fn from_json(
     v: &Value,
     schema: &Schema,
-    names: &Names<'_>,
+    names: &Names,
     text: BytesText,
     path: &str,
 ) -> Result<Av, String> {
@@ -919,7 +956,7 @@ fn source_name(f: &RecordField) -> &str {
         .unwrap_or(&f.name)
 }
 
-fn accepts_null(s: &Schema, names: &Names<'_>) -> bool {
+fn accepts_null(s: &Schema, names: &Names) -> bool {
     match resolve(s, names) {
         Ok(Schema::Null) => true,
         Ok(Schema::Union(u)) => u.is_nullable(),
@@ -1156,7 +1193,7 @@ pub fn arrow_schema(schema: &Schema) -> Result<arrow::datatypes::SchemaRef, Fauc
 #[cfg(feature = "arrow")]
 fn arrow_type(
     schema: &Schema,
-    names: &Names<'_>,
+    names: &Names,
     stack: &mut Vec<String>,
 ) -> Result<(arrow::datatypes::DataType, bool), FaucetError> {
     use arrow::datatypes::{DataType as D, Field, Fields, TimeUnit};
@@ -1305,6 +1342,30 @@ pub(crate) fn read_batches_checked<R: std::io::Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prepared_codec_matches_the_free_functions() {
+        let schema = Schema::parse_str(
+            r#"{"type":"record","name":"R","fields":[
+                {"name":"a","type":"long"},
+                {"name":"n","type":["null",{"type":"record","name":"In","fields":[{"name":"x","type":"string"}]}]},
+                {"name":"again","type":["null","In"]}]}"#,
+        )
+        .unwrap();
+        let codec = AvroDatumCodec::new(schema.clone());
+        assert_eq!(codec.schema(), &schema);
+        let json = serde_json::json!({"a": 1, "n": {"x": "y"}, "again": {"x": "z"}});
+        let datum = codec.from_json(&json, BytesText::Hex).unwrap();
+        assert_eq!(
+            datum,
+            datum_from_json_with(&json, &schema, BytesText::Hex).unwrap()
+        );
+        assert_eq!(
+            codec.to_json(&datum).unwrap(),
+            datum_to_json(&datum, &schema).unwrap()
+        );
+        assert_eq!(codec.to_json(&datum).unwrap(), json);
+    }
 
     #[test]
     fn datum_conversion_keeps_logical_types_exact_and_round_trips() {

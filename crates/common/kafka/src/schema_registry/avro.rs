@@ -5,12 +5,18 @@ use apache_avro::reader::datum::GenericDatumReader;
 use apache_avro::writer::datum::GenericDatumWriter;
 use apache_avro::{Schema, types::Value as AvroValue};
 use faucet_core::FaucetError;
-use faucet_core::file_format::avro::{BytesText, datum_from_json_with, datum_to_json};
+use faucet_core::file_format::avro::{AvroDatumCodec, BytesText};
 use serde_json::Value;
 
-fn parse(client: &SchemaRegistryClient, text: &str) -> Result<std::sync::Arc<Schema>, FaucetError> {
+/// The parsed schema with its named types indexed, built once per schema text.
+fn parse(
+    client: &SchemaRegistryClient,
+    text: &str,
+) -> Result<std::sync::Arc<AvroDatumCodec>, FaucetError> {
     client.parsed("avro", text, |t| {
-        Schema::parse_str(t).map_err(|e| FaucetError::Config(format!("avro schema parse: {e}")))
+        Schema::parse_str(t)
+            .map(AvroDatumCodec::new)
+            .map_err(|e| FaucetError::Config(format!("avro schema parse: {e}")))
     })
 }
 
@@ -19,13 +25,13 @@ fn parse(client: &SchemaRegistryClient, text: &str) -> Result<std::sync::Arc<Sch
 pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
     let registered = client.get_schema(schema_id).await?;
-    let schema = parse(client, &registered.schema)?;
+    let codec = parse(client, &registered.schema)?;
     let mut cursor = std::io::Cursor::new(body);
-    let avro_value = GenericDatumReader::builder(&schema)
+    let avro_value = GenericDatumReader::builder(codec.schema())
         .build()
         .and_then(|r| r.read_value(&mut cursor))
         .map_err(|e| FaucetError::Source(format!("avro decode: {e}")))?;
-    avro_to_json(&avro_value, &schema)
+    avro_to_json(&avro_value, &codec)
 }
 
 /// Encode a JSON value as Avro under the named subject, registering or
@@ -52,10 +58,10 @@ pub async fn encode_with(
     value: &Value,
     bytes: BytesText,
 ) -> Result<Vec<u8>, FaucetError> {
-    let schema = parse(client, schema_text)?;
+    let codec = parse(client, schema_text)?;
     let id = client.register_schema(subject, "AVRO", schema_text).await?;
-    let avro_value = json_to_avro(value, &schema, bytes)?;
-    let payload = GenericDatumWriter::builder(&schema)
+    let avro_value = json_to_avro(value, &codec, bytes)?;
+    let payload = GenericDatumWriter::builder(codec.schema())
         .build()
         .and_then(|w| w.write_value_to_vec(avro_value))
         .map_err(|e| FaucetError::Sink(format!("avro encode: {e}")))?;
@@ -67,15 +73,20 @@ pub async fn encode_with(
 /// exact decimal string, `bytes`/`fixed` as hex, `date`/`time`/`timestamp` as
 /// ISO 8601 strings. apache-avro's generic conversion turned these into int
 /// arrays and day numbers.
-fn avro_to_json(v: &AvroValue, schema: &Schema) -> Result<Value, FaucetError> {
-    datum_to_json(v, schema)
+fn avro_to_json(v: &AvroValue, codec: &AvroDatumCodec) -> Result<Value, FaucetError> {
+    codec.to_json(v)
 }
 
 /// Convert a `serde_json::Value` to an `AvroValue` against the writer schema,
 /// accepting the shapes [`avro_to_json`] produces, so a decoded record encodes
 /// back unchanged.
-fn json_to_avro(v: &Value, schema: &Schema, bytes: BytesText) -> Result<AvroValue, FaucetError> {
-    datum_from_json_with(v, schema, bytes)
+fn json_to_avro(
+    v: &Value,
+    codec: &AvroDatumCodec,
+    bytes: BytesText,
+) -> Result<AvroValue, FaucetError> {
+    codec
+        .from_json(v, bytes)
         .map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
 }
 
@@ -88,8 +99,12 @@ mod tests {
 
     #[test]
     fn json_without_an_avro_value_is_a_sink_error() {
-        let err = json_to_avro(&serde_json::json!(u64::MAX), &Schema::Long, BytesText::Hex)
-            .expect_err("u64");
+        let err = json_to_avro(
+            &serde_json::json!(u64::MAX),
+            &AvroDatumCodec::new(Schema::Long),
+            BytesText::Hex,
+        )
+        .expect_err("u64");
         assert!(err.to_string().contains("json->avro"), "{err}");
     }
 
