@@ -104,6 +104,26 @@ pub fn effective_budget_with_kinds(
     Ok((!merged.is_empty()).then_some(merged))
 }
 
+/// What is left of `spec` once a run has used what `state` recorded over
+/// `elapsed` — the budget a follow-up the run starts (a post-run
+/// `verify --repair`, #871) is bounded by. `allowed_sinks` carries over; a
+/// spent ceiling stays at its floor of one unit, which the follow-up's first
+/// write crosses.
+pub fn remaining_budget(
+    spec: &BudgetSpec,
+    state: Option<&faucet_core::BudgetState>,
+    elapsed: std::time::Duration,
+) -> BudgetSpec {
+    let left = |max: Option<u64>, used: u64| max.map(|m| m.saturating_sub(used).max(1));
+    let (records, bytes) = state.map_or((0, 0), |s| (s.records(), s.bytes()));
+    BudgetSpec {
+        max_records: left(spec.max_records, records),
+        max_bytes: left(spec.max_bytes, bytes),
+        max_duration_secs: left(spec.max_duration_secs, elapsed.as_secs()),
+        allowed_sinks: spec.allowed_sinks.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +230,30 @@ mod tests {
             ..Default::default()
         };
         assert!(effective_budget(Some(&bad), None).is_err());
+    }
+
+    #[test]
+    fn remaining_budget_subtracts_what_the_run_used() {
+        let spec = BudgetSpec {
+            max_records: Some(10),
+            max_bytes: Some(1_000),
+            max_duration_secs: Some(60),
+            allowed_sinks: vec!["w".into()],
+        };
+        let none = remaining_budget(&spec, None, std::time::Duration::from_secs(5));
+        assert_eq!(none.max_records, Some(10));
+        assert_eq!(none.max_duration_secs, Some(55));
+        let state = faucet_core::Governance::new()
+            .with_budget(spec.clone())
+            .budget_state()
+            .cloned()
+            .unwrap();
+        let left = remaining_budget(&spec, Some(&state), std::time::Duration::from_secs(90));
+        assert_eq!(left.max_records, Some(10));
+        assert_eq!(left.max_bytes, Some(1_000));
+        assert_eq!(left.max_duration_secs, Some(1));
+        assert_eq!(left.allowed_sinks, vec!["w".to_string()]);
+        let open = remaining_budget(&BudgetSpec::default(), None, std::time::Duration::ZERO);
+        assert!(open.max_records.is_none() && open.max_duration_secs.is_none());
     }
 }

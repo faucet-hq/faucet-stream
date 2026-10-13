@@ -405,7 +405,9 @@ fn check_budget_sinks(
 #[derive(Default)]
 pub struct TopologyBudgets {
     states: HashMap<String, std::sync::Arc<faucet_core::BudgetState>>,
-    timers: Vec<faucet_core::BudgetTimer>,
+    /// Each sink node's governance and the ids its masking rules are scoped
+    /// by, so the run can attach that node's governed DLQ (#870).
+    governance: HashMap<String, (faucet_core::Governance, Vec<String>)>,
 }
 
 impl TopologyBudgets {
@@ -971,11 +973,10 @@ async fn build_topology_inner(
     validate_topology_spec(cfg)?;
     let budget = opts.budget.as_ref().filter(|b| !b.is_empty());
     check_budget_sinks(cfg, budget)?;
-    let metadata = match &cfg.metadata_columns {
-        Some(spec) => faucet_core::CompiledMetadata::compile(spec)
-            .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?,
-        None => None,
-    };
+    if let Some(spec) = &cfg.metadata_columns {
+        faucet_core::CompiledMetadata::compile(spec)
+            .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?;
+    }
     let reaching = reaching_sources(cfg);
     let run_id = opts.run_id.clone().unwrap_or_default();
 
@@ -1069,108 +1070,60 @@ async fn build_topology_inner(
                     }
                     sink
                 };
-                // Run budget (#703): innermost, around the real destination, so
-                // the ceilings count what the sink accepts. A crossing page is
-                // refused whole and cancels the run's token, which stops every
-                // node; a duration ceiling records a verdict the run turns into
-                // this node's failure (#789 CLI-16).
-                let sink = match (budget, budgets.as_mut()) {
-                    (Some(spec), Some(states)) if !opts.dry_run => {
-                        let (wrapped, state, timer) = faucet_core::BudgetSink::wrap(
-                            sink,
-                            spec.clone(),
-                            opts.cancel.clone().unwrap_or_default(),
-                        );
-                        states.states.insert((*id).clone(), state);
-                        states.timers.push(timer);
-                        Box::new(wrapped) as Box<_>
+                // The node's sink-side governance (#875), in core's canonical
+                // order: policy → profiling → metadata → [--limit] → budget →
+                // destination. A budget crossing refuses the page whole and
+                // cancels the run's token, which stops every node; a duration
+                // ceiling records a verdict the run turns into this node's
+                // failure (#789 CLI-16).
+                let template_name = template.as_deref().unwrap_or("default");
+                let attributes = if template_name == "default" {
+                    spec.sinks.get("default").or(spec.sink.as_ref())
+                } else {
+                    spec.sinks.get(template_name)
+                }
+                .map(|b| b.attributes.clone())
+                .unwrap_or_default();
+                let built = crate::governance::topology_sink_governance(
+                    crate::governance::TopologySinkRequest {
+                        cfg,
+                        node_id: id.as_str(),
+                        kind: k.as_str(),
+                        template: template_name,
+                        attributes,
+                        run_id: &run_id,
+                        source_label: source_label(cfg, reaching.get(*id)),
+                        budget,
+                        cancel: opts.cancel.clone().unwrap_or_default(),
+                        dry_run: opts.dry_run,
+                        preview: opts.is_preview(),
+                    },
+                )?;
+                if let (Some(p), Some(map)) = (built.profiler, profilers.as_mut()) {
+                    map.insert((*id).clone(), p);
+                }
+                let limit = opts.limit;
+                let governed = built
+                    .governance
+                    .sink_builder()
+                    .inner_tap(move |s| match limit {
+                        Some(n) => Box::new(crate::executor::LimitedSink::wrap(s, n)) as Box<_>,
+                        None => s,
+                    })
+                    .build(sink);
+                if let Some(states) = budgets.as_mut() {
+                    if let Some(state) = governed.budget_state() {
+                        states.states.insert((*id).clone(), std::sync::Arc::clone(state));
                     }
-                    _ => sink,
-                };
-                let sink = match opts.limit {
-                    Some(n) => Box::new(crate::executor::LimitedSink::wrap(sink, n)) as Box<_>,
-                    None => sink,
-                };
-                // `_faucet_*` metadata columns (#510), stamped closest to the
-                // real write, as the matrix executor does (#789 CLI-16).
-                let sink = match &metadata {
-                    Some(meta) => Box::new(faucet_core::MetadataSink::new(
-                        sink,
-                        meta.clone(),
-                        faucet_core::MetadataContext {
-                            run_id: run_id.clone(),
-                            source: source_label(cfg, reaching.get(*id)),
-                        },
-                    )) as Box<_>,
-                    None => sink,
-                };
-                // Column profiling (#708): a real run's sink node profiles what
-                // it writes, exactly as a matrix invocation does. Previews are
-                // not profiled (their volumes are synthetic).
-                let sink = match (cfg.profiling.as_ref(), profilers.as_mut()) {
-                    (Some(spec), Some(map)) if !opts.is_preview() => {
-                        let profiler = std::sync::Arc::new(std::sync::Mutex::new(
-                            faucet_core::Profiler::new(spec.clone()),
-                        ));
-                        map.insert((*id).clone(), std::sync::Arc::clone(&profiler));
-                        Box::new(faucet_core::ProfilingSink::new(sink, profiler)) as Box<_>
-                    }
-                    _ => sink,
-                };
-                // Data-flow policy runtime backstop (#702): classify the real
-                // records with the same rules the static pass used. Attributes
-                // come from the node's resolved sink template.
-                #[cfg(feature = "policy")]
-                let sink = match cfg.policy.as_ref() {
-                    Some(policy_spec) if !opts.dry_run => {
-                        if crate::policy::quarantines(policy_spec) && spec.dlq.is_none() {
-                            return Err(CliError::Config(format!(
-                                "node '{id}': policy: a rule with `on_runtime: quarantine` needs a \
-                                 `dlq:` block to route the quarantined records to"
-                            )));
-                        }
-                        let compiled = faucet_core::CompiledPolicy::compile(
-                            &crate::policy::topology_runtime_spec(policy_spec, cfg),
-                        )
-                        .map_err(|e| CliError::Config(format!("policy: {e}")))?;
-                        let template_name = template.as_deref().unwrap_or("default");
-                        let attributes = if template_name == "default" {
-                            spec.sinks.get("default").or(spec.sink.as_ref())
-                        } else {
-                            spec.sinks.get(template_name)
-                        }
-                        .map(|b| b.attributes.clone())
-                        .unwrap_or_default();
-                        let mut policy_sink = faucet_core::PolicySink::new(
-                            sink,
-                            std::sync::Arc::new(compiled),
-                            faucet_core::SinkFacts {
-                                id: (*id).clone(),
-                                kind: k.clone(),
-                                attributes,
-                            },
-                            faucet_core::PolicyScope {
-                                pipeline: cfg.name.clone().unwrap_or_default(),
-                                row: (*id).clone(),
-                            },
-                        );
-                        if let Some(dlq) = &spec.dlq {
-                            policy_sink =
-                                policy_sink.with_dlq_destination(crate::policy::dlq_facts(dlq));
-                        }
-                        Box::new(match cfg.pipeline.masking.as_ref() {
-                            Some(masking) => policy_sink.with_masking(std::sync::Arc::new(
-                                faucet_core::CompiledMasking::compile_for_sink(
-                                    masking,
-                                    &[id.as_str(), template_name, k.as_str()],
-                                )
-                                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
-                            )),
-                            None => policy_sink,
-                        }) as Box<_>
-                    }
-                    _ => sink,
-                };
+                    states.governance.insert(
+                        (*id).clone(),
+                        (
+                            built.governance,
+                            vec![(*id).clone(), template_name.to_string(), k.clone()],
+                        ),
+                    );
+                }
+                let sink: Box<dyn faucet_core::Sink> = Box::new(governed);
                 NodeKind::Sink(sink)
             }
             NodeSpec::Transform { transforms } => {
@@ -1475,7 +1428,20 @@ pub async fn run_topology(
         });
     }
 
-    let governance = run_governance(cfg, run.is_preview())?;
+    #[allow(unused_mut)]
+    let mut governance = run_governance(cfg, run.is_preview())?;
+    // Each sink node's DLQ is a governed destination of its own (#870): the
+    // shared DLQ sink wrapped with that node's budget, policy facts and
+    // DLQ-only masking.
+    if let (Some(dlq_spec), Some(dlq_cfg)) = (&cfg.pipeline.dlq, opts.dlq.clone()) {
+        for (node_id, (g, ids)) in &budgets.governance {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            governance.dlq_by_sink.insert(
+                node_id.clone(),
+                crate::governance::topology_dlq(g, cfg, &ids, dlq_spec, dlq_cfg.clone())?,
+            );
+        }
+    }
     // Lineage START, one per sink node — a topology's analogue of an invocation.
     // Built before the run so a crash still leaves a START on record.
     #[cfg(feature = "lineage")]
@@ -2944,17 +2910,18 @@ pipeline:
     #[tokio::test]
     async fn a_spent_duration_budget_is_a_verdict_on_its_node() {
         let cancel = CancellationToken::new();
-        let (_sink, state, timer) = faucet_core::BudgetSink::wrap(
-            Box::new(NullSink),
-            faucet_core::BudgetSpec {
+        let governed = faucet_core::Governance::new()
+            .with_cancel(cancel.clone())
+            .with_budget(faucet_core::BudgetSpec {
                 max_duration_secs: Some(1),
                 ..Default::default()
-            },
-            cancel.clone(),
-        );
+            })
+            .sink_builder()
+            .build(Box::new(NullSink));
         let mut budgets = TopologyBudgets::default();
-        budgets.states.insert("w".into(), state);
-        budgets.timers.push(timer);
+        budgets
+            .states
+            .insert("w".into(), std::sync::Arc::clone(governed.budget_state().unwrap()));
         assert!(budgets.verdicts().is_empty());
         tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
             .await

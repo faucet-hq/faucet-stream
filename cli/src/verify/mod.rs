@@ -66,6 +66,36 @@ pub struct VerifyInputs {
     pub clock: DateTime<FixedOffset>,
 }
 
+/// The guarantees a repair runs under (#871): the budget, cancellation token
+/// and resilience policy of whatever started it. `faucet verify` takes them
+/// from the config; a post-run verify takes the run's (its remaining budget,
+/// its token).
+#[derive(Clone, Default)]
+pub struct RunGuards {
+    pub budget: Option<faucet_core::BudgetSpec>,
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
+    pub resilience: Option<faucet_core::ResiliencePolicy>,
+}
+
+impl RunGuards {
+    /// The config's own budget and resilience policy.
+    pub fn from_config(cfg: &PipelineConfig) -> CliResult<Self> {
+        Ok(Self {
+            budget: crate::budget::effective_budget_with_kinds(
+                cfg.budget.as_ref(),
+                None,
+                &crate::budget::sink_template_kinds(cfg),
+            )
+            .map_err(CliError::Config)?,
+            cancel: None,
+            resilience: match &cfg.resilience {
+                Some(spec) => Some(spec.to_policy()?),
+                None => None,
+            },
+        })
+    }
+}
+
 /// The result of one `faucet verify`: the row it compared, the two datasets,
 /// and the [`VerifyReport`].
 #[derive(Debug, Clone, Serialize)]
@@ -100,7 +130,8 @@ pub async fn verify(
     let node = crate::dlq_replay::plan::select_replay_node(nodes, inputs.row.as_deref())?;
     crate::destination::check_owns_destination(&node, &all)?;
     crate::destination::check_owns_destination_resolved(&node, &all, &inputs.auth).await?;
-    verify_node(&node, spec, &inputs).await
+    let guards = RunGuards::from_config(cfg)?;
+    verify_node_guarded(&node, spec, &inputs, &guards).await
 }
 
 /// [`verify_node`] behind a heap allocation, built in its own never-inlined
@@ -111,8 +142,9 @@ pub fn verify_node_boxed<'a>(
     node: &'a ExpandedNode,
     spec: &'a VerifySpec,
     inputs: &'a VerifyInputs,
+    guards: &'a RunGuards,
 ) -> futures::future::BoxFuture<'a, CliResult<VerifyOutcome>> {
-    Box::pin(verify_node(node, spec, inputs))
+    Box::pin(verify_node_guarded(node, spec, inputs, guards))
 }
 
 /// Verify an already-expanded root node. Shared by the command and the
@@ -121,6 +153,16 @@ pub async fn verify_node(
     node: &ExpandedNode,
     spec: &VerifySpec,
     inputs: &VerifyInputs,
+) -> CliResult<VerifyOutcome> {
+    verify_node_guarded(node, spec, inputs, &RunGuards::default()).await
+}
+
+/// [`verify_node`] whose repair runs under `guards` (#871).
+pub async fn verify_node_guarded(
+    node: &ExpandedNode,
+    spec: &VerifySpec,
+    inputs: &VerifyInputs,
+    guards: &RunGuards,
 ) -> CliResult<VerifyOutcome> {
     if !matches!(node.role, NodeRole::Root) {
         return Err(CliError::Config(format!(
@@ -293,6 +335,7 @@ pub async fn verify_node(
             &source_rows,
             allow_delete,
             inputs,
+            guards,
         )
         .await?;
         report.repaired_upserts = Some(ups);
@@ -660,6 +703,7 @@ async fn repair_node(
     source_rows: &HashMap<String, Value>,
     allow_delete: bool,
     inputs: &VerifyInputs,
+    guards: &RunGuards,
 ) -> CliResult<(u64, u64)> {
     if !crate::registry::sink_capabilities(&node.sink.kind, &node.sink.config)
         .supports_write_mode(faucet_core::WriteMode::Upsert)
@@ -686,24 +730,28 @@ async fn repair_node(
     let mut written = 0u64;
     let mut deleted = 0u64;
     if !upserts.is_empty() {
-        written = run_repair(node, key, "upsert", upserts, inputs).await?;
+        written = run_repair(node, key, "upsert", upserts, inputs, guards).await?;
     }
     if !deletes.is_empty() {
-        deleted = run_repair(node, key, "delete", deletes, inputs).await?;
+        deleted = run_repair(node, key, "delete", deletes, inputs, guards).await?;
     }
     Ok((written, deleted))
 }
 
 /// Run one repair pass: a copy of the row whose source is the given records
-/// and whose sink is forced to `write_mode`. Transforms and masking are
-/// cleared (the rows are already shaped), state is dropped (no bookmark to
-/// advance), delivery is at-least-once (keyed writes are idempotent).
+/// and whose sink is forced to `write_mode`. Transforms are cleared and
+/// masking and profiling opted out (the rows are already shaped and masked,
+/// and corrections must not shift the profile baseline), state is dropped (no
+/// bookmark to advance), delivery is at-least-once (keyed writes are
+/// idempotent). The budget, cancellation token and resilience policy come from
+/// `guards` (#871).
 async fn run_repair(
     node: &ExpandedNode,
     key: &[String],
     write_mode: &str,
     records: Vec<Value>,
     inputs: &VerifyInputs,
+    guards: &RunGuards,
 ) -> CliResult<u64> {
     let mut repair = node.clone();
     repair.source = ConnectorSpec {
@@ -712,10 +760,16 @@ async fn run_repair(
     };
     repair.source_override = Some(SourceOverride::new(Box::new(VecSource::new(records))));
     repair.transforms.clear();
-    #[cfg(feature = "masking")]
-    {
-        repair.masking = None;
-    }
+    repair.opt_outs.push(faucet_core::OptOut {
+        pass: faucet_core::Pass::Masking,
+        reason: "verify masked the rows it read from the source, and masking is not idempotent"
+            .into(),
+    });
+    repair.opt_outs.push(faucet_core::OptOut {
+        pass: faucet_core::Pass::Profiling,
+        reason: "repair writes correct earlier rows; they must not shift the profile baseline"
+            .into(),
+    });
     repair.state = None;
     repair.delivery = DeliveryMode::AtLeastOnce;
     repair.cleanup_scope = None;
@@ -745,8 +799,8 @@ async fn run_repair(
             shard: None,
             auth: inputs.auth.clone(),
             clock: inputs.clock,
-            cancel: None,
-            resilience: None,
+            cancel: guards.cancel.clone(),
+            resilience: guards.resilience.clone(),
             sla: None,
             reconcile: None,
             verify: None,
@@ -760,7 +814,7 @@ async fn run_repair(
             #[cfg(feature = "catalog")]
             catalog: None,
             usage: Default::default(),
-            budget: None,
+            budget: guards.budget.clone(),
         },
     )
     .await?;

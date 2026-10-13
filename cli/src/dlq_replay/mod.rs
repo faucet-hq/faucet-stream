@@ -156,6 +156,12 @@ pub struct ReplayInputs<'a> {
     /// Decryption for sealed DLQ lines. When inert, the referenced config's
     /// own dlq jsonl `encryption` block is picked up automatically.
     pub decryptor: DlqDecryptor,
+    /// The caller's budget (a tenant's limits, a request's ceiling), merged
+    /// with the config's own `budget:` — the stricter ceiling wins (#871).
+    pub budget: Option<faucet_core::BudgetSpec>,
+    /// Cooperative cancellation: the replay stops at its next page boundary
+    /// and flushes (#871).
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Reconstruct a pipeline whose source is the DLQ location (envelopes →
@@ -203,6 +209,18 @@ pub async fn replay(
         .filter(|e| reason_matches(e, reason.as_deref()))
         .count();
 
+    // A replay runs under the config's `budget:` (merged with the caller's)
+    // and `resilience:`, and stops on the caller's token (#871).
+    let budget = crate::budget::effective_budget_with_kinds(
+        cfg.budget.as_ref(),
+        inputs.budget,
+        &crate::budget::sink_template_kinds(cfg),
+    )
+    .map_err(CliError::Config)?;
+    let resilience = match &cfg.resilience {
+        Some(spec) => Some(spec.to_policy()?),
+        None => None,
+    };
     let summary = run_expanded(
         vec![node],
         ExecuteOptions {
@@ -219,8 +237,8 @@ pub async fn replay(
             shard: None,
             auth: inputs.auth,
             clock: inputs.clock,
-            cancel: None,
-            resilience: None,
+            cancel: inputs.cancel,
+            resilience,
             sla: None,
             reconcile: None,
             verify: None,
@@ -238,7 +256,7 @@ pub async fn replay(
             #[cfg(feature = "catalog")]
             catalog: None,
             usage: Default::default(),
-            budget: None,
+            budget,
         },
     )
     .await?;

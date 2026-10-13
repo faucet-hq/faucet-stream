@@ -88,6 +88,28 @@ pub struct DlqReplayRequest {
     /// empty, the config's own dlq jsonl `encryption` block is used.
     #[serde(default)]
     pub encryption_keys: Vec<String>,
+    /// An id for this replay, so `POST /v1/runs/{id}/cancel` can stop it
+    /// while it runs (#871). Generated (`dlq-replay-<uuid>`) when omitted and
+    /// returned as `id`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Replay on behalf of this tenant (#709, #871): the config loads under
+    /// the tenant's scope (its connections, `${tenant.*}`) and the replay is
+    /// admitted against the tenant's limits, whose per-run ceilings bound it.
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// Removes a replay's cancel token from the registry when the request ends.
+struct ReplayToken<'a> {
+    state: &'a ServerState,
+    id: String,
+}
+
+impl Drop for ReplayToken<'_> {
+    fn drop(&mut self) {
+        self.state.registry().deregister(&self.id);
+    }
 }
 
 /// `POST /v1/dlq/replay` → 200 with the
@@ -98,9 +120,24 @@ pub async fn replay(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<DlqReplayRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = state
-        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
-        .await?;
+    let tenant = match (&actor.tenant, &req.tenant) {
+        (Some(own), Some(asked)) if own != asked => return Err(ServeError::NotFound),
+        (own, asked) => own.clone().or_else(|| asked.clone()),
+    };
+    // A tenant's replay loads under its scope and is admitted against its
+    // limits, whose per-run ceilings join the config's budget (#871).
+    let caller_budget = match tenant.as_deref() {
+        Some(t) => admit_replay(&state, t).await?,
+        None => None,
+    };
+    let loaded = crate::serve::runner::load_for(
+        &state,
+        &req.config,
+        req.config_format.into(),
+        tenant.as_deref(),
+        state.caller_origin(),
+    )
+    .await?;
     if !req.dry_run {
         crate::serve::runner::refuse_unapproved_write(&state, "DLQ replay")?;
         crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;
@@ -112,6 +149,24 @@ pub async fn replay(
         .name
         .clone()
         .unwrap_or_else(|| "dlq-replay".to_string());
+
+    // Cancellable like a run (#871): the token is registered under the
+    // replay's id and stops with the server.
+    let id = req
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("dlq-replay-{}", uuid::Uuid::now_v7()));
+    if state.registry().is_registered(&id) {
+        return Err(ServeError::Conflict(format!(
+            "a run or replay with id '{id}' is already in flight"
+        )));
+    }
+    let cancel = state.shutdown_token().child_token();
+    state.registry().register(id.clone(), cancel.clone());
+    let _token = ReplayToken {
+        state: &state,
+        id: id.clone(),
+    };
 
     let outcome = dlq_replay::replay(
         &loaded.cfg,
@@ -128,6 +183,8 @@ pub async fn replay(
             decryptor: DlqDecryptor::from_keys(&req.encryption_keys)
                 .map_err(CliError::from)
                 .map_err(cli_to_serve)?,
+            budget: caller_budget,
+            cancel: Some(cancel),
         },
     )
     .await;
@@ -136,7 +193,36 @@ pub async fn replay(
     crate::serve::audit::write(&state, &actor, "dlq.replay", None, None, result_label).await;
 
     let outcome = outcome.map_err(cli_to_serve)?;
-    Ok(Json(serde_json::to_value(outcome).unwrap_or(Value::Null)))
+    let mut body = serde_json::to_value(outcome).unwrap_or(Value::Null);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("id".into(), Value::String(id));
+        if let Some(t) = tenant {
+            obj.insert("tenant".into(), Value::String(t));
+        }
+    }
+    Ok(Json(body))
+}
+
+/// Admit a replay for `tenant`: it exists, is not suspended and is under its
+/// concurrency limit; its per-run ceilings are returned as the replay's budget.
+#[cfg(feature = "tenants")]
+async fn admit_replay(
+    state: &ServerState,
+    tenant: &str,
+) -> Result<Option<faucet_core::BudgetSpec>, ServeError> {
+    crate::serve::tenants::admit_inline(state, tenant)
+        .await
+        .map(|(_admission, budget)| budget)
+}
+
+#[cfg(not(feature = "tenants"))]
+async fn admit_replay(
+    _state: &ServerState,
+    tenant: &str,
+) -> Result<Option<faucet_core::BudgetSpec>, ServeError> {
+    Err(ServeError::BadConfig(format!(
+        "replay for tenant '{tenant}' refused: this server was built without the `tenants` feature"
+    )))
 }
 
 /// `POST /v1/dlq/discard` request body.

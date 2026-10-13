@@ -130,6 +130,8 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
             auth,
             clock: Utc::now().fixed_offset(),
             decryptor: decryptor(&args.encryption_key, &args.encryption_key_file)?,
+            budget: None,
+            cancel: None,
         },
     )
     .await?;

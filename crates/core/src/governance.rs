@@ -586,8 +586,16 @@ impl Governance {
         .collect()
     }
 
-    /// Wrap the DLQ sink in its governed stack (#870). `labels` = (pipeline,
-    /// row) for the policy metric. Returns `None` when no DLQ is configured.
+    /// The DLQ wiring with its sink wrapped in the governed stack (#870):
+    /// masking (rules naming the DLQ) → policy (the DLQ's attributes) → budget
+    /// (shared with the main sink) → metering. `None` without a DLQ. For a
+    /// caller that drives the write loop itself (a topology sink node).
+    pub fn dlq_config(&self) -> Option<DlqConfig> {
+        self.governed_dlq()
+    }
+
+    /// Wrap the DLQ sink in its governed stack (#870). Returns `None` when no
+    /// DLQ is configured.
     pub(crate) fn governed_dlq(&self) -> Option<DlqConfig> {
         let dlq = self.dlq.as_ref()?;
         Some(govern_dlq(

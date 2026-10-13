@@ -2459,6 +2459,7 @@ async fn run_one_invocation(
         Some(opts.run_id.clone().unwrap_or_else(|| run_id.clone())),
         Some(run_id.clone()),
     );
+    let invocation_clock = std::time::Instant::now();
     let pipeline_name = opts.pipeline_name.clone();
     let row_id = node.id.clone();
     #[cfg(feature = "lineage")]
@@ -2990,7 +2991,20 @@ async fn run_one_invocation(
             // machine is large, and inlining it here overflowed the 2 MiB
             // test-thread stack under `--all-features` (see
             // `boxed_run_one_invocation`).
-            match crate::verify::verify_node_boxed(node, spec, &inputs).await {
+            // A repair is bounded by what is left of this run's budget, stops
+            // with it, and retries like it (#871).
+            let guards = crate::verify::RunGuards {
+                budget: opts.budget.as_ref().map(|spec| {
+                    crate::budget::remaining_budget(
+                        spec,
+                        budget_state.as_deref(),
+                        invocation_clock.elapsed(),
+                    )
+                }),
+                cancel: Some(cancel.clone()),
+                resilience: opts.resilience.clone(),
+            };
+            match crate::verify::verify_node_boxed(node, spec, &inputs, &guards).await {
                 Ok(outcome) if outcome.report.equal() => result,
                 // A repair that re-synced every reported difference healed the
                 // drift: the run is green, and the drift is logged.

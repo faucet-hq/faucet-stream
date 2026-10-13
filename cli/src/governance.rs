@@ -186,15 +186,44 @@ pub(crate) fn dlq_governance(
     dlq: &DlqSpec,
     config: faucet_core::DlqConfig,
 ) -> CliResult<DlqGovernance> {
+    dlq_governance_for(
+        DlqTarget {
+            #[cfg(feature = "masking")]
+            masking: node.masking.as_ref(),
+            #[cfg(feature = "policy")]
+            policy: node.policy.is_some(),
+            main_ids: &[node.sink_ref.as_str(), node.sink.kind.as_str()],
+        },
+        dlq,
+        config,
+    )
+}
+
+/// What the DLQ is governed against: the run's masking spec, whether a policy
+/// is configured, and the ids of the main destination.
+pub(crate) struct DlqTarget<'a> {
+    #[cfg(feature = "masking")]
+    pub masking: Option<&'a faucet_core::MaskingSpec>,
+    #[cfg(feature = "policy")]
+    pub policy: bool,
+    pub main_ids: &'a [&'a str],
+}
+
+/// [`dlq_governance`] for any caller (a matrix row or a topology sink node).
+pub(crate) fn dlq_governance_for(
+    target: DlqTarget<'_>,
+    dlq: &DlqSpec,
+    config: faucet_core::DlqConfig,
+) -> CliResult<DlqGovernance> {
     #[allow(unused_mut)]
     let mut d = DlqGovernance::new(config);
     #[cfg(feature = "policy")]
-    if node.policy.is_some() {
+    if target.policy {
         d = d.with_facts(crate::policy::dlq_facts(dlq));
     }
     #[cfg(feature = "masking")]
-    if let Some(spec) = &node.masking
-        && let Some(only) = dlq_only_masking(spec, node, dlq)
+    if let Some(spec) = target.masking
+        && let Some(only) = dlq_only_masking(spec, target.main_ids, dlq)
     {
         d = d.with_masking(Arc::new(
             faucet_core::CompiledMasking::compile(&only)
@@ -202,8 +231,142 @@ pub(crate) fn dlq_governance(
         ));
     }
     #[cfg(not(any(feature = "policy", feature = "masking")))]
-    let _ = (node, dlq);
+    let _ = (target, dlq);
     Ok(d)
+}
+
+/// One topology sink node's governance request.
+pub(crate) struct TopologySinkRequest<'a> {
+    pub cfg: &'a crate::config::PipelineConfig,
+    pub node_id: &'a str,
+    pub kind: &'a str,
+    pub template: &'a str,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    pub run_id: &'a str,
+    pub source_label: String,
+    pub budget: Option<&'a faucet_core::BudgetSpec>,
+    pub cancel: CancellationToken,
+    pub dry_run: bool,
+    pub preview: bool,
+}
+
+/// The sink-side governance of one topology sink node (#875): budget, metadata
+/// columns, profiling and the policy backstop. The page passes (masking,
+/// quality, contract, drift, resilience) run in the topology's own sink loop
+/// from [`faucet_core::TopologyGovernance`]; the DLQ is attached with
+/// [`topology_dlq`] once it is built.
+pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResult<GovernanceBuild> {
+    let cfg = req.cfg;
+    let mut g = Governance::new().with_cancel(req.cancel.clone());
+    if let Some(spec) = req.budget.filter(|b| !b.is_empty()) {
+        g = g.with_budget(spec.clone());
+        if req.dry_run {
+            g = g.without(Pass::Budget, "a --dry-run writes nothing to count");
+        }
+    }
+    if let Some(spec) = &cfg.metadata_columns
+        && let Some(meta) = faucet_core::CompiledMetadata::compile(spec)
+            .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?
+    {
+        g = g.with_metadata(
+            meta,
+            faucet_core::MetadataContext {
+                run_id: req.run_id.to_string(),
+                source: req.source_label.clone(),
+            },
+        );
+    }
+    let mut profiler = None;
+    if let Some(spec) = &cfg.profiling {
+        if req.preview {
+            g = g.without(
+                Pass::Profiling,
+                "a preview's volumes are synthetic, so they would skew the baseline",
+            );
+        } else {
+            let p = Arc::new(Mutex::new(faucet_core::Profiler::new(spec.clone())));
+            g = g.with_profiler(Arc::clone(&p));
+            profiler = Some(p);
+        }
+    }
+    #[cfg(feature = "policy")]
+    if let Some(policy_spec) = cfg.policy.as_ref() {
+        if crate::policy::quarantines(policy_spec) && cfg.pipeline.dlq.is_none() {
+            return Err(CliError::Config(format!(
+                "node '{}': policy: a rule with `on_runtime: quarantine` needs a `dlq:` block \
+                 to route the quarantined records to",
+                req.node_id
+            )));
+        }
+        let compiled = faucet_core::CompiledPolicy::compile(&crate::policy::topology_runtime_spec(
+            policy_spec,
+            cfg,
+        ))
+        .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+        #[allow(unused_mut)]
+        let mut p = faucet_core::PolicyGovernance::new(
+            Arc::new(compiled),
+            faucet_core::SinkFacts {
+                id: req.node_id.to_string(),
+                kind: req.kind.to_string(),
+                attributes: req.attributes.clone(),
+            },
+            faucet_core::PolicyScope {
+                pipeline: cfg.name.clone().unwrap_or_default(),
+                row: req.node_id.to_string(),
+            },
+        );
+        #[cfg(feature = "masking")]
+        if let Some(masking) = cfg.pipeline.masking.as_ref() {
+            p = p.with_masking(Arc::new(
+                faucet_core::CompiledMasking::compile_for_sink(
+                    masking,
+                    &[req.node_id, req.template, req.kind],
+                )
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+            ));
+        }
+        g = g.with_policy(p);
+        if req.dry_run {
+            g = g.without(
+                Pass::Policy,
+                "a --dry-run writes nothing; the static policy pass still ran",
+            );
+        }
+    }
+    Ok(GovernanceBuild {
+        governance: g,
+        profiler,
+    })
+}
+
+/// A topology sink node's governed DLQ (#870): the shared DLQ sink wrapped
+/// with that node's budget, policy facts and DLQ-only masking.
+pub(crate) fn topology_dlq(
+    governance: &Governance,
+    cfg: &crate::config::PipelineConfig,
+    main_ids: &[&str],
+    dlq: &DlqSpec,
+    config: faucet_core::DlqConfig,
+) -> CliResult<faucet_core::DlqConfig> {
+    let d = dlq_governance_for(
+        DlqTarget {
+            #[cfg(feature = "masking")]
+            masking: cfg.pipeline.masking.as_ref(),
+            #[cfg(feature = "policy")]
+            policy: cfg.policy.is_some(),
+            main_ids,
+        },
+        dlq,
+        config,
+    )?;
+    #[cfg(not(any(feature = "policy", feature = "masking")))]
+    let _ = cfg;
+    Ok(governance
+        .clone()
+        .with_dlq(d)
+        .dlq_config()
+        .expect("a DLQ was just attached"))
 }
 
 /// The ids masking `applies_to` / policy facts use for a node's DLQ.
@@ -217,10 +380,9 @@ pub fn dlq_ids(dlq: &DlqSpec) -> [&str; 2] {
 #[cfg(feature = "masking")]
 pub fn dlq_only_masking(
     spec: &faucet_core::MaskingSpec,
-    node: &ExpandedNode,
+    main: &[&str],
     dlq: &DlqSpec,
 ) -> Option<faucet_core::MaskingSpec> {
-    let main = [node.sink_ref.as_str(), node.sink.kind.as_str()];
     let at_dlq = dlq_ids(dlq);
     let mut only = spec.clone();
     only.rules.retain(|r| {

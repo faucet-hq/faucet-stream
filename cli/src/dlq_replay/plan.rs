@@ -198,11 +198,15 @@ pub fn build_replay_node(
     // The quality and contract passes are deliberately kept: they are pure
     // predicates over the record, so re-checking is idempotent — and a replay is
     // exactly when you want them re-enforced.
+    // Masking is opted out by name rather than cleared, so the policy
+    // backstop still knows which columns are masked (#875).
     node.transforms.clear();
-    #[cfg(feature = "masking")]
-    {
-        node.masking = None;
-    }
+    node.opt_outs.push(faucet_core::OptOut {
+        pass: faucet_core::Pass::Masking,
+        reason: "DLQ payloads were masked before they were dead-lettered, and masking is not \
+                 idempotent"
+            .into(),
+    });
 
     // A replay reads the whole DLQ location once — no bookmarking, and never
     // exactly-once (the reader is not a deterministic-replay source).
