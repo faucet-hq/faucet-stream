@@ -152,9 +152,10 @@ async fn roundtrips_are_recorded_and_a_spent_context_fails_every_row() {
     cut.write_batch(&[serde_json::json!({"id": 4, "v": "d"})])
         .await
         .expect("a write before the context runs out");
-    cut.set_call_context(faucet_core::CallContext::new().with_deadline(
-        tokio::time::Instant::now() - std::time::Duration::from_millis(1),
-    ));
+    cut.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() - std::time::Duration::from_millis(1)),
+    );
     let outcomes = cut
         .write_batch_partial(&[
             serde_json::json!({"id": 2, "v": "b"}),
@@ -164,5 +165,9 @@ async fn roundtrips_are_recorded_and_a_spent_context_fails_every_row() {
         .expect("per-row outcomes");
     assert_eq!(outcomes.len(), 2);
     assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
-    assert_eq!(count(&client, "recorded").await, 2, "nothing more was written");
+    assert_eq!(
+        count(&client, "recorded").await,
+        2,
+        "nothing more was written"
+    );
 }

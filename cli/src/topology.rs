@@ -2392,11 +2392,10 @@ pipeline:
             "o: { type: jsonl, config: { path: /tmp/o.jsonl } }",
             "o: { type: file, config: { path: /tmp/o.csv, csv: { on_unknown_field: warn } } }",
         );
-        let err = validate_topology_spec(&cfg(&format!(
-            "{dropping}  schema: {{ on_drift: fail }}\n"
-        )))
-        .unwrap_err()
-        .to_string();
+        let err =
+            validate_topology_spec(&cfg(&format!("{dropping}  schema: {{ on_drift: fail }}\n")))
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("sink node 'w'"), "{err}");
         assert!(err.contains("(sink 'file')"), "{err}");
         assert!(

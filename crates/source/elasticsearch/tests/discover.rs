@@ -248,7 +248,10 @@ async fn discover_surfaces_transport_and_body_failures() {
         .discover()
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("catalog discovery failed"), "{err}");
+    assert!(
+        err.to_string().contains("catalog discovery failed"),
+        "{err}"
+    );
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -261,5 +264,8 @@ async fn discover_surfaces_transport_and_body_failures() {
         .discover()
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("catalog discovery failed"), "{err}");
+    assert!(
+        err.to_string().contains("catalog discovery failed"),
+        "{err}"
+    );
 }

@@ -155,9 +155,10 @@ async fn roundtrips_are_recorded_and_a_spent_context_ends_a_streams_read() {
     cfg.mode = ReadMode::Streams;
     cfg.idle_termination_secs = Some(120);
     let streams = DynamoDbSource::new(cfg).await.unwrap();
-    streams.set_call_context(faucet_core::CallContext::new().with_deadline(
-        tokio::time::Instant::now() + std::time::Duration::from_secs(3),
-    ));
+    streams.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
+    );
     let started = std::time::Instant::now();
     let err = streams.fetch_all().await.unwrap_err();
     assert!(

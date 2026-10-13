@@ -1203,7 +1203,11 @@ mod tests {
             .dlq_config()
             .unwrap();
         let envelope = || json!({"payload": {"email": "a@b.co"}});
-        let report = config.sink.write_batch_reported(&[envelope()]).await.unwrap();
+        let report = config
+            .sink
+            .write_batch_reported(&[envelope()])
+            .await
+            .unwrap();
         assert_eq!(report.accepted, 1);
         let outcomes = config
             .sink

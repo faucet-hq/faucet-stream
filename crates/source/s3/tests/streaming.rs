@@ -829,6 +829,8 @@ async fn an_object_deleted_after_the_listing_fails_with_its_key() {
             break;
         }
     }
-    let err = err.expect("the deleted object fails the stream").to_string();
+    let err = err
+        .expect("the deleted object fails the stream")
+        .to_string();
     assert!(err.contains("b.jsonl"), "{err}");
 }

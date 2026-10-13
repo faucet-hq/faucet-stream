@@ -335,6 +335,11 @@ async fn sink_records_roundtrips_and_fails_on_a_missing_container() {
         Ok(_) => sink.flush().await,
         Err(e) => Err(e),
     };
-    let err = outcome.expect_err("a missing container fails the write").to_string();
-    assert!(err.contains("no-such-container") || err.contains("azure"), "{err}");
+    let err = outcome
+        .expect_err("a missing container fails the write")
+        .to_string();
+    assert!(
+        err.contains("no-such-container") || err.contains("azure"),
+        "{err}"
+    );
 }

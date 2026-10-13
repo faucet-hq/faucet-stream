@@ -143,7 +143,10 @@ pub async fn assert_source_records_roundtrips<S: Source>(source: &S) {
         .await
         .expect("the source reads from its live backend");
     let n = meter.snapshot().roundtrips(faucet_core::UsageSide::Source);
-    assert!(n > 0, "the installed recorder counted no source round trips");
+    assert!(
+        n > 0,
+        "the installed recorder counted no source round trips"
+    );
 }
 
 /// Assert a recorder installed through [`Sink::set_roundtrip_recorder`]

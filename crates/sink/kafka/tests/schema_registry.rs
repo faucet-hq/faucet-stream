@@ -140,9 +140,15 @@ async fn the_registry_client_gets_the_runs_context_and_recorder() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 7})))
         .mount(&registry)
         .await;
-    let mut cfg = sink_config("127.0.0.1:1", "sr-ctx", avro_format(&registry.uri(), "utf8"));
+    let mut cfg = sink_config(
+        "127.0.0.1:1",
+        "sr-ctx",
+        avro_format(&registry.uri(), "utf8"),
+    );
     cfg.message_timeout = Duration::from_millis(500);
-    let sink = KafkaSink::new(cfg).await.expect("sink builds without a broker");
+    let sink = KafkaSink::new(cfg)
+        .await
+        .expect("sink builds without a broker");
     let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
     sink.set_call_context(faucet_core::CallContext::new());
     sink.set_roundtrip_recorder(std::sync::Arc::new(

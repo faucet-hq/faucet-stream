@@ -591,9 +591,13 @@ mod tests {
             t.cancel();
         });
         let started = std::time::Instant::now();
-        let r = run_call(&fast_policy(1), Some(&token), Some(&rec), Some(5), || async {
-            Err::<i32, _>(FaucetError::RateLimited(Duration::from_secs(30)))
-        })
+        let r = run_call(
+            &fast_policy(1),
+            Some(&token),
+            Some(&rec),
+            Some(5),
+            || async { Err::<i32, _>(FaucetError::RateLimited(Duration::from_secs(30))) },
+        )
         .await;
         assert!(matches!(r, Err(FaucetError::RateLimited(_))), "{r:?}");
         assert!(started.elapsed() < Duration::from_secs(10));

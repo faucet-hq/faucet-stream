@@ -4,7 +4,9 @@
 //! that runs out while the reader waits.
 
 use faucet_core::{CallContext, FaucetError, Source};
-use faucet_source_kinesis::{KinesisCredentials, KinesisSource, KinesisSourceConfig, StartPosition};
+use faucet_source_kinesis::{
+    KinesisCredentials, KinesisSource, KinesisSourceConfig, StartPosition,
+};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -204,7 +206,10 @@ async fn a_timestamp_start_position_is_sent() {
 async fn a_spent_call_context_ends_every_wait() {
     let scripts = [
         Script::new(vec![error("InvalidArgumentException")], vec![caught_up()]),
-        Script::new(vec![ok(json!({"ShardIterator": "it-0"}))], vec![caught_up()]),
+        Script::new(
+            vec![ok(json!({"ShardIterator": "it-0"}))],
+            vec![caught_up()],
+        ),
         Script::new(
             vec![ok(json!({"ShardIterator": "it-0"}))],
             vec![error("InvalidArgumentException")],

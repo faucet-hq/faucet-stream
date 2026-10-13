@@ -783,7 +783,13 @@ async fn http_fetcher_get_and_head_without_a_call_context() {
     ));
     let fetcher = HttpFetcher::new(&Default::default(), 0).unwrap();
     let url = format!("{}/f.jsonl", server.uri());
-    let body = fetcher.get(&url, &slot).await.unwrap().text().await.unwrap();
+    let body = fetcher
+        .get(&url, &slot)
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert_eq!(body, "{\"a\":1}\n");
     let meta = fetcher.head(&url, &slot).await.unwrap();
     assert_eq!(meta.last_modified_ns, Some(1_000_000_000));

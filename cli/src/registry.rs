@@ -3894,7 +3894,9 @@ mod tests {
                 source_kind_capabilities(kind)
             };
             let checked = present.then_some(c);
-            checked.iter().for_each(|c| assert_eq!(f(c), want, "{kind}"));
+            checked
+                .iter()
+                .for_each(|c| assert_eq!(f(c), want, "{kind}"));
         };
         spot("bigquery", Capabilities::staged_load, true, true);
         spot("redshift", Capabilities::staged_load, true, true);
