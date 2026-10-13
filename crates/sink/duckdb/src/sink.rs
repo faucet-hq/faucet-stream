@@ -862,6 +862,16 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(count(&sink, "events"), 2);
         assert_eq!(sink.connector_name(), "duckdb");
+        // A recorder installed mid-run meters the next write.
+        sink.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Sink,
+                "p",
+                "r",
+                "duckdb",
+            ),
+        ));
+        assert_eq!(sink.write_batch(&[json!({"a": 3})]).await.unwrap(), 1);
     }
 
     #[tokio::test]
