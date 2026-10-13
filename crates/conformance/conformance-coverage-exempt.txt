@@ -37,5 +37,9 @@ faucet-sink-singer overwrite: ACTIVATE_VERSION makes the target drop older versi
 # a fake would only test itself. Their SQL is pinned by the src/sql.rs unit
 # tests instead.
 faucet-sink-databricks keyed_write_modes: MERGE semantics are the warehouse's (no emulator); the MERGE text is pinned by src/sql.rs unit tests and the fake-warehouse tests in tests/integration.rs
-faucet-sink-databricks replay_safe: a replayed MERGE converges by the warehouse's key semantics (no emulator); the statement is sent as Replay::Safe only for MERGE and REPLACE WHERE, pinned by tests/integration.rs
+faucet-sink-databricks replay_safe: a replayed keyed write is a MERGE, which converges by the warehouse's key semantics (no emulator); pinned by the upsert tests in tests/integration.rs
 faucet-sink-databricks overwrite: staging and INSERT OVERWRITE run in the warehouse (no emulator); the lifecycle statements are pinned by tests/integration.rs
+faucet-sink-bigquery keyed_write_modes: MERGE semantics are BigQuery's (no emulator runs the MERGE script); the script is pinned by src/merge.rs unit tests and tests/upsert.rs
+faucet-sink-bigquery replay_safe: a replayed keyed write is one MERGE, which converges by BigQuery's key semantics (no emulator); pinned by src/merge.rs unit tests and tests/upsert.rs
+faucet-sink-bigquery overwrite: the temp-table load and TRUNCATE + INSERT swap run in BigQuery (no emulator); the lifecycle requests are pinned by tests/overwrite.rs
+faucet-sink-redshift atomic_batches: batches are atomic only for write_strategy: copy with batch_size: 0, whose COPY FROM 's3://…' needs a real cluster and bucket; COPY SQL is unit-tested in src/copy.rs

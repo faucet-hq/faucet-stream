@@ -76,3 +76,54 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_sink_call_deadline(make, &[serde_json::json!({"id": 1})])
         .await;
 }
+
+// ── #878: declared capabilities over the PostgreSQL wire ──────────────────────
+
+/// The `insert` strategy speaks the PostgreSQL wire protocol, so a stock
+/// Postgres container stands in for a cluster (as in `tests/integration.rs`):
+/// per-row outcomes, and a cancelled run flushing the commit group the sink
+/// buffers (`commit_rows`).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    use testcontainers::ImageExt;
+    use testcontainers_modules::postgres::Postgres;
+
+    let Some(container) = faucet_conformance::containers::start_or_skip(
+        || Postgres::default().with_tag("16-alpine"),
+        &faucet_conformance::containers::StartOptions::default(),
+    )
+    .await
+    else {
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    sqlx::query("CREATE TABLE cap (id BIGINT, v TEXT)")
+        .execute(&pool)
+        .await
+        .expect("create");
+    let pool = &pool;
+    let count = move || async move {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cap")
+            .fetch_one(pool)
+            .await
+            .expect("count") as usize
+    };
+
+    let v = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": port,
+        "database": "postgres",
+        "user": "postgres",
+        "credentials": {"type": "password", "config": {"password": "postgres"}},
+        "tls": false,
+        "table_name": "cap",
+        "write_strategy": "insert",
+        "commit_rows": 1000
+    });
+    let cfg: faucet_sink_redshift::RedshiftSinkConfig = serde_json::from_value(v).unwrap();
+    let sink = faucet_sink_redshift::RedshiftSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+}
