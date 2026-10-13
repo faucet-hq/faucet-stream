@@ -61,6 +61,34 @@ async fn streams_with_bounded_memory() {
 Sinks use the value form of check 1:
 `conf::assert_config_schema_valid_value(&sink.config_schema(), sink.connector_name())`.
 
+## Forwarding harnesses (for wrappers)
+
+A wrapper (a source or sink that holds another one) must forward every
+defaulted hook, or the feature behind it turns off for everything it wraps.
+Write wrappers with `faucet_core::forward_source!` / `forward_sink!`, then prove
+the result with `faucet_conformance::forwarding`:
+
+```rust
+use faucet_conformance::forwarding::{HookSink, assert_sink_forwards_every_hook};
+
+#[tokio::test]
+async fn my_wrapper_forwards_every_hook() {
+    let probe = HookSink::default();
+    let wrapped = MyWrapper::new(Box::new(probe.clone()));
+    // List the hooks the wrapper deliberately does not forward.
+    assert_sink_forwards_every_hook(&wrapped, &probe, &["load_native"]).await;
+}
+```
+
+`HookSource` / `HookSink` answer every hook differently from the trait default
+and record which hooks were reached; `assert_source_forwards_every_hook` /
+`assert_sink_forwards_every_hook` call every hook through the wrapper and name
+the ones that never reached the inner connector. A name in the skip list that
+is not a hook fails the assertion, so the list cannot go stale. `SOURCE_HOOKS`
+and `SINK_HOOKS` are the canonical hook lists; a test in this crate checks them
+against the trait definitions, so a hook added to either trait without being
+added to the harness fails CI.
+
 ## Doubles
 
 `faucet_conformance::doubles` provides a `CountingSource` (lazily emits N

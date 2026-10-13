@@ -68,6 +68,15 @@
 //!   every source↔sink pair inherits a type-exactness test instead of
 //!   hand-rolling one.
 //!
+//! # Wrapper forwarding
+//!
+//! [`forwarding`] proves a wrapper (a source or sink holding another one)
+//! forwards every defaulted hook to the connector it wraps:
+//! [`assert_source_forwards_every_hook`](forwarding::assert_source_forwards_every_hook)
+//! and [`assert_sink_forwards_every_hook`](forwarding::assert_sink_forwards_every_hook),
+//! driven by the canonical [`SOURCE_HOOKS`](forwarding::SOURCE_HOOKS) /
+//! [`SINK_HOOKS`](forwarding::SINK_HOOKS) lists.
+//!
 //! With the `containers` feature, the `containers` module is the one way integration
 //! tests start a testcontainers backend: a shared start-up budget, a bounded
 //! retry of start-up failures, an optional readiness probe, and the

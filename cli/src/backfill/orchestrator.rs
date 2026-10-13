@@ -222,6 +222,14 @@ impl BoundedSource {
 
 #[faucet_core::async_trait]
 impl faucet_core::Source for BoundedSource {
+    // Every hook that does not read rows reaches the wrapped source. The fast
+    // paths and server-side range digests would bypass the bound, so they stay
+    // at the trait default (off); the convenience fetches go through it.
+    faucet_core::forward_source!(inner; except
+        fetch_with_context, fetch_with_context_incremental, stream_pages, fetch_all,
+        fetch_all_incremental, supports_columnar, stream_batches, native_output_formats,
+        stream_native, range_digest);
+
     async fn fetch_with_context(
         &self,
         context: &std::collections::HashMap<String, Value>,
@@ -264,65 +272,6 @@ impl faucet_core::Source for BoundedSource {
                 bookmark: p.bookmark,
             })
         }))
-    }
-
-    fn state_key(&self) -> Option<String> {
-        self.inner.state_key()
-    }
-
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        self.inner.apply_start_bookmark(bookmark).await
-    }
-
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
-    }
-
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-
-    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
-        self.inner.set_run_clock(now);
-    }
-
-    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-        self.inner.set_cancel(cancel)
     }
 }
 
@@ -855,6 +804,31 @@ mod tests {
             to: serde_json::json!(9),
         };
         assert_forwards_multi_table_hooks(&wrapped);
+    }
+
+    #[tokio::test]
+    async fn bounded_source_forwards_every_hook_that_does_not_read_rows() {
+        use faucet_conformance::forwarding::{HookSource, assert_source_forwards_every_hook};
+        let probe = HookSource::default();
+        let wrapped = BoundedSource {
+            inner: Box::new(probe.clone()),
+            field: "id".into(),
+            to: serde_json::json!(9),
+        };
+        assert_source_forwards_every_hook(
+            &wrapped,
+            &probe,
+            &[
+                "fetch_all",
+                "fetch_all_incremental",
+                "supports_columnar",
+                "stream_batches",
+                "native_output_formats",
+                "stream_native",
+                "range_digest",
+            ],
+        )
+        .await;
     }
     use super::*;
     use serde_json::json;

@@ -522,6 +522,29 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 
 > **Keep `faucet-core` the only required dependency.** If your connector needs a new common dependency, propose re-exporting it from `faucet-core` rather than requiring every connector author to add it. Keep the `Source` / `Sink` traits object-safe (no connector-specific types or generics on methods) and `FaucetError::Custom` intact for third-party error wrapping.
 
+## Wrapping a source or sink
+
+A wrapper that holds another connector must forward every defaulted hook, or the
+feature behind it turns off for everything it wraps. `forward_source!` /
+`forward_sink!` generate the forwarding body of every hook inside the wrapper's
+`impl` block; the wrapper writes only the hooks it changes and lists them (plus
+any it deliberately leaves at the trait default) after `except`:
+
+```rust,ignore
+#[async_trait]
+impl Sink for Stamped {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.inner.write_batch(&self.stamp(records)).await
+    }
+    forward_sink!(inner; except write_batch, write_batch_partial, write_batch_idempotent,
+        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+}
+```
+
+An unknown name in `except` does not compile, so the list stays exact. Prove the
+wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
+`assert_source_forwards_every_hook`.
+
 ## Modules
 
 | Module | Contents |
@@ -534,6 +557,7 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 | `config` | `load_json`, `load_env`, `load_env_file`, duration serde helpers |
 | `transform` | `RecordTransform`, `CompiledTransform`, support enums (`CastType`, `CastOnError`, `KeyCaseMode`, `ValueCaseMode`) |
 | `transforming_source` | `TransformingSource` — attach stages to any source |
+| `forward` | `forward_source!` / `forward_sink!` — generate a wrapper's pass-through hooks (see below) |
 | `stage` | `TransformStage`, `FilterSpec`, `ExplodeSpec`, `CdcUnwrapSpec`, `compile_stage` |
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |

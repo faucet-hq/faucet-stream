@@ -110,7 +110,6 @@ macro_rules! __faucet_if_arrow {
 /// # let s = Keyed { inner: Box::new(Empty), key: "k".into() };
 /// # assert_eq!(s.state_key().as_deref(), Some("k"));
 /// ```
-
 #[macro_export]
 macro_rules! forward_source {
     ($inner:tt) => { $crate::forward_source!($inner; except); };
@@ -564,7 +563,6 @@ macro_rules! forward_source {
 ///     forward_sink!(inner; except write_btach);
 /// }
 /// ```
-
 #[macro_export]
 macro_rules! forward_sink {
     ($inner:tt) => { $crate::forward_sink!($inner; except); };

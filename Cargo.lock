@@ -4829,6 +4829,7 @@ dependencies = [
 name = "faucet-cli"
 version = "1.13.3"
 dependencies = [
+ "arrow 58.3.0",
  "assert_cmd",
  "async-stream",
  "async-trait",
