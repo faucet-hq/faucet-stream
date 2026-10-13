@@ -424,6 +424,19 @@ impl Sink for KafkaSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        self.write_batch_idempotent_reported(records, scope, token)
+            .await
+            .map(|r| r.accepted)
+    }
+
+    /// Records skipped under `on_key_error: skip` are reported as skipped, so
+    /// the exactly-once page accounts for every row it was offered (#879).
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
         let producer = self.txn_producer(scope).await?;
         let calls = self.calls.get();
 
@@ -572,7 +585,7 @@ impl Sink for KafkaSink {
                 "kafka sink: dropped records due to OnKeyError::Skip"
             );
         }
-        Ok(produced)
+        Ok(faucet_core::WriteReport::accepted(produced).with_skipped(skipped))
     }
 
     fn connector_name(&self) -> &'static str {

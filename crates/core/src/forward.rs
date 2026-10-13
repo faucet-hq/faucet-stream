@@ -861,6 +861,25 @@ macro_rules! forward_sink {
                 self.$inner.write_batch_idempotent(records, scope, token)
             }
         });
+        $crate::__faucet_forward_filter!(write_batch_idempotent_reported [$($skip)*] {
+            fn write_batch_idempotent_reported<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+                &'life0 self,
+                records: &'life1 [$crate::Value],
+                scope: &'life2 str,
+                token: &'life3 str,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<$crate::accounting::WriteReport>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                'life3: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.write_batch_idempotent_reported(records, scope, token)
+            }
+        });
         $crate::__faucet_forward_filter!(last_committed_token [$($skip)*] {
             fn last_committed_token<'life0, 'life1, 'async_trait>(
                 &'life0 self,
@@ -1154,6 +1173,10 @@ macro_rules! __faucet_forward_filter {
     (supports_staged_load [supports_staged_load $($rest:ident)*] $item:tt) => {};
     (cleanup_scope [cleanup_scope $($rest:ident)*] $item:tt) => {};
     (write_batch_idempotent [write_batch_idempotent $($rest:ident)*] $item:tt) => {};
+    (write_batch_idempotent_reported [write_batch_idempotent_reported $($rest:ident)*] $item:tt) => {};
+    // A wrapper that changes `write_batch_idempotent` takes the trait default
+    // for the reported write, which goes through its own change (#879).
+    (write_batch_idempotent_reported [write_batch_idempotent $($rest:ident)*] $item:tt) => {};
     (last_committed_token [last_committed_token $($rest:ident)*] $item:tt) => {};
     (is_overwrite [is_overwrite $($rest:ident)*] $item:tt) => {};
     (begin_overwrite [begin_overwrite $($rest:ident)*] $item:tt) => {};
@@ -1236,6 +1259,7 @@ macro_rules! __faucet_forward_known {
     (@sink [supports_staged_load $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [cleanup_scope $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [write_batch_idempotent $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
+    (@sink [write_batch_idempotent_reported $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [last_committed_token $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [is_overwrite $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [begin_overwrite $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };

@@ -395,7 +395,11 @@ Every row offered to a sink is accounted for: `offered = accepted + coalesced +
 skipped + failed + quarantined + dropped`. The pipeline writes through
 `Sink::write_batch_reported`, whose default wraps `write_batch`'s count
 (crediting a keyed sink's merged rows as coalesced); a shortfall fails the page
-with `FaucetError::RowsUnaccounted` before its bookmark advances.
+with `FaucetError::RowsUnaccounted` before its bookmark advances. The
+exactly-once path does the same through `Sink::write_batch_idempotent_reported`
+(default: `write_batch_idempotent`'s count): a short report fails the page after
+the sink committed its token and before the bookmark is persisted, so the next
+run resumes from the sink's watermark and the run is never reported green.
 `Pipeline::with_row_accounts(Arc<RowAccounts>)` exposes the counts.
 
 ## Effectively-once delivery

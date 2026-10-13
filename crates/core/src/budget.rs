@@ -403,6 +403,7 @@ impl Sink for BudgetSink {
     // everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
         admit_page, write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_idempotent_reported,
         write_batch_columnar, native_load_capabilities, load_native);
 
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
@@ -449,6 +450,21 @@ impl Sink for BudgetSink {
             .await?;
         self.account(n as u64, bytes);
         Ok(n)
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let bytes = self.admit(records)?;
+        let r = self
+            .inner
+            .write_batch_idempotent_reported(records, scope, token)
+            .await?;
+        self.account(r.accepted as u64, bytes);
+        Ok(r)
     }
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(

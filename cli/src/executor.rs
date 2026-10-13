@@ -3948,7 +3948,8 @@ impl Sink for CapturingSink {
     // wrapped sink.
     faucet_core::forward_sink!(inner; except
         write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+        write_batch_idempotent_reported, supports_columnar, write_batch_columnar,
+        native_load_capabilities, load_native);
 
     async fn write_batch_reported(
         &self,
@@ -4016,6 +4017,26 @@ impl Sink for CapturingSink {
                 .map(|r| project_record(r, &self.projection)),
         );
         Ok(written)
+    }
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let report = self
+            .inner
+            .write_batch_idempotent_reported(records, scope, token)
+            .await?;
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+        Ok(report)
     }
 }
 
@@ -4245,6 +4266,7 @@ mod tests {
             &[
                 "supports_idempotent_writes",
                 "write_batch_idempotent",
+                "write_batch_idempotent_reported",
                 "last_committed_token",
                 "supports_columnar",
                 "write_batch_columnar",

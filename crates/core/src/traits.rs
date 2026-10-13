@@ -912,6 +912,31 @@ pub trait Sink: Send + Sync {
         self.write_batch(records).await
     }
 
+    /// [`write_batch_idempotent`](Self::write_batch_idempotent) with a
+    /// [`WriteReport`](crate::accounting::WriteReport): the exactly-once path
+    /// calls this, and a page whose report does not account for every row it
+    /// offered fails with [`FaucetError::RowsUnaccounted`] before its bookmark
+    /// is persisted (#879). Override it when the sink declines rows by design
+    /// inside the atomic commit (a record without a key under a skip policy)
+    /// and report them as `skipped`.
+    ///
+    /// The default credits the rows `write_batch_idempotent` returns — as
+    /// coalesced-by-key when [`dedups_by_key`](Self::dedups_by_key) — so a
+    /// sink that silently writes fewer rows than it was offered fails the page.
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let n = self.write_batch_idempotent(records, scope, token).await?;
+        Ok(if self.dedups_by_key() {
+            crate::accounting::WriteReport::keyed(records.len(), n)
+        } else {
+            crate::accounting::WriteReport::accepted(n)
+        })
+    }
+
     /// The last token durably committed for `scope`, or `None` if this sink has
     /// never committed under that scope. Default: `None`.
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {

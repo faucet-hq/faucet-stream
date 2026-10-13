@@ -347,3 +347,108 @@ async fn at_least_once_is_the_control_arm_and_does_duplicate() {
         eo_log.records_written()
     );
 }
+
+/// An idempotent sink that commits a page's token while writing one row
+/// fewer than it was offered — silently, or saying so.
+struct ShortSink {
+    inner: ScriptedSink,
+    explains: bool,
+}
+
+#[faucet_core::async_trait]
+impl Sink for ShortSink {
+    faucet_core::forward_sink!(inner; except write_batch_idempotent, write_batch_idempotent_reported);
+
+    async fn write_batch_idempotent(
+        &self,
+        records: &[faucet_core::Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<usize, faucet_core::FaucetError> {
+        self.write_batch_idempotent_reported(records, scope, token)
+            .await
+            .map(|r| r.accepted)
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[faucet_core::Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, faucet_core::FaucetError> {
+        let kept = &records[..records.len().saturating_sub(1)];
+        let n = self
+            .inner
+            .write_batch_idempotent(kept, scope, token)
+            .await?;
+        let report = faucet_core::WriteReport::accepted(n);
+        Ok(if self.explains {
+            report.with_skipped(records.len() - kept.len())
+        } else {
+            report
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_unexplained_shortfall_fails_the_page_before_its_bookmark() {
+    // #879: the idempotent write returns a count, and the page's token is
+    // already committed — a shortfall the sink does not explain is a silent
+    // loss, so it fails the run instead of being booked as skipped.
+    let log = EventLog::new();
+    let sink = ShortSink {
+        inner: ScriptedSink::new(log.clone()).idempotent(),
+        explains: false,
+    };
+    let store = Arc::new(sink.inner.state_store());
+    let source = PagedSource::new(2, 3);
+
+    let err = Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .with_delivery(DeliveryMode::ExactlyOnce)
+        .run()
+        .await
+        .expect_err("a silent shortfall is not a green run");
+    assert!(
+        matches!(
+            err,
+            faucet_core::FaucetError::RowsUnaccounted {
+                offered: 3,
+                accepted: 2
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        store.stored("scripted:paged"),
+        None,
+        "the page's bookmark is not persisted"
+    );
+    assert!(
+        sink.last_committed_token("scripted:paged")
+            .await
+            .expect("token read")
+            .is_some(),
+        "the sink committed the page's token; the next run resumes from it"
+    );
+}
+
+#[tokio::test]
+async fn a_shortfall_the_sink_reports_as_skipped_completes_the_run() {
+    let log = EventLog::new();
+    let sink = ShortSink {
+        inner: ScriptedSink::new(log.clone()).idempotent(),
+        explains: true,
+    };
+    let store = Arc::new(sink.inner.state_store());
+    let source = PagedSource::new(2, 3);
+
+    let result = Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .with_delivery(DeliveryMode::ExactlyOnce)
+        .run()
+        .await
+        .expect("a declared skip is accounted for");
+    assert_eq!(result.records_written, 4);
+    assert!(store.stored("scripted:paged").is_some());
+}
