@@ -222,6 +222,45 @@ let stages = vec![TransformStage::Map(
 let wrapped = TransformingSource::new(source, stages);
 ```
 
+## Backend calls: `CallContext`, `http::Client`, batching
+
+Every call a connector makes to its backend runs through
+`faucet_core::io::CallContext` (RFC 0013, #880). `ctx.call(op, || fut)` applies
+the per-attempt timeout (`DEFAULT_CALL_TIMEOUT`, 300 s, unless set), the run's
+deadline, classified retry under a `RetryPolicy` (a
+`FaucetError::RateLimited(wait)` waits the time it states; an optional
+separate rate-limit budget), cancellation, round-trip metering (`op` is the
+`faucet_*_roundtrips_total` label) and redaction of the returned error.
+`ctx.wait(d)` is the cancel- and deadline-aware pause for poll intervals.
+
+A connector keeps a `CallSlot`: its own settings from config, plus the context
+the pipeline installs through the defaulted `Source::set_call_context` /
+`Sink::set_call_context` (every wrapper forwards it). The pipeline's context
+carries the round-trip recorder, any deadline from
+`Pipeline::with_call_context`, and — for a source only — the run's cancel
+token; it never carries a retry policy.
+
+```rust
+use faucet_core::io::{CallContext, CallSlot};
+use faucet_core::http::Client;
+
+let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+let calls = CallSlot::new(CallContext::new().with_retry(faucet_core::RetryPolicy::default()));
+let resp = client.execute(&calls.get(), "page", || client.get("https://api.example.com/items")).await?;
+let body: serde_json::Value = client.json(resp).await?;
+```
+
+`faucet_core::http::Client` wraps reqwest: redirects followed by faucet, which
+drops credential headers (and never replays a body) on a hop to another
+origin; bounded buffered reads (`max_response_bytes`, 1 GiB default); one
+status-error shape. `faucet_core::batching` re-chunks under the `batch_size`
+contract (`chunks`, `into_chunks`) and bounds concurrency (`map_concurrent`,
+`for_each_concurrent`, `ConcurrencyLimit`).
+
+The workspace `clippy.toml` disallows constructing reqwest clients directly and
+`tokio::time::sleep` / `sleep_until` / `std::thread::sleep`; a sanctioned site
+carries `#[allow(clippy::disallowed_methods)] // <reason>`.
+
 ## Resource annotations and reference policies
 
 Mark a config field that names a local path, a URL or a program with
@@ -257,9 +296,11 @@ is confined without serve changes.
 | `ContractViolation { version, message }` | A record breached the data contract under `on_breach: fail` |
 | `State(String)` | State-store read/write/delete failures |
 | `StateIncompatible { key, found, expected }` | A stored bookmark written by a newer release or another source (#736) — refused before the source is read |
+| `Timeout { operation, after }` | A call did not finish within its bound (retriable) |
+| `Cancelled { operation }` | A backend call was abandoned because the run was cancelled (#880) |
 | `Custom(Box<dyn Error + Send + Sync>)` | Wrap any third-party connector error |
 
-`FaucetError::is_retriable()` classifies transient failures (network errors, 5xx, 429) so connectors can drive `execute_with_retry` (exponential backoff + jitter, also re-exported). The `Custom` variant is intentionally permanent in the public API so connector authors can wrap their own error types without losing the chain.
+`FaucetError::is_retriable()` classifies transient failures (network errors, 5xx, 429); connectors retry through `CallContext::call` (see [Backend calls](#backend-calls-callcontext-httpclient-batching)). The `Custom` variant is intentionally permanent in the public API so connector authors can wrap their own error types without losing the chain.
 
 ## State stores (resume & bookmarks)
 
@@ -602,6 +643,9 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction` (the `masking` feature) |
 | `replication` | `ReplicationMethod`, `filter_incremental`, `max_replication_value` |
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
+| `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |
+| `http` | `Client`, `ClientBuilder`, `status_error`, `is_cross_origin`, `strip_credentials`, `ResponseTooLarge` |
+| `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `ConcurrencyLimit` |
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |

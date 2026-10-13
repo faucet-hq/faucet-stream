@@ -265,11 +265,87 @@ applied part of it:
 | `position_min(positions)` | The earliest position every table can resume from. Override it when positions are only partially ordered (one cursor per capture instance). |
 | `record_covered(&record, &position)` | Whether a run resumed from `position` would not deliver `record` again. **Implement it**: pages are cut differently on replay, so a page can straddle a table's committed position, and only this per-record test drops what that table already applied. Returning `None` (the default) re-delivers those changes — duplicates on an append destination; the mirror logs a warning when it happens. |
 
-## Retries
+## Backend calls: `CallContext`, `http::Client`, batching
 
-- **Reads and other idempotent calls** inside your connector retry transient
-  failures with `faucet_core::execute_with_retry`, which retries only errors
-  whose `is_retriable()` is true, with capped exponential backoff and jitter.
+Every call a connector makes to its backend goes through
+[`faucet_core::io::CallContext`](https://docs.rs/faucet-core/latest/faucet_core/io/struct.CallContext.html)
+(RFC 0013, #880). One `ctx.call(op, || fut)` applies the per-call timeout, the
+run's deadline, classified retry (a `FaucetError::RateLimited(wait)` waits the
+time it states), prompt cancellation, round-trip metering and redaction of the
+error it returns. Don't write a retry loop, a timeout or a backoff sleep.
+
+Keep one in a `CallSlot`, built in `new()` from what your config documents,
+and let the pipeline install the run's part:
+
+```rust
+use faucet_core::io::{CallContext, CallSlot};
+
+pub struct AcmeSource {
+    client: faucet_core::http::Client,
+    calls: CallSlot,
+}
+
+impl AcmeSource {
+    pub fn new(config: AcmeConfig) -> Result<Self, FaucetError> {
+        let client = faucet_core::http::Client::builder()
+            .timeout(config.timeout)
+            .sensitive_header("x-api-key")
+            .build()?;
+        let calls = CallSlot::new(
+            CallContext::new()
+                .with_timeout(config.timeout)
+                .with_retry(faucet_core::RetryPolicy {
+                    max_attempts: config.max_retries + 1,
+                    ..Default::default()
+                }),
+        );
+        Ok(Self { client, calls })
+    }
+
+    async fn page(&self, url: &str) -> Result<Value, FaucetError> {
+        let resp = self
+            .client
+            .execute(&self.calls.get(), "page", || self.client.get(url))
+            .await?;
+        self.client.json(resp).await
+    }
+}
+
+#[async_trait]
+impl Source for AcmeSource {
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+    fn set_roundtrip_recorder(&self, r: Arc<RoundtripRecorder>) {
+        self.calls.install_recorder(r);
+    }
+    // …
+}
+```
+
+What you get, and who sets it:
+
+| Setting | Set by | Default |
+|---|---|---|
+| attempt timeout (`with_timeout` / `without_timeout`) | the connector, from its config; else the caller | `DEFAULT_CALL_TIMEOUT` (300 s) |
+| retry policy (`with_retry`) | the connector | one attempt |
+| rate-limit budget (`with_rate_limit_retries`) | the connector | a rate limit is an ordinary attempt |
+| deadline | the caller (`Pipeline::with_call_context`) | none |
+| cancel token | the pipeline, **sources only** | none |
+| round-trip recorder | the pipeline | none |
+| redactor | the caller | the process-wide `faucet_core::redact` hook |
+
+`ctx.call` counts every attempt as a round trip labelled `op` (a closed,
+connector-defined set — `query`, `page`, `put`). Use `ctx.wait(d)` for a pause
+that is not a retry (a poll interval, a pacing delay): it ends early on cancel
+and at the deadline.
+
+A sink's context never carries the run's cancel token — a cancelled run still
+flushes its sinks — and neither side gets a retry policy from the pipeline.
+
+### Retries and writes
+
+- **Reads and other idempotent calls** retry through your context's policy.
   Expose the retry count in config.
 - **Sink writes** are retried by the pipeline (under a `resilience:` policy),
   and a plain `write_batch` only when `write_batch_is_replay_safe()` is true —
@@ -279,22 +355,62 @@ applied part of it:
   `PUT`).
 - Never retry a non-idempotent write inside your own `write_batch`: if the
   server committed and the response was lost, the retry duplicates every row.
-  Let the error propagate; the page is replayed from the last checkpoint.
+  Give such a call `without_retry()` and let the error propagate; the page is
+  replayed from the last checkpoint ([ADR 0007](https://github.com/faucet-hq/faucet-stream/blob/main/docs/adr/0007-retries.md)).
+
+### HTTP connectors
+
+Build clients with `faucet_core::http::Client`, never `reqwest::Client`
+directly. It follows redirects itself so a hop to another origin drops
+`Authorization`, cookies, every header marked sensitive and every header named
+with `sensitive_header`, and never replays a request body to another origin. It
+refuses a buffered body above `max_response_bytes` (1 GiB by default), turns a
+non-2xx response into `FaucetError::HttpStatus` (a `429`/`503` with
+`Retry-After` into `RateLimited`), and strips credentials from the URLs errors
+carry. `client.execute(&ctx, op, || request)` runs a request under a context;
+`client.send(request)` sends one attempt when you classify the response
+yourself. reqwest options it does not name (compression, mutual TLS) go
+through `ClientBuilder::configure`.
+
+### Batching
+
+`faucet_core::batching::chunks(records, batch_size)` re-chunks a page under the
+`batch_size` contract (`0` = one request for the whole page);
+`map_concurrent` / `for_each_concurrent` run work with at most `n` in flight
+and stop at the first error, and `ConcurrencyLimit` bounds work spread over
+separate calls.
+
+### The lint
+
+The workspace `clippy.toml` disallows `reqwest::Client::new`,
+`reqwest::Client::builder`, `reqwest::ClientBuilder::new`,
+`tokio::time::sleep`, `tokio::time::sleep_until` and `std::thread::sleep`, and
+CI runs clippy with `-D warnings`. A site that genuinely needs one — a
+test driving time, a server-side timer that is not a backend wait — carries
+`#[allow(clippy::disallowed_methods)] // <reason>`. A third-party connector in
+its own repository can copy the same `clippy.toml`.
+
+Prove it: call
+`faucet_conformance::calls::assert_source_call_deadline` (or
+`assert_sink_call_deadline`) from your `tests/conformance.rs` against a backend
+that never answers (a wiremock server with a long `set_delay`); it checks the
+call ends at the deadline and on cancel.
 
 ## Make it fast
 
 Performance is the project's first principle, and none of this may trade away
 the ordering rules above:
 
-- Build HTTP clients, pools and producers once in `new()` and store them; never
-  per call, page or record. Bound database pools with a `max_connections`
+- Build HTTP clients (`faucet_core::http::Client`), pools and producers once
+  in `new()` and store them; never per call, page or record. Bound database pools with a `max_connections`
   field.
 - Use bulk APIs: multi-row `INSERT … VALUES (…), (…)` or `COPY` per batch inside
   a transaction, a bulk HTTP endpoint per chunk, pipelining for key-value
   stores. One statement per record is a defect. Make the per-request limit a
   config field with a safe default.
-- Bound parallel I/O (`buffer_unordered(concurrency)` or a semaphore) and expose
-  `concurrency`; concurrency must never reorder emitted pages.
+- Bound parallel I/O (`faucet_core::batching::map_concurrent`, or
+  `ConcurrencyLimit` across calls) and expose `concurrency`; concurrency must
+  never reorder emitted pages.
 - Put blocking or CPU-heavy work (synchronous drivers, encoding, compression)
   on `tokio::task::spawn_blocking`; buffer file and socket writers.
 - Don't log or meter per record. The pipeline already records metrics and spans
