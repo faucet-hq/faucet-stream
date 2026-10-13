@@ -100,6 +100,10 @@ already landed a second time). See
 
 Declares `write_mode: append` only; no idempotent writes. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+The connect and each publish group run through the pipeline's `CallContext` (#880): the run's deadline ends them promptly, `publish_timeout_secs` still bounds each group, and the rows of a group cut short fail per row (DLQ-routable). Each counts as one round trip (`connect`, `publish`) in `faucet_sink_roundtrips_total`. The sink never re-publishes itself.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

@@ -28,6 +28,8 @@ pub struct RabbitMqSink {
     config: RabbitMqSinkConfig,
     routing: RoutingKey,
     state: Mutex<Option<Publisher>>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 struct Publisher {
@@ -44,6 +46,7 @@ impl RabbitMqSink {
             config,
             routing,
             state: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -55,20 +58,26 @@ impl RabbitMqSink {
         {
             return Ok(p.channel.clone());
         }
-        let conn = faucet_common_rabbitmq::connect(&self.config.connection).await?;
-        let channel = conn
-            .create_channel()
-            .await
-            .map_err(|e| sink_error("open channel", e))?;
-        if self.config.confirm {
-            channel
-                .confirm_select(ConfirmSelectOptions::default())
-                .await
-                .map_err(|e| sink_error("enable publisher confirms", e))?;
-        }
-        if let Some(kind) = self.config.exchange_kind {
-            declare_exchange(&channel, &self.config.exchange, kind).await?;
-        }
+        let (conn, channel) = self
+            .calls
+            .call_once("connect", async {
+                let conn = faucet_common_rabbitmq::connect(&self.config.connection).await?;
+                let channel = conn
+                    .create_channel()
+                    .await
+                    .map_err(|e| sink_error("open channel", e))?;
+                if self.config.confirm {
+                    channel
+                        .confirm_select(ConfirmSelectOptions::default())
+                        .await
+                        .map_err(|e| sink_error("enable publisher confirms", e))?;
+                }
+                if let Some(kind) = self.config.exchange_kind {
+                    declare_exchange(&channel, &self.config.exchange, kind).await?;
+                }
+                Ok((conn, channel))
+            })
+            .await?;
         *guard = Some(Publisher {
             conn,
             channel: channel.clone(),
@@ -126,16 +135,27 @@ impl RabbitMqSink {
         for (n, group) in prepared.chunks(chunk).enumerate() {
             // Bounded: a broker resource alarm (`connection.blocked`) holds
             // publishers indefinitely (#789 MSG-84).
-            let done = tokio::time::timeout(
-                limit,
-                self.publish_group(&channel, group, &props, options, &mut outcomes),
-            )
-            .await;
+            let done = self
+                .calls
+                .call_once("publish", async {
+                    Ok(tokio::time::timeout(
+                        limit,
+                        self.publish_group(&channel, group, &props, options, &mut outcomes),
+                    )
+                    .await)
+                })
+                .await;
             match done {
-                Ok(published) => published?,
-                Err(_) => {
+                Ok(Ok(published)) => published?,
+                Ok(Err(_)) => {
                     let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
                     fail_unconfirmed(&mut outcomes, unconfirmed, limit);
+                    return Ok(outcomes);
+                }
+                // The run's deadline cut the group (#880).
+                Err(cause) => {
+                    let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
+                    fail_cut(&mut outcomes, unconfirmed, &cause);
                     return Ok(outcomes);
                 }
             }
@@ -248,6 +268,17 @@ fn sink_error(context: &str, e: lapin::Error) -> FaucetError {
 
 #[async_trait]
 impl Sink for RabbitMqSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -378,9 +409,62 @@ fn fail_unconfirmed(
     }
 }
 
+/// Like [`fail_unconfirmed`], for a group the run's call context cut short:
+/// every listed row not yet decided fails with that cause.
+fn fail_cut(
+    outcomes: &mut [faucet_core::RowOutcome],
+    rows: impl Iterator<Item = usize>,
+    cause: &FaucetError,
+) {
+    for i in rows {
+        if outcomes[i].is_ok() {
+            outcomes[i] = Err(match cause {
+                FaucetError::Cancelled { operation } => FaucetError::Cancelled {
+                    operation: operation.clone(),
+                },
+                FaucetError::Timeout { operation, after } => FaucetError::Timeout {
+                    operation: operation.clone(),
+                    after: *after,
+                },
+                other => FaucetError::Sink(format!("rabbitmq publish: {other}")),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_group_fails_only_rows_not_yet_decided() {
+        let mut outcomes: Vec<faucet_core::RowOutcome> =
+            vec![Err(FaucetError::Sink("own".into())), Ok(()), Ok(()), Ok(())];
+        fail_cut(
+            &mut outcomes,
+            [0, 1].into_iter(),
+            &FaucetError::Cancelled {
+                operation: "publish call".into(),
+            },
+        );
+        assert!(matches!(&outcomes[0], Err(FaucetError::Sink(m)) if m == "own"));
+        assert!(matches!(&outcomes[1], Err(FaucetError::Cancelled { .. })));
+        fail_cut(
+            &mut outcomes,
+            [2].into_iter(),
+            &FaucetError::Timeout {
+                operation: "publish call (deadline)".into(),
+                after: std::time::Duration::ZERO,
+            },
+        );
+        assert!(matches!(&outcomes[2], Err(FaucetError::Timeout { .. })));
+        fail_cut(
+            &mut outcomes,
+            [3].into_iter(),
+            &FaucetError::Source("x".into()),
+        );
+        assert!(matches!(&outcomes[3], Err(FaucetError::Sink(m)) if m.contains("x")));
+    }
 
     #[test]
     fn a_timeout_fails_only_rows_not_yet_decided() {
