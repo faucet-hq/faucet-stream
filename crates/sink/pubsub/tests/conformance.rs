@@ -148,9 +148,17 @@ async fn assert_capabilities_truthful_count(
     seen: Arc<AtomicUsize>,
     sub: Arc<Subscription>,
 ) {
+    let (seen2, sub2) = (seen.clone(), sub.clone());
     faucet_conformance::assert_capabilities_truthful(sink, move || {
         let seen = seen.clone();
         let sub = sub.clone();
+        async move { count_available(&sub, &seen).await }
+    })
+    .await;
+    // #878: per-message publish outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(sink, move || {
+        let seen = seen2.clone();
+        let sub = sub2.clone();
         async move { count_available(&sub, &seen).await }
     })
     .await;

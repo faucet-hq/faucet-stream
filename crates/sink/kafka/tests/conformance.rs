@@ -165,6 +165,19 @@ mod idempotent {
         })
         .await;
     }
+
+    /// #878: the write report accounts for every record produced, and a
+    /// cancelled run still flushes the producer's queue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_declared_capabilities() {
+        let (_container, brokers, sink) = fresh_sink().await;
+        let count = || {
+            let brokers = brokers.clone();
+            async move { distinct_ids(&brokers, "conformance_dest").await }
+        };
+        faucet_conformance::assert_reported_rows_truthful(&sink, count).await;
+        faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+    }
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

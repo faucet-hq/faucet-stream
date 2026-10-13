@@ -244,3 +244,63 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+// ── #878: declared capabilities ───────────────────────────────────────────────
+
+#[allow(dead_code)]
+#[path = "support/fake_cluster.rs"]
+mod fake_cluster;
+
+/// Per-row `_bulk` outcomes are truthful, and a replayed keyed write converges
+/// on the document `_id`.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_partial_outcomes_and_replay_safety() {
+    let server = MockServer::start().await;
+    let store = BulkDocStore::new();
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(store.clone())
+        .mount(&server)
+        .await;
+    let config = ElasticsearchSinkConfig {
+        write: WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".to_string()],
+            delete_marker: None,
+            rollback: None,
+        },
+        ..ElasticsearchSinkConfig::new(server.uri(), "idx")
+    };
+    let sink = ElasticsearchSink::new(config).unwrap();
+    let count = || {
+        let store = store.clone();
+        async move { store.count() }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+}
+
+/// The alias-swap overwrite stages into a new index until commit, against the
+/// same stand-in cluster `tests/overwrite.rs` uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_overwrite_lifecycle() {
+    let server = MockServer::start().await;
+    let cluster = fake_cluster::FakeCluster::default();
+    Mock::given(wiremock::matchers::any())
+        .respond_with(cluster.clone())
+        .mount(&server)
+        .await;
+    cluster.add_index(
+        "orders-old",
+        vec![json!({"id": -1}), json!({"id": -2})],
+        Some("orders"),
+    );
+    let mut cfg = ElasticsearchSinkConfig::new(server.uri(), "orders");
+    cfg.write.write_mode = WriteMode::Overwrite;
+    let sink = ElasticsearchSink::new(cfg).unwrap();
+    faucet_conformance::assert_overwrite_lifecycle(&sink, || {
+        let cluster = cluster.clone();
+        async move { cluster.alias_docs("orders").len() }
+    })
+    .await;
+}

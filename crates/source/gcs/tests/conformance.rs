@@ -294,23 +294,10 @@ async fn conformance_call_deadline() {
 /// The object's headers arrive, then its body stops mid-stream: the read must
 /// still end at the deadline and on cancel, because the body is read under the
 /// call context too (#880), not only the request. The storage client's read
-/// future is deep, so the test runs on threads with a larger stack.
+/// future is deep, so the body runs on a large stack.
 #[test]
 fn conformance_call_deadline_bounds_a_stalled_body() {
-    const STACK: usize = 32 << 20;
-    std::thread::Builder::new()
-        .stack_size(STACK)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .thread_stack_size(STACK)
-                .enable_all()
-                .build()
-                .expect("runtime")
-                .block_on(stalled_body())
-        })
-        .expect("thread")
-        .join()
-        .expect("stalled-body check");
+    faucet_conformance::block_on_large_stack(stalled_body());
 }
 
 async fn stalled_body() {

@@ -161,3 +161,32 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+/// The capabilities the sink declares beyond its descriptor (#878): truthful
+/// per-row outcomes, a replay-safe keyed write, an atomic keyed batch (strict
+/// mode rejects a non-numeric `BIGINT`, failing the transaction) and the
+/// overwrite lifecycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let (_container, _permit, url, sink) = fresh_sink().await;
+    let count = || {
+        let url = url.clone();
+        async move { count_rows(&url).await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 961, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+
+    let mut cfg = MysqlSinkConfig::new(&url, "t").column_mapping(MysqlColumnMapping::AutoMap);
+    cfg.write.write_mode = WriteMode::Overwrite;
+    let overwrite = MysqlSink::new(cfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+}

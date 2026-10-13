@@ -213,3 +213,68 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+// ── #878: declared capabilities against the SFTP container ────────────────────
+
+/// Records in the files directly inside `dir`: the overwrite swap area is a
+/// subdirectory (`.faucet-overwrite-…/`), so a reader of the destination never
+/// sees it.
+async fn records_in(conn: &SftpConnectionConfig, dir: &str) -> usize {
+    let sftp = faucet_common_sftp::connect(conn)
+        .await
+        .expect("count connect");
+    let Ok(entries) = sftp.read_dir(dir).await else {
+        return 0;
+    };
+    let mut total = 0usize;
+    for entry in entries {
+        if !entry.file_type().is_file() || entry.file_name().starts_with('.') {
+            continue;
+        }
+        let bytes = sftp
+            .read(format!("{dir}/{}", entry.file_name()))
+            .await
+            .expect("read object");
+        total += String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+    }
+    total
+}
+
+/// The file is uploaded when the sink flushes, so a cancelled run must still
+/// flush; and `write_mode: overwrite` stages in a swap area until commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let Some((_container, port)) = start_sftp().await else {
+        return;
+    };
+    let conn = connection(port);
+    let conn_ref = &conn;
+
+    let sink = SftpSink::new(SftpSinkConfig::new(conn.clone(), format!("{UPLOAD_DIR}/cancel")))
+        .expect("SftpSink::new");
+    faucet_conformance::assert_cancellation_flushes(&sink, || async move {
+        records_in(conn_ref, &format!("{UPLOAD_DIR}/cancel")).await
+    })
+    .await;
+
+    let sftp = faucet_common_sftp::connect(&conn).await.expect("seed connect");
+    let dir = format!("{UPLOAD_DIR}/ovw");
+    sftp.create_dir(dir.as_str()).await.expect("create dir");
+    let seed = format!("{dir}/out-00001.jsonl");
+    sftp.create(seed.as_str()).await.expect("create seed");
+    sftp.write(seed.as_str(), b"{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n")
+        .await
+        .expect("write seed");
+    let mut cfg = SftpSinkConfig::new(conn.clone(), dir.clone());
+    cfg.file_name = Some("out-{part}.jsonl".into());
+    cfg.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+    let overwrite = SftpSink::new(cfg).expect("overwrite sink");
+    let dir_ref = dir.as_str();
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, || async move {
+        records_in(conn_ref, dir_ref).await
+    })
+    .await;
+}

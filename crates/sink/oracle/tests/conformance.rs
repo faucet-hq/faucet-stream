@@ -68,6 +68,24 @@ async fn conformance_live_battery() {
     common::exec(&conn, &["DELETE FROM \"t\""]).await;
     faucet_conformance::assert_write_modes_truthful(&sink, count).await;
     faucet_conformance::assert_schema_evolution_effective(&sink).await;
+
+    // #878: per-row outcomes, a replay-safe keyed write, an atomic batch (a
+    // non-numeric NUMBER fails the array DML) and the overwrite lifecycle.
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 965, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+    let mut overwrite = OracleSinkConfig::new(conn.clone(), "t");
+    overwrite.write.write_mode = WriteMode::Overwrite;
+    let overwrite = OracleSink::new(overwrite).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
 }
 
 /// A table another session holds an exclusive lock on stands in for a hung

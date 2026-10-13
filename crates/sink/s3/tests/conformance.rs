@@ -224,3 +224,97 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+// ── #878: declared capabilities against MinIO ─────────────────────────────────
+
+/// Records in the objects under `prefix` a reader of the destination sees: the
+/// overwrite swap area (`.faucet-overwrite-…/`) and its markers are not part of
+/// it.
+async fn visible_records(client: &Client, prefix: &str) -> usize {
+    let resp = client
+        .list_objects_v2()
+        .bucket(TEST_BUCKET)
+        .prefix(prefix)
+        .send()
+        .await
+        .expect("list objects");
+    let mut total = 0usize;
+    for key in resp.contents().iter().filter_map(|o| o.key()) {
+        if key.contains("/.faucet-") {
+            continue;
+        }
+        let obj = client
+            .get_object()
+            .bucket(TEST_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .expect("get object");
+        let bytes = obj.body.collect().await.expect("collect body").into_bytes();
+        total += String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+    }
+    total
+}
+
+/// The object is uploaded when the sink flushes, so a cancelled run must
+/// still flush; and `write_mode: overwrite` stages in a swap area until
+/// commit, leaving the previous objects in place on abort.
+///
+/// The SDK's upload futures are deep, so the body runs on a large stack.
+#[test]
+fn conformance_declared_capabilities() {
+    faucet_conformance::block_on_large_stack(declared_capabilities());
+}
+
+async fn declared_capabilities() {
+    let (_container, endpoint) = start_minio().await;
+    let admin = admin_client(&endpoint).await;
+    admin
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+    // SAFETY: constants; overlapping tests write the same values.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    }
+    let admin_ref = &admin;
+
+    let sink = S3Sink::new(
+        S3SinkConfig::new(TEST_BUCKET)
+            .prefix("cancel/")
+            .endpoint_url(endpoint.clone())
+            .region(REGION.to_string()),
+    )
+    .await
+    .expect("S3Sink::new");
+    faucet_conformance::assert_cancellation_flushes(&sink, || async move {
+        visible_records(admin_ref, "cancel/").await
+    })
+    .await;
+
+    admin
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("ovw/out-00001.jsonl")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n"))
+        .send()
+        .await
+        .expect("seed object");
+    let mut cfg = S3SinkConfig::new(TEST_BUCKET)
+        .endpoint_url(endpoint.clone())
+        .region(REGION.to_string());
+    cfg.path = Some("ovw/out-{part}.jsonl".into());
+    cfg.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+    let overwrite = S3Sink::new(cfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, || async move {
+        visible_records(admin_ref, "ovw/").await
+    })
+    .await;
+}

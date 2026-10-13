@@ -172,6 +172,11 @@ async fn conformance_capabilities_truthful() {
         count_records(client_ref).await
     })
     .await;
+    // #878: per-entry PutRecords outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || async move {
+        count_records(client_ref).await
+    })
+    .await;
 
     // The honest branch must have left the append-only sink non-idempotent.
     assert!(!sink.supports_idempotent_writes());

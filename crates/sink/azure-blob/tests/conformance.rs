@@ -250,3 +250,66 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+// ── #878: declared capabilities against Azurite ───────────────────────────────
+
+/// Rows under `prefix` a reader of the destination sees: the overwrite swap
+/// area (`.faucet-overwrite-…/`) and its markers are not part of it.
+async fn visible_rows(port: u16, prefix: &str) -> usize {
+    let store = verify_store(port);
+    let mut listing = store.list(Some(&ObjPath::from(prefix)));
+    let mut total = 0usize;
+    while let Some(meta) = listing.next().await {
+        let key = meta.expect("list meta").location;
+        if key.as_ref().contains("/.faucet-") {
+            continue;
+        }
+        let bytes = store
+            .get(&key)
+            .await
+            .expect("get object")
+            .bytes()
+            .await
+            .expect("read bytes");
+        total += String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+    }
+    total
+}
+
+/// The blob is committed when the sink flushes, so a cancelled run must still
+/// flush; and `write_mode: overwrite` stages in a swap area until commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let Some((_c, port)) = start_azurite().await else {
+        faucet_conformance::containers::backend_missing("Docker unavailable");
+        return;
+    };
+    create_container(port).await;
+
+    let sink = AzureBlobSink::new(sink_config(port).prefix("cancel/"))
+        .await
+        .expect("sink new");
+    faucet_conformance::assert_cancellation_flushes(&sink, move || async move {
+        visible_rows(port, "cancel").await
+    })
+    .await;
+
+    verify_store(port)
+        .put(
+            &ObjPath::from("ovw/out-00001.jsonl"),
+            "{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n".into(),
+        )
+        .await
+        .expect("seed blob");
+    let mut cfg = sink_config(port);
+    cfg.path = Some("ovw/out-{part}.jsonl".into());
+    cfg.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+    let overwrite = AzureBlobSink::new(cfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, move || async move {
+        visible_rows(port, "ovw").await
+    })
+    .await;
+}

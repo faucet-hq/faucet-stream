@@ -140,6 +140,24 @@ mod idempotent {
         })
         .await;
     }
+
+    /// #878: per-row outcomes are truthful, a replayed keyed write converges,
+    /// and `write_mode: overwrite` stages until commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_declared_capabilities() {
+        let (_container, uri, sink) = keyed_sink().await;
+        let count = || {
+            let uri = uri.clone();
+            async move { count_docs(&uri).await }
+        };
+        faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+        faucet_conformance::assert_replay_safe(&sink, count).await;
+
+        let mut config = MongoSinkConfig::new(&uri, DB, COLLECTION);
+        config.write.write_mode = faucet_core::WriteMode::Overwrite;
+        let overwrite = MongoSink::new(config).await.expect("overwrite sink new");
+        faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+    }
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

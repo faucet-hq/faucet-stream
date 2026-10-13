@@ -114,6 +114,35 @@ pub mod hung;
 pub mod required;
 pub mod scripted;
 
+/// Stack size [`block_on_large_stack`] gives its thread.
+pub const LARGE_STACK: usize = 32 << 20;
+
+/// Run `fut` to completion on a fresh thread with a [`LARGE_STACK`] stack and
+/// its own Tokio runtime. Some cloud clients build futures deep enough to
+/// overflow the default 2 MiB test-thread stack in a debug build; a
+/// conformance test that drives one wraps its body in this.
+pub fn block_on_large_stack<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(LARGE_STACK)
+            .spawn_scoped(s, || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_stack_size(LARGE_STACK)
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime")
+                    .block_on(fut)
+            })
+            .expect("spawn large-stack thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
 pub use checks::{
     assert_batch_atomicity_truthful, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
     assert_replay_safe, assert_reported_rows_truthful,
@@ -1504,6 +1533,17 @@ mod tests {
         // The written page was flushed to durable storage on the cancel path.
         assert_eq!(sink.durable_len(), 3);
         assert_eq!(sink.staged_len(), 0);
+    }
+
+    #[test]
+    fn block_on_large_stack_returns_the_output() {
+        assert_eq!(block_on_large_stack(async { 7 }), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "inside the large stack")]
+    fn block_on_large_stack_propagates_a_panic() {
+        block_on_large_stack(async { panic!("inside the large stack") });
     }
 
     #[tokio::test]
