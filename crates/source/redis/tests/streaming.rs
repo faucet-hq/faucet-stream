@@ -58,17 +58,20 @@ async fn open_conn(url: &str) -> redis::aio::MultiplexedConnection {
 /// Seed `n` keys named `seed:i` with JSON-encoded values `{"i": i}`.
 async fn seed_keys(url: &str, prefix: &str, n: usize) {
     let mut conn = open_conn(url).await;
-    // Pipeline the SETs so seeding 10k keys is one round-trip.
-    let mut pipe = redis::pipe();
-    for i in 0..n {
-        let key = format!("{prefix}:{i}");
-        let value = format!("{{\"i\":{i}}}");
-        pipe.set::<_, _>(key, value).ignore();
+    // Pipelined in chunks: one 10k-command pipeline can outlast the client's
+    // response timeout on a loaded (instrumented) CI runner.
+    for start in (0..n).step_by(1_000) {
+        let mut pipe = redis::pipe();
+        for i in start..(start + 1_000).min(n) {
+            let key = format!("{prefix}:{i}");
+            let value = format!("{{\"i\":{i}}}");
+            pipe.set::<_, _>(key, value).ignore();
+        }
+        let _: () = pipe
+            .query_async(&mut conn)
+            .await
+            .expect("pipelined SET seed");
     }
-    let _: () = pipe
-        .query_async(&mut conn)
-        .await
-        .expect("pipelined SET seed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
