@@ -4,6 +4,7 @@
 use crate::config::SqsSinkConfig;
 use aws_sdk_sqs::Client;
 use aws_sdk_sqs::types::SendMessageBatchRequestEntry;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -144,6 +145,7 @@ fn clone_outcome(o: &Result<(), FaucetError>) -> Result<(), FaucetError> {
 pub struct SqsSink {
     config: SqsSinkConfig,
     client: Client,
+    calls: CallSlot,
 }
 
 impl SqsSink {
@@ -157,7 +159,11 @@ impl SqsSink {
             &config.credentials,
         )
         .await?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            calls: CallSlot::new(CallContext::new().without_retry()),
+        })
     }
 
     /// Encode every record; per-record failures (serialization, oversized body,
@@ -213,7 +219,6 @@ impl SqsSink {
     /// Send one chunk, retrying per-entry partial failures with backoff.
     /// Returns per-entry outcomes keyed by input index; a whole-request failure
     /// that outlives the retry budget is the outer `Err`.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn put_chunk(
         &self,
         mut pending: Vec<Encoded>,
@@ -240,12 +245,17 @@ impl SqsSink {
                 .collect::<Result<_, _>>()?;
 
             let response = self
-                .client
-                .send_message_batch()
-                .queue_url(&self.config.queue_url)
-                .set_entries(Some(entries))
-                .send()
-                .await;
+                .calls
+                .call("put", || async {
+                    Ok(self
+                        .client
+                        .send_message_batch()
+                        .queue_url(&self.config.queue_url)
+                        .set_entries(Some(entries.clone()))
+                        .send()
+                        .await)
+                })
+                .await?;
 
             match response {
                 Ok(out) => {
@@ -310,7 +320,7 @@ impl SqsSink {
                         delay_ms = delay.as_millis() as u64,
                         "sqs: retrying partially-failed SendMessageBatch entries"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.calls.wait(delay).await?;
                 }
                 Err(err) => {
                     use aws_sdk_sqs::error::ProvideErrorMetadata as _;
@@ -342,7 +352,7 @@ impl SqsSink {
                         delay_ms = delay.as_millis() as u64,
                         "sqs: SendMessageBatch request failed; retrying"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.calls.wait(delay).await?;
                 }
             }
         }
@@ -521,6 +531,17 @@ impl faucet_core::Sink for SqsSink {
         "sqs"
     }
 
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         let name = self
             .config
@@ -543,15 +564,26 @@ impl faucet_core::Sink for SqsSink {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
         use aws_sdk_sqs::types::QueueAttributeName;
-        let fut = self
-            .client
-            .get_queue_attributes()
-            .queue_url(&self.config.queue_url)
-            .attribute_names(QueueAttributeName::FifoQueue)
-            .attribute_names(QueueAttributeName::ContentBasedDeduplication)
-            .send();
-        let probe = match tokio::time::timeout(ctx.timeout, fut).await {
-            Err(_) => Probe::fail("get_queue_attributes", start.elapsed(), "timed out"),
+        let sent = self
+            .calls
+            .get()
+            .with_timeout(ctx.timeout)
+            .call("attributes", || async {
+                Ok(self
+                    .client
+                    .get_queue_attributes()
+                    .queue_url(&self.config.queue_url)
+                    .attribute_names(QueueAttributeName::FifoQueue)
+                    .attribute_names(QueueAttributeName::ContentBasedDeduplication)
+                    .send()
+                    .await)
+            })
+            .await;
+        let probe = match sent {
+            Err(FaucetError::Timeout { .. }) => {
+                Probe::fail("get_queue_attributes", start.elapsed(), "timed out")
+            }
+            Err(e) => Probe::fail("get_queue_attributes", start.elapsed(), e.to_string()),
             Ok(Ok(out)) => {
                 let attr = |name: QueueAttributeName| {
                     out.attributes()

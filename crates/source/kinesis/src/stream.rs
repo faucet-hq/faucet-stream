@@ -7,6 +7,7 @@ use crate::config::StartPosition;
 use crate::shard::{BehindLatest, ShardEvent, probe_behind, run_shard};
 use crate::state::{ShardBookmarks, state_key};
 use aws_sdk_kinesis::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use serde_json::Value;
 use std::pin::Pin;
@@ -22,6 +23,7 @@ pub struct KinesisSource {
     start_bookmarks: Mutex<Option<ShardBookmarks>>,
     /// Each shard's latest `MillisBehindLatest` this run (#733).
     behind: BehindLatest,
+    calls: CallSlot,
 }
 
 /// One discovered shard eligible for consumption.
@@ -104,6 +106,7 @@ impl KinesisSource {
             client,
             start_bookmarks: Mutex::new(None),
             behind: BehindLatest::default(),
+            calls: CallSlot::new(CallContext::new()),
         })
     }
 
@@ -116,20 +119,26 @@ impl KinesisSource {
         let mut all = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
-            let mut req = self.client.list_shards();
-            // ListShards takes either the stream name or a pagination token,
-            // never both.
-            req = match &next_token {
-                Some(token) => req.next_token(token),
-                None => req.stream_name(&self.config.stream_name),
-            };
-            let out = req.send().await.map_err(|e| {
-                FaucetError::Source(format!(
-                    "kinesis: ListShards for stream '{}' failed: {}",
-                    self.config.stream_name,
-                    e.into_service_error()
-                ))
-            })?;
+            let out = self
+                .calls
+                .call("list_shards", || async {
+                    let req = self.client.list_shards();
+                    // ListShards takes either the stream name or a pagination
+                    // token, never both.
+                    let req = match &next_token {
+                        Some(token) => req.next_token(token),
+                        None => req.stream_name(&self.config.stream_name),
+                    };
+                    Ok(req.send().await)
+                })
+                .await?
+                .map_err(|e| {
+                    FaucetError::Source(format!(
+                        "kinesis: ListShards for stream '{}' failed: {}",
+                        self.config.stream_name,
+                        e.into_service_error()
+                    ))
+                })?;
             for s in out.shards() {
                 all.push(EligibleShard {
                     id: s.shard_id().to_string(),
@@ -237,6 +246,7 @@ impl faucet_core::Source for KinesisSource {
                     .filter_map(|p| drained.get(p).map(|s| s.subscribe()))
                     .collect();
                 let done = drained.get(&shard_id).cloned();
+                let calls = self.calls.get();
                 handles.push(tokio::spawn(async move {
                     for mut parent in parents {
                         if parent.wait_for(|d| *d).await.is_err() {
@@ -244,7 +254,8 @@ impl faucet_core::Source for KinesisSource {
                         }
                     }
                     let finished =
-                        run_shard(client, config, shard_id, bookmark, tx, behind, permits).await;
+                        run_shard(client, calls, config, shard_id, bookmark, tx, behind, permits)
+                            .await;
                     if finished && let Some(done) = done {
                         let _ = done.send(true);
                     }
@@ -391,6 +402,7 @@ impl faucet_core::Source for KinesisSource {
                 for shard in self.discover_shards(&bookmarks).await?.0 {
                     if let Some(ms) = probe_behind(
                         &self.client,
+                        &self.calls.get(),
                         &self.config,
                         &shard.id,
                         bookmarks.get(&shard.id),
@@ -418,6 +430,17 @@ impl faucet_core::Source for KinesisSource {
         "kinesis"
     }
 
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "kinesis://{}/{}",
@@ -435,13 +458,24 @@ impl faucet_core::Source for KinesisSource {
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
-        let fut = self
-            .client
-            .describe_stream_summary()
-            .stream_name(&self.config.stream_name)
-            .send();
-        let probe = match tokio::time::timeout(ctx.timeout, fut).await {
-            Err(_) => Probe::fail("describe_stream", start.elapsed(), "timed out"),
+        let sent = self
+            .calls
+            .get()
+            .with_timeout(ctx.timeout)
+            .call("describe", || async {
+                Ok(self
+                    .client
+                    .describe_stream_summary()
+                    .stream_name(&self.config.stream_name)
+                    .send()
+                    .await)
+            })
+            .await;
+        let probe = match sent {
+            Err(FaucetError::Timeout { .. }) => {
+                Probe::fail("describe_stream", start.elapsed(), "timed out")
+            }
+            Err(e) => Probe::fail("describe_stream", start.elapsed(), e.to_string()),
             Ok(Ok(_)) => Probe::pass("describe_stream", start.elapsed()),
             Ok(Err(e)) => Probe::fail(
                 "describe_stream",

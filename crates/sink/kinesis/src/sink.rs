@@ -6,6 +6,7 @@ use crate::partition::{derive_explicit_hash_key, derive_partition_key, encode_pa
 use aws_sdk_kinesis::Client;
 use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::PutRecordsRequestEntry;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -140,6 +141,7 @@ pub(crate) fn chunk_requests(
 pub struct KinesisSink {
     config: KinesisSinkConfig,
     client: Client,
+    calls: CallSlot,
 }
 
 impl KinesisSink {
@@ -153,7 +155,11 @@ impl KinesisSink {
             &config.credentials,
         )
         .await?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            calls: CallSlot::new(CallContext::new().without_retry()),
+        })
     }
 
     /// Encode every record; per-record failures (bad payload for the format,
@@ -202,7 +208,6 @@ impl KinesisSink {
     /// Send one chunk, retrying per-entry partial failures with backoff.
     /// Returns per-entry outcomes keyed by input index; a whole-request
     /// failure that outlives the retry budget is the outer `Err`.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn put_chunk(
         &self,
         mut pending: Vec<Encoded>,
@@ -227,12 +232,17 @@ impl KinesisSink {
                 .collect::<Result<_, _>>()?;
 
             let response = self
-                .client
-                .put_records()
-                .stream_name(&self.config.stream_name)
-                .set_records(Some(entries))
-                .send()
-                .await;
+                .calls
+                .call("put", || async {
+                    Ok(self
+                        .client
+                        .put_records()
+                        .stream_name(&self.config.stream_name)
+                        .set_records(Some(entries.clone()))
+                        .send()
+                        .await)
+                })
+                .await?;
 
             match response {
                 Ok(out) => {
@@ -287,7 +297,7 @@ impl KinesisSink {
                         delay_ms = delay.as_millis() as u64,
                         "kinesis: retrying partially-failed PutRecords entries"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.calls.wait(delay).await?;
                     pending = retry;
                 }
                 Err(err) => {
@@ -320,7 +330,7 @@ impl KinesisSink {
                         delay_ms = delay.as_millis() as u64,
                         "kinesis: PutRecords request failed; retrying"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.calls.wait(delay).await?;
                 }
             }
         }
@@ -447,6 +457,17 @@ impl faucet_core::Sink for KinesisSink {
         "kinesis"
     }
 
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "kinesis://{}/{}",
@@ -462,13 +483,24 @@ impl faucet_core::Sink for KinesisSink {
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
-        let fut = self
-            .client
-            .describe_stream_summary()
-            .stream_name(&self.config.stream_name)
-            .send();
-        let probe = match tokio::time::timeout(ctx.timeout, fut).await {
-            Err(_) => Probe::fail("describe_stream", start.elapsed(), "timed out"),
+        let sent = self
+            .calls
+            .get()
+            .with_timeout(ctx.timeout)
+            .call("describe", || async {
+                Ok(self
+                    .client
+                    .describe_stream_summary()
+                    .stream_name(&self.config.stream_name)
+                    .send()
+                    .await)
+            })
+            .await;
+        let probe = match sent {
+            Err(FaucetError::Timeout { .. }) => {
+                Probe::fail("describe_stream", start.elapsed(), "timed out")
+            }
+            Err(e) => Probe::fail("describe_stream", start.elapsed(), e.to_string()),
             Ok(Ok(_)) => Probe::pass("describe_stream", start.elapsed()),
             Ok(Err(e)) => Probe::fail(
                 "describe_stream",

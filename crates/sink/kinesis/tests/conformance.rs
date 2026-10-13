@@ -200,3 +200,25 @@ async fn conformance_descriptor_matches_built_sink() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let make = || {
+        let mut cfg = KinesisSinkConfig::new("hung");
+        cfg.region = Some("us-east-1".into());
+        cfg.endpoint_url = Some(endpoint.clone());
+        cfg.credentials = test_credentials();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(KinesisSink::new(cfg))
+        })
+        .expect("sink builds offline")
+    };
+    faucet_conformance::calls::assert_sink_call_deadline(make, &[serde_json::json!({"a": 1})])
+        .await;
+}

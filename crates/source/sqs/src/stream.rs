@@ -22,6 +22,7 @@ use aws_sdk_sqs::Client;
 use aws_sdk_sqs::types::{
     ChangeMessageVisibilityBatchRequestEntry, DeleteMessageBatchRequestEntry,
 };
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::lease::LeaseExtender;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use serde_json::Value;
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 pub struct SqsSource {
     config: SqsSourceConfig,
     client: Client,
+    calls: CallSlot,
 }
 
 /// Decode one SQS message body: the parsed JSON value if the body is valid
@@ -95,7 +97,13 @@ pub(crate) fn held_handles(assembling: &[Option<String>], yielded: &[String]) ->
 
 /// Renew the visibility timeout of `handles`, chunked to the 10-entry API cap.
 /// Best-effort: a failure is logged and the message may be redelivered.
-async fn extend_visibility(client: Client, queue_url: String, handles: Vec<String>, secs: i32) {
+async fn extend_visibility(
+    client: Client,
+    calls: CallContext,
+    queue_url: String,
+    handles: Vec<String>,
+    secs: i32,
+) {
     for chunk in handles.chunks(MAX_RECEIVE_BATCH as usize) {
         let entries: Result<Vec<_>, _> = chunk
             .iter()
@@ -109,19 +117,26 @@ async fn extend_visibility(client: Client, queue_url: String, handles: Vec<Strin
             })
             .collect();
         let Ok(entries) = entries else { continue };
-        if let Err(e) = client
-            .change_message_visibility_batch()
-            .queue_url(&queue_url)
-            .set_entries(Some(entries))
-            .send()
-            .await
-        {
-            tracing::warn!(
-                queue = %queue_url,
-                error = %e.into_service_error(),
-                "sqs: visibility renewal failed; held messages may be redelivered"
-            );
-        }
+        let sent = calls
+            .call("visibility", || async {
+                Ok(client
+                    .change_message_visibility_batch()
+                    .queue_url(&queue_url)
+                    .set_entries(Some(entries.clone()))
+                    .send()
+                    .await)
+            })
+            .await;
+        let error = match sent {
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => e.into_service_error().to_string(),
+            Err(e) => e.to_string(),
+        };
+        tracing::warn!(
+            queue = %queue_url,
+            error = %error,
+            "sqs: visibility renewal failed; held messages may be redelivered"
+        );
     }
 }
 
@@ -137,7 +152,11 @@ impl SqsSource {
             &config.credentials,
         )
         .await?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            calls: CallSlot::new(CallContext::new()),
+        })
     }
 
     /// Delete a page's receipt handles, chunked to the 10-entry API cap. A
@@ -159,12 +178,17 @@ impl SqsSource {
                 })
                 .collect::<Result<_, _>>()?;
             let out = self
-                .client
-                .delete_message_batch()
-                .queue_url(&self.config.queue_url)
-                .set_entries(Some(entries))
-                .send()
-                .await
+                .calls
+                .call("delete", || async {
+                    Ok(self
+                        .client
+                        .delete_message_batch()
+                        .queue_url(&self.config.queue_url)
+                        .set_entries(Some(entries.clone()))
+                        .send()
+                        .await)
+                })
+                .await?
                 .map_err(|e| {
                     FaucetError::Source(format!(
                         "sqs: DeleteMessageBatch on '{}' failed: {}",
@@ -202,7 +226,6 @@ impl faucet_core::Source for SqsSource {
         Ok(all)
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages<'a>(
         &'a self,
         _context: &'a std::collections::HashMap<String, Value>,
@@ -235,11 +258,18 @@ impl faucet_core::Source for SqsSource {
             let renew_secs = self.config.visibility_extension_secs;
             let lease = (renew_secs > 0).then(|| {
                 let client = self.client.clone();
+                let calls = self.calls.get();
                 let queue = self.config.queue_url.clone();
                 LeaseExtender::spawn(
                     Duration::from_secs(u64::from(renew_secs / 3).max(1)),
                     move |handles: Vec<String>| {
-                        extend_visibility(client.clone(), queue.clone(), handles, renew_secs as i32)
+                        extend_visibility(
+                            client.clone(),
+                            calls.clone(),
+                            queue.clone(),
+                            handles,
+                            renew_secs as i32,
+                        )
                     },
                 )
             });
@@ -261,18 +291,21 @@ impl faucet_core::Source for SqsSource {
                 let want = remaining
                     .map_or(MAX_RECEIVE_BATCH, |r| r.min(MAX_RECEIVE_BATCH as usize) as i32);
 
-                let mut receive = self
-                    .client
-                    .receive_message()
-                    .queue_url(&self.config.queue_url)
-                    .max_number_of_messages(want)
-                    .wait_time_seconds(self.config.wait_time_seconds);
-                if self.config.include_metadata {
-                    receive = receive.message_attribute_names("All");
-                }
-                let resp = receive
-                    .send()
-                    .await
+                let resp = self
+                    .calls
+                    .call("receive", || async {
+                        let mut receive = self
+                            .client
+                            .receive_message()
+                            .queue_url(&self.config.queue_url)
+                            .max_number_of_messages(want)
+                            .wait_time_seconds(self.config.wait_time_seconds);
+                        if self.config.include_metadata {
+                            receive = receive.message_attribute_names("All");
+                        }
+                        Ok(receive.send().await)
+                    })
+                    .await?
                     .map_err(|e| {
                         FaucetError::Source(format!(
                             "sqs: ReceiveMessage on '{}' failed: {}",
@@ -296,7 +329,7 @@ impl faucet_core::Source for SqsSource {
                     // A short poll returns at once when the queue is empty;
                     // back off instead of spinning (#789 MSG-93).
                     if self.config.wait_time_seconds == 0 {
-                        tokio::time::sleep(EMPTY_RECEIVE_BACKOFF).await;
+                        self.calls.wait(EMPTY_RECEIVE_BACKOFF).await?;
                     }
                     continue;
                 }
@@ -388,6 +421,17 @@ impl faucet_core::Source for SqsSource {
         "sqs"
     }
 
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         let name = self
             .config
@@ -411,13 +455,24 @@ impl faucet_core::Source for SqsSource {
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
-        let fut = self
-            .client
-            .get_queue_attributes()
-            .queue_url(&self.config.queue_url)
-            .send();
-        let probe = match tokio::time::timeout(ctx.timeout, fut).await {
-            Err(_) => Probe::fail("get_queue_attributes", start.elapsed(), "timed out"),
+        let sent = self
+            .calls
+            .get()
+            .with_timeout(ctx.timeout)
+            .call("attributes", || async {
+                Ok(self
+                    .client
+                    .get_queue_attributes()
+                    .queue_url(&self.config.queue_url)
+                    .send()
+                    .await)
+            })
+            .await;
+        let probe = match sent {
+            Err(FaucetError::Timeout { .. }) => {
+                Probe::fail("get_queue_attributes", start.elapsed(), "timed out")
+            }
+            Err(e) => Probe::fail("get_queue_attributes", start.elapsed(), e.to_string()),
             Ok(Ok(_)) => Probe::pass("get_queue_attributes", start.elapsed()),
             Ok(Err(e)) => Probe::fail(
                 "get_queue_attributes",

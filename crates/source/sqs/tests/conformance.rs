@@ -393,3 +393,26 @@ async fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let make = || {
+        let mut cfg = SqsSourceConfig::new(format!("{endpoint}/1/hung"));
+        cfg.region = Some("us-east-1".into());
+        cfg.endpoint_url = Some(endpoint.clone());
+        cfg.credentials = test_credentials();
+        cfg.wait_time_seconds = 0;
+        cfg.max_messages = Some(1);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(SqsSource::new(cfg))
+        })
+        .expect("source builds offline")
+    };
+    faucet_conformance::calls::assert_source_call_deadline(make).await;
+}

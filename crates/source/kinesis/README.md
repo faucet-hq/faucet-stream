@@ -102,6 +102,15 @@ logged once and reported as no lag — it never fails a run.
 
 Declares lag reporting (`MillisBehindLatest`); no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every Kinesis request — `ListShards`, `GetShardIterator`, `GetRecords` —
+runs through the pipeline's `CallContext` (#880): each is bounded by the
+default 300 s call timeout and any caller deadline, the run's cancel token stops
+an in-flight read, the poll-interval pause and every backoff, and each is
+metered as a round trip (`list_shards`, `get_shard_iterator`, `get_records`).
+The throttle-aware backoff and the per-shard error budget are unchanged.
+
 ## License
 
 MIT OR Apache-2.0
