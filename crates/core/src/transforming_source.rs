@@ -46,6 +46,8 @@ pub struct TransformingSource {
     /// source is columnar, the whole chain runs on the columnar fast path.
     #[cfg(feature = "arrow")]
     batch_fns: Vec<Option<crate::stage::PageFnBatchBox>>,
+    /// Rows in / out of the chain, for the run's row accounting (#879).
+    row_accounts: Option<std::sync::Arc<crate::accounting::RowAccounts>>,
 }
 
 impl TransformingSource {
@@ -83,6 +85,7 @@ impl TransformingSource {
             labels,
             #[cfg(feature = "arrow")]
             batch_fns,
+            row_accounts: None,
         })
     }
 
@@ -113,7 +116,18 @@ impl TransformingSource {
             stages: compiled,
             labels,
             batch_fns,
+            row_accounts: None,
         })
+    }
+
+    /// Count the rows entering and leaving the chain into `accounts` (#879),
+    /// so a run summary can say how many a filter removed.
+    pub fn with_row_accounts(
+        mut self,
+        accounts: std::sync::Arc<crate::accounting::RowAccounts>,
+    ) -> Self {
+        self.row_accounts = Some(accounts);
+        self
     }
 }
 
@@ -156,6 +170,9 @@ impl Source for TransformingSource {
                 let page_len = page.records.len();
                 let records = page.records;
                 let out = instrumented_apply_stages(records, &self.stages, &self.labels)?;
+                if let Some(a) = &self.row_accounts {
+                    a.add_transform(page_len, out.len());
+                }
                 if out.is_empty() {
                     yield StreamPage { records: vec![], bookmark: page.bookmark };
                     continue;

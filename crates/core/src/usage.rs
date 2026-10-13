@@ -160,6 +160,12 @@ pub struct UsageSnapshot {
     /// `connection`, `timeout`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub source_retries: BTreeMap<String, u64>,
+    /// Envelopes written to the dead-letter queue (#870).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dlq_records_written: u64,
+    /// Estimated serialized bytes written to the dead-letter queue.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dlq_bytes_written: u64,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -200,6 +206,8 @@ impl UsageSnapshot {
         for (k, v) in &other.source_retries {
             *self.source_retries.entry(k.clone()).or_default() += v;
         }
+        self.dlq_records_written += other.dlq_records_written;
+        self.dlq_bytes_written += other.dlq_bytes_written;
     }
 }
 
@@ -215,6 +223,8 @@ pub struct UsageMeter {
     throttled: AtomicU64,
     throttle_wait_nanos: AtomicU64,
     source_retries: Mutex<BTreeMap<&'static str, u64>>,
+    dlq_records_written: AtomicU64,
+    dlq_bytes_written: AtomicU64,
 }
 
 impl UsageMeter {
@@ -232,6 +242,13 @@ impl UsageMeter {
     pub fn add_written(&self, records: u64, bytes: u64) {
         self.records_written.fetch_add(records, Ordering::Relaxed);
         self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Count envelopes written to the dead-letter queue (#870).
+    pub fn add_dlq_written(&self, records: u64, bytes: u64) {
+        self.dlq_records_written
+            .fetch_add(records, Ordering::Relaxed);
+        self.dlq_bytes_written.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Count one backend round trip.
@@ -321,6 +338,8 @@ impl UsageMeter {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            dlq_records_written: self.dlq_records_written.load(Ordering::Relaxed),
+            dlq_bytes_written: self.dlq_bytes_written.load(Ordering::Relaxed),
         }
     }
 }

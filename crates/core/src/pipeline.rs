@@ -164,6 +164,11 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     /// Store bookmarks bare instead of in the versioned envelope (#736): a
     /// cluster member that predates the envelope is still live.
     legacy_state_writes: bool,
+    /// Pipeline-owned governance (#875): the DLQ stack and path selection
+    /// read it; the page passes it carries are copied into the fields above.
+    governance: Option<crate::governance::Governance>,
+    /// Per-run row accounting (#879).
+    row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
 }
 
 /// Build and install the source/sink round-trip recorders for one run (#638).
@@ -230,7 +235,67 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             allow_dlq_all_duplicates: false,
             lag_observer: None,
             legacy_state_writes: false,
+            governance: None,
+            row_accounts: None,
         }
+    }
+
+    /// Attach every governance pass at once (RFC 0013, #875). The page passes
+    /// (masking, quality, contract, schema drift), resilience, cancellation,
+    /// metering and the DLQ come from `governance`; the sink-side layers
+    /// (policy, profiling, metadata, budget) must already wrap the sink this
+    /// pipeline was built with — build it with
+    /// [`Governance::sink_builder`](crate::governance::Governance::sink_builder),
+    /// or [`run`](Self::run) refuses to start. The DLQ is governed as a
+    /// destination of its own (#870).
+    pub fn with_governance(mut self, governance: crate::governance::Governance) -> Self {
+        #[cfg(feature = "masking")]
+        {
+            self.masking = governance.masking().cloned();
+        }
+        #[cfg(feature = "quality")]
+        {
+            self.quality = governance.quality().cloned();
+        }
+        #[cfg(feature = "contract")]
+        {
+            self.contract = governance.contract().cloned();
+        }
+        self.schema_drift = governance.schema_drift();
+        self.resilience = governance.resilience().cloned();
+        self.cancel = governance.cancel().cloned();
+        self.usage_meter = governance.usage_meter().cloned();
+        self.dlq = governance.dlq().map(|d| d.config.clone());
+        self.governance = Some(governance);
+        self
+    }
+
+    /// Count every row of the run into `accounts` (#879): offered, accepted,
+    /// coalesced, failed to the DLQ, quarantined, dropped. Complete when
+    /// [`run`](Self::run) returns, `Err` included.
+    pub fn with_row_accounts(mut self, accounts: Arc<crate::accounting::RowAccounts>) -> Self {
+        self.row_accounts = Some(accounts);
+        self
+    }
+
+    /// The DLQ this run writes to: governed when a governance value is
+    /// attached (#870), metered whenever a usage meter is.
+    fn effective_dlq(&self) -> Option<DlqConfig> {
+        if let Some(g) = &self.governance {
+            return g.governed_dlq();
+        }
+        let dlq = self.dlq.as_ref()?;
+        Some(match &self.usage_meter {
+            Some(m) => crate::governance::govern_dlq(
+                &crate::governance::DlqGovernance::new(dlq.clone()),
+                Some(m),
+                None,
+                None,
+                #[cfg(feature = "policy")]
+                None,
+            ),
+            None => dlq.clone(),
+        })
     }
 
     /// Suppress the overwrite begin/commit/abort lifecycle inside `run()` so an
@@ -362,7 +427,11 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         on.push((self.masking.is_some(), F::Masking));
         #[cfg(feature = "arrow")]
         on.push((self.masking_retypes_by_value(), F::MaskingRetypesByValue));
-        on.into_iter().filter(|(c, _)| *c).map(|(_, f)| f).collect()
+        let mut features: Vec<F> = on.into_iter().filter(|(c, _)| *c).map(|(_, f)| f).collect();
+        if let Some(g) = &self.governance {
+            features.extend(g.compat_features());
+        }
+        features
     }
 
     /// A masking rule that re-types values page by page would change a
@@ -598,8 +667,20 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         let lag_poller =
             crate::lag::LagPoller::new(&wrapped_source, &name, &row, self.lag_observer.clone());
 
+        let dlq_effective = self.effective_dlq();
         // Run inside the span.
         let result = async {
+            if let Some(g) = &self.governance
+                && g.has_sink_layers()
+                && !g.sink_built()
+            {
+                return Err(FaucetError::Config(
+                    "governance has sink-side passes (policy, profiling, metadata columns or a \
+                     budget) but the sink was not built with Governance::sink_builder, so they \
+                     would not apply"
+                        .into(),
+                ));
+            }
             if let Some(dlq) = &self.dlq {
                 crate::dlq::check_dlq_all_policy(
                     &wrapped_sink,
@@ -805,6 +886,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         has_governance = has_governance || self.masking.is_some();
                     }
                     let sink_name = wrapped_sink.connector_name();
+                    let row_accounts = self.row_accounts.clone();
                     let specs = GovernanceSpecs {
                         #[cfg(feature = "masking")]
                         masking: self.masking.as_ref(),
@@ -829,7 +911,8 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         &run_id,
                         specs,
                         has_governance,
-                        self.dlq.clone(),
+                        dlq_effective.clone(),
+                        row_accounts,
                         crate::dlq::BatchOutcomeSink::new(
                             &name,
                             &row,
@@ -859,7 +942,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             if let (Some(store), Some(key)) = (wrapped_state_store.clone(), state_key.clone()) {
                 opts = opts.with_state(store, key);
             }
-            if let Some(dlq) = self.dlq.clone() {
+            if let Some(dlq) = dlq_effective.clone() {
                 opts = opts.with_dlq(dlq);
             }
             #[cfg(feature = "quality")]
@@ -912,6 +995,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             let extras = StreamExtras {
                 batch_outcomes: self.batch_outcomes.clone(),
                 source_drains_on_cancel,
+                row_accounts: self.row_accounts.clone(),
             };
             let overwriting = wrapped_sink.is_overwrite() && !self.suppress_overwrite_lifecycle;
             if overwriting {
@@ -1076,6 +1160,7 @@ async fn run_stream_columnar<S, Si>(
     specs: GovernanceSpecs<'_>,
     has_governance: bool,
     dlq: Option<crate::dlq::DlqConfig>,
+    row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
     outcomes: crate::dlq::BatchOutcomeSink,
 ) -> Result<PipelineResult, FaucetError>
 where
@@ -1140,6 +1225,7 @@ where
         // deferral the `Value` path uses, so quarantined rows are never dropped
         // on the way out (#146 M4).
         let mut deferred: Option<FaucetError> = None;
+        let mut account = crate::accounting::PageAccount::new(rows);
         let batch = if has_governance && rows > 0 {
             let records = crate::columnar::record_batch_to_values(&page.batch)?;
             let schema = page.batch.schema();
@@ -1184,7 +1270,8 @@ where
                     .sink
                     .write_batch(&gov.envelopes)
                     .await
-                    .map_err(|e| FaucetError::Sink(format!("DLQ write failed: {e}")))?;
+                    .map_err(|e| dlq_write_error("DLQ write failed", e))?;
+                account.quarantined += page_failures;
                 dlq_stats.records_dlq += page_failures;
                 dlq_stats.pages_with_failures += 1;
             }
@@ -1211,9 +1298,14 @@ where
         if rows > 0 {
             let n = outcomes.observe(sink.write_batch_columnar(&batch).await)?;
             records_written += n;
+            account.accepted += n;
             counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
             counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
         }
+        account.settle(
+            row_accounts.as_deref(),
+            (pipeline, row, sink.connector_name()),
+        )?;
 
         // Checkpoint: flush then persist the bookmark, never the other way
         // round (ADR 0002) — the state store is always at or behind the sink.
@@ -1314,6 +1406,7 @@ where
     let mut pending_bookmark: Option<Value> = None;
     let mut first_batch = true;
     let mut cancelled = false;
+    let mut warned_unchecked = false;
 
     loop {
         let next = match &cancel {
@@ -1336,8 +1429,28 @@ where
             write_mode,
             first_batch,
         };
+        let offered = batch.records;
         let n = outcomes.observe(sink.load_native(batch, &scope, load_ctx).await)?;
         first_batch = false;
+        match offered {
+            Some(offered) if (n as u64) < offered => {
+                let mut page = crate::accounting::PageAccount::new(offered as usize);
+                page.accepted = n;
+                page.settle(None, (pipeline, row, sink.connector_name()))?;
+            }
+            Some(_) => {}
+            None if !warned_unchecked => {
+                warned_unchecked = true;
+                tracing::warn!(
+                    pipeline,
+                    row,
+                    connector = sink.connector_name(),
+                    "native load: the source does not report a row count, so rows loaded \
+                     cannot be checked against rows offered on this path"
+                );
+            }
+            None => {}
+        }
         records_written += n;
         counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
         counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
@@ -1420,6 +1533,8 @@ pub(crate) struct StreamExtras {
     /// The source answered [`Source::set_cancel`] with `true`: on cancel it
     /// yields what it buffered and ends, so the loop keeps polling to the end.
     pub(crate) source_drains_on_cancel: bool,
+    /// Per-run row accounting (#879).
+    pub(crate) row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
 }
 
 pub(crate) async fn run_stream_with<S, Si>(
@@ -1442,6 +1557,7 @@ where
     let dlq = options.dlq.clone();
     let cancel = options.cancel.clone();
     let source_drains = extras.source_drains_on_cancel;
+    let row_accounts = extras.row_accounts.clone();
 
     #[cfg(feature = "quality")]
     let quality = options.quality.clone();
@@ -1722,6 +1838,7 @@ where
                     if page.records.is_empty() && page.bookmark.is_none() {
                         continue;
                     }
+                    let mut account = crate::accounting::PageAccount::new(page.records.len());
 
                     // Governance passes — masking → quality → contract →
                     // schema drift — shared verbatim with the columnar loop
@@ -1743,6 +1860,7 @@ where
                     let gov =
                         apply_governance(page.records, &specs, &mut gov_state, sink).await?;
                     let quality_envelopes = gov.envelopes;
+                    account.quarantined = quality_envelopes.len();
                     // A drift `fail` stops the run before anything from this
                     // page is written or bookmarked: only the page's quarantine
                     // envelopes are made durable first (CORE-20).
@@ -1850,7 +1968,8 @@ where
                                 // DLQ with the bookmark moving past it (CORE-27).
                                 Err(
                                     e @ (FaucetError::BudgetExceeded { .. }
-                                    | FaucetError::PolicyViolation { .. }),
+                                    | FaucetError::PolicyViolation { .. }
+                                    | FaucetError::RowsUnaccounted { .. }),
                                 ) => {
                                     outcomes.record(BatchOutcome::Failed);
                                     return Err(e);
@@ -2021,6 +2140,8 @@ where
                                     poison_drop,
                                 );
                             }
+                            account.failed += chunk_errors;
+                            account.dropped += poison_drop as usize;
                             outcomes.record(if chunk_synthesized {
                                 BatchOutcome::DlqAll
                             } else if chunk_errors > 0 || poison_drop > 0 {
@@ -2122,7 +2243,15 @@ where
                                 "faucet_sink_dlq_write_duration_seconds",
                                 metric_labels.clone(),
                             );
-                            dlq_cfg.sink.write_batch(&envelopes).await.map_err(|e| {
+                            let dlq_sink = &dlq_cfg.sink;
+                            let written = if retry_policy.is_some()
+                                && dlq_sink.write_batch_is_replay_safe()
+                            {
+                                with_retry!("dlq_write", dlq_sink.write_batch(&envelopes))
+                            } else {
+                                dlq_sink.write_batch(&envelopes).await
+                            };
+                            written.map_err(|e| {
                                 let mut lbl = metric_labels.clone();
                                 lbl.push(Label::new(
                                     "kind",
@@ -2131,7 +2260,7 @@ where
                                     ),
                                 ));
                                 counter!("faucet_sink_dlq_errors_total", lbl).increment(1);
-                                FaucetError::Sink(format!("DLQ sink write failed: {e}"))
+                                dlq_write_error("DLQ sink write failed", e)
                             })?;
                             dlq_stats.records_dlq += page_failures;
                             dlq_stats.pages_with_failures += 1;
@@ -2172,6 +2301,11 @@ where
                         }
 
                         records_written += page_success;
+                        account.accepted += page_success;
+                        account.settle(
+                            row_accounts.as_deref(),
+                            (&pipeline_name, &row, sink_name),
+                        )?;
 
                         if let Some(bookmark) = page.bookmark {
                             // Retry-wrap the main-sink flush, the DLQ-sink flush,
@@ -2256,16 +2390,23 @@ where
                                 ];
                                 counter!("faucet_pipeline_pages_skipped_total", skip_labels)
                                     .increment(1);
+                                account.accepted += page.records.len();
                             } else {
                                 // A retry after an ambiguous failure first asks the
                                 // sink whether the page already committed: replaying
                                 // it would insert its rows again.
                                 let attempt = std::sync::atomic::AtomicU32::new(0);
-                                records_written += outcomes.observe(with_retry!(
+                                let n = outcomes.observe(with_retry!(
                                     "sink_write",
                                     eo_write_once(sink, &page.records, &scope, &token, next_seq, &attempt)
                                 ))?;
+                                records_written += n;
+                                account.add_report(eo_report(sink, page.records.len(), n));
                             }
+                            account.settle(
+                                row_accounts.as_deref(),
+                                (&pipeline_name, &row, sink_name),
+                            )?;
                             with_retry!("flush", sink.flush())?;
                             let bm_labels =
                                 crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
@@ -2282,10 +2423,16 @@ where
                             // No bookmark → not individually checkpointed; write
                             // as-is (rare for EO sources, which bookmark every
                             // page). Stays at-least-once for this page.
-                            records_written += outcomes.observe(with_retry_write!(
+                            let report = outcomes.observe(with_retry_write!(
                                 "sink_write",
-                                sink.write_batch(&page.records)
+                                sink.write_batch_reported(&page.records)
                             ))?;
+                            records_written += report.accepted;
+                            account.add_report(report);
+                            account.settle(
+                                row_accounts.as_deref(),
+                                (&pipeline_name, &row, sink_name),
+                            )?;
                         }
                     } else {
                         // ── DLQ-disabled path (today's behaviour) ──────────────
@@ -2306,11 +2453,13 @@ where
                                         ctrl.current().max(1).min(page.records.len() - offset);
                                     let chunk = &page.records[offset..offset + size];
                                     let t0 = std::time::Instant::now();
-                                    let n = outcomes.observe(with_retry_write!(
+                                    let report = outcomes.observe(with_retry_write!(
                                         "sink_write",
-                                        sink.write_batch(chunk)
+                                        sink.write_batch_reported(chunk)
                                     ))?;
                                     let latency = t0.elapsed();
+                                    let n = report.accepted;
+                                    account.add_report(report);
                                     records_written += n;
                                     offset += size;
                                     let adj = ctrl.observe(crate::adaptive::Observation {
@@ -2321,12 +2470,18 @@ where
                                     emit_adaptive_metrics(ctrl, adj, &pipeline_name, &row);
                                 }
                             } else {
-                                records_written += outcomes.observe(with_retry_write!(
+                                let report = outcomes.observe(with_retry_write!(
                                     "sink_write",
-                                    sink.write_batch(&page.records)
+                                    sink.write_batch_reported(&page.records)
                                 ))?;
+                                records_written += report.accepted;
+                                account.add_report(report);
                             }
                         }
+                        account.settle(
+                            row_accounts.as_deref(),
+                            (&pipeline_name, &row, sink_name),
+                        )?;
                         if let Some(bookmark) = page.bookmark {
                             if !defer_bookmarks {
                                 with_retry!("flush", sink.flush())?;
@@ -2474,6 +2629,21 @@ async fn eo_write_once<Si: Sink + ?Sized>(
         return Ok(records.len());
     }
     sink.write_batch_idempotent(records, scope, token).await
+}
+
+/// The row report of an exactly-once page write. The idempotent write returns
+/// a count only, so a sink that merges rows by key (an upsert with a commit
+/// token) is credited with the rows it merged.
+fn eo_report<Si: Sink + ?Sized>(
+    sink: &Si,
+    offered: usize,
+    written: usize,
+) -> crate::accounting::WriteReport {
+    if sink.dedups_by_key() {
+        crate::accounting::WriteReport::keyed(offered, written)
+    } else {
+        crate::accounting::WriteReport::accepted(written)
+    }
 }
 
 /// Emit the adaptive controller's current state + any adjustment as metrics.
@@ -2817,7 +2987,7 @@ async fn abort_with_envelopes(
         .sink
         .write_batch(envelopes)
         .await
-        .map_err(|e| FaucetError::Sink(format!("DLQ sink write failed: {e}")))?;
+        .map_err(|e| dlq_write_error("DLQ sink write failed", e))?;
     dlq_cfg
         .sink
         .flush()
@@ -2826,6 +2996,18 @@ async fn abort_with_envelopes(
     dlq_stats.records_dlq += envelopes.len();
     dlq_stats.pages_with_failures += 1;
     Ok(())
+}
+
+/// A failed DLQ write. A refusal by the DLQ's own governance — its policy, the
+/// run budget, or row accounting (#870, #879) — keeps its type so the run fails
+/// with the real reason; anything else is a DLQ sink failure.
+fn dlq_write_error(context: &str, e: FaucetError) -> FaucetError {
+    match e {
+        e @ (FaucetError::PolicyViolation { .. }
+        | FaucetError::BudgetExceeded { .. }
+        | FaucetError::RowsUnaccounted { .. }) => e,
+        e => FaucetError::Sink(format!("{context}: {e}")),
+    }
 }
 
 /// Apply the schema-drift policy to a page (#194). Returns the (possibly

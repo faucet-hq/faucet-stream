@@ -60,6 +60,13 @@ impl CompiledPolicy {
         &self.rules
     }
 
+    /// Whether any rule quarantines at run time (`on_runtime: quarantine`).
+    pub fn quarantines(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.on_runtime == super::spec::RuntimeAction::Quarantine)
+    }
+
     pub fn classifications(&self) -> &[CompiledClassification] {
         &self.classifications
     }

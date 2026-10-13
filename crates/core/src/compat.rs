@@ -62,6 +62,14 @@ pub enum Feature {
     Cleanup,
     /// A data-flow policy rule with `on_runtime: quarantine`.
     PolicyQuarantine,
+    /// A data-flow policy runtime backstop (any rule).
+    Policy,
+    /// A run budget (`budget:` ceilings).
+    Budget,
+    /// Column profiling (`profiling:`).
+    Profiling,
+    /// `_faucet_*` metadata columns (`metadata_columns:`).
+    MetadataColumns,
 }
 
 impl Feature {
@@ -85,6 +93,10 @@ impl Feature {
         Feature::Resilience,
         Feature::Cleanup,
         Feature::PolicyQuarantine,
+        Feature::Policy,
+        Feature::Budget,
+        Feature::Profiling,
+        Feature::MetadataColumns,
     ];
 
     /// How the feature is spelled in a config.
@@ -108,6 +120,10 @@ impl Feature {
             Feature::Resilience => "`resilience:`",
             Feature::Cleanup => "`complete_for: { on_missing: delete }`",
             Feature::PolicyQuarantine => "`policy:` rule with `on_runtime: quarantine`",
+            Feature::Policy => "`policy:`",
+            Feature::Budget => "`budget:`",
+            Feature::Profiling => "`profiling:`",
+            Feature::MetadataColumns => "`metadata_columns:`",
         }
     }
 }
@@ -297,6 +313,10 @@ pub const RULES: &[Rule] = &[
     path(F::Resilience, P::Native, D),
     path(F::Cleanup, P::Native, D),
     path(F::PolicyQuarantine, P::Native, D),
+    path(F::Policy, P::Native, D),
+    path(F::Budget, P::Native, D),
+    path(F::Profiling, P::Native, D),
+    path(F::MetadataColumns, P::Native, D),
     // Columnar: governance runs inside the loop; per-row outcomes do not.
     path(F::MaskingRetypesByValue, P::Columnar, D),
     path(F::DlqAll, P::Columnar, D),
@@ -307,6 +327,7 @@ pub const RULES: &[Rule] = &[
     path(F::Resilience, P::Columnar, D),
     path(F::Cleanup, P::Columnar, D),
     path(F::PolicyQuarantine, P::Columnar, D),
+    path(F::MetadataColumns, P::Columnar, D),
     // The exactly-once watermark commits a whole page atomically.
     path(F::DlqPropagate, P::Watermark, R(EO_WITH_DLQ)),
     path(F::DlqAll, P::Watermark, R(EO_WITH_DLQ)),

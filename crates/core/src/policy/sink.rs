@@ -35,6 +35,9 @@ pub struct PolicySink {
     scope: PolicyScope,
     masking: Option<Arc<CompiledMasking>>,
     dlq: Option<SinkFacts>,
+    /// The wrapped sink is a DLQ: records are envelopes, the payload is
+    /// classified, and any violation fails the write (#870).
+    envelopes: bool,
 }
 
 impl PolicySink {
@@ -51,6 +54,24 @@ impl PolicySink {
             scope,
             masking: None,
             dlq: None,
+            envelopes: false,
+        }
+    }
+
+    /// Enforce the policy at a DLQ (#870): every envelope's payload is
+    /// classified against the DLQ's own `facts`, whichever pass quarantined it
+    /// (quality, contract, drift, policy, or a per-row sink failure). There is
+    /// no DLQ behind a DLQ, so any violation — `quarantine` rules included —
+    /// fails the write, and with it the run.
+    pub fn for_dlq(
+        inner: Box<dyn Sink>,
+        policy: Arc<CompiledPolicy>,
+        dlq: SinkFacts,
+        scope: PolicyScope,
+    ) -> Self {
+        Self {
+            envelopes: true,
+            ..Self::new(inner, policy, dlq, scope)
         }
     }
 
@@ -117,11 +138,20 @@ impl PolicySink {
         let mut offending = Vec::new();
         let mut names = NameLabels::new();
         for (i, r) in records.iter().enumerate() {
+            let r = if self.envelopes {
+                r.get("payload").unwrap_or(r)
+            } else {
+                r
+            };
             let (columns, mut violations) = self.check_record(r, &mut names);
             if violations.is_empty() {
                 continue;
             }
-            let mut action = self.action_for(&violations);
+            let mut action = if self.envelopes {
+                RuntimeAction::Fail
+            } else {
+                self.action_for(&violations)
+            };
             if action == RuntimeAction::Quarantine
                 && let Some(dlq) = &self.dlq
             {
@@ -274,8 +304,23 @@ impl Sink for PolicySink {
     // Classification needs parsed rows, so the native byte path stays off;
     // everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        write_batch, write_batch_partial, write_batch_idempotent, write_batch_columnar,
-        native_load_capabilities, load_native);
+        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_columnar, native_load_capabilities, load_native);
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let offending = self.screen(records)?;
+        if let Some((_, v)) = offending.first() {
+            return Err(FaucetError::PolicyViolation {
+                rule: v.rule.clone(),
+                column: v.column.clone(),
+                message: format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
+            });
+        }
+        self.inner.write_batch_reported(records).await
+    }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let offending = self.screen(records)?;

@@ -300,7 +300,8 @@ impl Sink for MetadataSink {
     // The columnar and native paths carry no per-row Value to stamp, so they stay
     // at the trait default (off); everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        admit_page, write_batch, write_batch_partial, write_batch_idempotent, begin_overwrite,
+        admit_page, write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        begin_overwrite,
         supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
 
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
@@ -314,6 +315,14 @@ impl Sink for MetadataSink {
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         self.ensure_columns().await?;
         self.inner.write_batch_partial(&self.stamp(records)).await
+    }
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.ensure_columns().await?;
+        self.inner.write_batch_reported(&self.stamp(records)).await
     }
 
     async fn write_batch_idempotent(

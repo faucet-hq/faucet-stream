@@ -348,6 +348,7 @@ pub(crate) fn error_kind(e: &FaucetError) -> &'static str {
         FaucetError::ProfileDrift { .. } => "ProfileDrift",
         FaucetError::PolicyViolation { .. } => "PolicyViolation",
         FaucetError::BudgetExceeded { .. } => "BudgetExceeded",
+        FaucetError::RowsUnaccounted { .. } => "RowsUnaccounted",
         FaucetError::ContractViolation { .. } => "ContractViolation",
         FaucetError::State(_) => "State",
         FaucetError::StateIncompatible { .. } => "StateIncompatible",
@@ -410,6 +411,79 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
         FaucetError::Custom(format!("panic in {what}: {}", panic_message(&*panic)).into())
     }
 
+    /// The instrumented write behind `write_batch` and `write_batch_reported`.
+    async fn write_instrumented(
+        &self,
+        records: &[Value],
+        reported: bool,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let span = info_span!(
+            "faucet.sink.write",
+            pipeline = %self.labels.pipeline,
+            row = %self.labels.row,
+            run_id = %self.labels.run_id,
+            connector = %self.connector,
+            records = records.len(),
+        );
+        let metric_labels = self.metric_labels();
+        gauge!("faucet_sink_in_flight", metric_labels.clone()).increment(1.0);
+
+        // RAII guard ensures the gauge is decremented even if write_batch
+        // panics or the future is cancelled.
+        struct InFlightGuard(Vec<Label>);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                gauge!("faucet_sink_in_flight", self.0.clone()).decrement(1.0);
+            }
+        }
+        let _in_flight = InFlightGuard(metric_labels.clone());
+
+        let _timer =
+            DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
+
+        let write = async {
+            if reported {
+                self.inner.write_batch_reported(records).await
+            } else {
+                self.inner
+                    .write_batch(records)
+                    .await
+                    .map(crate::accounting::WriteReport::accepted)
+            }
+        };
+        let result = AssertUnwindSafe(write)
+            .catch_unwind()
+            .instrument(span)
+            .await;
+
+        match result {
+            Ok(Ok(r)) => {
+                let n = r.accepted;
+                counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
+                counter!("faucet_sink_records_total", metric_labels.clone()).increment(n as u64);
+                self.meter_written(records, n);
+                Ok(r)
+            }
+            Ok(Err(e)) => {
+                counter!(
+                    "faucet_sink_errors_total",
+                    self.error_labels(error_kind(&e))
+                )
+                .increment(1);
+                Err(e)
+            }
+            Err(panic) => {
+                counter!("faucet_sink_errors_total", self.error_labels("Panic")).increment(1);
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                Err(FaucetError::Custom(format!("panic in sink: {msg}").into()))
+            }
+        }
+    }
+
     /// Count `accepted` records of `records` as written; when the sink
     /// accepted a prefix, only that prefix's estimated size is attributed.
     fn meter_written(&self, records: &[Value], accepted: usize) {
@@ -432,7 +506,8 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     // unchanged: identity, capabilities, lifecycle and provenance must look
     // through the decorator, or the feature behind each one goes inert.
     crate::forward_sink!(inner; except connector_name, write_batch_columnar,
-        load_native, write_batch, write_batch_partial, flush, write_batch_idempotent);
+        load_native, write_batch, write_batch_reported, write_batch_partial, flush,
+        write_batch_idempotent);
 
     fn connector_name(&self) -> &'static str {
         // Return the guarded name so an inner connector that returns "" maps to
@@ -495,60 +570,16 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        let span = info_span!(
-            "faucet.sink.write",
-            pipeline = %self.labels.pipeline,
-            row = %self.labels.row,
-            run_id = %self.labels.run_id,
-            connector = %self.connector,
-            records = records.len(),
-        );
-        let metric_labels = self.metric_labels();
-        gauge!("faucet_sink_in_flight", metric_labels.clone()).increment(1.0);
+        self.write_instrumented(records, false)
+            .await
+            .map(|r| r.accepted)
+    }
 
-        // RAII guard ensures the gauge is decremented even if write_batch
-        // panics or the future is cancelled.
-        struct InFlightGuard(Vec<Label>);
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                gauge!("faucet_sink_in_flight", self.0.clone()).decrement(1.0);
-            }
-        }
-        let _in_flight = InFlightGuard(metric_labels.clone());
-
-        let _timer =
-            DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
-
-        let result = AssertUnwindSafe(self.inner.write_batch(records))
-            .catch_unwind()
-            .instrument(span)
-            .await;
-
-        match result {
-            Ok(Ok(n)) => {
-                counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
-                counter!("faucet_sink_records_total", metric_labels.clone()).increment(n as u64);
-                self.meter_written(records, n);
-                Ok(n)
-            }
-            Ok(Err(e)) => {
-                counter!(
-                    "faucet_sink_errors_total",
-                    self.error_labels(error_kind(&e))
-                )
-                .increment(1);
-                Err(e)
-            }
-            Err(panic) => {
-                counter!("faucet_sink_errors_total", self.error_labels("Panic")).increment(1);
-                let msg = panic
-                    .downcast_ref::<&'static str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                Err(FaucetError::Custom(format!("panic in sink: {msg}").into()))
-            }
-        }
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.write_instrumented(records, true).await
     }
 
     async fn write_batch_partial(

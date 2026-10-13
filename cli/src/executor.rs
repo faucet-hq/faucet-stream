@@ -3741,6 +3741,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::ProfileDrift { .. } => "profile_drift",
         FaucetError::PolicyViolation { .. } => "policy",
         FaucetError::BudgetExceeded { .. } => "budget_exceeded",
+        FaucetError::RowsUnaccounted { .. } => "rows_unaccounted",
         FaucetError::Timeout { .. } => "timeout",
         _ => "error",
     }
@@ -4052,8 +4053,24 @@ impl Sink for CapturingSink {
     // carry none) stay at the trait default (off); everything else reaches the
     // wrapped sink.
     faucet_core::forward_sink!(inner; except
-        write_batch, write_batch_partial, write_batch_idempotent, supports_columnar,
-        write_batch_columnar, native_load_capabilities, load_native);
+        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let report = self.inner.write_batch_reported(records).await?;
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+        Ok(report)
+    }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let written = self.inner.write_batch(records).await?;
@@ -4130,7 +4147,8 @@ impl Sink for LimitedSink {
     // and native paths stay at the trait default (the idempotent default calls
     // write_batch); everything else reaches the wrapped sink.
     faucet_core::forward_sink!(inner; except
-        write_batch_partial, commit_overwrite, write_batch, supports_idempotent_writes,
+        write_batch_partial, commit_overwrite, write_batch, write_batch_reported,
+        supports_idempotent_writes,
         write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
 
@@ -4162,6 +4180,23 @@ impl Sink for LimitedSink {
              and the destination is left unchanged"
         );
         self.inner.abort_overwrite().await
+    }
+    // Rows past the cap are dropped by design and reported as skipped, so row
+    // accounting (#879) does not take them for a silent loss.
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let take = remaining.min(records.len());
+        let report = if take == 0 {
+            faucet_core::WriteReport::default()
+        } else {
+            self.inner.write_batch_reported(&records[..take]).await?
+        };
+        self.remaining
+            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
+        Ok(report.with_skipped(report.skipped + (records.len() - take)))
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);

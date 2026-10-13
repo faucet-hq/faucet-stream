@@ -594,6 +594,21 @@ macro_rules! forward_sink {
                 self.$inner.write_batch(records)
             }
         });
+        $crate::__faucet_forward_filter!(write_batch_reported [$($skip)*] {
+            fn write_batch_reported<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                records: &'life1 [$crate::Value],
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<$crate::accounting::WriteReport>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.write_batch_reported(records)
+            }
+        });
         $crate::__faucet_forward_filter!(flush [$($skip)*] {
             fn flush<'life0, 'async_trait>(
                 &'life0 self,
@@ -1099,6 +1114,10 @@ macro_rules! __faucet_forward_filter {
     (dataset_uri [dataset_uri $($rest:ident)*] $item:tt) => {};
     (check [check $($rest:ident)*] $item:tt) => {};
     (write_batch [write_batch $($rest:ident)*] $item:tt) => {};
+    (write_batch_reported [write_batch_reported $($rest:ident)*] $item:tt) => {};
+    // A wrapper that changes `write_batch` takes the trait default for the
+    // reported write, which goes through its own `write_batch` (#879).
+    (write_batch_reported [write_batch $($rest:ident)*] $item:tt) => {};
     (flush [flush $($rest:ident)*] $item:tt) => {};
     (write_batch_partial [write_batch_partial $($rest:ident)*] $item:tt) => {};
     (batch_atomicity [batch_atomicity $($rest:ident)*] $item:tt) => {};
@@ -1177,6 +1196,7 @@ macro_rules! __faucet_forward_known {
     (@source [dataset_uri $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [check $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@sink [write_batch $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
+    (@sink [write_batch_reported $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [flush $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [write_batch_partial $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [batch_atomicity $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };

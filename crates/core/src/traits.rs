@@ -589,9 +589,32 @@ pub trait Sink: Send + Sync {
     /// onto a uniform all-`Ok(())` vector. An outer failure is bubbled up
     /// unchanged so the pipeline's DLQ router can apply its `on_batch_error`
     /// policy at a single decision point.
+    ///
+    /// The default checks the write's [`WriteReport`](crate::WriteReport)
+    /// (#879): rows it neither wrote nor reported as coalesced fail the batch
+    /// with [`FaucetError::RowsUnaccounted`] instead of being reported `Ok`.
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        self.write_batch(records).await?;
+        self.write_batch_reported(records)
+            .await?
+            .check(records.len())?;
         Ok(records.iter().map(|_| Ok(())).collect())
+    }
+
+    /// Write a batch and report what happened to every row offered (#879).
+    ///
+    /// The pipeline calls this instead of [`Self::write_batch`] and checks that
+    /// `accepted + coalesced` covers the page; a shortfall fails the page with
+    /// [`FaucetError::RowsUnaccounted`]. The default wraps `write_batch`'s
+    /// count. A sink that merges rows of the same key within a page (keyed
+    /// upsert / delete, last write wins) overrides it and reports the merged
+    /// rows as [`coalesced`](crate::WriteReport::coalesced).
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        Ok(crate::accounting::WriteReport::accepted(
+            self.write_batch(records).await?,
+        ))
     }
 
     /// What a failed batch write leaves behind (#737): nothing
