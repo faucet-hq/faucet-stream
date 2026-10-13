@@ -982,13 +982,13 @@ mod tests {
 
     #[tokio::test]
     async fn budget_sink_forwards_every_hook_but_native() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let (sink, _s, _t) = BudgetSink::wrap(
             Box::new(probe.clone()),
             BudgetSpec::default(),
             CancellationToken::new(),
         );
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &sink,
             &probe,
             &["native_load_capabilities", "load_native"],

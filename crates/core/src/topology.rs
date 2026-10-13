@@ -3092,7 +3092,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let snap = crate::observability::decorator::source_tests::snapshotter();
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let topo = Topology::builder()
             .source("src-node", VecSource::boxed(recs(3)))
             .sink("sink-node", Box::new(probe.clone()))

@@ -555,12 +555,12 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_sink_forwards_every_hook_but_the_unstamped_paths() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
             .unwrap()
             .unwrap();
         let sink = MetadataSink::new(Box::new(probe.clone()), meta, ctx());
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &sink,
             &probe,
             &[

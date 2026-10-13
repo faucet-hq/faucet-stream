@@ -341,12 +341,12 @@ mod tests {
 
     #[tokio::test]
     async fn profiling_sink_forwards_every_hook_but_native() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let sink = ProfilingSink::new(
             Box::new(probe.clone()),
             Arc::new(Mutex::new(Profiler::new(ProfilingSpec::default()))),
         );
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &sink,
             &probe,
             &["native_load_capabilities", "load_native"],

@@ -594,10 +594,10 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_tracker_forwards_every_hook() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let policy = CleanupPolicy::new(scope(), vec!["id".into()], 10).unwrap();
         let t = CleanupTracker::new(&probe, &policy);
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &t,
             &probe,
             &[

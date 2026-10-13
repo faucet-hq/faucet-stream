@@ -949,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_sink_forwards_every_hook_but_native() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let s = PolicySink::new(
             Box::new(probe.clone()),
             policy("fail"),
@@ -963,7 +963,7 @@ mod tests {
                 row: "r".into(),
             },
         );
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &s,
             &probe,
             &["native_load_capabilities", "load_native"],

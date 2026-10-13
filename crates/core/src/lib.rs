@@ -37,6 +37,15 @@ pub mod drift;
 pub mod encryption;
 pub mod error;
 pub mod file_format;
+pub mod forward;
+// The conformance crate's forwarding harness, compiled into core's own unit
+// tests under the `faucet_core::` paths it is written against.
+#[cfg(test)]
+extern crate self as faucet_core;
+#[cfg(test)]
+#[path = "../../conformance/src/forwarding.rs"]
+#[allow(dead_code)]
+mod forwarding;
 pub mod idempotency;
 pub mod join;
 pub mod json_numbers;
@@ -62,8 +71,6 @@ pub mod retry;
 pub mod rollback;
 pub mod schema;
 pub mod shard;
-#[cfg(test)]
-mod sink_forwarding;
 pub mod stage;
 pub mod staging;
 pub mod state;
