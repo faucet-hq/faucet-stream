@@ -86,3 +86,7 @@ already landed a second time). See
 ## Capabilities
 
 Append only. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every page write runs through the pipeline's `CallContext` (#880): the run's deadline ends it promptly, and a write cut short is interrupted inside DuckDB so its transaction rolls back. Each write counts as one `write` round trip in `faucet_sink_roundtrips_total`. The sink never retries a write itself.

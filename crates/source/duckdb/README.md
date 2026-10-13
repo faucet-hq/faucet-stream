@@ -84,3 +84,7 @@ streaming (seeded temp database), and errors-not-panics.
 ## Capabilities
 
 A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every query runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end it promptly, and a query cut short is interrupted inside DuckDB so its blocking task stops rather than running on. Each query counts as one `query` round trip in `faucet_source_roundtrips_total`. Reads are not retried.

@@ -29,6 +29,20 @@ use tokio::sync::mpsc;
 pub struct DuckdbSource {
     config: DuckdbSourceConfig,
     conn: Arc<Mutex<Connection>>,
+    /// Interrupts the running query when the call context cuts it short, so
+    /// the blocking task stops instead of running on unobserved.
+    interrupt: Arc<duckdb::InterruptHandle>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
+}
+
+/// Whether `e` is the call context cutting a call short.
+fn cut_short(e: &FaucetError) -> bool {
+    matches!(
+        e,
+        FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
+    )
 }
 
 /// Open a DuckDB connection honouring the config's path and access mode.
@@ -91,9 +105,12 @@ impl DuckdbSource {
         let conn = tokio::task::spawn_blocking(move || open(&cfg))
             .await
             .map_err(|e| FaucetError::Source(format!("duckdb open task panicked: {e}")))??;
+        let interrupt = conn.interrupt_handle();
         Ok(Self {
             config,
             conn: Arc::new(Mutex::new(conn)),
+            interrupt,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 }
@@ -443,6 +460,17 @@ fn stream_blocking(
 
 #[async_trait]
 impl faucet_core::Source for DuckdbSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -450,10 +478,19 @@ impl faucet_core::Source for DuckdbSource {
         let conn = self.conn.clone();
         let (query_str, binds) = resolve_query(&self.config, context);
         let query_label = self.config.query.clone();
-        let records =
-            tokio::task::spawn_blocking(move || collect_blocking(&conn, &query_str, &binds))
-                .await
-                .map_err(|e| FaucetError::Source(format!("duckdb query task panicked: {e}")))??;
+        let task = tokio::task::spawn_blocking(move || collect_blocking(&conn, &query_str, &binds));
+        let records = self
+            .calls
+            .call_once("query", async {
+                task.await
+                    .map_err(|e| FaucetError::Source(format!("duckdb query task panicked: {e}")))?
+            })
+            .await
+            .inspect_err(|e| {
+                if cut_short(e) {
+                    self.interrupt.interrupt();
+                }
+            })?;
         tracing::info!(
             rows = records.len(),
             query = %query_label,
@@ -488,8 +525,21 @@ impl faucet_core::Source for DuckdbSource {
         });
 
         Box::pin(async_stream::try_stream! {
+            let calls = self.calls.get();
+            calls.record("query");
+            // A page read from the running query is not a round trip of its own.
+            let steps = calls.with_roundtrip_metering(false);
             let mut total = 0usize;
-            while let Some(item) = rx.recv().await {
+            loop {
+                let next = steps
+                    .call_once("query", async { Ok(rx.recv().await) })
+                    .await
+                    .inspect_err(|e| {
+                        if cut_short(e) {
+                            self.interrupt.interrupt();
+                        }
+                    })?;
+                let Some(item) = next else { break };
                 let page = item?;
                 total += page.records.len();
                 yield page;
@@ -601,6 +651,8 @@ mod tests {
             DuckdbSource {
                 config: s.config.with_batch_size(100),
                 conn: s.conn,
+                interrupt: s.interrupt,
+                calls: s.calls,
             }
         };
         let ctx = HashMap::new();
