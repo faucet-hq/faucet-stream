@@ -421,6 +421,7 @@ function rowsCell(r) {
   const title = [
     `${fmtInt(r.offered || 0)} offered`,
     filtered ? `${fmtInt(filtered)} filtered by transforms` : null,
+    r.non_finite ? `${fmtInt(r.non_finite)} NaN / infinite values written as null` : null,
   ].filter(Boolean).join(", ");
   return `<span class="batch-cell" title="${title}">${parts.join(" · ")}</span>`;
 }
