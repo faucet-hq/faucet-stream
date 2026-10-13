@@ -691,6 +691,7 @@ mod tests {
     /// #871: a replay that fails, is cancelled, or whose request is abandoned
     /// closes its record, so it never keeps holding a slot.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
     async fn an_unfinished_replay_record_is_closed() {
         let state = crate::serve::test_support::test_state();
         let failed = start_replay_record(&state, "rp-f", "/d", None, None)
