@@ -66,10 +66,11 @@ impl SqlExecutor for Recorder {
 }
 
 fn spec(mode: WriteMode, key: &[&str]) -> WriteSpec {
-    let mut s = WriteSpec::default();
-    s.write_mode = mode;
-    s.key = key.iter().map(|k| k.to_string()).collect();
-    s
+    WriteSpec {
+        write_mode: mode,
+        key: key.iter().map(|k| k.to_string()).collect(),
+        ..Default::default()
+    }
 }
 
 fn target<D: SqlDialect>(d: &D, name: &str) -> TableTarget {

@@ -110,7 +110,7 @@ pub fn field_for<'a>(
             .map(|(_, v)| v),
         ColumnMatching::FoldUnique => obj
             .iter()
-            .filter(|(k, _)| {
+            .rfind(|(k, _)| {
                 k.eq_ignore_ascii_case(column)
                     && !columns.iter().any(|c| c.name == **k)
                     && columns
@@ -119,7 +119,6 @@ pub fn field_for<'a>(
                         .count()
                         == 1
             })
-            .last()
             .map(|(_, v)| v),
         ColumnMatching::UpperFold => {
             if column != column.to_uppercase() {

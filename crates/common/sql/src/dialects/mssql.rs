@@ -74,7 +74,7 @@ impl SqlDialect for Mssql {
         if width == 0 {
             return 1;
         }
-        (self.param_limit() / width).max(1).min(MAX_VALUES_ROWS)
+        (self.param_limit() / width).clamp(1, MAX_VALUES_ROWS)
     }
 
     fn column_matching(&self) -> ColumnMatching {
