@@ -3794,6 +3794,22 @@ mod tests {
             .expect("a plain path is valid");
     }
 
+    /// A first-party kind this build left out is assumed to support everything,
+    /// so no load-time gate refuses it before the build reports it unknown.
+    #[test]
+    fn an_uncompiled_builtin_is_assumed_capable() {
+        let keyed = serde_json::json!({"write_mode": "upsert", "key": ["id"]});
+        let c = uncompiled_capabilities(&keyed);
+        assert_eq!(c.write_modes().len(), 4);
+        assert!(c.idempotent_writes() && c.keyed_upsert() && c.keyed_dedup());
+        assert!(c.cleanup() && c.rollback() && c.schema_evolution());
+        assert!(c.scoped_overwrite() && c.direct_overwrite() && c.staged_load());
+        assert!(c.exactly_once() && c.discover() && c.shardable());
+        assert!(c.range_read() && c.range_digest() && c.reports_lag());
+        assert!(!uncompiled_capabilities(&serde_json::json!({})).keyed_dedup());
+        assert!(!uncompiled_builtin("no-such-kind", "sink"));
+    }
+
     /// The kind-level capabilities the built-in connectors declare — what the
     /// hand-kept `*_KINDS` allowlists used to say (#876). A kind this build did
     /// not compile in is skipped.
@@ -3824,10 +3840,8 @@ mod tests {
             ("stdout", &[A], false, false, false, false),
         ];
         let mut checked = 0;
-        for (kind, modes, idempotent, keyed, cleanup, evolution) in sinks {
-            if sink_descriptor(kind).is_none() {
-                continue;
-            }
+        let compiled = sinks.iter().filter(|s| sink_descriptor(s.0).is_some());
+        for (kind, modes, idempotent, keyed, cleanup, evolution) in compiled {
             checked += 1;
             let c = sink_kind_capabilities(kind);
             assert_eq!(c.write_modes(), *modes, "{kind} write modes");
@@ -3859,10 +3873,8 @@ mod tests {
             ("file", false, true),
             ("csv", false, false),
         ];
-        for (kind, exactly_once, discover) in sources {
-            if source_descriptor(kind).is_none() {
-                continue;
-            }
+        let compiled = sources.iter().filter(|s| source_descriptor(s.0).is_some());
+        for (kind, exactly_once, discover) in compiled {
             checked += 1;
             let c = source_kind_capabilities(kind);
             assert_eq!(c.exactly_once(), *exactly_once, "{kind} exactly-once");
@@ -3876,14 +3888,15 @@ mod tests {
             } else {
                 source_descriptor(kind).is_some()
             };
-            if present {
-                let c = if sink {
-                    sink_kind_capabilities(kind)
-                } else {
-                    source_kind_capabilities(kind)
-                };
-                assert_eq!(f(&c), want, "{kind}");
-            }
+            let c = if sink {
+                sink_kind_capabilities(kind)
+            } else {
+                source_kind_capabilities(kind)
+            };
+            let checked = present.then_some(c);
+            checked
+                .iter()
+                .for_each(|c| assert_eq!(f(c), want, "{kind}"));
         };
         spot("bigquery", Capabilities::staged_load, true, true);
         spot("redshift", Capabilities::staged_load, true, true);

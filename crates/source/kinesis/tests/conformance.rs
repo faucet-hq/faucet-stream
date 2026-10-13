@@ -260,3 +260,17 @@ async fn conformance_call_deadline() {
     };
     faucet_conformance::calls::assert_source_call_deadline(make).await;
 }
+
+// ── Check: the installed round-trip recorder counts backend calls ───────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "recorded", 1).await;
+    put_records(&client, "recorded", 0, 3).await;
+    let mut cfg = source_config(&endpoint, "recorded");
+    cfg.idle_termination_secs = Some(2);
+    let source = KinesisSource::new(cfg).await.expect("source");
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+}

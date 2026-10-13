@@ -234,3 +234,31 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    let Some((_container, port)) = start_sftp().await else {
+        return;
+    };
+    let conn = connection(port);
+    use faucet_common_sftp::OpenFlags;
+    use tokio::io::AsyncWriteExt;
+    let sftp = faucet_common_sftp::connect(&conn)
+        .await
+        .expect("seed connect");
+    let mut file = sftp
+        .open_with_flags(
+            format!("{UPLOAD_DIR}/rt.jsonl"),
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .expect("seed open");
+    file.write_all(jsonl_body(1, 3).as_bytes())
+        .await
+        .expect("seed write");
+    file.shutdown().await.expect("seed close");
+    drop(file);
+    drop(sftp);
+    let source = SftpSource::new(SftpSourceConfig::new(conn, UPLOAD_DIR)).expect("source");
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+}

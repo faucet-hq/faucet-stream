@@ -2383,6 +2383,27 @@ pipeline:
     - { from: s, to: w }
 "#;
 
+    /// `on_drift: fail` cannot see a column a sink node drops silently, so a
+    /// node whose sink drops unknown fields is refused by name.
+    #[cfg(feature = "sink-file")]
+    #[test]
+    fn drift_fail_is_refused_for_a_node_that_drops_unknown_fields() {
+        let dropping = LINEAR.replace(
+            "o: { type: jsonl, config: { path: /tmp/o.jsonl } }",
+            "o: { type: file, config: { path: /tmp/o.csv, csv: { on_unknown_field: warn } } }",
+        );
+        let err =
+            validate_topology_spec(&cfg(&format!("{dropping}  schema: {{ on_drift: fail }}\n")))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("sink node 'w'"), "{err}");
+        assert!(err.contains("(sink 'file')"), "{err}");
+        assert!(
+            validate_topology_spec(&cfg(&format!("{LINEAR}  schema: {{ on_drift: fail }}\n")))
+                .is_ok()
+        );
+    }
+
     /// The runtime policy backstop (#702) wraps every sink node; a quarantining
     /// rule needs a DLQ to route through, and that is refused before the graph
     /// is built.

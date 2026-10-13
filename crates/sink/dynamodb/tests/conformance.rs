@@ -132,3 +132,42 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+/// The installed recorder counts `BatchWriteItem` calls; a call context that
+/// has run out fails every pending row instead of writing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn roundtrips_are_recorded_and_a_spent_context_fails_every_row() {
+    let Some((_c, endpoint, client)) = start().await else {
+        return;
+    };
+    keyed_table(&client, "recorded").await;
+    let sink = keyed_sink(&endpoint, "recorded").await;
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &sink,
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+
+    let cut = keyed_sink(&endpoint, "recorded").await;
+    cut.write_batch(&[serde_json::json!({"id": 4, "v": "d"})])
+        .await
+        .expect("a write before the context runs out");
+    cut.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() - std::time::Duration::from_millis(1)),
+    );
+    let outcomes = cut
+        .write_batch_partial(&[
+            serde_json::json!({"id": 2, "v": "b"}),
+            serde_json::json!({"id": 3, "v": "c"}),
+        ])
+        .await
+        .expect("per-row outcomes");
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
+    assert_eq!(
+        count(&client, "recorded").await,
+        2,
+        "nothing more was written"
+    );
+}

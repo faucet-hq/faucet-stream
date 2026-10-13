@@ -677,6 +677,40 @@ mod tests {
         }
     }
 
+    /// Removes nothing: every delete fails.
+    struct Sticky(MemoryStateStore);
+
+    #[async_trait::async_trait]
+    impl StateStore for Sticky {
+        async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, FaucetError> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, value: &serde_json::Value) -> Result<(), FaucetError> {
+            self.0.put(key, value).await
+        }
+        async fn delete(&self, _key: &str) -> Result<(), FaucetError> {
+            Err(FaucetError::State("read-only".into()))
+        }
+    }
+
+    /// A legacy key that cannot be removed still moves: the value is under the
+    /// current key, and the stale copy is left behind (a later run sees the
+    /// current key first).
+    #[tokio::test]
+    async fn a_legacy_key_that_cannot_be_removed_still_moves() {
+        let store = Sticky(MemoryStateStore::new());
+        store.put("p::old", &json!(2)).await.unwrap();
+        migrate_state_key(&store, "p::new", &["p::old".into()])
+            .await
+            .unwrap();
+        assert_eq!(store.get("p::new").await.unwrap(), Some(json!(2)));
+        assert_eq!(store.get("p::old").await.unwrap(), Some(json!(2)));
+        let racing = Racing(MemoryStateStore::new());
+        racing.put("k", &json!(1)).await.unwrap();
+        racing.delete("k").await.unwrap();
+        assert_eq!(racing.get("k").await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn a_concurrent_writer_wins_the_race() {
         let store = Racing(MemoryStateStore::new());

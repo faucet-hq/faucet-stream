@@ -127,3 +127,52 @@ async fn confluent_avro_honours_bytes_encoding_against_a_real_broker() {
         "hex decodes the string under schema id 8"
     );
 }
+
+/// The run's call context and round-trip recorder reach the Schema Registry
+/// client: the registration a write makes is counted on the recorder, before
+/// any broker is involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_registry_client_gets_the_runs_context_and_recorder() {
+    use faucet_core::observability::{RoundtripRecorder, RoundtripSide};
+    let registry = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/subjects/sr-ctx-value/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 7})))
+        .mount(&registry)
+        .await;
+    let mut cfg = sink_config(
+        "127.0.0.1:1",
+        "sr-ctx",
+        avro_format(&registry.uri(), "utf8"),
+    );
+    cfg.message_timeout = Duration::from_millis(500);
+    let sink = KafkaSink::new(cfg)
+        .await
+        .expect("sink builds without a broker");
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_call_context(faucet_core::CallContext::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        RoundtripRecorder::new(RoundtripSide::Sink, "p", "", "kafka")
+            .with_meter(std::sync::Arc::clone(&meter)),
+    ));
+    let _ = sink.write_batch(&[json!({"raw": "aGk="})]).await;
+    assert!(
+        !registry
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the schema was registered"
+    );
+    assert!(
+        meter
+            .snapshot()
+            .sink_roundtrips
+            .get("register")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "{:?}",
+        meter.snapshot()
+    );
+}

@@ -841,6 +841,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A schema that refers to itself through `oneOf`, and a config nested
+    /// deeper than the walk follows, end the walk rather than recursing on.
+    #[test]
+    fn self_referential_schemas_and_deep_configs_stop_at_the_depth_cap() {
+        let s = json!({"oneOf": [{"$ref": "#"}], "type": "object"});
+        assert!(annotated_fields(&s).is_empty());
+        let nested = json!({
+            "type": "object",
+            "properties": {"next": {"$ref": "#"}, "path": {"type": "string", "x-faucet-resource": "path"}}
+        });
+        let mut config = json!({"path": "/deepest"});
+        for _ in 0..MAX_DEPTH + 2 {
+            config = json!({"next": config});
+        }
+        let found = annotated_resources(&nested, &config);
+        assert!(found.is_empty(), "{found:?}");
+        let shallow = annotated_resources(&nested, &json!({"next": {"path": "/a"}}));
+        assert_eq!(shallow.len(), 1);
+    }
+
+    #[test]
+    fn a_scheme_without_slashes_names_its_host() {
+        assert_eq!(url_hosts("mysql:db.internal:3306/app"), vec!["db.internal"]);
+    }
+
+    #[test]
+    fn a_branch_without_properties_declares_no_sandbox_field() {
+        assert!(sandbox_fields(&json!({"oneOf": [{"type": "string"}]})).is_empty());
+    }
+
     #[test]
     fn sandbox_fields_are_read_from_the_root_and_its_branches() {
         assert!(sandbox_fields(&schema()).is_empty());

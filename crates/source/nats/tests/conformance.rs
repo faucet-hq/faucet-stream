@@ -360,6 +360,18 @@ mod docker {
         cfg
     }
 
+    /// A durable consumer that does not exist fails the read by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_durable_consumer_is_a_typed_error() {
+        let (_container, server) = start_jetstream().await;
+        jetstream_with(&server, 100, 1).await;
+        let mut cfg = js_config(&server, 1);
+        cfg.jetstream_consumer = Some("nobody".into());
+        let source = NatsSource::new(cfg).await.expect("source new");
+        let err = source.fetch_all().await.unwrap_err().to_string();
+        assert!(err.contains("get_consumer 'nobody'"), "{err}");
+    }
+
     /// `max_messages` pulls only what it needs, so the next run gets the rest
     /// immediately instead of after `ack_wait` (MSG-45); every record carries
     /// its stream sequence for downstream dedupe (MSG-91).
@@ -456,4 +468,26 @@ async fn conformance_call_deadline() {
     let built = std::sync::Mutex::new(built);
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
+}
+
+/// The installed recorder counts the queue-group subscription's backend
+/// calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    use testcontainers_modules::nats::Nats;
+    let container = faucet_conformance::containers::start(Nats::default).await;
+    let port = container.get_host_port_ipv4(4222).await.expect("nats port");
+    let server = format!("nats://127.0.0.1:{port}");
+    for _ in 0..50 {
+        if async_nats::connect(&server).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let mut cfg = NatsSourceConfig::new("recorded.>");
+    cfg.connection.servers = vec![server];
+    cfg.queue_group = Some("workers".into());
+    cfg.idle_timeout_secs = Some(1);
+    let source = NatsSource::new(cfg).await.expect("source new");
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
 }

@@ -6683,6 +6683,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

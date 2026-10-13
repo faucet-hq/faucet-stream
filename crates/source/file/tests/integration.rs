@@ -751,3 +751,50 @@ fn gz_path(dir: &tempfile::TempDir) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// The fetcher's context-free `get` / `head` count each request as a round
+/// trip and read the remote file's modification time.
+#[tokio::test]
+async fn http_fetcher_get_and_head_without_a_call_context() {
+    use faucet_core::observability::{RecorderSlot, RoundtripRecorder, RoundtripSide};
+    use faucet_source_file::http::HttpFetcher;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/f.jsonl"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"a\":1}\n"))
+        .mount(&server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path("/f.jsonl"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Last-Modified", "Thu, 01 Jan 1970 00:00:01 GMT"),
+        )
+        .mount(&server)
+        .await;
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    let slot = RecorderSlot::default();
+    slot.install(std::sync::Arc::new(
+        RoundtripRecorder::new(RoundtripSide::Source, "p", "", "file")
+            .with_meter(std::sync::Arc::clone(&meter)),
+    ));
+    let fetcher = HttpFetcher::new(&Default::default(), 0).unwrap();
+    let url = format!("{}/f.jsonl", server.uri());
+    let body = fetcher
+        .get(&url, &slot)
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, "{\"a\":1}\n");
+    let meta = fetcher.head(&url, &slot).await.unwrap();
+    assert_eq!(meta.last_modified_ns, Some(1_000_000_000));
+    assert_eq!(
+        meter.snapshot().roundtrips(faucet_core::UsageSide::Source),
+        2
+    );
+}

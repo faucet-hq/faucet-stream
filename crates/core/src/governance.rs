@@ -1182,6 +1182,87 @@ mod tests {
         ));
     }
 
+    /// The reported and partial DLQ writes go through the same masking and
+    /// metering as a plain write: the payload is masked and the accepted rows
+    /// are counted as dead-lettered.
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn the_governed_dlq_masks_and_meters_every_write_kind() {
+        let spec: crate::masking::MaskingSpec = serde_json::from_value(json!({
+            "rules": [{"match": {"fields": ["email"]}, "action": {"type": "redact"}}]
+        }))
+        .unwrap();
+        let masking = Arc::new(crate::masking::CompiledMasking::compile(&spec).unwrap());
+        let seen: Seen = Arc::default();
+        let meter = Arc::new(UsageMeter::new());
+        let dlq = DlqGovernance::new(DlqConfig::new(Arc::new(Dest(Arc::clone(&seen)))))
+            .with_masking(masking);
+        let config = Governance::new()
+            .with_usage_meter(Arc::clone(&meter))
+            .with_dlq(dlq)
+            .dlq_config()
+            .unwrap();
+        let envelope = || json!({"payload": {"email": "a@b.co"}});
+        let report = config
+            .sink
+            .write_batch_reported(&[envelope()])
+            .await
+            .unwrap();
+        assert_eq!(report.accepted, 1);
+        let outcomes = config
+            .sink
+            .write_batch_partial(&[envelope(), envelope()])
+            .await
+            .unwrap();
+        assert!(outcomes.iter().all(|o| o.is_ok()));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|(_, r)| r["payload"]["email"] == "***"));
+        assert_eq!(meter.snapshot().dlq_records_written, 3);
+    }
+
+    /// Opting out of the record passes clears them.
+    #[cfg(all(feature = "quality", feature = "contract", feature = "policy"))]
+    #[test]
+    fn the_record_passes_can_be_opted_out() {
+        let quality: crate::quality::QualitySpec = serde_json::from_value(json!({})).unwrap();
+        let contract: crate::contract::ContractSpec = serde_json::from_value(json!({
+            "version": "1", "fields": [{"name": "id", "type": "integer"}]
+        }))
+        .unwrap();
+        let policy: crate::policy::PolicySpec = serde_json::from_value(json!({
+            "classifications": [], "rules": []
+        }))
+        .unwrap();
+        let g = Governance::new()
+            .with_quality(Arc::new(
+                crate::quality::CompiledQuality::compile(&quality).unwrap(),
+            ))
+            .with_contract(Arc::new(
+                crate::contract::CompiledContract::compile(&contract).unwrap(),
+            ))
+            .with_policy(PolicyGovernance::new(
+                Arc::new(crate::policy::CompiledPolicy::compile(&policy).unwrap()),
+                crate::policy::SinkFacts {
+                    id: "w".into(),
+                    kind: "stdout".into(),
+                    attributes: Default::default(),
+                },
+                crate::policy::PolicyScope {
+                    pipeline: "p".into(),
+                    row: "w".into(),
+                },
+            ));
+        assert!(g.quality().is_some() && g.contract().is_some() && g.policy().is_some());
+        let g = g
+            .without(Pass::Masking, "m")
+            .without(Pass::Quality, "q")
+            .without(Pass::Contract, "c")
+            .without(Pass::Policy, "p");
+        assert!(g.quality().is_none() && g.contract().is_none() && g.policy().is_none());
+        assert_eq!(g.opt_outs().len(), 4);
+    }
+
     #[cfg(feature = "masking")]
     #[tokio::test]
     async fn dlq_only_masking_rewrites_the_envelope_payload() {

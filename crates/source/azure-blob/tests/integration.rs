@@ -533,3 +533,62 @@ async fn listing_handles_partial_prefixes_special_names_markers_and_the_size_cap
         .unwrap_err();
     assert!(err.to_string().contains("max_object_bytes"), "{err}");
 }
+
+// ── Missing blobs, a spent call context, and the round-trip recorder ─────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_blobs_spent_contexts_and_recorded_roundtrips() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    let store = seed_store(port);
+    put_object(&store, "rt/a.jsonl", b"{\"id\":1}\n".to_vec()).await;
+
+    let source = AzureBlobSource::new(source_config(port).prefix("rt/"))
+        .await
+        .expect("source new");
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+
+    let missing = AzureBlobSource::new(source_config(port).object_keys(vec!["nope.jsonl".into()]))
+        .await
+        .expect("source new");
+    let err = missing.fetch_all().await.unwrap_err().to_string();
+    assert!(err.contains("azure get error"), "{err}");
+
+    #[cfg(feature = "arrow")]
+    {
+        let missing = AzureBlobSource::new(
+            source_config(port)
+                .object_keys(vec!["nope.parquet".into()])
+                .file_format(AzureFileFormat::Parquet),
+        )
+        .await
+        .expect("source new");
+        let ctx = HashMap::new();
+        let mut batches = missing.stream_batches(&ctx, 100);
+        let Some(Err(err)) = batches.next().await else {
+            panic!("a missing blob fails");
+        };
+        let err = err.to_string();
+        assert!(err.contains("azure head error"), "{err}");
+    }
+
+    // A context cancelled before the probe makes the listing fail, not hang.
+    let token = faucet_core::CancellationToken::new();
+    token.cancel();
+    source.set_call_context(faucet_core::CallContext::new().with_cancel(token));
+    let report = source
+        .check(&faucet_core::check::CheckContext {
+            timeout: std::time::Duration::from_secs(10),
+        })
+        .await
+        .expect("check");
+    assert!(
+        report
+            .probes
+            .iter()
+            .any(|p| matches!(p.status, faucet_core::check::ProbeStatus::Fail { .. })),
+        "{:?}",
+        report.probes
+    );
+}

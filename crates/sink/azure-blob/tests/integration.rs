@@ -314,3 +314,32 @@ async fn sink_writes_gzip_when_compression_enabled() {
         .collect();
     assert_eq!(ids, vec![1, 2]);
 }
+
+// ── Recorded round trips, and a container that does not exist ───────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sink_records_roundtrips_and_fails_on_a_missing_container() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+
+    let sink = AzureBlobSink::new(sink_config(port).prefix("rt/").with_batch_size(0))
+        .await
+        .expect("sink new");
+    faucet_conformance::calls::assert_sink_records_roundtrips(&sink, &[json!({"id": 1})]).await;
+
+    let mut missing = sink_config(port).prefix("out/").with_batch_size(0);
+    missing.connection.container = "no-such-container".into();
+    let sink = AzureBlobSink::new(missing).await.expect("sink new");
+    let outcome = match sink.write_batch(&[json!({"id": 1})]).await {
+        Ok(_) => sink.flush().await,
+        Err(e) => Err(e),
+    };
+    let err = outcome
+        .expect_err("a missing container fails the write")
+        .to_string();
+    assert!(
+        err.contains("no-such-container") || err.contains("azure"),
+        "{err}"
+    );
+}

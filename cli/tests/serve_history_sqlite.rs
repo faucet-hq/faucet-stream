@@ -46,6 +46,22 @@ fn rec(id: &str, status: RunStatus, submitted: chrono::DateTime<Utc>) -> RunReco
     r
 }
 
+/// `insert_new` claims an id once: a second insert of the same id is refused
+/// and leaves the first record in place.
+#[tokio::test]
+async fn insert_new_claims_an_id_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = store(&dir, "n.db").await;
+    let first = rec("run-n", RunStatus::Running, Utc::now());
+    assert!(h.insert_new(&first).await.unwrap());
+    let mut second = rec("run-n", RunStatus::Completed, Utc::now());
+    second.records_written = 9;
+    assert!(!h.insert_new(&second).await.unwrap());
+    let got = h.get("run-n").await.unwrap().expect("present");
+    assert_eq!(got.status, RunStatus::Running);
+    assert_eq!(got.records_written, 0);
+}
+
 #[tokio::test]
 async fn upsert_get_and_missing() {
     let dir = tempfile::tempdir().unwrap();

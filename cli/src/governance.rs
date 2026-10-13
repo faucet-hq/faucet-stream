@@ -661,6 +661,67 @@ mod tests {
         assert!(err.to_string().contains("needs a `dlq:` block"));
     }
 
+    /// The policy backstop of a topology sink node sees the node's masking, so
+    /// a column masked for that node is not refused; a bad rule fails the build.
+    #[cfg(all(feature = "policy", feature = "masking"))]
+    #[test]
+    fn a_topology_policy_backstop_carries_the_nodes_masking() {
+        let policy = "policy:\n  classifications:\n    - { label: pii, fields: [email] }\n  rules:\n    - { name: r, when: { label: pii }, require: { residency: [eu] }, mask: [hash] }\n";
+        let req = |c| TopologySinkRequest {
+            cfg: c,
+            node_id: "w",
+            kind: "stdout",
+            template: "default",
+            attributes: Default::default(),
+            run_id: "r",
+            source_label: "rest".into(),
+            budget: None,
+            cancel: CancellationToken::new(),
+            dry_run: false,
+            preview: false,
+        };
+        let masked = cfg(&format!(
+            "  masking:\n    rules:\n      - {{ match: {{ fields: [email] }}, action: {{ type: hash }} }}\n{policy}"
+        ));
+        let built = topology_sink_governance(req(&masked)).unwrap();
+        assert!(built.governance.is_active(Pass::Policy));
+        let mut bad = masked.clone();
+        bad.pipeline.masking = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{"match": {"field_pattern": "("}, "action": {"type": "hash"}}]
+            }))
+            .unwrap(),
+        );
+        let err = topology_sink_governance(req(&bad)).err().unwrap();
+        assert!(err.to_string().contains("masking"), "{err}");
+    }
+
+    /// A DLQ-only masking rule that does not compile fails the topology DLQ.
+    #[cfg(all(feature = "sink-jsonl", feature = "masking"))]
+    #[tokio::test]
+    async fn a_topology_dlq_with_a_bad_masking_rule_is_refused() {
+        let mut c = cfg(DLQ);
+        c.pipeline.masking = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{"match": {"field_pattern": "("}, "action": {"type": "hash"},
+                           "applies_to": ["dlq"]}]
+            }))
+            .unwrap(),
+        );
+        let dlq = c.pipeline.dlq.clone().unwrap();
+        let config = crate::executor::build_dlq_config(&dlq).await.unwrap();
+        let Err(err) = topology_dlq(
+            &Governance::new(),
+            &c,
+            &["w", "default", "stdout"],
+            &dlq,
+            config,
+        ) else {
+            panic!("a bad rule is refused");
+        };
+        assert!(err.to_string().contains("masking"), "{err}");
+    }
+
     #[cfg(feature = "sink-jsonl")]
     #[tokio::test]
     async fn a_topology_dlq_is_governed_with_the_nodes_budget() {

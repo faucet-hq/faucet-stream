@@ -150,3 +150,18 @@ async fn conformance_call_deadline() {
             .await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_roundtrips_recorded() {
+    let server = common::start_server().await;
+    let config = GrpcStreamConfig::new(
+        &server.endpoint,
+        "faucet.test.echo.EchoService",
+        "List",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 3 }))
+    .rpc_kind(RpcKind::Unary);
+    let source = GrpcStream::new(config).unwrap();
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+}

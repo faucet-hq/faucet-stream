@@ -283,3 +283,17 @@ async fn conformance_declared_capabilities() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    let Some((_container, port)) = start_sftp().await else {
+        return;
+    };
+    let sink =
+        SftpSink::new(SftpSinkConfig::new(connection(port), UPLOAD_DIR)).expect("SftpSink::new");
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &sink,
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}

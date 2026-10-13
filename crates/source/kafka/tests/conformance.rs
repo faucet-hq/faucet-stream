@@ -254,3 +254,31 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
 }
+
+/// With a Schema Registry configured, the run's context and recorder are
+/// handed on as well, and a cancelled context still ends the poll loop.
+#[cfg(feature = "schema-registry")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_backed_source_takes_the_runs_context_and_recorder() {
+    use faucet_core::observability::{RoundtripRecorder, RoundtripSide};
+    use faucet_core::{Source, UsageMeter};
+    let mut cfg = source_config("127.0.0.1:1", "t", "g-sr-ctx", 100, 250);
+    cfg.value_format = serde_json::from_value(serde_json::json!({
+        "type": "confluent_avro",
+        "schema_registry": {"url": "http://127.0.0.1:1"}
+    }))
+    .expect("value format");
+    let source = KafkaSource::new(cfg).await.expect("source new");
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        RoundtripRecorder::new(RoundtripSide::Source, "p", "", "kafka")
+            .with_meter(std::sync::Arc::new(UsageMeter::new())),
+    ));
+    let token = faucet_core::CancellationToken::new();
+    token.cancel();
+    source.set_call_context(faucet_core::CallContext::new().with_cancel(token));
+    let err = tokio::time::timeout(Duration::from_secs(20), source.fetch_all())
+        .await
+        .expect("a cancelled context ends the read")
+        .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+}

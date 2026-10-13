@@ -267,6 +267,17 @@ pipeline:
         assert_eq!(t.rows[0].role, RowRole::TopologySink);
         assert!(t.rows[1].overwrite);
         assert_eq!(t.rows[1].sink_kind, "sqlite");
+        assert!(t.rows.iter().all(|r| !r.atomic_watermark));
+
+        // Exactly-once marks the nodes whose sink keeps a watermark.
+        let mut eo = cfg.clone();
+        eo.delivery = faucet_core::DeliveryMode::ExactlyOnce;
+        let t = PipelineTarget::resolve(&eo, "topo").unwrap();
+        assert!(!t.rows[0].atomic_watermark, "jsonl keeps no watermark");
+        assert_eq!(
+            t.rows[1].atomic_watermark,
+            crate::registry::sink_kind_capabilities("sqlite").idempotent_writes()
+        );
     }
 
     #[test]

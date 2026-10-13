@@ -206,3 +206,22 @@ async fn replay_real_via_command_writes_and_renders_human() {
     assert!(landed.contains("\"id\":1") || landed.contains("\"id\": 1"));
     assert!(landed.contains("\"id\":2") || landed.contains("\"id\": 2"));
 }
+
+/// A replay runs under the config's `resilience:` block (#871).
+#[tokio::test]
+async fn replay_runs_under_the_configs_resilience_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dlq_file(dir.path());
+    let out = dir.path().join("out.jsonl");
+    let cfg = write(
+        dir.path(),
+        "resilient.yaml",
+        &format!(
+            "version: 1\nname: replay\nresilience: {{ retry: {{ max_attempts: 2 }} }}\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            out.display()
+        ),
+    );
+    dlq::run(replay_args(cfg, &dlq, false, true)).await.unwrap();
+    let landed = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(landed.lines().count(), 2, "{landed}");
+}

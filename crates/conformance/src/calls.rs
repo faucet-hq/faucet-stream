@@ -116,6 +116,55 @@ where
     assert_cancel_like(&outcome, "sink write after cancel");
 }
 
+fn metered_recorder(
+    side: faucet_core::observability::RoundtripSide,
+    connector: &'static str,
+) -> (
+    std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    std::sync::Arc<faucet_core::UsageMeter>,
+) {
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    let recorder =
+        faucet_core::observability::RoundtripRecorder::new(side, "conformance", "", connector)
+            .with_meter(std::sync::Arc::clone(&meter));
+    (std::sync::Arc::new(recorder), meter)
+}
+
+/// Assert a recorder installed through [`Source::set_roundtrip_recorder`]
+/// counts the source's backend calls: `source` (pointed at a live backend) is
+/// drained and at least one source round trip must be tallied.
+pub async fn assert_source_records_roundtrips<S: Source>(source: &S) {
+    let (recorder, meter) = metered_recorder(
+        faucet_core::observability::RoundtripSide::Source,
+        source.connector_name(),
+    );
+    source.set_roundtrip_recorder(recorder);
+    drain(source)
+        .await
+        .expect("the source reads from its live backend");
+    let n = meter.snapshot().roundtrips(faucet_core::UsageSide::Source);
+    assert!(
+        n > 0,
+        "the installed recorder counted no source round trips"
+    );
+}
+
+/// Assert a recorder installed through [`Sink::set_roundtrip_recorder`]
+/// counts the sink's backend calls while `records` are written and flushed.
+pub async fn assert_sink_records_roundtrips<S: Sink>(sink: &S, records: &[Value]) {
+    let (recorder, meter) = metered_recorder(
+        faucet_core::observability::RoundtripSide::Sink,
+        sink.connector_name(),
+    );
+    sink.set_roundtrip_recorder(recorder);
+    sink.write_batch(records)
+        .await
+        .expect("the sink writes to its live backend");
+    sink.flush().await.expect("the sink flushes");
+    let n = meter.snapshot().roundtrips(faucet_core::UsageSide::Sink);
+    assert!(n > 0, "the installed recorder counted no sink round trips");
+}
+
 /// A deadline surfaces as a timeout; a connector may wrap it in its own error
 /// text, so the text is accepted too.
 fn assert_timeout_like(err: &FaucetError, what: &str) {
@@ -176,6 +225,104 @@ mod tests {
         fn set_call_context(&self, ctx: CallContext) {
             self.slot.install(ctx);
         }
+    }
+
+    /// A connector whose one backend call answers at once, counted through
+    /// the recorder it is handed.
+    #[derive(Default)]
+    struct Talks {
+        slot: faucet_core::CallSlot,
+        forward: bool,
+    }
+
+    impl Talks {
+        async fn call(&self) -> Result<(), FaucetError> {
+            self.slot.call("call", || async { Ok(()) }).await
+        }
+        fn install(&self, r: std::sync::Arc<faucet_core::observability::RoundtripRecorder>) {
+            if self.forward {
+                self.slot.install_recorder(r);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Source for Talks {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            self.call().await?;
+            Ok(vec![])
+        }
+        fn set_roundtrip_recorder(
+            &self,
+            r: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+        ) {
+            self.install(r);
+        }
+    }
+
+    #[async_trait]
+    impl Sink for Talks {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.call().await?;
+            Ok(records.len())
+        }
+        fn set_roundtrip_recorder(
+            &self,
+            r: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+        ) {
+            self.install(r);
+        }
+    }
+
+    /// A sink whose writes buffer and whose flush reaches the hung backend.
+    #[derive(Default)]
+    struct FlushHung(faucet_core::CallSlot);
+
+    #[async_trait]
+    impl Sink for FlushHung {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        async fn flush(&self) -> Result<(), FaucetError> {
+            self.0.call("flush", std::future::pending).await
+        }
+        fn set_call_context(&self, ctx: CallContext) {
+            self.0.install(ctx);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sink_hanging_in_flush_is_bounded_too() {
+        assert_sink_call_deadline(FlushHung::default, &[faucet_core::json!({"a": 1})]).await;
+    }
+
+    #[tokio::test]
+    async fn a_connector_counting_through_its_recorder_passes() {
+        let t = Talks {
+            forward: true,
+            ..Talks::default()
+        };
+        assert_source_records_roundtrips(&t).await;
+        let t = Talks {
+            forward: true,
+            ..Talks::default()
+        };
+        assert_sink_records_roundtrips(&t, &[faucet_core::json!({"a": 1})]).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "counted no source round trips")]
+    async fn a_source_dropping_its_recorder_fails() {
+        assert_source_records_roundtrips(&Talks::default()).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "counted no sink round trips")]
+    async fn a_sink_dropping_its_recorder_fails() {
+        assert_sink_records_roundtrips(&Talks::default(), &[]).await;
     }
 
     fn honouring() -> Hung {

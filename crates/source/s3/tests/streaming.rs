@@ -789,3 +789,48 @@ async fn markers_are_skipped_and_whole_objects_are_capped() {
     bad.endpoint_url = Some(endpoint.clone());
     assert!(S3Source::new(bad).await.is_err());
 }
+
+/// An object deleted between the listing and its read fails the stream with
+/// the key, rather than being skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_object_deleted_after_the_listing_fails_with_its_key() {
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(
+        &endpoint,
+        &[
+            ("a.jsonl".to_string(), jsonl_body(1, 3)),
+            ("b.jsonl".to_string(), jsonl_body(4, 6)),
+        ],
+    )
+    .await;
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1)
+            .concurrency(1),
+    )
+    .await;
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1);
+    let first = pages.next().await.expect("a page").expect("a.jsonl reads");
+    assert_eq!(first.records.len(), 1);
+    build_admin_client(&endpoint)
+        .await
+        .delete_object()
+        .bucket(TEST_BUCKET)
+        .key("b.jsonl")
+        .send()
+        .await
+        .expect("delete");
+    let mut err = None;
+    while let Some(page) = pages.next().await {
+        if let Err(e) = page {
+            err = Some(e);
+            break;
+        }
+    }
+    let err = err
+        .expect("the deleted object fails the stream")
+        .to_string();
+    assert!(err.contains("b.jsonl"), "{err}");
+}

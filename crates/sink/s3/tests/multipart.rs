@@ -277,3 +277,31 @@ async fn an_overwrite_commit_replaces_the_previous_objects() {
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1, 2, 3, 4]);
 }
+
+/// A run cancelled before the upload starts ends the multipart upload with
+/// the cancellation rather than starting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_run_does_not_start_a_multipart_upload() {
+    let (_c, endpoint) = start_minio().await;
+    seed(&endpoint).await;
+    let sink = build_sink(
+        &endpoint,
+        S3SinkConfig::new(TEST_BUCKET)
+            .prefix("cut/")
+            .file_extension(".jsonl")
+            .with_batch_size(0),
+    )
+    .await;
+    let token = faucet_core::CancellationToken::new();
+    sink.set_call_context(faucet_core::CallContext::new().with_cancel(token.clone()));
+    let page: Vec<Value> = (0..RECORDS).map(wide_record).collect();
+    let outcome = match sink.write_batch(&page).await {
+        Ok(_) => {
+            token.cancel();
+            sink.flush().await
+        }
+        Err(e) => Err(e),
+    };
+    let err = outcome.expect_err("a cancelled run fails").to_string();
+    assert!(err.contains("cancelled"), "{err}");
+}

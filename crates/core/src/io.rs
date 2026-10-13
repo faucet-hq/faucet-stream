@@ -717,6 +717,27 @@ mod tests {
         assert_eq!(meter.snapshot().source_roundtrips["query"], 2);
     }
 
+    /// A call whose deadline has already passed is refused before it starts.
+    #[tokio::test]
+    async fn a_spent_deadline_refuses_the_call_without_running_it() {
+        let ctx = CallContext::new().with_deadline(Instant::now() - Duration::from_millis(1));
+        let ran = AtomicU32::new(0);
+        let r: Result<(), _> = ctx
+            .call("read", || async {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        match r {
+            Err(FaucetError::Timeout { operation, after }) => {
+                assert_eq!(operation, "read call (deadline)");
+                assert_eq!(after, Duration::ZERO);
+            }
+            other => panic!("expected a deadline timeout, got {other:?}"),
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn call_once_ends_at_the_deadline_and_on_cancel() {
         let ctx = CallContext::new().with_deadline(Instant::now() + Duration::from_millis(20));

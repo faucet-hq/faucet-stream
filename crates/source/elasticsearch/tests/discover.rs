@@ -235,3 +235,37 @@ async fn an_index_with_an_unreadable_mapping_is_skipped_not_fatal() {
     let names: Vec<&str> = datasets.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, vec!["logs"]);
 }
+
+/// A cluster that cannot be reached, or a catalog that is not JSON, fails
+/// discovery with a typed source error.
+#[tokio::test(flavor = "multi_thread")]
+async fn discover_surfaces_transport_and_body_failures() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gone = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let err = ElasticsearchSource::new(ElasticsearchSourceConfig::new(gone, "orders"))
+        .unwrap()
+        .discover()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("catalog discovery failed"),
+        "{err}"
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/_cat/indices"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+    let err = ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "orders"))
+        .unwrap()
+        .discover()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("catalog discovery failed"),
+        "{err}"
+    );
+}

@@ -245,3 +245,21 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_sink_call_deadline(make, &[serde_json::json!({"a": 1})])
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    let queue_url = create_queue(&client, "recorded").await;
+    let mut cfg = SqsSinkConfig::new(&queue_url);
+    cfg.region = Some("us-east-1".into());
+    cfg.endpoint_url = Some(endpoint.clone());
+    cfg.credentials = test_credentials();
+    let sink = SqsSink::new(cfg).await.expect("sink");
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &sink,
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+    assert_eq!(count_messages(&client, &queue_url).await, 1);
+}

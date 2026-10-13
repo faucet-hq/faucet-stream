@@ -268,9 +268,6 @@ mod tests {
         ) -> Result<usize, faucet_core::FaucetError> {
             Ok(records.len())
         }
-        async fn flush(&self) -> Result<(), faucet_core::FaucetError> {
-            Ok(())
-        }
     }
 
     /// A run that spent its whole record ceiling leaves its follow-up nothing:

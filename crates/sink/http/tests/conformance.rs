@@ -115,3 +115,18 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn conformance_roundtrips_recorded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let sink = HttpSink::new(HttpSinkConfig::new(format!("{}/ingest", server.uri())));
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &sink,
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}

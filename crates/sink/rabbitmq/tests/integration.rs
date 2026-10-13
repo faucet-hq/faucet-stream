@@ -130,3 +130,14 @@ async fn unroutable_messages_fail_by_default() {
         "{outcomes:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publishes_are_counted_on_the_installed_recorder() {
+    let broker = start_broker().await;
+    declare_queue(&broker.url, "rt").await;
+    let sink = RabbitMqSink::new(sink_cfg(&broker.url, "rt"))
+        .await
+        .unwrap();
+    faucet_conformance::calls::assert_sink_records_roundtrips(&sink, &[json!({"a": 1})]).await;
+    assert_eq!(wait_ready(&broker.url, "rt", 1).await, 1);
+}

@@ -66,3 +66,38 @@ async fn a_corrupt_body_fails_to_decode() {
     let err = avro::decode(&client, &bytes).await.unwrap_err();
     assert!(err.to_string().contains("avro decode"), "{err}");
 }
+
+/// A refused or unreadable registration surfaces the registry's answer, and
+/// each registry request is counted on the installed recorder.
+#[tokio::test]
+async fn a_failed_registration_is_a_typed_error_and_requests_are_counted() {
+    use faucet_core::observability::{RoundtripRecorder, RoundtripSide};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/subjects/refused-value/versions"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("incompatible"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/subjects/garbled-value/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+    let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    client.set_roundtrip_recorder(std::sync::Arc::new(
+        RoundtripRecorder::new(RoundtripSide::Sink, "p", "", "kafka")
+            .with_meter(std::sync::Arc::clone(&meter)),
+    ));
+    let err = avro::encode(&client, "refused-value", SCHEMA, &json!({"id": 1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("409") && err.contains("incompatible"), "{err}");
+    let err = avro::encode(&client, "garbled-value", SCHEMA, &json!({"id": 1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("register JSON decode"), "{err}");
+    assert!(meter.snapshot().roundtrips(faucet_core::UsageSide::Sink) >= 2);
+}

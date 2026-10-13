@@ -132,3 +132,39 @@ async fn conformance_call_deadline() {
     };
     faucet_conformance::calls::assert_source_call_deadline(make).await;
 }
+
+/// The installed recorder counts scan calls; a streams read whose call
+/// context runs out stops with the timeout instead of waiting out its idle
+/// window.
+#[tokio::test(flavor = "multi_thread")]
+async fn roundtrips_are_recorded_and_a_spent_context_ends_a_streams_read() {
+    let Some((_c, endpoint, client)) = start().await else {
+        return;
+    };
+    create_table(&client, "rec", ScalarAttributeType::N, false, true).await;
+    put_items(
+        &client,
+        "rec",
+        (0..3).map(|i| item(vec![("pk", n(i))])).collect(),
+    )
+    .await;
+    let source = DynamoDbSource::new(config(&endpoint, "rec")).await.unwrap();
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+
+    let mut cfg = config(&endpoint, "rec");
+    cfg.mode = ReadMode::Streams;
+    cfg.idle_termination_secs = Some(120);
+    let streams = DynamoDbSource::new(cfg).await.unwrap();
+    streams.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
+    );
+    let started = std::time::Instant::now();
+    let err = streams.fetch_all().await.unwrap_err();
+    assert!(
+        matches!(err, faucet_core::FaucetError::Timeout { .. })
+            || err.to_string().contains("timed out"),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}

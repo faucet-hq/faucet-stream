@@ -579,6 +579,31 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// A rate-limit wait outside the attempt budget is counted as a retry and
+    /// ends with the rate limit when the run is cancelled mid-wait.
+    #[tokio::test]
+    async fn a_cancel_during_a_budgeted_rate_limit_wait_ends_the_call() {
+        let rec = recorder();
+        let token = CancellationToken::new();
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            t.cancel();
+        });
+        let started = std::time::Instant::now();
+        let r = run_call(
+            &fast_policy(1),
+            Some(&token),
+            Some(&rec),
+            Some(5),
+            || async { Err::<i32, _>(FaucetError::RateLimited(Duration::from_secs(30))) },
+        )
+        .await;
+        assert!(matches!(r, Err(FaucetError::RateLimited(_))), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(rec.throttle_tally().throttled(), 1);
+    }
+
     #[tokio::test]
     async fn recorded_runner_counts_a_final_rate_limit_it_does_not_retry() {
         let rec = recorder();
