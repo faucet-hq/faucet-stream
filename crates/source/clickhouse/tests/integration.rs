@@ -347,3 +347,25 @@ async fn datetimes_carry_their_zone_and_denormals_survive() {
     assert_eq!(ids, vec![2, 3]);
     assert_eq!(bookmark, Some(json!("2024-01-03T04:30:00Z")));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_are_metered_on_the_installed_recorder() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    let source =
+        ClickHouseSource::new(ClickHouseSourceConfig::new(&base, "SELECT 1 AS n")).expect("source");
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "clickhouse",
+        )
+        .with_meter(meter.clone()),
+    ));
+    let rows = source.fetch_all().await.expect("fetch_all");
+    assert_eq!(rows.len(), 1);
+    let trips = meter.snapshot().source_roundtrips;
+    assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
+}

@@ -314,6 +314,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn both_client_builders_succeed() {
+        let conn = ClickHouseConnection::from_url("http://localhost:8123/");
+        assert!(build_client(&conn).is_ok());
+        assert!(http_client(&conn).is_ok());
+    }
+
+    #[test]
     fn base_url_from_url_trims_trailing_slash() {
         let conn = ClickHouseConnection::from_url("http://localhost:8123/");
         assert_eq!(conn.base_url().unwrap(), "http://localhost:8123");

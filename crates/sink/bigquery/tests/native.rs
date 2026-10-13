@@ -730,3 +730,86 @@ async fn load_native_uses_the_explicit_schema_and_honours_create_table_false() {
         "{body}"
     );
 }
+
+/// An HTTP server that reads each request whole, then answers a `200` that
+/// announces 64 body bytes, sends three and closes the connection.
+async fn truncating_server() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..h]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nabc")
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A truncating native CSV load whose media upload goes to `upload_base`.
+async fn csv_overwrite_against(upload_base: String) -> faucet_core::FaucetError {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
+    let mut config = native_config(&server);
+    config.upload_base_url = Some(upload_base);
+    let (sink, _sa) = build_sink(&server, config).await;
+    let mut batch =
+        NativeBatch::bytes(NativeFormat::Csv, b"Col1,Col2\n1,2\n".to_vec()).with_records(Some(1));
+    batch.csv.has_header = true;
+    sink.load_native(
+        batch,
+        "p::row",
+        NativeLoadContext {
+            write_mode: WriteMode::Overwrite,
+            first_batch: true,
+        },
+    )
+    .await
+    .expect_err("the media upload fails")
+}
+
+#[tokio::test]
+async fn a_media_upload_that_cannot_connect_fails_the_load() {
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", dead.local_addr().unwrap());
+    drop(dead);
+    let err = csv_overwrite_against(base).await;
+    assert!(
+        err.to_string().contains("media load upload failed"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_media_upload_response_cut_short_fails_the_load() {
+    let err = csv_overwrite_against(truncating_server().await).await;
+    assert!(
+        err.to_string().contains("media load: read response"),
+        "{err}"
+    );
+}

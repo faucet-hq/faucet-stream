@@ -363,6 +363,49 @@ async fn current_schema_reports_table_columns() {
     assert_eq!(props["active"]["type"], json!(["boolean", "null"]));
 }
 
+/// `check` reaches the catalog through the call context, and catalog calls
+/// are metered on the installed recorder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_probes_the_catalog_and_calls_are_metered() {
+    use faucet_core::check::{CheckContext, ProbeStatus};
+    let dir = TempDir::new().expect("tempdir");
+    let sink = IcebergSink::new(sink_config(&dir, "probed"))
+        .await
+        .expect("IcebergSink::new");
+    let meter = Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "iceberg",
+        )
+        .with_meter(meter.clone()),
+    ));
+    let report = sink.check(&CheckContext::default()).await.expect("check");
+    let catalog = report
+        .probes
+        .iter()
+        .find(|p| p.name == "catalog")
+        .expect("catalog probe");
+    assert!(matches!(catalog.status, ProbeStatus::Pass), "{report:?}");
+    assert!(meter.snapshot().sink_roundtrips.values().sum::<u64>() >= 1);
+
+    sink.set_call_context(
+        faucet_core::CallContext::new().with_deadline(tokio::time::Instant::now()),
+    );
+    let report = sink.check(&CheckContext::default()).await.expect("check");
+    let catalog = report
+        .probes
+        .iter()
+        .find(|p| p.name == "catalog")
+        .expect("catalog probe");
+    assert!(
+        matches!(catalog.status, ProbeStatus::Fail { .. }),
+        "{report:?}"
+    );
+}
+
 /// #255: additive schema evolution — `evolve_schema` adds a new optional column
 /// to an existing table via iceberg-rust 0.10.0's `update_schema` action, and
 /// rejects (non-applicable) widenings.
