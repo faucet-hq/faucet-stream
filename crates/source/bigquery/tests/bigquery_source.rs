@@ -994,10 +994,10 @@ async fn storage_read_connect_honours_the_call_deadline() {
         .next()
         .await
         .expect("the stream yields its failure");
-    let err = first.err().expect("the connect is cut off");
     assert!(
-        matches!(err, faucet_core::FaucetError::Timeout { .. }),
-        "{err:?}"
+        matches!(first, Err(faucet_core::FaucetError::Timeout { .. })),
+        "the connect is cut off: {:?}",
+        first.err()
     );
 }
 

@@ -619,9 +619,10 @@ async fn a_blocked_add_column_times_out() {
         .expect("lock");
     // The sink sets no per-attempt timeout of its own, so the run's deadline
     // is what bounds the statement.
-    sink.set_call_context(faucet_core::CallContext::new().with_deadline(
-        tokio::time::Instant::now() + std::time::Duration::from_millis(1500),
-    ));
+    sink.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(1500)),
+    );
     let err = sink
         .write_batch(&[json!({"id": 2, "extra": "x"})])
         .await
