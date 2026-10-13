@@ -10,6 +10,7 @@ fn capabilities(_config: &Value) -> Capabilities {
         .exactly_once(true)
         .shardable(true)
         .reports_lag(true)
+        .read_side_effects(true)
         .build()
 }
 
@@ -27,6 +28,7 @@ mod tests {
         ] {
             let caps = DESCRIPTOR.capabilities(&c);
             assert!(caps.exactly_once() && caps.shardable() && caps.reports_lag());
+            assert!(caps.read_side_effects() && !caps.table_routing());
             assert!(!caps.discover() && !caps.columnar() && !caps.native());
             assert!(!caps.range_read() && !caps.range_digest());
         }

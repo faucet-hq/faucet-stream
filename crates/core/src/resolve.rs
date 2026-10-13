@@ -779,10 +779,63 @@ pub fn declares(schema: &Value, kind: ResourceKind) -> bool {
     annotated_fields(schema).iter().any(|(_, k)| *k == kind)
 }
 
+/// The JSON Schema keyword (value `true`) on a top-level boolean config field
+/// that, set to `true`, confines a connector whose own input can otherwise
+/// reach host files or the network — a SQL query that can `ATTACH` or
+/// `read_csv` — to the resources its configuration declares. A host loading a
+/// config it does not trust forces every such field on:
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-sandbox" = true))]
+/// pub sandbox: bool,
+/// ```
+pub const SANDBOX_ANNOTATION: &str = "x-faucet-sandbox";
+
+/// The top-level config fields `schema` marks with [`SANDBOX_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn sandbox_fields(schema: &Value) -> Vec<String> {
+    let mut alts = Vec::new();
+    alternatives(schema, schema, &mut alts, 0);
+    let mut out = BTreeSet::new();
+    for alt in alts {
+        let Some(Value::Object(props)) = alt.get("properties") else {
+            continue;
+        };
+        for (name, field) in props {
+            let mut field_alts = Vec::new();
+            alternatives(schema, field, &mut field_alts, 0);
+            if field_alts
+                .iter()
+                .any(|n| n.get(SANDBOX_ANNOTATION) == Some(&Value::Bool(true)))
+            {
+                out.insert(name.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sandbox_fields_are_read_from_the_root_and_its_branches() {
+        assert!(sandbox_fields(&schema()).is_empty());
+        let s = json!({
+            "type": "object",
+            "properties": {
+                "sandbox": {"type": "boolean", "x-faucet-sandbox": true},
+                "confine": {"$ref": "#/$defs/Flag"},
+                "off": {"type": "boolean", "x-faucet-sandbox": false},
+                "query": {"type": "string"}
+            },
+            "allOf": [{"properties": {"lock": {"anyOf": [{"type": "boolean", "x-faucet-sandbox": true}]}}}],
+            "$defs": {"Flag": {"type": "boolean", "x-faucet-sandbox": true}}
+        });
+        assert_eq!(sandbox_fields(&s), vec!["confine", "lock", "sandbox"]);
+    }
 
     fn schema() -> Value {
         json!({

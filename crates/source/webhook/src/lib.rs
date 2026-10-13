@@ -15,4 +15,11 @@ pub use stream::WebhookSource;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("webhook", faucet_core::capabilities::plain_source);
+    faucet_core::ConnectorDescriptor::new("webhook", capabilities);
+
+/// Reading opens a listener: a side effect a read-only preview must not cause.
+fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+    faucet_core::Capabilities::builder()
+        .read_side_effects(true)
+        .build()
+}

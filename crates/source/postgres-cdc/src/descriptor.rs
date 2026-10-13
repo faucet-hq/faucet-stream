@@ -9,6 +9,8 @@ fn capabilities(_config: &Value) -> Capabilities {
     Capabilities::builder()
         .exactly_once(true)
         .reports_lag(true)
+        .table_routing(true)
+        .read_side_effects(true)
         .build()
 }
 
@@ -22,6 +24,7 @@ mod tests {
         for cfg in [Value::Null, json!({}), json!({"slot_name": "s"})] {
             let c = DESCRIPTOR.capabilities(&cfg);
             assert!(c.exactly_once() && c.reports_lag());
+            assert!(c.table_routing() && c.read_side_effects());
             assert!(!c.discover() && !c.shardable() && !c.range_read() && !c.range_digest());
         }
         assert_eq!(DESCRIPTOR.kind(), "postgres-cdc");

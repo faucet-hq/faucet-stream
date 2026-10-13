@@ -269,6 +269,8 @@ impl Source for MssqlCdcSource {
         faucet_core::Capabilities::of_source(self)
             .to_builder()
             .reports_lag(true)
+            .table_routing(true)
+            .read_side_effects(true)
             .build()
     }
 

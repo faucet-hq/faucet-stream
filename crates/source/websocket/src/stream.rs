@@ -549,6 +549,13 @@ impl Source for WebsocketSource {
         serde_json::to_value(&schema).unwrap_or(Value::Null)
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .read_side_effects(true)
+            .build()
+    }
+
     fn connector_name(&self) -> &'static str {
         "websocket"
     }

@@ -8,17 +8,6 @@ use faucet_core::DatasetDescriptor;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// CDC source kinds that can drive a multi-table mirror (each implements
-/// `Source::record_table`). `dynamodb` qualifies in `mode: streams`.
-pub const MULTI_TABLE_CDC_KINDS: &[&str] = &[
-    "postgres-cdc",
-    "mysql-cdc",
-    "mongodb-cdc",
-    "mssql-cdc",
-    "oracle-cdc",
-    "dynamodb",
-];
-
 /// Everything needed to mirror one table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TablePlan {

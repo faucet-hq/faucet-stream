@@ -307,7 +307,9 @@ fn capabilities(cfg: &Value) -> Capabilities {
   that config returns. The trait method is defaulted and derives every field
   from the per-capability methods above, so most connectors only write the
   descriptor. Override `capabilities()` for what no method expresses —
-  `range_read` / `range_digest` / `reports_lag` on a source,
+  `range_read` / `range_digest` / `reports_lag` / `table_routing` (your
+  source implements `record_table`) / `read_side_effects` (reading creates a
+  slot, joins a consumer group or opens a listener) on a source,
   `scoped_overwrite` / `schema_report` on a sink — starting from
   `Capabilities::of_source(self)` / `of_sink(self)`.
 - Called with `Value::Null`, it returns the kind-level view: every capability

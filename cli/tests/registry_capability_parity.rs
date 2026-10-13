@@ -361,6 +361,8 @@ fn kind_capabilities_cover_every_config() {
             ("reports_lag", c.reports_lag()),
             ("columnar", c.columnar()),
             ("native", c.native()),
+            ("table_routing", c.table_routing()),
+            ("read_side_effects", c.read_side_effects()),
         ]
     }
     let check = |kind: &str,

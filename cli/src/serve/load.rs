@@ -37,19 +37,68 @@ impl BodyOrigin {
     }
 }
 
-/// Source kinds whose query can reach host files; `faucet serve` sandboxes them.
-pub const SANDBOXED_SOURCE_KINDS: &[&str] = &["duckdb", "sqlite"];
-/// Sink kinds `faucet serve` sandboxes.
-pub const SANDBOXED_SINK_KINDS: &[&str] = &["duckdb"];
+/// The sandbox switches (fields annotated `x-faucet-sandbox`, see
+/// [`faucet_core::resolve::sandbox_fields`]) a connector's config schema
+/// declares — empty for a connector that has none or an unknown kind. Read
+/// from the same schema `faucet schema` prints, so a plugin connector that
+/// declares one is confined like a built-in.
+pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
+    type Cache = std::sync::RwLock<std::collections::HashMap<(bool, String), std::sync::Arc<[String]>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (is_source, kind.to_string());
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+    let schema = if is_source {
+        crate::registry::source_schema(kind)
+    } else {
+        crate::registry::sink_schema(kind)
+    };
+    let Ok(schema) = schema else {
+        return std::sync::Arc::from(Vec::new());
+    };
+    let fields: std::sync::Arc<[String]> = faucet_core::resolve::sandbox_fields(&schema).into();
+    if let Ok(mut c) = cache.write() {
+        c.insert(key, std::sync::Arc::clone(&fields));
+    }
+    fields
+}
 
-fn force_sandbox(config: &mut Value) {
+/// Whether `faucet serve` confines a source of this kind.
+pub fn source_is_sandboxed(kind: &str) -> bool {
+    !sandbox_fields(true, kind).is_empty()
+}
+
+/// Whether `faucet serve` confines a sink of this kind.
+pub fn sink_is_sandboxed(kind: &str) -> bool {
+    !sandbox_fields(false, kind).is_empty()
+}
+
+fn force_fields(config: &mut Value, fields: &[String]) {
     if let Value::Object(map) = config {
-        map.insert("sandbox".into(), Value::Bool(true));
+        for f in fields {
+            map.insert(f.clone(), Value::Bool(true));
+        }
     }
 }
 
-fn force_sandbox_override(config: &mut Option<Value>) {
-    force_sandbox(config.get_or_insert_with(|| Value::Object(Default::default())));
+fn force_source(config: &mut Value, kind: &str) {
+    force_fields(config, &sandbox_fields(true, kind));
+}
+
+fn force_sink(config: &mut Value, kind: &str) {
+    force_fields(config, &sandbox_fields(false, kind));
+}
+
+fn force_override(config: &mut Option<Value>, is_source: bool, kind: &str) {
+    let fields = sandbox_fields(is_source, kind);
+    if !fields.is_empty() {
+        force_fields(
+            config.get_or_insert_with(|| Value::Object(Default::default())),
+            &fields,
+        );
+    }
 }
 
 fn template_kind<'a>(
@@ -74,23 +123,15 @@ fn template_kind<'a>(
 /// snapshot, partition bound probes, `verify.destination` and DLQ sinks are
 /// all covered; a submitted `sandbox: false` is overwritten.
 pub fn confine_sql(cfg: &mut PipelineConfig) {
-    let source_kind = |k: &str| SANDBOXED_SOURCE_KINDS.contains(&k);
-    let sink_kind = |k: &str| SANDBOXED_SINK_KINDS.contains(&k);
     let p = &mut cfg.pipeline;
     for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
-        if source_kind(&spec.kind) {
-            force_sandbox(&mut spec.config);
-        }
+        force_source(&mut spec.config, &spec.kind);
     }
     for spec in p.sink.iter_mut().chain(p.sinks.values_mut()) {
-        if sink_kind(&spec.kind) {
-            force_sandbox(&mut spec.config);
-        }
+        force_sink(&mut spec.config, &spec.kind);
     }
-    if let Some(d) = p.dlq.as_mut()
-        && sink_kind(&d.sink.kind)
-    {
-        force_sandbox(&mut d.sink.config);
+    if let Some(d) = p.dlq.as_mut() {
+        force_sink(&mut d.sink.config, &d.sink.kind);
     }
     let (sources, source, sinks, sink) = (&p.sources, &p.source, &p.sinks, &p.sink);
     for node in p.nodes.values_mut() {
@@ -100,11 +141,11 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                 kind,
                 config,
             } => {
-                let k = kind
+                if let Some(k) = kind
                     .as_deref()
-                    .or_else(|| template_kind(sources, source, template.as_deref()));
-                if k.is_some_and(source_kind) {
-                    force_sandbox_override(config);
+                    .or_else(|| template_kind(sources, source, template.as_deref()))
+                {
+                    force_override(config, true, k);
                 }
             }
             crate::config::NodeSpec::Sink {
@@ -112,11 +153,11 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                 kind,
                 config,
             } => {
-                let k = kind
+                if let Some(k) = kind
                     .as_deref()
-                    .or_else(|| template_kind(sinks, sink, template.as_deref()));
-                if k.is_some_and(sink_kind) {
-                    force_sandbox_override(config);
+                    .or_else(|| template_kind(sinks, sink, template.as_deref()))
+                {
+                    force_override(config, false, k);
                 }
             }
             _ => {}
@@ -135,30 +176,20 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         ];
         for (over, templates, legacy, is_source) in rows {
             let Some(over) = over else { continue };
-            let k = over
+            if let Some(k) = over
                 .kind
                 .as_deref()
-                .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()));
-            if k.is_some_and(|k| {
-                if is_source {
-                    source_kind(k)
-                } else {
-                    sink_kind(k)
-                }
-            }) {
-                force_sandbox_override(&mut over.config);
+                .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()))
+            {
+                force_override(&mut over.config, is_source, k);
             }
         }
-        if let Some(Some(d)) = row.dlq.as_mut()
-            && sink_kind(&d.sink.kind)
-        {
-            force_sandbox(&mut d.sink.config);
+        if let Some(Some(d)) = row.dlq.as_mut() {
+            force_sink(&mut d.sink.config, &d.sink.kind);
         }
     }
-    if let Some(r) = cfg.replication.as_mut()
-        && source_kind(&r.snapshot.source.kind)
-    {
-        force_sandbox(&mut r.snapshot.source.config);
+    if let Some(r) = cfg.replication.as_mut() {
+        force_source(&mut r.snapshot.source.config, &r.snapshot.source.kind);
     }
     let probes = cfg
         .partition
@@ -166,36 +197,23 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         .chain(cfg.matrix.iter_mut().filter_map(|r| r.partition.as_mut()))
         .filter_map(crate::partition::PartitionSpec::probe_mut);
     for probe in probes {
-        if source_kind(&probe.from_source.kind) {
-            force_sandbox(&mut probe.from_source.config);
-        }
+        force_source(&mut probe.from_source.config, &probe.from_source.kind);
     }
-    if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut())
-        && source_kind(&dest.kind)
-    {
-        force_sandbox(&mut dest.config);
+    if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut()) {
+        force_source(&mut dest.config, &dest.kind);
     }
 }
 
 /// [`confine_sql`] over expanded rows: the merged configs each row builds.
 pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     for n in nodes {
-        if SANDBOXED_SOURCE_KINDS.contains(&n.source.kind.as_str()) {
-            force_sandbox(&mut n.source.config);
-        }
-        if SANDBOXED_SINK_KINDS.contains(&n.sink.kind.as_str()) {
-            force_sandbox(&mut n.sink.config);
-        }
-        if let Some(d) = n.dlq.as_mut()
-            && SANDBOXED_SINK_KINDS.contains(&d.sink.kind.as_str())
-        {
-            force_sandbox(&mut d.sink.config);
+        force_source(&mut n.source.config, &n.source.kind);
+        force_sink(&mut n.sink.config, &n.sink.kind);
+        if let Some(d) = n.dlq.as_mut() {
+            force_sink(&mut d.sink.config, &d.sink.kind);
         }
     }
 }
-
-/// Connector kinds that spawn a program named in their config.
-pub const SUBPROCESS_CONNECTOR_KINDS: &[&str] = &["singer"];
 
 /// Environment variables `faucet serve` reads its own credentials from. A
 /// loaded config can never resolve them through `${env:}` / `${secret:}`.
@@ -949,14 +967,14 @@ pub fn refuse_server_paths_with(
     Ok(())
 }
 
-/// The subprocess connector kinds `doc` names anywhere as a `type:`.
+/// The connector kinds `doc` names anywhere as a `type:` whose schema declares
+/// a `command` field (`x-faucet-resource: command`): they run a program.
 pub fn subprocess_kinds_in(doc: &Value) -> std::collections::BTreeSet<String> {
     fn walk(v: &Value, out: &mut std::collections::BTreeSet<String>) {
         match v {
             Value::Object(map) => {
                 if let Some(Value::String(t)) = map.get("type")
-                    && (SUBPROCESS_CONNECTOR_KINDS.contains(&t.as_str())
-                        || crate::serve::references::runs_program(t))
+                    && crate::serve::references::runs_program(t)
                 {
                     out.insert(t.clone());
                 }
@@ -1508,6 +1526,29 @@ pub async fn load_submission_with(
 mod tests {
     use super::*;
 
+    /// The sandbox switches come from the connector's schema (#876).
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[test]
+    fn sandboxed_kinds_are_read_from_the_schema() {
+        assert_eq!(&*sandbox_fields(true, "sqlite"), &["sandbox".to_string()]);
+        assert!(source_is_sandboxed("sqlite"));
+        assert!(!sink_is_sandboxed("sqlite"), "the sqlite sink runs no caller SQL");
+        assert!(!source_is_sandboxed("no-such-kind"));
+        let mut cfg = json!({});
+        force_override_value(&mut cfg);
+        assert!(cfg.as_object().unwrap().is_empty());
+    }
+
+    fn force_override_value(cfg: &mut Value) {
+        let mut opt = Some(cfg.clone());
+        force_override(&mut opt, true, "no-such-kind");
+        *cfg = opt.unwrap();
+        let mut none = None;
+        force_override(&mut none, true, "no-such-kind");
+        assert!(none.is_none(), "an unconfined kind gets no override block");
+    }
+
+    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
     #[test]
     fn every_sql_connector_position_is_sandboxed() {
         let doc = json!({
@@ -1581,6 +1622,7 @@ mod tests {
         assert!(on(&b.dlq.as_ref().unwrap().sink.config));
     }
 
+    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
     #[test]
     fn topology_nodes_fan_out_sources_and_the_mirror_snapshot_are_sandboxed() {
         let topo = json!({
@@ -1655,6 +1697,7 @@ mod tests {
         assert!(!BodyOrigin::ServerFile.confines_sql());
     }
 
+    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
     #[tokio::test]
     async fn a_loaded_submission_is_sandboxed_unless_it_came_from_a_server_file() {
         let body = json!({
@@ -2082,6 +2125,7 @@ schedule:
         assert!(refuse_server_paths(&fine, &[], caller).is_ok());
     }
 
+    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
     #[test]
     fn bound_probes_and_the_verify_destination_are_sandboxed() {
         let mut cfg = cfg_of(
@@ -2193,6 +2237,7 @@ schedule:
         assert!(matches!(resolution_error(absent), ServeError::BadConfig(_)));
     }
 
+    #[cfg(any(feature = "source-singer", feature = "sink-singer"))]
     #[test]
     fn subprocess_kinds_are_found_anywhere() {
         let doc = json!({
