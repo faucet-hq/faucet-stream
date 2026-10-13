@@ -282,12 +282,46 @@ last confirmed point.
 
 ## State keys
 
-Each invocation has a state key so concurrent matrix rows don't collide:
-`{name}::{row_id}` for roots and `{name}::{row_id}::{parent_record_key}` for DAG
-children. The CDC source uses `postgres-cdc:<slot>`. Because the key is built
-from the pipeline `name` and the row `id`, renaming either starts the row from
-an empty bookmark; read the old one with `faucet state show` and set it on the
-new row with `faucet state set`.
+Each invocation has a state key so concurrent matrix rows don't collide. Every
+key is built from its components by `faucet_core::StateKey` and rendered one
+way:
+
+| Key | Holds |
+|---|---|
+| `{name}::{row_id}` | a root row's bookmark |
+| `{name}::{row_id}::{parent_key}` | a DAG child's bookmark, one per parent record |
+| `{name}::{row_id}::{alias:value/…}` | one product / chained-discovery tuple |
+| `{name}::{row_id}::{shard_id}` | one shard of a sharded run |
+| `{tenant}::{name}::{row_id}` | a tenant run's bookmark (`faucet serve`) |
+| `{name}::backfill::{range_hash}::{unit}` | one backfill unit's bookmark |
+| `{name}::cdc`, `{name}::{table_id}` | a mirror's CDC / per-table bookmark |
+| `{key}::__sla__`, `::__profiling__`, `::__status__`, `::__lease__`, `::__rollback__[::{run}]` | an invocation's markers |
+| `{name}::__replication__`, `::__backfill__::{hash}`, `::__serve_backfill__::{hash}` | pipeline-level markers |
+
+A parent-key value made only of key characters (letters, digits, `_ - . : /`,
+up to 64 of them) is used as is; anything else becomes a readable prefix plus a
+stable hash, so an email or a value containing `::` cannot split the key. Source
+connectors keep their own natural keys (the CDC source uses
+`postgres-cdc:<slot>`).
+
+### Key migration
+
+The rendering is versioned (`faucet_core::KEY_SCHEME_VERSION`). When a release
+changes how a key is rendered, the old rendering stays known: at the start of
+every run with a durable state store, if the invocation's key holds nothing, the
+executor looks under the keys earlier schemes produced for it — and under the
+ids a row declares in `legacy_state_ids` — and moves the first value it finds to
+the current key. The move claims the new key only if it is still empty, so a
+concurrent run's fresh bookmark is never overwritten, and then deletes the old
+key; each move is logged and counted in
+`faucet_state_key_migrations_total{outcome}` (`moved`, or `raced` when another
+writer got there first). So an upgrade never turns a resumable row into a first
+run.
+
+Renaming the pipeline `name` or a row `id` is a change you make, not a scheme
+change: declare the old row id under the row's `legacy_state_ids` and the first
+run moves its bookmark, or read the old one with `faucet state show` and set it
+on the new row with `faucet state set`.
 
 To inspect, move, reset, back up or migrate these keys — and to see each row's
 health at a glance — use `faucet state` and `faucet status`; see

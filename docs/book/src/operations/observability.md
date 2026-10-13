@@ -68,7 +68,9 @@ cardinality and never a Prometheus label.
   `faucet_transform_duration_seconds`.
 - **State:** `faucet_state_{get,put,delete}_total` (get carries
   `outcome=hit|miss`), `faucet_state_errors_total{op,kind}`, plus duration
-  histograms.
+  histograms; `faucet_state_key_migrations_total{outcome=moved|raced}` counts
+  bookmarks moved from a key an earlier release rendered (see
+  [State keys](../cookbook/state.md#key-migration)).
 - **Pipeline:** `faucet_pipeline_runs_total{status=ok|err,kind}`,
   `faucet_pipeline_run_duration_seconds`, `faucet_pipeline_in_flight`,
   `faucet_pipeline_seconds_since_last_bookmark`,

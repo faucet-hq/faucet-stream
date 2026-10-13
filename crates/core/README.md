@@ -285,6 +285,25 @@ let result = Pipeline::new(&source, &sink)
 
 State keys are validated via `state::validate_state_key`.
 
+Runtimes that drive many pipelines build their keys with `StateKey` (#882): a
+typed key from its components (tenant, pipeline, row, parent key, shard, a
+`KeySuffix` marker) with one rendering,
+`[{tenant}::]{pipeline}::{row}[::{sub}][::{shard}][::{suffix}]`. The rendering
+is versioned by `KEY_SCHEME_VERSION`; `StateKey::legacy_renderings()` lists the
+keys earlier schemes rendered, and `migrate_state_key(store, key, candidates)`
+moves a value left under one of them to the current key (only while the current
+key is empty), so a rendering change never turns a resumable pipeline into a
+first run.
+
+```rust
+use faucet_core::{KeySuffix, StateKey};
+
+let key = StateKey::invocation("orders", "lines").with_parent_key("42");
+assert_eq!(key.render(), "orders::lines::42");
+let sla = key.with_suffix(KeySuffix::Sla);
+assert_eq!(sla.render(), "orders::lines::42::__sla__");
+```
+
 The pipeline stores each bookmark in a **versioned envelope** (#736,
 `state_version`): `{ "faucet_state": 1, "owner": <connector_name>, "schema":
 <state_schema>, "data": <bookmark> }`. On resume it refuses
