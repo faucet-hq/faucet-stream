@@ -1072,7 +1072,9 @@ jobs:
           retry cargo test -p faucet-cli --all-features --test '*'
           cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE"
           # Both scripts merge a file's records across reports (a line hit in either counts).
-          cat integration-libs.lcov integration-cli.lcov > integration.lcov
+          # One newline between reports, so a file without a trailing one
+          # cannot run its `end_of_record` into the next report's `SF:`.
+          for f in integration-libs.lcov integration-cli.lcov; do cat "$f"; echo; done > integration.lcov
 
           echo "::group::teardown before the unit phase"
           df -h /
@@ -1087,7 +1089,7 @@ jobs:
 
           retry cargo test --workspace --all-features --lib --bins
           cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
-          cat integration.lcov unit.lcov > lcov.info
+          for f in integration.lcov unit.lcov; do cat "$f"; echo; done > lcov.info
       - name: Keep the coverage reports
         # So a failing coverage gate can be read line by line (Codecov only
         # receives the report after the gates pass).

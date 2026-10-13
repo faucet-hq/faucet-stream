@@ -121,6 +121,13 @@ async fn conformance_capabilities_truthful() {
         &sink,
     );
 
+    // A publish is counted on the run's round-trip recorder.
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &sink,
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
+
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),

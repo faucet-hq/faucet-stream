@@ -294,6 +294,8 @@ impl PubsubSink {
                 .map(|(i, p)| (*i, p.ordering_key.clone()))
                 .collect();
             let outcomes = self.publish_chunk(send).await;
+            // The publisher bundles messages itself; one page is one round trip.
+            self.calls.record("publish");
             for (index, outcome) in &outcomes {
                 if outcome.is_err()
                     && let Some(key) = keys.get(index)
