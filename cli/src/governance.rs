@@ -291,7 +291,7 @@ pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResul
     }
     #[cfg(feature = "policy")]
     if let Some(policy_spec) = cfg.policy.as_ref() {
-        if crate::policy::quarantines(policy_spec) && cfg.pipeline.dlq.is_none() {
+        if crate::policy::quarantines(policy_spec) && cfg.pipeline.dlq.is_none() && !req.dry_run {
             return Err(CliError::Config(format!(
                 "node '{}': policy: a rule with `on_runtime: quarantine` needs a `dlq:` block \
                  to route the quarantined records to",
@@ -368,6 +368,32 @@ pub(crate) fn topology_dlq(
         .dlq_config()
         .expect("a DLQ was just attached"))
 }
+
+/// The governance of a preview — `faucet preview`, a topology preview and the
+/// MCP `preview` / dry-run tools (#875). A preview writes nothing, so only
+/// masking applies (every rule: there is no destination to scope by); the
+/// rest are opted out by name.
+pub fn preview_governance(
+    #[allow(unused_variables)] masking: Option<&faucet_core::MaskingSpec>,
+) -> CliResult<Governance> {
+    #[allow(unused_mut)]
+    let mut g = Governance::new();
+    #[cfg(feature = "masking")]
+    if let Some(spec) = masking {
+        g = g.with_masking(Arc::new(
+            faucet_core::CompiledMasking::compile(spec)
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+        ));
+    }
+    Ok(g.without(Pass::Budget, PREVIEW_WRITES_NOTHING)
+        .without(Pass::Policy, PREVIEW_WRITES_NOTHING)
+        .without(Pass::Dlq, PREVIEW_WRITES_NOTHING)
+        .without(Pass::Profiling, PREVIEW_WRITES_NOTHING)
+        .without(Pass::Cancel, "a preview is bounded by its own deadline"))
+}
+
+/// The reason a preview opts out of the write-side passes.
+pub const PREVIEW_WRITES_NOTHING: &str = "a preview writes nothing; it only shows masked records";
 
 /// The ids masking `applies_to` / policy facts use for a node's DLQ.
 pub fn dlq_ids(dlq: &DlqSpec) -> [&str; 2] {

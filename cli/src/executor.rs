@@ -4137,6 +4137,45 @@ fn value_to_string_brief(v: &Value) -> String {
 }
 
 #[cfg(test)]
+impl ExecuteOptions {
+    /// Plain options for a unit test: no budget, cancel, resilience or
+    /// observers.
+    pub(crate) fn for_tests(name: &str) -> Self {
+        ExecuteOptions {
+            legacy_state_writes: false,
+            force_lease: false,
+            pipeline_name: name.into(),
+            run_id: None,
+            execution: None,
+            concurrency: None,
+            dry_run: false,
+            limit: None,
+            state_path_override: None,
+            state_scope: Default::default(),
+            shard: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+            cancel: None,
+            resilience: None,
+            sla: None,
+            reconcile: None,
+            verify: None,
+            rollback: None,
+            #[cfg(feature = "lineage")]
+            lineage: None,
+            #[cfg(feature = "lineage")]
+            lineage_cfg: None,
+            #[cfg(feature = "notify")]
+            notifier: None,
+            #[cfg(feature = "catalog")]
+            catalog: None,
+            usage: Default::default(),
+            budget: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use faucet_conformance::forwarding::{
