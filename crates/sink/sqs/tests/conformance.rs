@@ -120,6 +120,12 @@ async fn conformance_capabilities_truthful() {
         async move { count_messages(client_ref, &url).await }
     })
     .await;
+    // #878: per-entry SendMessageBatch outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || {
+        let url = url.clone();
+        async move { count_messages(client_ref, &url).await }
+    })
+    .await;
 
     // The honest branch must have left the append-only sink non-idempotent.
     assert!(!sink.supports_idempotent_writes());

@@ -1,0 +1,45 @@
+# Declared capabilities whose conformance assertion a connector's
+# tests/conformance.rs does not call, each with the reason (#878, RFC 0013).
+# Format: `<crate> <requirement-id>: <reason>`. Requirement ids are the `id`s of
+# faucet_conformance::required::REQUIREMENTS; `scripts/conformance-coverage.py`
+# fails on an entry that does not apply or is already met. The call-deadline
+# requirement reads crates/conformance/call-deadline-exempt.txt instead.
+
+# Connectors that open a connection inside `new()`: they cannot be built
+# without a backend, so `src/descriptor.rs` unit tests pin every capability for
+# every config branch and faucet-cli's `registry_capability_parity` test probes
+# them whenever they build (see the faucet-conformance README).
+faucet-source-postgres descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-source-mysql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-source-mssql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-source-oracle descriptor: connects in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
+faucet-source-mysql-cdc descriptor: connection preflight in new(); pinned by src/descriptor.rs unit tests
+faucet-source-mssql-cdc descriptor: connection preflight in new(); pinned by src/descriptor.rs unit tests
+faucet-source-oracle-cdc descriptor: connection preflight in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
+faucet-source-mongodb-cdc descriptor: `hello` round trip in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-postgres descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-mysql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-mssql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-oracle descriptor: connects in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
+faucet-sink-redis descriptor: the connection manager opens in new(); pinned by src/descriptor.rs unit tests
+
+# The Singer target bridge forwards `key_properties` and `ACTIVATE_VERSION` to an
+# external target: whether rows converge by key, or stay hidden until the
+# version is activated, is that target's behaviour, not the bridge's. The sink
+# declares neither keyed_upsert nor keyed dedup for that reason.
+faucet-sink-singer keyed_write_modes: upsert passes key_properties to an external target; convergence is the target's, which the bridge cannot vouch for (it declares no keyed_upsert)
+faucet-sink-singer overwrite: ACTIVATE_VERSION makes the target drop older versions at commit; rows of the new version are visible as the target loads them, so staging is the target's
+
+# Warehouse sinks without an emulator are tested against a wiremock fake of
+# their statements API. The fake applies appends and keeps the watermark, which
+# proves the sink's side of exactly-once and per-row outcomes; key
+# convergence, MERGE and INSERT OVERWRITE semantics are the warehouse's own, so
+# a fake would only test itself. Their SQL is pinned by the src/sql.rs unit
+# tests instead.
+faucet-sink-databricks keyed_write_modes: MERGE semantics are the warehouse's (no emulator); the MERGE text is pinned by src/sql.rs unit tests and the fake-warehouse tests in tests/integration.rs
+faucet-sink-databricks replay_safe: a replayed keyed write is a MERGE, which converges by the warehouse's key semantics (no emulator); pinned by the upsert tests in tests/integration.rs
+faucet-sink-databricks overwrite: staging and INSERT OVERWRITE run in the warehouse (no emulator); the lifecycle statements are pinned by tests/integration.rs
+faucet-sink-bigquery keyed_write_modes: MERGE semantics are BigQuery's (no emulator runs the MERGE script); the script is pinned by src/merge.rs unit tests and tests/upsert.rs
+faucet-sink-bigquery replay_safe: a replayed keyed write is one MERGE, which converges by BigQuery's key semantics (no emulator); pinned by src/merge.rs unit tests and tests/upsert.rs
+faucet-sink-bigquery overwrite: the temp-table load and TRUNCATE + INSERT swap run in BigQuery (no emulator); the lifecycle requests are pinned by tests/overwrite.rs
+faucet-sink-redshift atomic_batches: batches are atomic only for write_strategy: copy with batch_size: 0, whose COPY FROM 's3://…' needs a real cluster and bucket; COPY SQL is unit-tested in src/copy.rs

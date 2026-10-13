@@ -286,3 +286,43 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+/// The object's headers arrive, then its body stops mid-stream: the read must
+/// still end at the deadline and on cancel, because the body is read under the
+/// call context too (#880), not only the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline_bounds_a_stalled_body() {
+    use faucet_conformance::hung::{Reply, StallingBodyServer};
+    let server = StallingBodyServer::start(|_method, target| {
+        if target.contains("list-type=2") {
+            Reply::full(
+                "application/xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>stalled</Name><Prefix></Prefix><KeyCount>1</KeyCount>\
+                 <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+                 <Contents><Key>a.jsonl</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                 <ETag>\"e\"</ETag><Size>4096</Size><StorageClass>STANDARD</StorageClass>\
+                 </Contents></ListBucketResult>",
+            )
+        } else {
+            Reply::stall_body("application/octet-stream", "{\"id\":1}\n", 4096)
+        }
+    })
+    .await
+    .expect("server");
+    let endpoint = server.http_url();
+    // SAFETY: the same constants every other test here sets.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    }
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let config = S3SourceConfig::new("stalled")
+            .endpoint_url(endpoint.clone())
+            .region(REGION.to_string());
+        block_on(S3Source::new(config)).expect("source builds offline")
+    })
+    .await;
+}

@@ -92,13 +92,13 @@ impl Source for SingerSource {
         let on_malformed = self.config.on_malformed;
 
         Box::pin(async_stream::try_stream! {
-            let mut process = TapProcess::spawn(&self.config, start.as_ref())?;
+            let reads = self.calls.get();
+            let mut process = TapProcess::spawn_in(&self.config, start.as_ref(), &reads).await?;
             let mut assembler = PageAssembler::new(target_stream.clone(), batch_size, flush_on_state);
             if let Some(alias) = self.config.catalog.as_ref().and_then(|c| stream_alias(c, &target_stream)) {
                 assembler = assembler.with_alias(alias);
             }
 
-            let reads = self.calls.get();
             loop {
                 let received = match process.recv(idle).within_ctx(&reads, "read").await {
                     Ok(received) => received,

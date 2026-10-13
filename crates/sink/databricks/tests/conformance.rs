@@ -146,3 +146,154 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+// ── #878: declared capabilities against a stateful statements fake ──────────
+
+/// One stored row: the exactly-once scope and page sequence it was written
+/// under, if any.
+type Row = (Option<String>, Option<u64>);
+
+/// A statements endpoint that applies the append-path writes it is sent to an
+/// in-memory row list — plain `INSERT … FROM VALUES`, the exactly-once
+/// `INSERT … REPLACE WHERE` (replacing the scope's rows at or past the page's
+/// sequence) and its empty-page `DELETE` — and keeps the watermark `MERGE`,
+/// answering the token `SELECT` and the column listing from that state.
+#[derive(Clone, Default)]
+struct Warehouse {
+    rows: Arc<Mutex<Vec<Row>>>,
+    tokens: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    table: Arc<Mutex<Option<bool>>>,
+}
+
+impl Warehouse {
+    fn len(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
+}
+
+/// Rows of an inline `VALUES (…), (…) AS v(…)` relation.
+fn values_rows(sql: &str) -> usize {
+    let Some(start) = sql.find("FROM VALUES ") else {
+        return 0;
+    };
+    let body = &sql[start + "FROM VALUES ".len()..];
+    let (mut rows, mut depth, mut quoted, mut escaped) = (0, 0, false, false);
+    for c in body.chars() {
+        if quoted {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '\'') => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '\'' => quoted = true,
+            '(' => {
+                if depth == 0 {
+                    rows += 1;
+                }
+                depth += 1;
+            }
+            ')' => depth -= 1,
+            'A' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// `` `_faucet_scope` = 's' AND `_faucet_seq` >= n ``.
+fn eo_predicate(sql: &str) -> Option<(String, u64)> {
+    let rest = &sql[sql.find("`_faucet_scope` = '")? + "`_faucet_scope` = '".len()..];
+    let scope = rest[..rest.find('\'')?].to_string();
+    let rest = &rest[rest.find("`_faucet_seq` >= ")? + "`_faucet_seq` >= ".len()..];
+    let seq = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((scope, seq))
+}
+
+fn param(body: &Value, name: &str) -> Option<String> {
+    body["parameters"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
+        .and_then(|p| p["value"].as_str().map(str::to_string))
+}
+
+impl Respond for Warehouse {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        let sql = body["statement"].as_str().unwrap_or_default();
+        let mut data: Vec<Value> = Vec::new();
+        if sql.contains("information_schema.columns") {
+            if let Some(eo) = *self.table.lock().unwrap() {
+                data.push(json!(["id", "bigint", "YES", null, "NO"]));
+                data.push(json!(["v", "string", "YES", null, "NO"]));
+                if eo {
+                    data.push(json!(["_faucet_scope", "string", "YES", null, "NO"]));
+                    data.push(json!(["_faucet_seq", "bigint", "YES", null, "NO"]));
+                }
+            }
+        } else if sql.contains("_faucet_commit_token") {
+            let scope = param(&body, "scope").unwrap_or_default();
+            if sql.starts_with("SELECT") {
+                if let Some(t) = self.tokens.lock().unwrap().get(&scope) {
+                    data.push(json!([t]));
+                }
+            } else if sql.starts_with("MERGE")
+                && let Some(token) = param(&body, "token")
+            {
+                self.tokens.lock().unwrap().insert(scope, token);
+            }
+        } else if sql.starts_with("CREATE TABLE") {
+            *self.table.lock().unwrap() = Some(sql.contains("_faucet_scope"));
+        } else if sql.starts_with("ALTER TABLE") && sql.contains("_faucet_scope") {
+            *self.table.lock().unwrap() = Some(true);
+        } else if sql.starts_with("INSERT INTO") || sql.starts_with("DELETE FROM") {
+            let mut rows = self.rows.lock().unwrap();
+            let pred = eo_predicate(sql);
+            if (sql.contains(" REPLACE WHERE ") || sql.starts_with("DELETE FROM"))
+                && let Some((scope, seq)) = &pred
+            {
+                rows.retain(|(s, n)| {
+                    s.as_deref() != Some(scope.as_str()) || n.is_none_or(|n| n < *seq)
+                });
+            }
+            let tag: Row = match &pred {
+                Some((s, n)) => (Some(s.clone()), Some(*n)),
+                None => (None, None),
+            };
+            for _ in 0..values_rows(sql) {
+                rows.push(tag.clone());
+            }
+        }
+        ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "x",
+            "status": {"state": "SUCCEEDED"},
+            "result": {"data_array": data}
+        }))
+    }
+}
+
+#[tokio::test]
+async fn conformance_declared_capabilities() {
+    let server = MockServer::start().await;
+    let wh = Warehouse::default();
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(wh.clone())
+        .mount(&server)
+        .await;
+    let sink = DatabricksSink::new(config(&server.uri())).unwrap();
+    let count = || {
+        let wh = wh.clone();
+        async move { wh.len() }
+    };
+    faucet_conformance::assert_idempotent_replay(&sink, count).await;
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+}

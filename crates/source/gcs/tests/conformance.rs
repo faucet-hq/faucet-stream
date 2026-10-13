@@ -290,3 +290,34 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+/// The object's headers arrive, then its body stops mid-stream: the read must
+/// still end at the deadline and on cancel, because the body is read under the
+/// call context too (#880), not only the request. The storage client's read
+/// future is deep, so the body runs on a large stack.
+#[test]
+fn conformance_call_deadline_bounds_a_stalled_body() {
+    faucet_conformance::block_on_large_stack(stalled_body());
+}
+
+async fn stalled_body() {
+    use faucet_conformance::hung::{Reply, StallingBodyServer};
+    let server = StallingBodyServer::start(|_method, _target| {
+        Reply::stall_body("application/octet-stream", "{\"id\":1}\n", 4096)
+            .header("x-goog-generation", "1")
+            .header("x-goog-metageneration", "1")
+            .header("x-goog-stored-content-length", "4096")
+            .header("x-goog-storage-class", "STANDARD")
+    })
+    .await
+    .expect("server");
+    let host = server.http_url();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let config = GcsSourceConfig::new("stalled")
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host)
+            .object_keys(vec!["a.jsonl".into()]);
+        block_on(GcsSource::new(config)).expect("source builds offline")
+    })
+    .await;
+}

@@ -52,8 +52,29 @@
 //! 13. [`assert_cancellation_flushes`] — a mid-run cancel stops at a page
 //!     boundary and flushes the sink, so buffered output survives (#146 H16).
 //!
+//! Declared-capability checks (RFC 0013, #878) — each proves a sink behaves as
+//! a capability it declares says it does:
+//! 15. [`assert_partial_outcomes_truthful`] — `write_batch_partial` reports one
+//!     outcome per row and an `Ok` row is in the destination.
+//! 16. [`assert_reported_rows_truthful`] — `write_batch_reported` accounts for
+//!     every row offered and `accepted` equals what landed.
+//! 17. [`assert_replay_safe`] — a replay-safe plain write retried after a lost
+//!     response does not duplicate rows.
+//! 18. [`assert_overwrite_lifecycle`] — `write_mode: overwrite` stages until
+//!     commit, and an abort leaves the destination as it was.
+//! 19. [`assert_batch_atomicity_truthful`] — a failed write of a batch
+//!     declared atomic lands no row; a per-row batch lands exactly its `Ok`
+//!     rows.
+//!
 //! Each check has both a passing and a `#[should_panic]` failing test in this
 //! crate — a check that cannot fail is worthless.
+//!
+//! # Which checks a connector must run
+//!
+//! [`required::REQUIREMENTS`] maps each declared capability to the assertions
+//! that prove it; `scripts/conformance-coverage.py` fails CI when a built-in
+//! connector declares a capability and its `tests/conformance.rs` calls none
+//! of them.
 //!
 //! # Reliability suites
 //!
@@ -83,13 +104,49 @@
 //! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule.
 
 pub mod calls;
+mod checks;
 #[cfg(feature = "containers")]
 pub mod containers;
 pub mod doubles;
 pub mod fidelity;
 pub mod forwarding;
 pub mod hung;
+pub mod required;
 pub mod scripted;
+
+/// Stack size [`block_on_large_stack`] gives its thread.
+pub const LARGE_STACK: usize = 32 << 20;
+
+/// Run `fut` to completion on a fresh thread with a [`LARGE_STACK`] stack and
+/// its own Tokio runtime. Some cloud clients build futures deep enough to
+/// overflow the default 2 MiB test-thread stack in a debug build; a
+/// conformance test that drives one wraps its body in this.
+pub fn block_on_large_stack<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(LARGE_STACK)
+            .spawn_scoped(s, || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_stack_size(LARGE_STACK)
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime")
+                    .block_on(fut)
+            })
+            .expect("spawn large-stack thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+pub use checks::{
+    assert_batch_atomicity_truthful, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
+    assert_replay_safe, assert_reported_rows_truthful,
+};
 
 use std::collections::HashMap;
 
@@ -297,8 +354,9 @@ async fn drain<S: Source + ?Sized>(
 /// under test must be configured `write_mode: upsert` with `key: ["id"]`.
 ///
 /// Dispatches on the mechanism the sink advertises:
-/// - `supports_idempotent_writes()` → the **atomic-watermark** path: writing a
-///   page durably records a commit token; a crash-replay (guarded by
+/// - `supports_idempotent_writes()` → the **atomic-watermark** path: writing
+///   and flushing a page (as the pipeline does before it checkpoints) durably
+///   records a commit token; a crash-replay (guarded by
 ///   `last_committed_token`, exactly as the pipeline guards it) does not
 ///   re-write, and forward progress still advances.
 /// - else `dedups_by_key()` → the **keyed-upsert** path: overlapping keys across
@@ -347,6 +405,9 @@ where
     sink.write_batch_idempotent(&p1, scope, &t1)
         .await
         .unwrap_or_else(|e| panic!("[{label}] write_batch_idempotent(page 1) errored: {e}"));
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] flush after page 1 errored: {e}"));
     let after_first = count().await;
     assert_eq!(
         after_first - before,
@@ -388,6 +449,9 @@ where
     sink.write_batch_idempotent(&p2, scope, &t2)
         .await
         .unwrap_or_else(|e| panic!("[{label}] write_batch_idempotent(page 2) errored: {e}"));
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] flush after page 2 errored: {e}"));
     let after_second = count().await;
     assert_eq!(
         after_second - after_first,
@@ -1469,6 +1533,17 @@ mod tests {
         // The written page was flushed to durable storage on the cancel path.
         assert_eq!(sink.durable_len(), 3);
         assert_eq!(sink.staged_len(), 0);
+    }
+
+    #[test]
+    fn block_on_large_stack_returns_the_output() {
+        assert_eq!(block_on_large_stack(async { 7 }), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "inside the large stack")]
+    fn block_on_large_stack_propagates_a_panic() {
+        block_on_large_stack(async { panic!("inside the large stack") });
     }
 
     #[tokio::test]

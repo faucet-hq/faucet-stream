@@ -68,6 +68,25 @@ async fn conformance_cancellation_flushes() {
     .await;
 }
 
+/// `write_mode: overwrite` stages until commit and an abort leaves the
+/// previous output in place (#878).
+#[tokio::test]
+async fn conformance_overwrite_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.jsonl");
+    std::fs::write(&path, "{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n").unwrap();
+    let s = FileSink::new(
+        FileSinkConfig::new(path.to_string_lossy())
+            .write_mode(faucet_sink_file::FileWriteMode::Overwrite),
+    )
+    .unwrap();
+    faucet_conformance::assert_overwrite_lifecycle(&s, || {
+        let path = path.clone();
+        async move { count_lines(&path) }
+    })
+    .await;
+}
+
 // ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
 
 #[test]

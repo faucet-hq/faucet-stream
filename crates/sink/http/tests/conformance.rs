@@ -62,6 +62,27 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.dedups_by_key());
 }
 
+/// #878: in Individual mode every record is its own request, so the per-row
+/// outcomes the sink reports must match the requests the endpoint accepted.
+#[tokio::test]
+async fn conformance_partial_outcomes_truthful() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let sink = HttpSink::new(
+        HttpSinkConfig::new(format!("{}/ingest", server.uri()))
+            .batch_mode(HttpBatchMode::Individual),
+    );
+    let server_ref = &server;
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || async move {
+        server_ref.received_requests().await.unwrap().len()
+    })
+    .await;
+}
+
 #[test]
 fn conformance_descriptor_matches_built_sink() {
     for v in [

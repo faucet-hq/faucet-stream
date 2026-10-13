@@ -178,8 +178,9 @@ The crate exports `DESCRIPTOR` (RFC 0013): write modes `append`, `upsert` and `o
 Every page written to the target and every wait for its confirmation run
 through the pipeline's `CallContext` (#880), once: any caller deadline ends the
 wait, the target is stopped, and — as for any other target failure — a page
-not yet confirmed fails the run. `flush_timeout_secs` and the stdin write
-timeout are unchanged.
+not yet confirmed fails the run. Spawning the target does not block the
+runtime: a transient `Text file busy` retry waits through the same context.
+`flush_timeout_secs` and the stdin write timeout are unchanged.
 
 ## License
 

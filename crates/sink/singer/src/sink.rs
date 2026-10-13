@@ -147,7 +147,9 @@ impl SingerSink {
 
     async fn write_page(&self, inner: &mut Inner, records: &[Value]) -> Result<(), FaucetError> {
         if inner.process.is_none() {
-            inner.process = Some(TargetProcess::spawn(&self.config, &self.redactor)?);
+            inner.process = Some(
+                TargetProcess::spawn_in(&self.config, &self.redactor, &self.calls.get()).await?,
+            );
             inner.sent_schema = None;
         }
         let stream = self.config.stream_name();
@@ -340,7 +342,8 @@ impl Sink for SingerSink {
             return Err(e);
         }
         let stream = self.config.stream_name();
-        let mut process = TargetProcess::spawn(&self.config, &self.redactor)?;
+        let mut process =
+            TargetProcess::spawn_in(&self.config, &self.redactor, &self.calls.get()).await?;
         let mut buf = Vec::new();
         // The committing sink is usually not one of the writers: it sends the
         // schema the run's writers sent. An empty SCHEMA could reset the

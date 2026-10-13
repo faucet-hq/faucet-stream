@@ -509,7 +509,9 @@ Every object-store request — listings, object and metadata reads, each ranged
 Parquet read — runs through the pipeline's `CallContext` (#880): the run's
 cancel token stops an in-flight request, any caller deadline ends it, and round
 trips are still metered as `list` / `get` / `head` (see Usage signals). The
-SDK's own timeouts and retry are unchanged.
+object body is read under the same context, so a body that stops arriving
+mid-stream ends at the deadline or on cancel too. The SDK's own timeouts and
+retry are unchanged.
 
 ## License
 

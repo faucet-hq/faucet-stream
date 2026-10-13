@@ -122,8 +122,9 @@ The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabi
 Every read of the tap's output waits through the pipeline's `CallContext`
 (#880): the run's cancel token or any caller deadline ends the wait and stops
 the tap (SIGTERM, then SIGKILL). `idle_timeout_secs` still bounds a tap that
-goes quiet. Discovery (`faucet init --discover`) spawns the tap without
-blocking the runtime.
+goes quiet. Spawning the tap (for a run and for discovery,
+`faucet init --discover`) does not block the runtime: a transient
+`Text file busy` retry waits through the same context.
 
 ## License
 

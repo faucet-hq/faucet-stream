@@ -112,6 +112,42 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.dedups_by_key());
 }
 
+// ── #878: declared capabilities (real backend, skip if no Docker) ──────────
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let Some((_c, base)) = start_clickhouse().await else {
+        return;
+    };
+    http_exec(
+        &base,
+        "CREATE TABLE cap (id Int64, v String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let base_ref = base.as_str();
+    let count = move || async move { count_rows(base_ref).await };
+
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "cap")).expect("sink");
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+
+    // One INSERT per page: a page with a row ClickHouse cannot parse lands
+    // nothing.
+    let atomic: ClickHouseSinkConfig = serde_json::from_value(serde_json::json!({
+        "url": base, "table": "cap", "batch_size": 0
+    }))
+    .unwrap();
+    let atomic = ClickHouseSink::new(atomic).expect("sink");
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &atomic,
+        count,
+        &[
+            serde_json::json!({"id": 954, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+}
+
 #[test]
 fn descriptor_matches_the_built_sink() {
     for v in [

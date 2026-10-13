@@ -538,6 +538,7 @@ impl IcebergSink {
                 Ok(tx) => tx,
                 Err(e) => {
                     maybe_cleanup_orphans(
+                        &self.calls,
                         table.file_io(),
                         &self.config.table,
                         self.config.cleanup_orphans_on_failure,
@@ -558,6 +559,7 @@ impl IcebergSink {
                 // Building the append failed locally — the data files were
                 // uploaded but definitively never committed.
                 maybe_cleanup_orphans(
+                    &self.calls,
                     table.file_io(),
                     &self.config.table,
                     self.config.cleanup_orphans_on_failure,
@@ -580,6 +582,7 @@ impl IcebergSink {
             Err(spent) => {
                 // The commit may have landed: never clean up after it.
                 maybe_cleanup_orphans(
+                    &self.calls,
                     table.file_io(),
                     &self.config.table,
                     self.config.cleanup_orphans_on_failure,
@@ -591,6 +594,7 @@ impl IcebergSink {
             }
             Ok(Err(e)) => {
                 maybe_cleanup_orphans(
+                    &self.calls,
                     table.file_io(),
                     &self.config.table,
                     self.config.cleanup_orphans_on_failure,
@@ -616,9 +620,10 @@ impl IcebergSink {
 ///
 /// No-op (with a one-line warning) when cleanup is disabled (`enabled == false`)
 /// or the failure is ambiguous (`definite_loss == false`); otherwise deletes
-/// `file_paths` via `file_io`. Errors are logged, never propagated — the caller
-/// still returns the original commit error.
+/// `file_paths` via `file_io`, each delete under `calls`. Errors are logged,
+/// never propagated — the caller still returns the original commit error.
 pub(crate) async fn maybe_cleanup_orphans(
+    calls: &faucet_core::CallSlot,
     file_io: &FileIO,
     table_name: &str,
     enabled: bool,
@@ -649,7 +654,7 @@ pub(crate) async fn maybe_cleanup_orphans(
         return;
     }
 
-    let (deleted, failed) = delete_data_files(file_io, file_paths).await;
+    let (deleted, failed) = delete_data_files(calls, file_io, file_paths).await;
     tracing::info!(
         table = %table_name,
         deleted,
@@ -715,15 +720,28 @@ where
 
 /// Delete each path in `paths` via `file_io`, returning `(deleted, failed)`.
 ///
-/// Best-effort: a delete error is logged and counted as `failed` but does not
-/// stop the remaining deletes. The data files written by this sink have unique
+/// Best-effort: a delete error — including one that hits the call deadline or
+/// a cancel — is logged and counted as `failed` but does not stop the
+/// remaining deletes. The data files written by this sink have unique
 /// (UUID-based) names, so deleting them can never remove a file a concurrent
 /// writer references.
-pub(crate) async fn delete_data_files(file_io: &FileIO, paths: &[String]) -> (usize, usize) {
+pub(crate) async fn delete_data_files(
+    calls: &faucet_core::CallSlot,
+    file_io: &FileIO,
+    paths: &[String],
+) -> (usize, usize) {
     let mut deleted = 0usize;
     let mut failed = 0usize;
     for path in paths {
-        match file_io.delete(path).await {
+        let outcome = calls
+            .call_once("delete", async {
+                file_io
+                    .delete(path)
+                    .await
+                    .map_err(|e| FaucetError::Sink(e.to_string()))
+            })
+            .await;
+        match outcome {
             Ok(()) => deleted += 1,
             Err(e) => {
                 failed += 1;
@@ -1314,7 +1332,8 @@ mod tests {
         let io = FileIO::new_with_fs();
         let paths = seed_files(&io, dir.path(), 3).await;
 
-        let (deleted, failed) = delete_data_files(&io, &paths).await;
+        let (deleted, failed) =
+            delete_data_files(&faucet_core::CallSlot::default(), &io, &paths).await;
         assert_eq!(deleted, 3);
         assert_eq!(failed, 0);
         for p in &paths {
@@ -1338,7 +1357,8 @@ mod tests {
             dir.path().display()
         ));
 
-        let (deleted, failed) = delete_data_files(&io, &paths).await;
+        let (deleted, failed) =
+            delete_data_files(&faucet_core::CallSlot::default(), &io, &paths).await;
         assert_eq!(
             failed, 0,
             "idempotent delete of a missing file is not a failure"
@@ -1350,6 +1370,28 @@ mod tests {
         );
     }
 
+    // A delete runs under the call context: once it is cancelled the delete
+    // ends as a counted failure and the file stays (#880).
+    #[tokio::test]
+    async fn delete_data_files_honours_the_call_context() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let io = FileIO::new_with_fs();
+        let paths = seed_files(&io, dir.path(), 2).await;
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        let calls = faucet_core::CallSlot::default();
+        calls.install(faucet_core::CallContext::new().with_cancel(token));
+
+        let (deleted, failed) = delete_data_files(&calls, &io, &paths).await;
+        assert_eq!((deleted, failed), (0, 2));
+        for p in &paths {
+            assert!(
+                io.exists(p).await.expect("exists check"),
+                "cancelled → kept"
+            );
+        }
+    }
+
     // Cleanup is a no-op when disabled: files survive.
     #[tokio::test]
     async fn maybe_cleanup_disabled_keeps_files() {
@@ -1358,7 +1400,12 @@ mod tests {
         let paths = seed_files(&io, dir.path(), 2).await;
 
         maybe_cleanup_orphans(
-            &io, "t", /*enabled=*/ false, /*definite=*/ true, &paths,
+            &faucet_core::CallSlot::default(),
+            &io,
+            "t",
+            /*enabled=*/ false,
+            /*definite=*/ true,
+            &paths,
         )
         .await;
 
@@ -1376,7 +1423,12 @@ mod tests {
         let paths = seed_files(&io, dir.path(), 2).await;
 
         maybe_cleanup_orphans(
-            &io, "t", /*enabled=*/ true, /*definite=*/ false, &paths,
+            &faucet_core::CallSlot::default(),
+            &io,
+            "t",
+            /*enabled=*/ true,
+            /*definite=*/ false,
+            &paths,
         )
         .await;
 
@@ -1396,7 +1448,12 @@ mod tests {
         let paths = seed_files(&io, dir.path(), 2).await;
 
         maybe_cleanup_orphans(
-            &io, "t", /*enabled=*/ true, /*definite=*/ true, &paths,
+            &faucet_core::CallSlot::default(),
+            &io,
+            "t",
+            /*enabled=*/ true,
+            /*definite=*/ true,
+            &paths,
         )
         .await;
 

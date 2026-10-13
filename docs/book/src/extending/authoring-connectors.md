@@ -677,8 +677,14 @@ each one's exact signature for your version):
 | a discoverable source | discover round-trips (integration-level) |
 | every sink | config schema valid, connector name non-empty, capabilities truthful, well-formed `check()` probe |
 | a keyed or idempotent sink | idempotent replay, write modes truthful |
-| a sink with schema evolution / a declared batch atomicity | schema evolution effective / batch atomicity declared |
+| a sink with schema evolution | schema evolution effective |
+| a sink declaring atomic batches | batch atomicity truthful (pass a page holding a row the sink rejects) |
+| a sink overriding `write_batch_partial` | partial outcomes truthful |
+| a sink overriding `write_batch_reported` | reported rows truthful |
+| a keyed (replay-safe) sink | replay safe |
+| a sink with `write_mode: overwrite` | overwrite lifecycle (seed the destination first) |
 | a buffering sink | cancellation flushes (integration-level) |
+| a connector with backend calls | call deadline (see [Backend calls](#backend-calls-callcontext-httpclient-batching)) |
 
 The sink checks write rows keyed on `"id"` with a `"v"` column, so configure
 the sink under test `write_mode: upsert`, `key: ["id"]` for the keyed checks.
@@ -686,6 +692,26 @@ They measure row-count deltas through your `distinct_count` closure, so give
 each check its own fresh destination (a new mock server, table or container).
 `faucet_conformance::doubles` has a counting source and a test sink for testing
 your own wrappers.
+
+**A declared capability needs its check.** `faucet_conformance::required::REQUIREMENTS`
+is the table behind the rows above: each capability, how a connector declares
+it (a descriptor flag, a write mode, a trait-method override, a buffering
+`flush`, a declared `BatchAtomicity`) and the assertions that prove it. For the
+built-in connectors CI enforces it: `scripts/conformance-coverage.py` (the
+`Doc counts` job) reads the committed snapshot
+`crates/conformance/declared-capabilities.json` plus each crate's `src/` and
+`tests/conformance.rs`, and fails when a declared capability has no matching
+assertion call. A check that genuinely cannot run in CI (no emulator for the
+backend) goes in `crates/conformance/conformance-coverage-exempt.txt` with the
+reason; an exemption that no longer applies fails the run too. When a
+connector's declared capabilities change, regenerate the snapshot with
+`cargo test -p faucet-cli --features full --test declared_capabilities -- --ignored regenerate`.
+
+A check that needs a second connector — a sink counted back through its own
+source — lives in `crates/interop-tests/tests/<kind>_conformance.rs` (or
+`<kind>_<role>_conformance.rs`), which the script reads as well. A cloud client
+whose futures overflow the default test stack in a debug build runs its test
+body through `faucet_conformance::block_on_large_stack`.
 
 The full contract is the
 [Faucet Connector Protocol (FCP v0)](../spec/faucet-connector-spec-v0.md).

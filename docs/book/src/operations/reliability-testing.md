@@ -29,7 +29,7 @@ test checks and which stays green through a real regression.
 |---|---|---|---|
 | **Engine guarantees** | Bookmark ordering, exactly-once (both mechanisms), overwrite atomicity, cleanup safety, cancel-still-flushes, panic isolation on every transfer path | No | Every PR, **required** |
 | **State compatibility** | Bookmarks / exactly-once envelopes / versioned state envelopes / commit tokens written by a release still load; an older bookmark shape migrates; a newer one is refused; every state **key** a release wrote still renders, or is migrated from | No | Every PR, **required** |
-| **Connector conformance** | Per-connector battery (capabilities truthful, bounded memory, idempotent replay, …) | Per connector | Every PR |
+| **Connector conformance** | Per-connector battery (capabilities truthful, bounded memory, idempotent replay, …); every declared capability has its check (`scripts/conformance-coverage.py`) | Per connector | Every PR |
 | **Drift policy matrix** | All five `on_drift` policies against a live evolving destination | No | Every PR, **required** |
 | **Containerized integration** | Real databases, Kafka, object stores; CDC replication | Yes | Every PR, reported |
 | **Fidelity round-trip** | Type-exact landing per source↔sink pair | Per pair | Every PR, reported |

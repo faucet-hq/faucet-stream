@@ -107,6 +107,38 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.dedups_by_key());
 }
 
+/// #878: output buffered when a run is cancelled is still flushed, and the
+/// write report accounts for every row — including rows past `max_records`,
+/// which the sink drops by design and reports as skipped.
+#[tokio::test]
+async fn conformance_cancellation_flushes_and_reports_rows() {
+    let capture = CaptureWriter::default();
+    let sink = StdoutSink::with_writer(StdoutSinkConfig::new(), Box::new(capture.clone()));
+    let capture_ref = &capture;
+    faucet_conformance::assert_cancellation_flushes(
+        &sink,
+        || async move { capture_ref.line_count() },
+    )
+    .await;
+    faucet_conformance::assert_reported_rows_truthful(
+        &sink,
+        || async move { capture_ref.line_count() },
+    )
+    .await;
+
+    let capped = CaptureWriter::default();
+    let capped_sink = StdoutSink::with_writer(
+        StdoutSinkConfig::new().max_records(2),
+        Box::new(capped.clone()),
+    );
+    let capped_ref = &capped;
+    faucet_conformance::assert_reported_rows_truthful(&capped_sink, || async move {
+        capped_ref.line_count()
+    })
+    .await;
+    assert_eq!(capped.line_count(), 2);
+}
+
 #[test]
 fn conformance_descriptor_matches_built_sink() {
     for v in [serde_json::json!({}), serde_json::json!({"format": "tsv"})] {

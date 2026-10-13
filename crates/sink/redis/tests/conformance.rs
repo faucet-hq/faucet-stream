@@ -109,6 +109,12 @@ mod idempotent {
             async move { count_entries(&url).await }
         })
         .await;
+        // #878: per-row pipeline outcomes are truthful.
+        faucet_conformance::assert_partial_outcomes_truthful(&sink, || {
+            let url = url.clone();
+            async move { count_entries(&url).await }
+        })
+        .await;
     }
 
     /// A server whose clients are paused stands in for a hung backend (#880):

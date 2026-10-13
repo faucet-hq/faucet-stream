@@ -8,7 +8,9 @@
 //! `ErringCheckSink`) exist so the battery's own unit tests can prove each
 //! check actually *fails* when the contract is violated — a check that can
 //! never fail is worthless. The conformant ones (`CountingSource`, `TestSink`,
-//! `EvolvingSink`) demonstrate the contract genuinely.
+//! `EvolvingSink`) demonstrate the contract genuinely. `PartialOutcomeSink`,
+//! `MisreportingSink`, `OverwriteSink` and `AtomicitySink` come in an honest
+//! constructor and one per way of lying, for the declared-capability checks.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -17,7 +19,10 @@ use std::sync::{Arc, Mutex};
 use faucet_core::check::{CheckContext, CheckReport};
 use faucet_core::drift::SchemaEvolution;
 use faucet_core::write_mode::{DeleteMarker, WriteMode};
-use faucet_core::{FaucetError, Sink, Source, StreamPage, Value, async_trait};
+use faucet_core::{
+    BatchAtomicity, FaucetError, RowOutcome, Sink, Source, StreamPage, Value, WriteReport,
+    async_trait,
+};
 use futures_core::Stream;
 use serde_json::json;
 
@@ -799,6 +804,399 @@ impl Sink for BufferedSink {
     }
 }
 
+/// A sink overriding [`Sink::write_batch_partial`], for
+/// [`assert_partial_outcomes_truthful`](crate::assert_partial_outcomes_truthful).
+/// [`honest`](Self::honest) reports one truthful outcome per row; the other
+/// constructors lie in one way each.
+#[derive(Clone, Default)]
+pub struct PartialOutcomeSink {
+    rows: Arc<Mutex<Vec<Value>>>,
+    lie: PartialLie,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum PartialLie {
+    #[default]
+    None,
+    DropsSilently,
+    Short,
+    RejectsAll,
+}
+
+impl PartialOutcomeSink {
+    /// Writes every row and reports each `Ok`.
+    pub fn honest() -> Self {
+        Self::default()
+    }
+    /// Reports every row `Ok` but drops the last one.
+    pub fn drops_silently() -> Self {
+        Self {
+            lie: PartialLie::DropsSilently,
+            ..Self::default()
+        }
+    }
+    /// Writes every row but returns one outcome too few.
+    pub fn short() -> Self {
+        Self {
+            lie: PartialLie::Short,
+            ..Self::default()
+        }
+    }
+    /// Writes nothing and reports every row failed.
+    pub fn rejects_all() -> Self {
+        Self {
+            lie: PartialLie::RejectsAll,
+            ..Self::default()
+        }
+    }
+    /// Rows written so far.
+    pub fn len(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
+    /// Whether nothing has been written.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait]
+impl Sink for PartialOutcomeSink {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.rows.lock().unwrap().extend(records.iter().cloned());
+        Ok(records.len())
+    }
+
+    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+        let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
+        match self.lie {
+            PartialLie::None => {
+                self.write_batch(records).await?;
+            }
+            PartialLie::DropsSilently => {
+                self.write_batch(&records[..records.len().saturating_sub(1)])
+                    .await?;
+            }
+            PartialLie::Short => {
+                self.write_batch(records).await?;
+                outcomes.pop();
+            }
+            PartialLie::RejectsAll => {
+                outcomes = records
+                    .iter()
+                    .map(|_| Err(FaucetError::Sink("rejected".into())))
+                    .collect();
+            }
+        }
+        Ok(outcomes)
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "partial-outcome-sink"
+    }
+}
+
+/// A sink overriding [`Sink::write_batch_reported`], for
+/// [`assert_reported_rows_truthful`](crate::assert_reported_rows_truthful).
+/// Every variant writes all but the last row of a page; they differ in what
+/// they report about it.
+#[derive(Clone, Default)]
+pub struct MisreportingSink {
+    rows: Arc<Mutex<Vec<Value>>>,
+    report: ReportStyle,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ReportStyle {
+    #[default]
+    HonestSkip,
+    OverReports,
+    UnderReports,
+}
+
+impl MisreportingSink {
+    /// Reports the dropped row as skipped — truthful.
+    pub fn honest_skip() -> Self {
+        Self::default()
+    }
+    /// Reports the dropped row as accepted.
+    pub fn over_reports() -> Self {
+        Self {
+            report: ReportStyle::OverReports,
+            ..Self::default()
+        }
+    }
+    /// Does not report the dropped row at all.
+    pub fn under_reports() -> Self {
+        Self {
+            report: ReportStyle::UnderReports,
+            ..Self::default()
+        }
+    }
+    /// Rows written so far.
+    pub fn len(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
+    /// Whether nothing has been written.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait]
+impl Sink for MisreportingSink {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        let kept = &records[..records.len().saturating_sub(1)];
+        self.rows.lock().unwrap().extend(kept.iter().cloned());
+        Ok(kept.len())
+    }
+
+    async fn write_batch_reported(&self, records: &[Value]) -> Result<WriteReport, FaucetError> {
+        let n = self.write_batch(records).await?;
+        let dropped = records.len() - n;
+        Ok(match self.report {
+            ReportStyle::HonestSkip => WriteReport::accepted(n).with_skipped(dropped),
+            ReportStyle::OverReports => WriteReport::accepted(records.len()),
+            ReportStyle::UnderReports => WriteReport::accepted(n),
+        })
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "misreporting-sink"
+    }
+}
+
+/// A sink configured for `write_mode: overwrite`, for
+/// [`assert_overwrite_lifecycle`](crate::assert_overwrite_lifecycle): writes
+/// go to a staging buffer that `commit_overwrite` swaps into the destination.
+/// [`honest`](Self::honest) keeps the lifecycle; the other constructors break
+/// it in one way each.
+#[derive(Clone, Default)]
+pub struct OverwriteSink {
+    destination: Arc<Mutex<Vec<Value>>>,
+    staging: Arc<Mutex<Vec<Value>>>,
+    flaw: OverwriteFlaw,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum OverwriteFlaw {
+    #[default]
+    None,
+    Eager,
+    TruncatingAbort,
+    AppendingCommit,
+}
+
+impl OverwriteSink {
+    /// The faithful lifecycle.
+    pub fn honest() -> Self {
+        Self::default()
+    }
+    /// Writes straight into the destination, bypassing staging.
+    pub fn eager() -> Self {
+        Self {
+            flaw: OverwriteFlaw::Eager,
+            ..Self::default()
+        }
+    }
+    /// `abort_overwrite` empties the destination.
+    pub fn truncating_abort() -> Self {
+        Self {
+            flaw: OverwriteFlaw::TruncatingAbort,
+            ..Self::default()
+        }
+    }
+    /// `commit_overwrite` appends the staged rows instead of replacing.
+    pub fn appending_commit() -> Self {
+        Self {
+            flaw: OverwriteFlaw::AppendingCommit,
+            ..Self::default()
+        }
+    }
+    /// Put `n` rows in the destination, as an earlier run would have.
+    pub fn seed(&self, n: i64) {
+        self.destination
+            .lock()
+            .unwrap()
+            .extend((0..n).map(|i| json!({ "id": -i - 1 })));
+    }
+    /// Rows in the destination.
+    pub fn len(&self) -> usize {
+        self.destination.lock().unwrap().len()
+    }
+    /// Whether the destination is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait]
+impl Sink for OverwriteSink {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        let target = if self.flaw == OverwriteFlaw::Eager {
+            &self.destination
+        } else {
+            &self.staging
+        };
+        target.lock().unwrap().extend(records.iter().cloned());
+        Ok(records.len())
+    }
+
+    fn supported_write_modes(&self) -> &'static [WriteMode] {
+        &[WriteMode::Append, WriteMode::Overwrite]
+    }
+
+    fn is_overwrite(&self) -> bool {
+        true
+    }
+
+    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        self.staging.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        let staged: Vec<Value> = self.staging.lock().unwrap().drain(..).collect();
+        let mut dest = self.destination.lock().unwrap();
+        if self.flaw != OverwriteFlaw::AppendingCommit {
+            dest.clear();
+        }
+        dest.extend(staged);
+        Ok(())
+    }
+
+    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+        self.staging.lock().unwrap().clear();
+        if self.flaw == OverwriteFlaw::TruncatingAbort {
+            self.destination.lock().unwrap().clear();
+        }
+        Ok(())
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "overwrite-sink"
+    }
+}
+
+/// A sink declaring atomic or per-row batches, for
+/// [`assert_batch_atomicity_truthful`](crate::assert_batch_atomicity_truthful).
+/// A record without an `"id"` is the poison row it rejects.
+#[derive(Clone, Default)]
+pub struct AtomicitySink {
+    rows: Arc<Mutex<Vec<Value>>>,
+    style: AtomicityStyle,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum AtomicityStyle {
+    #[default]
+    Atomic,
+    Torn,
+    PerRow,
+    PerRowOuterErr,
+    PerRowTorn,
+}
+
+impl AtomicitySink {
+    /// Declares `Atomic` and writes nothing from a page holding a poison row.
+    pub fn atomic() -> Self {
+        Self::default()
+    }
+    /// Declares `Atomic` but writes the rows before the poison row.
+    pub fn torn() -> Self {
+        Self {
+            style: AtomicityStyle::Torn,
+            ..Self::default()
+        }
+    }
+    /// Declares `PerRow` and fails only the poison row.
+    pub fn per_row() -> Self {
+        Self {
+            style: AtomicityStyle::PerRow,
+            ..Self::default()
+        }
+    }
+    /// Declares `PerRow` and fails the whole call, writing nothing.
+    pub fn per_row_outer_err() -> Self {
+        Self {
+            style: AtomicityStyle::PerRowOuterErr,
+            ..Self::default()
+        }
+    }
+    /// Declares `PerRow` but fails the whole call after writing the good rows.
+    pub fn per_row_torn() -> Self {
+        Self {
+            style: AtomicityStyle::PerRowTorn,
+            ..Self::default()
+        }
+    }
+    /// Rows written so far.
+    pub fn len(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
+    /// Whether nothing has been written.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn good(records: &[Value]) -> Vec<Value> {
+        records
+            .iter()
+            .filter(|r| r.get("id").is_some())
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Sink for AtomicitySink {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        let good = Self::good(records);
+        let poisoned = good.len() < records.len();
+        if !poisoned || self.style == AtomicityStyle::Torn {
+            self.rows.lock().unwrap().extend(good);
+        }
+        if poisoned {
+            return Err(FaucetError::Sink("record missing `id`".into()));
+        }
+        Ok(records.len())
+    }
+
+    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+        match self.style {
+            AtomicityStyle::PerRowOuterErr => Err(FaucetError::Sink("batch refused".into())),
+            AtomicityStyle::PerRowTorn => {
+                self.rows.lock().unwrap().extend(Self::good(records));
+                Err(FaucetError::Sink("batch failed".into()))
+            }
+            _ => {
+                let mut rows = self.rows.lock().unwrap();
+                Ok(records
+                    .iter()
+                    .map(|r| {
+                        if r.get("id").is_some() {
+                            rows.push(r.clone());
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink("record missing `id`".into()))
+                        }
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    fn batch_atomicity(&self) -> BatchAtomicity {
+        match self.style {
+            AtomicityStyle::Atomic | AtomicityStyle::Torn => BatchAtomicity::Atomic,
+            _ => BatchAtomicity::PerRow,
+        }
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "atomicity-sink"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,6 +1406,29 @@ mod tests {
         let empty = DiscoverableSource::empty();
         assert!(empty.supports_discover());
         assert!(empty.discover().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn declared_capability_doubles_start_empty_and_name_themselves() {
+        assert!(PartialOutcomeSink::honest().is_empty());
+        assert!(MisreportingSink::honest_skip().is_empty());
+        assert!(OverwriteSink::honest().is_empty());
+        assert!(AtomicitySink::atomic().is_empty());
+        assert_eq!(
+            PartialOutcomeSink::honest().connector_name(),
+            "partial-outcome-sink"
+        );
+        assert_eq!(
+            MisreportingSink::honest_skip().connector_name(),
+            "misreporting-sink"
+        );
+        assert_eq!(OverwriteSink::honest().connector_name(), "overwrite-sink");
+        assert_eq!(AtomicitySink::atomic().connector_name(), "atomicity-sink");
+        assert!(
+            OverwriteSink::honest()
+                .supported_write_modes()
+                .contains(&WriteMode::Overwrite)
+        );
     }
 
     #[tokio::test]

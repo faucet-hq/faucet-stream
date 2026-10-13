@@ -62,7 +62,7 @@ async fn conformance_keyed_battery() {
     let Some((_c, endpoint, client)) = start().await else {
         return;
     };
-    for t in ["caps", "modes", "replay"] {
+    for t in ["caps", "modes", "replay", "declared"] {
         keyed_table(&client, t).await;
     }
 
@@ -77,6 +77,13 @@ async fn conformance_keyed_battery() {
 
     let sink = keyed_sink(&endpoint, "replay").await;
     assert_idempotent_replay(&sink, || count(&client, "replay")).await;
+
+    // #878: per-row BatchWriteItem outcomes are truthful and a replayed keyed
+    // write converges.
+    let sink = keyed_sink(&endpoint, "declared").await;
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || count(&client, "declared"))
+        .await;
+    faucet_conformance::assert_replay_safe(&sink, || count(&client, "declared")).await;
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

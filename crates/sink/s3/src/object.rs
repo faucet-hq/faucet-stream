@@ -263,7 +263,7 @@ impl ObjectClient for S3Objects {
             .within(&self.calls, "get")
             .await?
             .map_err(|e| self.sdk_err("get object", key, e))?;
-        let mut reader = out.body.into_async_read();
+        let mut reader = self.calls.get().reader(out.body.into_async_read());
         let mut file = tokio::fs::File::create(to)
             .await
             .map_err(|e| err("create local copy", key, e))?;

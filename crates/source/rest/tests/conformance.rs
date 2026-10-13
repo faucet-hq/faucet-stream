@@ -148,3 +148,54 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+/// #878: every dataset an OData `$metadata` discovery reports can be selected
+/// by its `config_patch` and read.
+#[tokio::test]
+async fn conformance_discover_roundtrips() {
+    const EDMX: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Fin" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Ledger">
+        <Key><PropertyRef Name="RecId"/></Key>
+        <Property Name="RecId" Type="Edm.Int64" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="LedgerEntries" EntityType="Fin.Ledger"/>
+        <EntitySet Name="Departments" EntityType="Fin.Ledger"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"#;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/$metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EDMX))
+        .mount(&server)
+        .await;
+    for entity in ["LedgerEntries", "Departments"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{entity}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"value": [{"RecId": 1}]})),
+            )
+            .mount(&server)
+            .await;
+    }
+    let base = json!({
+        "base_url": server.uri(),
+        "path": "/",
+        "odata": {"version": "v4", "fan_out": true, "objects": "LedgerEntries,Departments"}
+    });
+    let cfg: RestStreamConfig = serde_json::from_value(base.clone()).unwrap();
+    let source = RestStream::new(cfg).unwrap();
+    faucet_conformance::assert_discover_roundtrips(&source, |patch| {
+        let v = faucet_conformance::merge_config_patch(base.clone(), &patch);
+        async move {
+            let cfg: RestStreamConfig = serde_json::from_value(v).unwrap();
+            Box::new(RestStream::new(cfg).unwrap()) as Box<dyn faucet_core::Source>
+        }
+    })
+    .await;
+}

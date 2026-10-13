@@ -96,15 +96,19 @@ mod docker {
         .await;
 
         let counter_cl = counter.clone();
-        faucet_conformance::assert_capabilities_truthful(&sink, move || {
+        let count = move || {
             let c = counter_cl.clone();
             async move {
                 // Let in-flight deliveries settle before reading the count.
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 c.load(Ordering::SeqCst)
             }
-        })
-        .await;
+        };
+        faucet_conformance::assert_capabilities_truthful(&sink, count.clone()).await;
+        // #878: per-message outcomes are truthful, and a cancelled run still
+        // flushes the client's buffered publishes.
+        faucet_conformance::assert_partial_outcomes_truthful(&sink, count.clone()).await;
+        faucet_conformance::assert_cancellation_flushes(&sink, count).await;
     }
 
     /// JetStream mode awaits every publish acknowledgement: a row whose

@@ -170,6 +170,46 @@ async fn conformance_capabilities_truthful() {
     .await;
 }
 
+/// The capabilities the sink declares beyond its descriptor (#878): truthful
+/// per-row outcomes, a replay-safe keyed write, atomic batches and the
+/// overwrite lifecycle.
+#[tokio::test]
+async fn conformance_declared_capabilities() {
+    let (_dir, url, sink) = fresh_sink().await;
+    let count = || {
+        let url = url.clone();
+        async move { count_rows(&url).await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 951, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"v": "no key"}),
+        ],
+    )
+    .await;
+
+    let overwrite = SqliteSink::new(SqliteSinkConfig {
+        database_url: url.clone(),
+        table_name: "t".to_string(),
+        column_mapping: SqliteColumnMapping::AutoMap,
+        batch_size: 1000,
+        max_connections: 1,
+        create_table: true,
+        busy_timeout_secs: 60,
+        write: WriteSpec {
+            write_mode: WriteMode::Overwrite,
+            ..WriteSpec::default()
+        },
+    })
+    .await
+    .expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+}
+
 #[tokio::test]
 async fn descriptor_matches_the_built_sink() {
     let dir = TempDir::new().expect("tempdir");

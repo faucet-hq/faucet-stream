@@ -140,6 +140,10 @@ jobs:
         run: |
           python3 scripts/test_helm_app_version.py
           python3 scripts/helm-app-version.py
+      - name: Check every declared connector capability has its conformance test (#878)
+        run: |
+          python3 scripts/test_conformance_coverage.py
+          python3 scripts/conformance-coverage.py
 
   # The agent skills ship with the engine (#853): they link to docs pages and
   # cli/examples files that must exist, carry no version facts, and their

@@ -39,11 +39,13 @@ async fn conformance_capabilities_truthful() {
     .await;
 
     let url = broker.url.clone();
-    faucet_conformance::assert_capabilities_truthful(&sink, move || {
+    let count = move || {
         let url = url.clone();
         async move { common::ready_count(&url, "conformance").await as usize }
-    })
-    .await;
+    };
+    faucet_conformance::assert_capabilities_truthful(&sink, count.clone()).await;
+    // #878: per-message confirm outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

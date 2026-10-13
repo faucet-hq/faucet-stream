@@ -157,6 +157,20 @@ async fn conformance_write_modes_truthful() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    // #878: per-row outcomes are truthful and a replayed keyed write converges
+    // on the primary key.
+    let sink = fresh_sink_delete("conf-declared").await;
+    let conn = support::connection("conf-declared", &support::emulator_host().await);
+    let count = || {
+        let conn = conn.clone();
+        async move { support::count_rows(&conn, "t").await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+}
+
 // ── Check: backend calls honour the call deadline and cancel (#880) ──────────
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
