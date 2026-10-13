@@ -65,6 +65,7 @@ pub enum HostKeyPolicy {
         /// Path to the `known_hosts` file. `None` uses the standard
         /// `~/.ssh/known_hosts` location.
         #[serde(default)]
+        #[schemars(extend("x-faucet-resource" = "path"))]
         known_hosts_path: Option<String>,
     },
     /// Trust-on-first-use: accept and record a host key the first time it is
@@ -93,6 +94,7 @@ pub enum SftpAuth {
     /// Public-key authentication with an OpenSSH/PEM private key on disk.
     PrivateKey {
         /// Path to the private-key file.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
         /// Optional passphrase used to decrypt an encrypted private key.
         #[serde(default)]

@@ -629,8 +629,7 @@ fn parse_config_with(
     crate::interpolate::interpolate_value(&mut doc).map_err(|e| e.to_string())?;
     crate::params::bind_document(&mut doc, &Default::default(), mode).map_err(|e| e.to_string())?;
     if let Some(origin) = screen {
-        crate::serve::load::refuse_subprocess(&doc, origin, false)
-            .and_then(|()| crate::serve::load::refuse_server_secrets(&doc))
+        crate::serve::load::screen_document(&doc, origin)
             .map_err(|e| e.api_error().error.message)?;
     }
     let mut cfg = PipelineConfig::from_value(doc).map_err(|e| e.to_string())?;
@@ -662,9 +661,7 @@ fn screen_config(ctx: &McpContext, text: &str) -> Result<(), String> {
         return Ok(());
     };
     let doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
-    crate::serve::load::refuse_server_secrets(&doc)
-        .and_then(|()| crate::serve::load::refuse_subprocess(&doc, origin, false))
-        .map_err(|e| e.api_error().error.message)
+    crate::serve::load::screen_document(&doc, origin).map_err(|e| e.api_error().error.message)
 }
 
 /// Read-only introspection: a config whose required params arrive later still

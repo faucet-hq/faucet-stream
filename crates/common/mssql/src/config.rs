@@ -33,6 +33,7 @@ pub struct MssqlConnectionConfig {
     /// `mssql://user:pass@host:1433/database` URL form. Mutually exclusive with
     /// [`connection_string`](Self::connection_string).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: Option<String>,
     /// ADO.NET-style connection string handed straight to `tiberius`, e.g.
     /// `Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually
@@ -55,6 +56,7 @@ pub struct MssqlTls {
     /// Optional path to a CA certificate (PEM/DER) to trust for server
     /// validation. Ignored when `mode` is [`MssqlTlsMode::Disable`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub ca_cert_path: Option<PathBuf>,
 }
 

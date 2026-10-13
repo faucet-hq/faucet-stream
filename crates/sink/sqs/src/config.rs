@@ -17,12 +17,14 @@ pub const MAX_BATCH_BYTES: usize = 1_048_576;
 #[serde(deny_unknown_fields)]
 pub struct SqsSinkConfig {
     /// SQS queue URL (e.g. `https://sqs.us-east-1.amazonaws.com/1234/my-q`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub queue_url: String,
     /// AWS region. `None` uses the SDK default chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// Custom endpoint URL for LocalStack / VPC endpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// AWS credentials. Defaults to the SDK default provider chain.
     #[serde(default)]

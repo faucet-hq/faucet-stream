@@ -55,6 +55,7 @@ pub enum Auth {
     },
     #[serde(rename = "oauth2")]
     OAuth2 {
+        #[schemars(extend("x-faucet-resource" = "url"))]
         token_url: String,
         client_id: String,
         client_secret: String,
@@ -75,6 +76,7 @@ pub enum Auth {
     /// is provided and the server returns an expiry value.
     TokenEndpoint {
         /// URL of the token endpoint.
+        #[schemars(extend("x-faucet-resource" = "url"))]
         url: String,
         /// HTTP method for the token request (e.g. GET, POST).
         #[serde(with = "crate::serde_helpers::http_method")]

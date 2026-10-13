@@ -67,6 +67,7 @@ pub mod quality;
 pub mod redact;
 pub mod replication;
 pub mod resilience;
+pub mod resolve;
 pub mod retry;
 pub mod rollback;
 pub mod schema;

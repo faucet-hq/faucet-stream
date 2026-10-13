@@ -154,6 +154,7 @@ fn config() -> ServeConfig {
         vault: None,
         connect_providers_path: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

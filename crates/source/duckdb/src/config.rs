@@ -11,6 +11,7 @@ pub struct DuckdbSourceConfig {
     /// Path to the DuckDB database file, or `:memory:` for an in-memory
     /// database. A `duckdb://` / `duckdb:` scheme prefix is accepted and
     /// stripped.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub database: String,
     /// SQL query to execute.
     pub query: String,

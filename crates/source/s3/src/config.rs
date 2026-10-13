@@ -115,6 +115,7 @@ pub struct S3SourceConfig {
     pub region: Option<String>,
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// Format of the files to read. Defaults to `json_lines`.
     #[serde(default)]

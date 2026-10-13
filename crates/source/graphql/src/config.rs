@@ -180,6 +180,7 @@ fn default_replication_method() -> ReplicationMethod {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphqlStreamConfig {
     /// GraphQL endpoint URL.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: String,
     /// The GraphQL query string.
     pub query: String,

@@ -142,6 +142,7 @@ pub struct DatabricksParam {
 #[serde(deny_unknown_fields)]
 pub struct DatabricksSourceConfig {
     /// Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub workspace_url: String,
     /// Target SQL Warehouse id.
     pub warehouse_id: String,

@@ -222,6 +222,20 @@ let stages = vec![TransformStage::Map(
 let wrapped = TransformingSource::new(source, stages);
 ```
 
+## Resource annotations and reference policies
+
+Mark a config field that names a local path, a URL or a program with
+`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`).
+`faucet_core::resolve` reads the annotation back from a config schema
+(`annotated_resources(schema, config)`, `declares(schema, kind)`) and checks
+each value with a `ReferencePolicy`: an allow-list of path roots (compared
+after symlinks resolve), URL schemes and hosts (link-local and cloud-metadata
+hosts refused unless listed), environment variable names, secret-manager
+schemes and whether a program may run. `ReferencePolicy::deny_all()` is the
+default and `open()` allows everything but metadata hosts. `faucet serve` uses
+it to confine configs a caller submits, so an annotated third-party connector
+is confined without serve changes.
+
 ## Error types
 
 `FaucetError` covers every failure mode:

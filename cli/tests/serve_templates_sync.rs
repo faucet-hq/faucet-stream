@@ -73,6 +73,7 @@ fn args(port: u16, sync: Option<std::path::PathBuf>) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

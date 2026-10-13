@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct SqliteSourceConfig {
     /// SQLite database URL (file path or `sqlite::memory:`).
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub database_url: String,
     /// SQL query to execute.
     pub query: String,

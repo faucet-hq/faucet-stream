@@ -114,6 +114,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(

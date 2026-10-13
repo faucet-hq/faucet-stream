@@ -497,6 +497,26 @@ pub fn run_expanded_boxed(
 }
 
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
+    run_expanded_unredacted(nodes, opts)
+        .await
+        .map(redact_summary)
+}
+
+/// Redact every invocation error where it is created (#874), before any
+/// consumer persists or forwards it.
+fn redact_summary(mut summary: RunSummary) -> RunSummary {
+    for inv in &mut summary.invocations {
+        if let Some(e) = inv.error.take() {
+            inv.error = Some(crate::secrets::registry::redact_message(&e));
+        }
+    }
+    summary
+}
+
+async fn run_expanded_unredacted(
+    nodes: Vec<ExpandedNode>,
+    opts: ExecuteOptions,
+) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
     if !opts.dry_run {
         check_overwrite_plan(&nodes, &opts).await?;

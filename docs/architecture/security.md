@@ -148,6 +148,19 @@ connector's `tls` / transport option as something to configure, not to inherit.
   `/v1` route is **admin-only, fail-closed**.
 - **Audit log** records `run.submit` / `run.cancel` / `run.delete` and every
   denial, through a single choke point (`serve/audit.rs`).
+- **One allow-list for every reference a caller's config makes.** Connector
+  fields that name a path, URL or program carry an `x-faucet-resource` schema
+  annotation (`faucet_core::resolve`), so a config sent over HTTP or MCP is
+  confined to `--allow-path-root` directories, `--allow-url-scheme` /
+  `--allow-url-host` URLs (link-local and metadata hosts refused unless
+  listed), `--allow-env` variables and `--allow-secret-scheme` secret managers,
+  and runs a program only with `--allow-subprocess-connectors`. The defaults
+  deny environment and secret-manager reads. Operator-written configs
+  (templates, the triggers file, `--default-config`) are not checked. See
+  [Reference policy](../book/src/reference/http-api.md#reference-policy).
+- **Run errors are redacted before they are persisted**, so the history
+  database never holds a resolved secret or a URL password from a failure
+  message.
 - **The static UI shell is public; all `/v1` data is bearer-gated.** The browser
   stores the token in `localStorage`.
 - **Cluster mode** shares a SQL database across instances; secure that database
@@ -190,6 +203,9 @@ For production deployments:
   config or committed files.
 - [ ] For `faucet serve`: never use `--no-auth` outside a trusted network; prefer
   `--auth-config` RBAC over a single admin token; secure the cluster database.
+- [ ] For `faucet serve`: set `--allow-path-root` / `--allow-url-host` to the
+  directories and hosts your pipelines need; grant `--allow-env` /
+  `--allow-secret-scheme` only for what submitted configs must read.
 - [ ] Restrict filesystem access to the state store and DLQ locations.
 - [ ] Review connector debug output before enabling it anywhere near secrets.
 

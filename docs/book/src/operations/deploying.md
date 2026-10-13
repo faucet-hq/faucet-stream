@@ -179,6 +179,10 @@ stray `.env` is never read.
   [serve security model](../cookbook/serve.md) before exposing it. Never use
   `--no-auth` beyond loopback, prefer RBAC with `viewer` as the default role,
   restrict egress, and keep `--preview-local-outputs` off outside development.
+  A submitted config may touch only what the
+  [reference policy](../reference/http-api.md#reference-policy) allows: name the
+  directories and hosts your pipelines need with `--allow-path-root` and
+  `--allow-url-host`, and grant `--allow-env` / `--allow-secret-scheme` sparingly.
 - **Logs.** Use `--log-format json` and `info` or quieter. Never run at debug
   level with resolved secrets: third-party connector output is outside faucet's
   redaction.

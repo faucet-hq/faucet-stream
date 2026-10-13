@@ -140,6 +140,7 @@ pub struct SnowflakeStageConfig {
     /// `s3://bucket/prefix/`, `gs://bucket/prefix/`, or
     /// `azure://container/prefix/`. Uploaded Parquet files land here and are
     /// then loaded via `@stage/<file>`.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
     /// Extra `object_store` config keys for the upload client (credentials,
     /// region, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,

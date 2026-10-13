@@ -15,6 +15,7 @@ use std::time::Duration;
 pub struct WebsocketSourceConfig {
     /// WebSocket endpoint, `ws://` or `wss://`. Supports `{placeholder}`
     /// parent-matrix context substitution.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
 
     /// Authentication applied to the HTTP upgrade request. Either inline

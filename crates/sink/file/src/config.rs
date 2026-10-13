@@ -29,6 +29,7 @@ pub struct FileSinkConfig {
     /// directory: files are named `part-{part}` plus the format's extension,
     /// so `format` must be set. `${now.*}` tokens are resolved by the CLI
     /// before the sink sees the path.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub path: String,
     /// File format: `auto` (default) resolves from the path's extension,
     /// looking through a compression suffix (`.csv.gz` is CSV). ORC is

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct JsonlSinkConfig {
     /// Path to the output file.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub path: PathBuf,
     /// Whether to append to an existing file (default: false, truncates).
     #[serde(default)]

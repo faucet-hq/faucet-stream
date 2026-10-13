@@ -18,6 +18,7 @@ pub struct DeltaConnection {
     /// Delta table location URI: `file:///abs/path`, `s3://bucket/key`,
     /// `abfss://…`, `gs://bucket/key`. A bare local path is accepted and
     /// treated as `file://`.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub table_uri: String,
 
     /// Object-store credentials. Defaults to the ambient provider chain.

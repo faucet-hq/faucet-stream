@@ -134,6 +134,7 @@ pub struct AwsCredentials {
     pub region: Option<String>,
     /// `AWS_ENDPOINT_URL` — override for S3-compatible stores (MinIO, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// `AWS_ALLOW_HTTP` — permit plaintext HTTP to the endpoint (MinIO in dev).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +177,7 @@ impl std::fmt::Debug for AzureCredentials {
 pub struct GcpCredentials {
     /// `GOOGLE_SERVICE_ACCOUNT` — path to a service-account JSON key file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub service_account_path: Option<String>,
     /// `GOOGLE_SERVICE_ACCOUNT_KEY` — inline service-account JSON key.
     #[serde(default, skip_serializing_if = "Option::is_none")]

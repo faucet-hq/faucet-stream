@@ -15,7 +15,6 @@ use crate::error::CliError;
 use crate::pipeline_state::PipelineTarget;
 use crate::pipeline_state::ops::{self, Stores};
 use crate::serve::error::ServeError;
-use crate::serve::load::load_submission;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
@@ -75,7 +74,6 @@ async fn resolve(
                 .into(),
         ));
     }
-    let policy = crate::serve::runner::server_policy(state);
     let loaded = match (&src.config, &src.template) {
         (Some(_), Some(_)) => {
             return Err(ServeError::BadConfig(
@@ -83,25 +81,19 @@ async fn resolve(
             ));
         }
         (Some(body), None) => {
-            load_submission(
-                body,
-                src.config_format.into(),
-                state.default_base().as_ref(),
-                policy.as_deref(),
-                state.caller_origin(),
-            )
-            .await?
+            state
+                .load_submission(body, src.config_format.into(), state.caller_origin())
+                .await?
         }
         (None, Some(id)) => {
             let body = template_body(state, id, src).await?;
-            load_submission(
-                &body,
-                crate::serve::load::ConfigFormat::Json,
-                state.default_base().as_ref(),
-                policy.as_deref(),
-                crate::serve::load::BodyOrigin::Trusted,
-            )
-            .await?
+            state
+                .load_submission(
+                    &body,
+                    crate::serve::load::ConfigFormat::Json,
+                    crate::serve::load::BodyOrigin::Trusted,
+                )
+                .await?
         }
         (None, None) => {
             return Err(ServeError::BadConfig(

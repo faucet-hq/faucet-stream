@@ -151,6 +151,8 @@ pub struct ServeConfig {
     /// Whether a caller-supplied config may use connectors that run a program
     /// on the server (`--allow-subprocess-connectors`).
     pub allow_subprocess_connectors: bool,
+    /// What a caller-supplied config may reach (#881): the `--allow-*` flags.
+    pub references: crate::serve::references::ServeReferencePolicy,
 }
 
 /// Log-shipping buffer bounds and the console's log link (#806).
@@ -475,6 +477,8 @@ impl ServeConfig {
             }),
             connect_providers_path: args.connect_providers,
             allow_subprocess_connectors: args.allow_subprocess_connectors,
+            references: crate::serve::references::ServeReferencePolicy::from_args(&args.references)
+                .map_err(CliError::Config)?,
         })
     }
 }
@@ -646,6 +650,7 @@ mod tests {
             vault_previous_key: Vec::new(),
             connect_providers: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         }
     }
 

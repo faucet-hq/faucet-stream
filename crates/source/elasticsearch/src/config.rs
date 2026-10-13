@@ -12,6 +12,7 @@ pub use faucet_common_elasticsearch::ElasticsearchAuth;
 #[serde(deny_unknown_fields)]
 pub struct ElasticsearchSourceConfig {
     /// Base URL of the Elasticsearch cluster (e.g. `"http://localhost:9200"`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub base_url: String,
     /// Index name to search.
     pub index: String,

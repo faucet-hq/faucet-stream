@@ -56,6 +56,7 @@ pub struct ClickHouseConnection {
     /// `"http://localhost:8123"`. Mutually exclusive with
     /// [`host`](Self::host). A trailing slash is trimmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: Option<String>,
     /// Hostname of the ClickHouse server. Mutually exclusive with
     /// [`url`](Self::url); combined with [`http_port`](Self::http_port) and

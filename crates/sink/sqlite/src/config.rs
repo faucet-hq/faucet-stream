@@ -28,6 +28,7 @@ impl Default for SqliteColumnMapping {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SqliteSinkConfig {
     /// SQLite database URL (file path or `:memory:`).
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub database_url: String,
     /// Target table name.
     pub table_name: String,

@@ -43,11 +43,13 @@ pub enum CdcTls {
     /// Require TLS and verify the chain against `ca_path` (or system roots).
     VerifyCa {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("x-faucet-resource" = "path"))]
         ca_path: Option<String>,
     },
     /// Require TLS and verify both the chain and the hostname.
     VerifyFull {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("x-faucet-resource" = "path"))]
         ca_path: Option<String>,
     },
 }
@@ -57,6 +59,7 @@ pub enum CdcTls {
 #[serde(deny_unknown_fields)]
 pub struct MysqlCdcSourceConfig {
     /// Connection URL, e.g. `mysql://repl:pass@host:3306/db`.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
     /// Replica server id. **Required** and must be unique across all replicas.
     pub server_id: u32,

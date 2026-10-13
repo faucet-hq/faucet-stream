@@ -70,6 +70,8 @@ struct Inner {
     /// Whether a caller-supplied config may use subprocess connectors
     /// (`--allow-subprocess-connectors`).
     allow_subprocess_connectors: bool,
+    /// What a caller-supplied config may reach (#881).
+    references: Arc<crate::serve::references::ServeReferencePolicy>,
     /// Set when shutdown begins: new work is refused and `/readyz` is 503.
     draining: std::sync::atomic::AtomicBool,
 }
@@ -117,6 +119,7 @@ impl ServerState {
                 require_approval: config.require_approval.clone(),
                 approval_expiry: config.approval_expiry,
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
+                references: Arc::new(config.references.clone()),
                 draining: std::sync::atomic::AtomicBool::new(false),
             }),
         }
@@ -134,6 +137,31 @@ impl ServerState {
         crate::serve::load::BodyOrigin::Caller {
             allow_subprocess: self.inner.allow_subprocess_connectors,
         }
+    }
+
+    /// The server's reference policy (#881).
+    pub fn references(&self) -> Arc<crate::serve::references::ServeReferencePolicy> {
+        self.inner.references.clone()
+    }
+
+    /// Load a config body under this server's default base, data-flow policy
+    /// and reference policy.
+    pub async fn load_submission(
+        &self,
+        body: &str,
+        format: crate::serve::load::ConfigFormat,
+        origin: crate::serve::load::BodyOrigin,
+    ) -> Result<crate::serve::load::LoadedSubmission, crate::serve::error::ServeError> {
+        crate::serve::load::load_submission_with(
+            body,
+            format,
+            self.default_base().as_ref(),
+            crate::serve::runner::server_policy(self).as_deref(),
+            origin,
+            None,
+            &self.references(),
+        )
+        .await
     }
 
     /// The origin of a body: [`Self::caller_origin`] unless the server's
@@ -401,6 +429,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         }
     }
 

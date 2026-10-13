@@ -207,6 +207,7 @@ pub enum XmlPagination {
 #[serde(deny_unknown_fields)]
 pub struct XmlStreamConfig {
     /// Base URL of the API.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub base_url: String,
     /// Request path (appended to base_url).
     pub path: String,
