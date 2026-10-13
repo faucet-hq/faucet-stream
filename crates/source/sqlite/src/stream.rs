@@ -21,6 +21,9 @@ pub struct SqliteSource {
     /// whole-dataset shard) means the full query is streamed. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
     applied_shard: Mutex<Option<PkShardBounds>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 /// Quote a SQLite identifier with backticks.
@@ -79,6 +82,7 @@ impl SqliteSource {
             config,
             pool,
             applied_shard: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -309,6 +313,17 @@ fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Result<Value, FaucetError> {
 
 #[async_trait]
 impl faucet_core::Source for SqliteSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
@@ -317,10 +332,15 @@ impl faucet_core::Source for SqliteSource {
         let query_str = self.shard_wrap(query_str);
         let query = bind_params(sqlx::query(&query_str), &bind_values)?;
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?;
+        let rows = self
+            .calls
+            .call_once("query", async {
+                query
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))
+            })
+            .await?;
 
         let records: Vec<Value> = rows.iter().map(row_to_json).collect::<Result<_, _>>()?;
         tracing::info!(
@@ -358,22 +378,33 @@ impl faucet_core::Source for SqliteSource {
             let query = bind_params(sqlx::query(&query_str), &bind_values)?;
 
             let mut rows = query.fetch(&self.pool);
+            // The first step runs the statement (and waits on a lock); later
+            // steps read the local file.
+            let first = self
+                .calls
+                .call_once("query", async {
+                    rows.try_next()
+                        .await
+                        .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))
+                })
+                .await?;
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            while let Some(row) = rows
-                .try_next()
-                .await
-                .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?
-            {
+            let mut next = first;
+            while let Some(row) = next {
                 buffer.push(row_to_json(&row)?);
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
                     yield StreamPage { records: page, bookmark: None };
                 }
+                next = rows
+                    .try_next()
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?;
             }
             if !buffer.is_empty() {
                 total += buffer.len();
@@ -423,14 +454,19 @@ impl faucet_core::Source for SqliteSource {
     /// `pragma_table_info` — catalog metadata only, no data scan. SQLite has
     /// no cheap row-count statistic, so `estimated_rows` is always `None`.
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
-        let tables = sqlx::query(
-            "SELECT name FROM sqlite_master \
+        let tables = self
+            .calls
+            .call_once("discover", async {
+                sqlx::query(
+                    "SELECT name FROM sqlite_master \
               WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
               ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FaucetError::Source(format!("sqlite: catalog discovery failed: {e}")))?;
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Source(format!("sqlite: catalog discovery failed: {e}")))
+            })
+            .await?;
 
         let mut catalog: Vec<CatalogRow> = Vec::new();
         for table_row in &tables {
@@ -443,8 +479,12 @@ impl faucet_core::Source for SqliteSource {
             // backtick-quoted because NOTNULL is a SQLite operator keyword
             // (and double quotes are a misfeature here — see
             // `quote_ident_sqlite`).
-            let columns =
-                sqlx::query("SELECT name, type, `notnull` FROM pragma_table_info(?) ORDER BY cid")
+            let columns = self
+                .calls
+                .call_once("discover", async {
+                    sqlx::query(
+                        "SELECT name, type, `notnull` FROM pragma_table_info(?) ORDER BY cid",
+                    )
                     .bind(&table)
                     .fetch_all(&self.pool)
                     .await
@@ -452,7 +492,9 @@ impl faucet_core::Source for SqliteSource {
                         FaucetError::Source(format!(
                             "sqlite: catalog discovery failed (table_info for {table}): {e}"
                         ))
-                    })?;
+                    })
+                })
+                .await?;
             for col in &columns {
                 let decode = |c: &str| -> Result<String, FaucetError> {
                     col.try_get::<String, _>(c).map_err(|e| {
@@ -493,16 +535,21 @@ impl faucet_core::Source for SqliteSource {
             &quote_ident_sqlite(&shard_cfg.key),
             "INTEGER",
         );
-        let row = sqlx::query(&bounds_sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!(
-                    "sqlite: failed to compute shard bounds for key {:?} \
+        let row = self
+            .calls
+            .call_once("query", async {
+                sqlx::query(&bounds_sql)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Source(format!(
+                            "sqlite: failed to compute shard bounds for key {:?} \
                      (it must be an integer-typed column): {e}",
-                    shard_cfg.key
-                ))
-            })?;
+                            shard_cfg.key
+                        ))
+                    })
+            })
+            .await?;
 
         let lo: Option<i64> = row
             .try_get("lo")
