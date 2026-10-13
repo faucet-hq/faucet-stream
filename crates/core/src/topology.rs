@@ -1714,7 +1714,8 @@ async fn compute_resume(
     }
     let mut stored: Vec<(String, Option<Value>)> = Vec::with_capacity(sinks.len());
     for (id, _) in sinks {
-        let key = format!("{}::{}", opts.pipeline_name, id);
+        let key = crate::state_key::StateKey::invocation(opts.pipeline_name.as_str(), id.as_str())
+            .render();
         let value = match store.get(&key).await {
             // Refuse a bookmark the source cannot read; migrate an older one (#736).
             Ok(Some(v)) => Some(match source {
@@ -1746,7 +1747,8 @@ async fn compute_resume(
             .as_ref()
             .map(crate::idempotency::unwrap_state)
             .unwrap_or((None, 0));
-        let key = format!("{}::{}", opts.pipeline_name, id);
+        let key = crate::state_key::StateKey::invocation(opts.pipeline_name.as_str(), id.as_str())
+            .render();
         if let (Some(sink), Some(src)) = (sink, source)
             && sink.supports_idempotent_writes()
             && src.replay_guarantee() == crate::idempotency::ReplayGuarantee::Deterministic
@@ -2402,7 +2404,9 @@ async fn run_sink_node(
     let overwriting = sink.is_overwrite();
     let mut deferred = None;
     if let Some(store) = opts.state_store {
-        let key = format!("{}::{}", opts.pipeline_name, node_id);
+        let key =
+            crate::state_key::StateKey::invocation(opts.pipeline_name.as_str(), node_id.as_str())
+                .render();
         let store: Arc<dyn StateStore> = Arc::new(crate::state_version::VersionedStateStore::new(
             store,
             key.clone(),
