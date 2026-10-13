@@ -137,6 +137,10 @@ Forwarding is verbatim. That includes the convenience hooks whose default calls
 another hook (`fetch_all`, `stream_pages`, `check`, `write_batch_partial`,
 `write_batch_idempotent`). If your wrapper changes a hook, list the other hooks
 that must go through the change rather than straight to the inner connector.
+One exception is automatic: a wrapper that lists `write_batch` does not forward
+`write_batch_reported` either, so the pipeline's reported write goes through
+your `write_batch` (#879). Define `write_batch_reported` yourself to pass the
+inner sink's coalescing / skip report through.
 
 Then prove it with the forwarding harness from `faucet-conformance`.
 `HookSource` / `HookSink` answer every hook differently from the default and
@@ -225,6 +229,26 @@ bookmark. The bookmark never moves ahead of durable data, which asks of you:
 - The crash window between flush and checkpoint is deliberate: the page is
   re-read on the next run. Default delivery is at-least-once, so every sink must
   tolerate seeing a page twice. An empty slice is a cheap `Ok(0)`.
+
+**Row accounting.** The pipeline checks that every row it offers a sink is
+accounted for (#879): it calls `write_batch_reported` and fails the page with
+`RowsUnaccounted` when the report covers fewer rows than were offered — so
+`write_batch` must return the number of rows it wrote, not the number of
+requests or a count the backend may lower. The default report wraps that
+count, and for a sink configured to merge rows by key (`dedups_by_key()`)
+credits the shortfall as coalesced. Override `write_batch_reported` when the
+sink declines rows **by design of its configuration** (a key policy that
+skips records, a preview cap) and report them as skipped:
+
+```rust,ignore
+async fn write_batch_reported(&self, records: &[Value]) -> Result<WriteReport, FaucetError> {
+    let (written, skipped) = self.produce(records).await?;
+    Ok(WriteReport::accepted(written).with_skipped(skipped))
+}
+```
+
+A row the sink could not write is never "skipped": return it as a per-row
+`Err` from `write_batch_partial` (it goes to the DLQ) or fail the batch.
 
 **Per-row outcomes.** Override `write_batch_partial` when the backend reports
 per-row results or a row is invalid before sending (a missing key): one outcome

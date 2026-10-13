@@ -153,9 +153,21 @@ renamed (`ssn` → `tax_id`) carries the labels of its original name there too.
   let the record reach the DLQ either, the run fails instead of moving it
   there. Every labelled column of the record is checked at the DLQ, not only
   the one that broke the main sink's rule. `faucet validate` / `faucet policy`
-  report those violations against sink `dlq`. Rows that other passes send to
-  the DLQ (quality, contract, schema drift, per-row sink failures) are checked
-  only by the static pass, which evaluates sink `dlq` like any other sink.
+  report those violations against sink `dlq`.
+- **Every row that reaches the DLQ is checked there**, whichever pass sent it:
+  a quality, contract or schema-drift quarantine, a per-row sink failure, or a
+  policy quarantine. The DLQ is a governed destination of its own, so a row
+  whose labels may not reach the DLQ's `attributes` fails the run instead of
+  landing there. The static pass evaluates sink `dlq` whenever a `dlq:` block
+  is configured, with the masking that reaches it — a masking rule whose
+  `applies_to` names `dlq` (or the DLQ's connector kind) masks the envelope
+  payloads and satisfies a `mask:` rule there.
+- A `quarantine` rule makes the run take the row path, so the same input
+  quarantines the same rows whichever fast path (columnar, native) the
+  connectors would otherwise take. It cannot be combined with
+  `delivery: exactly_once` on the atomic-watermark path (that commits whole
+  pages and forbids a DLQ): `faucet validate` refuses the pair by name and
+  suggests `on_runtime: fail` or keyed-upsert effectively-once.
 
 ```yaml
 pipeline:

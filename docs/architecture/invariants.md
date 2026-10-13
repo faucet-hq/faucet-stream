@@ -84,7 +84,14 @@ before the DLQ, and before any lineage sample. No downstream component ever sees
 unmasked PII.
 
 **Where.** `run_stream` applies masking as the first per-page transformation
-(`crates/core/src/pipeline.rs`, guarded by `#[cfg(feature = "masking")]`).
+(`crates/core/src/pipeline.rs`, guarded by `#[cfg(feature = "masking")]`). Every
+entry point gets the pass from one `faucet_core::Governance` value
+(`crates/core/src/governance.rs`, RFC 0013 #875), built by the CLI's single
+`governance_for` — a caller that must not mask (a DLQ replay: the payloads are
+already masked) opts out with `Governance::without(Pass::Masking, reason)`,
+which is recorded and logged, never by leaving the field unset. Masking rules
+whose `applies_to` names the DLQ (`dlq` or its kind) are applied to the
+envelope payloads by the governed DLQ stack (#870).
 
 **If violated.** PII would leak to a sink, a DLQ envelope, or a lineage sample —
 a security/compliance defect. See [masking](./masking.md).
@@ -96,7 +103,19 @@ a security/compliance defect. See [masking](./masking.md).
 data must never be committed; `schema: on_drift=fail` *defers* its abort until
 the page's individually-valid survivors are durable.
 
-**Where.** `run_stream` pass sequence in `crates/core/src/pipeline.rs`.
+**Where.** `run_stream` pass sequence in `crates/core/src/pipeline.rs`. Around
+the sink the order is fixed too, and enforced by the one builder
+(`Governance::sink_builder`, `faucet_core::SINK_LAYERS`, #875):
+
+```text
+policy → profiling → [outer tap] → metadata columns → [inner tap] → budget → destination
+```
+
+A unit test asserts the order; `Pipeline::run` refuses a governance value with
+sink-side passes whose destination was not built by the builder. The DLQ is
+wrapped by the same machinery — DLQ-only masking → policy (the DLQ's own
+`attributes`) → budget (shared with the main sink) → metering — so a row any
+pass quarantines is governed like a written one (#870).
 
 **If violated.** Reordering could let a quality check pass on unmasked data, or
 commit contract-breaching rows. The fixed order removes a footgun config knob.
@@ -170,6 +189,26 @@ emitter's swallow-and-count path.
 **If violated.** A metrics backend outage could take down data movement — an
 unacceptable coupling. See [observability](./observability.md),
 [standards: logging](../standards/logging.md).
+
+## I12 — Every row offered to a sink is accounted for
+
+**Guarantee.** Per page, `offered = accepted + coalesced + skipped + failed
+(DLQ) + quarantined + dropped` (#879). A sink whose write reports fewer rows
+than it was offered — with no per-row outcome, no coalescing and no declared
+skip — fails the page with `FaucetError::RowsUnaccounted` before the bookmark
+advances, so a resumed run reads the page again.
+
+**Where.** `crates/core/src/accounting.rs` (`WriteReport`, `RowAccounts`) and the
+write sites of `run_stream` / the columnar loop, which call
+`Sink::write_batch_reported`. A sink that merges rows by key
+(`dedups_by_key()`) is credited with the merged rows by the trait default; one
+that declines rows by design reports them as `skipped`. Native loads are
+checked when the source reports a row count, and logged as unchecked
+otherwise.
+
+**If violated.** A sink that silently dropped rows (unknown fields, conversion
+failures, best-effort APIs) would report a green run — the "silent green" class
+of the audits.
 
 ---
 
