@@ -557,6 +557,41 @@ impl CallSlot {
     }
 }
 
+/// Run any future as a one-shot backend call: `client.send().within(&slot,
+/// "put").await?` is [`CallSlot::call_once`] for a future whose output is not
+/// a [`FaucetError`] result (an SDK response), handing that output back
+/// untouched. The outer `Result` is the call context running out — the
+/// deadline or the cancel token.
+pub trait CallExt: Future + Send + Sized {
+    /// `self` as the call `op` through `slot`'s effective context.
+    fn within<'a>(
+        self,
+        slot: &'a CallSlot,
+        op: &'static str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Self::Output, FaucetError>> + Send + 'a>>
+    where
+        Self: 'a,
+        Self::Output: Send,
+    {
+        Box::pin(slot.call_once(op, async move { Ok(self.await) }))
+    }
+
+    /// [`within`](Self::within) through a [`CallContext`].
+    fn within_ctx<'a>(
+        self,
+        ctx: &'a CallContext,
+        op: &'static str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Self::Output, FaucetError>> + Send + 'a>>
+    where
+        Self: 'a,
+        Self::Output: Send,
+    {
+        Box::pin(ctx.call_once(op, async move { Ok(self.await) }))
+    }
+}
+
+impl<F: Future + Send> CallExt for F {}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
@@ -634,6 +669,17 @@ mod tests {
         cancel.cancel();
         let r = slot.call_once("read", async { Ok(5) }).await;
         assert!(matches!(r, Err(FaucetError::Cancelled { .. })), "{r:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn within_hands_back_the_output_or_the_spent_context() {
+        let slot = CallSlot::new(CallContext::new().with_timeout(Duration::from_secs(1)));
+        let out: Result<u8, &str> = async { Err("sdk") }.within(&slot, "put").await.unwrap();
+        assert_eq!(out, Err("sdk"));
+        let hung = std::future::pending::<u8>().within(&slot, "put").await;
+        assert!(matches!(hung, Err(FaucetError::Timeout { .. })), "{hung:?}");
+        let ctx = CallContext::new();
+        assert_eq!(async { 3 }.within_ctx(&ctx, "get").await.unwrap(), 3);
     }
 
     #[tokio::test]
