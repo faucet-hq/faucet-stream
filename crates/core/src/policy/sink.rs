@@ -132,6 +132,18 @@ impl PolicySink {
         .increment(1);
     }
 
+    /// Screen an exactly-once page, which commits whole: any violation fails it.
+    fn screen_idempotent(&self, records: &[Value]) -> Result<(), FaucetError> {
+        match self.screen(records)?.first() {
+            Some((_, v)) => Err(FaucetError::PolicyViolation {
+                rule: v.rule.clone(),
+                column: v.column.clone(),
+                message: format!("{v} (exactly-once pages cannot be partially quarantined)"),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Screen a page: `Ok(offending indexes with their first violation)` when
     /// every violated rule quarantines, `Err` when any asks to fail the run.
     fn screen(&self, records: &[Value]) -> Result<Vec<(usize, Violation)>, FaucetError> {
@@ -305,6 +317,7 @@ impl Sink for PolicySink {
     // everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
         write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_idempotent_reported,
         write_batch_columnar, native_load_capabilities, load_native);
 
     async fn write_batch_reported(
@@ -381,16 +394,21 @@ impl Sink for PolicySink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let offending = self.screen(records)?;
-        if let Some((_, v)) = offending.first() {
-            return Err(FaucetError::PolicyViolation {
-                rule: v.rule.clone(),
-                column: v.column.clone(),
-                message: format!("{v} (exactly-once pages cannot be partially quarantined)"),
-            });
-        }
+        self.screen_idempotent(records)?;
         self.inner
             .write_batch_idempotent(records, scope, token)
+            .await
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.screen_idempotent(records)?;
+        self.inner
+            .write_batch_idempotent_reported(records, scope, token)
             .await
     }
 

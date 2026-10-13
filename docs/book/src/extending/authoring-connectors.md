@@ -140,7 +140,10 @@ that must go through the change rather than straight to the inner connector.
 One exception is automatic: a wrapper that lists `write_batch` does not forward
 `write_batch_reported` either, so the pipeline's reported write goes through
 your `write_batch` (#879). Define `write_batch_reported` yourself to pass the
-inner sink's coalescing / skip report through.
+inner sink's coalescing / skip report through. The same holds for the
+exactly-once write: a wrapper that lists `write_batch_idempotent` does not
+forward `write_batch_idempotent_reported`; define it to pass the inner report
+through.
 
 Then prove it with the forwarding harness from `faucet-conformance`.
 `HookSource` / `HookSink` answer every hook differently from the default and
@@ -249,6 +252,15 @@ async fn write_batch_reported(&self, records: &[Value]) -> Result<WriteReport, F
 
 A row the sink could not write is never "skipped": return it as a per-row
 `Err` from `write_batch_partial` (it goes to the DLQ) or fail the batch.
+
+The exactly-once path is held to the same rule. It calls
+`write_batch_idempotent_reported`, whose default wraps
+`write_batch_idempotent`'s count the same way; a page whose report is short
+fails with `RowsUnaccounted` after the sink committed its token but before the
+bookmark is persisted, so the run is red and the next run resumes from the
+sink's watermark. An idempotent sink that declines rows by design inside the
+atomic commit overrides `write_batch_idempotent_reported` and reports them as
+skipped (the kafka sink does this for `on_key_error: skip`).
 
 **Per-row outcomes.** Override `write_batch_partial` when the backend reports
 per-row results or a row is invalid before sending (a missing key): one outcome

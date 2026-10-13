@@ -751,6 +751,15 @@ pub fn quarantines(spec: &PolicySpec) -> bool {
         .any(|r| r.on_runtime == faucet_core::policy::RuntimeAction::Quarantine)
 }
 
+/// Whether a rule that can apply at `sink` — its `when.sink_kind` and
+/// `when.sink` attributes match — quarantines at run time.
+pub fn quarantines_at(spec: &PolicySpec, sink: &SinkFacts) -> bool {
+    spec.rules.iter().any(|r| {
+        r.on_runtime == faucet_core::policy::RuntimeAction::Quarantine
+            && faucet_core::policy::rule_applies(r, &r.when.label, sink)
+    })
+}
+
 /// Count the static violations into the shared metric.
 pub fn record_metrics(pipeline: &str, report: &PolicyReport) {
     for row in &report.rows {
@@ -927,6 +936,39 @@ pipeline:
             err.contains("on_runtime: quarantine is not compatible with delivery: exactly_once"),
             "{err}"
         );
+    }
+
+    /// The exactly-once refusal counts only quarantine rules whose `when`
+    /// scope can reach this row's sink.
+    #[test]
+    fn only_a_quarantine_scoped_to_the_rows_sink_refuses_exactly_once() {
+        let refused = |when: Value| {
+            let mut c =
+                mk_cfg("  state: { type: file, config: { path: st } }\ndelivery: exactly_once\n");
+            c.policy = Some(
+                serde_json::from_value(json!({
+                    "classifications": [{"label": "pii", "fields": ["email"]}],
+                    "rules": [{"name": "r", "when": when,
+                               "require": {"residency": ["eu"]}, "on_runtime": "quarantine"}]
+                }))
+                .unwrap(),
+            );
+            expand(&c)
+                .unwrap_err()
+                .to_string()
+                .contains("on_runtime: quarantine is not compatible")
+        };
+        assert!(refused(json!({"label": "pii", "sink_kind": ["jsonl"]})));
+        assert!(refused(
+            json!({"label": "pii", "sink": {"environment": ["prod"]}})
+        ));
+        assert!(!refused(json!({"label": "pii", "sink_kind": ["postgres"]})));
+        assert!(!refused(
+            json!({"label": "pii", "sink": {"environment": ["dev"]}})
+        ));
+        assert!(!refused(
+            json!({"label": "pii", "sink": {"region": ["eu-west-1"]}})
+        ));
     }
 
     /// #870: a DLQ is evaluated as a destination of its own whenever one is

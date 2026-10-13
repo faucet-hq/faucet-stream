@@ -127,6 +127,7 @@ pub const SINK_HOOKS: &[&str] = &[
     "supports_staged_load",
     "cleanup_scope",
     "write_batch_idempotent",
+    "write_batch_idempotent_reported",
     "last_committed_token",
     "is_overwrite",
     "begin_overwrite",
@@ -330,6 +331,15 @@ impl Sink for HookSink {
         self.hit("write_batch_idempotent");
         Ok(records.len())
     }
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        _scope: &str,
+        _token: &str,
+    ) -> Result<WriteReport, FaucetError> {
+        self.hit("write_batch_idempotent_reported");
+        Ok(WriteReport::accepted(records.len()))
+    }
     async fn last_committed_token(&self, _scope: &str) -> Result<Option<String>, FaucetError> {
         self.hit("last_committed_token");
         Ok(Some("tok".into()))
@@ -459,6 +469,9 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
     let _ = sink.supports_staged_load();
     let _ = sink.cleanup_scope(&BTreeMap::new(), &SeenKeys::new()).await;
     let _ = sink.write_batch_idempotent(&page, "scope", "tok").await;
+    let _ = sink
+        .write_batch_idempotent_reported(&page, "scope", "tok")
+        .await;
     let _ = sink.last_committed_token("scope").await;
     let _ = sink.is_overwrite();
     let _ = sink.begin_overwrite().await;

@@ -36,6 +36,7 @@ impl Sink for ProfilingSink {
     // else reaches the wrapped sink.
     crate::forward_sink!(inner; except
         write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_idempotent_reported,
         write_batch_columnar, native_load_capabilities, load_native);
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -83,6 +84,20 @@ impl Sink for ProfilingSink {
             .await?;
         self.observe(records);
         Ok(n)
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let r = self
+            .inner
+            .write_batch_idempotent_reported(records, scope, token)
+            .await?;
+        self.observe(records);
+        Ok(r)
     }
 
     #[cfg(feature = "arrow")]

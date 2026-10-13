@@ -248,7 +248,7 @@ Use `${env:VAR}` / `${secret:…}` interpolation so credentials never land in th
 | Value | Behaviour |
 |-------|-----------|
 | `fail` *(default)* | Abort the batch with `FaucetError::Sink`. |
-| `skip` | Drop the record, log a `WARN`, continue. The dropped records are reported as *skipped* to the pipeline's row accounting, so the run stays balanced. |
+| `skip` | Drop the record, log a `WARN`, continue. The dropped records are reported as *skipped* to the pipeline's row accounting — on the exactly-once path too (`write_batch_idempotent_reported`) — so the run stays balanced. |
 | `round_robin` | Send the record with no key; librdkafka assigns the partition. Record is kept. |
 
 It does **not** apply to `from_path` topic failures (including a path resolving to `null`) — those are always fatal.

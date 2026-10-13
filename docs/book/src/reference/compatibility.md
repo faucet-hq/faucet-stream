@@ -53,7 +53,7 @@ A sink declares its capabilities (`Sink::capabilities`, `faucet list --json`). T
 
 - `dlq:` (`on_batch_error: propagate`) × exactly-once watermark: delivery: exactly_once (atomic watermark) is not compatible with a DLQ in this version.
 - `write_mode: overwrite` × exactly-once watermark: delivery: exactly_once (atomic watermark) is not compatible with write_mode: overwrite.
-- `policy:` rule with `on_runtime: quarantine` × exactly-once watermark: a policy rule with on_runtime: quarantine is not compatible with delivery: exactly_once (atomic watermark): a quarantined row would fail the whole page's atomic commit instead of reaching the DLQ.
+- `policy:` rule with `on_runtime: quarantine` × exactly-once watermark: a policy rule with on_runtime: quarantine is not compatible with delivery: exactly_once (atomic watermark): a quarantined row would fail the whole page's atomic commit instead of reaching the DLQ (only a rule whose `when` can match the row's sink kind and attributes counts).
 - `complete_for: { on_missing: delete }` × overwrite staging: write_mode: overwrite replaces the whole destination, so scoped cleanup has nothing to do.
 - `schema: { on_drift: evolve }` × overwrite staging: write_mode: overwrite stages into a copy of the destination taken before the run, so schema.on_drift: evolve cannot apply to it.
 - `schema: { on_drift: fail }` × sink drops unknown fields: schema.on_drift: fail cannot be enforced against this sink: it reports no destination schema and silently drops fields its schema lacks, so a drift would never be detected and the fields would be lost.

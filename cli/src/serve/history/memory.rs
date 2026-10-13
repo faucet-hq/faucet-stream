@@ -230,6 +230,16 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn insert_new(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        match self.runs.entry(rec.run_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(rec.clone());
+                Ok(true)
+            }
+        }
+    }
+
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError> {
         Ok(self.runs.get(id).map(|r| r.clone()))
     }

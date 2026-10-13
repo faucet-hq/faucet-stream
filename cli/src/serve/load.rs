@@ -725,6 +725,20 @@ fn check_connector(
                 continue;
             }
         }
+        if caller
+            && (r.kind == ResourceKind::Url
+                || (r.kind == ResourceKind::Path && local_path(&r.value).is_none()))
+            && faucet_core::resolve::url_hosts(&r.value)
+                .iter()
+                .any(|h| takes_record_value(h))
+        {
+            found.policy.push(format!(
+                "{kind}{}: {} (a URL host in a submitted config may not take a value from \
+                 records — it cannot be checked)",
+                r.pointer, r.value
+            ));
+            continue;
+        }
         if let Some(Err(e)) = policy.map(|p| p.check(&r)) {
             found.policy.push(format!("{} ({})", r.value, e.reason));
         }
@@ -898,6 +912,58 @@ fn override_connectors(cfg: &PipelineConfig) -> Vec<(String, Value, Access)> {
         }
     }
     out
+}
+
+/// Refuse a server-local path a request names outside a config (a DLQ
+/// location): like a connector path in a submitted config, it may not reach a
+/// system tree or the server's credentials, and must pass the caller
+/// reference policy — for a tenant, confined to the tenant's path root.
+/// `write` is a path the request writes, archives or deletes.
+pub fn refuse_request_path(
+    field: &str,
+    path: &str,
+    write: bool,
+    tenant: Option<&str>,
+) -> Result<(), ServeError> {
+    let policy = crate::serve::references::installed().for_origin(
+        BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        tenant,
+    );
+    refuse_request_path_with(field, path, write, tenant.is_some(), &policy)
+}
+
+/// [`refuse_request_path`] under an explicit caller policy.
+pub fn refuse_request_path_with(
+    field: &str,
+    path: &str,
+    write: bool,
+    for_tenant: bool,
+    policy: &ReferencePolicy,
+) -> Result<(), ServeError> {
+    let local = local_path(path).unwrap_or(path);
+    let protected = data_path_is_protected(local, Access::Read { recursive: true })
+        || (write && data_path_is_protected(local, Access::Write));
+    if protected {
+        return Err(ServeError::Forbidden(format!(
+            "`{field}` ({path}) reaches a location a request to `faucet serve` may not touch — \
+             a system tree ({}) or a file holding the server's own credentials",
+            SYSTEM_DIRS.join(", ")
+        )));
+    }
+    policy.check_path(path).map_err(|e| {
+        ServeError::Forbidden(format!(
+            "`{field}` ({path}) is not allowed under the server's reference policy: {}; the \
+             operator can allow it with --allow-path-root{}",
+            e.reason,
+            if for_tenant {
+                " (a tenant is confined to --tenant-path-root/<tenant>)"
+            } else {
+                ""
+            }
+        ))
+    })
 }
 
 /// Refuse a config whose local-file connectors, state store or DLQ point at
@@ -1526,6 +1592,51 @@ pub async fn load_submission_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path a request names directly (a DLQ location) is held to the
+    /// caller policy, the system trees and a tenant's root.
+    #[test]
+    fn a_request_path_is_screened_like_a_connector_path() {
+        let base = tempfile::tempdir().unwrap();
+        let tenants = base.path().join("tenants");
+        std::fs::create_dir_all(tenants.join("acme")).unwrap();
+        std::fs::create_dir_all(tenants.join("other")).unwrap();
+        let args = crate::cli::ReferenceArgs {
+            allow_path_root: vec![base.path().to_path_buf()],
+            tenant_path_root: Some(tenants.clone()),
+            ..Default::default()
+        };
+        let refs = crate::serve::references::ServeReferencePolicy::from_args(&args).unwrap();
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let acme = refs.for_origin(caller, Some("acme"));
+        let own = tenants.join("acme/dlq.jsonl").display().to_string();
+        let theirs = tenants.join("other/dlq.jsonl").display().to_string();
+        assert!(refuse_request_path_with("from", &own, true, true, &acme).is_ok());
+        let err = refuse_request_path_with("from", &theirs, false, true, &acme).unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("`from`") && m.contains("--tenant-path-root")),
+            "{err:?}"
+        );
+        let open = ReferencePolicy::open();
+        for bad in ["/proc/self/environ", "/sys/kernel", "/dev/sda"] {
+            let err = refuse_request_path_with("location", bad, false, false, &open).unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains("system tree")),
+                "{bad}"
+            );
+        }
+        let operator = refs.for_origin(caller, None);
+        let outside = "/var/tmp-faucet-not-a-root/dlq.jsonl";
+        let err =
+            refuse_request_path_with("location", outside, true, false, &operator).unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("--allow-path-root") && !m.contains("tenant")),
+            "{err:?}"
+        );
+        assert!(refuse_request_path("location", "/etc/shadow", true, None).is_err());
+    }
 
     /// The sandbox switches come from the connector's schema (#876).
     #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
@@ -2444,5 +2555,44 @@ schedule:
             .unwrap_err()
             .to_string();
         assert!(err.contains("from records"), "{err}");
+    }
+
+    /// A URL host a submitted config takes from records cannot be checked
+    /// against any list, so it is refused for a caller even when the host
+    /// policy is open; a host fixed in the config, or a token in the path,
+    /// still passes.
+    #[cfg(all(feature = "source-rest", feature = "sink-stdout"))]
+    #[test]
+    fn a_caller_url_host_may_not_come_from_records() {
+        let cfg = |base: &str| {
+            PipelineConfig::from_value(serde_json::json!({
+                "version": 1,
+                "pipeline": {
+                    "source": {"type": "rest", "config": {"base_url": base}},
+                    "sink": {"type": "stdout", "config": {}}
+                }
+            }))
+            .unwrap()
+        };
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let open = ReferencePolicy::open();
+        for bad in ["https://${parent.host}/v1", "${parent.next_url}"] {
+            let err = refuse_server_paths_with(&cfg(bad), &[], caller, &open)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("rest/base_url") && err.contains("may not take a value from records"),
+                "{bad}: {err}"
+            );
+            refuse_server_paths_with(&cfg(bad), &[], BodyOrigin::Trusted, &open).unwrap();
+        }
+        for ok in [
+            "https://api.example.com/items/${parent.id}",
+            "https://api.example.com/${now.date}",
+        ] {
+            refuse_server_paths_with(&cfg(ok), &[], caller, &open).unwrap();
+        }
     }
 }

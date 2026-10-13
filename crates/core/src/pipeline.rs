@@ -2448,12 +2448,13 @@ where
                                 // sink whether the page already committed: replaying
                                 // it would insert its rows again.
                                 let attempt = std::sync::atomic::AtomicU32::new(0);
-                                let n = outcomes.observe(with_retry!(
+                                // A short report fails the page in `settle`, before its bookmark is persisted (#879).
+                                let report = outcomes.observe(with_retry!(
                                     "sink_write",
                                     eo_write_once(sink, &page.records, &scope, &token, next_seq, &attempt)
                                 ))?;
-                                records_written += n;
-                                account.add_report(eo_report(sink, page.records.len(), n));
+                                records_written += report.accepted;
+                                account.add_report(report);
                             }
                             account.settle(
                                 row_accounts.as_deref(),
@@ -2673,40 +2674,15 @@ async fn eo_write_once<Si: Sink + ?Sized>(
     token: &str,
     seq: u64,
     attempt: &std::sync::atomic::AtomicU32,
-) -> Result<usize, FaucetError> {
+) -> Result<crate::accounting::WriteReport, FaucetError> {
     if attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
         && let Some(committed) = sink.last_committed_token(scope).await?
         && crate::idempotency::parse_token(&committed).is_some_and(|c| c >= seq)
     {
-        return Ok(records.len());
+        return Ok(crate::accounting::WriteReport::accepted(records.len()));
     }
-    sink.write_batch_idempotent(records, scope, token).await
-}
-
-/// The row report of an exactly-once page write. The idempotent write returns
-/// a count only and commits the page atomically, so a sink that merges rows by
-/// key is credited with the rows it merged, and any other shortfall (a row the
-/// sink's configuration declines) is counted as skipped with a warning rather
-/// than failing a page whose commit token already covers it.
-fn eo_report<Si: Sink + ?Sized>(
-    sink: &Si,
-    offered: usize,
-    written: usize,
-) -> crate::accounting::WriteReport {
-    if sink.dedups_by_key() {
-        return crate::accounting::WriteReport::keyed(offered, written);
-    }
-    let short = offered.saturating_sub(written);
-    if short > 0 {
-        tracing::warn!(
-            connector = sink.connector_name(),
-            offered,
-            written,
-            "exactly-once write reported fewer rows than it was offered; the idempotent \
-             write returns a count only, so the difference is counted as skipped"
-        );
-    }
-    crate::accounting::WriteReport::accepted(written).with_skipped(short)
+    sink.write_batch_idempotent_reported(records, scope, token)
+        .await
 }
 
 /// Emit the adaptive controller's current state + any adjustment as metrics.

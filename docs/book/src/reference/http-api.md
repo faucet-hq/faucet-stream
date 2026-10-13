@@ -264,8 +264,26 @@ lineage paths, and the `token_url` / `url` of an `auth:` provider.
 
 A refused reference is a `403` that names the field, the value and the flag
 that would allow it. `/dev/null` and `:memory:` are always allowed. A path is
-compared after symlinks are resolved, and a `..` that leaves a root is
-refused. A path field that holds a remote URL (`s3://…`) is checked as a URL.
+compared after symlinks are resolved — a `..` after a symlink climbs out of the
+link's target, as the kernel would — and a `..` that leaves a root, or that
+follows a directory which does not exist yet, is refused. A path field that
+holds a remote URL (`s3://…`) is checked as a URL. A URL host is compared in
+the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
+or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
+metadata address they spell. A URL whose host a caller's config takes from
+records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
+checked, so it is refused; register the pipeline as a template instead.
+
+**At run time.** A caller's run executes with the caller policy scoped over
+it — on every instance that claims it, sharded or not — so its HTTP connectors
+check the first request and every redirect hop against it. Whatever the
+origin, an HTTP connector never follows a redirect into a link-local or
+cloud-metadata address.
+
+**DLQ locations.** The `location` of `POST /v1/dlq/inspect` and
+`/v1/dlq/discard`, and the `from` / `failed_dlq` of `POST /v1/dlq/replay`, are
+checked like a connector path: never a system tree or a server credential
+file, and under the path roots — for a tenant, under `--tenant-path-root/<tenant>`.
 
 The server's own credentials stay unreadable whatever the flags say:
 `FAUCET_VAULT_KEY`, the serve token variables and the files and variables

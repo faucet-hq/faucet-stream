@@ -1062,7 +1062,11 @@ impl Topology {
             .collect();
         let handles: Vec<tokio::task::JoinHandle<Result<NodeOutcome, FaucetError>>> = futs
             .into_iter()
-            .map(|f| tokio::spawn(tracing::Instrument::in_current_span(f)))
+            .map(|f| {
+                tokio::spawn(tracing::Instrument::in_current_span(
+                    crate::http::inherit_reference_policy(f),
+                ))
+            })
             .collect();
         // Dropping a `JoinHandle` detaches the task rather than cancelling it, so
         // every abandon path below aborts explicitly.

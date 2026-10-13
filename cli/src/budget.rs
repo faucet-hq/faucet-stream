@@ -106,15 +106,16 @@ pub fn effective_budget_with_kinds(
 
 /// What is left of `spec` once a run has used what `state` recorded over
 /// `elapsed` — the budget a follow-up the run starts (a post-run
-/// `verify --repair`, #871) is bounded by. `allowed_sinks` carries over; a
-/// spent ceiling stays at its floor of one unit, which the follow-up's first
-/// write crosses.
+/// `verify --repair`, #871) is bounded by. `allowed_sinks` carries over. A
+/// spent ceiling is left at `0`, so the follow-up's first write is refused
+/// (and a spent duration stops it at once) — `0` is not a valid configured
+/// ceiling ([`BudgetSpec::validate`]), but the budget sink enforces it.
 pub fn remaining_budget(
     spec: &BudgetSpec,
     state: Option<&faucet_core::BudgetState>,
     elapsed: std::time::Duration,
 ) -> BudgetSpec {
-    let left = |max: Option<u64>, used: u64| max.map(|m| m.saturating_sub(used).max(1));
+    let left = |max: Option<u64>, used: u64| max.map(|m| m.saturating_sub(used));
     let (records, bytes) = state.map_or((0, 0), |s| (s.records(), s.bytes()));
     BudgetSpec {
         max_records: left(spec.max_records, records),
@@ -251,9 +252,58 @@ mod tests {
         let left = remaining_budget(&spec, Some(&state), std::time::Duration::from_secs(90));
         assert_eq!(left.max_records, Some(10));
         assert_eq!(left.max_bytes, Some(1_000));
-        assert_eq!(left.max_duration_secs, Some(1));
+        assert_eq!(left.max_duration_secs, Some(0));
         assert_eq!(left.allowed_sinks, vec!["w".to_string()]);
         let open = remaining_budget(&BudgetSpec::default(), None, std::time::Duration::ZERO);
         assert!(open.max_records.is_none() && open.max_duration_secs.is_none());
+    }
+
+    struct Accepting;
+
+    #[faucet_core::async_trait]
+    impl faucet_core::Sink for Accepting {
+        async fn write_batch(
+            &self,
+            records: &[serde_json::Value],
+        ) -> Result<usize, faucet_core::FaucetError> {
+            Ok(records.len())
+        }
+        async fn flush(&self) -> Result<(), faucet_core::FaucetError> {
+            Ok(())
+        }
+    }
+
+    /// A run that spent its whole record ceiling leaves its follow-up nothing:
+    /// the follow-up's first record is refused, not let through.
+    #[tokio::test]
+    async fn a_spent_ceiling_refuses_the_follow_ups_first_write() {
+        use faucet_core::Sink as _;
+        let spec = BudgetSpec {
+            max_records: Some(100),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (run, state, _timer) =
+            faucet_core::BudgetSink::wrap(Box::new(Accepting), spec.clone(), cancel.clone());
+        let page: Vec<serde_json::Value> = (0..100).map(|i| serde_json::json!({"i": i})).collect();
+        assert_eq!(run.write_batch(&page).await.unwrap(), 100);
+        let left = remaining_budget(&spec, Some(&state), std::time::Duration::ZERO);
+        assert_eq!(left.max_records, Some(0));
+        let (repair, _, _t) = faucet_core::BudgetSink::wrap(Box::new(Accepting), left, cancel);
+        let err = repair
+            .write_batch(&[serde_json::json!({"i": 100})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                faucet_core::FaucetError::BudgetExceeded {
+                    limit: 0,
+                    actual: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

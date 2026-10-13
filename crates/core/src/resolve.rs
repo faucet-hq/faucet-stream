@@ -159,25 +159,51 @@ impl Default for ReferencePolicy {
 }
 
 /// Hosts a URL may name only when a policy lists them explicitly: link-local
-/// and cloud instance-metadata endpoints.
-fn is_metadata_host(host: &str) -> bool {
-    let h = host.trim_start_matches('[').trim_end_matches(']');
+/// and cloud instance-metadata endpoints. `host` is compared in its canonical
+/// form ([`canonical_host`]), so `2852039166`, `0xa9fea9fe` or a trailing dot
+/// name the same address as `169.254.169.254`.
+pub fn is_metadata_host(host: &str) -> bool {
+    let canonical = canonical_host(host);
+    let h = canonical.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.octets() == [100, 100, 100, 200],
-            std::net::IpAddr::V6(v6) => {
-                (v6.segments()[0] & 0xffc0) == 0xfe80
-                    || v6
-                        == "fd00:ec2::254"
-                            .parse::<std::net::Ipv6Addr>()
-                            .expect("valid")
-                    || v6
-                        .to_ipv4_mapped()
-                        .is_some_and(|v4| v4.is_link_local() || v4.octets() == [100, 100, 100, 200])
-            }
-        };
+        return is_metadata_ip(ip);
     }
     matches!(h, "metadata.google.internal" | "metadata")
+}
+
+/// Whether an address is link-local or a cloud instance-metadata endpoint.
+pub fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
+    let v4_meta =
+        |v4: std::net::Ipv4Addr| v4.is_link_local() || v4.octets() == [100, 100, 100, 200];
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_meta(v4),
+        std::net::IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || v6.to_ipv4_mapped().is_some_and(v4_meta)
+        }
+    }
+}
+
+/// The canonical, lower-case form of a URL host as a URL parser (and the
+/// system resolver) reads it: numeric IPv4 forms (`2852039166`, `0xa9fea9fe`,
+/// `0251.0376.0251.0376`, `169.254.43518`) become dotted quads, IPv6 is
+/// bracketed and compressed, and a domain loses its trailing dots. A host the
+/// parser rejects (a token, a pattern) is returned lower-cased as written.
+pub fn canonical_host(host: &str) -> String {
+    let raw = host.to_ascii_lowercase();
+    if raw.is_empty() || raw.contains(['$', '{', '}', '*', '/', '?', '#', '@']) {
+        return raw;
+    }
+    match url::Url::parse(&format!("http://{raw}/"))
+        .ok()
+        .and_then(|u| u.host().map(|h| h.to_owned()))
+    {
+        Some(url::Host::Ipv4(v4)) => v4.to_string(),
+        Some(url::Host::Ipv6(v6)) => format!("[{v6}]"),
+        Some(url::Host::Domain(d)) => d.trim_end_matches('.').to_string(),
+        None => raw.trim_end_matches('.').to_string(),
+    }
 }
 
 /// Whether `name` matches `pattern`: exact, `*` (anything) or `PREFIX*`.
@@ -196,50 +222,38 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
     match pattern.strip_prefix("*.") {
         Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
-        None => pattern == host,
+        None => canonical_host(&pattern) == host,
     }
 }
 
-/// Resolve `.` / `..` without touching the filesystem.
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Absolute, symlink-resolved form of `path` (the longest existing prefix is
-/// canonicalized; the rest is normalized lexically).
-fn normalize(path: &Path) -> PathBuf {
+/// Absolute, symlink-resolved form of `path`: the longest existing prefix of
+/// the path as written is canonicalized by the filesystem (so a `..` after a
+/// symlink climbs out of the link's target, as the kernel would), and the
+/// components after it are appended. `None` when a component after that
+/// prefix is `..` — where it lands depends on directories that do not exist
+/// yet, so it cannot be checked.
+fn normalize(path: &Path) -> Option<PathBuf> {
     let absolute = if path.is_relative() {
-        std::env::current_dir()
-            .map(|d| d.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+        std::env::current_dir().ok()?.join(path)
     } else {
         path.to_path_buf()
     };
-    let absolute = lexical_normalize(&absolute);
-    let mut existing = absolute.as_path();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            return rest.iter().rev().fold(real, |p, c| p.join(c));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(last)) => {
-                rest.push(last.to_os_string());
-                existing = parent;
+    let components: Vec<Component<'_>> = absolute.components().collect();
+    for split in (1..=components.len()).rev() {
+        let prefix: PathBuf = components[..split].iter().collect();
+        let Ok(mut out) = std::fs::canonicalize(&prefix) else {
+            continue;
+        };
+        for c in &components[split..] {
+            match c {
+                Component::CurDir => {}
+                Component::Normal(name) => out.push(name),
+                _ => return None,
             }
-            _ => return absolute,
         }
+        return Some(out);
     }
+    None
 }
 
 /// The scheme of `value` when it is written `scheme://…` or `scheme:…`, lower
@@ -291,8 +305,9 @@ fn is_relative_path(value: &str) -> bool {
 }
 
 /// The hosts a URL's authority names (several for `h1,h2` connection
-/// strings), lower case, without userinfo or port.
-fn url_hosts(value: &str) -> Vec<String> {
+/// strings), in canonical form ([`canonical_host`]), without userinfo or
+/// port. A host taken from a `${…}` token is returned lower-cased as written.
+pub fn url_hosts(value: &str) -> Vec<String> {
     let after = match value.find("://") {
         Some(i) => &value[i + 3..],
         None => match scheme_of(value) {
@@ -315,7 +330,7 @@ fn url_hosts(value: &str) -> Vec<String> {
                     .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
                     .map_or(h, |(host, _)| host)
             };
-            h.to_ascii_lowercase()
+            canonical_host(h)
         })
         .filter(|h| !h.is_empty())
         .collect()
@@ -532,8 +547,14 @@ impl ReferencePolicy {
         if rest.split('/').any(|seg| seg == "..") {
             return Err("a pattern or token segment may not contain `..`".into());
         }
-        let target = normalize(Path::new(base));
-        if roots.iter().any(|r| target.starts_with(normalize(r))) {
+        let Some(target) = normalize(Path::new(base)) else {
+            return Err("a `..` below a directory that does not exist cannot be checked".into());
+        };
+        if roots
+            .iter()
+            .filter_map(|r| normalize(r))
+            .any(|root| target.starts_with(root))
+        {
             return Ok(());
         }
         Err(if roots.is_empty() {
@@ -1082,6 +1103,8 @@ mod tests {
             std::os::unix::fs::symlink("/etc", &link).unwrap();
             assert!(p.check_path(&format!("{d}/link/passwd")).is_err());
         }
+        assert!(p.check_path(&format!("{d}/sub/../in.csv")).is_ok());
+        assert!(p.check_path(&format!("{d}/missing/../in.csv")).is_err());
         let cwd = ReferencePolicy::deny_all().with_path_roots(["."]);
         assert!(cwd.check_path("data/in.csv").is_ok());
         assert!(cwd.check_path("*.csv").is_ok());
@@ -1173,6 +1196,52 @@ mod tests {
         assert!(ReferencePolicy::open().check(&path).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_step_after_a_symlink_follows_the_link_target() {
+        let base = std::env::temp_dir().join(format!("faucet-resolve-ln-{}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("secret"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("inner"), root.join("l")).unwrap();
+        let p = ReferencePolicy::deny_all().with_path_roots([&root]);
+        let r = root.display();
+        assert!(p.check_path(&format!("{r}/l/../secret")).is_err());
+        assert!(p.check_path(&format!("{r}/l/../new.csv")).is_err());
+        assert!(p.check_path(&format!("{r}/l/../*.csv")).is_err());
+        assert!(p.check_path(&format!("{r}/ok.csv")).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn numeric_and_dotted_forms_of_a_metadata_host_are_refused() {
+        let p = ReferencePolicy::open();
+        for bad in [
+            "http://2852039166/latest",
+            "http://0xa9fea9fe/latest",
+            "http://0xA9.0xFE.0xA9.0xFE/",
+            "http://0251.0376.0251.0376/",
+            "http://169.254.43518/",
+            "http://169.254.169.254./latest",
+            "http://metadata.google.internal./x",
+            "http://METADATA.google.internal/x",
+            "http://[0:0:0:0:0:ffff:a9fe:a9fe]/",
+            "postgres://u@db,2852039166:5432/x",
+        ] {
+            assert!(p.check_url(bad).is_err(), "{bad}");
+        }
+        assert!(is_metadata_host("2852039166"));
+        assert!(!is_metadata_host("example.com."));
+        assert_eq!(canonical_host("Example.COM."), "example.com");
+        assert_eq!(canonical_host("${host}"), "${host}");
+        assert_eq!(canonical_host("0x7f000001"), "127.0.0.1");
+        let listed = ReferencePolicy::open().with_url_hosts(["api.example.com"]);
+        assert!(listed.check_url("https://API.example.com./v1").is_ok());
+        assert!(listed.check_url("https://0x7f000001/").is_err());
+    }
+
     #[test]
     fn helpers() {
         assert_eq!(scheme_of("C:/x"), None);
@@ -1183,9 +1252,10 @@ mod tests {
         assert_eq!(url_hosts("h:notaport"), vec!["h:notaport".to_string()]);
         assert!(!host_matches("*.example.com", "example.com"));
         assert_eq!(
-            lexical_normalize(Path::new("/a/./b/../c")),
-            PathBuf::from("/a/c")
+            normalize(Path::new("/./faucet-no-such-dir/./x")),
+            Some(PathBuf::from("/faucet-no-such-dir/x"))
         );
+        assert_eq!(normalize(Path::new("/faucet-no-such-dir/../etc")), None);
         let e = Refusal::new(RefusalKind::Command, "x", "why");
         assert_eq!(e.to_string(), "x (why)");
         assert_eq!(ResourceKind::Url.to_string(), "url");

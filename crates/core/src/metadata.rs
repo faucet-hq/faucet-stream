@@ -301,6 +301,7 @@ impl Sink for MetadataSink {
     // at the trait default (off); everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
         admit_page, write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_idempotent_reported,
         begin_overwrite,
         supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
 
@@ -334,6 +335,18 @@ impl Sink for MetadataSink {
         self.ensure_columns().await?;
         self.inner
             .write_batch_idempotent(&self.stamp(records), scope, token)
+            .await
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.ensure_columns().await?;
+        self.inner
+            .write_batch_idempotent_reported(&self.stamp(records), scope, token)
             .await
     }
 

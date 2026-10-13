@@ -671,6 +671,8 @@ pub struct Stmts {
     /// only via `request_cancel` and cleared by `reclaim_requeue`; it defaults to
     /// NULL on insert.)
     pub upsert: String,
+    /// `upsert` that leaves an existing row alone.
+    pub insert_new: String,
     pub select_body: String,
     pub select_status: String,
     pub select_submitted: String,
@@ -1202,6 +1204,10 @@ impl Stmts {
                 finished_at=excluded.finished_at,idempotency_key=excluded.idempotency_key,\
                 owner=excluded.owner,lease_expires_at=excluded.lease_expires_at,\
                 body=excluded.body"
+                .into(),
+            insert_new: "INSERT INTO faucet_serve_runs \
+                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body) \
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=$1".into(),
             select_status: "SELECT status FROM faucet_serve_runs WHERE run_id=$1".into(),
@@ -1758,6 +1764,10 @@ impl Stmts {
                 finished_at=excluded.finished_at,idempotency_key=excluded.idempotency_key,\
                 owner=excluded.owner,lease_expires_at=excluded.lease_expires_at,\
                 body=excluded.body"
+                .into(),
+            insert_new: "INSERT INTO faucet_serve_runs \
+                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body) \
+                VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=?".into(),
             select_status: "SELECT status FROM faucet_serve_runs WHERE run_id=?".into(),
@@ -2765,6 +2775,31 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err($crate::serve::history::sql::classify_backend_error)?;
                 Ok(())
+            }
+
+            async fn insert_new(
+                &self,
+                rec: &$crate::serve::history::RunRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let body = sql::encode_body(rec)?;
+                let submitted = sql::fmt_ts(rec.submitted_at);
+                let finished = rec.finished_at.map(sql::fmt_ts);
+                let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let done = sqlx::query(&self.stmts.insert_new)
+                    .bind(&rec.run_id)
+                    .bind(rec.name.as_deref())
+                    .bind(rec.status.as_str())
+                    .bind(&submitted)
+                    .bind(finished.as_deref())
+                    .bind(rec.idempotency_key.as_deref())
+                    .bind(&self.instance_id)
+                    .bind(&lease)
+                    .bind(&body)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(done.rows_affected() == 1)
             }
 
             async fn get(

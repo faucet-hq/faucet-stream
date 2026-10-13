@@ -167,7 +167,10 @@ renamed (`ssn` → `tax_id`) carries the labels of its original name there too.
   connectors would otherwise take. It cannot be combined with
   `delivery: exactly_once` on the atomic-watermark path (that commits whole
   pages and forbids a DLQ): `faucet validate` refuses the pair by name and
-  suggests `on_runtime: fail` or keyed-upsert effectively-once.
+  suggests `on_runtime: fail` or keyed-upsert effectively-once. Only a
+  quarantine rule that can reach the row's sink counts — one whose
+  `when.sink_kind` / `when.sink` attributes exclude that sink does not block
+  an exactly-once row.
 
 ```yaml
 pipeline:

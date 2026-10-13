@@ -9,6 +9,11 @@
 //!   marked sensitive, and every header named with
 //!   [`ClientBuilder::sensitive_header`] (an API-key header). reqwest's own
 //!   policy only knows the standard headers.
+//! - **Redirect targets are checked.** A redirect into a link-local or cloud
+//!   instance-metadata address is always refused. Under a reference policy
+//!   ([`ClientBuilder::reference_policy`], or one scoped over a run with
+//!   [`with_reference_policy`]) the first request and every redirect hop must
+//!   pass [`ReferencePolicy::check_url`](crate::resolve::ReferencePolicy::check_url).
 //! - **Bounded response reads.** [`Client::bytes`] / [`text`](Client::text) /
 //!   [`json`](Client::json) refuse a body above
 //!   [`max_response_bytes`](ClientBuilder::max_response_bytes) instead of
@@ -46,6 +51,7 @@
 
 use crate::error::FaucetError;
 use crate::io::CallContext;
+use crate::resolve::ReferencePolicy;
 use reqwest::header::{self, HeaderMap, HeaderName};
 use reqwest::{Method, Request, RequestBuilder, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -89,6 +95,7 @@ pub struct ClientBuilder {
     max_response_bytes: Option<u64>,
     max_redirects: usize,
     sensitive: Vec<HeaderName>,
+    policy: Option<Arc<ReferencePolicy>>,
     error: Option<FaucetError>,
 }
 
@@ -118,6 +125,7 @@ impl ClientBuilder {
             max_response_bytes: Some(DEFAULT_MAX_RESPONSE_BYTES),
             max_redirects: DEFAULT_MAX_REDIRECTS,
             sensitive: Vec::new(),
+            policy: None,
             error: None,
         }
     }
@@ -186,6 +194,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Check the first request and every redirect hop [`send`](Client::send)
+    /// follows against `policy`, instead of the one scoped over the task
+    /// ([`with_reference_policy`]).
+    pub fn reference_policy(mut self, policy: Arc<ReferencePolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     /// Drop the header `name` on a redirect to another origin, like
     /// `Authorization`. Name every header that carries a credential (an API
     /// key, a session id). An invalid name fails [`build`](Self::build).
@@ -242,6 +258,7 @@ impl ClientBuilder {
             max_response_bytes: self.max_response_bytes,
             max_redirects: self.max_redirects,
             sensitive: self.sensitive.into(),
+            policy: self.policy,
         })
     }
 }
@@ -272,6 +289,66 @@ pub struct Client {
     max_response_bytes: Option<u64>,
     max_redirects: usize,
     sensitive: Arc<[HeaderName]>,
+    policy: Option<Arc<ReferencePolicy>>,
+}
+
+tokio::task_local! {
+    static SCOPED_POLICY: Arc<ReferencePolicy>;
+}
+
+/// Run `fut` with `policy` as the reference policy every [`Client`] without
+/// its own ([`ClientBuilder::reference_policy`]) checks its requests and
+/// redirect hops against. A host scopes the policy that admitted a config
+/// over that config's run; a task spawned from `fut` must be wrapped again
+/// ([`current_reference_policy`]).
+pub async fn with_reference_policy<F: std::future::Future>(
+    policy: Arc<ReferencePolicy>,
+    fut: F,
+) -> F::Output {
+    SCOPED_POLICY.scope(policy, fut).await
+}
+
+/// The reference policy scoped over the current task, if any.
+pub fn current_reference_policy() -> Option<Arc<ReferencePolicy>> {
+    SCOPED_POLICY.try_with(Arc::clone).ok()
+}
+
+/// `fut` under the reference policy scoped over the current task, for a
+/// future about to be spawned onto another task.
+pub fn inherit_reference_policy<F: std::future::Future>(
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let policy = current_reference_policy();
+    async move {
+        match policy {
+            Some(p) => SCOPED_POLICY.scope(p, fut).await,
+            None => fut.await,
+        }
+    }
+}
+
+/// Refuse a request to `url`. Under a policy, `url` must pass it; without
+/// one, a redirect hop (`hop > 0`) may not reach a link-local or metadata
+/// address — a redirect there is never legitimate.
+fn guard_target(
+    policy: Option<&ReferencePolicy>,
+    url: &Url,
+    hop: usize,
+) -> Result<(), FaucetError> {
+    let shown = || crate::util::redact_uri_credentials(url.as_str());
+    let refused = |reason: String| {
+        let what = if hop == 0 { "request" } else { "redirect" };
+        FaucetError::Config(format!("{what} to {} refused: {reason}", shown()))
+    };
+    match policy {
+        Some(p) => p
+            .check_url(url.as_str())
+            .map_err(|e| refused(format!("{} (reference policy)", e.reason))),
+        None if hop > 0 && url.host_str().is_some_and(crate::resolve::is_metadata_host) => Err(
+            refused("the target is a link-local / cloud-metadata address".into()),
+        ),
+        None => Ok(()),
+    }
 }
 
 impl fmt::Debug for Client {
@@ -347,9 +424,11 @@ impl Client {
 
     /// [`send`](Self::send) for an already-built request.
     pub async fn send_request(&self, request: Request) -> Result<Response, FaucetError> {
+        let policy = self.policy.clone().or_else(current_reference_policy);
         let mut current = request;
         let mut hops = 0usize;
         loop {
+            guard_target(policy.as_deref(), current.url(), hops)?;
             let template = current.try_clone();
             let method = current.method().clone();
             let url = current.url().clone();
@@ -727,6 +806,107 @@ mod tests {
         for h in ["authorization", "x-api-key", "x-session", "cookie"] {
             assert!(has(&seen, "same", h), "{h} kept on a same-origin hop");
         }
+    }
+
+    fn redirector(to: String) -> Router {
+        Router::new()
+            .route(
+                "/go",
+                get(move || {
+                    let to = to.clone();
+                    async move { (AxStatus::SEE_OTHER, [("location", to)]).into_response() }
+                }),
+            )
+            .route("/land", get(|| async { "landed" }))
+    }
+
+    #[tokio::test]
+    async fn a_redirect_into_instance_metadata_is_always_refused() {
+        for target in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://2852039166/latest",
+            "http://[fe80::1]/x",
+            "http://metadata.google.internal./x",
+        ] {
+            let base = serve(redirector(target.to_string())).await;
+            let client = Client::new().unwrap();
+            let err = client
+                .send(client.get(format!("{base}/go")))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, FaucetError::Config(m) if m.starts_with("redirect to") && m.contains("metadata")),
+                "{target}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spawned_task_inherits_the_scoped_policy_only_when_asked() {
+        let policy = Arc::new(ReferencePolicy::deny_all());
+        let (inherited, plain) = with_reference_policy(policy, async {
+            let inherited = tokio::spawn(inherit_reference_policy(async {
+                current_reference_policy().is_some()
+            }));
+            let plain = tokio::spawn(async { current_reference_policy().is_some() });
+            (inherited.await.unwrap(), plain.await.unwrap())
+        })
+        .await;
+        assert!(inherited);
+        assert!(!plain);
+        assert!(!inherit_reference_policy(async { current_reference_policy().is_some() }).await);
+    }
+
+    #[tokio::test]
+    async fn a_policy_checks_the_first_request_and_every_redirect_hop() {
+        let land = serve(Router::new().route("/land", get(|| async { "landed" }))).await;
+        let port = land.rsplit(':').next().unwrap().to_string();
+        let to_localhost = format!("http://localhost:{port}/land");
+        let base = serve(redirector(to_localhost.clone())).await;
+        let policy = Arc::new(ReferencePolicy::open().with_url_hosts(["127.0.0.1"]));
+        let client = Client::builder()
+            .reference_policy(policy.clone())
+            .build()
+            .unwrap();
+        let err = client
+            .send(client.get(format!("{base}/go")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.contains("host `localhost` not in the allow-list")),
+            "{err}"
+        );
+        let err = client.send(client.get(&to_localhost)).await.unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.starts_with("request to")),
+            "{err}"
+        );
+        let allowed = serve(redirector(format!("{land}/land"))).await;
+        let resp = client
+            .send(client.get(format!("{allowed}/go")))
+            .await
+            .unwrap();
+        assert_eq!(client.text(resp).await.unwrap(), "landed");
+
+        let plain = Client::new().unwrap();
+        let scoped = with_reference_policy(policy.clone(), async {
+            assert!(current_reference_policy().is_some());
+            plain.send(plain.get(format!("{base}/go"))).await
+        })
+        .await;
+        assert!(scoped.is_err());
+        assert!(current_reference_policy().is_none());
+        let resp = plain.send(plain.get(format!("{base}/go"))).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let meta = Arc::new(ReferencePolicy::open().with_url_hosts(["169.254.169.254"]));
+        assert!(
+            guard_target(
+                Some(&meta),
+                &Url::parse("http://169.254.169.254/").unwrap(),
+                1
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

@@ -508,7 +508,7 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     // through the decorator, or the feature behind each one goes inert.
     crate::forward_sink!(inner; except connector_name, write_batch_columnar,
         load_native, write_batch, write_batch_reported, write_batch_partial, flush,
-        write_batch_idempotent);
+        write_batch_idempotent, write_batch_idempotent_reported);
 
     fn connector_name(&self) -> &'static str {
         // Return the guarded name so an inner connector that returns "" maps to
@@ -699,6 +699,39 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        self.idempotent_instrumented(
+            records,
+            self.inner.write_batch_idempotent(records, scope, token),
+            |n| *n,
+        )
+        .await
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.idempotent_instrumented(
+            records,
+            self.inner
+                .write_batch_idempotent_reported(records, scope, token),
+            |r| r.accepted,
+        )
+        .await
+    }
+}
+
+impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
+    /// The instrumented exactly-once write behind `write_batch_idempotent` and
+    /// `write_batch_idempotent_reported`.
+    async fn idempotent_instrumented<T>(
+        &self,
+        records: &[Value],
+        write: impl std::future::Future<Output = Result<T, FaucetError>>,
+        accepted: impl Fn(&T) -> usize,
+    ) -> Result<T, FaucetError> {
         let span = info_span!(
             "faucet.sink.write_idempotent",
             pipeline = %self.labels.pipeline,
@@ -719,16 +752,17 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         let _timer =
             DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
 
-        let result = AssertUnwindSafe(self.inner.write_batch_idempotent(records, scope, token))
+        let result = AssertUnwindSafe(write)
             .catch_unwind()
             .instrument(span)
             .await;
         match result {
-            Ok(Ok(n)) => {
+            Ok(Ok(out)) => {
+                let n = accepted(&out);
                 counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
                 counter!("faucet_sink_records_total", metric_labels).increment(n as u64);
                 self.meter_written(records, n);
-                Ok(n)
+                Ok(out)
             }
             Ok(Err(e)) => {
                 counter!(
