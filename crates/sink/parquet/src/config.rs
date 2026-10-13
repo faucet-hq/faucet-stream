@@ -258,12 +258,28 @@ impl ParquetCompression {
             ParquetCompression::Lz4 => PC::LZ4_RAW,
         }
     }
+
+    /// The shared file writer's codec for this one (an S3 destination writes
+    /// through it).
+    pub fn as_codec(&self) -> faucet_common_file::write::ParquetCodec {
+        use faucet_common_file::write::ParquetCodec;
+        match self {
+            ParquetCompression::Uncompressed => ParquetCodec::None,
+            ParquetCompression::Snappy => ParquetCodec::Snappy,
+            ParquetCompression::Gzip => ParquetCodec::Gzip,
+            ParquetCompression::Zstd => ParquetCodec::Zstd,
+            ParquetCompression::Lz4 => ParquetCodec::Lz4,
+        }
+    }
 }
 
 impl ParquetSinkConfig {
     /// What a failed batch write leaves behind (#737): rows stream into an open file that may roll over mid-batch.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        faucet_core::BatchAtomicity::BestEffort
+        match &self.destination {
+            ParquetDestination::S3(s3) => crate::sink::s3_write_config(self, s3).batch_atomicity(),
+            ParquetDestination::LocalPath { .. } => faucet_core::BatchAtomicity::BestEffort,
+        }
     }
 }
 
@@ -358,6 +374,20 @@ mod tests {
         assert!(matches!(ParquetCompression::Gzip.as_parquet(), PC::GZIP(_)));
         assert!(matches!(ParquetCompression::Zstd.as_parquet(), PC::ZSTD(_)));
         assert!(matches!(ParquetCompression::Lz4.as_parquet(), PC::LZ4_RAW));
+    }
+
+    #[test]
+    fn compression_maps_to_the_shared_codec() {
+        use faucet_common_file::write::ParquetCodec;
+        for (c, codec) in [
+            (ParquetCompression::Uncompressed, ParquetCodec::None),
+            (ParquetCompression::Snappy, ParquetCodec::Snappy),
+            (ParquetCompression::Gzip, ParquetCodec::Gzip),
+            (ParquetCompression::Zstd, ParquetCodec::Zstd),
+            (ParquetCompression::Lz4, ParquetCodec::Lz4),
+        ] {
+            assert_eq!(c.as_codec(), codec);
+        }
     }
 
     #[test]

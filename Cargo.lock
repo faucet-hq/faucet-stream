@@ -5993,6 +5993,8 @@ dependencies = [
  "arrow-json 58.3.0",
  "async-trait",
  "bytes",
+ "faucet-common-file",
+ "faucet-common-s3",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -6006,6 +6008,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
