@@ -90,6 +90,9 @@ pub struct RedisSource {
     /// failover), where a bare multiplexed connection failed every later
     /// command until it was rebuilt (#789 MSG-78). Cheap to clone.
     conn: std::panic::AssertUnwindSafe<tokio::sync::OnceCell<ConnectionManager>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: std::panic::AssertUnwindSafe<faucet_core::CallSlot>,
 }
 
 impl RedisSource {
@@ -101,25 +104,31 @@ impl RedisSource {
         Ok(Self {
             config,
             conn: std::panic::AssertUnwindSafe(tokio::sync::OnceCell::new()),
+            calls: std::panic::AssertUnwindSafe(faucet_core::CallSlot::new(
+                faucet_core::CallContext::new().without_timeout(),
+            )),
         })
     }
 
     /// Return a clone of the shared connection, opening it once on first call.
     async fn connection(&self) -> Result<ConnectionManager, FaucetError> {
+        let calls = self.calls.get();
         let conn = self
             .conn
-            .get_or_try_init(|| async {
-                let client = redis::Client::open(self.config.url.as_str())
-                    .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
-                let manager = redis::aio::ConnectionManagerConfig::new()
-                    .set_number_of_retries(3)
-                    .set_min_delay(std::time::Duration::from_millis(2))
-                    .set_max_delay(std::time::Duration::from_secs(1))
-                    .set_connection_timeout(Some(std::time::Duration::from_secs(10)))
-                    .set_response_timeout(None);
-                ConnectionManager::new_with_config(client, manager)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("Redis connection failed: {e}")))
+            .get_or_try_init(|| {
+                calls.call_once("connect", async {
+                    let client = redis::Client::open(self.config.url.as_str())
+                        .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
+                    let manager = redis::aio::ConnectionManagerConfig::new()
+                        .set_number_of_retries(3)
+                        .set_min_delay(std::time::Duration::from_millis(2))
+                        .set_max_delay(std::time::Duration::from_secs(1))
+                        .set_connection_timeout(Some(std::time::Duration::from_secs(10)))
+                        .set_response_timeout(None);
+                    ConnectionManager::new_with_config(client, manager)
+                        .await
+                        .map_err(|e| FaucetError::Source(format!("Redis connection failed: {e}")))
+                })
             })
             .await?;
         Ok(conn.clone())
@@ -226,6 +235,17 @@ fn next_stream_id(id: &str) -> String {
 
 #[async_trait]
 impl faucet_core::Source for RedisSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
@@ -257,6 +277,7 @@ impl faucet_core::Source for RedisSource {
 
         Box::pin(async_stream::try_stream! {
             let mut conn = self.connection().await?;
+            let calls = self.calls.get();
 
             let mut emitted: usize = 0;
 
@@ -267,7 +288,7 @@ impl faucet_core::Source for RedisSource {
                     } else {
                         faucet_core::util::substitute_context(key, context)
                     };
-                    let pages = stream_list(&mut conn, &resolved, batch_size, max_records, decoding);
+                    let pages = stream_list(&calls, &mut conn, &resolved, batch_size, max_records, decoding);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -294,7 +315,7 @@ impl faucet_core::Source for RedisSource {
                     } else {
                         faucet_core::util::substitute_context(key, context)
                     };
-                    let pages = stream_xrange(&mut conn, &resolved, batch_size, max_records, decoding);
+                    let pages = stream_xrange(&calls, &mut conn, &resolved, batch_size, max_records, decoding);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -308,7 +329,7 @@ impl faucet_core::Source for RedisSource {
                     } else {
                         substitute_pattern(pattern, context)
                     };
-                    let pages = stream_keys(&mut conn, &resolved, batch_size, max_records, decoding);
+                    let pages = stream_keys(&calls, &mut conn, &resolved, batch_size, max_records, decoding);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -357,6 +378,7 @@ impl faucet_core::Source for RedisSource {
 /// a queue-style workload where the list is being consumed concurrently,
 /// prefer a Redis Stream (`XRANGE`/consumer groups) over a list.
 fn stream_list<'a>(
+    calls: &'a faucet_core::CallContext,
     conn: &'a mut ConnectionManager,
     key: &'a str,
     batch_size: usize,
@@ -365,7 +387,7 @@ fn stream_list<'a>(
 ) -> impl Stream<Item = Result<StreamPage, FaucetError>> + 'a {
     async_stream::try_stream! {
         if batch_size == 0 {
-            let values = lrange(conn, key, 0, -1).await?;
+            let values = calls.call_once("lrange", lrange(conn, key, 0, -1)).await?;
             let mut records = decode_all(&values, key, decoding)?;
             if let Some(max) = max_records {
                 records.truncate(max);
@@ -378,7 +400,7 @@ fn stream_list<'a>(
         let mut emitted: usize = 0;
         loop {
             let stop: isize = start + batch_size as isize - 1;
-            let values = lrange(conn, key, start, stop).await?;
+            let values = calls.call_once("lrange", lrange(conn, key, start, stop)).await?;
             if values.is_empty() {
                 break;
             }
@@ -430,6 +452,7 @@ fn decode_all(
 /// start ID on each page. With `batch_size == 0`, drains via a single
 /// `XRANGE - +` round-trip.
 fn stream_xrange<'a>(
+    calls: &'a faucet_core::CallContext,
     conn: &'a mut ConnectionManager,
     key: &'a str,
     batch_size: usize,
@@ -439,10 +462,13 @@ fn stream_xrange<'a>(
     use redis::AsyncCommands as _;
     async_stream::try_stream! {
         if batch_size == 0 {
-            let reply: redis::streams::StreamRangeReply = conn
-                .xrange_all(key)
-                .await
-                .map_err(|e| FaucetError::Source(format!("XRANGE failed on '{key}': {e}")))?;
+            let reply: redis::streams::StreamRangeReply = calls
+                .call_once("xrange", async {
+                    conn.xrange_all(key)
+                        .await
+                        .map_err(|e| FaucetError::Source(format!("XRANGE failed on '{key}': {e}")))
+                })
+                .await?;
             let mut records: Vec<Value> = reply
                 .ids
                 .iter()
@@ -458,10 +484,13 @@ fn stream_xrange<'a>(
         let mut start: String = "-".to_string();
         let mut emitted: usize = 0;
         loop {
-            let reply: redis::streams::StreamRangeReply = conn
-                .xrange_count(key, &start, "+", batch_size)
-                .await
-                .map_err(|e| FaucetError::Source(format!("XRANGE failed on '{key}': {e}")))?;
+            let reply: redis::streams::StreamRangeReply = calls
+                .call_once("xrange", async {
+                    conn.xrange_count(key, &start, "+", batch_size)
+                        .await
+                        .map_err(|e| FaucetError::Source(format!("XRANGE failed on '{key}': {e}")))
+                })
+                .await?;
 
             if reply.ids.is_empty() {
                 break;
@@ -506,6 +535,7 @@ fn stream_xrange<'a>(
 /// `batch_size == 0`, drains the entire scan and emits one page after a
 /// single `MGET`.
 fn stream_keys<'a>(
+    calls: &'a faucet_core::CallContext,
     conn: &'a mut ConnectionManager,
     pattern: &'a str,
     batch_size: usize,
@@ -535,15 +565,21 @@ fn stream_keys<'a>(
         let mut skipped: usize = 0;
 
         'scan: loop {
-            let (next_cursor, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(pattern)
-                .arg("COUNT")
-                .arg(scan_hint)
-                .query_async(conn)
-                .await
-                .map_err(|e| FaucetError::Source(format!("SCAN failed with pattern '{pattern}': {e}")))?;
+            let (next_cursor, keys): (u64, Vec<Vec<u8>>) = calls
+                .call_once("scan", async {
+                    redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(pattern)
+                        .arg("COUNT")
+                        .arg(scan_hint)
+                        .query_async(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Source(format!("SCAN failed with pattern '{pattern}': {e}"))
+                        })
+                })
+                .await?;
             cursor = next_cursor;
             buffer.extend(keys.into_iter().filter(|k| seen.insert(key_fingerprint(k))));
 
@@ -551,7 +587,7 @@ fn stream_keys<'a>(
             while emitted < cap && buffer.len() >= chunk_size {
                 let take = chunk_size.min(cap - emitted);
                 let page_keys: Vec<Vec<u8>> = buffer.drain(..take).collect();
-                let (records, other) = mget_records(conn, &page_keys, decoding).await?;
+                let (records, other) = mget_records(calls, conn, &page_keys, decoding).await?;
                 skipped += other;
                 emitted += records.len();
                 yield StreamPage { records, bookmark: None };
@@ -566,7 +602,7 @@ fn stream_keys<'a>(
         if emitted < cap && !buffer.is_empty() {
             let take = (cap - emitted).min(buffer.len());
             let page_keys: Vec<Vec<u8>> = buffer.drain(..take).collect();
-            let (records, other) = mget_records(conn, &page_keys, decoding).await?;
+            let (records, other) = mget_records(calls, conn, &page_keys, decoding).await?;
             skipped += other;
             yield StreamPage { records, bookmark: None };
         }
@@ -587,15 +623,20 @@ fn stream_keys<'a>(
 /// found with one pipelined `TYPE` round trip over the nil keys only (#789
 /// MSG-30).
 async fn mget_records(
+    calls: &faucet_core::CallContext,
     conn: &mut ConnectionManager,
     keys: &[Vec<u8>],
     decoding: Decoding,
 ) -> Result<(Vec<Value>, usize), FaucetError> {
-    let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-        .arg(keys)
-        .query_async(conn)
-        .await
-        .map_err(|e| FaucetError::Source(format!("MGET failed: {e}")))?;
+    let values: Vec<Option<Vec<u8>>> = calls
+        .call_once("mget", async {
+            redis::cmd("MGET")
+                .arg(keys)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| FaucetError::Source(format!("MGET failed: {e}")))
+        })
+        .await?;
     let missing: Vec<&Vec<u8>> = keys
         .iter()
         .zip(&values)
@@ -608,10 +649,13 @@ async fn mget_records(
         for k in &missing {
             pipe.cmd("TYPE").arg(*k);
         }
-        let types: Vec<String> = pipe
-            .query_async(conn)
-            .await
-            .map_err(|e| FaucetError::Source(format!("TYPE failed: {e}")))?;
+        let types: Vec<String> = calls
+            .call_once("type", async {
+                pipe.query_async(&mut *conn)
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("TYPE failed: {e}")))
+            })
+            .await?;
         non_strings = count_non_strings(&types);
     }
     Ok((collect_kv_records(keys, values, decoding)?, non_strings))

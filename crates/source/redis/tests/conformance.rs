@@ -166,3 +166,26 @@ async fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the lazy connect waits on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let url = format!("redis://{addr}");
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        RedisSource::new(RedisSourceConfig::new(
+            &url,
+            RedisSourceType::List { key: "q".into() },
+        ))
+        .unwrap()
+    })
+    .await;
+}

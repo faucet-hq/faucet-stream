@@ -370,6 +370,10 @@ already landed a second time). See
 
 Declares `write_mode: append` and idempotent (exactly-once) writes. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every pipelined chunk, exactly-once script and commit-token read runs through the pipeline's `CallContext` (#880): the run's deadline ends a hung command promptly, and each counts as one round trip (`pipeline`, `script`, `get`) in `faucet_sink_roundtrips_total`. The sink never retries a write itself.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
