@@ -143,16 +143,16 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
 pub use error::FaucetError;
-pub use governance::{
-    DlqGovernance, Governance, GovernedSink, GovernedSinkBuilder, OptOut, Pass, SINK_LAYERS,
-    SinkLayer,
-};
-#[cfg(feature = "policy")]
-pub use governance::PolicyGovernance;
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
     AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, CsvUnknownField, ExcelOptions,
     FileFormat, FileInput, FormatOptions, OrcOptions, XmlOptions,
+};
+#[cfg(feature = "policy")]
+pub use governance::PolicyGovernance;
+pub use governance::{
+    DlqGovernance, Governance, GovernedSink, GovernedSinkBuilder, OptOut, Pass, SINK_LAYERS,
+    SinkLayer,
 };
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,

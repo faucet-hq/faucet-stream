@@ -1113,7 +1113,9 @@ async fn build_topology_inner(
                     .build(sink);
                 if let Some(states) = budgets.as_mut() {
                     if let Some(state) = governed.budget_state() {
-                        states.states.insert((*id).clone(), std::sync::Arc::clone(state));
+                        states
+                            .states
+                            .insert((*id).clone(), std::sync::Arc::clone(state));
                     }
                     states.governance.insert(
                         (*id).clone(),
@@ -2919,9 +2921,10 @@ pipeline:
             .sink_builder()
             .build(Box::new(NullSink));
         let mut budgets = TopologyBudgets::default();
-        budgets
-            .states
-            .insert("w".into(), std::sync::Arc::clone(governed.budget_state().unwrap()));
+        budgets.states.insert(
+            "w".into(),
+            std::sync::Arc::clone(governed.budget_state().unwrap()),
+        );
         assert!(budgets.verdicts().is_empty());
         tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
             .await

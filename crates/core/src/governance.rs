@@ -338,7 +338,9 @@ impl Governance {
     /// Budget ceilings. The main sink and the DLQ count against one shared
     /// state. An empty spec is ignored.
     pub fn with_budget(mut self, spec: BudgetSpec) -> Self {
-        if spec.max_records.is_none() && spec.max_bytes.is_none() && spec.max_duration_secs.is_none()
+        if spec.max_records.is_none()
+            && spec.max_bytes.is_none()
+            && spec.max_duration_secs.is_none()
         {
             self.budget = None;
             self.budget_state = None;
@@ -529,7 +531,9 @@ impl Governance {
     pub fn policy_quarantines(&self) -> bool {
         #[cfg(feature = "policy")]
         {
-            self.policy.as_ref().is_some_and(PolicyGovernance::quarantines)
+            self.policy
+                .as_ref()
+                .is_some_and(PolicyGovernance::quarantines)
         }
         #[cfg(not(feature = "policy"))]
         {
@@ -738,7 +742,8 @@ impl<'g> GovernedSinkBuilder<'g> {
                         layers.push(*layer);
                     }
                 }
-                SinkLayer::Policy => {
+                SinkLayer::Policy =>
+                {
                     #[cfg(feature = "policy")]
                     if let Some(p) = &gov.policy {
                         let mut ps = crate::policy::PolicySink::new(
@@ -1064,7 +1069,9 @@ mod tests {
             .with_cancel(CancellationToken::new())
             .with_usage_meter(Arc::new(UsageMeter::new()))
             .with_resilience(crate::resilience::ResiliencePolicy::default())
-            .with_schema_drift(crate::drift::SchemaDriftPolicy::compile(&serde_json::from_value(json!({})).unwrap()));
+            .with_schema_drift(crate::drift::SchemaDriftPolicy::compile(
+                &serde_json::from_value(json!({})).unwrap(),
+            ));
         for p in [
             Pass::Budget,
             Pass::Metadata,
@@ -1132,7 +1139,10 @@ mod tests {
             .run()
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Governance::sink_builder"), "{err}");
+        assert!(
+            err.to_string().contains("Governance::sink_builder"),
+            "{err}"
+        );
         let governed = g.sink_builder().build(Box::new(raw));
         let r = crate::Pipeline::new(&source, &governed)
             .with_governance(g)
@@ -1166,7 +1176,10 @@ mod tests {
             crate::compat::WritePath::Columnar,
             &f
         ));
-        assert!(crate::compat::path_allowed(crate::compat::WritePath::Row, &f));
+        assert!(crate::compat::path_allowed(
+            crate::compat::WritePath::Row,
+            &f
+        ));
     }
 
     #[cfg(feature = "masking")]

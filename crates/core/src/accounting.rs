@@ -151,17 +151,19 @@ impl RowAccountsSnapshot {
 
     /// Whether every offered row is accounted for.
     pub fn balanced(&self) -> bool {
-        self.accepted + self.coalesced + self.skipped + self.failed + self.quarantined + self.dropped
+        self.accepted
+            + self.coalesced
+            + self.skipped
+            + self.failed
+            + self.quarantined
+            + self.dropped
             >= self.offered
             && self.unaccounted == 0
     }
 
     /// One line for a run summary.
     pub fn summary_line(&self) -> String {
-        let mut line = format!(
-            "rows: offered {}, accepted {}",
-            self.offered, self.accepted
-        );
+        let mut line = format!("rows: offered {}, accepted {}", self.offered, self.accepted);
         for (label, n) in [
             ("coalesced", self.coalesced),
             ("skipped", self.skipped),
@@ -236,7 +238,12 @@ impl PageAccount {
     }
 
     fn accounted(&self) -> usize {
-        self.accepted + self.coalesced + self.skipped + self.failed + self.quarantined + self.dropped
+        self.accepted
+            + self.coalesced
+            + self.skipped
+            + self.failed
+            + self.quarantined
+            + self.dropped
     }
 
     /// Fold the page into the run's counters and fail it when rows are
@@ -333,7 +340,13 @@ mod tests {
         let mut short = PageAccount::new(4);
         short.add_report(WriteReport::accepted(3));
         let err = short.settle(Some(&run), ("p", "r", "c")).unwrap_err();
-        assert!(matches!(err, FaucetError::RowsUnaccounted { offered: 4, accepted: 3 }));
+        assert!(matches!(
+            err,
+            FaucetError::RowsUnaccounted {
+                offered: 4,
+                accepted: 3
+            }
+        ));
         let s = run.snapshot();
         assert_eq!(s.unaccounted, 1);
         assert!(!s.balanced());

@@ -75,10 +75,12 @@ impl Source for Rows {
     ) -> std::pin::Pin<
         Box<dyn faucet_core::Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>,
     > {
-        let batch = faucet_core::columnar::values_to_record_batch_inferred(&self.rows)
-            .map(|batch| ColumnarPage {
-                batch,
-                bookmark: Some(json!({"done": true})),
+        let batch =
+            faucet_core::columnar::values_to_record_batch_inferred(&self.rows).map(|batch| {
+                ColumnarPage {
+                    batch,
+                    bookmark: Some(json!({"done": true})),
+                }
             });
         Box::pin(futures::stream::iter(vec![batch]))
     }
@@ -157,7 +159,9 @@ impl Sink for Capture {
                 .map(|_| Err(FaucetError::Sink("row rejected".into())))
                 .collect());
         }
-        self.write_batch_reported(records).await?.check(records.len())?;
+        self.write_batch_reported(records)
+            .await?
+            .check(records.len())?;
         Ok(records.iter().map(|_| Ok(())).collect())
     }
 
@@ -267,7 +271,11 @@ async fn a_quality_quarantine_never_lands_a_label_the_dlq_may_not_hold() {
         let dlq = Capture::new(Mode::All);
         let g = Governance::new()
             .with_quality(quality_quarantine_null_id())
-            .with_policy(PolicyGovernance::new(policy(), facts("main", "eu"), scope()))
+            .with_policy(PolicyGovernance::new(
+                policy(),
+                facts("main", "eu"),
+                scope(),
+            ))
             .with_dlq(dlq_of(Arc::clone(&dlq), Some(dlq_residency)));
         let governed = g.sink_builder().build(Box::new(Shared(Arc::clone(&main))));
         let result = Pipeline::new(&source, &governed)
@@ -297,7 +305,11 @@ async fn a_per_row_sink_failure_is_policy_checked_at_the_dlq() {
     let main = Capture::new(Mode::RejectRows);
     let dlq = Capture::new(Mode::All);
     let g = Governance::new()
-        .with_policy(PolicyGovernance::new(policy(), facts("main", "eu"), scope()))
+        .with_policy(PolicyGovernance::new(
+            policy(),
+            facts("main", "eu"),
+            scope(),
+        ))
         .with_dlq(dlq_of(Arc::clone(&dlq), Some("us")));
     let governed = g.sink_builder().build(Box::new(Shared(main)));
     let err = Pipeline::new(&source, &governed)
@@ -335,7 +347,11 @@ async fn dlq_records_and_bytes_are_metered_and_budgeted() {
     let usage = meter.snapshot();
     assert_eq!(usage.dlq_records_written, 2);
     assert!(usage.dlq_bytes_written > 0);
-    assert_eq!(state.records(), 2, "the DLQ envelopes count against the budget");
+    assert_eq!(
+        state.records(),
+        2,
+        "the DLQ envelopes count against the budget"
+    );
 }
 
 /// #870: a budget the DLQ alone crosses stops the run like a main-sink
@@ -358,7 +374,14 @@ async fn a_budget_crossed_by_the_dlq_alone_stops_the_run() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, FaucetError::BudgetExceeded { limit: 2, actual: 3, .. }),
+        matches!(
+            err,
+            FaucetError::BudgetExceeded {
+                limit: 2,
+                actual: 3,
+                ..
+            }
+        ),
         "{err}"
     );
     assert!(dlq.rows().is_empty(), "the crossing page is refused whole");
@@ -402,7 +425,10 @@ async fn a_transient_dlq_failure_is_retried_under_resilience() {
             assert_eq!(dlq.attempts.load(Ordering::Relaxed), 2);
             assert_eq!(dlq.rows.lock().unwrap().len(), 1);
         } else {
-            assert!(result.is_err(), "a non-replay-safe DLQ write is not retried");
+            assert!(
+                result.is_err(),
+                "a non-replay-safe DLQ write is not retried"
+            );
             assert_eq!(dlq.attempts.load(Ordering::Relaxed), 1);
         }
     }
@@ -456,9 +482,7 @@ async fn coalesced_and_skipped_rows_balance() {
         let source = Rows::new((0..4).map(|i| json!({"id": i})).collect());
         let accounts = Arc::new(RowAccounts::new());
         let g = Governance::new();
-        let governed = g
-            .sink_builder()
-            .build(Box::new(Shared(Capture::new(mode))));
+        let governed = g.sink_builder().build(Box::new(Shared(Capture::new(mode))));
         Pipeline::new(&source, &governed)
             .with_governance(g)
             .with_row_accounts(Arc::clone(&accounts))
@@ -475,7 +499,11 @@ async fn coalesced_and_skipped_rows_balance() {
 /// #879: quarantined and DLQ'd rows count, so a page with both balances.
 #[tokio::test]
 async fn quarantined_and_failed_rows_are_accounted() {
-    let source = Rows::new(vec![json!({"id": null}), json!({"id": 1}), json!({"id": 2})]);
+    let source = Rows::new(vec![
+        json!({"id": null}),
+        json!({"id": 1}),
+        json!({"id": 2}),
+    ]);
     let accounts = Arc::new(RowAccounts::new());
     let g = Governance::new()
         .with_quality(quality_quarantine_null_id())
@@ -490,7 +518,10 @@ async fn quarantined_and_failed_rows_are_accounted() {
         .await
         .unwrap();
     let s = accounts.snapshot();
-    assert_eq!((s.offered, s.quarantined, s.failed, s.accepted), (3, 1, 2, 0));
+    assert_eq!(
+        (s.offered, s.quarantined, s.failed, s.accepted),
+        (3, 1, 2, 0)
+    );
     assert!(s.balanced());
 }
 
@@ -513,7 +544,11 @@ async fn policy_quarantine_is_per_row_on_a_columnar_capable_pair() {
         let main = Capture::columnar(Mode::All);
         let dlq = Capture::new(Mode::All);
         let g = Governance::new()
-            .with_policy(PolicyGovernance::new(policy(), facts("main", "us"), scope()))
+            .with_policy(PolicyGovernance::new(
+                policy(),
+                facts("main", "us"),
+                scope(),
+            ))
             .with_dlq(dlq_of(Arc::clone(&dlq), Some("eu")));
         assert!(g.policy_quarantines());
         let governed = g.sink_builder().build(Box::new(Shared(Arc::clone(&main))));

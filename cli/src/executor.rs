@@ -2729,12 +2729,15 @@ async fn run_one_invocation(
         if stages.is_empty() {
             source
         } else {
-            Box::new(faucet_core::TransformingSource::new_with_batches(
-                source,
-                stages,
-                batch_fns,
-                obs_labels.clone(),
-            )?.with_row_accounts(Arc::clone(&row_accounts)))
+            Box::new(
+                faucet_core::TransformingSource::new_with_batches(
+                    source,
+                    stages,
+                    batch_fns,
+                    obs_labels.clone(),
+                )?
+                .with_row_accounts(Arc::clone(&row_accounts)),
+            )
         }
     };
     #[cfg(not(feature = "arrow"))]
@@ -2743,11 +2746,10 @@ async fn run_one_invocation(
         if stages.is_empty() {
             source
         } else {
-            Box::new(faucet_core::TransformingSource::new(
-                source,
-                stages,
-                obs_labels.clone(),
-            )?.with_row_accounts(Arc::clone(&row_accounts)))
+            Box::new(
+                faucet_core::TransformingSource::new(source, stages, obs_labels.clone())?
+                    .with_row_accounts(Arc::clone(&row_accounts)),
+            )
         }
     };
 
@@ -2827,7 +2829,9 @@ async fn run_one_invocation(
     // budget → destination. The budget is innermost so its ceilings count what
     // the destination accepts; a duration ceiling cancels the cooperative token.
     let limit = opts.limit;
-    let capture_sink = capture.as_ref().map(|p| (Arc::clone(&captured), Arc::clone(p)));
+    let capture_sink = capture
+        .as_ref()
+        .map(|p| (Arc::clone(&captured), Arc::clone(p)));
     #[allow(unused_mut)]
     let mut builder = governance.sink_builder().inner_tap(move |s| {
         let s: Box<dyn Sink> = match limit {

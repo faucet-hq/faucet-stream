@@ -40,7 +40,10 @@ pub(crate) struct GovernanceBuild {
 }
 
 /// Why profiling does not apply to an invocation, if it does not.
-pub(crate) fn profiling_scope_opt_out(node: &ExpandedNode, opts: &ExecuteOptions) -> Option<&'static str> {
+pub(crate) fn profiling_scope_opt_out(
+    node: &ExpandedNode,
+    opts: &ExecuteOptions,
+) -> Option<&'static str> {
     if !matches!(node.role, NodeRole::Root) {
         Some("profiling learns a baseline from root rows only")
     } else if opts.dry_run {
@@ -128,8 +131,9 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
                 node.id
             )));
         }
-        let compiled = faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
-            .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+        let compiled =
+            faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
+                .map_err(|e| CliError::Config(format!("policy: {e}")))?;
         let mut p = faucet_core::PolicyGovernance::new(
             Arc::new(compiled),
             faucet_core::SinkFacts {
@@ -524,7 +528,9 @@ mod tests {
             pass: Pass::Profiling,
             reason: "repair".into(),
         });
-        let built = build(&repair, &ExecuteOptions::for_tests("g")).await.unwrap();
+        let built = build(&repair, &ExecuteOptions::for_tests("g"))
+            .await
+            .unwrap();
         assert!(built.profiler.is_none(), "an opt-out drops the profiler");
         assert_eq!(built.governance.opted_out(Pass::Profiling), Some("repair"));
     }
@@ -535,10 +541,18 @@ mod tests {
         let mut opts = ExecuteOptions::for_tests("g");
         assert!(profiling_scope_opt_out(&n, &opts).is_none());
         opts.limit = Some(1);
-        assert!(profiling_scope_opt_out(&n, &opts).unwrap().contains("--limit"));
+        assert!(
+            profiling_scope_opt_out(&n, &opts)
+                .unwrap()
+                .contains("--limit")
+        );
         opts.limit = None;
         opts.shard = Some(faucet_core::ShardSpec::whole());
-        assert!(profiling_scope_opt_out(&n, &opts).unwrap().contains("shard"));
+        assert!(
+            profiling_scope_opt_out(&n, &opts)
+                .unwrap()
+                .contains("shard")
+        );
         let mut child = n.clone();
         child.role = NodeRole::Child {
             parent_id: "p".into(),
@@ -588,8 +602,12 @@ mod tests {
         ));
         let n = node(&none);
         assert!(
-            dlq_only_masking(n.masking.as_ref().unwrap(), &["default"], n.dlq.as_ref().unwrap())
-                .is_none()
+            dlq_only_masking(
+                n.masking.as_ref().unwrap(),
+                &["default"],
+                n.dlq.as_ref().unwrap()
+            )
+            .is_none()
         );
     }
 
@@ -617,7 +635,13 @@ mod tests {
             preview,
         };
         let live = topology_sink_governance(req(false, false)).unwrap();
-        for p in [Pass::Budget, Pass::Policy, Pass::Profiling, Pass::Metadata, Pass::Cancel] {
+        for p in [
+            Pass::Budget,
+            Pass::Policy,
+            Pass::Profiling,
+            Pass::Metadata,
+            Pass::Cancel,
+        ] {
             assert!(live.governance.is_active(p), "{p}");
         }
         assert!(live.profiler.is_some());
@@ -655,7 +679,10 @@ mod tests {
             .write_batch(&[serde_json::json!({}), serde_json::json!({})])
             .await
             .unwrap_err();
-        assert!(matches!(err, faucet_core::FaucetError::BudgetExceeded { .. }), "{err}");
+        assert!(
+            matches!(err, faucet_core::FaucetError::BudgetExceeded { .. }),
+            "{err}"
+        );
     }
 
     /// A preview writes nothing: only masking applies, the rest is opted out.
@@ -667,8 +694,17 @@ mod tests {
         }))
         .unwrap();
         let g = preview_governance(Some(&spec)).unwrap();
-        assert!(g.is_active(Pass::Masking), "every rule applies to a preview");
-        for p in [Pass::Budget, Pass::Policy, Pass::Dlq, Pass::Profiling, Pass::Cancel] {
+        assert!(
+            g.is_active(Pass::Masking),
+            "every rule applies to a preview"
+        );
+        for p in [
+            Pass::Budget,
+            Pass::Policy,
+            Pass::Dlq,
+            Pass::Profiling,
+            Pass::Cancel,
+        ] {
             assert!(g.opted_out(p).is_some(), "{p}");
         }
         assert!(!preview_governance(None).unwrap().is_active(Pass::Masking));

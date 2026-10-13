@@ -885,8 +885,18 @@ mod tests {
         .await
         .unwrap();
         assert!(built.profiler.is_none());
-        assert!(built.governance.opted_out(faucet_core::Pass::Profiling).is_some());
-        assert!(built.governance.opted_out(faucet_core::Pass::Masking).is_some());
+        assert!(
+            built
+                .governance
+                .opted_out(faucet_core::Pass::Profiling)
+                .is_some()
+        );
+        assert!(
+            built
+                .governance
+                .opted_out(faucet_core::Pass::Masking)
+                .is_some()
+        );
 
         let inputs = VerifyInputs {
             row: None,
@@ -909,9 +919,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("max_records"), "{err}");
-        let written = run_repair(&node, &key, "upsert", rows(), &inputs, &RunGuards::default())
-            .await
-            .unwrap();
+        let written = run_repair(
+            &node,
+            &key,
+            "upsert",
+            rows(),
+            &inputs,
+            &RunGuards::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(written, 2);
     }
 

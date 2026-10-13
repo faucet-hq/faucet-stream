@@ -331,7 +331,11 @@ mod tests {
         .unwrap();
         assert!(out.0["id"].as_str().unwrap().starts_with("dlq-replay-"));
         assert_eq!(out.0["records_written"], 2);
-        assert!(!state.registry().is_registered(out.0["id"].as_str().unwrap()));
+        assert!(
+            !state
+                .registry()
+                .is_registered(out.0["id"].as_str().unwrap())
+        );
 
         state
             .registry()
@@ -354,9 +358,13 @@ mod tests {
         let (cfg, from) = fixture(dir.path(), 3, "");
         let state = crate::serve::test_support::test_state();
         state.shutdown_token().cancel();
-        let out = replay(State(state), Extension(actor(None)), Json(request(cfg, from)))
-            .await
-            .unwrap();
+        let out = replay(
+            State(state),
+            Extension(actor(None)),
+            Json(request(cfg, from)),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.0["records_written"], 0);
     }
 
@@ -366,9 +374,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, from) = fixture(dir.path(), 3, "budget: { max_records: 2 }\n");
         let state = crate::serve::test_support::test_state();
-        let err = replay(State(state), Extension(actor(None)), Json(request(cfg, from)))
-            .await
-            .unwrap_err();
+        let err = replay(
+            State(state),
+            Extension(actor(None)),
+            Json(request(cfg, from)),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{err:?}").contains("max_records"), "{err:?}");
     }
 
@@ -414,9 +426,13 @@ mod tests {
         // A principal confined to another tenant cannot name this one.
         let mut req = request(cfg.clone(), from.clone());
         req.tenant = Some("acme".into());
-        let err = replay(State(state.clone()), Extension(actor(Some("other"))), Json(req))
-            .await
-            .unwrap_err();
+        let err = replay(
+            State(state.clone()),
+            Extension(actor(Some("other"))),
+            Json(req),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ServeError::NotFound), "{err:?}");
 
         t.suspended = true;

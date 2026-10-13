@@ -912,9 +912,8 @@ pipeline:
     /// atomic-watermark exactly-once, naming why.
     #[test]
     fn a_quarantine_with_exactly_once_is_refused_by_name() {
-        let mut c = mk_cfg(
-            "  state: { type: file, config: { path: st } }\ndelivery: exactly_once\n",
-        );
+        let mut c =
+            mk_cfg("  state: { type: file, config: { path: st } }\ndelivery: exactly_once\n");
         c.policy = Some(
             serde_json::from_value(json!({
                 "classifications": [{"label": "pii", "fields": ["email"]}],
@@ -957,7 +956,10 @@ pipeline:
         assert_eq!(at_dlq.len(), 1, "{r:?}");
         assert_eq!(at_dlq[0].rule, "pii-eu");
         let r = report(&cfg("eu"));
-        assert!(r.rows[0].violations.iter().all(|v| v.sink != "dlq"), "{r:?}");
+        assert!(
+            r.rows[0].violations.iter().all(|v| v.sink != "dlq"),
+            "{r:?}"
+        );
     }
 
     /// #870: a masking rule that names the DLQ satisfies a `mask:` rule there.
@@ -972,7 +974,10 @@ pipeline:
             "  contract:\n    version: \"1\"\n    fields:\n      - { name: email, type: string }\n  masking:\n    rules:\n      - { match: { fields: [email] }, action: { type: hash }, applies_to: [dlq] }\n  dlq:\n    sink: { type: jsonl, config: { path: dlq.jsonl }, attributes: { residency: us } }\n",
         );
         let r = evaluate_nodes(&masked, &expand(&c).unwrap(), &HashMap::new()).unwrap();
-        assert!(r.rows[0].violations.iter().all(|v| v.sink != "dlq"), "{r:?}");
+        assert!(
+            r.rows[0].violations.iter().all(|v| v.sink != "dlq"),
+            "{r:?}"
+        );
         assert!(
             r.rows[0].violations.iter().any(|v| v.sink != "dlq"),
             "the main sink is not masked by a DLQ-only rule: {r:?}"

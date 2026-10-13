@@ -359,7 +359,10 @@ pipeline:
         )
         .unwrap();
         let out = render_summary(&spec, &destinations(&cfg).unwrap());
-        assert!(out.contains("- dlq (dead-letter queue) [jsonl]: d"), "{out}");
+        assert!(
+            out.contains("- dlq (dead-letter queue) [jsonl]: d"),
+            "{out}"
+        );
     }
 
     /// The report scopes rules by the kind a row actually writes (after its
