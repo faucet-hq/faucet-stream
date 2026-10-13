@@ -329,7 +329,7 @@ export async function renderDetail(container, { id }) {
       .sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
     const maxMs = Math.max(1, ...invs.map((i) => i.duration_ms || 0));
     inv.innerHTML =
-      `<table class="tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th title="the invocation's own run id — what faucet rollback --run undoes">run id</th><th>records</th><th title="where every offered row went: written / merged by a keyed write / declined by the sink / failed to the DLQ / quarantined / dropped / unaccounted">rows</th><th title="sink writes: committed / partly to the DLQ / whole to the DLQ (dlq_all) / failed">batches</th><th title="how far the source was behind its head when the invocation ended">lag</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
+      `<table class="tbl inv-tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th title="the invocation's own run id — what faucet rollback --run undoes">run id</th><th>records</th><th title="where every offered row went: written / merged by a keyed write / declined by the sink / failed to the DLQ / quarantined / dropped / unaccounted">rows</th><th title="sink writes: committed / partly to the DLQ / whole to the DLQ (dlq_all) / failed">batches</th><th title="how far the source was behind its head when the invocation ended">lag</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
       invs
         .map((i) => {
           const ms = i.duration_ms || 0;
@@ -410,10 +410,10 @@ export async function renderDetail(container, { id }) {
 /** `98 ok · 2 dlq` — where one invocation's offered rows went (#879). */
 function rowsCell(r) {
   if (!r || (!r.offered && !r.unaccounted)) return `<span class="run-meta">—</span>`;
-  const parts = [`${fmtInt(r.accepted || 0)} ok`];
+  const parts = [`<span>${fmtInt(r.accepted || 0)} ok</span>`];
   const filtered = Math.max(0, (r.transform_in || 0) - (r.transform_out || 0));
-  if (r.coalesced) parts.push(`${fmtInt(r.coalesced)} merged`);
-  if (r.skipped) parts.push(`${fmtInt(r.skipped)} skipped`);
+  if (r.coalesced) parts.push(`<span>${fmtInt(r.coalesced)} merged</span>`);
+  if (r.skipped) parts.push(`<span>${fmtInt(r.skipped)} skipped</span>`);
   if (r.failed) parts.push(`<span class="batch-warn">${fmtInt(r.failed)} dlq</span>`);
   if (r.quarantined) parts.push(`<span class="batch-warn">${fmtInt(r.quarantined)} quarantined</span>`);
   if (r.dropped) parts.push(`<span class="batch-warn">${fmtInt(r.dropped)} dropped</span>`);
@@ -428,7 +428,7 @@ function rowsCell(r) {
 /** `12 ok` or `10 ok · 1 partial · 1 dlq_all` for one invocation's sink writes (#737). */
 function batchCell(b) {
   if (!b || !b.attempted) return `<span class="run-meta">—</span>`;
-  const parts = [`${fmtInt(b.committed)} ok`];
+  const parts = [`<span>${fmtInt(b.committed)} ok</span>`];
   if (b.dlq_partial) parts.push(`<span class="batch-warn">${fmtInt(b.dlq_partial)} partial</span>`);
   if (b.dlq_all) parts.push(`<span class="batch-warn">${fmtInt(b.dlq_all)} dlq_all</span>`);
   if (b.failed) parts.push(`<span class="batch-bad">${fmtInt(b.failed)} failed</span>`);

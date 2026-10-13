@@ -1862,6 +1862,20 @@ select {
 .health-num { font-variant-numeric: tabular-nums; }
 .health-lag { white-space: nowrap; }
 .batch-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* run-detail invocations: nine columns, so each gets its own share */
+.tbl.inv-tbl th:nth-child(1), .tbl.inv-tbl td:nth-child(1) { width: 15%; }
+.tbl.inv-tbl th:nth-child(2), .tbl.inv-tbl td:nth-child(2) { width: 9%; }
+.tbl.inv-tbl th:nth-child(3), .tbl.inv-tbl td:nth-child(3) { width: 10%; }
+.tbl.inv-tbl th:nth-child(4), .tbl.inv-tbl td:nth-child(4) { width: 7%; }
+.tbl.inv-tbl th:nth-child(5), .tbl.inv-tbl td:nth-child(5) { width: 15%; }
+.tbl.inv-tbl th:nth-child(6), .tbl.inv-tbl td:nth-child(6) { width: 12%; }
+.tbl.inv-tbl th:nth-child(7), .tbl.inv-tbl td:nth-child(7) { width: 8%; }
+.tbl.inv-tbl th:nth-child(8), .tbl.inv-tbl td:nth-child(8) { width: 11%; }
+.tbl.inv-tbl th:nth-child(9), .tbl.inv-tbl td:nth-child(9) { width: 13%; }
+.tbl.inv-tbl th { overflow-wrap: normal; }
+.tbl.inv-tbl .batch-cell { white-space: normal; }
+.tbl.inv-tbl .batch-cell > span { white-space: nowrap; }
+.tbl.inv-tbl td:nth-child(3) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
 .batch-warn { color: var(--queued); }
 .batch-bad { color: var(--fail); }
 .ds-table.health-table tr.health-row:has(+ tr.health-why) td { border-bottom: none; padding-bottom: 4px; }
