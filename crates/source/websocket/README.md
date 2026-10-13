@@ -328,6 +328,12 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 - [`faucet-source-webhook`](https://crates.io/crates/faucet-source-webhook) — the inbound (server) counterpart for push delivery over HTTP.
 - [`faucet-source-kafka`](https://crates.io/crates/faucet-source-kafka) — durable, resumable streaming for a different transport.
 
+## Timeouts, cancellation and redirects
+
+The handshake runs through the pipeline's `CallContext` (#880): metered as
+`connect` and ended by a caller deadline or cancel token, after which the
+source stops instead of reconnecting.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

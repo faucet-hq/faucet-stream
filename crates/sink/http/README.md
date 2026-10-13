@@ -278,6 +278,16 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Timeouts, cancellation and redirects
+
+Every request runs through the pipeline's `CallContext` (#880): `max_retries`
+retries a `5xx` / `429` / connection failure with jittered backoff (a `429`
+waits its `Retry-After`), every attempt is counted as a `send` round trip, and
+a caller deadline ends the call. Custom auth headers are marked sensitive.
+Redirects are followed by `faucet_core::http::Client`: a hop to another
+origin drops `Authorization`, cookies and every credential header, and a request
+body is never replayed to another origin.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

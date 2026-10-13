@@ -441,6 +441,16 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 - [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) — the JSON/REST sibling source.
 - [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql) — GraphQL source.
 
+## Timeouts, cancellation and redirects
+
+Every request runs through the pipeline's `CallContext` (#880): each attempt is
+bounded by `timeout` (300 s when unset), the run's cancel token stops an
+in-flight request or backoff, and the retry policy is unchanged. Responses are
+read with a 1 GiB cap.
+Redirects are followed by `faucet_core::http::Client`: a hop to another
+origin drops `Authorization`, cookies and every credential header, and a request
+body is never replayed to another origin.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

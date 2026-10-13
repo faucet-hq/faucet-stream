@@ -1098,6 +1098,18 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 - [Config-file grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html)
 - Related crates: [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql), [`faucet-source-xml`](https://crates.io/crates/faucet-source-xml), [`faucet-sink-http`](https://crates.io/crates/faucet-sink-http), [`faucet-auth`](https://crates.io/crates/faucet-auth).
 
+## Timeouts, cancellation and redirects
+
+Every request runs through the pipeline's `CallContext` (#880): each attempt is
+bounded by `timeout` (300 s when `timeout` is unset), the run's cancel token
+stops an in-flight request or backoff, and any caller deadline ends the call.
+`max_retries` / `retry_backoff` (or an injected `resilience:` policy) and the
+"a `429` waits its `Retry-After` without using a retry, at most ten in a row"
+rule are unchanged. Buffered responses are capped at 1 GiB.
+Redirects are followed by `faucet_core::http::Client`: a hop to another
+origin drops `Authorization`, cookies and every credential header, and a request
+body is never replayed to another origin.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
