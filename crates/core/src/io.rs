@@ -401,6 +401,31 @@ impl CallContext {
         };
         outcome.map_err(|e| self.redact_error(e))
     }
+
+    /// Run `fut` as one backend call named `op`, for a request that cannot be
+    /// rebuilt: a future borrowing a cursor by `&mut`, a streamed body, an
+    /// SDK request already consumed. The attempt timeout, deadline, cancel
+    /// token and metering apply as in [`call`](Self::call); the retry policy
+    /// does not — the call is made once.
+    pub async fn call_once<T, Fut>(&self, op: &'static str, fut: Fut) -> Result<T, FaucetError>
+    where
+        Fut: Future<Output = Result<T, FaucetError>>,
+    {
+        let mut fut = Some(Box::pin(fut));
+        let once = self.clone().without_retry();
+        Box::pin(once.call(op, || {
+            let attempt = fut.take();
+            async move {
+                match attempt {
+                    Some(f) => f.await,
+                    None => Err(FaucetError::Custom(Box::new(std::io::Error::other(
+                        format!("{op} call: a one-shot call was retried"),
+                    )))),
+                }
+            }
+        }))
+        .await
+    }
 }
 
 fn cancelled_error(op: &'static str) -> FaucetError {
@@ -521,6 +546,15 @@ impl CallSlot {
     {
         self.get().call(op, f).await
     }
+
+    /// Run `fut` once through the effective context
+    /// ([`CallContext::call_once`]).
+    pub async fn call_once<T, Fut>(&self, op: &'static str, fut: Fut) -> Result<T, FaucetError>
+    where
+        Fut: Future<Output = Result<T, FaucetError>>,
+    {
+        self.get().call_once(op, fut).await
+    }
 }
 
 #[cfg(test)]
@@ -568,6 +602,38 @@ mod tests {
             Err(FaucetError::HttpStatus { status: 503, .. })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_once_bounds_a_one_shot_future_and_never_retries() {
+        let ctx = CallContext::new()
+            .with_timeout(Duration::from_secs(1))
+            .with_retry(fast(3));
+        let polls = AtomicU32::new(0);
+        let r: Result<(), _> = ctx
+            .call_once("read", async {
+                polls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            })
+            .await;
+        assert!(matches!(r, Err(FaucetError::Timeout { .. })), "{r:?}");
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "never retried");
+
+        let r = ctx
+            .call_once("read", async { Err::<(), _>(status(503)) })
+            .await;
+        assert!(matches!(
+            r,
+            Err(FaucetError::HttpStatus { status: 503, .. })
+        ));
+
+        let slot = CallSlot::new(CallContext::new());
+        let cancel = CancellationToken::new();
+        slot.install(CallContext::new().with_cancel(cancel.clone()));
+        assert_eq!(slot.call_once("read", async { Ok(5) }).await.unwrap(), 5);
+        cancel.cancel();
+        let r = slot.call_once("read", async { Ok(5) }).await;
+        assert!(matches!(r, Err(FaucetError::Cancelled { .. })), "{r:?}");
     }
 
     #[tokio::test]
