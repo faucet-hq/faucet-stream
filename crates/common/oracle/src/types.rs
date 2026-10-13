@@ -265,9 +265,8 @@ pub fn typed_text_to_json(text: &str, family: TypeFamily) -> Value {
             "0" | "FALSE" => Value::Bool(false),
             _ => Value::String(text.to_string()),
         },
-        TypeFamily::Json => {
-            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.into()))
-        }
+        TypeFamily::Json => faucet_core::fidelity::parse_json(text.as_bytes())
+            .unwrap_or_else(|_| Value::String(text.into())),
         _ => Value::String(text.to_string()),
     }
 }
