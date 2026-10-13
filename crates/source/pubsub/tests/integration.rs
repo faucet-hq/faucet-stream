@@ -405,3 +405,20 @@ async fn max_messages_strands_no_pulled_tail() {
         .unwrap();
     assert_eq!(rest.len(), 3, "the other three are delivered right away");
 }
+
+/// Pulls, acks and renewals are counted on the installed recorder.
+#[tokio::test(flavor = "multi_thread")]
+async fn pulls_and_acks_are_counted_on_the_installed_recorder() {
+    let emu = emulator().await;
+    let host = emu.host.as_str();
+    let client = setup_client().await;
+    create_topic_sub(&client, "src-rec-t", "src-rec-s").await;
+    publish(&client, "src-rec-t", vec![msg(b"{\"a\":1}", &[], "")]).await;
+
+    let mut cfg = PubsubSourceConfig::new("src-rec-s");
+    cfg.connection = conn(host);
+    cfg.idle_termination_secs = Some(5);
+    cfg.max_messages = Some(1);
+    let source = PubsubSource::new(cfg).await.expect("source builds");
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+}

@@ -602,6 +602,22 @@ mod tests {
         }
     }
 
+    /// A descriptor built at run time answers like a `const` one, and the
+    /// test connectors' read and write paths behave like real ones.
+    #[tokio::test]
+    async fn descriptors_built_at_run_time_and_the_test_connectors() {
+        let d = ConnectorDescriptor::new("rich", |_| Sink::capabilities(&Rich));
+        assert_eq!(d.kind(), "rich");
+        assert!(d.kind_capabilities().idempotent_writes());
+        let rows = [json!({"a": 1})];
+        for sink in [&Plain as &dyn Sink, &Rich] {
+            assert_eq!(sink.write_batch(&rows).await.unwrap(), 1);
+        }
+        for source in [&Plain as &dyn Source, &Rich] {
+            assert!(source.fetch_all().await.unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn plain_connectors_derive_nothing() {
         assert_eq!(Source::capabilities(&Plain), Capabilities::plain_source());

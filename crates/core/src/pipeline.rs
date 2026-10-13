@@ -5170,6 +5170,24 @@ mod tests {
         assert_eq!(main.committed.lock().unwrap()[0]["email"], "***");
     }
 
+    /// Without a governance value, a metered run still counts what it
+    /// dead-letters.
+    #[tokio::test]
+    async fn a_metered_run_counts_its_dead_letters() {
+        let source = MockSource(vec![json!({"id": 1}), json!({"id": 2})]);
+        let main = PartialSink::new(vec![0]);
+        let dlq = std::sync::Arc::new(MockSink::new());
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        Pipeline::new(&source, &main)
+            .with_dlq(DlqConfig::new(dlq.clone()))
+            .with_usage_meter(Arc::clone(&meter))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(dlq.0.lock().unwrap().len(), 1);
+        assert_eq!(meter.snapshot().dlq_records_written, 1);
+    }
+
     #[tokio::test]
     async fn dlq_propagate_policy_bubbles_outer_err() {
         let main = FailingSink;
@@ -8543,6 +8561,85 @@ mod cleanup_tests {
         assert!(
             value_path_events(&events).is_empty(),
             "no Value writes: {events:?}"
+        );
+    }
+
+    /// A source whose native batches carry no row count.
+    struct UncountedNativeSource;
+
+    #[async_trait]
+    impl Source for UncountedNativeSource {
+        async fn fetch_with_context(
+            &self,
+            _context: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn native_output_formats(&self) -> &'static [crate::native::NativeFormat] {
+            &[crate::native::NativeFormat::Csv]
+        }
+        fn stream_native<'a>(
+            &'a self,
+            _context: &'a std::collections::HashMap<String, Value>,
+            _format: crate::native::NativeFormat,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'a>>
+        {
+            Box::pin(futures::stream::iter((0..2).map(|i| {
+                Ok(crate::native::NativeBatch::bytes(
+                    crate::native::NativeFormat::Csv,
+                    format!("h\nrow{i}\n").into_bytes(),
+                )
+                .with_bookmark((i == 1).then(|| json!({"page": i}))))
+            })))
+        }
+    }
+
+    /// Hands every hook, `load_native` included, to the recording sink.
+    struct ForwardingNative(NativeRecordingSink);
+
+    #[async_trait]
+    impl Sink for ForwardingNative {
+        crate::forward_sink!(0);
+    }
+
+    /// Loads nothing of what it is offered.
+    struct DroppingNative(NativeRecordingSink);
+
+    #[async_trait]
+    impl Sink for DroppingNative {
+        crate::forward_sink!(0; except load_native);
+        async fn load_native(
+            &self,
+            _batch: crate::native::NativeBatch,
+            _scope: &str,
+            _ctx: crate::native::NativeLoadContext,
+        ) -> Result<usize, FaucetError> {
+            Ok(0)
+        }
+    }
+
+    /// An uncounted native batch is loaded unchecked (a forwarding wrapper
+    /// passes the load through); a counted one the sink only partly accepts
+    /// fails the run with the rows unaccounted for.
+    #[tokio::test]
+    async fn native_loads_are_checked_against_the_rows_offered() {
+        let sink = ForwardingNative(NativeRecordingSink::new(false));
+        let result = Pipeline::new(&UncountedNativeSource, &sink)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(sink.0.loads.lock().unwrap().len(), 2);
+        assert_eq!(result.bookmark, Some(json!({"page": 1})));
+
+        let short = DroppingNative(NativeRecordingSink::new(false));
+        let err = Pipeline::new(&NativeCsvSource::new(1), &short)
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FaucetError::RowsUnaccounted { .. }),
+            "{err:?}"
         );
     }
 

@@ -507,6 +507,20 @@ mod tests {
         assert_eq!(verdict(F::Masking, Target::Path(P::Native)), D);
     }
 
+    /// The table's constructors build the rows `verdict` reads.
+    #[test]
+    fn rule_constructors_build_table_rows() {
+        let p = path(F::Overwrite, P::Watermark, R(EO_WITH_OVERWRITE));
+        assert_eq!(p.target, Target::Path(P::Watermark));
+        assert_eq!(verdict(p.feature, p.target), p.verdict);
+        let c = cap(
+            F::Cleanup,
+            CapabilityCondition::NoCleanup,
+            R(CLEANUP_UNSUPPORTED),
+        );
+        assert_eq!(verdict(c.feature, c.target), c.verdict);
+    }
+
     #[test]
     fn row_path_honours_every_feature() {
         assert!(path_allowed(P::Row, Feature::ALL));
