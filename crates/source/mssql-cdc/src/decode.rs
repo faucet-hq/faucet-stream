@@ -67,15 +67,15 @@ fn scalar_to_json(data: &ColumnData<'_>) -> Option<Value> {
         ColumnData::I16(o) => o.map(|n| json!(n)),
         ColumnData::I32(o) => o.map(|n| json!(n)),
         ColumnData::I64(o) => o.map(|n| json!(n)),
-        ColumnData::F32(o) => o.map(|f| json!(f)),
-        ColumnData::F64(o) => o.map(|f| json!(f)),
+        ColumnData::F32(o) => o.map(faucet_core::fidelity::float32),
+        ColumnData::F64(o) => o.map(faucet_core::fidelity::float64),
         ColumnData::Bit(o) => o.map(|b| json!(b)),
         ColumnData::String(o) => o.as_ref().map(|s| json!(s.as_ref())),
         ColumnData::Guid(o) => o.map(|g| json!(g.to_string())),
         ColumnData::Binary(o) => o
             .as_ref()
             .map(|b| json!(base64::engine::general_purpose::STANDARD.encode(b.as_ref()))),
-        ColumnData::Numeric(o) => o.map(|n| json!(numeric_to_string(n))),
+        ColumnData::Numeric(o) => o.map(numeric_json),
         ColumnData::Xml(o) => o.as_ref().map(|x| json!(x.as_ref().clone().into_string())),
         ColumnData::DateTime(_)
         | ColumnData::SmallDateTime(_)
@@ -115,32 +115,55 @@ fn decode_temporal(row: &Row, idx: usize, data: &ColumnData<'_>) -> Result<Value
     Ok(value.unwrap_or(Value::Null))
 }
 
-/// Format an MSSQL DECIMAL/NUMERIC value as a precision-preserving string (JSON
-/// numbers cannot represent arbitrary-precision decimals — mirrors the query
-/// source's NUMERIC-as-string behaviour).
-pub(crate) fn numeric_to_string(n: Numeric) -> String {
-    let scale = n.scale() as usize;
-    let mantissa = n.value();
-    if scale == 0 {
-        return mantissa.to_string();
-    }
-    let negative = mantissa < 0;
-    let mut digits = mantissa.unsigned_abs().to_string();
-    if digits.len() <= scale {
-        digits = format!("{:0>width$}", digits, width = scale + 1);
-    }
-    let split = digits.len() - scale;
-    let (int_part, frac_part) = digits.split_at(split);
-    format!(
-        "{}{}.{}",
-        if negative { "-" } else { "" },
-        int_part,
-        frac_part
-    )
+/// An MSSQL DECIMAL/NUMERIC value as its exact digits at the column's scale.
+pub(crate) fn numeric_json(n: Numeric) -> Value {
+    faucet_core::fidelity::decimal_from_i128(n.value(), i32::from(n.scale()))
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The value-fidelity corpus (#885): the wide row as the TDS cells SQL
+    /// Server sends for it (a nested value is `NVARCHAR` JSON text — MSSQL has
+    /// no JSON type) decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let mut sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object_mut().unwrap().iter_mut() {
+            if v.is_object() || v.is_array() {
+                *v = serde_json::Value::String(v.to_string());
+            }
+            let cell = match &*v {
+                serde_json::Value::Null => tiberius::ColumnData::String(None),
+                serde_json::Value::Bool(b) => tiberius::ColumnData::Bit(Some(*b)),
+                serde_json::Value::Number(n) if n.is_f64() => tiberius::ColumnData::F64(n.as_f64()),
+                serde_json::Value::Number(n) => tiberius::ColumnData::I64(n.as_i64()),
+                serde_json::Value::String(s) if name.starts_with("canonical_decimal") => {
+                    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+                    let unscaled: i128 = format!("{int}{frac}").parse().unwrap();
+                    tiberius::ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                        unscaled,
+                        frac.len() as u8,
+                    )))
+                }
+                serde_json::Value::String(s) => {
+                    tiberius::ColumnData::String(Some(std::borrow::Cow::Owned(s.clone())))
+                }
+                _ => unreachable!("nested values were turned into text"),
+            };
+            landed.insert(
+                name.clone(),
+                super::scalar_to_json(&cell).expect("a non-temporal cell"),
+            );
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[serde_json::Value::Object(landed)],
+            fidelity::Tolerance::exact(),
+        );
+    }
     #[test]
     fn money_columns_decode_as_exact_text() {
         use tiberius::{ColumnData, ColumnType};
@@ -176,13 +199,24 @@ mod tests {
     #[test]
     fn numeric_formats_with_scale() {
         assert_eq!(
-            numeric_to_string(Numeric::new_with_scale(12345, 2)),
-            "123.45"
+            numeric_json(Numeric::new_with_scale(12345, 2)),
+            json!("123.45")
         );
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(100, 0)), "100");
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(5, 2)), "0.05");
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(-150, 2)), "-1.50");
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(-5, 2)), "-0.05");
+        assert_eq!(numeric_json(Numeric::new_with_scale(100, 0)), json!("100"));
+        assert_eq!(numeric_json(Numeric::new_with_scale(5, 2)), json!("0.05"));
+        assert_eq!(
+            numeric_json(Numeric::new_with_scale(-150, 2)),
+            json!("-1.50")
+        );
+        assert_eq!(numeric_json(Numeric::new_with_scale(-5, 2)), json!("-0.05"));
+        assert_eq!(
+            scalar_to_json(&ColumnData::F32(Some(0.1))),
+            Some(json!(0.1))
+        );
+        assert_eq!(
+            scalar_to_json(&ColumnData::F64(Some(f64::NAN))),
+            Some(serde_json::Value::Null)
+        );
     }
 
     #[test]

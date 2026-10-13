@@ -328,6 +328,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The value-fidelity corpus (#885): every parameter this sink binds
+    /// carries exactly the value it came from (a non-integer number as its
+    /// shortest text, which SQL Server parses exactly).
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let back = match BoundParam::from_value(v) {
+                BoundParam::I64(i) => json!(i),
+                BoundParam::Bool(b) => json!(b),
+                BoundParam::Null(_) | BoundParam::NullBinary(_) => Value::Null,
+                BoundParam::Str(s) if v.is_string() => json!(s),
+                BoundParam::Str(s) => faucet_core::fidelity::from_str(&s).unwrap(),
+            };
+            landed.insert(name.clone(), back);
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[Value::Object(landed)],
+            fidelity::Tolerance::exact(),
+        );
+    }
+
     #[test]
     fn fields_fold_to_columns_and_unmatched_rows_are_named() {
         let cols: Vec<String> = vec!["UserID".into(), "Kind".into(), "a".into(), "A".into()];

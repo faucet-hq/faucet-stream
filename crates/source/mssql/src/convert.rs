@@ -150,6 +150,48 @@ pub(crate) fn numeric_json(n: Numeric) -> Value {
 #[cfg(test)]
 mod tests {
 
+    /// The value-fidelity corpus (#885): the wide row as the TDS cells SQL
+    /// Server sends for it (a nested value is `NVARCHAR` JSON text — MSSQL has
+    /// no JSON type) decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let mut sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object_mut().unwrap().iter_mut() {
+            if v.is_object() || v.is_array() {
+                *v = serde_json::Value::String(v.to_string());
+            }
+            let cell = match &*v {
+                serde_json::Value::Null => tiberius::ColumnData::String(None),
+                serde_json::Value::Bool(b) => tiberius::ColumnData::Bit(Some(*b)),
+                serde_json::Value::Number(n) if n.is_f64() => tiberius::ColumnData::F64(n.as_f64()),
+                serde_json::Value::Number(n) => tiberius::ColumnData::I64(n.as_i64()),
+                serde_json::Value::String(s) if name.starts_with("canonical_decimal") => {
+                    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+                    let unscaled: i128 = format!("{int}{frac}").parse().unwrap();
+                    tiberius::ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                        unscaled,
+                        frac.len() as u8,
+                    )))
+                }
+                serde_json::Value::String(s) => {
+                    tiberius::ColumnData::String(Some(std::borrow::Cow::Owned(s.clone())))
+                }
+                _ => unreachable!("nested values were turned into text"),
+            };
+            landed.insert(
+                name.clone(),
+                super::scalar_to_json(&cell).expect("a non-temporal cell"),
+            );
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[serde_json::Value::Object(landed)],
+            fidelity::Tolerance::exact(),
+        );
+    }
+
     #[test]
     fn real_keeps_its_shortest_decimal_form() {
         assert_eq!(
