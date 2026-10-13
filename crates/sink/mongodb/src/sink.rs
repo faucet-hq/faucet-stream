@@ -216,6 +216,35 @@ struct InsertStep {
     consumed: usize,
 }
 
+/// A driver error as a [`FaucetError::Sink`] prefixed with `context`.
+fn sink_err(context: &'static str) -> impl FnOnce(mongodb::error::Error) -> FaucetError {
+    move |e| FaucetError::Sink(format!("{context}: {e}"))
+}
+
+/// A transaction error classified by [`classify_transaction_error`].
+fn txn_err(context: &'static str) -> impl FnOnce(mongodb::error::Error) -> FaucetError {
+    move |e| classify_transaction_error(context, &e.to_string())
+}
+
+/// Log the failure of a best-effort step that must not fail the write.
+fn ignore_error<T>(what: &str, result: mongodb::error::Result<T>) {
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "{what}");
+    }
+}
+
+/// Whether a failed commit is re-tried: only while its outcome is unknown
+/// (an `UnknownTransactionCommitResult`, e.g. a primary failover mid-commit),
+/// and at most [`MAX_COMMIT_RETRIES`] times — the driver-recommended retry.
+fn retry_commit(error: &impl std::fmt::Display, unknown: bool, attempt: &mut usize) -> bool {
+    if !unknown || *attempt >= MAX_COMMIT_RETRIES {
+        return false;
+    }
+    *attempt += 1;
+    tracing::warn!(attempt = *attempt, error = %error, "commit outcome unknown; retrying commit");
+    true
+}
+
 /// The outcome of an `insert_partial` call the call context cut short: an
 /// outer `Err` while nothing was inserted, else every pending document fails
 /// per row (earlier documents committed).
@@ -1016,13 +1045,12 @@ impl faucet_core::Sink for MongoSink {
             .call_once("begin_overwrite", async {
                 let db = self.client.database(&self.config.database);
                 // Best-effort drop; a missing namespace is not an error for our purpose.
-                if let Err(e) = db
-                    .collection::<Document>(&self.staging_collection())
-                    .drop()
-                    .await
-                {
-                    tracing::debug!(error = %e, "mongodb overwrite: staging drop before begin (ignored)");
-                }
+                ignore_error(
+                    "mongodb overwrite: staging drop before begin (ignored)",
+                    db.collection::<Document>(&self.staging_collection())
+                        .drop()
+                        .await,
+                );
                 self.clone_destination_shape().await
             })
             .await
@@ -1050,11 +1078,7 @@ impl faucet_core::Sink for MongoSink {
                         "dropTarget": true,
                     })
                     .await
-                    .map_err(|e| {
-                        FaucetError::Sink(format!(
-                            "mongodb overwrite swap (renameCollection) failed: {e}"
-                        ))
-                    })?;
+                    .map_err(sink_err("mongodb overwrite swap (renameCollection) failed"))?;
                 Ok(())
             })
             .await
@@ -1081,15 +1105,14 @@ impl faucet_core::Sink for MongoSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.calls
             .call_once("abort_overwrite", async {
-                if let Err(e) = self
-                    .client
-                    .database(&self.config.database)
-                    .collection::<Document>(&self.staging_collection())
-                    .drop()
-                    .await
-                {
-                    tracing::debug!(error = %e, "mongodb overwrite: staging drop on abort (ignored)");
-                }
+                ignore_error(
+                    "mongodb overwrite: staging drop on abort (ignored)",
+                    self.client
+                        .database(&self.config.database)
+                        .collection::<Document>(&self.staging_collection())
+                        .drop()
+                        .await,
+                );
                 Ok(())
             })
             .await
@@ -1261,9 +1284,7 @@ impl faucet_core::Sink for MongoSink {
                     .commit_token_collection()
                     .find_one(commit_token_filter(scope))
                     .await
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("MongoDB commit-token read failed: {e}"))
-                    })?;
+                    .map_err(sink_err("MongoDB commit-token read failed"))?;
                 doc.map(|d| token_from_commit_doc(&d)).transpose()
             })
             .await
@@ -1301,29 +1322,29 @@ impl faucet_core::Sink for MongoSink {
                 // Prepare (plan + convert to BSON) BEFORE the transaction so a
                 // key-extraction or conversion failure aborts without ever opening a
                 // transaction — mirroring the postgres sink's fail-fast on plan errors.
-                let prepared = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-                    PreparedWrite::Append(
-                        records
-                            .iter()
-                            .map(Self::value_to_document)
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )
-                } else {
-                    let plan = faucet_core::plan_writes_exact(records, &self.config.write);
-                    if let Some((idx, msg)) = plan.failed.first() {
-                        return Err(FaucetError::Sink(format!(
-                            "mongodb {}: row {idx}: {msg}",
-                            self.config.write.write_mode.as_str()
-                        )));
-                    }
-                    PreparedWrite::Planned(self.build_plan_ops(&plan)?)
-                };
+                let prepared =
+                    if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+                        PreparedWrite::Append(
+                            records
+                                .iter()
+                                .map(Self::value_to_document)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )
+                    } else {
+                        let plan = faucet_core::plan_writes_exact(records, &self.config.write);
+                        if let Some((idx, msg)) = plan.failed.first() {
+                            return Err(FaucetError::Sink(format!(
+                                "mongodb {}: row {idx}: {msg}",
+                                self.config.write.write_mode.as_str()
+                            )));
+                        }
+                        PreparedWrite::Planned(self.build_plan_ops(&plan)?)
+                    };
 
-                let mut session = self
-                    .client
-                    .start_session()
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("MongoDB session start failed: {e}")))?;
+                let mut session =
+                    self.client.start_session().await.map_err(|e| {
+                        FaucetError::Sink(format!("MongoDB session start failed: {e}"))
+                    })?;
                 // `w: majority` explicitly: with the client default (`w:1` before
                 // MongoDB 5.0 and on arbiter topologies) a committed page and its
                 // watermark can roll back after a failover (#789 MSG-71).
@@ -1331,9 +1352,7 @@ impl faucet_core::Sink for MongoSink {
                     .start_transaction()
                     .write_concern(mongodb::options::WriteConcern::majority())
                     .await
-                    .map_err(|e| {
-                        classify_transaction_error("MongoDB transaction start failed", &e.to_string())
-                    })?;
+                    .map_err(txn_err("MongoDB transaction start failed"))?;
 
                 let written = match self
                     .apply_in_transaction(&mut session, prepared, scope, token)
@@ -1343,9 +1362,10 @@ impl faucet_core::Sink for MongoSink {
                     Err(e) => {
                         // Best-effort abort so the server releases the transaction's
                         // locks promptly; the original error is what matters.
-                        if let Err(abort_err) = session.abort_transaction().await {
-                            tracing::debug!(error = %abort_err, "MongoDB abort_transaction failed (best-effort)");
-                        }
+                        ignore_error(
+                            "MongoDB abort_transaction failed (best-effort)",
+                            session.abort_transaction().await,
+                        );
                         return Err(e);
                     }
                 };
@@ -1355,26 +1375,11 @@ impl faucet_core::Sink for MongoSink {
                 // label (e.g. a primary failover mid-commit). Bounded so a persistent
                 // outage surfaces instead of spinning forever.
                 let mut attempt = 0usize;
-                loop {
-                    match session.commit_transaction().await {
-                        Ok(()) => break,
-                        Err(e)
-                            if e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
-                                && attempt < MAX_COMMIT_RETRIES =>
-                        {
-                            attempt += 1;
-                            tracing::warn!(
-                                attempt,
-                                error = %e,
-                                "MongoDB commit returned UnknownTransactionCommitResult; retrying commit"
-                            );
-                        }
-                        Err(e) => {
-                            return Err(classify_transaction_error(
-                                "MongoDB transaction commit failed",
-                                &e.to_string(),
-                            ));
-                        }
+                while let Err(e) = session.commit_transaction().await {
+                    let unknown =
+                        e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT);
+                    if !retry_commit(&e, unknown, &mut attempt) {
+                        return Err(txn_err("MongoDB transaction commit failed")(e));
                     }
                 }
 
@@ -1405,6 +1410,43 @@ pub(crate) fn collection_uri(connection_uri: &str, database: &str, collection: &
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_cut_call_fails_whole_until_something_landed() {
+        let pending = vec![(1usize, Document::new())];
+        let outcomes = || vec![Ok(()), Ok(())];
+        let cut = || FaucetError::Sink("deadline".into());
+        assert!(cut_short(cut(), false, &pending, outcomes()).is_err());
+        let rows = cut_short(cut(), true, &pending, outcomes()).unwrap();
+        assert!(rows[0].is_ok());
+        let msg = rows[1].as_ref().unwrap_err().to_string();
+        assert!(
+            msg.contains("MongoDB insert_many: ") && msg.contains("deadline"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn driver_errors_keep_their_context() {
+        let e = || mongodb::error::Error::custom("boom");
+        let msg = sink_err("MongoDB commit-token read failed")(e()).to_string();
+        assert!(msg.contains("MongoDB commit-token read failed: "), "{msg}");
+        let msg = txn_err("MongoDB transaction start failed")(e()).to_string();
+        assert!(msg.contains("MongoDB transaction start failed"), "{msg}");
+        ignore_error("best-effort", Err::<(), _>(e()));
+        ignore_error("best-effort", Ok(()));
+    }
+
+    #[test]
+    fn commit_retries_only_an_unknown_outcome_and_only_so_often() {
+        let mut attempt = 0;
+        assert!(!retry_commit(&"refused", false, &mut attempt));
+        for _ in 0..MAX_COMMIT_RETRIES {
+            assert!(retry_commit(&"unknown", true, &mut attempt));
+        }
+        assert!(!retry_commit(&"unknown", true, &mut attempt));
+        assert_eq!(attempt, MAX_COMMIT_RETRIES);
+    }
 
     #[test]
     fn collection_uris_drop_credentials_paths_and_options() {

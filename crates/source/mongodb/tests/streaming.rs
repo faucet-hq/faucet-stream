@@ -44,6 +44,14 @@ async fn stream_pages_chunks_documents_into_batch_sized_pages() {
 
     let config = MongoSourceConfig::new(uri, "testdb", "events").with_batch_size(1000);
     let source = MongoSource::new(config).await.expect("source new");
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "mongodb",
+        ),
+    ));
 
     let ctx: HashMap<String, serde_json::Value> = HashMap::new();
     let mut pages = source.stream_pages(&ctx, 1000);

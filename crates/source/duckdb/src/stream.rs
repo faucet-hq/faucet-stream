@@ -639,6 +639,34 @@ mod tests {
         assert_eq!(records[0]["data"], "AP8=");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetch_cut_by_the_deadline_interrupts_the_query() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT count(*) AS n FROM range(1000000000000) a",
+        ))
+        .await
+        .unwrap();
+        source.set_roundtrip_recorder(std::sync::Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "duckdb",
+            ),
+        ));
+        source
+            .set_call_context(faucet_core::CallContext::new().with_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            ));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            source.fetch_all().await,
+            Err(FaucetError::Timeout { .. })
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
     #[tokio::test]
     async fn streaming_pages_are_bounded() {
         let source = {
