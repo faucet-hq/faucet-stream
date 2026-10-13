@@ -946,6 +946,36 @@ mod tests {
     use faucet_core::{AuthProvider, AuthReference, AuthSpec, Credential, FaucetError};
     use std::sync::Arc;
 
+    /// The value-fidelity corpus (#885): each record carried as a
+    /// `google.protobuf.Struct` response decodes back unchanged. A Struct holds
+    /// every number as a double — an integer reads back as the equal double
+    /// (`1.0`, inside a list or object too), and the integers past 2^53 are
+    /// lost — which is that type's limitation, not the converter's.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let desc = DescriptorPool::global()
+            .get_message_by_name("google.protobuf.Struct")
+            .expect("well-known Struct");
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let msg = DynamicMessage::deserialize(desc.clone(), record.clone()).unwrap();
+            landed.extend(serialize_and_extract(&msg, None).unwrap());
+        }
+        fidelity::assert_round_trip(
+            &sent,
+            &landed,
+            fidelity::Tolerance::exact()
+                .float_epsilon(0.0)
+                .skipping("i64_max")
+                .skipping("i64_min")
+                .skipping("beyond_f64_exact")
+                .skipping("array")
+                .skipping("object"),
+        );
+    }
+
     // ── Backoff ───────────────────────────────────────────────────────────────
 
     /// Assert a jittered delay sits in core's documented `[0.5, 1.5)` band

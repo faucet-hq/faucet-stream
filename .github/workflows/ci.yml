@@ -148,6 +148,14 @@ jobs:
         run: |
           python3 scripts/test_conformance_coverage.py
           python3 scripts/conformance-coverage.py
+      - name: Check every connector runs the value-fidelity corpus (#885)
+        run: |
+          python3 scripts/test_fidelity_coverage.py
+          python3 scripts/fidelity-coverage.py
+      - name: Check no connector converts a decimal through a float (#885)
+        run: |
+          python3 scripts/test_decimal_f64.py
+          python3 scripts/decimal-f64.py
 
   # The agent skills ship with the engine (#853): they link to docs pages and
   # cli/examples files that must exist, carry no version facts, and their
