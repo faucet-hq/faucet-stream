@@ -1052,7 +1052,17 @@ jobs:
           cargo llvm-cov clean --workspace
           rm -f target/*.profraw
           eval "$(cargo llvm-cov show-env --sh)"
-          retry cargo test --workspace --all-features --test '*'
+          # Libraries and connectors first, then faucet-cli, with the first
+          # batch's test executables and containers dropped in between: all of
+          # them at once (plus the instrumented build) exhausts the runner disk.
+          retry cargo test --workspace --exclude faucet-cli --all-features --test '*'
+          cargo test --workspace --exclude faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
+            | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
+          retry cargo test -p faucet-cli --all-features --test '*'
           # The staged-load execution shims need a live warehouse that can reach
           # a live bucket, so they are excluded here, in codecov.yml, and in
           # scripts/patch-coverage.py (all three kept in sync).
@@ -1060,7 +1070,7 @@ jobs:
 
           echo "::group::teardown before the unit phase"
           df -h /
-          cargo test --workspace --all-features --test '*' --no-run --message-format=json 2>/dev/null \
+          cargo test -p faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
             | while read -r exe; do rm -f "$exe" "${exe}.d"; done
           rm -f target/*.profraw
