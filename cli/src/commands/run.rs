@@ -566,6 +566,12 @@ pub(crate) async fn execute(
                     eprintln!("  {:<30} {}", i.row_id, crate::usage::summary_line(u));
                 }
             }
+            // Row accounting (#879): where every offered row went.
+            for i in &summary.invocations {
+                if let Some(r) = i.metrics.as_ref().and_then(|m| m.rows.as_ref()) {
+                    eprintln!("  {:<30} {}", i.row_id, r.summary_line());
+                }
+            }
             // Undoable runs (#706): print each invocation's run id so the
             // operator can `faucet rollback --run <id>` without digging it
             // out of the destination's `_faucet_run_id` column.
@@ -714,6 +720,9 @@ pub(crate) struct RunRowSummary {
     /// The source's lag at the end of the run (#733).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_lag: Option<faucet_core::SourceLag>,
+    /// Where every row went (#879).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<faucet_core::RowAccountsSnapshot>,
 }
 
 /// Aggregate counters across every row.
@@ -777,6 +786,7 @@ pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
                 usage: o.usage.clone(),
                 batches: m.batches,
                 source_lag: m.source_lag,
+                rows: m.rows,
             }
         })
         .collect()
@@ -1019,6 +1029,7 @@ mod tests {
                 bookmark: None,
                 batches: None,
                 source_lag: None,
+                rows: None,
             }),
             usage: None,
         }

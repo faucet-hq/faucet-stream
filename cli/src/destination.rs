@@ -414,6 +414,7 @@ mod tests {
 
     fn node(id: &str, role: NodeRole, deps: &[&str], sink: Value) -> ExpandedNode {
         ExpandedNode {
+            opt_outs: Vec::new(),
             id: id.into(),
             row_index: 0,
             weight: None,
