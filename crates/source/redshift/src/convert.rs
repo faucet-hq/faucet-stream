@@ -45,10 +45,10 @@ pub(crate) fn pg_value_to_json(
         return Ok(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
-        return Ok(float_to_json(v));
+        return Ok(faucet_core::fidelity::float64(v));
     }
     if let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return Ok(float_to_json(f64::from(v)));
+        return Ok(faucet_core::fidelity::float32(v));
     }
     if let Ok(v) = row.try_get::<bool, _>(col_name) {
         return Ok(Value::Bool(v));
@@ -154,14 +154,6 @@ fn text_fallback_allowed(type_name: &str, text_format: bool) -> bool {
                 | "SUPER"
                 | "\"CHAR\""
         )
-}
-
-/// A float as a JSON number, or its text when it is not finite (JSON has no
-/// NaN/Infinity) — never `NULL`.
-fn float_to_json(v: f64) -> Value {
-    serde_json::Number::from_f64(v)
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::String(v.to_string()))
 }
 
 /// An INTERVAL as an ISO 8601 duration (`P1Y2M3DT4H5M6.5S`).
@@ -321,12 +313,6 @@ mod tests {
         assert_eq!(interval_to_iso(0, -2, -1_000_000), "P-2DT-1S");
         assert_eq!(interval_to_iso(0, 0, -500_000), "PT-0.5S");
         assert_eq!(interval_to_iso(0, 0, 60_000_000), "PT1M");
-    }
-
-    #[test]
-    fn non_finite_floats_keep_their_text() {
-        assert_eq!(float_to_json(f64::NAN), json!("NaN"));
-        assert_eq!(float_to_json(1.5), json!(1.5));
     }
 
     #[test]

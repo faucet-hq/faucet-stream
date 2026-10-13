@@ -39,7 +39,7 @@ pub struct SqsSource {
 /// Decode one SQS message body: the parsed JSON value if the body is valid
 /// JSON, otherwise the raw body wrapped as a JSON string. Pure.
 pub(crate) fn decode_body(body: &str) -> Value {
-    serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()))
+    faucet_core::fidelity::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
 
 /// Pause after an empty short-poll receive.

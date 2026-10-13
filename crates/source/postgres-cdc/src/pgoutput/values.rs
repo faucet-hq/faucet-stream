@@ -79,23 +79,15 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
             })?;
             Value::from(n)
         }
-        OID_FLOAT4 | OID_FLOAT8 => match text {
-            // JSON has no NaN/Inf. Preserve them as strings so the
-            // non-finite value is distinguishable from a SQL NULL, which
-            // also maps to `Value::Null` (#78/#45).
-            "NaN" => Value::String("NaN".into()),
-            "Infinity" => Value::String("Infinity".into()),
-            "-Infinity" => Value::String("-Infinity".into()),
-            other => {
-                let n: f64 = other.parse().map_err(|e| {
-                    FaucetError::Source(format!("pgoutput: float parse {text:?}: {e}"))
-                })?;
-                serde_json::Number::from_f64(n)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            }
-        },
-        OID_NUMERIC => Value::String(text.into()),
+        // JSON has no NaN/Inf: they become a counted `null` (#885).
+        OID_FLOAT4 | OID_FLOAT8 => {
+            let n: f64 = text
+                .parse()
+                .map_err(|e| FaucetError::Source(format!("pgoutput: float parse {text:?}: {e}")))?;
+            faucet_core::fidelity::float64(n)
+        }
+        OID_NUMERIC => faucet_core::fidelity::decimal_text(text)
+            .map_err(|e| FaucetError::Source(format!("pgoutput: numeric {e}")))?,
         OID_BYTEA => {
             let stripped = text.strip_prefix("\\x").ok_or_else(|| {
                 FaucetError::Source(format!(
@@ -106,9 +98,11 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
             Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
         OID_DATE | OID_TIME | OID_TIMESTAMP | OID_TIMESTAMPTZ => temporal_json(type_oid, text)?,
-        OID_JSON | OID_JSONB => serde_json::from_str(text).map_err(|e| {
-            FaucetError::Source(format!("pgoutput: json/jsonb parse {text:?}: {e}"))
-        })?,
+        OID_JSON | OID_JSONB => {
+            faucet_core::fidelity::parse_json(text.as_bytes()).map_err(|e| {
+                FaucetError::Source(format!("pgoutput: json/jsonb parse {text:?}: {e}"))
+            })?
+        }
         other => {
             // One-dimensional arrays of a known scalar element type decode
             // into a JSON array; everything else (incl. multi-dimensional
@@ -326,15 +320,16 @@ mod tests {
     #[test]
     fn floats() {
         assert_eq!(text_to_json(OID_FLOAT8, "3.5").unwrap(), json!(3.5));
-        // NaN/Inf are preserved as strings (distinct from a NULL → Value::Null).
-        assert_eq!(text_to_json(OID_FLOAT8, "NaN").unwrap(), json!("NaN"));
+        // NaN/Inf are a counted null (#885).
+        assert_eq!(text_to_json(OID_FLOAT8, "NaN").unwrap(), Value::Null);
+        assert_eq!(text_to_json(OID_FLOAT4, "Infinity").unwrap(), Value::Null);
+        assert_eq!(text_to_json(OID_FLOAT8, "-Infinity").unwrap(), Value::Null);
+        assert_eq!(text_to_json(OID_NUMERIC, "NaN").unwrap(), Value::Null);
+        assert!(text_to_json(OID_NUMERIC, "x").is_err());
+        assert!(text_to_json(OID_FLOAT8, "x").is_err());
         assert_eq!(
-            text_to_json(OID_FLOAT4, "Infinity").unwrap(),
-            json!("Infinity")
-        );
-        assert_eq!(
-            text_to_json(OID_FLOAT8, "-Infinity").unwrap(),
-            json!("-Infinity")
+            text_to_json(OID_JSONB, r#"{"n": 12345678901234567890.5}"#).unwrap(),
+            json!({"n": "12345678901234567890.5"})
         );
     }
 

@@ -94,13 +94,13 @@ fn payload_to_value(
         ))
     };
     match format {
-        NatsValueFormat::Auto => match serde_json::from_slice::<Value>(payload) {
+        NatsValueFormat::Auto => match faucet_core::fidelity::from_slice(payload) {
             Ok(v) => Ok(v),
             Err(_) => std::str::from_utf8(payload)
                 .map(|s| Value::String(s.to_string()))
                 .map_err(not_utf8),
         },
-        NatsValueFormat::Json => serde_json::from_slice(payload).map_err(|e| {
+        NatsValueFormat::Json => faucet_core::fidelity::from_slice(payload).map_err(|e| {
             FaucetError::Source(format!(
                 "nats: a message on '{subject}' is not valid JSON: {e}"
             ))

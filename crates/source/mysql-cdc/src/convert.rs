@@ -20,12 +20,8 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::NULL => Json::Null,
         Value::Int(i) => Json::from(*i),
         Value::UInt(u) => Json::from(*u),
-        Value::Float(f) => serde_json::Number::from_f64(f64::from(*f))
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
-        Value::Double(d) => serde_json::Number::from_f64(*d)
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
+        Value::Float(f) => faucet_core::fidelity::float64(f64::from(*f)),
+        Value::Double(d) => faucet_core::fidelity::float64(*d),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             // Text-like columns decode as UTF-8 strings; binary falls back to base64.
             Ok(s) => Json::String(s.to_owned()),
@@ -329,14 +325,7 @@ fn hinted_value(hint: &ColumnHint, v: &Value) -> Option<Json> {
             let year: u16 = std::str::from_utf8(b).ok()?.parse().ok()?;
             Some(Json::from(if year == 1900 { 0 } else { year }))
         }
-        (ColumnHint::Float, Value::Float(f)) => {
-            let shortest: f64 = f.to_string().parse().ok()?;
-            Some(
-                serde_json::Number::from_f64(shortest)
-                    .map(Json::Number)
-                    .unwrap_or(Json::Null),
-            )
-        }
+        (ColumnHint::Float, Value::Float(f)) => Some(faucet_core::fidelity::float32(*f)),
         (ColumnHint::Binary, Value::Bytes(b)) => Some(Json::String(
             base64::engine::general_purpose::STANDARD.encode(b),
         )),

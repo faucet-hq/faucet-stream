@@ -108,7 +108,7 @@ impl CompactDecoder {
         if text.is_empty() {
             return Ok(None);
         }
-        let value: Value = serde_json::from_str(text).map_err(|e| {
+        let value: Value = faucet_core::fidelity::from_str(text).map_err(|e| {
             FaucetError::Source(format!("ClickHouse: failed to parse response line: {e}"))
         })?;
         match std::mem::replace(&mut self.state, State::Names) {

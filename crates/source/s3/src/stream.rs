@@ -514,7 +514,7 @@ impl S3Source {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+                    let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
                         FaucetError::Source(format!(
                             "S3 JSON parse error in '{key}' at line {}: {e}",
                             line_num + 1
@@ -525,7 +525,7 @@ impl S3Source {
                 Ok(records)
             }
             S3FileFormat::JsonArray => {
-                let value: Value = serde_json::from_str(text).map_err(|e| {
+                let value: Value = faucet_core::fidelity::from_str(text).map_err(|e| {
                     FaucetError::Source(format!("S3 JSON parse error in '{key}': {e}"))
                 })?;
                 match value {
@@ -737,7 +737,7 @@ impl faucet_core::Source for S3Source {
                                 continue;
                             }
                             let value: Value =
-                                serde_json::from_str(trimmed).map_err(|e| {
+                                faucet_core::fidelity::from_str(trimmed).map_err(|e| {
                                     FaucetError::Source(format!(
                                         "S3 JSON parse error in '{key}' at line {line_num}: {e}",
                                     ))
@@ -843,7 +843,7 @@ impl faucet_core::Source for S3Source {
                         // structure), so each object is buffered fully and
                         // then chunked. The caveat is documented in the
                         // crate README.
-                        let value: Value = serde_json::from_str(&text).map_err(|e| {
+                        let value: Value = faucet_core::fidelity::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("S3 JSON parse error in '{key}': {e}"))
                         })?;
                         let array = match value {

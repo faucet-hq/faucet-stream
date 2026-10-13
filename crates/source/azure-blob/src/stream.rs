@@ -481,7 +481,7 @@ pub(crate) fn parse_file_content(
                 if trimmed.is_empty() {
                     continue;
                 }
-                let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+                let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
                     FaucetError::Source(format!(
                         "azure JSON parse error in '{key}' at line {}: {e}",
                         line_num + 1
@@ -492,7 +492,7 @@ pub(crate) fn parse_file_content(
             Ok(records)
         }
         AzureFileFormat::JsonArray => {
-            let value: Value = serde_json::from_str(text).map_err(|e| {
+            let value: Value = faucet_core::fidelity::from_str(text).map_err(|e| {
                 FaucetError::Source(format!("azure JSON parse error in '{key}': {e}"))
             })?;
             match value {
@@ -722,7 +722,7 @@ impl faucet_core::Source for AzureBlobSource {
                             line_num += 1;
                             let trimmed = line.trim();
                             if trimmed.is_empty() { continue; }
-                            let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+                            let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
                                 FaucetError::Source(format!(
                                     "azure JSON parse error in '{key}' at line {line_num}: {e}",
                                 ))
@@ -760,7 +760,7 @@ impl faucet_core::Source for AzureBlobSource {
                         }
                     }
                     Fetched::JsonArray(text) => {
-                        let value: Value = serde_json::from_str(&text).map_err(|e| {
+                        let value: Value = faucet_core::fidelity::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("azure JSON parse error in '{key}': {e}"))
                         })?;
                         let array = match value {

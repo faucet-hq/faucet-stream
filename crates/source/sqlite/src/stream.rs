@@ -120,8 +120,7 @@ fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Value {
         "REAL" => row
             .try_get::<f64, _>(idx)
             .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
+            .map(faucet_core::fidelity::float64)
             .unwrap_or(Value::Null),
         "BLOB" => row
             .try_get::<Vec<u8>, _>(idx)

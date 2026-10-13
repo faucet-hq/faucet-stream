@@ -484,7 +484,7 @@ impl GraphqlStream {
             };
             return Err(FaucetError::HttpStatus { status, url, body });
         }
-        serde_json::from_str(&text).map_err(FaucetError::Json)
+        faucet_core::fidelity::from_str(&text).map_err(FaucetError::Json)
     }
 
     /// Extract records from a GraphQL response using the configured JSONPath.

@@ -263,15 +263,18 @@ pub fn number_text(text: &str) -> Result<Value, FidelityError> {
     if digits.is_empty() {
         return Ok(Value::Number(0.into()));
     }
-    if crate::json_numbers::is_exact(t)
-        && let Ok(Value::Number(n)) = serde_json::from_str::<Value>(t.trim_start_matches('+'))
-    {
-        return Ok(Value::Number(n));
+    let positional = render_decimal(neg, &digits, scale);
+    for candidate in [t.trim_start_matches('+'), positional.as_str()] {
+        if crate::json_numbers::is_exact(candidate)
+            && let Ok(Value::Number(n)) = serde_json::from_str::<Value>(candidate)
+        {
+            return Ok(Value::Number(n));
+        }
     }
     if scale <= 0 && digits.len() as i64 - scale <= 39 {
-        return integer_text(&render_decimal(neg, &digits, scale));
+        return integer_text(&positional);
     }
-    Ok(Value::String(render_decimal(neg, &digits, scale)))
+    Ok(Value::String(positional))
 }
 
 /// A double as a JSON number; `NaN` / `±Infinity` become a counted `null`.
@@ -295,6 +298,14 @@ pub fn float32(v: f32) -> Value {
     v.to_string()
         .parse::<f64>()
         .map_or_else(|_| float64(f64::from(v)), float64)
+}
+
+/// The text a sink binds for a JSON number that is not an integer: its
+/// shortest round-trip decimal form, so the server parses the value the record
+/// holds. An `f64` bound into a `DECIMAL` column is converted from binary and
+/// lands as `0.1000000000000000055…`. `None` for an integer (bind it natively).
+pub fn non_integer_text(n: &Number) -> Option<String> {
+    n.is_f64().then(|| n.to_string())
 }
 
 /// Bytes as standard base64 with padding.
@@ -352,8 +363,43 @@ pub fn timestamp_from_epoch(
     })
 }
 
-/// Parse JSON text keeping every number exact: a number a `Value` cannot hold
-/// exactly becomes a string of its digits (see [`number_text`]).
+/// Parse JSON text a serializer produced (an HTTP body, a message payload, a
+/// JSON Lines record) the way [`serde_json::from_str`] does, except that a
+/// number literal the parsed value would not spell again — an integer beyond
+/// `u64`, a decimal with more digits than a double carries — becomes a string
+/// of its exact digits instead of the nearest `f64`. A 17-digit rendering of a
+/// double (`0.10000000000000001`) names that double and stays a number.
+pub fn from_str(text: &str) -> Result<Value, serde_json::Error> {
+    let value: Value = serde_json::from_str(text)?;
+    let lossy = crate::file_format::json::unfaithful_literals(text.as_bytes());
+    if lossy.is_empty() {
+        return Ok(value);
+    }
+    let mut rewritten = String::with_capacity(text.len() + 2 * lossy.len());
+    let mut last = 0;
+    for r in &lossy {
+        rewritten.push_str(&text[last..r.start]);
+        rewritten.push('"');
+        rewritten.push_str(&text[r.clone()]);
+        rewritten.push('"');
+        last = r.end;
+    }
+    rewritten.push_str(&text[last..]);
+    serde_json::from_str(&rewritten)
+}
+
+/// [`from_str`] over bytes, for a body that should be UTF-8.
+pub fn from_slice(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => from_str(text),
+        Err(_) => serde_json::from_slice(bytes),
+    }
+}
+
+/// Parse JSON text a database stored (a `JSON` / `JSONB` / `VARIANT` column)
+/// keeping every number exact: a number a `Value` cannot hold exactly — by
+/// decimal value, so `0.10000000000000001` is not `0.1` — becomes a string of
+/// its digits (see [`number_text`]).
 pub fn parse_json(text: &[u8]) -> Result<Value, FidelityError> {
     let text = std::str::from_utf8(text)
         .map_err(|e| FidelityError::NotANumber(format!("invalid UTF-8 in JSON: {e}")))?;
@@ -527,6 +573,10 @@ mod tests {
     #[test]
     fn unscaled_numbers_stay_numbers_only_when_exact() {
         assert_eq!(number_text("1.5").unwrap(), json!(1.5));
+        assert_eq!(number_text(".25").unwrap(), json!(0.25));
+        assert_eq!(number_text("-.5").unwrap(), json!(-0.5));
+        assert_eq!(number_text("+2.5").unwrap(), json!(2.5));
+        assert_eq!(number_text("1E+3").unwrap(), json!(1000.0));
         assert_eq!(number_text("0.1").unwrap(), json!(0.1));
         assert_eq!(number_text("42").unwrap(), json!(42));
         assert_eq!(number_text("1e2").unwrap(), json!(100.0));
@@ -587,6 +637,21 @@ mod tests {
         assert_eq!(float64(f64::NAN), Value::Null);
         assert!(unscoped_non_finite() > before);
         assert_eq!(counter.scope_sync(|| 1), 1);
+    }
+
+    #[test]
+    fn non_integers_bind_as_their_shortest_text() {
+        let n = |v: Value| match v {
+            Value::Number(n) => n,
+            _ => unreachable!(),
+        };
+        assert_eq!(non_integer_text(&n(json!(0.1))), Some("0.1".into()));
+        assert_eq!(
+            non_integer_text(&n(json!(-1.5e300))),
+            Some("-1.5e+300".into())
+        );
+        assert_eq!(non_integer_text(&n(json!(7))), None);
+        assert_eq!(non_integer_text(&n(json!(u64::MAX))), None);
     }
 
     #[test]
@@ -663,6 +728,25 @@ mod tests {
         assert_eq!(TimePrecision::from_digits(2), TimePrecision::Millis);
         assert_eq!(TimePrecision::from_digits(6), TimePrecision::Micros);
         assert_eq!(TimePrecision::from_digits(7), TimePrecision::Nanos);
+    }
+
+    #[test]
+    fn serialized_json_keeps_unfaithful_literals_as_strings() {
+        let v = from_str(
+            r#"{"id": 18446744073709551616, "amt": 0.12345678901234567890, "d": 0.10000000000000001, "s": "1234567890123456789", "n": [1, 2.5]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"id": "18446744073709551616", "amt": "0.12345678901234567890", "d": 0.1, "s": "1234567890123456789", "n": [1, 2.5]})
+        );
+        assert_eq!(from_slice(b"[1]").unwrap(), json!([1]));
+        assert!(from_str("{").is_err());
+        assert!(from_slice(&[b'"', 0xff, b'"']).is_err());
+        assert_eq!(
+            from_str("1e99999").is_err(),
+            serde_json::from_str::<Value>("1e99999").is_err()
+        );
     }
 
     #[test]

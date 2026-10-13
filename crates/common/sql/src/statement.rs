@@ -61,6 +61,17 @@ impl<'a> Param<'a> {
         }
     }
 
+    /// The text to bind when the value is a non-integer JSON number: its
+    /// shortest decimal form, so the server parses exactly the value the
+    /// record holds instead of converting a binary `f64` (#885). `None` for
+    /// any other value.
+    pub fn non_integer_text(&self) -> Option<String> {
+        match self.value.as_ref() {
+            Value::Number(n) => faucet_core::fidelity::non_integer_text(n),
+            _ => None,
+        }
+    }
+
     /// SQL `NULL` for a column the row does not carry.
     pub fn null(column: &'a str, sql_type: Option<&'a str>) -> Self {
         Self::borrowed(column, sql_type, &NULL)
@@ -112,6 +123,12 @@ mod tests {
             &json!("s")
         );
         assert_eq!(Param::null("a", None).value.as_ref(), &Value::Null);
+        assert_eq!(
+            Param::owned("a", None, json!(0.1)).non_integer_text(),
+            Some("0.1".to_string())
+        );
+        assert_eq!(Param::owned("a", None, json!(1)).non_integer_text(), None);
+        assert_eq!(Param::null("a", None).non_integer_text(), None);
         let s = Statement::bare(StatementKind::CleanupDrop, "DROP");
         assert!(s.params.is_empty());
         assert_eq!(s.kind, StatementKind::CleanupDrop);

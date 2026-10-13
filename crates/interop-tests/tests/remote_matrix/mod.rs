@@ -24,6 +24,32 @@ pub trait Remote: Send + Sync + 'static {
     fn sink(&self, cfg: Value) -> BoxFut<'_, Result<Box<dyn Sink>, FaucetError>>;
     /// Every object under `prefix`, as (name relative to `prefix`, body).
     fn objects(&self, prefix: &str) -> BoxFut<'_, Vec<(String, Vec<u8>)>>;
+    /// The backend's own source reading JSON Lines under `prefix`.
+    fn source(&self, prefix: &str) -> BoxFut<'_, Result<Box<dyn Source>, FaucetError>>;
+}
+
+/// The value-fidelity corpus (#885) written through the remote sink as JSON
+/// Lines, read back both by the file source over the downloaded objects and by
+/// the backend's own source: every value must land unchanged.
+#[allow(dead_code)]
+pub async fn assert_corpus_written<R: Remote>(r: &R) {
+    use faucet_conformance::fidelity::{self, Tolerance};
+    let prefix = "fidelity/";
+    let cfg = r.config(
+        prefix,
+        json!({"path": "corpus.jsonl", "format": "json_lines", "batch_size": 0}),
+    );
+    let sent = fidelity::corpus();
+    write(r, &cfg, std::slice::from_ref(&sent))
+        .await
+        .expect("write the corpus");
+    let dir = tempfile::tempdir().unwrap();
+    let (landed, _) = read_back(r, prefix, dir.path(), false)
+        .await
+        .expect("read the corpus back");
+    fidelity::assert_round_trip(&sent, &landed, Tolerance::exact());
+    let source = r.source(prefix).await.expect("source");
+    fidelity::assert_corpus_read(source.as_ref(), &sent, Tolerance::exact()).await;
 }
 
 pub const FORMATS: &[(&str, &str)] = &[

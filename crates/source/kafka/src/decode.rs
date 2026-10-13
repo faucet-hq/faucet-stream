@@ -21,7 +21,7 @@ pub async fn decode(
         return Ok(Value::Null);
     };
     match format {
-        KafkaValueFormat::Json => serde_json::from_slice(bytes)
+        KafkaValueFormat::Json => faucet_core::fidelity::from_slice(bytes)
             .map_err(|e| FaucetError::Source(format!("kafka json decode: {e}"))),
         KafkaValueFormat::RawString => {
             let s = std::str::from_utf8(bytes)

@@ -528,7 +528,7 @@ impl faucet_core::Source for FileSource {
                                 if line.is_empty() {
                                     continue;
                                 }
-                                buffer.push(serde_json::from_str(line).map_err(|e| {
+                                buffer.push(faucet_core::fidelity::from_str(line).map_err(|e| {
                                     FaucetError::Source(format!("file source: '{path}' line {n}: {e}"))
                                 })?);
                                 if buffer.len() >= chunk {

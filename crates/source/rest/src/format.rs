@@ -377,7 +377,7 @@ fn jsonl_line(line: &str, n: usize) -> Result<Option<Value>, FaucetError> {
     if line.is_empty() {
         return Ok(None);
     }
-    serde_json::from_str(line)
+    faucet_core::fidelity::from_str(line)
         .map(Some)
         .map_err(|e| FaucetError::Source(format!("rest: JSONL line {n} is not valid JSON: {e}")))
 }
@@ -588,9 +588,7 @@ fn cell_to_value_in(cell: &calamine::Data, timestamp: bool) -> Value {
         Data::String(s) => Value::String(s.clone()),
         Data::Bool(b) => Value::Bool(*b),
         Data::Int(i) => Value::from(*i),
-        Data::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        Data::Float(f) => faucet_core::fidelity::float64(*f),
         Data::DateTime(dt) => Value::String(excel_datetime_text_in(dt, timestamp)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),

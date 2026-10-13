@@ -64,16 +64,6 @@ pub(crate) fn money_text(f: f64) -> String {
     format!("{sign}{}.{:04}", abs / 10_000, abs % 10_000)
 }
 
-/// A `REAL` as the JSON number its shortest decimal form names, so `0.1`
-/// stays `0.1` rather than widening to `0.10000000149011612`.
-pub(crate) fn real_json(f: f32) -> Value {
-    f.to_string()
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-        .map_or(Value::Null, Value::Number)
-}
-
 /// Convert a non-temporal [`ColumnData`] to JSON.
 ///
 /// Returns `Some(Value::Null)` for a SQL NULL in a non-temporal column, and
@@ -85,15 +75,15 @@ fn scalar_to_json(data: &ColumnData<'_>) -> Option<Value> {
         ColumnData::I16(o) => o.map(|n| json!(n)),
         ColumnData::I32(o) => o.map(|n| json!(n)),
         ColumnData::I64(o) => o.map(|n| json!(n)),
-        ColumnData::F32(o) => o.map(real_json),
-        ColumnData::F64(o) => o.map(|f| json!(f)),
+        ColumnData::F32(o) => o.map(faucet_core::fidelity::float32),
+        ColumnData::F64(o) => o.map(faucet_core::fidelity::float64),
         ColumnData::Bit(o) => o.map(|b| json!(b)),
         ColumnData::String(o) => o.as_ref().map(|s| json!(s.as_ref())),
         ColumnData::Guid(o) => o.map(|g| json!(g.to_string())),
         ColumnData::Binary(o) => o
             .as_ref()
             .map(|b| json!(base64::engine::general_purpose::STANDARD.encode(b.as_ref()))),
-        ColumnData::Numeric(o) => o.map(|n| json!(numeric_to_string(n))),
+        ColumnData::Numeric(o) => o.map(numeric_json),
         ColumnData::Xml(o) => o.as_ref().map(|x| json!(x.as_ref().clone().into_string())),
         // Temporal variants are decoded by the caller via try_get.
         ColumnData::DateTime(_)
@@ -153,27 +143,8 @@ pub(crate) fn format_legacy_datetime(dt: NaiveDateTime) -> String {
 /// Format an MSSQL DECIMAL/NUMERIC value as a precision-preserving string
 /// (JSON numbers can't represent arbitrary-precision decimals — mirrors the
 /// postgres source's NUMERIC-as-string behaviour).
-pub(crate) fn numeric_to_string(n: Numeric) -> String {
-    let scale = n.scale() as usize;
-    let mantissa = n.value();
-    if scale == 0 {
-        return mantissa.to_string();
-    }
-    let negative = mantissa < 0;
-    // unsigned_abs avoids i128::MIN overflow.
-    let mut digits = mantissa.unsigned_abs().to_string();
-    if digits.len() <= scale {
-        // pad with leading zeros so there is at least one integer digit.
-        digits = format!("{:0>width$}", digits, width = scale + 1);
-    }
-    let split = digits.len() - scale;
-    let (int_part, frac_part) = digits.split_at(split);
-    format!(
-        "{}{}.{}",
-        if negative { "-" } else { "" },
-        int_part,
-        frac_part
-    )
+pub(crate) fn numeric_json(n: Numeric) -> Value {
+    faucet_core::fidelity::decimal_from_i128(n.value(), i32::from(n.scale()))
 }
 
 #[cfg(test)]
@@ -181,9 +152,10 @@ mod tests {
 
     #[test]
     fn real_keeps_its_shortest_decimal_form() {
-        assert_eq!(super::real_json(0.1), serde_json::json!(0.1));
-        assert_eq!(super::real_json(-3.5), serde_json::json!(-3.5));
-        assert_eq!(super::real_json(f32::NAN), serde_json::Value::Null);
+        assert_eq!(
+            super::scalar_to_json(&tiberius::ColumnData::F32(Some(f32::NAN))),
+            Some(serde_json::Value::Null)
+        );
         assert_eq!(
             super::scalar_to_json(&tiberius::ColumnData::F32(Some(0.1))),
             Some(serde_json::json!(0.1))
@@ -240,15 +212,18 @@ mod tests {
     #[test]
     fn numeric_formats_with_scale() {
         assert_eq!(
-            numeric_to_string(Numeric::new_with_scale(12345, 2)),
-            "123.45"
+            numeric_json(Numeric::new_with_scale(12345, 2)),
+            json!("123.45")
         );
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(100, 0)), "100");
+        assert_eq!(numeric_json(Numeric::new_with_scale(100, 0)), json!("100"));
         // value < 1 must keep a leading zero
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(5, 2)), "0.05");
+        assert_eq!(numeric_json(Numeric::new_with_scale(5, 2)), json!("0.05"));
         // negatives must not corrupt the fractional part
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(-150, 2)), "-1.50");
-        assert_eq!(numeric_to_string(Numeric::new_with_scale(-5, 2)), "-0.05");
+        assert_eq!(
+            numeric_json(Numeric::new_with_scale(-150, 2)),
+            json!("-1.50")
+        );
+        assert_eq!(numeric_json(Numeric::new_with_scale(-5, 2)), json!("-0.05"));
     }
 
     #[test]

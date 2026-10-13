@@ -17,8 +17,8 @@
 //!
 //! | BigQuery type                          | JSON output                      |
 //! |----------------------------------------|----------------------------------|
-//! | `INTEGER` / `INT64`                    | `Number` (i64 if it fits, else f64) |
-//! | `FLOAT` / `FLOAT64`                    | `Number` (f64)                   |
+//! | `INTEGER` / `INT64`                    | `Number` (an unparseable cell stays a `String`) |
+//! | `FLOAT` / `FLOAT64`                    | `Number` (f64; `NaN` / `Infinity` → counted `null`) |
 //! | `NUMERIC` / `BIGNUMERIC`               | `String` (full precision preserved) |
 //! | `BOOLEAN` / `BOOL`                     | `Bool`                           |
 //! | `RECORD` / `STRUCT`                    | nested `Object`                  |
@@ -178,17 +178,13 @@ fn record_to_json(payload: &Value, field: &TableFieldSchema) -> Value {
 }
 
 fn parse_integer(s: &str) -> Value {
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::Number(i.into());
-    }
-    parse_float(s)
+    faucet_core::fidelity::integer_text(s).unwrap_or_else(|_| Value::String(s.to_owned()))
 }
 
+/// A FLOAT64 cell; `NaN` / `Infinity` become a counted `null` (#885).
 fn parse_float(s: &str) -> Value {
     match s.parse::<f64>() {
-        Ok(f) => serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.to_owned())),
+        Ok(f) => faucet_core::fidelity::float64(f),
         Err(_) => Value::String(s.to_owned()),
     }
 }

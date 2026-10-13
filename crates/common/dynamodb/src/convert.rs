@@ -104,14 +104,10 @@ pub fn number_to_json(raw: &str) -> Value {
             return Value::Number(u.into());
         }
     }
-    if let Ok(f) = raw.trim().parse::<f64>()
-        && f.is_finite()
-        && canonical_decimal(&format!("{f}")).as_ref() == Some(&dec)
-        && let Some(n) = Number::from_f64(f)
-    {
-        return Value::Number(n);
+    match faucet_core::fidelity::number_text(raw) {
+        Ok(Value::Number(n)) => Value::Number(n),
+        _ => Value::String(raw.to_string()),
     }
-    Value::String(raw.to_string())
 }
 
 /// Convert one DynamoDB attribute value to plain JSON (see the module docs).

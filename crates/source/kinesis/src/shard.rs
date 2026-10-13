@@ -78,7 +78,7 @@ pub(crate) fn decode_payload(
     sequence: &str,
 ) -> Result<Value, FaucetError> {
     match format {
-        ValueFormat::Json => serde_json::from_slice(data).map_err(|e| {
+        ValueFormat::Json => faucet_core::fidelity::from_slice(data).map_err(|e| {
             FaucetError::Source(format!(
                 "kinesis: record {sequence} in {shard_id} is not valid JSON: {e}"
             ))

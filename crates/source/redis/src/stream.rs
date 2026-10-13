@@ -75,7 +75,7 @@ impl Decoding {
                 matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['))
             }
         };
-        if parse && let Ok(v) = serde_json::from_str::<Value>(text) {
+        if parse && let Ok(v) = faucet_core::fidelity::from_str(text) {
             return v;
         }
         Value::String(text.to_string())

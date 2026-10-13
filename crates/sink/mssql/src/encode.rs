@@ -16,7 +16,6 @@ use crate::config::OnUnknownField;
 /// borrows from a value that outlives the call.
 pub(crate) enum BoundParam {
     I64(i64),
-    F64(f64),
     Bool(bool),
     Str(String),
     /// A NULL bound as `nvarchar`, which converts to every non-binary type
@@ -38,7 +37,9 @@ impl BoundParam {
                 // the value.
                 Err(_) => BoundParam::Str(n.as_u64().unwrap().to_string()),
             },
-            Value::Number(n) => BoundParam::F64(n.as_f64().unwrap_or(0.0)),
+            // Its shortest text: SQL Server parses that exactly into a DECIMAL
+            // or a float, where a bound float converts from binary (#885).
+            Value::Number(n) => BoundParam::Str(n.to_string()),
             Value::Bool(b) => BoundParam::Bool(*b),
             Value::Null => BoundParam::Null(None),
             // Arrays/objects are serialized; for a json_column this is the whole
@@ -58,7 +59,6 @@ impl BoundParam {
     pub(crate) fn as_tosql(&self) -> &dyn ToSql {
         match self {
             BoundParam::I64(v) => v,
-            BoundParam::F64(v) => v,
             BoundParam::Bool(v) => v,
             BoundParam::Str(v) => v,
             BoundParam::Null(v) => v,
@@ -475,8 +475,8 @@ mod tests {
             BoundParam::I64(7)
         ));
         assert!(matches!(
-            BoundParam::from_value(&json!(1.5)),
-            BoundParam::F64(_)
+            BoundParam::from_value(&json!(0.1)),
+            BoundParam::Str(s) if s == "0.1"
         ));
         assert!(matches!(
             BoundParam::from_value(&json!(true)),

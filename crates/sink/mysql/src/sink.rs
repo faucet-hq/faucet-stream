@@ -103,6 +103,9 @@ impl SqlExecutor for MysqlExec<'_> {
                         }
                     }
                 }
+                _ if p.non_integer_text().is_some() => {
+                    q.bind(p.non_integer_text().expect("checked"))
+                }
                 v => bind_value(q, v),
             };
         }
@@ -273,9 +276,9 @@ pub(crate) fn bind_value<'q>(
             } else if let Some(u) = n.as_u64() {
                 // Above i64::MAX: exact, never through f64 (#789 SQL-73).
                 q.bind(u)
-            } else if let Some(f) = n.as_f64() {
-                q.bind(f)
             } else {
+                // Its shortest text, which MySQL parses exactly into a DECIMAL
+                // where a bound double would be converted from binary (#885).
                 q.bind(n.to_string())
             }
         }

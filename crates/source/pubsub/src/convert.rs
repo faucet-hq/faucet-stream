@@ -14,7 +14,7 @@ pub(crate) fn decode_payload(
     message_id: &str,
 ) -> Result<Value, FaucetError> {
     match format {
-        ValueFormat::Json => serde_json::from_slice(data).map_err(|e| {
+        ValueFormat::Json => faucet_core::fidelity::from_slice(data).map_err(|e| {
             FaucetError::Source(format!(
                 "pubsub: message {message_id} payload is not valid JSON: {e}"
             ))

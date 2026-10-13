@@ -11,7 +11,7 @@
 //! |---------------------------------|-----------------------------------------------|
 //! | `BOOLEAN`                       | `Bool`                                         |
 //! | `BYTE`/`SHORT`/`INT`/`LONG`     | `Number` (i64; kept as `String` if it overflows i64 — full precision) |
-//! | `FLOAT`/`DOUBLE`                | `Number` (f64; `NaN`/`Infinity` → `String`)   |
+//! | `FLOAT`/`DOUBLE`                | `Number` (f64; `NaN`/`Infinity` → counted `null`) |
 //! | `DECIMAL`                       | `String` (exact decimal — no f64 precision loss) |
 //! | `ARRAY`/`MAP`/`STRUCT`          | parsed nested JSON (falls back to `String`)    |
 //! | `STRING`/`DATE`/`TIMESTAMP`/`BINARY`/`CHAR`/`INTERVAL`/… | `String` (raw cell) |
@@ -78,9 +78,8 @@ fn cell_to_json(cell: Option<&Value>, type_name: &str) -> Value {
         // DECIMAL is preserved as an exact string (serde_json numbers are f64
         // here, which would lose precision on large/fractional decimals).
         "DECIMAL" => Value::String(s.to_owned()),
-        "ARRAY" | "MAP" | "STRUCT" => {
-            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned()))
-        }
+        "ARRAY" | "MAP" | "STRUCT" => faucet_core::fidelity::parse_json(s.as_bytes())
+            .unwrap_or_else(|_| Value::String(s.to_owned())),
         // STRING / DATE / TIMESTAMP / BINARY / CHAR / INTERVAL / NULL / UDT / …
         _ => Value::String(s.to_owned()),
     }
@@ -97,12 +96,10 @@ fn parse_int(s: &str) -> Value {
 }
 
 /// Parse a float cell. Non-finite values (`NaN`, `Infinity`, `-Infinity`),
-/// which JSON cannot represent, are preserved as strings.
+/// which JSON cannot represent, become a counted `null` (#885).
 fn parse_float(s: &str) -> Value {
     match s.parse::<f64>() {
-        Ok(f) => serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.to_owned())),
+        Ok(f) => faucet_core::fidelity::float64(f),
         Err(_) => Value::String(s.to_owned()),
     }
 }
@@ -181,15 +178,20 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_float_kept_as_string() {
+    fn non_finite_float_is_a_counted_null() {
         let c = [ColumnInfo {
             name: "f".into(),
             type_name: "DOUBLE".into(),
         }];
-        assert_eq!(row_to_json(&[json!("NaN")], &c)["f"], json!("NaN"));
+        assert_eq!(row_to_json(&[json!("NaN")], &c)["f"], Value::Null);
+        assert_eq!(row_to_json(&[json!("Infinity")], &c)["f"], Value::Null);
+        let c = [ColumnInfo {
+            name: "a".into(),
+            type_name: "ARRAY".into(),
+        }];
         assert_eq!(
-            row_to_json(&[json!("Infinity")], &c)["f"],
-            json!("Infinity")
+            row_to_json(&[json!("[12345678901234567890.5]")], &c)["a"],
+            json!(["12345678901234567890.5"])
         );
     }
 
