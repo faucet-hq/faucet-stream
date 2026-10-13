@@ -328,6 +328,10 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 - [`faucet-source-webhook`](https://crates.io/crates/faucet-source-webhook) — the inbound (server) counterpart for push delivery over HTTP.
 - [`faucet-source-kafka`](https://crates.io/crates/faucet-source-kafka) — durable, resumable streaming for a different transport.
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

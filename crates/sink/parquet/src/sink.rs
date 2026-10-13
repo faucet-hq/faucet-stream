@@ -509,6 +509,15 @@ impl faucet_core::Sink for ParquetSink {
         self.config.batch_atomicity()
     }
 
+    /// Derived, plus [`SchemaReport::DropsUnknownFields`](faucet_core::SchemaReport):
+    /// fields outside a file's schema are dropped with a warning.
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_sink(self)
+            .to_builder()
+            .schema_report(faucet_core::SchemaReport::DropsUnknownFields)
+            .build()
+    }
+
     fn connector_name(&self) -> &'static str {
         "parquet"
     }

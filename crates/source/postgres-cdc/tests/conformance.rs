@@ -219,3 +219,29 @@ async fn conformance_errors_not_panics() {
         .expect("new is lazy — must not connect");
     assert_errors_not_panics(&source).await;
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_source() {
+    for v in [
+        serde_json::json!({
+            "connection_url": "postgres://u:p@localhost:1/db",
+            "slot_name": "faucet_slot",
+            "publication_name": "faucet_pub"
+        }),
+        serde_json::json!({
+            "connection_url": "postgres://u:p@localhost:1/db",
+            "slot_name": "faucet_tmp",
+            "publication_name": "faucet_pub",
+            "batch_size": 0
+        }),
+    ] {
+        let cfg: PostgresCdcSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = PostgresCdcSource::new(cfg).await.expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_postgres_cdc::DESCRIPTOR,
+            "postgres-cdc",
+            &v,
+            &built,
+        );
+    }
+}

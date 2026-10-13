@@ -1685,6 +1685,17 @@ every command (`run`, `validate`, `schema`, `list`, `preview`, `serve`, …).
 - Use `register_source_with` / `register_sink_with` to also supply a config
   JSON-Schema closure and a one-line description for `faucet list` / `faucet
   schema`.
+- Use `register_source_described` / `register_sink_described` to also hand the
+  CLI the connector's `ConnectorDescriptor` — a pure
+  `fn(&Value) -> faucet_core::Capabilities` that says, from the config alone,
+  which write modes, exactly-once, cleanup, rollback, discovery and so on the
+  connector supports. Every load-time gate (`faucet validate`, upsert /
+  overwrite / exactly-once / cleanup / schema drift) reads it, exactly as for a
+  built-in. A connector registered without one is treated as append-only and
+  capability-free, so a `write_mode: upsert` against it is refused. Pin the
+  descriptor to the connector with
+  `faucet_conformance::assert_descriptor_matches_source` / `_sink` in its
+  tests.
 - Registering a name that collides with a built-in (or a duplicate) is rejected
   at startup with a clear error.
 - Custom connectors receive their `config` verbatim; the shared top-level

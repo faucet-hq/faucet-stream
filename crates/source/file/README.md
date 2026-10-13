@@ -220,3 +220,7 @@ let records = source.fetch_all().await?;
 let rows = faucet_source_file::read_records("./out/orders.jsonl").await?;
 # Ok(()) }
 ```
+
+## Capabilities
+
+Discovers one dataset per file; shardable except for an `http(s)://` path; columnar (with `arrow`) only for an explicit `format: avro`, `orc` or `parquet`. Not exactly-once. `faucet list --json` prints the declaration.

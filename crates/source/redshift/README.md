@@ -71,3 +71,7 @@ protocol, so `tests/integration.rs` runs the read path against a Postgres
 container (Docker required).
 
 License: MIT OR Apache-2.0
+
+## Capabilities
+
+A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.

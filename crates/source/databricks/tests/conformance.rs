@@ -70,3 +70,31 @@ async fn conformance_bounded_memory() {
 
     assert_bounded_memory(&src, batch, total).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    let base = json!({
+        "workspace_url": "https://x.cloud.databricks.com",
+        "warehouse_id": "wh",
+        "sql": "SELECT 1",
+        "auth": {"type": "pat", "config": {"token": "t"}},
+    });
+    let mut configs = vec![base.clone()];
+    if cfg!(feature = "arrow") {
+        let mut arrow = base;
+        arrow["arrow_native"] = json!(true);
+        configs.push(arrow);
+    }
+    for v in configs {
+        let cfg: DatabricksSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DatabricksSource::new(cfg).expect("offline source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_databricks::DESCRIPTOR,
+            "databricks",
+            &v,
+            &built,
+        );
+    }
+}

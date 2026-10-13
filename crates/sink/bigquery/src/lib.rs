@@ -23,3 +23,6 @@ pub use faucet_core::{FaucetError, Sink};
 pub use config::BigQueryLoadConfig;
 pub use config::{BigQueryCredentials, BigQuerySinkConfig};
 pub use sink::BigQuerySink;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

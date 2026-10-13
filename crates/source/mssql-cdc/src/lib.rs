@@ -15,11 +15,13 @@
 mod change;
 mod config;
 mod decode;
+mod descriptor;
 mod lsn;
 mod state;
 mod stream;
 
 pub use config::{MssqlCdcSourceConfig, OnGap, StartPosition};
+pub use descriptor::DESCRIPTOR;
 pub use lsn::Lsn;
 pub use state::Bookmarks;
 pub use stream::MssqlCdcSource;

@@ -94,6 +94,10 @@ pass the same values as `{key}` tokens through `fetch_with_context`.
 
 Not supported in v1.
 
+## Capabilities
+
+A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

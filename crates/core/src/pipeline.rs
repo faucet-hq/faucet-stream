@@ -317,6 +317,54 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// The [`compat`](crate::compat) features this run has, for path
+    /// selection (#883).
+    fn compat_features(
+        &self,
+        is_overwrite: bool,
+        dedups_by_key: bool,
+    ) -> Vec<crate::compat::Feature> {
+        use crate::compat::Feature as F;
+        #[allow(unused_mut)]
+        let mut on: Vec<(bool, F)> = vec![
+            (self.schema_drift.is_some(), F::SchemaDrift),
+            (self.adaptive.is_some(), F::Adaptive),
+            (self.resilience.is_some(), F::Resilience),
+            (self.cleanup.is_some(), F::Cleanup),
+            (dedups_by_key, F::KeyedWrites),
+            (is_overwrite, F::Overwrite),
+            (
+                is_overwrite && self.suppress_overwrite_lifecycle,
+                F::GroupedOverwrite,
+            ),
+            (
+                self.delivery == crate::idempotency::DeliveryMode::ExactlyOnce,
+                F::ExactlyOnce,
+            ),
+            (
+                self.dlq
+                    .as_ref()
+                    .is_some_and(|d| d.on_batch_error == crate::dlq::OnBatchError::Propagate),
+                F::DlqPropagate,
+            ),
+            (
+                self.dlq
+                    .as_ref()
+                    .is_some_and(|d| d.on_batch_error != crate::dlq::OnBatchError::Propagate),
+                F::DlqAll,
+            ),
+        ];
+        #[cfg(feature = "quality")]
+        on.push((self.quality.is_some(), F::Quality));
+        #[cfg(feature = "contract")]
+        on.push((self.contract.is_some(), F::Contract));
+        #[cfg(feature = "masking")]
+        on.push((self.masking.is_some(), F::Masking));
+        #[cfg(feature = "arrow")]
+        on.push((self.masking_retypes_by_value(), F::MaskingRetypesByValue));
+        on.into_iter().filter(|(c, _)| *c).map(|(_, f)| f).collect()
+    }
+
     /// A masking rule that re-types values page by page would change a
     /// column's Arrow type mid-run, so such a run takes the row path.
     #[cfg(feature = "arrow")]
@@ -639,23 +687,16 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 let source_formats = wrapped_source.native_output_formats();
                 // Pipeline mechanics that live in `run_stream` and would be
                 // silently skipped by the byte path (mirrors the columnar guards).
+                // Keyed writes need per-row keys bytes never carry; a grouped
+                // fan-out overwrite must go through the shared staging table.
                 let native_mechanics_ok = !source_formats.is_empty()
-                    && self.schema_drift.is_none()
-                    && self.adaptive.is_none()
-                    && self.resilience.is_none()
-                    && self.cleanup.is_none()
-                    // Upsert/Delete need per-row keys, which bytes never carry.
-                    // Without this gate an upsert-configured sink would be
-                    // misreported to the planner as `Append` and raw bytes
-                    // appended as duplicates — core owns this invariant, not
-                    // each connector's `load_native`.
-                    && !wrapped_sink.dedups_by_key()
-                    // Grouped fan-out overwrite (#552): the executor drives one
-                    // staging begin/commit per shared destination and suppresses
-                    // the per-invocation lifecycle. A native truncate-load would
-                    // bypass the staging table and truncate the live one, so
-                    // fall through to the `Value` path, which honors staging.
-                    && !(wrapped_sink.is_overwrite() && self.suppress_overwrite_lifecycle);
+                    && crate::compat::path_allowed(
+                        crate::compat::WritePath::Native,
+                        &self.compat_features(
+                            wrapped_sink.is_overwrite(),
+                            wrapped_sink.dedups_by_key(),
+                        ),
+                    );
                 // Governance passes need `Value`; the planner rejects them
                 // unconditionally, so surface them as `has_governance`.
                 // `mut` is used only when a governance feature is enabled.
@@ -733,29 +774,13 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             {
                 let columnar_ok = wrapped_source.supports_columnar()
                     && wrapped_sink.supports_columnar()
-                    // A DLQ is fine now: the columnar loop routes quarantine
-                    // envelopes and enforces the same budgets (#636). Only the
-                    // row-level `DlqAll` policy still needs the `Value` path,
-                    // because `write_batch_columnar` reports no per-row
-                    // outcomes to route.
-                    && self
-                        .dlq
-                        .as_ref()
-                        .is_none_or(|d| d.on_batch_error == crate::dlq::OnBatchError::Propagate)
-                    && self.delivery == crate::idempotency::DeliveryMode::AtLeastOnce
-                    && self.adaptive.is_none()
-                    && self.resilience.is_none()
-                    // The columnar fast-path bypasses `run_stream`, which is
-                    // where cleanup accumulates written keys and fires the
-                    // delete. Taking it with a policy attached would silently
-                    // skip the cleanup and leave the stale rows behind — the
-                    // exact failure this feature exists to prevent (#478).
-                    && self.cleanup.is_none()
-                    // Overwrite (#492) needs the begin/commit staging lifecycle
-                    // wired below; the columnar path would append straight to
-                    // the destination and skip the atomic swap.
-                    && !wrapped_sink.is_overwrite()
-                    && !self.masking_retypes_by_value();
+                    && crate::compat::path_allowed(
+                        crate::compat::WritePath::Columnar,
+                        &self.compat_features(
+                            wrapped_sink.is_overwrite(),
+                            wrapped_sink.dedups_by_key(),
+                        ),
+                    );
                 // Governance no longer disqualifies the fast path (#636) — it
                 // runs *inside* the columnar loop via the same
                 // `apply_governance` the `Value` loop uses, including
@@ -1491,20 +1516,10 @@ where
                     ));
                 }
                 if dlq.is_some() {
-                    return Err(FaucetError::Config(
-                        "delivery: exactly_once (atomic watermark) is not compatible with a DLQ \
-                         in this version"
-                            .into(),
-                    ));
+                    return Err(FaucetError::Config(crate::compat::EO_WITH_DLQ.into()));
                 }
                 if sink.is_overwrite() {
-                    // The watermark path persists state per page; an overwrite
-                    // must hold every bookmark until its swap commits.
-                    return Err(FaucetError::Config(
-                        "delivery: exactly_once (atomic watermark) is not compatible with \
-                         write_mode: overwrite"
-                            .into(),
-                    ));
+                    return Err(FaucetError::Config(crate::compat::EO_WITH_OVERWRITE.into()));
                 }
                 Some(crate::idempotency::EffectivelyOnceMechanism::AtomicWatermark)
             } else if sink.dedups_by_key() {

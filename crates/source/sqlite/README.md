@@ -332,6 +332,10 @@ Outside the cluster coordinator the `shard` config has **no effect** — a plain
 > Sharding a SQLite source across cluster workers requires every worker to
 > reach the same database file (e.g. a shared volume).
 
+## Capabilities
+
+Declares `discover` and `range_read` (`faucet verify` reads one integer-key range), and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

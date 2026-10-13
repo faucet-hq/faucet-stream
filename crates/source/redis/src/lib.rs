@@ -12,3 +12,7 @@ pub use faucet_core::{FaucetError, Source};
 
 pub use config::{RedisBinary, RedisJsonParsing, RedisSourceConfig, RedisSourceType};
 pub use stream::RedisSource;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("redis", faucet_core::capabilities::plain_source);

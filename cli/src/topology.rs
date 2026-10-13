@@ -223,11 +223,30 @@ fn validate_governance(cfg: &PipelineConfig) -> CliResult<()> {
         .as_ref()
         .is_some_and(|d| d.on_drift == faucet_core::OnDrift::Evolve)
     {
-        for (id, kind, _) in sink_nodes(cfg)? {
-            if !crate::registry::sink_supports_schema_evolution(&kind) {
+        for (id, kind, config) in sink_nodes(cfg)? {
+            if !crate::registry::sink_capabilities(&kind, &config).schema_evolution() {
                 return Err(CliError::Config(format!(
                     "sink node '{id}': schema.on_drift: evolve is not supported by sink \
                      '{kind}' — use warn, ignore, quarantine or fail"
+                )));
+            }
+        }
+    }
+    if drift
+        .as_ref()
+        .is_some_and(|d| d.on_drift == faucet_core::OnDrift::Fail)
+    {
+        use faucet_core::compat::Feature;
+        for (id, kind, config) in sink_nodes(cfg)? {
+            let caps = crate::registry::sink_capabilities(&kind, &config);
+            if let Some((_, _, reason)) = faucet_core::compat::refusals(
+                &[Feature::SchemaDrift, Feature::SchemaDriftFail],
+                Some(&caps),
+            )
+            .first()
+            {
+                return Err(CliError::Config(format!(
+                    "sink node '{id}': {reason} (sink '{kind}')"
                 )));
             }
         }
@@ -466,23 +485,23 @@ fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
     }
     // 2. The source must replay deterministically.
     let (src_id, src_kind) = &sources[0];
-    if !crate::registry::source_supports_exactly_once(src_kind) {
+    if !crate::registry::source_kind_capabilities(src_kind).exactly_once() {
         return Err(CliError::Config(format!(
             "node '{src_id}': `delivery: exactly_once` is not supported by source '{src_kind}' \
              (deterministic-replay sources only: {})",
-            crate::registry::EXACTLY_ONCE_SOURCE_KINDS.join(", ")
+            crate::registry::source_kinds_where(|c| c.exactly_once()).join(", ")
         )));
     }
     // 3. Every sink must commit data + token atomically.
     for (id, kind) in &sinks {
-        if !crate::registry::sink_supports_idempotent_writes(kind) {
+        if !crate::registry::sink_kind_capabilities(kind).idempotent_writes() {
             return Err(CliError::Config(format!(
                 "node '{id}': `delivery: exactly_once` is not supported by sink '{kind}' \
                  (sinks that commit a watermark atomically: {}). Every sink node must qualify — \
                  each one keeps its own watermark. A keyed upsert sink is not accepted in a node \
                  graph: keep `delivery: at_least_once` with `write_mode: upsert` + `key`, or run \
                  it as a matrix pipeline, which reports that as effectively-once",
-                crate::registry::IDEMPOTENT_SINK_KINDS.join(", ")
+                crate::registry::sink_kinds_where(|c| c.idempotent_writes()).join(", ")
             )));
         }
     }

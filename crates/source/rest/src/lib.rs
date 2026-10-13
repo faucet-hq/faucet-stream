@@ -9,6 +9,7 @@ pub mod async_job;
 pub mod auth;
 pub mod config;
 pub mod decode;
+mod descriptor;
 pub mod discovery;
 pub mod extract;
 pub mod format;
@@ -38,6 +39,7 @@ pub use config::{
     TlsClientConfig,
 };
 pub use decode::{DecodeStep, ParseFormat, ParseSpec, SimpleStep, UnzipSpec};
+pub use descriptor::DESCRIPTOR;
 pub use pagination::PaginationStyle;
 pub use route::{RecordsRoute, RouteBy, RouteTarget};
 pub use stream::RestStream;

@@ -1273,3 +1273,49 @@ mod in_place {
         );
     }
 }
+
+struct NoIdentity;
+
+#[faucet_core::async_trait]
+impl crate::write::SinkIdentity for NoIdentity {
+    fn connector_name(&self) -> &'static str {
+        "test"
+    }
+    fn config_schema(&self) -> Value {
+        json!({})
+    }
+    fn dataset_uri(&self) -> String {
+        String::new()
+    }
+}
+
+#[cfg(feature = "file-format-csv")]
+#[test]
+fn writer_sink_capabilities_agree_with_the_config_helper() {
+    use crate::capabilities::{SinkShape, writer_sink_capabilities};
+    use crate::write::WriterSink;
+    use faucet_core::{CsvUnknownField, Sink};
+    let dir = tempfile::tempdir().unwrap();
+    let shape = SinkShape {
+        path_field: "path",
+        default_format: crate::FileFormatChoice::Auto,
+        default_extension: None,
+        arrow: true,
+    };
+    for (path, policy, wire) in [
+        ("a.csv", CsvUnknownField::Warn, "warn"),
+        ("b.csv", CsvUnknownField::Widen, "widen"),
+        ("c.jsonl", CsvUnknownField::Warn, "warn"),
+    ] {
+        let format = FileFormat::from_path(path).unwrap();
+        let mut s = WriteSettings::new(format, Compression::None);
+        s.opts.csv.on_unknown_field = policy;
+        let sink = WriterSink::new(local(dir.path(), path, s), NoIdentity);
+        let config = json!({"path": path, "csv": {"on_unknown_field": wire}});
+        assert_eq!(
+            sink.capabilities(),
+            writer_sink_capabilities(&config, shape),
+            "{config}"
+        );
+    }
+}

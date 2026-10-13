@@ -24,3 +24,7 @@ pub use sink::PubsubSink;
 
 // Shared connection types, re-exported so users need only this crate.
 pub use faucet_common_pubsub::{PubsubConnection, PubsubCredentials};
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("pubsub", faucet_core::capabilities::append_only_sink);

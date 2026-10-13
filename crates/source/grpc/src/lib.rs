@@ -20,3 +20,7 @@ pub use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Source};
 
 pub use config::{GrpcAuth, GrpcStreamConfig, MetadataEntry, RpcKind};
 pub use stream::GrpcStream;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("grpc", faucet_core::capabilities::plain_source);

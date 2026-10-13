@@ -146,6 +146,10 @@ let rows = source.fetch_all().await?;
 
 The catalog features forward to [`faucet-common-iceberg`](https://crates.io/crates/faucet-common-iceberg), the same crate the sink uses, so both connectors gate catalogs identically.
 
+## Capabilities
+
+Declares `discover` and `shardable` (hash of data-file path), plus columnar (Arrow) output when built with the `arrow` feature. `faucet list --json` prints these declared capabilities.
+
 ## License
 
 MIT OR Apache-2.0.

@@ -111,3 +111,22 @@ async fn conformance_discover_roundtrips() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_source() {
+    for v in [
+        serde_json::json!({"database_url": "sqlite::memory:", "query": "SELECT 1"}),
+        serde_json::json!({
+            "database_url": "sqlite::memory:", "query": "SELECT 1", "shard": {"key": "id"}
+        }),
+    ] {
+        let cfg: SqliteSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SqliteSource::new(cfg).await.expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_sqlite::DESCRIPTOR,
+            "sqlite",
+            &v,
+            &built,
+        );
+    }
+}

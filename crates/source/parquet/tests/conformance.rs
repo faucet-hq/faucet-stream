@@ -133,3 +133,19 @@ async fn conformance_preflight_check_wellformed() {
         .unwrap();
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 }
+
+// ── Descriptor (RFC 0013): agrees with the built source ─────────────────────
+
+#[tokio::test]
+async fn descriptor_matches_built_source() {
+    let v =
+        serde_json::to_value(ParquetSourceConfig::local("/tmp/does-not-exist.parquet")).unwrap();
+    let cfg: ParquetSourceConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = ParquetSource::new(cfg).await.expect("source builds");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_parquet::DESCRIPTOR,
+        "parquet",
+        &v,
+        &built,
+    );
+}

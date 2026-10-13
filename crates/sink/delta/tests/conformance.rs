@@ -39,6 +39,21 @@ async fn conformance_connector_name_nonempty() {
     );
 }
 
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = serde_json::json!({ "table_uri": table_uri(&dir, "descriptor") });
+    let cfg: DeltaSinkConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = DeltaSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_delta::DESCRIPTOR,
+        "delta",
+        &v,
+        &built,
+    );
+}
+
 // ── Check 11: preflight check() is well-formed ────────────────────────────────
 /// A reachable local warehouse makes the metadata-open probe pass (the table
 /// need not exist yet); the check must return Ok(report) with a well-formed

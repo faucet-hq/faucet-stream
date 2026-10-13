@@ -83,3 +83,48 @@ async fn conformance_preflight_check_wellformed() {
     )
     .await;
 }
+
+fn async_job(fetch: serde_json::Value) -> serde_json::Value {
+    json!({
+        "submit": { "method": "POST", "url": "/jobs" },
+        "job_id": "$.id",
+        "poll": { "url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 30 },
+        "status": { "path": "$.state", "success": ["done"], "failure": ["failed"] },
+        "fetch": fetch
+    })
+}
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    let base = "http://127.0.0.1:1";
+    let configs = [
+        json!({ "base_url": base, "path": "/items" }),
+        json!({
+            "base_url": base, "path": "/items", "response_format": "csv",
+            "async_job": async_job(json!({
+                "url": "/jobs/${job_id}/result", "locator_header": "x-next", "locator_param": "loc"
+            }))
+        }),
+        json!({
+            "base_url": base, "path": "/items", "response_format": "csv",
+            "async_job": async_job(json!({
+                "url": "/jobs/${job_id}/result", "locator_body": "$.next", "locator_param": "loc"
+            }))
+        }),
+        json!({
+            "base_url": base, "path": "/items", "response_format": "json",
+            "async_job": async_job(json!({ "url": "/jobs/${job_id}/result" }))
+        }),
+        json!({ "base_url": base, "path": "", "odata": { "entity": "Orders" } }),
+    ];
+    for v in configs {
+        let cfg: RestStreamConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = RestStream::new(cfg).unwrap();
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_rest::DESCRIPTOR,
+            "rest",
+            &v,
+            &built,
+        );
+    }
+}

@@ -24,6 +24,34 @@ fn conformance_config_schema_valid() {
     assert_config_schema_valid_value(&schema, "spanner");
 }
 
+// ── Descriptor agreement (RFC 0013, Docker) ─────────────────────────────────
+
+/// `new()` opens a session pool, so the built sink needs the emulator.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    let conn = support::create_database("descriptor", Vec::new()).await;
+    let base = serde_json::json!({
+        "project_id": conn.project_id,
+        "instance": conn.instance,
+        "database": conn.database,
+        "emulator_host": conn.emulator_host,
+        "table_name": "t",
+    });
+    let mut upsert = base.clone();
+    upsert["write_mode"] = serde_json::json!("upsert");
+    upsert["key"] = serde_json::json!(["id"]);
+    for v in [base, upsert] {
+        let cfg: SpannerSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SpannerSink::new(cfg).await.expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_spanner::DESCRIPTOR,
+            "spanner",
+            &v,
+            &built,
+        );
+    }
+}
+
 /// A fresh database + upsert-configured sink (key = PK), mirroring the
 /// postgres conformance setup.
 async fn fresh_sink(database: &str) -> SpannerSink {

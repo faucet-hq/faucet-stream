@@ -149,6 +149,10 @@ table with its key attributes as the schema, `ItemCount` as the row estimate and
 `{table_name}` as the config patch. `check()` runs `DescribeTable` (and
 `DescribeStream` in streams mode) — nothing is read.
 
+## Capabilities
+
+Declares dataset discovery for every mode; sharding only under `mode: scan` (parallel segments) and lag reporting only under `mode: streams`. `faucet list --json` prints the declaration.
+
 ## License
 
 MIT OR Apache-2.0

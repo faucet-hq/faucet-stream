@@ -404,3 +404,26 @@ mod docker {
         assert_eq!(seqs, (1..=6).collect::<Vec<u64>>(), "no duplicates");
     }
 }
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"subject": "events.>", "servers": ["nats://127.0.0.1:1"], "idle_timeout_secs": 1}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_nats::NatsSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_nats::NatsSource::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_nats::DESCRIPTOR,
+            "nats",
+            &v,
+            &built,
+        );
+    }
+}

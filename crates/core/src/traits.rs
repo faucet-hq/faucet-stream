@@ -311,6 +311,16 @@ pub trait Source: Send + Sync {
         }
     }
 
+    /// What this source can do (RFC 0013, #876). The default derives every
+    /// field from the per-capability methods above
+    /// ([`Capabilities::of_source`](crate::Capabilities::of_source)); override
+    /// it to declare a capability no method expresses (range digests, lag),
+    /// keeping the connector's [`ConnectorDescriptor`](crate::ConnectorDescriptor)
+    /// in agreement. Decorators must forward this.
+    fn capabilities(&self) -> crate::capabilities::Capabilities {
+        crate::capabilities::Capabilities::of_source(self)
+    }
+
     /// Whether this source can split its work into independent shards for
     /// clustered (Mode B) execution. Default: `false` (single whole-dataset
     /// shard). Sources with a natural partition (object-store prefixes, table
@@ -710,6 +720,17 @@ pub trait Sink: Send + Sync {
         } else {
             crate::idempotency::SinkGuarantee::AtLeastOnce
         }
+    }
+
+    /// What this sink can do (RFC 0013, #876). The default derives every field
+    /// from the per-capability methods
+    /// ([`Capabilities::of_sink`](crate::Capabilities::of_sink)); override it
+    /// to declare a capability no method expresses (how unknown fields are
+    /// treated, scoped overwrite), keeping the connector's
+    /// [`ConnectorDescriptor`](crate::ConnectorDescriptor) in agreement.
+    /// Decorators must forward this.
+    fn capabilities(&self) -> crate::capabilities::Capabilities {
+        crate::capabilities::Capabilities::of_sink(self)
     }
 
     /// Whether a **plain [`write_batch`](Self::write_batch) is safe to replay**

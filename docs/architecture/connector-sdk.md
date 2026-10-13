@@ -104,9 +104,11 @@ The full authoring walkthrough is in
 
 ## Trade-offs
 
-- **Boolean capabilities** are simple and object-safe but stringly-typed at the CLI
-  gate (allowlists in `registry.rs`). A typed model would remove the allowlists at
-  the cost of trait complexity — deferred to [RFC 0001](../../rfcs/0001-capability-traits.md).
+- **Boolean capabilities** are simple and object-safe; the connector also
+  declares them as one `Capabilities` value and a static `ConnectorDescriptor`
+  the CLI gates read from the config alone (RFC 0013 — there are no allowlists
+  in `registry.rs`). Each connector's conformance test pins the descriptor to
+  the built connector.
 - **`serde_json::Value` records** maximise author ergonomics at an allocation cost —
   see [ADR 0004](../adr/0004-json-record-model.md).
 

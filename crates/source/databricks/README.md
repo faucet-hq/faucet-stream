@@ -122,3 +122,7 @@ To write to a SQL warehouse, use the
 [`faucet-sink-databricks`](https://crates.io/crates/faucet-sink-databricks) sink.
 
 License: MIT OR Apache-2.0.
+
+## Capabilities
+
+Declares columnar (Arrow) output only when the crate is built with the `arrow` feature and the config sets `arrow_native: true`; otherwise it declares nothing. `faucet list --json` prints these declared capabilities.

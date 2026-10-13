@@ -8,3 +8,6 @@ pub(crate) mod writer;
 pub use config::{CatalogConfig, IcebergSinkConfig, ParquetOpts, PartitionField};
 pub use faucet_core::WriteMode;
 pub use sink::IcebergSink;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

@@ -388,6 +388,10 @@ This crate has no optional features of its own. Enable it in the CLI/umbrella vi
 - [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html)
 - [`faucet-sink-http`](https://crates.io/crates/faucet-sink-http) · [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) · [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql)
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

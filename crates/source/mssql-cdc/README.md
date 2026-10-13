@@ -136,6 +136,10 @@ pipeline:
 and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
 logged once and reported as no lag — it never fails a run.
 
+## Capabilities
+
+Declares `exactly_once` (deterministic replay from the LSN bookmarks) and `reports_lag` (unread change transactions and their age). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

@@ -90,6 +90,10 @@ run) and a failure otherwise.
 Enable the `tls` feature (CLI: `rabbitmq-tls`) and set `tls.enabled: true` or
 use an `amqps://` url.
 
+## Capabilities
+
+Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

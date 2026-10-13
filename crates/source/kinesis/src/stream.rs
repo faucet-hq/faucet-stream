@@ -362,6 +362,13 @@ impl faucet_core::Source for KinesisSource {
         Some(state_key(&self.config.stream_name))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(true)
+            .build()
+    }
+
     /// How far the furthest-behind shard trails the stream's tip (#733):
     /// `MillisBehindLatest` from this run's reads, or — before any — one
     /// probing read per shard from the resume position.

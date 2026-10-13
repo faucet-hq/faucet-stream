@@ -82,6 +82,10 @@ pipeline:
       idle_timeout_secs: 10
 ```
 
+## Capabilities
+
+Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

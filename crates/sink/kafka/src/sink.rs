@@ -343,6 +343,20 @@ impl Sink for KafkaSink {
         true
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        #[cfg(feature = "schema-registry")]
+        let avro = matches!(
+            self.config.value_format,
+            KafkaValueFormat::ConfluentAvro { .. }
+        );
+        #[cfg(not(feature = "schema-registry"))]
+        let avro = false;
+        faucet_core::Capabilities::of_sink(self)
+            .to_builder()
+            .schema_report(crate::descriptor::schema_report(avro))
+            .build()
+    }
+
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let base = crate::idempotent::client_config_base(&self.config)?;
         crate::idempotent::ensure_commit_topic(&self.config, &base).await?;

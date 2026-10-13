@@ -28,3 +28,6 @@ pub use sink::DeltaSink;
 // Re-export the shared connection/credentials types so downstream users need
 // only depend on this crate.
 pub use faucet_common_delta::{DeltaConnection, DeltaCredentials};
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

@@ -17,3 +17,7 @@ pub use faucet_core::{FaucetError, Source};
 
 pub use config::{OnParseError, WebsocketAuth, WebsocketSourceConfig, WsMessageFormat};
 pub use stream::WebsocketSource;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("websocket", faucet_core::capabilities::plain_source);

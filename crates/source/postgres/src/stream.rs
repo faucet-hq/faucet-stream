@@ -1022,6 +1022,14 @@ impl faucet_core::Source for PostgresSource {
         )
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .range_read(true)
+            .range_digest(true)
+            .build()
+    }
+
     fn supports_discover(&self) -> bool {
         true
     }

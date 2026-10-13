@@ -109,8 +109,16 @@ async fn conformance_capabilities_truthful() {
     let mut cfg = PubsubSinkConfig::new("conf-sink-t");
     cfg.connection = conn(&host);
     cfg.value_format = ValueFormat::Json;
+    let cfg_value = faucet_core::serde_json::to_value(&cfg).expect("config serializes");
     let sink = PubsubSink::new(cfg).await.expect("sink builds");
     faucet_conformance::assert_batch_atomicity_declared(&sink);
+    // RFC 0013: the static descriptor answers what the built sink declares.
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_pubsub::DESCRIPTOR,
+        "pubsub",
+        &cfg_value,
+        &sink,
+    );
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty_value(

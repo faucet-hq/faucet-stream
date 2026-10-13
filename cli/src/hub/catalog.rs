@@ -274,7 +274,8 @@ pub struct Cell {
 /// catalog stays cheap, and a partially compatible pairing still reports
 /// which streams would work.
 pub fn cell(source: &SourceTemplate, sink: &SinkTemplate) -> Cell {
-    let supported = crate::registry::sink_supported_write_modes(&sink.sink.kind);
+    let caps = crate::registry::sink_kind_capabilities(&sink.sink.kind);
+    let supported = caps.write_modes();
     let aliases = sink.aliases();
     let truncates = sink.truncates_per_invocation();
     let mut streams = Vec::new();
@@ -756,7 +757,7 @@ fn index_json_unsorted(
             "docs": k.docs,
             "sink_type": k.sink.kind,
             "file": rel(&cat.root, p),
-            "write_modes": crate::registry::sink_supported_write_modes(&k.sink.kind).iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+            "write_modes": crate::registry::sink_kind_capabilities(&k.sink.kind).write_modes().iter().map(|m| m.as_str()).collect::<Vec<_>>(),
             "params": k.params.iter().map(|(n, p)| json!({
                 "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
                 "description": p.description, "default": p.default,
@@ -838,7 +839,8 @@ pub fn render_markdown(cat: &Catalog) -> String {
             anchor(&k.id()),
             k.description.as_deref().unwrap_or(""),
             k.sink.kind,
-            crate::registry::sink_supported_write_modes(&k.sink.kind)
+            crate::registry::sink_kind_capabilities(&k.sink.kind)
+                .write_modes()
                 .iter()
                 .map(|m| format!("`{}`", m.as_str()))
                 .collect::<Vec<_>>()

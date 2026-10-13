@@ -164,3 +164,33 @@ async fn conformance_errors_not_panics() {
 
     assert_errors_not_panics(&source).await;
 }
+
+// ── Descriptor agreement (RFC 0013, Docker) ─────────────────────────────────
+
+/// `new()` opens a session pool, so the built source needs the emulator.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(&emu.host, "descriptor", &[]).await;
+    let base = serde_json::json!({
+        "project_id": support::PROJECT,
+        "instance": support::INSTANCE,
+        "database": "descriptor",
+        "emulator_host": emu.host,
+        "query": "SELECT 1",
+    });
+    let mut sharded = base.clone();
+    sharded["shard"] = serde_json::json!({"key": "id"});
+    for v in [base, sharded] {
+        let cfg: SpannerSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SpannerSource::new(cfg).await.expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_spanner::DESCRIPTOR,
+            "spanner",
+            &v,
+            &built,
+        );
+    }
+}

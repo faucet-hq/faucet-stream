@@ -328,6 +328,17 @@ macro_rules! forward_source {
                 self.$inner.replay_guarantee()
             }
         });
+        $crate::__faucet_forward_filter!(capabilities [$($skip)*] {
+            fn capabilities(&self) -> $crate::capabilities::Capabilities
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                $crate::capabilities::Capabilities::decorated_source(
+                    self,
+                    &self.$inner.capabilities(),
+                )
+            }
+        });
         $crate::__faucet_forward_filter!(is_shardable [$($skip)*] {
             fn is_shardable(&self) -> bool
             {
@@ -704,6 +715,17 @@ macro_rules! forward_sink {
                 self.$inner.sink_guarantee()
             }
         });
+        $crate::__faucet_forward_filter!(capabilities [$($skip)*] {
+            fn capabilities(&self) -> $crate::capabilities::Capabilities
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                $crate::capabilities::Capabilities::decorated_sink(
+                    self,
+                    &self.$inner.capabilities(),
+                )
+            }
+        });
         $crate::__faucet_forward_filter!(write_batch_is_replay_safe [$($skip)*] {
             fn write_batch_is_replay_safe(&self) -> bool
             {
@@ -1059,6 +1081,7 @@ macro_rules! __faucet_forward_filter {
     (supports_exactly_once [supports_exactly_once $($rest:ident)*] $item:tt) => {};
     (consumes_destructively [consumes_destructively $($rest:ident)*] $item:tt) => {};
     (replay_guarantee [replay_guarantee $($rest:ident)*] $item:tt) => {};
+    (capabilities [capabilities $($rest:ident)*] $item:tt) => {};
     (is_shardable [is_shardable $($rest:ident)*] $item:tt) => {};
     (enumerate_shards [enumerate_shards $($rest:ident)*] $item:tt) => {};
     (apply_shard [apply_shard $($rest:ident)*] $item:tt) => {};
@@ -1136,6 +1159,7 @@ macro_rules! __faucet_forward_known {
     (@source [supports_exactly_once $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [consumes_destructively $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [replay_guarantee $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
+    (@source [capabilities $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [is_shardable $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [enumerate_shards $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [apply_shard $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
@@ -1163,6 +1187,7 @@ macro_rules! __faucet_forward_known {
     (@sink [load_native $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [supports_idempotent_writes $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [sink_guarantee $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
+    (@sink [capabilities $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [write_batch_is_replay_safe $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [dedups_by_key $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [supported_write_modes $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };

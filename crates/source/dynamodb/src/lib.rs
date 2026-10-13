@@ -39,3 +39,6 @@ pub use stream::DynamoDbSource;
 pub use faucet_common_dynamodb::{
     DynamoDbCredentials, RetryPolicy, ValueFormat, build_client, build_streams_client,
 };
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

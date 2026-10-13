@@ -147,6 +147,19 @@ impl faucet_core::Sink for CsvSink {
         self.config.batch_atomicity()
     }
 
+    /// Derived, plus [`SchemaReport::DropsUnknownFields`](faucet_core::SchemaReport)
+    /// under `on_unknown_field: warn`, whose frozen header drops new fields.
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        let base = faucet_core::Capabilities::of_sink(self);
+        if self.config.on_unknown_field == crate::config::OnUnknownField::Warn {
+            base.to_builder()
+                .schema_report(faucet_core::SchemaReport::DropsUnknownFields)
+                .build()
+        } else {
+            base
+        }
+    }
+
     fn connector_name(&self) -> &'static str {
         "csv"
     }

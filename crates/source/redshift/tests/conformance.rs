@@ -17,3 +17,23 @@ fn conformance_config_schema_valid() {
     .unwrap();
     assert_config_schema_valid_value(&schema, "faucet-source-redshift");
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_source() {
+    let v = serde_json::json!({
+        "host": "localhost",
+        "database": "db",
+        "user": "u",
+        "credentials": {"type": "password", "config": {"password": "pw"}},
+        "query": "SELECT 1"
+    });
+    let cfg: faucet_source_redshift::RedshiftSourceConfig =
+        serde_json::from_value(v.clone()).unwrap();
+    let built = faucet_source_redshift::RedshiftSource::new(cfg).expect("source");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_redshift::DESCRIPTOR,
+        "redshift",
+        &v,
+        &built,
+    );
+}

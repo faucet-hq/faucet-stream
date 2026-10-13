@@ -218,3 +218,25 @@ async fn conformance_errors_not_panics() {
     assert_errors_not_panics(&source).await;
     // _container stays alive to here
 }
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs =
+        vec![r#"{"brokers": "127.0.0.1:1", "topics": ["t"], "group_id": "g", "max_messages": 10}"#];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_kafka::KafkaSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_kafka::KafkaSource::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_kafka::DESCRIPTOR,
+            "kafka",
+            &v,
+            &built,
+        );
+    }
+}

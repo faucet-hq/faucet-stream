@@ -325,6 +325,10 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 - [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
 - Related crates: [faucet-source-websocket](https://crates.io/crates/faucet-source-websocket) · [faucet-source-kafka](https://crates.io/crates/faucet-source-kafka) · [faucet-sink-http](https://crates.io/crates/faucet-sink-http)
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

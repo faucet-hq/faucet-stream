@@ -209,3 +209,7 @@ the target (`Skip` when it is missing and will be created).
 | Feature | Enables |
 |---|---|
 | `staging` | S3 / GCS / ADLS staging locations via `object_store` (volume staging needs no feature) |
+
+## Capabilities
+
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent writes (exactly-once), keyed upsert, staged load and schema evolution (`schema_report: reported`); a `write_mode: upsert|delete` config with a `key` dedups by key. `faucet list --json` prints these declared capabilities.

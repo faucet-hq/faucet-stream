@@ -50,3 +50,23 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_sink() {
+    for v in [
+        serde_json::json!({"database": ":memory:", "table_name": "t"}),
+        serde_json::json!({
+            "database": ":memory:", "table_name": "t", "column_mapping": "auto_map",
+            "create_table": false
+        }),
+    ] {
+        let cfg: DuckdbSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DuckdbSink::new(cfg).await.expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_duckdb::DESCRIPTOR,
+            "duckdb",
+            &v,
+            &built,
+        );
+    }
+}

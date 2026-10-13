@@ -19,3 +19,6 @@ pub use faucet_core::{FaucetError, Source};
 
 pub use config::{BigQueryCredentials, BigQuerySourceConfig};
 pub use stream::BigQuerySource;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

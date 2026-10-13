@@ -290,6 +290,13 @@ impl Source for PostgresCdcSource {
         }))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(true)
+            .build()
+    }
+
     fn supports_exactly_once(&self) -> bool {
         // Durable monotonic LSN + deterministic replay from it + per-transaction
         // (per-page) bookmarks persisted only after the sink confirms — the

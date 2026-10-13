@@ -2,6 +2,9 @@
 
 //! Google Cloud Storage sink connector.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 mod config;
 mod object;
 mod sink;

@@ -271,6 +271,8 @@ alias the columns.
 | Compression | ❌ | No `compression` feature. |
 | Per-record (matrix) queries | ✅ | `${parent.field}` → SQL bind parameters. |
 
+Declared capabilities: `discover`, `range_read` and `range_digest` (`faucet verify` reads and digests one integer-key range server-side), and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.
+
 ## Config loading
 
 Load a config from a JSON file, environment variables, or a `.env` file via the helpers in `faucet_core::config`:

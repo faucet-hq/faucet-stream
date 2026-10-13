@@ -104,3 +104,30 @@ async fn conformance_preflight_wellformed_even_when_unreachable() {
     let down = DatabricksSink::new(config("http://127.0.0.1:1")).unwrap();
     assert_sink_preflight_check_wellformed(&down, &ctx).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+#[test]
+fn conformance_descriptor_matches_built_sink() {
+    let base = json!({
+        "workspace_url": "https://x.cloud.databricks.com",
+        "warehouse_id": "wh",
+        "schema": "s",
+        "table": "t",
+        "auth": {"type": "pat", "config": {"token": "t"}},
+    });
+    let mut upsert = base.clone();
+    upsert["write_mode"] = json!("upsert");
+    upsert["key"] = json!(["id"]);
+    let mut overwrite = base.clone();
+    overwrite["write_mode"] = json!("overwrite");
+    for v in [base, upsert, overwrite] {
+        let cfg: DatabricksSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DatabricksSink::new(cfg).expect("offline sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_databricks::DESCRIPTOR,
+            "databricks",
+            &v,
+            &built,
+        );
+    }
+}

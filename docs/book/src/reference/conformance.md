@@ -100,6 +100,15 @@ test:
   S3 multipart) survives cancellation rather than being orphaned
   ([ADR 0011](https://github.com/faucet-hq/faucet-stream/blob/main/docs/adr/0011-cooperative-cancellation.md)).
 
+One more check pins what the CLI checks a config against:
+
+- **`assert_descriptor_matches_source` / `_sink`** — the connector's static
+  `ConnectorDescriptor` answers, from a config alone, exactly what the connector
+  built from that config declares through `capabilities()`. Every built-in calls
+  it from its `tests/conformance.rs`; the few that connect inside `new()` pin
+  their descriptor in unit tests instead (listed in the `faucet-conformance`
+  README). See [Declaring capabilities](../extending/authoring-connectors.md#declaring-capabilities).
+
 See [Authoring connectors](../extending/authoring-connectors.md#self-certify-with-the-conformance-battery)
 for how to wire the battery into a new connector.
 

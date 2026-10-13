@@ -385,6 +385,10 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Declares `write_mode: append | upsert | delete | overwrite`, keyed upsert, scoped cleanup and schema evolution (it reports its live mapping); it dedups by key only when the config sets `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

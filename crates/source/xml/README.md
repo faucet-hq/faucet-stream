@@ -441,6 +441,10 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 - [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) — the JSON/REST sibling source.
 - [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql) — GraphQL source.
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -132,6 +132,10 @@ The connection is plaintext and unauthenticated. The process-global
 unset. This crate's integration tests provision instance + database
 programmatically against the emulator via testcontainers.
 
+## Capabilities
+
+Declares `discover`, and `shardable` when the config has a `shard:` block. `faucet list --json` prints these declared capabilities.
+
 ## License
 
 MIT OR Apache-2.0

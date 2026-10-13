@@ -28,6 +28,28 @@ this crate — a check that cannot fail is worthless.
 | 9 | `assert_batch_size_zero_single_page` | a source built with `batch_size = 0` yields the whole result set as one page |
 | 10 | `assert_connector_name_nonempty` | `connector_name()` is non-empty (an empty name becomes the `"unknown"` metric label) |
 | 11 | `assert_preflight_check_wellformed` | `check()` returns `Ok(CheckReport)` with well-formed probes; a probe failure is a `Fail` probe, not an `Err` |
+| 14 | `assert_descriptor_matches_source` / `_sink` | the connector's static `ConnectorDescriptor` answers, from a config alone, exactly what the connector built from that config declares through `capabilities()` (RFC 0013) — the CLI's load-time gates trust the first, the pipeline the second |
+
+### Descriptor checks the built-in connectors cannot run offline
+
+Every built-in connector calls check 14 from its `tests/conformance.rs` for
+sample configs covering each config-dependent capability. These connectors open
+a connection inside `new()`, so they cannot be built without a backend; their
+`src/descriptor.rs` unit tests pin every capability for every config branch
+instead (and `faucet-cli`'s `registry_capability_parity` test probes them
+whenever they do build):
+
+| Connector | Why |
+|---|---|
+| `faucet-source-postgres`, `faucet-source-mysql`, `faucet-source-mssql` | eager connection pool |
+| `faucet-source-oracle`, `faucet-sink-oracle` | connect at construction; need Oracle Instant Client |
+| `faucet-source-mysql-cdc`, `faucet-source-mssql-cdc`, `faucet-source-oracle-cdc` | connection preflight in `new()` |
+| `faucet-source-mongodb-cdc` | `hello` round trip in `new()` |
+| `faucet-sink-postgres`, `faucet-sink-mysql`, `faucet-sink-mssql` | eager connection pool |
+| `faucet-sink-redis` | connection manager opens in `new()` |
+
+The Spanner source and sink run check 14 against the emulator container, like
+their other conformance checks.
 
 ### Integration-level checks
 

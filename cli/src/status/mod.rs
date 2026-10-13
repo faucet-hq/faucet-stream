@@ -900,8 +900,8 @@ async fn row_status(
     }
 
     if inputs.probe
-        && let Some((kind, _)) = &row.source
-        && crate::registry::source_reports_lag(kind)
+        && let Some((kind, config)) = &row.source
+        && crate::registry::source_capabilities(kind, config).reports_lag()
     {
         match crate::pipeline_state::ops::probe_lag(row, st.resume_bookmark.as_ref(), inputs.auth)
             .await

@@ -32,13 +32,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Sink kinds that implement `Sink::rollback_run` (column-mapping mode).
-/// Mirrors each sink's `supports_rollback` override.
-pub const ROLLBACK_SINK_KINDS: &[&str] = &["postgres", "sqlite", "mysql"];
-
-/// Whether a sink kind can undo a run.
-pub fn sink_supports_rollback(kind: &str) -> bool {
-    ROLLBACK_SINK_KINDS.contains(&kind)
+/// Whether a sink configured this way can undo a run — its declared
+/// `rollback` capability (the SQL sinks need column mapping).
+pub fn sink_supports_rollback(kind: &str, config: &Value) -> bool {
+    crate::registry::sink_capabilities(kind, config).rollback()
 }
 
 /// The run-id column the metadata decorator stamps for `spec`
@@ -279,7 +276,7 @@ pub async fn rollback_node(
         return Err(CliError::Config(format!(
             "rollback: sink '{}' cannot undo a run (supported: {}; SQL sinks need column mapping)",
             node.sink.kind,
-            ROLLBACK_SINK_KINDS.join(", ")
+            crate::registry::sink_kinds_where(|c| c.rollback()).join(", ")
         )));
     }
     let ik = state::index_key(&marker.state_key);

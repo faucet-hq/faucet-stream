@@ -82,6 +82,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
     "supports_exactly_once",
     "consumes_destructively",
     "replay_guarantee",
+    "capabilities",
     "is_shardable",
     "enumerate_shards",
     "apply_shard",
@@ -113,6 +114,7 @@ pub const SINK_HOOKS: &[&str] = &[
     "load_native",
     "supports_idempotent_writes",
     "sink_guarantee",
+    "capabilities",
     "write_batch_is_replay_safe",
     "dedups_by_key",
     "supported_write_modes",
@@ -265,6 +267,12 @@ impl Sink for HookSink {
     fn sink_guarantee(&self) -> SinkGuarantee {
         self.hit("sink_guarantee");
         SinkGuarantee::KeyedUpsert
+    }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        self.hit("capabilities");
+        faucet_core::Capabilities::builder()
+            .range_digest(true)
+            .build()
     }
     fn write_batch_is_replay_safe(&self) -> bool {
         self.hit("write_batch_is_replay_safe");
@@ -429,6 +437,7 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
         .await;
     let _ = sink.supports_idempotent_writes();
     let _ = sink.sink_guarantee();
+    let _ = sink.capabilities();
     let _ = sink.write_batch_is_replay_safe();
     let _ = sink.dedups_by_key();
     let _ = sink.supported_write_modes();
@@ -613,6 +622,12 @@ impl Source for HookSource {
         self.hit("replay_guarantee");
         ReplayGuarantee::Deterministic
     }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        self.hit("capabilities");
+        faucet_core::Capabilities::builder()
+            .range_digest(true)
+            .build()
+    }
     fn is_shardable(&self) -> bool {
         self.hit("is_shardable");
         true
@@ -729,6 +744,7 @@ pub async fn assert_source_forwards_every_hook(
     let _ = source.supports_exactly_once();
     let _ = source.consumes_destructively();
     let _ = source.replay_guarantee();
+    let _ = source.capabilities();
     let _ = source.is_shardable();
     let _ = source.enumerate_shards(2).await;
     let _ = source.apply_shard(&ShardSpec::whole()).await;

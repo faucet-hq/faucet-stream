@@ -139,3 +139,56 @@ async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
     }
     started
 }
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+
+fn descriptor_config(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut v = base;
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+#[test]
+fn descriptor_matches_built_sink() {
+    let base = serde_json::to_value(SftpSinkConfig::new(
+        SftpConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            username: "nobody".to_string(),
+            auth: SftpAuth::Password {
+                password: "x".to_string(),
+            },
+            known_hosts: HostKeyPolicy::Insecure,
+            connect_timeout_secs: 30,
+            keepalive_interval_secs: 15,
+        },
+        "/data",
+    ))
+    .unwrap();
+    let mut cases = vec![
+        serde_json::json!({}),
+        serde_json::json!({"format": "raw_text"}),
+        serde_json::json!({"format": "auto", "file_name": "x.json"}),
+        serde_json::json!({"format": "auto", "file_extension": ".txt"}),
+    ];
+    #[cfg(feature = "file-format-csv")]
+    cases.extend([
+        serde_json::json!({"format": "csv", "csv": {"on_unknown_field": "warn"}}),
+        serde_json::json!({"format": "csv", "csv": {"on_unknown_field": "error"}}),
+    ]);
+    #[cfg(feature = "arrow")]
+    cases.push(serde_json::json!({"format": "auto", "file_name": "x-{part}.parquet"}));
+    for extra in cases {
+        let v = descriptor_config(base.clone(), extra);
+        let cfg: SftpSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SftpSink::new(cfg).expect("sink builds lazily");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_sftp::DESCRIPTOR,
+            "sftp",
+            &v,
+            &built,
+        );
+    }
+}

@@ -107,7 +107,8 @@ evolves independently.
 ## Future evolution
 
 - A capability-typed node model so the executor can reason about delivery/shard
-  support without string allowlists ([RFC 0001](../../rfcs/0001-capability-traits.md)).
+  support from each connector's declared `Capabilities` (RFC 0013 replaced the
+  string allowlists with them) rather than per-gate checks.
 - Distributed execution beyond the current serve cluster modes.
 
 ## Related

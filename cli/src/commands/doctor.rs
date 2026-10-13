@@ -659,7 +659,7 @@ pub async fn lag_probe(
     auth: &AuthCatalog,
     ctx: &CheckContext,
 ) -> Option<ProbeOut> {
-    if !crate::registry::source_reports_lag(&source.kind) {
+    if !crate::registry::source_capabilities(&source.kind, &source.config).reports_lag() {
         return None;
     }
     let start = Instant::now();
@@ -684,7 +684,7 @@ async fn lag_probe_built(
     sla: Option<&crate::sla::SlaSpec>,
     ctx: &CheckContext,
 ) -> Option<ProbeOut> {
-    if !crate::registry::source_reports_lag(&source.kind) {
+    if !src.capabilities().reports_lag() {
         return None;
     }
     let start = Instant::now();

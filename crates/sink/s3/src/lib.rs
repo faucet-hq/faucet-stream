@@ -8,6 +8,9 @@
 //! JSON Lines, JSON, CSV, XML, Excel, Avro, Parquet and raw text — through
 //! the shared file writer in `faucet-common-file` (#777).
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 mod object;
 pub mod sink;

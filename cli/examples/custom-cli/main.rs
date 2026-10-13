@@ -25,7 +25,9 @@
 
 use faucet_cli::registry::PluginRegistry;
 use faucet_core::serde_json::{Value, json};
-use faucet_core::{FaucetError, JsonSchema, Source, async_trait, schema_for};
+use faucet_core::{
+    Capabilities, ConnectorDescriptor, FaucetError, JsonSchema, Source, async_trait, schema_for,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -73,11 +75,26 @@ impl Source for LoremSource {
     fn connector_name(&self) -> &'static str {
         "lorem"
     }
+
+    fn supports_discover(&self) -> bool {
+        true
+    }
 }
 
+/// What a `lorem` source can do, answered from its config alone (RFC 0013).
+/// The load-time gates (`faucet validate`, `faucet discover`, exactly-once)
+/// read this; it must agree with the built source's `capabilities()`, which
+/// `faucet_conformance::assert_descriptor_matches_source` checks.
+fn lorem_capabilities(_config: &Value) -> Capabilities {
+    Capabilities::builder().discover(true).build()
+}
+
+/// Ships with the connector crate, next to the source.
+const LOREM: ConnectorDescriptor = ConnectorDescriptor::new("lorem", lorem_capabilities);
+
 fn main() -> std::process::ExitCode {
-    let registry = PluginRegistry::with_builtins().register_source_with(
-        "lorem",
+    let registry = PluginRegistry::with_builtins().register_source_described(
+        LOREM,
         |cfg| Ok(Box::new(LoremSource::from_value(cfg)?)),
         || faucet_core::serde_json::to_value(schema_for!(LoremConfig)).unwrap_or(Value::Null),
         "Toy placeholder-record source (custom-cli example)",

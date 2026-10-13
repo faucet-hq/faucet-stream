@@ -73,3 +73,7 @@ already landed a second time). See
 ## Integer columns
 
 A fractional number bound for an integer column (`10.5` into a `long`) fails the write naming the column instead of being truncated.
+
+## Capabilities
+
+Declares `append` only and `schema_report: drops_unknown_fields` (fields the table lacks are warned about and dropped, so `on_drift: fail` is refused), plus columnar (Arrow) input when built with the `arrow` feature. `faucet list --json` prints these declared capabilities.

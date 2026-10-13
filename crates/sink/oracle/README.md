@@ -95,6 +95,10 @@ sink.write_batch(&[json!({"ID": 1, "NAME": "a"})]).await?;
 # }
 ```
 
+## Capabilities
+
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema. Keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

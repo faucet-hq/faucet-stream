@@ -15,6 +15,9 @@
 //!
 //! See the crate README for a configuration guide.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 pub mod schema;
 pub mod sink;

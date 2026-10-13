@@ -16,3 +16,7 @@ pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{StdStream, StdoutFormat, StdoutSinkConfig};
 pub use sink::StdoutSink;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("stdout", faucet_core::capabilities::append_only_sink);

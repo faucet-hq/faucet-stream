@@ -14,3 +14,6 @@ pub use faucet_core::{FaucetError, Sink};
 
 pub use config::MongoSinkConfig;
 pub use sink::MongoSink;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

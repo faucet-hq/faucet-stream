@@ -303,6 +303,10 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 - [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [faucet-sink-redis](https://crates.io/crates/faucet-sink-redis) · [faucet-source-kafka](https://crates.io/crates/faucet-source-kafka)
 
+## Capabilities
+
+Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

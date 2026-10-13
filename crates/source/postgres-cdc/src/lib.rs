@@ -9,12 +9,14 @@
 //! role, publication).
 
 pub mod config;
+mod descriptor;
 pub mod pgoutput;
 pub mod replication;
 pub mod state;
 pub mod stream;
 
 pub use config::{CdcTls, PostgresCdcSourceConfig, SlotType};
+pub use descriptor::DESCRIPTOR;
 pub use faucet_core::{FaucetError, Source};
 pub use state::Bookmark;
 pub use stream::PostgresCdcSource;

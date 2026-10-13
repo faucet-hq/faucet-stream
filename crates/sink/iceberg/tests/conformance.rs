@@ -56,3 +56,32 @@ async fn conformance_connector_name_nonempty() {
         sink.connector_name(),
     );
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+/// Offline against a SQLite catalog, like check 10.
+#[cfg(feature = "catalog-sql")]
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    use faucet_sink_iceberg::{IcebergSink, IcebergSinkConfig};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let warehouse_path = dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse_path).expect("create warehouse dir");
+    let v = serde_json::json!({
+        "catalog": {
+            "type": "sql",
+            "uri": format!("sqlite:{}?mode=rwc", dir.path().join("catalog.db").display()),
+            "warehouse": format!("file://{}", warehouse_path.display()),
+        },
+        "namespace": ["db"],
+        "table": "descriptor",
+    });
+    let cfg: IcebergSinkConfig = serde_json::from_value(v.clone()).expect("sink config parse");
+    let built = IcebergSink::new(cfg).await.expect("IcebergSink::new");
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_iceberg::DESCRIPTOR,
+        "iceberg",
+        &v,
+        &built,
+    );
+}

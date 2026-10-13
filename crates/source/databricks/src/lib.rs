@@ -28,3 +28,6 @@ pub use config::{
     ResultDisposition,
 };
 pub use stream::DatabricksSource;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

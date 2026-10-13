@@ -364,3 +364,7 @@ already landed a second time). See
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
+
+## Capabilities
+
+Append only; columnar with the `arrow` feature. Fields outside a file's schema are dropped with a warning, so it declares `schema_report: drops_unknown_fields`. `faucet list --json` prints the declaration.

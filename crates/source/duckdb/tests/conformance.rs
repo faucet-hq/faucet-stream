@@ -78,3 +78,20 @@ async fn conformance_errors_not_panics() {
         .expect("source builds; the query only fails at read time");
     faucet_conformance::assert_errors_not_panics(&source).await;
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_source() {
+    for v in [
+        serde_json::json!({"database": ":memory:", "query": "SELECT 1"}),
+        serde_json::json!({"database": ":memory:", "query": "SELECT 1", "batch_size": 0}),
+    ] {
+        let cfg: DuckdbSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DuckdbSource::new(cfg).await.expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_duckdb::DESCRIPTOR,
+            "duckdb",
+            &v,
+            &built,
+        );
+    }
+}

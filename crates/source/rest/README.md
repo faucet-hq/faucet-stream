@@ -1098,6 +1098,16 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 - [Config-file grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html)
 - Related crates: [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql), [`faucet-source-xml`](https://crates.io/crates/faucet-source-xml), [`faucet-sink-http`](https://crates.io/crates/faucet-sink-http), [`faucet-auth`](https://crates.io/crates/faucet-auth).
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013), which answers from the config alone:
+
+- **discover** when a `discovery:` recipe or an `odata:` block is set;
+- **native** (NDJSON byte passthrough) for an `async_job` with `response_format: csv` and no `decode:` steps;
+- **columnar** (Arrow, `arrow` feature) for the same shape when the fetch locator rides a header, not `locator_body`.
+
+Nothing else (no exactly-once replay, no sharding). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

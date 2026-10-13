@@ -297,6 +297,11 @@ impl Sink for SingerSink {
         false
     }
 
+    /// `key` goes to an external target whose convergence faucet cannot vouch for.
+    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
+        faucet_core::SinkGuarantee::AtLeastOnce
+    }
+
     fn is_overwrite(&self) -> bool {
         self.config.write.is_overwrite()
     }
@@ -404,6 +409,15 @@ mod tests {
 
     fn sink(v: Value) -> SingerSink {
         SingerSink::new(serde_json::from_value(v).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn upsert_is_not_a_keyed_upsert_guarantee() {
+        let s = sink(json!({"target_command": "t", "write_mode": "upsert", "key": ["id"]}));
+        assert_eq!(s.sink_guarantee(), faucet_core::SinkGuarantee::AtLeastOnce);
+        let caps = Sink::capabilities(&s);
+        assert!(caps.supports_write_mode(WriteMode::Upsert));
+        assert!(!caps.keyed_upsert() && !caps.keyed_dedup());
     }
 
     #[test]

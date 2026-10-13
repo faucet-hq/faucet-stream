@@ -182,6 +182,13 @@ impl Source for MysqlCdcSource {
             .map(faucet_core::SourceLag::bytes))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(true)
+            .build()
+    }
+
     fn supports_exactly_once(&self) -> bool {
         // Durable monotonic binlog file/pos + deterministic replay from it +
         // per-transaction (per-page) bookmarks — the requirements for

@@ -98,6 +98,10 @@ config:
 and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
 logged once and reported as no lag — it never fails a run.
 
+## Capabilities
+
+Declares lag reporting (`MillisBehindLatest`); no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.
+
 ## License
 
 MIT OR Apache-2.0

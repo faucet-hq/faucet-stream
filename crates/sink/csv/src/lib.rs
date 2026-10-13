@@ -7,6 +7,9 @@
 //!
 //! Writes JSON records to a CSV file with configurable delimiter and headers.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 pub(crate) mod probe;
 pub mod sink;

@@ -16,3 +16,6 @@ pub mod stream;
 
 pub use config::{CatalogConfig, IcebergSourceConfig, OnExpired, OnRewrite, ReadMode};
 pub use stream::IcebergSource;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

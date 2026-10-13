@@ -14,3 +14,6 @@ pub use faucet_core::{FaucetError, Source};
 
 pub use config::MongoSourceConfig;
 pub use stream::MongoSource;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

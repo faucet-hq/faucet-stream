@@ -454,6 +454,10 @@ omitted the flag when `false`; such a bookmark is migrated on the next run
 `faucet migrate --state`. A bookmark at a newer schema is refused rather than
 misread. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html).
 
+## Capabilities
+
+Declares exactly-once replay from its `resumeToken` bookmark and lag reporting, for every config. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of:

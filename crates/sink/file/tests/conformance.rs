@@ -67,3 +67,35 @@ async fn conformance_cancellation_flushes() {
     })
     .await;
 }
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+
+#[test]
+fn descriptor_matches_built_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = vec![
+        ("a.jsonl", serde_json::json!({})),
+        ("b.json", serde_json::json!({})),
+    ];
+    #[cfg(feature = "file-format-csv")]
+    paths.extend([
+        ("c.csv", serde_json::json!({"on_unknown_field": "warn"})),
+        ("d.csv", serde_json::json!({"on_unknown_field": "widen"})),
+    ]);
+    #[cfg(feature = "file-format-parquet")]
+    paths.push(("e-{part}.parquet", serde_json::json!({})));
+    for (name, csv) in paths {
+        let v = serde_json::json!({
+            "path": dir.path().join(name).to_string_lossy(),
+            "csv": csv,
+        });
+        let cfg: FileSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = FileSink::new(cfg).expect("sink builds");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_file::DESCRIPTOR,
+            "file",
+            &v,
+            &built,
+        );
+    }
+}

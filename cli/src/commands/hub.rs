@@ -389,7 +389,8 @@ fn render_list(
             "  {:<w$} {:<10} {:<28} {:<14} {:>7} {:<10}  {}\n",
             snk_ids[i],
             k.sink.kind,
-            crate::registry::sink_supported_write_modes(&k.sink.kind)
+            crate::registry::sink_kind_capabilities(&k.sink.kind)
+                .write_modes()
                 .iter()
                 .map(|m| m.as_str())
                 .collect::<Vec<_>>()

@@ -121,3 +121,21 @@ async fn conformance_preflight_check_wellformed() {
     let source = WebsocketSource::new(base_config("ws://127.0.0.1:1")).unwrap();
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 }
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    for v in [
+        serde_json::json!({"url": "ws://127.0.0.1:1", "max_messages": 10}),
+        serde_json::json!({"url": "ws://127.0.0.1:1", "idle_timeout": 5, "envelope": true}),
+    ] {
+        let cfg: faucet_source_websocket::WebsocketSourceConfig =
+            serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_websocket::WebsocketSource::new(cfg).unwrap();
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_websocket::DESCRIPTOR,
+            "websocket",
+            &v,
+            &built,
+        );
+    }
+}

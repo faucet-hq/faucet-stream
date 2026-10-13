@@ -29,6 +29,7 @@
 //! ```
 
 mod config;
+mod descriptor;
 mod sink;
 #[cfg(feature = "staging")]
 mod staged;
@@ -40,4 +41,5 @@ pub use sink::ClickHouseSink;
 
 // Re-export the shared connection type so users configure the sink without
 // depending on `faucet-common-clickhouse` directly.
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_clickhouse::ClickHouseConnection;

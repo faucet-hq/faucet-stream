@@ -214,3 +214,7 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
+## Capabilities
+
+Write modes `append` and `overwrite`; no exactly-once or keyed upsert. Columnar for Parquet and Avro output (with the `arrow` feature). For CSV output under `csv.on_unknown_field: warn` it declares that it drops fields outside the frozen header (`schema_report: drops_unknown_fields`), so `schema.on_drift: fail` is refused at load time. `faucet list --json` prints the declaration.

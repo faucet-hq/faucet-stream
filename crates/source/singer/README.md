@@ -113,6 +113,10 @@ pipeline:
       path: ./state
 ```
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

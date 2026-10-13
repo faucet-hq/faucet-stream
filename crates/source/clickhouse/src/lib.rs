@@ -37,3 +37,7 @@ pub use stream::ClickHouseSource;
 // Re-export the shared connection type so users configure the source without
 // depending on `faucet-common-clickhouse` directly.
 pub use faucet_common_clickhouse::ClickHouseConnection;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("clickhouse", faucet_core::capabilities::plain_source);

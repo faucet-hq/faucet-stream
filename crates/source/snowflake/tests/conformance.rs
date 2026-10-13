@@ -215,3 +215,25 @@ async fn conformance_errors_not_panics() {
     assert_connector_name_nonempty(&source);
     assert_errors_not_panics(&source).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    let v = json!({
+        "account": "xy12345",
+        "warehouse": "WH",
+        "database": "DB",
+        "schema": "PUBLIC",
+        "auth": {"type": "oauth", "config": {"token": "t"}},
+        "query": "SELECT 1",
+    });
+    let cfg: SnowflakeSourceConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = SnowflakeSource::new(cfg).expect("source new");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_snowflake::DESCRIPTOR,
+        "snowflake",
+        &v,
+        &built,
+    );
+}

@@ -464,6 +464,10 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
 logged once and reported as no lag — it never fails a run.
 
+## Capabilities
+
+Declares `exactly_once` (deterministic replay from the binlog bookmark) and `reports_lag` (binlog distance in bytes). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -471,6 +471,10 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) — the REST sibling source with broader pagination styles.
 - [`faucet-auth`](https://crates.io/crates/faucet-auth) — shared OAuth2 / token-endpoint providers.
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

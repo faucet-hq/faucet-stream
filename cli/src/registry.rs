@@ -8,7 +8,7 @@
 
 use crate::auth_catalog::{self, AuthCatalog};
 use crate::error::{CliError, CliResult};
-use faucet_core::{FaucetError, Sink, Source};
+use faucet_core::{Capabilities, ConnectorDescriptor, FaucetError, Sink, Source};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,12 +38,14 @@ struct SourceEntry {
     factory: SourceFactory,
     schema: SchemaFn,
     description: &'static str,
+    descriptor: Option<ConnectorDescriptor>,
 }
 
 struct SinkEntry {
     factory: SinkFactory,
     schema: SchemaFn,
     description: &'static str,
+    descriptor: Option<ConnectorDescriptor>,
 }
 
 /// A registry of connector factories keyed by their YAML `type:` string.
@@ -112,13 +114,56 @@ impl PluginRegistry {
 
     /// Register a custom source with an explicit schema closure and one-line
     /// description (shown by `faucet list` and `faucet schema source <name>`).
+    /// It declares no capabilities to the load-time gates; use
+    /// [`register_source_described`](Self::register_source_described) to
+    /// declare them.
     #[must_use]
     pub fn register_source_with<F, S>(
+        self,
+        name: &str,
+        factory: F,
+        schema: S,
+        description: &str,
+    ) -> Self
+    where
+        F: Fn(Value) -> CliResult<Box<dyn Source>> + Send + Sync + 'static,
+        S: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.insert_source(name, factory, schema, description, None)
+    }
+
+    /// Register a custom source under `descriptor.kind()` together with its
+    /// [`ConnectorDescriptor`], so the load-time gates (`faucet validate`,
+    /// exactly-once, discover, verify) see the capabilities it declares —
+    /// exactly as they see a built-in's (RFC 0013).
+    #[must_use]
+    pub fn register_source_described<F, S>(
+        self,
+        descriptor: ConnectorDescriptor,
+        factory: F,
+        schema: S,
+        description: &str,
+    ) -> Self
+    where
+        F: Fn(Value) -> CliResult<Box<dyn Source>> + Send + Sync + 'static,
+        S: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.insert_source(
+            descriptor.kind(),
+            factory,
+            schema,
+            description,
+            Some(descriptor),
+        )
+    }
+
+    fn insert_source<F, S>(
         mut self,
         name: &str,
         factory: F,
         schema: S,
         description: &str,
+        descriptor: Option<ConnectorDescriptor>,
     ) -> Self
     where
         F: Fn(Value) -> CliResult<Box<dyn Source>> + Send + Sync + 'static,
@@ -142,6 +187,7 @@ impl PluginRegistry {
                 factory: Arc::new(factory),
                 schema: Arc::new(schema),
                 description: leak_str(description),
+                descriptor,
             },
         );
         self
@@ -157,13 +203,56 @@ impl PluginRegistry {
     }
 
     /// Register a custom sink with an explicit schema closure and description.
+    /// It declares append-only capabilities to the load-time gates; use
+    /// [`register_sink_described`](Self::register_sink_described) to declare
+    /// its write modes, exactly-once, cleanup and the rest.
     #[must_use]
     pub fn register_sink_with<F, S>(
+        self,
+        name: &str,
+        factory: F,
+        schema: S,
+        description: &str,
+    ) -> Self
+    where
+        F: Fn(Value) -> CliResult<Box<dyn Sink>> + Send + Sync + 'static,
+        S: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.insert_sink(name, factory, schema, description, None)
+    }
+
+    /// Register a custom sink under `descriptor.kind()` together with its
+    /// [`ConnectorDescriptor`], so the load-time gates (write modes, upsert,
+    /// overwrite, exactly-once, cleanup, rollback, schema drift) accept what it
+    /// declares — exactly as they accept a built-in's (RFC 0013).
+    #[must_use]
+    pub fn register_sink_described<F, S>(
+        self,
+        descriptor: ConnectorDescriptor,
+        factory: F,
+        schema: S,
+        description: &str,
+    ) -> Self
+    where
+        F: Fn(Value) -> CliResult<Box<dyn Sink>> + Send + Sync + 'static,
+        S: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.insert_sink(
+            descriptor.kind(),
+            factory,
+            schema,
+            description,
+            Some(descriptor),
+        )
+    }
+
+    fn insert_sink<F, S>(
         mut self,
         name: &str,
         factory: F,
         schema: S,
         description: &str,
+        descriptor: Option<ConnectorDescriptor>,
     ) -> Self
     where
         F: Fn(Value) -> CliResult<Box<dyn Sink>> + Send + Sync + 'static,
@@ -187,6 +276,7 @@ impl PluginRegistry {
                 factory: Arc::new(factory),
                 schema: Arc::new(schema),
                 description: leak_str(description),
+                descriptor,
             },
         );
         self
@@ -888,40 +978,6 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
     }
 }
 
-/// Source connector kinds that deterministically replay (exactly-once-capable).
-/// Mirrors `Source::supports_exactly_once` overrides — keep in sync when a new
-/// source opts in. The single source of truth for both the boolean gate and the
-/// human-readable list shown in error messages (F44). `kafka` qualifies because
-/// partitions are immutable logs and every page carries a complete offsets
-/// bookmark (#291).
-pub const EXACTLY_ONCE_SOURCE_KINDS: &[&str] = &[
-    "postgres-cdc",
-    "mysql-cdc",
-    "mssql-cdc",
-    "mongodb-cdc",
-    "kafka",
-    "oracle-cdc",
-];
-
-/// Source kinds that report how far behind their head they are
-/// (`Source::lag`, #733). Mirrors the overrides — `faucet status --probe` only
-/// builds a source to ask when its kind is listed.
-pub const LAG_SOURCE_KINDS: &[&str] = &[
-    "postgres-cdc",
-    "mysql-cdc",
-    "mssql-cdc",
-    "mongodb-cdc",
-    "oracle-cdc",
-    "kafka",
-    "kinesis",
-    "dynamodb",
-];
-
-/// See [`LAG_SOURCE_KINDS`].
-pub fn source_reports_lag(kind: &str) -> bool {
-    LAG_SOURCE_KINDS.contains(&kind)
-}
-
 /// The bookmark shape version a source kind stores (#736) — the offline
 /// answer `faucet state show`, `faucet migrate --state` and `faucet doctor`
 /// use, matching the built source's `Source::state_schema`. A kind that
@@ -974,122 +1030,14 @@ pub fn state_codec_for(source: Option<(&str, &Value)>) -> faucet_core::state_ver
     }
 }
 
-/// Sink connector kinds that can durably commit a token atomically with data.
-/// Mirrors `Sink::supports_idempotent_writes` overrides — keep in sync when a
-/// new sink opts in. Single source of truth for the gate + the error-message
-/// list (F44).
-pub const IDEMPOTENT_SINK_KINDS: &[&str] = &[
-    "sqlite",
-    "postgres",
-    "mysql",
-    "mssql",
-    "iceberg",
-    "bigquery",
-    "kafka",
-    "snowflake",
-    "redis",
-    "mongodb",
-    "spanner",
-    "databricks",
-    "oracle",
-];
-
-/// Sink kinds that can apply additive/widening DDL via `Sink::evolve_schema`.
-/// Mirrors each sink's `supports_schema_evolution()` override. Iceberg is
-/// additive-only (new columns) via iceberg-rust 0.10.0's `update_schema`
-/// action (#255).
-pub const SCHEMA_EVOLUTION_SINK_KINDS: &[&str] = &[
-    "postgres",
-    "mysql",
-    "mssql",
-    "sqlite",
-    "bigquery",
-    "elasticsearch",
-    "spanner",
-    "iceberg",
-    "databricks",
-    "oracle",
-];
-
-/// Sink kinds that support `write_mode: upsert|delete`. Mirrors each sink's
-/// `Sink::supported_write_modes()` override. Single source of truth for the gate
-/// + the error-message list (F44).
-pub const UPSERT_SINK_KINDS: &[&str] = &[
-    "postgres",
-    "sqlite",
-    "mysql",
-    "mssql",
-    "mongodb",
-    "elasticsearch",
-    "bigquery",
-    "spanner",
-    "dynamodb",
-    "databricks",
-    "oracle",
-];
-
-/// Sink kinds that implement scoped cleanup (`Sink::cleanup_scope`, #478) —
-/// deleting destination rows inside a source's declared completeness scope that
-/// the run did not write. Kept in sync with each sink's `supports_cleanup()`
-/// override; `cli/tests/registry_capability_parity.rs` asserts they agree.
-///
-/// A subset of [`UPSERT_SINK_KINDS`]: cleanup is only meaningful alongside
-/// `write_mode: upsert`, but not every upsert-capable sink can express a scoped
-/// delete (`dynamodb`, `databricks` and `oracle` cannot), so the lists differ.
-pub const CLEANUP_SINK_KINDS: &[&str] = &[
-    "postgres",
-    "sqlite",
-    "mysql",
-    "mssql",
-    "mongodb",
-    "elasticsearch",
-    "bigquery",
-    "spanner",
-];
-
-/// Sink kinds that support `write_mode: overwrite` (#492) — full-destination
-/// replacement via the atomic begin/commit staging lifecycle. Mirrors each
-/// sink's `Sink::supported_write_modes()` override (which must list
-/// `WriteMode::Overwrite`); `cli/tests/registry_capability_parity.rs` asserts
-/// they agree. A subset of [`UPSERT_SINK_KINDS`] — overwrite lands on the
-/// keyed-write sinks as their lifecycle is added.
-pub const OVERWRITE_SINK_KINDS: &[&str] = &[
-    "sqlite",
-    "postgres",
-    "mysql",
-    "mssql",
-    "mongodb",
-    "bigquery",
-    // elasticsearch overwrites via an atomic alias swap (#494) rather than a
-    // staging-table swap, but exposes the same begin/commit/abort lifecycle.
-    "elasticsearch",
-    "databricks",
-    "oracle",
-    // local files: staged in a hidden directory, moved into place on commit.
-    "file",
-    // object stores and SFTP (#777): the same stage-and-swap under a staging
-    // key prefix / directory, through the shared file writer.
-    "s3",
-    "gcs",
-    "azure-blob",
-    "sftp",
-];
-
-/// Whether a sink kind supports `write_mode: overwrite`.
-pub fn sink_supports_overwrite(kind: &str) -> bool {
-    OVERWRITE_SINK_KINDS.contains(&kind)
-}
-
-/// File sinks that replace their output every time an invocation writes to it
-/// (#752), outside the grouped `write_mode: overwrite` lifecycle: `jsonl` /
-/// `csv` with `append: false` (the default), `parquet` writing one fixed
-/// `*.parquet` file (no rollover), and `file` in `if_exists: replace` (the
-/// default; formerly `mode: overwrite`) without `write_mode: overwrite`. Run once per parent record at one
-/// path, each invocation wipes the previous one's rows.
-pub const TRUNCATING_FILE_SINK_KINDS: &[&str] = &["jsonl", "csv", "parquet", "file"];
-
-/// The destination path of a [`TRUNCATING_FILE_SINK_KINDS`] sink config, when
-/// that config replaces its output on every invocation; `None` otherwise.
+/// The destination path of a file sink config that replaces its output every
+/// time an invocation writes to it (#752), outside the grouped
+/// `write_mode: overwrite` lifecycle: `jsonl` / `csv` with `append: false`
+/// (the default), `parquet` writing one fixed `*.parquet` file (no rollover),
+/// and `file` in `if_exists: replace` (the default; formerly
+/// `mode: overwrite`) without `write_mode: overwrite`. Run once per parent
+/// record at one path, each invocation wipes the previous one's rows. `None`
+/// otherwise.
 pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
     let flag = |k: &str| cfg.get(k).and_then(Value::as_bool).unwrap_or(false);
     let text = |v: Option<&'a Value>| v.and_then(Value::as_str);
@@ -1203,107 +1151,6 @@ pub fn sink_destination_patch(kind: &str, cfg: &Value, tag: &str) -> Option<Valu
     }
 }
 
-/// Sinks that support a **scoped/windowed** overwrite (#518) — replacing only
-/// the rows matching a `scope` (a date window) instead of the whole table. A
-/// subset of [`OVERWRITE_SINK_KINDS`]; the others still support full overwrite.
-/// (v1: the atomic scoped delete + staged insert; the wider SQL family and
-/// key-scope are follow-ups.)
-pub const SCOPED_OVERWRITE_SINK_KINDS: &[&str] = &["postgres", "bigquery"];
-
-/// Whether a sink kind supports a scoped overwrite `scope`.
-pub fn sink_supports_scoped_overwrite(kind: &str) -> bool {
-    SCOPED_OVERWRITE_SINK_KINDS.contains(&kind)
-}
-
-/// Sinks with a **direct** (staging-free) overwrite path: a solo full-refresh
-/// loads straight into the target (e.g. an atomic BigQuery `WRITE_TRUNCATE`
-/// load, which replaces the table only on success), so no staging table is
-/// needed. The executor injects the internal `_overwrite_staging` signal into
-/// *these* sinks only when the overwrite is a grouped fan-out (>1 writer → one
-/// physical table), where a shared staging table is the only safe cross-writer
-/// swap. Non-listed sinks always stage via their own begin/commit lifecycle.
-pub const DIRECT_OVERWRITE_SINK_KINDS: &[&str] = &["bigquery"];
-
-/// Whether a sink kind has a staging-free direct overwrite path (and therefore
-/// understands the internal `_overwrite_staging` grouped-signal).
-pub fn sink_supports_direct_overwrite(kind: &str) -> bool {
-    DIRECT_OVERWRITE_SINK_KINDS.contains(&kind)
-}
-
-/// Sink kinds that bulk-load via an object-store stage + native load command
-/// (staged bulk load, #528). These mirror each sink's
-/// `Sink::supports_staged_load` override. Redshift (`write_strategy: copy`), Snowflake (`bulk_load`), and
-/// BigQuery (`bulk_load`) load from S3 / an external stage / GCS respectively;
-/// ClickHouse pulls a staged S3/GCS object with the `s3()` / `gcs()` table
-/// function, and MSSQL/Synapse pulls a staged Azure Blob object with `COPY INTO`
-/// (`staging:` blocks, #528). The load SQL/URL generators are unit-tested; the
-/// server-side execution is not exercised in CI (no live warehouse + object
-/// store), same as Redshift/Snowflake/BigQuery.
-pub const STAGED_LOAD_SINK_KINDS: &[&str] = &[
-    "redshift",
-    "snowflake",
-    "bigquery",
-    "clickhouse",
-    "mssql",
-    "databricks",
-];
-
-/// Whether a sink kind supports staged bulk load. See [`STAGED_LOAD_SINK_KINDS`].
-pub fn sink_supports_staged_load(kind: &str) -> bool {
-    STAGED_LOAD_SINK_KINDS.contains(&kind)
-}
-
-/// Source kinds that implement live dataset discovery (`Source::discover`,
-/// issue #211) — mirrors the discoverable-source list in the connector docs.
-/// Single source of truth for the conformance scorecard (#330).
-pub const DISCOVER_SOURCE_KINDS: &[&str] = &[
-    "postgres",
-    "mysql",
-    "mssql",
-    "sqlite",
-    "mongodb",
-    "elasticsearch",
-    "bigquery",
-    "snowflake",
-    "spanner",
-    "s3",
-    "gcs",
-    "iceberg",
-    "dynamodb",
-    "oracle",
-    "file",
-];
-
-/// Whether a source kind supports `faucet discover` (dataset introspection).
-pub fn source_supports_discover(kind: &str) -> bool {
-    DISCOVER_SOURCE_KINDS.contains(&kind)
-}
-
-/// The typed replay capability a source kind advertises
-/// (`Source::replay_guarantee`, issue #292). Derived from
-/// [`EXACTLY_ONCE_SOURCE_KINDS`] — the kind table stays the single source of
-/// truth; this is the typed view the delivery-guarantee derivation consumes.
-pub fn source_replay_guarantee(kind: &str) -> faucet_core::ReplayGuarantee {
-    if EXACTLY_ONCE_SOURCE_KINDS.contains(&kind) {
-        faucet_core::ReplayGuarantee::Deterministic
-    } else {
-        faucet_core::ReplayGuarantee::NonDeterministic
-    }
-}
-
-/// The strongest delivery guarantee a sink kind can uphold
-/// (`Sink::sink_guarantee`, issue #292). Derived from
-/// [`IDEMPOTENT_SINK_KINDS`] / [`UPSERT_SINK_KINDS`].
-pub fn sink_guarantee(kind: &str) -> faucet_core::SinkGuarantee {
-    if IDEMPOTENT_SINK_KINDS.contains(&kind) {
-        faucet_core::SinkGuarantee::AtomicWatermark
-    } else if UPSERT_SINK_KINDS.contains(&kind) {
-        faucet_core::SinkGuarantee::KeyedUpsert
-    } else {
-        faucet_core::SinkGuarantee::AtLeastOnce
-    }
-}
-
 /// Config-level mirror of `Source::consumes_destructively` for the built-in
 /// queue sources: reading them acks, deletes or settles messages as the
 /// pipeline moves past each page (`sqs`, `pubsub`, `rabbitmq`, and `nats` in
@@ -1372,57 +1219,307 @@ pub fn source_position_fields(kind: &str) -> &'static [&'static str] {
     }
 }
 
-/// See [`EXACTLY_ONCE_SOURCE_KINDS`].
-pub fn source_supports_exactly_once(kind: &str) -> bool {
-    source_replay_guarantee(kind) == faucet_core::ReplayGuarantee::Deterministic
-}
-
-/// See [`IDEMPOTENT_SINK_KINDS`].
-pub fn sink_supports_idempotent_writes(kind: &str) -> bool {
-    sink_guarantee(kind) == faucet_core::SinkGuarantee::AtomicWatermark
-}
-
-/// See [`SCHEMA_EVOLUTION_SINK_KINDS`].
-pub fn sink_supports_schema_evolution(kind: &str) -> bool {
-    SCHEMA_EVOLUTION_SINK_KINDS.contains(&kind)
-}
-
-/// See [`CLEANUP_SINK_KINDS`].
-pub fn sink_supports_cleanup(kind: &str) -> bool {
-    CLEANUP_SINK_KINDS.contains(&kind)
-}
-
-/// The Singer target bridge's write modes: upsert only hands `key` to the
-/// target as `key_properties` (the target merges), and overwrite maps to
-/// `ACTIVATE_VERSION`. It is deliberately not in [`UPSERT_SINK_KINDS`] — faucet
-/// cannot vouch for the target deduplicating by key — nor in
-/// [`OVERWRITE_SINK_KINDS`], which promises an atomic swap.
-pub const SINGER_WRITE_MODES: &[faucet_core::WriteMode] = &[
-    faucet_core::WriteMode::Append,
-    faucet_core::WriteMode::Upsert,
-    faucet_core::WriteMode::Overwrite,
-];
-
-/// Write modes each sink kind supports. Kept in sync with each sink's
-/// `Sink::supported_write_modes()` override via [`UPSERT_SINK_KINDS`].
-pub fn sink_supported_write_modes(kind: &str) -> &'static [faucet_core::WriteMode] {
-    use faucet_core::WriteMode;
-    if kind == "singer" {
-        return SINGER_WRITE_MODES;
+/// The static descriptor of a source kind (RFC 0013, #876): a registered
+/// custom connector's, else the built-in's. `None` for an unknown kind, or a
+/// custom one registered without a descriptor.
+pub fn source_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
+    match global().sources.get(kind) {
+        Some(entry) => entry.descriptor,
+        None => builtin_source_descriptor(kind),
     }
-    match (
-        UPSERT_SINK_KINDS.contains(&kind),
-        OVERWRITE_SINK_KINDS.contains(&kind),
-    ) {
-        (true, true) => &[
+}
+
+/// The static descriptor of a sink kind. See [`source_descriptor`].
+pub fn sink_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
+    match global().sinks.get(kind) {
+        Some(entry) => entry.descriptor,
+        None => builtin_sink_descriptor(kind),
+    }
+}
+
+/// A config value as a descriptor reads it: an absent config is an empty
+/// object, never the `Null` that asks for the kind-level view.
+fn config_object(config: &Value) -> std::borrow::Cow<'_, Value> {
+    if config.is_null() {
+        std::borrow::Cow::Owned(Value::Object(serde_json::Map::new()))
+    } else {
+        std::borrow::Cow::Borrowed(config)
+    }
+}
+
+/// Whether `kind` is a first-party connector this binary was built without.
+fn uncompiled_builtin(kind: &str, role: &str) -> bool {
+    static INDEX: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            crate::registry_index::RegistryIndex::embedded()
+                .connectors
+                .into_iter()
+                .filter(|c| c.verified)
+                .map(|c| (c.kind, c.name))
+                .collect()
+        })
+        .iter()
+        .any(|(k, n)| k == role && n == kind)
+}
+
+/// What a first-party connector this binary does not compile in is assumed to
+/// support: everything. Its descriptor is not linked in, so a load-time gate
+/// cannot check it; building it fails with "unknown kind" instead, exactly as
+/// before it was declared.
+fn uncompiled_capabilities(config: &Value) -> Capabilities {
+    use faucet_core::WriteMode;
+    Capabilities::builder()
+        .write_modes([
             WriteMode::Append,
             WriteMode::Upsert,
             WriteMode::Delete,
             WriteMode::Overwrite,
-        ],
-        (true, false) => &[WriteMode::Append, WriteMode::Upsert, WriteMode::Delete],
-        (false, true) => &[WriteMode::Append, WriteMode::Overwrite],
-        (false, false) => &[WriteMode::Append],
+        ])
+        .idempotent_writes(true)
+        .keyed_upsert(true)
+        .keyed_dedup(faucet_core::capabilities::config::dedups_by_key(config))
+        .cleanup(true)
+        .rollback(true)
+        .schema_evolution(true)
+        .scoped_overwrite(true)
+        .direct_overwrite(true)
+        .staged_load(true)
+        .exactly_once(true)
+        .discover(true)
+        .shardable(true)
+        .range_read(true)
+        .range_digest(true)
+        .reports_lag(true)
+        .build()
+}
+
+/// What a source of `kind` configured with `config` can do, read without
+/// building it — what every load-time gate consults. A kind without a
+/// descriptor declares nothing (a first-party one this binary was built
+/// without is not refused).
+pub fn source_capabilities(kind: &str, config: &Value) -> Capabilities {
+    let config = config_object(config);
+    match source_descriptor(kind) {
+        Some(d) => d.capabilities(&config),
+        None if !source_exists(kind) && uncompiled_builtin(kind, "source") => {
+            uncompiled_capabilities(&config)
+        }
+        None => Capabilities::plain_source(),
+    }
+}
+
+/// What a sink of `kind` configured with `config` can do, read without
+/// building it. A kind without a descriptor is append-only (a first-party
+/// one this binary was built without is not refused).
+pub fn sink_capabilities(kind: &str, config: &Value) -> Capabilities {
+    let config = config_object(config);
+    match sink_descriptor(kind) {
+        Some(d) => d.capabilities(&config),
+        None if !sink_exists(kind) && uncompiled_builtin(kind, "sink") => {
+            uncompiled_capabilities(&config)
+        }
+        None => Capabilities::append_only_sink(),
+    }
+}
+
+/// Every capability some config of a source `kind` enables — the kind-level
+/// view listings show ([`ConnectorDescriptor::kind_capabilities`]).
+pub fn source_kind_capabilities(kind: &str) -> Capabilities {
+    source_descriptor(kind).map_or_else(Capabilities::plain_source, |d| d.kind_capabilities())
+}
+
+/// [`source_kind_capabilities`] for sinks.
+pub fn sink_kind_capabilities(kind: &str) -> Capabilities {
+    sink_descriptor(kind).map_or_else(Capabilities::append_only_sink, |d| d.kind_capabilities())
+}
+
+/// The compiled source kinds whose kind-level capabilities satisfy `pred`,
+/// sorted — the "supported: …" list in a gate's error message.
+pub fn source_kinds_where(pred: impl Fn(&Capabilities) -> bool) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = source_kinds()
+        .into_iter()
+        .filter(|k| pred(&source_kind_capabilities(k)))
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// [`source_kinds_where`] for sinks.
+pub fn sink_kinds_where(pred: impl Fn(&Capabilities) -> bool) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = sink_kinds()
+        .into_iter()
+        .filter(|k| pred(&sink_kind_capabilities(k)))
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+fn builtin_source_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
+    match kind {
+        #[cfg(feature = "source-rest")]
+        "rest" => Some(faucet_source_rest::DESCRIPTOR),
+        #[cfg(feature = "source-graphql")]
+        "graphql" => Some(faucet_source_graphql::DESCRIPTOR),
+        #[cfg(feature = "source-xml")]
+        "xml" => Some(faucet_source_xml::DESCRIPTOR),
+        #[cfg(feature = "source-grpc")]
+        "grpc" => Some(faucet_source_grpc::DESCRIPTOR),
+        #[cfg(feature = "source-postgres")]
+        "postgres" => Some(faucet_source_postgres::DESCRIPTOR),
+        #[cfg(feature = "source-postgres-cdc")]
+        "postgres-cdc" => Some(faucet_source_postgres_cdc::DESCRIPTOR),
+        #[cfg(feature = "source-mysql")]
+        "mysql" => Some(faucet_source_mysql::DESCRIPTOR),
+        #[cfg(feature = "source-mssql")]
+        "mssql" => Some(faucet_source_mssql::DESCRIPTOR),
+        #[cfg(feature = "source-sqlite")]
+        "sqlite" => Some(faucet_source_sqlite::DESCRIPTOR),
+        #[cfg(feature = "source-duckdb")]
+        "duckdb" => Some(faucet_source_duckdb::DESCRIPTOR),
+        #[cfg(feature = "source-sqs")]
+        "sqs" => Some(faucet_source_sqs::DESCRIPTOR),
+        #[cfg(feature = "source-nats")]
+        "nats" => Some(faucet_source_nats::DESCRIPTOR),
+        #[cfg(feature = "source-rabbitmq")]
+        "rabbitmq" => Some(faucet_source_rabbitmq::DESCRIPTOR),
+        #[cfg(feature = "source-sftp")]
+        "sftp" => Some(faucet_source_sftp::DESCRIPTOR),
+        #[cfg(feature = "source-file")]
+        "file" => Some(faucet_source_file::DESCRIPTOR),
+        #[cfg(feature = "source-s3")]
+        "s3" => Some(faucet_source_s3::DESCRIPTOR),
+        #[cfg(feature = "source-mongodb")]
+        "mongodb" => Some(faucet_source_mongodb::DESCRIPTOR),
+        #[cfg(feature = "source-mongodb-cdc")]
+        "mongodb-cdc" => Some(faucet_source_mongodb_cdc::DESCRIPTOR),
+        #[cfg(feature = "source-mysql-cdc")]
+        "mysql-cdc" => Some(faucet_source_mysql_cdc::DESCRIPTOR),
+        #[cfg(feature = "source-redis")]
+        "redis" => Some(faucet_source_redis::DESCRIPTOR),
+        #[cfg(feature = "source-webhook")]
+        "webhook" => Some(faucet_source_webhook::DESCRIPTOR),
+        #[cfg(feature = "source-websocket")]
+        "websocket" => Some(faucet_source_websocket::DESCRIPTOR),
+        #[cfg(feature = "source-csv")]
+        "csv" => Some(faucet_source_csv::DESCRIPTOR),
+        #[cfg(feature = "source-singer")]
+        "singer" => Some(faucet_source_singer::DESCRIPTOR),
+        #[cfg(feature = "source-elasticsearch")]
+        "elasticsearch" => Some(faucet_source_elasticsearch::DESCRIPTOR),
+        #[cfg(feature = "source-kafka")]
+        "kafka" => Some(faucet_source_kafka::DESCRIPTOR),
+        #[cfg(feature = "source-kinesis")]
+        "kinesis" => Some(faucet_source_kinesis::DESCRIPTOR),
+        #[cfg(feature = "source-spanner")]
+        "spanner" => Some(faucet_source_spanner::DESCRIPTOR),
+        #[cfg(feature = "source-parquet")]
+        "parquet" => Some(faucet_source_parquet::DESCRIPTOR),
+        #[cfg(feature = "source-delta")]
+        "delta" => Some(faucet_source_delta::DESCRIPTOR),
+        #[cfg(feature = "source-databricks")]
+        "databricks" => Some(faucet_source_databricks::DESCRIPTOR),
+        #[cfg(feature = "source-iceberg")]
+        "iceberg" => Some(faucet_source_iceberg::DESCRIPTOR),
+        #[cfg(feature = "source-dynamodb")]
+        "dynamodb" => Some(faucet_source_dynamodb::DESCRIPTOR),
+        #[cfg(feature = "source-oracle")]
+        "oracle" => Some(faucet_source_oracle::DESCRIPTOR),
+        #[cfg(feature = "source-oracle-cdc")]
+        "oracle-cdc" => Some(faucet_source_oracle_cdc::DESCRIPTOR),
+        #[cfg(feature = "source-gcs")]
+        "gcs" => Some(faucet_source_gcs::DESCRIPTOR),
+        #[cfg(feature = "source-bigquery")]
+        "bigquery" => Some(faucet_source_bigquery::DESCRIPTOR),
+        #[cfg(feature = "source-snowflake")]
+        "snowflake" => Some(faucet_source_snowflake::DESCRIPTOR),
+        #[cfg(feature = "source-mssql-cdc")]
+        "mssql-cdc" => Some(faucet_source_mssql_cdc::DESCRIPTOR),
+        #[cfg(feature = "source-redshift")]
+        "redshift" => Some(faucet_source_redshift::DESCRIPTOR),
+        #[cfg(feature = "source-pubsub")]
+        "pubsub" => Some(faucet_source_pubsub::DESCRIPTOR),
+        #[cfg(feature = "source-clickhouse")]
+        "clickhouse" => Some(faucet_source_clickhouse::DESCRIPTOR),
+        #[cfg(feature = "source-azure-blob")]
+        "azure-blob" => Some(faucet_source_azure_blob::DESCRIPTOR),
+        _ => None,
+    }
+}
+
+fn builtin_sink_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
+    match kind {
+        #[cfg(feature = "sink-bigquery")]
+        "bigquery" => Some(faucet_sink_bigquery::DESCRIPTOR),
+        #[cfg(feature = "sink-iceberg")]
+        "iceberg" => Some(faucet_sink_iceberg::DESCRIPTOR),
+        #[cfg(feature = "sink-delta")]
+        "delta" => Some(faucet_sink_delta::DESCRIPTOR),
+        #[cfg(feature = "sink-postgres")]
+        "postgres" => Some(faucet_sink_postgres::DESCRIPTOR),
+        #[cfg(feature = "sink-jsonl")]
+        "jsonl" => Some(faucet_sink_jsonl::DESCRIPTOR),
+        #[cfg(feature = "sink-snowflake")]
+        "snowflake" => Some(faucet_sink_snowflake::DESCRIPTOR),
+        #[cfg(feature = "sink-mysql")]
+        "mysql" => Some(faucet_sink_mysql::DESCRIPTOR),
+        #[cfg(feature = "sink-mssql")]
+        "mssql" => Some(faucet_sink_mssql::DESCRIPTOR),
+        #[cfg(feature = "sink-sqlite")]
+        "sqlite" => Some(faucet_sink_sqlite::DESCRIPTOR),
+        #[cfg(feature = "sink-duckdb")]
+        "duckdb" => Some(faucet_sink_duckdb::DESCRIPTOR),
+        #[cfg(feature = "sink-sqs")]
+        "sqs" => Some(faucet_sink_sqs::DESCRIPTOR),
+        #[cfg(feature = "sink-nats")]
+        "nats" => Some(faucet_sink_nats::DESCRIPTOR),
+        #[cfg(feature = "sink-rabbitmq")]
+        "rabbitmq" => Some(faucet_sink_rabbitmq::DESCRIPTOR),
+        #[cfg(feature = "sink-sftp")]
+        "sftp" => Some(faucet_sink_sftp::DESCRIPTOR),
+        #[cfg(feature = "sink-singer")]
+        "singer" => Some(faucet_sink_singer::DESCRIPTOR),
+        #[cfg(feature = "sink-s3")]
+        "s3" => Some(faucet_sink_s3::DESCRIPTOR),
+        #[cfg(feature = "sink-mongodb")]
+        "mongodb" => Some(faucet_sink_mongodb::DESCRIPTOR),
+        #[cfg(feature = "sink-redis")]
+        "redis" => Some(faucet_sink_redis::DESCRIPTOR),
+        #[cfg(feature = "sink-csv")]
+        "csv" => Some(faucet_sink_csv::DESCRIPTOR),
+        #[cfg(feature = "sink-elasticsearch")]
+        "elasticsearch" => Some(faucet_sink_elasticsearch::DESCRIPTOR),
+        #[cfg(feature = "sink-kafka")]
+        "kafka" => Some(faucet_sink_kafka::DESCRIPTOR),
+        #[cfg(feature = "sink-kinesis")]
+        "kinesis" => Some(faucet_sink_kinesis::DESCRIPTOR),
+        #[cfg(feature = "sink-spanner")]
+        "spanner" => Some(faucet_sink_spanner::DESCRIPTOR),
+        #[cfg(feature = "sink-http")]
+        "http" => Some(faucet_sink_http::DESCRIPTOR),
+        #[cfg(feature = "sink-stdout")]
+        "stdout" => Some(faucet_sink_stdout::DESCRIPTOR),
+        #[cfg(feature = "sink-parquet")]
+        "parquet" => Some(faucet_sink_parquet::DESCRIPTOR),
+        #[cfg(feature = "sink-file")]
+        "file" => Some(faucet_sink_file::DESCRIPTOR),
+        #[cfg(feature = "sink-gcs")]
+        "gcs" => Some(faucet_sink_gcs::DESCRIPTOR),
+        #[cfg(feature = "sink-redshift")]
+        "redshift" => Some(faucet_sink_redshift::DESCRIPTOR),
+        #[cfg(feature = "sink-pubsub")]
+        "pubsub" => Some(faucet_sink_pubsub::DESCRIPTOR),
+        #[cfg(feature = "sink-clickhouse")]
+        "clickhouse" => Some(faucet_sink_clickhouse::DESCRIPTOR),
+        #[cfg(feature = "sink-azure-blob")]
+        "azure-blob" => Some(faucet_sink_azure_blob::DESCRIPTOR),
+        #[cfg(feature = "sink-dynamodb")]
+        "dynamodb" => Some(faucet_sink_dynamodb::DESCRIPTOR),
+        #[cfg(feature = "sink-databricks")]
+        "databricks" => Some(faucet_sink_databricks::DESCRIPTOR),
+        #[cfg(feature = "sink-oracle")]
+        "oracle" => Some(faucet_sink_oracle::DESCRIPTOR),
+        _ => None,
     }
 }
 
@@ -3040,22 +3137,6 @@ mod tests {
         assert!(sink.to_string().contains("not-a-connector"), "{sink}");
     }
 
-    #[test]
-    fn staged_load_allowlist_matches_capable_sinks() {
-        for k in ["redshift", "snowflake", "bigquery", "clickhouse", "mssql"] {
-            assert!(
-                sink_supports_staged_load(k),
-                "{k} should support staged load"
-            );
-        }
-        for k in ["jsonl", "postgres", "sqlite", "stdout"] {
-            assert!(
-                !sink_supports_staged_load(k),
-                "{k} should not (yet) support staged load"
-            );
-        }
-    }
-
     // A trivial in-memory source used to exercise custom registration without
     // any I/O.
     #[derive(Clone)]
@@ -3144,37 +3225,6 @@ mod tests {
             (reg.sources.get("acme").unwrap().schema)()["title"],
             serde_json::json!("acme")
         );
-    }
-
-    #[test]
-    fn capability_constants_match_their_predicates() {
-        // F44: the human-readable lists in error messages derive from these
-        // constants, which must stay in lockstep with the boolean gates. In
-        // particular the idempotent-sink list must include bigquery AND kafka,
-        // and the upsert-sink list must include bigquery — the values the old
-        // hand-maintained message strings had drifted away from.
-        for &k in EXACTLY_ONCE_SOURCE_KINDS {
-            assert!(
-                source_supports_exactly_once(k),
-                "{k} should be exactly-once"
-            );
-        }
-        for &k in IDEMPOTENT_SINK_KINDS {
-            assert!(
-                sink_supports_idempotent_writes(k),
-                "{k} should be idempotent"
-            );
-        }
-        for &k in UPSERT_SINK_KINDS {
-            use faucet_core::WriteMode;
-            assert!(
-                sink_supported_write_modes(k).contains(&WriteMode::Upsert),
-                "{k} should support upsert"
-            );
-        }
-        assert!(IDEMPOTENT_SINK_KINDS.contains(&"bigquery"));
-        assert!(IDEMPOTENT_SINK_KINDS.contains(&"kafka"));
-        assert!(UPSERT_SINK_KINDS.contains(&"bigquery"));
     }
 
     #[cfg(feature = "source-rest")]
@@ -3627,54 +3677,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exactly_once_capability_allowlists() {
-        assert!(source_supports_exactly_once("postgres-cdc"));
-        assert!(source_supports_exactly_once("mysql-cdc"));
-        assert!(source_supports_exactly_once("mongodb-cdc"));
-        assert!(source_supports_exactly_once("kafka"));
-        assert!(!source_supports_exactly_once("rest"));
-
-        assert!(sink_supports_idempotent_writes("postgres"));
-        assert!(sink_supports_idempotent_writes("iceberg"));
-        assert!(sink_supports_idempotent_writes("bigquery"));
-        assert!(sink_supports_idempotent_writes("kafka"));
-        assert!(sink_supports_idempotent_writes("snowflake"));
-        assert!(sink_supports_idempotent_writes("redis"));
-        assert!(sink_supports_idempotent_writes("mongodb"));
-        assert!(!sink_supports_idempotent_writes("jsonl"));
-    }
-
-    #[test]
-    fn typed_delivery_capabilities_derive_from_kind_tables() {
-        use faucet_core::{ReplayGuarantee, SinkGuarantee};
-        assert_eq!(
-            source_replay_guarantee("kafka"),
-            ReplayGuarantee::Deterministic
-        );
-        assert_eq!(
-            source_replay_guarantee("rest"),
-            ReplayGuarantee::NonDeterministic
-        );
-        assert_eq!(sink_guarantee("postgres"), SinkGuarantee::AtomicWatermark);
-        // Upsert-capable but not atomic: elasticsearch dedups by key only.
-        assert_eq!(sink_guarantee("elasticsearch"), SinkGuarantee::KeyedUpsert);
-        assert_eq!(sink_guarantee("jsonl"), SinkGuarantee::AtLeastOnce);
-    }
-
-    #[test]
-    fn singer_write_modes_are_not_key_deduplicating() {
-        use faucet_core::WriteMode;
-        assert_eq!(sink_supported_write_modes("singer"), SINGER_WRITE_MODES);
-        assert!(!sink_supported_write_modes("singer").contains(&WriteMode::Delete));
-        assert!(!UPSERT_SINK_KINDS.contains(&"singer"));
-        assert!(!sink_supports_overwrite("singer"));
-        assert_eq!(
-            sink_guarantee("singer"),
-            faucet_core::SinkGuarantee::AtLeastOnce
-        );
-    }
-
     #[cfg(feature = "sink-singer")]
     #[tokio::test]
     async fn singer_sink_builds_validates_and_registers_secrets() {
@@ -3699,86 +3701,6 @@ mod tests {
         let bad = json!({"target_command": "t", "write_mode": "delete", "key": ["id"]});
         assert!(validate_sink_config("singer", "row", bad).is_err());
         assert!(sink_descriptions().iter().any(|(k, _)| *k == "singer"));
-    }
-
-    #[test]
-    fn sink_supported_write_modes_allowlist() {
-        use faucet_core::WriteMode;
-        assert!(sink_supported_write_modes("postgres").contains(&WriteMode::Upsert));
-        assert!(sink_supported_write_modes("elasticsearch").contains(&WriteMode::Delete));
-        assert!(sink_supported_write_modes("bigquery").contains(&WriteMode::Upsert));
-        // a sink without upsert support is append-only
-        assert_eq!(sink_supported_write_modes("jsonl"), &[WriteMode::Append]);
-        assert_eq!(sink_supported_write_modes("kafka"), &[WriteMode::Append]);
-
-        // Overwrite (#492, #494) lands on the 6 staging-swap sinks plus
-        // elasticsearch (atomic alias swap); the rest reject it.
-        for k in [
-            "postgres",
-            "sqlite",
-            "mysql",
-            "mssql",
-            "mongodb",
-            "bigquery",
-            "elasticsearch",
-        ] {
-            assert!(
-                sink_supported_write_modes(k).contains(&WriteMode::Overwrite),
-                "{k} should support overwrite"
-            );
-            assert!(sink_supports_overwrite(k), "{k} sink_supports_overwrite");
-        }
-        // jsonl supports neither upsert nor overwrite.
-        assert!(!sink_supports_overwrite("jsonl"));
-    }
-
-    #[test]
-    fn connectors_710_713_capability_allowlists() {
-        use faucet_core::{SinkGuarantee, WriteMode};
-        assert_eq!(
-            sink_supported_write_modes("dynamodb"),
-            &[WriteMode::Append, WriteMode::Upsert, WriteMode::Delete]
-        );
-        assert!(!sink_supports_overwrite("dynamodb"));
-        assert!(!sink_supports_idempotent_writes("dynamodb"));
-        assert!(!sink_supports_schema_evolution("dynamodb"));
-        assert!(!sink_supports_cleanup("dynamodb"));
-        assert_eq!(sink_guarantee("dynamodb"), SinkGuarantee::KeyedUpsert);
-
-        assert_eq!(
-            sink_supported_write_modes("databricks"),
-            &[
-                WriteMode::Append,
-                WriteMode::Upsert,
-                WriteMode::Delete,
-                WriteMode::Overwrite
-            ]
-        );
-        assert!(sink_supports_idempotent_writes("databricks"));
-        assert!(sink_supports_schema_evolution("databricks"));
-        assert!(sink_supports_staged_load("databricks"));
-        assert!(!sink_supports_cleanup("databricks"));
-
-        for k in ["iceberg", "dynamodb"] {
-            assert!(source_supports_discover(k), "{k} discovers");
-            assert!(!source_supports_exactly_once(k), "{k} is not exactly-once");
-        }
-
-        assert!(source_supports_exactly_once("oracle-cdc"));
-        assert!(!source_supports_exactly_once("oracle"));
-        assert!(source_supports_discover("oracle"));
-        assert_eq!(
-            sink_supported_write_modes("oracle"),
-            &[
-                WriteMode::Append,
-                WriteMode::Upsert,
-                WriteMode::Delete,
-                WriteMode::Overwrite
-            ]
-        );
-        assert!(sink_supports_idempotent_writes("oracle"));
-        assert!(sink_supports_schema_evolution("oracle"));
-        assert!(!sink_supports_cleanup("oracle"));
     }
 
     #[cfg(feature = "sink-databricks")]
@@ -3852,17 +3774,180 @@ mod tests {
             .expect("a plain path is valid");
     }
 
+    /// The kind-level capabilities the built-in connectors declare — what the
+    /// hand-kept `*_KINDS` allowlists used to say (#876). A kind this build did
+    /// not compile in is skipped.
     #[test]
-    fn sink_supports_schema_evolution_allowlist() {
-        assert!(sink_supports_schema_evolution("postgres"));
-        assert!(sink_supports_schema_evolution("mysql"));
-        assert!(sink_supports_schema_evolution("mssql"));
-        assert!(sink_supports_schema_evolution("sqlite"));
-        assert!(sink_supports_schema_evolution("bigquery"));
-        assert!(sink_supports_schema_evolution("elasticsearch"));
-        assert!(sink_supports_schema_evolution("iceberg"));
-        assert!(!sink_supports_schema_evolution("jsonl"));
-        assert!(!sink_supports_schema_evolution("kafka"));
+    fn builtin_kind_capabilities_are_pinned() {
+        use faucet_core::WriteMode::{Append as A, Delete as D, Overwrite as O, Upsert as U};
+        #[allow(clippy::type_complexity)]
+        let sinks: &[(&str, &[faucet_core::WriteMode], bool, bool, bool, bool)] = &[
+            // kind, write modes, idempotent, keyed upsert, cleanup, schema evolution
+            ("postgres", &[A, U, D, O], true, true, true, true),
+            ("sqlite", &[A, U, D, O], true, true, true, true),
+            ("mysql", &[A, U, D, O], true, true, true, true),
+            ("mssql", &[A, U, D, O], true, true, true, true),
+            ("mongodb", &[A, U, D, O], true, true, true, false),
+            ("elasticsearch", &[A, U, D, O], false, true, true, true),
+            ("bigquery", &[A, U, D, O], true, true, true, true),
+            ("spanner", &[A, U, D], true, true, true, true),
+            ("dynamodb", &[A, U, D], false, true, false, false),
+            ("databricks", &[A, U, D, O], true, true, false, true),
+            ("oracle", &[A, U, D, O], true, true, false, true),
+            ("iceberg", &[A], true, false, false, true),
+            ("kafka", &[A], true, false, false, false),
+            ("snowflake", &[A], true, false, false, false),
+            ("redis", &[A], true, false, false, false),
+            ("singer", &[A, U, O], false, false, false, false),
+            ("file", &[A, O], false, false, false, false),
+            ("jsonl", &[A], false, false, false, false),
+            ("stdout", &[A], false, false, false, false),
+        ];
+        let mut checked = 0;
+        for (kind, modes, idempotent, keyed, cleanup, evolution) in sinks {
+            if sink_descriptor(kind).is_none() {
+                continue;
+            }
+            checked += 1;
+            let c = sink_kind_capabilities(kind);
+            assert_eq!(c.write_modes(), *modes, "{kind} write modes");
+            assert_eq!(c.idempotent_writes(), *idempotent, "{kind} idempotent");
+            assert_eq!(c.keyed_upsert(), *keyed, "{kind} keyed upsert");
+            assert_eq!(c.cleanup(), *cleanup, "{kind} cleanup");
+            assert_eq!(c.schema_evolution(), *evolution, "{kind} schema evolution");
+            let expected = if *idempotent {
+                faucet_core::SinkGuarantee::AtomicWatermark
+            } else if *keyed {
+                faucet_core::SinkGuarantee::KeyedUpsert
+            } else {
+                faucet_core::SinkGuarantee::AtLeastOnce
+            };
+            assert_eq!(c.sink_guarantee(), expected, "{kind} guarantee");
+        }
+        let sources: &[(&str, bool, bool)] = &[
+            // kind, exactly-once replay, discover
+            ("postgres-cdc", true, false),
+            ("mysql-cdc", true, false),
+            ("mssql-cdc", true, false),
+            ("mongodb-cdc", true, false),
+            ("oracle-cdc", true, false),
+            ("kafka", true, false),
+            ("postgres", false, true),
+            ("oracle", false, true),
+            ("iceberg", false, true),
+            ("dynamodb", false, true),
+            ("file", false, true),
+            ("csv", false, false),
+        ];
+        for (kind, exactly_once, discover) in sources {
+            if source_descriptor(kind).is_none() {
+                continue;
+            }
+            checked += 1;
+            let c = source_kind_capabilities(kind);
+            assert_eq!(c.exactly_once(), *exactly_once, "{kind} exactly-once");
+            assert_eq!(c.discover(), *discover, "{kind} discover");
+        }
+        assert!(checked > 0, "no built-in connector compiled in");
+        // Spot checks of the capabilities no per-capability trait method has.
+        let spot = |kind: &str, f: fn(&Capabilities) -> bool, want: bool, sink: bool| {
+            let present = if sink {
+                sink_descriptor(kind).is_some()
+            } else {
+                source_descriptor(kind).is_some()
+            };
+            if present {
+                let c = if sink {
+                    sink_kind_capabilities(kind)
+                } else {
+                    source_kind_capabilities(kind)
+                };
+                assert_eq!(f(&c), want, "{kind}");
+            }
+        };
+        spot("bigquery", Capabilities::staged_load, true, true);
+        spot("redshift", Capabilities::staged_load, true, true);
+        spot("postgres", Capabilities::staged_load, false, true);
+        spot("postgres", Capabilities::rollback, true, true);
+        spot("mongodb", Capabilities::rollback, false, true);
+        spot("postgres", Capabilities::scoped_overwrite, true, true);
+        spot("bigquery", Capabilities::scoped_overwrite, true, true);
+        spot("sqlite", Capabilities::scoped_overwrite, false, true);
+        spot("bigquery", Capabilities::direct_overwrite, true, true);
+        spot("postgres", Capabilities::direct_overwrite, false, true);
+        spot("postgres", Capabilities::range_read, true, false);
+        spot("sqlite", Capabilities::range_read, true, false);
+        spot("csv", Capabilities::range_read, false, false);
+        spot("postgres", Capabilities::range_digest, true, false);
+        spot("sqlite", Capabilities::range_digest, false, false);
+        spot("kafka", Capabilities::reports_lag, true, false);
+        spot("postgres", Capabilities::reports_lag, false, false);
+    }
+
+    /// Config-dependent capabilities are answered from the config (#876): a
+    /// SQL sink cleans up and rolls back only under column mapping.
+    #[cfg(feature = "sink-sqlite")]
+    #[test]
+    fn sink_capabilities_read_the_config() {
+        let json_column = sink_capabilities("sqlite", &json!({"table_name": "t"}));
+        assert!(!json_column.cleanup() && !json_column.rollback());
+        assert!(!json_column.keyed_dedup());
+        let mapped = sink_capabilities(
+            "sqlite",
+            &json!({"column_mapping": "auto_map", "write_mode": "upsert", "key": ["id"]}),
+        );
+        assert!(mapped.cleanup() && mapped.keyed_dedup());
+        assert_eq!(
+            sink_capabilities("sqlite", &Value::Null),
+            sink_capabilities("sqlite", &json!({})),
+            "an absent config is an empty one, not the kind-level view"
+        );
+    }
+
+    #[cfg(not(feature = "sink-oracle"))]
+    #[test]
+    fn an_uncompiled_builtin_is_not_refused_at_load() {
+        let c = sink_capabilities("oracle", &json!({"write_mode": "upsert", "key": ["id"]}));
+        assert!(c.supports_write_mode(faucet_core::WriteMode::Upsert));
+        assert!(c.keyed_dedup() && c.idempotent_writes());
+        assert!(!sink_capabilities("oracle", &json!({})).keyed_dedup());
+        assert_eq!(
+            sink_kind_capabilities("oracle"),
+            Capabilities::append_only_sink(),
+            "listings show only what is compiled in"
+        );
+    }
+
+    #[cfg(not(feature = "source-oracle-cdc"))]
+    #[test]
+    fn an_uncompiled_builtin_source_is_not_refused_at_load() {
+        assert!(source_capabilities("oracle-cdc", &json!({})).exactly_once());
+    }
+
+    #[test]
+    fn unknown_kinds_declare_nothing() {
+        assert!(source_descriptor("no-such-source").is_none());
+        assert!(sink_descriptor("no-such-sink").is_none());
+        assert_eq!(
+            source_capabilities("no-such-source", &json!({})),
+            Capabilities::plain_source()
+        );
+        assert_eq!(
+            sink_capabilities("no-such-sink", &json!({})),
+            Capabilities::append_only_sink()
+        );
+        assert_eq!(
+            sink_kind_capabilities("no-such-sink"),
+            Capabilities::append_only_sink()
+        );
+        assert_eq!(
+            source_kind_capabilities("no-such-source"),
+            Capabilities::plain_source()
+        );
+        assert!(
+            !sink_kinds_where(|c| c.supports_write_mode(faucet_core::WriteMode::Append)).is_empty()
+        );
+        assert!(source_kinds_where(|_| false).is_empty());
     }
 
     #[test]
@@ -4344,6 +4429,5 @@ mod truncating_tests {
             None
         );
         assert_eq!(p("postgres", json!({"path": "x"})), None);
-        assert!(TRUNCATING_FILE_SINK_KINDS.contains(&"jsonl"));
     }
 }

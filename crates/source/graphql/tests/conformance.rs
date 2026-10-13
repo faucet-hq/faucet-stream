@@ -184,3 +184,21 @@ async fn conformance_preflight_check_wellformed() {
     )
     .await;
 }
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    for v in [
+        serde_json::json!({"endpoint": "http://127.0.0.1:1/graphql", "query": "{ items { id } }", "auth": {"type": "none"}, "records_path": null, "pagination": null}),
+        serde_json::json!({"endpoint": "http://127.0.0.1:1/graphql", "query": "{ items { id } }", "auth": {"type": "none"}, "records_path": "$.data.items[*]", "pagination": null, "batch_size": 0}),
+    ] {
+        let cfg: faucet_source_graphql::GraphqlStreamConfig =
+            serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_graphql::GraphqlStream::new(cfg);
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_graphql::DESCRIPTOR,
+            "graphql",
+            &v,
+            &built,
+        );
+    }
+}

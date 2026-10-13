@@ -24,3 +24,6 @@ pub use stream::KinesisSource;
 
 // Shared connection types, re-exported so users need only this crate.
 pub use faucet_common_kinesis::{KinesisCredentials, build_client};
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
