@@ -244,3 +244,16 @@ async fn resume_position_lag_and_check_read_the_database() {
     let report = source.check(&CheckContext::default()).await.unwrap();
     assert_eq!(report.failed_count(), 0);
 }
+
+#[tokio::test]
+async fn a_cut_connection_that_cannot_be_replaced_keeps_the_error() {
+    let server = TdsServer::start().await.unwrap();
+    preflight(&server, 1);
+    let source = MssqlCdcSource::new(cfg(&server, json!({"statement_timeout_secs": 1})))
+        .await
+        .unwrap();
+    server.on(BOUNDS, Reply::Hang);
+    server.refuse_logins();
+    let err = pages(&source).await.unwrap_err();
+    assert!(err.contains("mssql-cdc: query timed out"), "{err}");
+}
