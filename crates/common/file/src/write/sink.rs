@@ -270,12 +270,34 @@ impl Sink for WriterSink {
 /// [`FileSink`] (or [`WriterSink`]) field: `delegate_sink!(S3Sink, inner);`.
 /// Every hook is forwarded ([`faucet_core::forward_sink!`]), so a hook the
 /// trait gains later reaches the shared sink without touching the connector.
+/// The columnar hooks follow the calling crate's `arrow` feature, so the
+/// connector never claims the columnar path its own build leaves out.
 #[macro_export]
 macro_rules! delegate_sink {
     ($ty:ty, $field:ident) => {
         #[$crate::__private::async_trait]
         impl $crate::__private::Sink for $ty {
-            $crate::__private::forward_sink!($field);
+            $crate::__private::forward_sink!($field;
+                except capabilities, supports_columnar, write_batch_columnar);
+            fn capabilities(&self) -> $crate::__private::Capabilities {
+                let caps = $crate::__private::Sink::capabilities(&self.$field);
+                if cfg!(feature = "arrow") {
+                    caps
+                } else {
+                    caps.to_builder().columnar(false).build()
+                }
+            }
+            #[cfg(feature = "arrow")]
+            fn supports_columnar(&self) -> bool {
+                $crate::__private::Sink::supports_columnar(&self.$field)
+            }
+            #[cfg(feature = "arrow")]
+            async fn write_batch_columnar(
+                &self,
+                batch: &::arrow::array::RecordBatch,
+            ) -> ::std::result::Result<usize, $crate::__private::FaucetError> {
+                $crate::__private::Sink::write_batch_columnar(&self.$field, batch).await
+            }
         }
     };
 }

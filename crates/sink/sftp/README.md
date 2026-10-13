@@ -162,6 +162,11 @@ ORC is read-only, so there is no `orc` format here. Enable with
 
 ## Shared file writer (#777)
 
+The sink is the shared `FileSink<SftpBackend>` (RFC 0013, #886): the one `Sink`
+implementation every file sink is — the local `file` sink over the local
+file system, this one over the `SftpBackend` in
+[`faucet-common-sftp`](https://crates.io/crates/faucet-common-sftp). Its preflight probe (`faucet doctor`) opens the SSH session — host, host key and credentials — and writes nothing.
+
 This sink writes through the same file-writing layer as the local
 [`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
 format and option the file sink does, with the same field names:

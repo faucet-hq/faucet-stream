@@ -18,6 +18,25 @@ This crate is a small building block, not a connector itself. It provides:
   — opens the SSH transport, authenticates, verifies the host key, and opens
   the `sftp` subsystem.
 
+## Storage backend for the file writer
+
+`SftpBackend` is the `StorageBackend` the shared file writer in
+[`faucet-common-file`](https://crates.io/crates/faucet-common-file) publishes
+files through; the [`faucet-sink-sftp`](https://crates.io/crates/faucet-sink-sftp)
+sink is a `FileSink<SftpBackend>` (RFC 0013, #886). Build it with
+`SftpBackend::builder(connection).concurrency(n).scratch_dir(dir).build(base, &template)`;
+it opens no connection until the first operation.
+
+- Each file is built in a local scratch file, uploaded to a hidden temporary
+  name beside its destination and renamed into place (`posix-rename` when the
+  server has it, else remove-then-rename), so a reader never sees a partial
+  file. Missing directories are created.
+- Only the server's typed "no such file" status means missing; every other
+  refused stat or remove is an error naming the operation and the path.
+- Every operation runs through the run's call context and reports to the
+  run's round-trip recorder; the preflight probe opens the SSH session (host,
+  host key, credentials) and writes nothing.
+
 ## Host-key verification
 
 Man-in-the-middle protection is on by default. The policy is selected via the

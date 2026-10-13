@@ -13588,7 +13588,7 @@
           }
         },
         {
-          "description": "S3 bucket. Each written object is `<prefix><uuid>.parquet`.",
+          "description": "S3 bucket. Each written object is `<prefix><run id>-<part>.parquet`.",
           "type": "object",
           "properties": {
             "bucket": {
@@ -13618,7 +13618,7 @@
               "x-faucet-resource": "url"
             },
             "allow_http": {
-              "description": "Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`\nURL (e.g. for LocalStack).",
+              "description": "Accepted for compatibility: the S3 client takes an `http://`\n`endpoint_url` (e.g. for LocalStack) without it.",
               "type": [
                 "boolean",
                 "string"

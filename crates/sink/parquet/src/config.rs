@@ -182,7 +182,7 @@ pub enum ParquetDestination {
         #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
     },
-    /// S3 bucket. Each written object is `<prefix><uuid>.parquet`.
+    /// S3 bucket. Each written object is `<prefix><run id>-<part>.parquet`.
     S3(ParquetS3Destination),
 }
 
@@ -206,8 +206,8 @@ pub struct ParquetS3Destination {
     #[serde(default)]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
-    /// Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`
-    /// URL (e.g. for LocalStack).
+    /// Accepted for compatibility: the S3 client takes an `http://`
+    /// `endpoint_url` (e.g. for LocalStack) without it.
     #[serde(default)]
     pub allow_http: bool,
 }

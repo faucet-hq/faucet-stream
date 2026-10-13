@@ -44,6 +44,23 @@ let store = build_store(&conn)?;
 # Ok::<(), faucet_core::FaucetError>(())
 ```
 
+## Storage backend for the file writer
+
+`AzureBackend` is the `StorageBackend` the shared file writer in
+[`faucet-common-file`](https://crates.io/crates/faucet-common-file) publishes
+blobs through; the [`faucet-sink-azure-blob`](https://crates.io/crates/faucet-sink-azure-blob)
+sink is a `FileSink<AzureBackend>` (RFC 0013, #886). Build it with
+`AzureBackend::builder(build_store(&conn)?, container).concurrency(n).scratch_dir(dir).build(base, &template)`.
+
+- A blob up to 8 MiB (`PART_BYTES`) is one `Put Blob`; a larger one is
+  uploaded as blocks and committed with one `Put Block List`, which is what
+  makes it visible. JSON Lines and raw text go up block by block while they
+  are written.
+- A move into place (`write_mode: overwrite`) is a server-side copy and a
+  delete.
+- Every request runs through the run's call context and reports to the run's
+  round-trip recorder; the preflight probe lists the container's first blob.
+
 ## License
 
 MIT
