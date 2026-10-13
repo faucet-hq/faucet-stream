@@ -238,33 +238,30 @@ async fn read_message(socket: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     }
 }
 
-async fn write_message(socket: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
-    let chunks: Vec<&[u8]> = if payload.is_empty() {
-        vec![&[]]
-    } else {
-        payload.chunks(4000).collect()
-    };
+async fn write_message(socket: &mut TcpStream, payload: &[u8], end: bool) {
+    let chunks: Vec<&[u8]> = payload.chunks(4000).collect();
     let last = chunks.len() - 1;
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let mut packet = vec![TABULAR, u8::from(i == last), 0, 0, 0, 0, (i + 1) as u8, 0];
+        let status = u8::from(end && i == last);
+        let mut packet = vec![TABULAR, status, 0, 0, 0, 0, (i + 1) as u8, 0];
         packet[2..4].copy_from_slice(&((chunk.len() + 8) as u16).to_be_bytes());
         packet.extend_from_slice(chunk);
-        socket.write_all(&packet).await?;
+        // A failed write surfaces as the next read failing.
+        let _ = socket.write_all(&packet).await;
     }
-    socket.flush().await
 }
 
 async fn serve(mut socket: TcpStream, script: Arc<Mutex<Script>>) {
     while let Some((kind, payload)) = read_message(&mut socket).await {
         let lock = || script.lock().unwrap_or_else(|p| p.into_inner());
         let reply = match kind {
-            PRELOGIN => Some(prelogin_response()),
+            PRELOGIN => prelogin_response(),
             LOGIN if lock().refuse_login => {
                 let mut out = error_token(18456, "Login failed for user 'sa'.");
                 out.extend(done(0x02, 0));
-                Some(out)
+                out
             }
-            LOGIN => Some(done(0, 0)),
+            LOGIN => done(0, 0),
             _ => {
                 let text = request_text(&payload);
                 let reply = {
@@ -277,24 +274,15 @@ async fn serve(mut socket: TcpStream, script: Arc<Mutex<Script>>) {
                     Reply::Stall(inner) => {
                         let mut tokens = encode_reply(&inner);
                         tokens.truncate(tokens.len() - 13);
-                        let mut packet = vec![TABULAR, 0, 0, 0, 0, 0, 1, 0];
-                        packet[2..4].copy_from_slice(&((tokens.len() + 8) as u16).to_be_bytes());
-                        packet.extend(tokens);
-                        if socket.write_all(&packet).await.is_ok() {
-                            drain(socket).await;
-                        }
-                        return;
+                        write_message(&mut socket, &tokens, false).await;
+                        return drain(socket).await;
                     }
                     Reply::Close => return,
-                    other => Some(encode_reply(&other)),
+                    other => encode_reply(&other),
                 }
             }
         };
-        if let Some(bytes) = reply
-            && write_message(&mut socket, &bytes).await.is_err()
-        {
-            return;
-        }
+        write_message(&mut socket, &reply, true).await;
     }
 }
 
@@ -443,9 +431,7 @@ fn encode_reply(reply: &Reply) -> Vec<u8> {
             out.extend(done(0x02, 0));
             out
         }
-        Reply::Hang | Reply::Close | Reply::Stall(_) => {
-            unreachable!("handled by the connection loop")
-        }
+        Reply::Hang | Reply::Close | Reply::Stall(_) => Vec::new(),
     }
 }
 
@@ -495,6 +481,11 @@ mod tests {
         assert_eq!(cell(TdsType::BigInt, &5i64.into()).len(), 9);
         assert_eq!(cell(TdsType::SmallInt, &5i64.into()), vec![2, 5, 0]);
         assert_eq!(cell(TdsType::TinyInt, &5i64.into()), vec![1, 5]);
+        assert_eq!(cell(TdsType::Int, &5i64.into()), vec![4, 5, 0, 0, 0]);
+        assert_eq!(type_info(TdsType::Int), vec![0x26, 4]);
+        assert_eq!(type_info(TdsType::Bit), vec![0x68, 1]);
+        assert_eq!(type_info(TdsType::Float), vec![0x6D, 8]);
+        assert!(encode_reply(&Reply::Hang).is_empty());
         assert_eq!(type_info(TdsType::TinyInt), vec![0x26, 1]);
         assert_eq!(type_info(TdsType::SmallInt), vec![0x26, 2]);
         assert_eq!(
@@ -516,10 +507,10 @@ mod tests {
         let mut socket = TcpStream::connect(("127.0.0.1", server.port()))
             .await
             .unwrap();
-        let mut packet = vec![0x01, 0x01, 0, 0, 0, 0, 1, 0];
+        let mut packet = vec![0x01, 0x00, 0, 10, 0, 0, 1, 0, b'x', 0];
+        packet.extend([0x01, 0x01, 0, 0, 0, 0, 2, 0]);
         packet.extend(ucs2("WAIT"));
-        let len = packet.len() as u16;
-        packet[2..4].copy_from_slice(&len.to_be_bytes());
+        packet[12..14].copy_from_slice(&16u16.to_be_bytes());
         socket.write_all(&packet).await.unwrap();
         let read = tokio::time::timeout(
             std::time::Duration::from_millis(100),

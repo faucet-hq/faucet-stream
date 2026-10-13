@@ -140,15 +140,21 @@ async fn the_shape_probe_runs_under_the_call_deadline() {
         err.contains("deadline") || err.contains("timed out"),
         "{err}"
     );
+    let source = MssqlSource::new(cfg(&server)).await.unwrap();
     source.set_call_context(
         CallContext::new().with_deadline(tokio::time::Instant::now() + Duration::from_millis(200)),
     );
+    let before = server.requests().len();
     let err = source.fetch_all().await.unwrap_err().to_string();
     assert!(
         err.contains("deadline") || err.contains("timed out"),
         "{err}"
     );
-    assert!(server.requests().len() >= 2, "both reads reached the probe");
+    assert!(
+        server.requests()[before..]
+            .iter()
+            .any(|r| r.contains("sp_describe_first_result_set"))
+    );
 }
 
 #[tokio::test]
