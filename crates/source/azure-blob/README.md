@@ -182,6 +182,14 @@ pipeline:
       file_format: json_lines
 ```
 
+## Timeouts, cancellation and retries
+
+Every Blob Storage request — listings, blob reads, each ranged Parquet read —
+runs through the pipeline's `CallContext` (#880): the run's cancel token stops
+an in-flight request, any caller deadline ends it, and each is metered as a
+round trip (`list`, `head`, `get`). The store client's own timeouts and retry
+are unchanged.
+
 ## License
 
 MIT

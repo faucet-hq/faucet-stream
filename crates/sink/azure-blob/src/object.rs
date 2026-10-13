@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use faucet_common_file::write::ObjectClient;
+use faucet_core::CallExt as _;
 use faucet_core::FaucetError;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
@@ -23,6 +24,8 @@ pub(crate) struct AzureObjects {
     pub part_bytes: usize,
     pub concurrency: usize,
     pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    /// The run's call context (#880) every request runs through, once.
+    pub calls: Arc<faucet_core::CallSlot>,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -49,7 +52,7 @@ impl ObjectClient for AzureObjects {
         self.roundtrips.record("list");
         let mut listing = self.store.list(root.as_ref());
         let mut keys = Vec::new();
-        while let Some(meta) = listing.next().await {
+        while let Some(meta) = listing.next().within(&self.calls, "list").await? {
             let meta = meta.map_err(|e| err("list", prefix, e))?;
             let key = meta.location.to_string();
             if key.starts_with(prefix) {
@@ -61,7 +64,12 @@ impl ObjectClient for AzureObjects {
 
     async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
         self.roundtrips.record("head");
-        match self.store.head(&ObjectPath::from(key)).await {
+        match self
+            .store
+            .head(&ObjectPath::from(key))
+            .within(&self.calls, "head")
+            .await?
+        {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(err("head", key, e)),
@@ -74,13 +82,14 @@ impl ObjectClient for AzureObjects {
         let got = self
             .store
             .get(&ObjectPath::from(key))
-            .await
+            .within(&self.calls, "get")
+            .await?
             .map_err(|e| err("get", key, e))?;
         let mut stream = got.into_stream();
         let mut file = tokio::fs::File::create(to)
             .await
             .map_err(|e| err("create local copy", key, e))?;
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = stream.next().within(&self.calls, "get").await? {
             let chunk = chunk.map_err(|e| err("download", key, e))?;
             file.write_all(&chunk)
                 .await
@@ -103,7 +112,8 @@ impl ObjectClient for AzureObjects {
             self.roundtrips.record("put");
             self.store
                 .put(&path, bytes::Bytes::from(body).into())
-                .await
+                .within(&self.calls, "put")
+                .await?
                 .map_err(|e| err("put object", key, e))?;
             return Ok(());
         }
@@ -113,15 +123,27 @@ impl ObjectClient for AzureObjects {
         let upload = self
             .store
             .put_multipart(&path)
-            .await
+            .within(&self.calls, "put")
+            .await?
             .map_err(|e| err("start multipart", key, e))?;
         let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, self.part_bytes);
         let mut result = Ok(());
         let mut sent = 0;
         while sent < len {
-            if let Err(e) = writer.wait_for_capacity(self.concurrency.max(1)).await {
-                result = Err(err("put part", key, e));
-                break;
+            match writer
+                .wait_for_capacity(self.concurrency.max(1))
+                .within(&self.calls, "put")
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    result = Err(err("put part", key, e));
+                    break;
+                }
+                Err(spent) => {
+                    result = Err(spent);
+                    break;
+                }
             }
             let mut part = vec![0u8; self.part_bytes.min(len - sent)];
             if let Err(e) = file.read_exact(&mut part).await {
@@ -134,7 +156,7 @@ impl ObjectClient for AzureObjects {
         }
         if result.is_ok() {
             self.roundtrips.record("put");
-            return match writer.finish().await {
+            return match writer.finish().within(&self.calls, "put").await? {
                 Ok(_) => Ok(()),
                 Err(e) => Err(err("complete multipart", key, e)),
             };
@@ -145,7 +167,12 @@ impl ObjectClient for AzureObjects {
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         self.roundtrips.record("delete");
-        match self.store.delete(&ObjectPath::from(key)).await {
+        match self
+            .store
+            .delete(&ObjectPath::from(key))
+            .within(&self.calls, "delete")
+            .await?
+        {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(err("delete", key, e)),
         }
@@ -155,7 +182,8 @@ impl ObjectClient for AzureObjects {
         self.roundtrips.record("copy");
         self.store
             .copy(&ObjectPath::from(from), &ObjectPath::from(to))
-            .await
+            .within(&self.calls, "copy")
+            .await?
             .map_err(|e| err("copy", to, e))?;
         self.delete(from).await
     }
@@ -181,6 +209,7 @@ mod tests {
             part_bytes: 4,
             concurrency: 2,
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::default()),
         };
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -245,6 +274,7 @@ mod tests {
             part_bytes,
             concurrency: 1,
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::default()),
         }
     }
 

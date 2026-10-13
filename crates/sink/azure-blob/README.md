@@ -224,6 +224,14 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 
 See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
 
+## Timeouts, cancellation and retries
+
+Every Blob Storage request — `Put Blob`, blocks and the block list, listings,
+copies, deletes — runs through the pipeline's `CallContext` (#880): each is
+sent once, any caller deadline ends it, and round trips are still metered as
+`put` / `list` / `head` / `get` / `copy` / `delete`. The store client's own
+timeouts and retry are unchanged.
+
 ## License
 
 MIT
