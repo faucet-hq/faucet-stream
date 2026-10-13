@@ -155,7 +155,8 @@ budget:
 - **Follow-up work stays inside it.** A [DLQ replay](./dlq.md#replaying) runs
   under the config's budget (and a tenant's per-run limits under
   `faucet serve`); a [`verify` repair](./verify.md) started by a run's post-run
-  verify is bounded by what is left of that run's budget, and stops on its
+  verify is bounded by what is left of that run's budget — a run that spent a
+  ceiling leaves the repair nothing, so its first write is refused — and stops on its
   cancellation.
 
 `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink
