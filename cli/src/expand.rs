@@ -1243,6 +1243,23 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         };
         let delivery_guarantee = faucet_core::derive_delivery_guarantee(&guarantee_inputs);
 
+        // A policy quarantine sends single rows to the DLQ; the atomic
+        // watermark commits whole pages and forbids a DLQ, so the combination
+        // is refused by name before the generic gates below (#873). Keyed
+        // upsert keeps the row path, where per-row quarantine works.
+        #[cfg(feature = "policy")]
+        if delivery == faucet_core::DeliveryMode::ExactlyOnce
+            && !keyed_upsert_configured
+            && cfg.policy.as_ref().is_some_and(crate::policy::quarantines)
+        {
+            return Err(CliError::Config(format!(
+                "row '{}': {}; use `on_runtime: fail`, or `write_mode: upsert` + `key` for \
+                 keyed-upsert effectively-once",
+                ids[i],
+                faucet_core::compat::EO_WITH_POLICY_QUARANTINE
+            )));
+        }
+
         // Exactly-once delivery gate: `delivery: exactly_once` means "require
         // ≥ effectively-once". Enforced at config-load time so `faucet
         // validate` catches an unsupported topology before any run starts,
