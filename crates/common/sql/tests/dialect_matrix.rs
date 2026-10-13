@@ -1,7 +1,10 @@
 //! The shared planning matrix (#884): every planning case runs against every
 //! dialect, so a rule fixed for one backend is checked for all of them.
 
-use faucet_common_sql::dialects::{Mssql, Mysql, Postgres, Sqlite};
+use faucet_common_sql::dialects::{
+    BigQuery, ClickHouse, Databricks, Duckdb, Mssql, Mysql, Oracle, Postgres, Redshift, Snowflake,
+    Sqlite,
+};
 use faucet_common_sql::{
     ColumnMatching, EngineOptions, EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine,
     Statement, StatementKind, TableColumn, TableTarget,
@@ -73,6 +76,27 @@ fn target<D: SqlDialect>(d: &D, name: &str) -> TableTarget {
 /// Run `case` against every built-in dialect.
 macro_rules! every_dialect {
     ($case:ident) => {
+        every_keyed_dialect!($case);
+        $case(Duckdb);
+        $case(Redshift);
+        $case(ClickHouse);
+        $case(Snowflake);
+        $case(Databricks);
+        $case(BigQuery);
+    };
+}
+
+/// Run `case` against every dialect whose sink upserts and deletes by key.
+macro_rules! every_keyed_dialect {
+    ($case:ident) => {
+        every_cleanup_dialect!($case);
+        $case(Oracle);
+    };
+}
+
+/// Run `case` against every dialect whose sink runs scoped cleanup.
+macro_rules! every_cleanup_dialect {
+    ($case:ident) => {
         $case(Postgres);
         $case(Mysql);
         $case(Sqlite);
@@ -83,7 +107,12 @@ macro_rules! every_dialect {
 fn quoting_escapes_the_quote_character<D: SqlDialect>(d: D) {
     let q = d.quote_ident("a\"b`c]d");
     assert!(q.len() > "a\"b`c]d".len(), "{}: {q}", d.name());
-    assert_eq!(d.quote_literal("o'k").matches("''").count(), 1, "{}", d.name());
+    let lit = d.quote_literal("o'k");
+    assert!(
+        lit.ends_with('\'') && (lit.contains("''") || lit.contains("\\'")),
+        "{}: the quote is escaped: {lit}",
+        d.name()
+    );
     assert!(d.quote("plain").is_ok());
 }
 
@@ -91,7 +120,15 @@ fn quoting_escapes_the_quote_character<D: SqlDialect>(d: D) {
 fn matrix_quoting() {
     every_dialect!(quoting_escapes_the_quote_character);
     assert!(Mssql.quote("bad\0name").is_err());
+    assert!(Oracle.quote("has\"quote").is_err());
+    assert!(Oracle.quote("").is_err());
+    assert!(Oracle.quote(&"x".repeat(129)).is_err());
     assert_eq!(Mysql.quote_literal("a\\b"), "'a\\\\b'");
+    // Backslash-escaping dialects escape the escape first, so it cannot be forged.
+    assert_eq!(ClickHouse.quote_ident("a\\\"b"), "\"a\\\\\\\"b\"");
+    assert_eq!(BigQuery.quote_ident("a`b"), "`a\\`b`");
+    assert_eq!(Databricks.quote_literal("a\\'b"), "'a\\\\\\'b'");
+    assert_eq!(Snowflake.quote_literal("a\\'b"), "'a\\\\''b'");
 }
 
 fn mapping_follows_the_dialect_rule<D: SqlDialect>(d: D) {
@@ -101,9 +138,9 @@ fn mapping_follows_the_dialect_rule<D: SqlDialect>(d: D) {
     let t = target(engine.dialect(), "t");
     let mapped = engine.map_page(&t, &columns, &records);
     match engine.dialect().column_matching() {
-        ColumnMatching::Exact => {
+        ColumnMatching::Exact | ColumnMatching::UpperFold => {
             let rows = mapped.expect("name matches exactly");
-            assert_eq!(rows[0].cells.len(), 1, "case variants do not match");
+            assert_eq!(rows[0].cells.len(), 1, "a mixed-case column is not folded to");
         }
         _ => {
             let rows = mapped.expect("both fields match");
@@ -193,7 +230,7 @@ fn groups_run_in_page_order_with_journal_first<D: SqlDialect>(d: D) {
 
 #[test]
 fn matrix_upsert_delete_ordering() {
-    every_dialect!(groups_run_in_page_order_with_journal_first);
+    every_keyed_dialect!(groups_run_in_page_order_with_journal_first);
 }
 
 fn statements_stay_under_the_parameter_limit<D: SqlDialect>(d: D) {
@@ -202,24 +239,32 @@ fn statements_stay_under_the_parameter_limit<D: SqlDialect>(d: D) {
         let rows = d.rows_per_statement(width);
         assert!(rows >= 1);
         assert!(
-            rows * width <= d.param_limit().max(width),
+            rows.saturating_mul(width) <= d.param_limit().max(width),
             "{name}: {rows} rows of {width} exceed {}",
             d.param_limit()
         );
     }
     let engine = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
     let columns = vec![TableColumn::new("a", "int"), TableColumn::new("b", "int")];
-    let per = engine.dialect().rows_per_statement(2);
+    let per = engine.dialect().rows_per_statement(2).min(100_000);
     let page: Vec<Value> = (0..per + 3).map(|i| json!({"a": i, "b": i})).collect();
     let t = target(engine.dialect(), "t");
     let (written, stmts) = engine.insert_statements(&t, &columns, &page, false).unwrap();
     assert_eq!(written, page.len());
-    assert_eq!(stmts.len(), 2, "{name}");
-    assert_eq!(stmts[0].params.len(), per * 2, "{name}");
-    assert_eq!(stmts[1].params.len(), 6, "{name}: the remainder");
+    let expected = page.len().div_ceil(engine.dialect().rows_per_statement(2));
+    assert_eq!(stmts.len(), expected, "{name}");
+    let params: usize = stmts.iter().map(|s| s.params.len()).sum();
+    assert_eq!(params, page.len() * 2, "{name}: every cell bound once");
+    assert!(
+        stmts
+            .iter()
+            .all(|s| s.params.len() <= engine.dialect().param_limit()),
+        "{name}"
+    );
     let narrow: Vec<Value> = (0..3).map(|i| json!({"a": i})).collect();
     let (_, stmts) = engine.insert_statements(&t, &columns, &narrow, false).unwrap();
-    assert_eq!(stmts[0].params.len(), 3, "{name}: only the carried column");
+    let params: usize = stmts.iter().map(|s| s.params.len()).sum();
+    assert_eq!(params, 3, "{name}: only the carried column");
 }
 
 #[test]
@@ -238,9 +283,12 @@ fn append_unions_columns_and_upsert_groups_them<D: SqlDialect>(d: D) {
     let page = vec![json!({"id": 1, "a": 1}), json!({"id": 2, "b": 2})];
     let t = target(engine.dialect(), "t");
     let (_, append) = engine.insert_statements(&t, &columns, &page, false).unwrap();
-    assert_eq!(append.len(), 1);
-    assert_eq!(append[0].params.len(), 6, "{name}: union of 3 columns × 2 rows");
-    assert_eq!(append[0].params[2].value.as_ref(), &Value::Null, "{name}");
+    let bound: Vec<&Value> = append
+        .iter()
+        .flat_map(|s| s.params.iter().map(|p| p.value.as_ref()))
+        .collect();
+    assert_eq!(bound.len(), 6, "{name}: union of 3 columns × 2 rows");
+    assert_eq!(bound[2], &Value::Null, "{name}: a missing column binds NULL");
     let (_, upsert) = engine.insert_statements(&t, &columns, &page, true).unwrap();
     assert_eq!(upsert.len(), 2, "{name}: one statement per carried set");
     assert!(upsert.iter().all(|s| s.kind == StatementKind::Upsert));
@@ -249,7 +297,7 @@ fn append_unions_columns_and_upsert_groups_them<D: SqlDialect>(d: D) {
 
 #[test]
 fn matrix_present_column_groups() {
-    every_dialect!(append_unions_columns_and_upsert_groups_them);
+    every_keyed_dialect!(append_unions_columns_and_upsert_groups_them);
 }
 
 #[test]
@@ -302,10 +350,13 @@ fn integer_to_fraction_widens_exactly<D: SqlDialect>(d: D) {
     let name = d.name();
     match name {
         "sqlite" => assert_eq!(ty, "REAL", "dynamic typing: widening is a no-op"),
+        // Delta widens only the narrow integer types, exactly; the sink
+        // refuses a BIGINT column rather than round it.
+        "databricks" => assert_eq!(ty, "DOUBLE"),
         _ => {
             let upper = ty.to_ascii_uppercase();
             assert!(
-                upper.contains("NUMERIC") || upper.contains("DECIMAL"),
+                upper.contains("NUMERIC") || upper.contains("DECIMAL") || upper.starts_with("NUMBER"),
                 "{name}: an integer column must widen to an exact type, got {ty}"
             );
         }
@@ -356,9 +407,40 @@ fn keyed_create_table_bounds_key_text<D: SqlDialect>(d: D) {
     assert!(json_table.is_some_and(|s| s.contains(&engine.dialect().quote_ident("doc"))));
 }
 
+fn append_create_table_types_every_column<D: SqlDialect>(d: D) {
+    let name = d.name();
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
+    let t = target(engine.dialect(), "t");
+    let sql = engine
+        .create_table_sql(&t, &[json!({"n": 1, "s": "x", "f": 1.5, "b": true})], None)
+        .unwrap()
+        .expect("a page to infer from");
+    assert!(!sql.contains("PRIMARY KEY"), "{name}: {sql}");
+    for base in [
+        SqlBaseType::Integer,
+        SqlBaseType::Text,
+        SqlBaseType::Double,
+        SqlBaseType::Boolean,
+    ] {
+        let ty = engine.dialect().type_name(base);
+        assert!(sql.contains(ty), "{name}: {ty} in {sql}");
+    }
+    let add = engine
+        .dialect()
+        .add_column_sql(&t, "extra", SqlBaseType::Json)
+        .unwrap();
+    assert!(add.contains(&engine.dialect().quote_ident("extra")), "{name}: {add}");
+    assert!(add.contains(engine.dialect().type_name(SqlBaseType::Json)), "{name}");
+}
+
+#[test]
+fn matrix_append_create_table() {
+    every_dialect!(append_create_table_types_every_column);
+}
+
 #[test]
 fn matrix_create_table() {
-    every_dialect!(keyed_create_table_bounds_key_text);
+    every_keyed_dialect!(keyed_create_table_bounds_key_text);
 }
 
 fn cleanup_runs_create_load_delete<D: SqlDialect>(d: D) {
@@ -410,7 +492,7 @@ fn cleanup_runs_create_load_delete<D: SqlDialect>(d: D) {
 
 #[test]
 fn matrix_cleanup() {
-    every_dialect!(cleanup_runs_create_load_delete);
+    every_cleanup_dialect!(cleanup_runs_create_load_delete);
 }
 
 fn token_and_journal_sql_use_the_dialect<D: SqlDialect>(d: D) {
@@ -434,7 +516,10 @@ fn token_and_journal_sql_use_the_dialect<D: SqlDialect>(d: D) {
         );
         assert!(j.select().contains("run_id ="), "{name}");
     } else {
-        assert_eq!(name, "mssql", "only SQL Server has no run rollback");
+        assert!(
+            !["postgres", "mysql", "sqlite"].contains(&name),
+            "{name}: the rollback-capable dialects journal"
+        );
     }
 }
 

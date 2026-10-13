@@ -22,6 +22,43 @@ pub enum ColumnMatching {
     /// it ignoring ASCII case, unless the record already carries that column
     /// exactly or several columns match it (SQL Server's default collation).
     FoldUnique,
+    /// The exactly-named field first, else the field whose upper-case form
+    /// names an all-upper-case column (Oracle stores unquoted identifiers
+    /// upper-cased).
+    UpperFold,
+}
+
+/// The column `field` addresses among `columns` under `matching`, looked up
+/// from the field's side.
+pub fn column_for_field<'a>(
+    field: &str,
+    columns: &'a [String],
+    matching: ColumnMatching,
+) -> Option<&'a str> {
+    if let Some(c) = columns.iter().find(|c| c.as_str() == field) {
+        return Some(c);
+    }
+    match matching {
+        ColumnMatching::Exact => None,
+        ColumnMatching::CaseInsensitive => columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(field))
+            .map(String::as_str),
+        ColumnMatching::FoldUnique => {
+            let mut folded = columns.iter().filter(|c| c.eq_ignore_ascii_case(field));
+            match (folded.next(), folded.next()) {
+                (Some(c), None) => Some(c.as_str()),
+                _ => None,
+            }
+        }
+        ColumnMatching::UpperFold => {
+            let upper = field.to_uppercase();
+            columns
+                .iter()
+                .find(|c| c.as_str() == upper && c.as_str() == c.to_uppercase())
+                .map(String::as_str)
+        }
+    }
 }
 
 /// One live column of a target table.
@@ -84,6 +121,16 @@ pub fn field_for<'a>(
             })
             .last()
             .map(|(_, v)| v),
+        ColumnMatching::UpperFold => {
+            if column != column.to_uppercase() {
+                return None;
+            }
+            obj.iter()
+                .find(|(k, _)| {
+                    k.to_uppercase() == column && !columns.iter().any(|c| c.name == **k)
+                })
+                .map(|(_, v)| v)
+        }
     }
 }
 
@@ -119,6 +166,10 @@ pub fn unmatched_fields<'a>(
                         .filter(|c| c.name.eq_ignore_ascii_case(k))
                         .count()
                         != 1
+            }
+            ColumnMatching::UpperFold => {
+                let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                column_for_field(k, &names, ColumnMatching::UpperFold).is_none()
             }
         })
         .map(String::as_str)
@@ -289,6 +340,33 @@ mod tests {
         assert_eq!(
             Value::Object(fold_record(&names, &obj(json!({"userid": 1, "kind": 2})))),
             json!({"UserID": 1, "kind": 2})
+        );
+    }
+
+    #[test]
+    fn upper_fold_reaches_only_all_upper_columns() {
+        let c = cols(&["ID", "Mixed"]);
+        let o = obj(json!({"id": 1, "mixed": 2}));
+        assert_eq!(
+            match_record(&c, &o, ColumnMatching::UpperFold),
+            vec![(0, &json!(1))]
+        );
+        assert_eq!(unmatched_fields(&o, &c, ColumnMatching::UpperFold), vec!["mixed"]);
+        let names: Vec<String> = c.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(column_for_field("id", &names, ColumnMatching::UpperFold), Some("ID"));
+        assert_eq!(column_for_field("mixed", &names, ColumnMatching::UpperFold), None);
+        assert_eq!(column_for_field("ID", &names, ColumnMatching::Exact), Some("ID"));
+        assert_eq!(column_for_field("id", &names, ColumnMatching::Exact), None);
+        assert_eq!(
+            column_for_field("mixed", &names, ColumnMatching::CaseInsensitive),
+            Some("Mixed")
+        );
+        let dup = vec!["a".to_string(), "A".to_string()];
+        assert_eq!(column_for_field("x", &dup, ColumnMatching::FoldUnique), None);
+        assert_eq!(column_for_field("aa", &dup, ColumnMatching::FoldUnique), None);
+        assert_eq!(
+            column_for_field("mixed", &names, ColumnMatching::FoldUnique),
+            Some("Mixed")
         );
     }
 

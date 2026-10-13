@@ -357,10 +357,39 @@ pub trait SqlDialect: Send + Sync {
     }
 
     /// `CREATE TABLE IF NOT EXISTS` for the commit-token watermark table.
-    fn commit_token_table_sql(&self) -> String;
+    fn commit_token_table_sql(&self) -> String {
+        let (t, s, k) = self.commit_token_names();
+        format!(
+            "CREATE TABLE IF NOT EXISTS {t} ({s} VARCHAR(255) PRIMARY KEY, {k} {} NOT NULL)",
+            self.type_name(SqlBaseType::Text)
+        )
+    }
 
-    /// Upsert one scope's commit token (binds: scope, token).
-    fn commit_token_upsert_sql(&self) -> String;
+    /// Upsert one scope's commit token (binds: scope, token): the dialect's
+    /// upsert tail when it has one, else a standard `MERGE`.
+    fn commit_token_upsert_sql(&self) -> String {
+        let (t, s, k) = self.commit_token_names();
+        let key = [faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL.to_string()];
+        let cols = [
+            faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL.to_string(),
+            faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL.to_string(),
+        ];
+        match self.upsert_tail(&key, &cols) {
+            Some(tail) => format!(
+                "INSERT INTO {t} ({s}, {k}) VALUES ({}) {tail}",
+                self.values_sql(2, &[], 1, 0)
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+            ),
+            None => format!(
+                "MERGE INTO {t} w USING (SELECT {} AS {s}, {} AS {k}) n ON w.{s} = n.{s} \
+                 WHEN MATCHED THEN UPDATE SET {k} = n.{k} \
+                 WHEN NOT MATCHED THEN INSERT ({s}, {k}) VALUES (n.{s}, n.{k})",
+                self.placeholder(1, None),
+                self.placeholder(2, None)
+            ),
+        }
+    }
 
     /// Read one scope's commit token (binds: scope).
     fn commit_token_select_sql(&self) -> String {
