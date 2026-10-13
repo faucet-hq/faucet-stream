@@ -24,7 +24,7 @@
 //! [`FaucetError::RowsUnaccounted`] before the bookmark advances, so a sink that
 //! silently drops rows can no longer report a green run. Rows a transform
 //! filtered out (or added) never reach the page, so they are counted
-//! separately ([`RowAccounts::transform_in`] / [`RowAccounts::transform_out`]).
+//! separately ([`RowAccountsSnapshot::transform_in`] / [`RowAccountsSnapshot::transform_out`]).
 
 use crate::error::FaucetError;
 use std::sync::atomic::{AtomicU64, Ordering};
