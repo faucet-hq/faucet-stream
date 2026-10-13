@@ -238,6 +238,46 @@ otherwise it is a `422`. A config submitted for a tenant is refused even then.
 Registered templates and the triggers file are written by the server's
 operator and may always use them.
 
+### Reference policy
+
+Every config the server loads from a caller is checked against one
+allow-list before anything runs. A connector field that names a local path,
+a URL or a program carries an `x-faucet-resource` annotation in its schema, so
+the server confines connector configs it has never seen, plugin connectors
+included, with no per-connector code. The same allow-list covers `${env:}`,
+`${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
+lineage paths, and the `token_url` / `url` of an `auth:` provider.
+
+| Reference | Default for a caller's config | Widen with |
+|-----------|-------------------------------|------------|
+| Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
+| URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
+| URL host | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
+| `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
+| A program (`singer`) | refused | `--allow-subprocess-connectors` |
+
+A refused reference is a `403` that names the field, the value and the flag
+that would allow it. `/dev/null` and `:memory:` are always allowed. A path is
+compared after symlinks are resolved, and a `..` that leaves a root is
+refused. A path field that holds a remote URL (`s3://…`) is checked as a URL.
+
+The server's own credentials stay unreadable whatever the flags say:
+`FAUCET_VAULT_KEY`, the serve token variables and the files and variables
+`--auth-config` read.
+
+**Tenants.** A config submitted for a tenant never runs a program, and with
+`--tenant-path-root DIR` its local paths are confined to `DIR/<tenant id>`
+instead of the roots above.
+
+**Trusted configs.** Registered templates, the `--triggers` file and the
+`--default-config` base are written by the server's operator, so they are not
+checked against the allow-list.
+
+**Errors.** A run's error text is redacted before it is stored, so a resolved
+secret or a URL password in a failure message never reaches the history
+database, a peer instance or `GET /v1/runs/{id}`.
+
 **Who am I.** `GET /v1/whoami` returns the caller's `principal`, `role` and
 `permissions` to any authenticated caller (`--no-auth` and `--auth-token`
 report an admin). The web console uses it to hide controls the role cannot use;

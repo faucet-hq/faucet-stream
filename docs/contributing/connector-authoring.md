@@ -73,6 +73,26 @@ override `stream_pages`** so memory stays O(batch_size). See
 `connector_name()` must return a non-empty `&'static str` — it becomes the
 `connector` metric label. Empty strings fall back to `"unknown"`.
 
+### Mark the fields that name a resource
+
+A config field that names a local path, a URL or a program the connector runs
+carries an `x-faucet-resource` annotation:
+
+```rust
+#[schemars(extend("x-faucet-resource" = "path"))]   // or "url" / "command"
+pub path: String,
+```
+
+`faucet serve` reads it from the schema and checks the value against the
+operator's [reference policy](../book/src/reference/http-api.md#reference-policy)
+before running a config a caller sent, so your connector is confined with no
+serve code. A field that only looks like a resource (an object key inside a
+configured bucket, a URL path appended to a checked `base_url`) goes in
+`scripts/resource-annotation-allow.txt` with a reason instead.
+`cli/tests/resource_annotations.rs` fails on an unannotated field whose name
+looks like a resource, and on an allow-list entry that no longer matches one.
+After adding an annotation, regenerate `schemas/faucet.schema.json`.
+
 ### Resumability
 
 If your source can resume, implement two methods:
