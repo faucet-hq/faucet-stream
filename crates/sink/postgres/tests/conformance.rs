@@ -166,6 +166,7 @@ async fn conformance_declared_capabilities() {
         async move { count_rows(&url).await }
     };
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_reported_rows_truthful(&sink, count).await;
     faucet_conformance::assert_replay_safe(&sink, count).await;
 
     let mut cfg = PostgresSinkConfig::new(&url, "t").column_mapping(PostgresColumnMapping::AutoMap);
