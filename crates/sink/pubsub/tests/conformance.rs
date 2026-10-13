@@ -109,8 +109,16 @@ async fn conformance_capabilities_truthful() {
     let mut cfg = PubsubSinkConfig::new("conf-sink-t");
     cfg.connection = conn(&host);
     cfg.value_format = ValueFormat::Json;
+    let cfg_value = faucet_core::serde_json::to_value(&cfg).expect("config serializes");
     let sink = PubsubSink::new(cfg).await.expect("sink builds");
     faucet_conformance::assert_batch_atomicity_declared(&sink);
+    // RFC 0013: the static descriptor answers what the built sink declares.
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_pubsub::DESCRIPTOR,
+        "pubsub",
+        &cfg_value,
+        &sink,
+    );
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty_value(
@@ -145,27 +153,4 @@ async fn assert_capabilities_truthful_count(
         async move { count_available(&sub, &seen).await }
     })
     .await;
-}
-
-/// The static descriptor answers exactly what the built sink declares (RFC 0013).
-#[tokio::test(flavor = "multi_thread")]
-async fn conformance_descriptor_matches_built_sink() {
-    #[allow(unused_mut)]
-    let configs = vec![
-        r#"{"topic": "t", "project_id": "p", "emulator_host": "127.0.0.1:1", "credentials": {"type": "anonymous"}}"#,
-    ];
-    for raw in configs {
-        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
-        let cfg: faucet_sink_pubsub::PubsubSinkConfig =
-            faucet_core::serde_json::from_value(v.clone()).expect("config");
-        let built = faucet_sink_pubsub::PubsubSink::new(cfg)
-            .await
-            .expect("offline build");
-        faucet_conformance::assert_descriptor_matches_sink(
-            &faucet_sink_pubsub::DESCRIPTOR,
-            "pubsub",
-            &v,
-            &built,
-        );
-    }
 }

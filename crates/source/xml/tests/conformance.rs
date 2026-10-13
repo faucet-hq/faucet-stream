@@ -127,11 +127,9 @@ async fn conformance_preflight_check_wellformed() {
 
 #[test]
 fn conformance_descriptor_matches_built_source() {
-    for v in [
-        serde_json::json!({"base_url": "http://127.0.0.1:1", "path": "/feed.xml"}),
-        serde_json::json!({"base_url": "http://127.0.0.1:1", "path": "/feed.xml", "batch_size": 0}),
-    ] {
-        let cfg: faucet_source_xml::XmlStreamConfig = serde_json::from_value(v.clone()).unwrap();
+    for path in ["/feed.xml", "/other.xml"] {
+        let v = serde_json::to_value(XmlStreamConfig::new("http://127.0.0.1:1", path)).unwrap();
+        let cfg: XmlStreamConfig = serde_json::from_value(v.clone()).unwrap();
         let built = faucet_source_xml::XmlStream::new(cfg);
         faucet_conformance::assert_descriptor_matches_source(
             &faucet_source_xml::DESCRIPTOR,

@@ -375,7 +375,7 @@ async fn a_single_group_fifo_queue_drains_in_order() {
 async fn conformance_descriptor_matches_built_source() {
     #[allow(unused_mut)]
     let configs = vec![
-        r#"{"queue_url": "http://127.0.0.1:1/1/q", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"queue_url": "http://127.0.0.1:1/1/q", "region": "us-east-1", "max_messages": 1, "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
     ];
     for raw in configs {
         let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");

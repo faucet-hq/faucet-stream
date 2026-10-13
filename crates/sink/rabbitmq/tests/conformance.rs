@@ -50,7 +50,8 @@ async fn conformance_capabilities_truthful() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_descriptor_matches_built_sink() {
     #[allow(unused_mut)]
-    let configs = vec![r#"{"url": "amqp://127.0.0.1:1/%2f", "exchange": "x"}"#];
+    let configs =
+        vec![r#"{"url": "amqp://127.0.0.1:1/%2f", "exchange": "x", "routing_key": "rk"}"#];
     for raw in configs {
         let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
         let cfg: faucet_sink_rabbitmq::RabbitMqSinkConfig =

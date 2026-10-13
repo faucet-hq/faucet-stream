@@ -8,12 +8,9 @@ use serde_json::Value;
 pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("s3", capabilities);
 
 fn columnar_format(format: &str) -> bool {
-    match format {
-        "parquet" => true,
-        "avro" => cfg!(feature = "file-format-avro"),
-        "orc" => cfg!(feature = "file-format-orc"),
-        _ => false,
-    }
+    format == "parquet"
+        || (format == "avro" && cfg!(feature = "file-format-avro"))
+        || (format == "orc" && cfg!(feature = "file-format-orc"))
 }
 
 fn capabilities(config: &Value) -> Capabilities {

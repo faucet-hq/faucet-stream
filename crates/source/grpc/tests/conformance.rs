@@ -104,11 +104,17 @@ async fn conformance_preflight_check_wellformed() {
 
 #[test]
 fn conformance_descriptor_matches_built_source() {
-    for v in [
-        serde_json::json!({"endpoint": "http://127.0.0.1:1", "service_name": "faucet.test.echo.EchoService", "method_name": "List", "descriptor_set_path": common::descriptor_set_path()}),
-        serde_json::json!({"endpoint": "http://127.0.0.1:1", "service_name": "faucet.test.echo.EchoService", "method_name": "List", "descriptor_set_path": common::descriptor_set_path(), "rpc_kind": "server_streaming"}),
-    ] {
-        let cfg: faucet_source_grpc::GrpcStreamConfig = serde_json::from_value(v.clone()).unwrap();
+    for kind in [RpcKind::Unary, RpcKind::ServerStreaming] {
+        let typed = GrpcStreamConfig::new(
+            "http://127.0.0.1:1",
+            "faucet.test.echo.EchoService",
+            "List",
+            common::descriptor_set_path(),
+        )
+        .request(json!({ "count": 1 }))
+        .rpc_kind(kind);
+        let v = serde_json::to_value(typed).unwrap();
+        let cfg: GrpcStreamConfig = serde_json::from_value(v.clone()).unwrap();
         let built = faucet_source_grpc::GrpcStream::new(cfg).unwrap();
         faucet_conformance::assert_descriptor_matches_source(
             &faucet_source_grpc::DESCRIPTOR,

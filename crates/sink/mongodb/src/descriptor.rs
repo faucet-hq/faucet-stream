@@ -50,7 +50,7 @@ mod tests {
                 ]
             );
             assert!(k.keyed_upsert());
-            assert_eq!(k.idempotent_writes(), true);
+            assert!(k.idempotent_writes());
             assert!(k.cleanup() && !k.schema_evolution() && !k.rollback());
             assert_eq!(k.schema_report(), SchemaReport::Undeclared);
         }

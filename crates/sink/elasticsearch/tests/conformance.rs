@@ -210,9 +210,9 @@ async fn conformance_preflight_check_wellformed() {
 async fn conformance_descriptor_matches_built_sink() {
     #[allow(unused_mut)]
     let configs = vec![
-        r#"{"base_url": "http://127.0.0.1:1", "index": "i"}"#,
-        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "write_mode": "upsert", "key": ["id"]}"#,
-        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "write_mode": "delete", "key": ["id"]}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "auth": {"type": "none"}}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "auth": {"type": "none"}, "write_mode": "upsert", "key": ["id"]}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "auth": {"type": "none"}, "write_mode": "delete", "key": ["id"]}"#,
     ];
     for raw in configs {
         let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");

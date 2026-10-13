@@ -223,7 +223,9 @@ async fn conformance_preflight_check_wellformed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_descriptor_matches_built_source() {
     #[allow(unused_mut)]
-    let configs = vec![r#"{"base_url": "http://127.0.0.1:1", "index": "i"}"#];
+    let configs = vec![
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "query": {"match_all": {}}, "auth": {"type": "none"}}"#,
+    ];
     for raw in configs {
         let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
         let cfg: faucet_source_elasticsearch::ElasticsearchSourceConfig =

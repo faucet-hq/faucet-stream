@@ -232,7 +232,7 @@ async fn descriptor_matches_the_built_source() {
             "connection_url": "postgres://u:p@localhost:1/db",
             "slot_name": "faucet_tmp",
             "publication_name": "faucet_pub",
-            "slot_type": "temporary"
+            "batch_size": 0
         }),
     ] {
         let cfg: PostgresCdcSourceConfig = serde_json::from_value(v.clone()).unwrap();

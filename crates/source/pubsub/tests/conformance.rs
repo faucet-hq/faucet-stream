@@ -106,8 +106,16 @@ async fn conformance_bounded_memory() {
     cfg.idle_termination_secs = Some(5);
     cfg.max_messages = Some(150);
     cfg.batch_size = 30;
+    let cfg_value = faucet_core::serde_json::to_value(&cfg).expect("config serializes");
     let source = PubsubSource::new(cfg).await.expect("source builds");
     assert!(source.consumes_destructively());
+    // RFC 0013: the static descriptor answers what the built source declares.
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_pubsub::DESCRIPTOR,
+        "pubsub",
+        &cfg_value,
+        &source,
+    );
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty(&source);
@@ -120,27 +128,4 @@ async fn conformance_bounded_memory() {
     .await;
 
     faucet_conformance::assert_bounded_memory(&source, 30, 150).await;
-}
-
-/// The static descriptor answers exactly what the built source declares (RFC 0013).
-#[tokio::test(flavor = "multi_thread")]
-async fn conformance_descriptor_matches_built_source() {
-    #[allow(unused_mut)]
-    let configs = vec![
-        r#"{"subscription": "s", "project_id": "p", "emulator_host": "127.0.0.1:1", "credentials": {"type": "anonymous"}}"#,
-    ];
-    for raw in configs {
-        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
-        let cfg: faucet_source_pubsub::PubsubSourceConfig =
-            faucet_core::serde_json::from_value(v.clone()).expect("config");
-        let built = faucet_source_pubsub::PubsubSource::new(cfg)
-            .await
-            .expect("offline build");
-        faucet_conformance::assert_descriptor_matches_source(
-            &faucet_source_pubsub::DESCRIPTOR,
-            "pubsub",
-            &v,
-            &built,
-        );
-    }
 }
