@@ -237,6 +237,50 @@ async fn shards_partition_the_read_without_loss_or_duplication() {
     assert_eq!(all.len(), 100);
 }
 
+/// A shard-bounds query the database rejects — at planning (an unknown key
+/// column) or while reading its row (a runtime error) — fails shard
+/// enumeration; the probe queries are metered on the installed recorder.
+#[tokio::test(flavor = "multi_thread")]
+async fn shard_bounds_errors_fail_enumeration() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(
+        &emu.host,
+        "shardbad",
+        &["CREATE TABLE items (id INT64 NOT NULL) PRIMARY KEY (id)"],
+    )
+    .await;
+    let client = support::raw_client(&emu.host, "shardbad").await;
+    support::execute_dml(&client, "INSERT INTO items (id) VALUES (0), (1)").await;
+
+    let mut unknown = cfg(&emu.host, "shardbad", "SELECT * FROM items");
+    unknown.shard = Some(ShardConfig { key: "nope".into() });
+    let source = SpannerSource::new(unknown).await.expect("source");
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "spanner",
+        )
+        .with_meter(meter.clone()),
+    ));
+    assert!(source.enumerate_shards(4).await.is_err());
+    let trips = meter.snapshot().source_roundtrips;
+    assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
+
+    let mut runtime = cfg(
+        &emu.host,
+        "shardbad",
+        "SELECT id FROM items WHERE DIV(10, id - id) > 0",
+    );
+    runtime.shard = Some(ShardConfig { key: "id".into() });
+    let source = SpannerSource::new(runtime).await.expect("source");
+    assert!(source.enumerate_shards(4).await.is_err());
+}
+
 // ── Coverage: stale reads, convenience fetch, default check probe ────────────
 
 #[tokio::test(flavor = "multi_thread")]
