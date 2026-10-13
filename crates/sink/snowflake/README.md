@@ -397,6 +397,14 @@ already landed a second time). See
 
 Declares `append`, idempotent writes (exactly-once) and staged load. Columnar (Arrow) loading is declared only when built with the `arrow` feature and `bulk_load` is set. `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+Every SQL API request — submit, the `202` status polls, the bulk-load stage
+upload — runs through the pipeline's `CallContext` (#880): each is sent once,
+any caller deadline ends it (an abandoned statement is cancelled on the
+warehouse), and each is metered as a round trip (`submit`, `poll`, `stage`).
+The HTTP client's connect / idle-read timeouts and `poll_timeout` are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
