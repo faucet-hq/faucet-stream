@@ -1034,26 +1034,25 @@ async fn run_expanded_unredacted(
             let dlq_sinks = Arc::clone(&dlq_sinks);
             let state_stores = Arc::clone(&state_stores);
             let handle = joinset.spawn(
-                STATE_STORES
-                    .scope(
-                        state_stores,
-                        DLQ_SINKS.scope(dlq_sinks, async move {
-                            let _permit = sem.acquire().await.expect("semaphore not closed");
-                            run_unit(
-                                &unit,
-                                capture,
-                                &captured,
-                                &discovered,
-                                &collected,
-                                &opts2,
-                                unit_cancel,
-                                suppress_overwrite,
-                                overwrite_grouped,
-                            )
-                            .await
-                        }),
-                    )
-                    .in_current_span(),
+                faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
+                    state_stores,
+                    DLQ_SINKS.scope(dlq_sinks, async move {
+                        let _permit = sem.acquire().await.expect("semaphore not closed");
+                        run_unit(
+                            &unit,
+                            capture,
+                            &captured,
+                            &discovered,
+                            &collected,
+                            &opts2,
+                            unit_cancel,
+                            suppress_overwrite,
+                            overwrite_grouped,
+                        )
+                        .await
+                    }),
+                ))
+                .in_current_span(),
             );
             task_meta.insert(handle.id(), meta);
         }

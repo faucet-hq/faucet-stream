@@ -119,6 +119,34 @@ pub fn stored_origin(rec: &RunRecord) -> BodyOrigin {
     }
 }
 
+/// The reference policy a run's HTTP clients check their requests and
+/// redirect hops against (#881): the caller policy for a config the request
+/// carried, none (metadata redirects are still refused) for an operator's.
+pub(crate) fn runtime_reference_policy(
+    caller_config: bool,
+    tenant: Option<&str>,
+) -> Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>> {
+    caller_config.then(|| {
+        std::sync::Arc::new(crate::serve::references::installed().for_origin(
+            BodyOrigin::Caller {
+                allow_subprocess: false,
+            },
+            tenant,
+        ))
+    })
+}
+
+/// Run `fut` under `policy` ([`runtime_reference_policy`]).
+async fn under_reference_policy<F: std::future::Future>(
+    policy: Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>>,
+    fut: F,
+) -> F::Output {
+    match policy {
+        Some(p) => faucet_core::http::with_reference_policy(p, fut).await,
+        None => fut.await,
+    }
+}
+
 /// What a gated submission produced (#703).
 #[derive(Debug)]
 pub enum SubmitOutcome {
@@ -509,16 +537,20 @@ fn resume_claimed(
         // calling registry.cancel) reaches this run.
         let run_token = CancellationToken::new();
         state.registry().register(run_id.clone(), run_token.clone());
-        execute_run(
-            state.clone(),
-            loaded,
-            run_id,
-            run_token,
-            rec.submitted_at,
-            rec.timeout_secs,
-            rec.clock.clone(),
-            rec.concurrency,
-            Some(guard),
+        let policy = runtime_reference_policy(rec.caller_config, rec.tenant.as_deref());
+        under_reference_policy(
+            policy,
+            execute_run(
+                state.clone(),
+                loaded,
+                run_id,
+                run_token,
+                rec.submitted_at,
+                rec.timeout_secs,
+                rec.clock.clone(),
+                rec.concurrency,
+                Some(guard),
+            ),
         )
         .await;
     });
@@ -701,17 +733,21 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let (outcome, shutdown) = execute_shard(
-            &state,
-            loaded,
-            &run_id,
-            &shard_id,
-            shard,
-            coop,
-            run.timeout_secs,
-            run.clock.clone(),
-            run.concurrency,
-            run.submitted_at,
+        let policy = runtime_reference_policy(run.caller_config, run.tenant.as_deref());
+        let (outcome, shutdown) = under_reference_policy(
+            policy,
+            execute_shard(
+                &state,
+                loaded,
+                &run_id,
+                &shard_id,
+                shard,
+                coop,
+                run.timeout_secs,
+                run.clock.clone(),
+                run.concurrency,
+                run.submitted_at,
+            ),
         )
         .await;
 
@@ -1235,6 +1271,7 @@ pub async fn submit(
     rec.tenant = actor.tenant.clone();
     rec.selection = req.selection.clone();
     rec.host_access = req.server_file;
+    rec.caller_config = matches!(req.origin(&state), BodyOrigin::Caller { .. });
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -1832,16 +1869,23 @@ fn spawn_run(
             }
             permit = state.semaphore().acquire_owned() => permit.expect("semaphore not closed"),
         };
-        execute_run(
-            state,
-            loaded,
-            run_id,
-            run_token,
-            submitted_at,
-            req.timeout_secs,
-            req.clock,
-            req.concurrency,
-            None,
+        let policy = runtime_reference_policy(
+            matches!(req.origin(&state), BodyOrigin::Caller { .. }),
+            loaded.tenant.as_ref().map(|t| t.values.id.as_str()),
+        );
+        under_reference_policy(
+            policy,
+            execute_run(
+                state,
+                loaded,
+                run_id,
+                run_token,
+                submitted_at,
+                req.timeout_secs,
+                req.clock,
+                req.concurrency,
+                None,
+            ),
         )
         .await;
         // `_permit` drops here.
@@ -2343,6 +2387,28 @@ fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) ->
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    /// A caller's config runs with the caller reference policy scoped over
+    /// it, so its HTTP clients check every request and redirect hop (#881).
+    #[tokio::test]
+    async fn a_caller_run_executes_under_the_caller_reference_policy() {
+        assert!(runtime_reference_policy(false, None).is_none());
+        let policy = runtime_reference_policy(true, None).expect("a caller run is scoped");
+        assert!(policy.check_url("http://169.254.169.254/").is_err());
+        assert!(!policy.allows_subprocess());
+        let seen = under_reference_policy(Some(policy), async {
+            faucet_core::http::current_reference_policy()
+        })
+        .await;
+        assert!(seen.is_some());
+        assert!(
+            under_reference_policy(None, async {
+                faucet_core::http::current_reference_policy()
+            })
+            .await
+            .is_none()
+        );
+    }
 
     #[test]
     fn caller_idempotency_keys_stay_out_of_the_server_namespaces() {

@@ -11,6 +11,7 @@ use crate::dlq_replay::{self, ReplayInputs, reader::DlqDecryptor};
 use crate::error::CliError;
 use crate::serve::error::ServeError;
 use crate::serve::history::{RunRecord, RunStatus};
+use crate::serve::load::refuse_request_path;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
@@ -50,8 +51,10 @@ pub struct DlqInspectRequest {
 /// [`InspectSummary`](crate::dlq_replay::InspectSummary). Read-only.
 pub async fn inspect(
     State(_state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Json(req): Json<DlqInspectRequest>,
 ) -> Result<Json<Value>, ServeError> {
+    refuse_request_path("location", &req.location, false, actor.tenant.as_deref())?;
     let location = req.location;
     let reason = req.reason;
     let limit = req.limit;
@@ -105,11 +108,12 @@ pub struct DlqReplayRequest {
 struct ReplayToken<'a> {
     state: &'a ServerState,
     id: String,
+    claim: u64,
 }
 
 impl Drop for ReplayToken<'_> {
     fn drop(&mut self) {
-        self.state.registry().deregister(&self.id);
+        self.state.registry().release_claim(&self.id, self.claim);
     }
 }
 
@@ -125,6 +129,10 @@ pub async fn replay(
         (Some(own), Some(asked)) if own != asked => return Err(ServeError::NotFound),
         (own, asked) => own.clone().or_else(|| asked.clone()),
     };
+    refuse_request_path("from", &req.from, false, tenant.as_deref())?;
+    if let Some(failed) = &req.failed_dlq {
+        refuse_request_path("failed_dlq", failed, true, tenant.as_deref())?;
+    }
     // A tenant's replay loads under its scope and is admitted against its
     // limits, whose per-run ceilings join the config's budget (#871).
     let (admission, caller_budget) = match tenant.as_deref() {
@@ -160,16 +168,16 @@ pub async fn replay(
         .id
         .clone()
         .unwrap_or_else(|| format!("dlq-replay-{}", uuid::Uuid::now_v7()));
-    if state.registry().is_registered(&id) {
+    let cancel = state.shutdown_token().child_token();
+    let Some(claim) = state.registry().try_register(id.clone(), cancel.clone()) else {
         return Err(ServeError::Conflict(format!(
             "a run or replay with id '{id}' is already in flight"
         )));
-    }
-    let cancel = state.shutdown_token().child_token();
-    state.registry().register(id.clone(), cancel.clone());
+    };
     let _token = ReplayToken {
         state: &state,
         id: id.clone(),
+        claim,
     };
     let decryptor = DlqDecryptor::from_keys(&req.encryption_keys)
         .map_err(CliError::from)
@@ -260,16 +268,6 @@ async fn start_replay_record(
     admission: Option<ReplayAdmission>,
 ) -> Result<ReplayRecord, ServeError> {
     let history = state.history();
-    if history
-        .get(id)
-        .await
-        .map_err(|e| ServeError::from_history("run history", e))?
-        .is_some()
-    {
-        return Err(ServeError::Conflict(format!(
-            "a run with id '{id}' already exists"
-        )));
-    }
     let now = Utc::now();
     let mut labels = std::collections::BTreeMap::new();
     labels.insert(LABEL_DLQ_REPLAY.to_string(), "true".to_string());
@@ -278,10 +276,15 @@ async fn start_replay_record(
     rec.started_at = Some(now);
     rec.replay_of = Some(from.to_string());
     rec.tenant = tenant.map(str::to_string);
-    history
-        .upsert(&rec)
+    if !history
+        .insert_new(&rec)
         .await
-        .map_err(|e| ServeError::from_history("run history", e))?;
+        .map_err(|e| ServeError::from_history("run history", e))?
+    {
+        return Err(ServeError::Conflict(format!(
+            "a run with id '{id}' already exists"
+        )));
+    }
     let guard = ReplayRecord {
         state: state.clone(),
         rec: Some(rec),
@@ -386,6 +389,7 @@ pub async fn discard(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<DlqDiscardRequest>,
 ) -> Result<Json<Value>, ServeError> {
+    refuse_request_path("location", &req.location, true, actor.tenant.as_deref())?;
     let location = req.location;
     let reason = req.reason;
     let before_ms = req.before_ms;
@@ -726,6 +730,101 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(status, RunStatus::Cancelled);
+    }
+
+    /// The DLQ locations a request names are screened like connector paths:
+    /// a system tree or a path outside the server's roots is refused before
+    /// anything is read, archived or deleted.
+    #[tokio::test]
+    async fn dlq_locations_are_screened_by_the_reference_policy() {
+        let state = crate::serve::test_support::test_state();
+        let inspect_req: DlqInspectRequest =
+            serde_json::from_value(serde_json::json!({"location": "/etc/passwd"})).unwrap();
+        let err = inspect(
+            State(state.clone()),
+            Extension(actor(None)),
+            Json(inspect_req),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
+
+        let victim = "/var/faucet-not-a-root/dlq.jsonl";
+        let discard_req: DlqDiscardRequest =
+            serde_json::from_value(serde_json::json!({"location": victim, "delete": true}))
+                .unwrap();
+        let err = discard(
+            State(state.clone()),
+            Extension(actor(None)),
+            Json(discard_req),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("--allow-path-root")),
+            "{err:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 1, "");
+        let mut req = request(cfg.clone(), "/etc/hosts".into());
+        req.failed_dlq = None;
+        let err = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
+        let mut req = request(cfg, from);
+        req.failed_dlq = Some("/etc/faucet-failed.jsonl".into());
+        let err = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("failed_dlq")),
+            "{err:?}"
+        );
+    }
+
+    /// A replay id is claimed atomically: a replay whose id another holds is
+    /// refused without releasing the holder's registration, and a replay whose
+    /// id names a recorded run is refused and leaves nothing registered.
+    #[tokio::test]
+    async fn a_replay_id_is_claimed_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 1, "");
+        let state = crate::serve::test_support::test_state();
+        let held = state
+            .registry()
+            .try_register("dup".into(), tokio_util::sync::CancellationToken::new())
+            .unwrap();
+        let mut req = request(cfg.clone(), from.clone());
+        req.id = Some("dup".into());
+        let err = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        assert!(
+            state.registry().is_registered("dup"),
+            "the holder keeps its claim"
+        );
+        state.registry().release_claim("dup", held);
+
+        let existing =
+            RunRecord::queued("taken".into(), None, Default::default(), None, Utc::now());
+        state.history().upsert(&existing).await.unwrap();
+        let mut req = request(cfg, from);
+        req.id = Some("taken".into());
+        let err = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        assert!(!state.registry().is_registered("taken"));
+        let rec = state.history().get("taken").await.unwrap().unwrap();
+        assert_eq!(
+            rec.status,
+            RunStatus::Queued,
+            "the existing record is untouched"
+        );
+        assert!(!state.history().insert_new(&existing).await.unwrap());
     }
 
     /// A dry-run replay writes nothing, so it is not recorded as a run.

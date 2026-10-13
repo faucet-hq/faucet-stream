@@ -2928,6 +2928,7 @@ components:
         tenant: { type: string, description: "The tenant this run was started for (#709); absent for an ordinary run." }
         selection: { $ref: "#/components/schemas/RowSelection" }
         host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
+        caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }

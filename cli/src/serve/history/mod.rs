@@ -205,6 +205,11 @@ pub struct RunRecord {
     /// so a claim or resume keeps its SQL connectors' host access (#862 H-04).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_access: bool,
+    /// The run's config was carried by the request (not a template or a
+    /// server file), so its HTTP requests and redirect hops stay under the
+    /// caller reference policy wherever it runs (#881).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caller_config: bool,
 }
 
 impl RunRecord {
@@ -241,6 +246,7 @@ impl RunRecord {
             tenant: None,
             selection: None,
             host_access: false,
+            caller_config: false,
         }
     }
 }
@@ -633,6 +639,17 @@ pub trait RunHistory: Send + Sync {
 
     /// Insert or replace a run record.
     async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError>;
+
+    /// Insert a run record only when no record has its id; `false` when one
+    /// does. Backends override it with an atomic insert so two writers racing
+    /// for one id cannot both win.
+    async fn insert_new(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        if self.get(&rec.run_id).await?.is_some() {
+            return Ok(false);
+        }
+        self.upsert(rec).await?;
+        Ok(true)
+    }
 
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError>;
 

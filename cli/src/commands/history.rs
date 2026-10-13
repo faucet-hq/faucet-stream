@@ -208,6 +208,7 @@ mod tests {
             tenant: None,
             selection: None,
             host_access: false,
+            caller_config: false,
         }
     }
 

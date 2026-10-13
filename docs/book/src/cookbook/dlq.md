@@ -257,7 +257,16 @@ A replay that writes is recorded as a run under its `id` (label
 so it shows in the run list and counts toward its tenant's
 `max_concurrent_runs`: with the limit at `1`, a run submitted for the tenant
 while its replay runs is refused with `429`. A `--dry-run` replay writes
-nothing and is not recorded.
+nothing and is not recorded. An `id` is claimed atomically: a second replay
+with an `id` in flight, or one naming a run already in the history, is refused
+with `409` and leaves the first untouched.
+
+The DLQ locations a request names — `from` and `failed_dlq` here, `location`
+for `inspect` and `discard` — are server-local paths, so the server checks them
+against its [reference policy](../reference/http-api.md#reference-policy) like a
+connector path in a submitted config: a system tree or a server credential file
+is refused, a path outside `--allow-path-root` is refused (`403`), and a
+tenant's request is confined to `--tenant-path-root/<tenant>`.
 
 Rows that fail **again** on replay are quarantined to a *fresh* DLQ — a
 `replay-failed.jsonl` sibling of the source by default (override with

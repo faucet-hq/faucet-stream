@@ -412,11 +412,10 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     //
     // - `/mcp` — its baseline is a read scope; the one mutating tool
     //   (`run_pipeline`) re-checks `RunWrite` inside the handler.
-    // - `/v1/dlq/inspect` — reads a DLQ location and summarises it. Note for
-    //   operators: the location is caller-supplied, so a read token can ask
-    //   the server to read a path on its filesystem. That is the same trust
-    //   boundary as run logs (which carry record data) and is why the DLQ
-    //   endpoints are not exposed to the public internet.
+    // - `/v1/dlq/inspect` — reads a DLQ location and summarises it. The
+    //   location is caller-supplied, so it is screened by the reference
+    //   policy like a connector path (the path roots, never a system tree or a
+    //   server credential file, a tenant's root for a tenant).
     // - `/v1/status` — assembles a health report from state, history and the
     //   DLQ; the POST form only carries the config in a body. `--probe` builds
     //   the sink for its read-only watermark read, nothing more. A viewer may

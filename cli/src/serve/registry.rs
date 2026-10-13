@@ -4,7 +4,7 @@
 //! spawned but has not yet acquired an execution permit.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,9 @@ fn shard_key(run_id: &str, shard_id: &str) -> String {
 
 pub struct Registry {
     tokens: DashMap<String, CancellationToken>,
+    /// Claims taken with [`Registry::try_register`], by id.
+    claims: DashMap<String, u64>,
+    next_claim: AtomicU64,
     queued: AtomicUsize,
     in_flight: AtomicUsize,
     max_queued: usize,
@@ -28,6 +31,8 @@ impl Registry {
     pub fn new(max_queued: usize) -> Self {
         Self {
             tokens: DashMap::new(),
+            claims: DashMap::new(),
+            next_claim: AtomicU64::new(1),
             queued: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_queued: max_queued.max(1),
@@ -109,6 +114,30 @@ impl Registry {
     /// Whether a token is registered under `id`.
     pub fn is_registered(&self, id: &str) -> bool {
         self.tokens.contains_key(id)
+    }
+
+    /// Register `token` under `id` only when nothing is registered there,
+    /// atomically: two requests racing for one id cannot both get it. The
+    /// returned claim releases exactly this registration
+    /// ([`release_claim`](Self::release_claim)); `None` when `id` is taken.
+    pub fn try_register(&self, id: String, token: CancellationToken) -> Option<u64> {
+        match self.tokens.entry(id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                let claim = self.next_claim.fetch_add(1, Ordering::Relaxed);
+                self.claims.insert(id, claim);
+                slot.insert(token);
+                Some(claim)
+            }
+        }
+    }
+
+    /// Drop the registration [`try_register`](Self::try_register) returned
+    /// `claim` for — and nothing registered under `id` since.
+    pub fn release_claim(&self, id: &str, claim: u64) {
+        if self.claims.remove_if(id, |_, c| *c == claim).is_some() {
+            self.tokens.remove(id);
+        }
     }
 
     /// Drop the token registered under `id` without touching the queue /
@@ -245,6 +274,49 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claim_is_exclusive_and_releases_only_itself() {
+        let r = Registry::new(4);
+        let first = r
+            .try_register("x".into(), CancellationToken::new())
+            .unwrap();
+        assert!(
+            r.try_register("x".into(), CancellationToken::new())
+                .is_none()
+        );
+        r.release_claim("x", first + 1);
+        assert!(r.is_registered("x"));
+        r.release_claim("x", first);
+        assert!(!r.is_registered("x"));
+        let second = r
+            .try_register("x".into(), CancellationToken::new())
+            .unwrap();
+        r.release_claim("x", first);
+        assert!(
+            r.is_registered("x"),
+            "a stale claim must not drop a newer one"
+        );
+        r.release_claim("x", second);
+        assert!(!r.is_registered("x"));
+
+        let r = std::sync::Arc::new(Registry::new(4));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let won: usize = (0..16)
+            .map(|_| {
+                let (r, b) = (r.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    r.try_register("race".into(), CancellationToken::new())
+                        .is_some()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum();
+        assert_eq!(won, 1, "exactly one concurrent claim wins");
+    }
 
     #[test]
     fn has_run_shards_tracks_the_runs_registered_shards() {

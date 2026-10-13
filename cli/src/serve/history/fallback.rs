@@ -274,6 +274,10 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.upsert(rec), f => f.upsert(rec))
     }
 
+    async fn insert_new(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        via!(self, p => p.insert_new(rec), f => f.insert_new(rec))
+    }
+
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError> {
         via!(self, p => p.get(id), f => f.get(id))
     }
