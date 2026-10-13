@@ -784,7 +784,10 @@ paths:
       description: >
         Re-feeds the unwrapped original payloads from a DLQ location through the
         submitted config's transforms / quality / contract / sink. Rows that
-        fail again land in a fresh DLQ (never the source). Requires the
+        fail again land in a fresh DLQ (never the source). The replay runs
+        under the config's `budget:` (merged with a tenant's per-run limits)
+        and `resilience:`, and is cancellable while it runs with
+        `POST /v1/runs/{id}/cancel` using the replay's `id` (#871). Requires the
         `DlqManage` permission (operator); audited as `dlq.replay`.
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -807,14 +810,23 @@ paths:
                   items: { type: string }
                   description: Keys for a DLQ sealed at rest by the jsonl sink's `encryption` block (first = current, rest = rotated). Requires a server built with the `encryption` feature.
                   # When empty, the config's own dlq jsonl `encryption` block is used.
+                id:
+                  type: string
+                  description: An id to cancel this replay with `POST /v1/runs/{id}/cancel` while it runs. Generated (`dlq-replay-<uuid>`) when omitted; returned as `id`. An id already in flight is a 409.
+                tenant:
+                  type: string
+                  description: Replay on behalf of this tenant (`tenants` feature) — the config loads under the tenant's scope and the replay is admitted against its limits, whose per-run ceilings bound it. A principal confined to another tenant gets a 404.
       responses:
         "200":
-          description: Replay outcome (candidates, records_written, failed_dlq)
+          description: Replay outcome (id, tenant, candidates, records_written, failed_dlq)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad config, location, or reason filter }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
+        "404": { description: The named tenant is not visible to this principal }
+        "409": { description: The replay id is already in flight, or the tenant is suspended }
         "422": { description: Config failed validation / expansion }
+        "429": { description: The tenant is at its max_concurrent_runs limit }
   /v1/dlq/discard:
     post:
       summary: Discard (archive or delete) DLQ envelopes
@@ -3303,6 +3315,8 @@ components:
           type: object
           description: Source-side retries by class (`rate_limited`, `http_5xx`, `connection`, `timeout`).
           additionalProperties: { type: integer }
+        dlq_records_written: { type: integer, description: "Envelopes written to the dead-letter queue (#870). Omitted when zero." }
+        dlq_bytes_written: { type: integer, description: "Estimated serialized bytes written to the dead-letter queue. Omitted when zero." }
     CostEstimate:
       type: object
       description: The priced view of a `UsageSnapshot` — an estimate, in the deployment's configured currency.
