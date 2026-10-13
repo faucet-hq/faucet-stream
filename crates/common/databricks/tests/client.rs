@@ -334,3 +334,57 @@ async fn oauth_m2m_provider_is_used_and_refreshed_on_401() {
     let r = c.execute(&StatementRequest::new("SELECT 1")).await.unwrap();
     assert_eq!(r.statement_id.as_deref(), Some("m"));
 }
+
+#[tokio::test]
+async fn a_spent_call_context_ends_the_poll_and_cancels_the_statement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"statement_id": "s1", "status": {"state": "RUNNING"}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/s1/cancel"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut o = opts();
+    o.poll_interval = Duration::from_secs(60);
+    let token = faucet_core::CancellationToken::new();
+    let c = client(&server.uri(), o)
+        .with_call_context(faucet_core::CallContext::new().with_cancel(token.clone()));
+    assert!(c.call_context().cancel().is_some());
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.cancel();
+    };
+    let req = StatementRequest::new("SELECT 1");
+    let (result, ()) = tokio::join!(c.execute(&req), cancel);
+    assert!(
+        matches!(result, Err(FaucetError::Cancelled { .. })),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_ends_a_hung_submit() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let c = client(&server.uri(), opts()).with_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + Duration::from_millis(200)),
+    );
+    let result = c.execute(&StatementRequest::new("SELECT 1")).await;
+    assert!(
+        matches!(result, Err(FaucetError::Timeout { .. })),
+        "{result:?}"
+    );
+}

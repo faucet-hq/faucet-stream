@@ -253,7 +253,6 @@ impl FilesApiStager {
         Ok(url)
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn send(
         &self,
         method: reqwest::Method,
@@ -265,26 +264,33 @@ impl FilesApiStager {
             url.query_pairs_mut().append_pair("overwrite", "true");
         }
         let opts = self.client.options().clone();
+        let calls = self.client.call_context();
         let mut attempt = 0u32;
         loop {
             let auth = self.client.authorization().await?;
-            let mut req = self
-                .client
-                .http()
-                .request(method.clone(), url.clone())
-                .header("Authorization", auth);
-            if let Some(b) = &body {
-                req = req
-                    .header("Content-Type", "application/octet-stream")
-                    .body(b.clone());
-            }
-            let outcome = req.send().await;
+            let outcome = calls
+                .call("files", || {
+                    let mut req = self
+                        .client
+                        .http()
+                        .request(method.clone(), url.clone())
+                        .header("Authorization", auth.as_str());
+                    if let Some(b) = &body {
+                        req = req
+                            .header("Content-Type", "application/octet-stream")
+                            .body(b.clone());
+                    }
+                    async move { Ok(req.send().await) }
+                })
+                .await?;
             let retry = match &outcome {
                 Ok(r) => r.status().as_u16() == 429 || r.status().is_server_error(),
                 Err(_) => true,
             };
             if retry && attempt < opts.max_retries {
-                tokio::time::sleep(backoff_delay(opts.retry_backoff, attempt)).await;
+                calls
+                    .wait(backoff_delay(opts.retry_backoff, attempt))
+                    .await?;
                 attempt += 1;
                 continue;
             }

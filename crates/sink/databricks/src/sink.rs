@@ -45,6 +45,9 @@ pub struct DatabricksSink {
     stage_seq: AtomicU64,
     columns: tokio::sync::Mutex<Option<Vec<TableColumn>>>,
     token_table_ready: AtomicBool,
+    /// Backend-call context (#880): bounded by the run's deadline, one attempt
+    /// per request — the statement client's own retry rules stay in charge.
+    calls: faucet_core::CallSlot,
 }
 
 impl DatabricksSink {
@@ -81,6 +84,11 @@ impl DatabricksSink {
             stage_seq: AtomicU64::new(0),
             columns: tokio::sync::Mutex::new(None),
             token_table_ready: AtomicBool::new(false),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -124,6 +132,7 @@ impl DatabricksSink {
             },
             ErrorSide::Sink,
         )
+        .with_call_context(self.calls.get())
     }
 
     fn final_target(&self) -> TableRef {
@@ -146,7 +155,6 @@ impl DatabricksSink {
         }
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn run(
         &self,
         req: StatementRequest,
@@ -161,16 +169,22 @@ impl DatabricksSink {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     let msg = e.to_string();
+                    let spent = matches!(
+                        e,
+                        FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
+                    );
                     let conflict = msg.to_ascii_uppercase().contains("CONCURRENT");
                     let ambiguous = msg.contains("submit request failed");
-                    let retry = conflict || (ambiguous && replay == Replay::Safe);
+                    let retry = !spent && (conflict || (ambiguous && replay == Replay::Safe));
                     if retry && attempt < self.config.max_retries {
                         tracing::debug!(attempt, error = %msg, "databricks sink: retrying statement");
-                        tokio::time::sleep(backoff_delay(
-                            Duration::from_millis(self.config.retry_backoff_ms),
-                            attempt,
-                        ))
-                        .await;
+                        client
+                            .call_context()
+                            .wait(backoff_delay(
+                                Duration::from_millis(self.config.retry_backoff_ms),
+                                attempt,
+                            ))
+                            .await?;
                         attempt += 1;
                         continue;
                     }
@@ -313,7 +327,22 @@ impl DatabricksSink {
         };
         let stager = self.stager(loc)?;
         let path = loc.object_path(&name.rel());
-        stager.put(&path, body).await?;
+        let mut upload = Some(stager.put(&path, body));
+        self.calls
+            .get()
+            .with_roundtrip_metering(false)
+            .call("stage", || {
+                let attempt = upload.take();
+                async move {
+                    match attempt {
+                        Some(f) => f.await,
+                        None => Err(FaucetError::Sink(
+                            "databricks sink: a staged upload is sent once".into(),
+                        )),
+                    }
+                }
+            })
+            .await?;
         let (sql, replay) = make_sql(loc, &name);
         let result = self.exec(sql, replay).await;
         let cleanup = self
@@ -724,6 +753,17 @@ impl Sink for DatabricksSink {
 
     fn connector_name(&self) -> &'static str {
         "databricks"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
