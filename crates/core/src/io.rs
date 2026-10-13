@@ -401,6 +401,25 @@ impl CallContext {
         };
         outcome.map_err(|e| self.redact_error(e))
     }
+
+    /// Run `fut` as one backend call named `op`, in a single attempt: the
+    /// form for a call that cannot be rebuilt — a statement on a borrowed
+    /// transaction, a step of a cursor or stream, a non-idempotent write.
+    /// Timeout, deadline, cancel, metering and redaction apply as in
+    /// [`call`](Self::call); any retry policy is ignored.
+    pub async fn call_once<T, Fut>(&self, op: &'static str, fut: Fut) -> Result<T, FaucetError>
+    where
+        Fut: Future<Output = Result<T, FaucetError>>,
+    {
+        let single = self.clone().without_retry();
+        let mut fut = Some(fut);
+        single
+            .call(op, || {
+                let f = fut.take();
+                async move { f.expect("call_once makes one attempt").await }
+            })
+            .await
+    }
 }
 
 fn cancelled_error(op: &'static str) -> FaucetError {
@@ -521,6 +540,14 @@ impl CallSlot {
     {
         self.get().call(op, f).await
     }
+
+    /// Run `fut` once through the effective context ([`CallContext::call_once`]).
+    pub async fn call_once<T, Fut>(&self, op: &'static str, fut: Fut) -> Result<T, FaucetError>
+    where
+        Fut: Future<Output = Result<T, FaucetError>>,
+    {
+        self.get().call_once(op, fut).await
+    }
 }
 
 #[cfg(test)]
@@ -548,6 +575,41 @@ mod tests {
             url: "http://h/x".into(),
             body: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn call_once_makes_one_metered_attempt_whatever_the_policy() {
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        let rec = Arc::new(
+            RoundtripRecorder::new(RoundtripSide::Source, "p", "r", "c").with_meter(meter.clone()),
+        );
+        let slot = CallSlot::new(CallContext::new().with_retry(fast(5)));
+        slot.install_recorder(rec);
+        let err = slot
+            .call_once("query", async { Err::<(), _>(status(503)) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::HttpStatus { status: 503, .. }));
+        assert_eq!(slot.call_once("query", async { Ok(7) }).await.unwrap(), 7);
+        assert_eq!(meter.snapshot().source_roundtrips["query"], 2);
+    }
+
+    #[tokio::test]
+    async fn call_once_ends_at_the_deadline_and_on_cancel() {
+        let ctx = CallContext::new().with_deadline(Instant::now() + Duration::from_millis(20));
+        let err = ctx
+            .call_once("query", std::future::pending::<Result<(), FaucetError>>())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }));
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = CallContext::new()
+            .with_cancel(token)
+            .call_once("query", async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Cancelled { .. }));
     }
 
     #[tokio::test]
