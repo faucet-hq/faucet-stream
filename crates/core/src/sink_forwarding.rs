@@ -34,6 +34,7 @@ pub(crate) const HOOKS: &[&str] = &[
     "load_native",
     "supports_idempotent_writes",
     "sink_guarantee",
+    "capabilities",
     "write_batch_is_replay_safe",
     "dedups_by_key",
     "supported_write_modes",
@@ -140,6 +141,10 @@ impl Sink for HookSink {
     fn sink_guarantee(&self) -> SinkGuarantee {
         self.hit("sink_guarantee");
         SinkGuarantee::KeyedUpsert
+    }
+    fn capabilities(&self) -> crate::Capabilities {
+        self.hit("capabilities");
+        crate::Capabilities::builder().range_digest(true).build()
     }
     fn write_batch_is_replay_safe(&self) -> bool {
         self.hit("write_batch_is_replay_safe");
@@ -313,6 +318,7 @@ pub(crate) async fn assert_forwards_every_hook(sink: &dyn Sink, probe: &HookSink
         .await;
     let _ = sink.supports_idempotent_writes();
     let _ = sink.sink_guarantee();
+    let _ = sink.capabilities();
     let _ = sink.write_batch_is_replay_safe();
     let _ = sink.dedups_by_key();
     let _ = sink.supported_write_modes();

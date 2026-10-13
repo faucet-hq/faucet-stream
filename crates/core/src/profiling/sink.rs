@@ -91,6 +91,9 @@ impl Sink for ProfilingSink {
     fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
         self.inner.sink_guarantee()
     }
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities::decorated_sink(self, &self.inner.capabilities())
+    }
     fn write_batch_is_replay_safe(&self) -> bool {
         self.inner.write_batch_is_replay_safe()
     }

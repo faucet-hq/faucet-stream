@@ -359,6 +359,9 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
         self.inner.sink_guarantee()
     }
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities::decorated_sink(self, &self.inner.capabilities())
+    }
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.current_schema().await
     }

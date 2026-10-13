@@ -3997,6 +3997,9 @@ impl Source for StateKeyOverride {
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()
     }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::decorated_source(self, &self.inner.capabilities())
+    }
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
@@ -4133,6 +4136,9 @@ impl Source for BindContextSource {
     }
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()
+    }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::decorated_source(self, &self.inner.capabilities())
     }
     async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
         self.inner.lag().await
@@ -4318,6 +4324,9 @@ impl Sink for CapturingSink {
     }
     fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
         self.inner.sink_guarantee()
+    }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::decorated_sink(self, &self.inner.capabilities())
     }
     fn write_batch_is_replay_safe(&self) -> bool {
         self.inner.write_batch_is_replay_safe()
@@ -4506,6 +4515,9 @@ impl Sink for LimitedSink {
     }
     fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
         self.inner.sink_guarantee()
+    }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::decorated_sink(self, &self.inner.capabilities())
     }
     fn write_batch_is_replay_safe(&self) -> bool {
         self.inner.write_batch_is_replay_safe()

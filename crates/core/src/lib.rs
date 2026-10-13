@@ -17,12 +17,14 @@ pub mod adaptive;
 pub mod anomaly;
 pub mod auth;
 pub mod budget;
+pub mod capabilities;
 pub mod check;
 pub mod cleanup;
 #[cfg(feature = "arrow")]
 pub mod columnar;
 #[cfg(feature = "arrow")]
 pub mod columnar_transform;
+pub mod compat;
 pub mod config;
 #[cfg(feature = "contract")]
 pub mod contract;
@@ -95,6 +97,7 @@ pub use auth::{
     SharedAuthProvider, rejects_credential, send_with_reauth,
 };
 pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
+pub use capabilities::{Capabilities, CapabilitiesBuilder, ConnectorDescriptor, SchemaReport};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
 pub use cleanup::{CleanupMode, CleanupPolicy, DEFAULT_MAX_KEYS, SeenKeys};
 #[cfg(feature = "arrow")]

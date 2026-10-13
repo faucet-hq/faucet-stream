@@ -170,6 +170,9 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
     fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
         self.inner.replay_guarantee()
     }
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities::decorated_source(self, &self.inner.capabilities())
+    }
 
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
@@ -774,6 +777,9 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
 
     fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
         self.inner.sink_guarantee()
+    }
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities::decorated_sink(self, &self.inner.capabilities())
     }
 
     fn dedups_by_key(&self) -> bool {

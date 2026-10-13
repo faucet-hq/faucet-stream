@@ -822,6 +822,40 @@ pub fn assert_batch_atomicity_declared<S: Sink + ?Sized>(sink: &S) -> faucet_cor
     first
 }
 
+/// RFC 0013 (#876): a source's static [`ConnectorDescriptor`](faucet_core::ConnectorDescriptor)
+/// must answer, from `config` alone, exactly what the source built from that
+/// config declares through `capabilities()` — the load-time gates trust the
+/// descriptor, the pipeline trusts the built source. Also checks the
+/// descriptor's kind against the expected `type:` name.
+pub fn assert_descriptor_matches_source<S: Source + ?Sized>(
+    descriptor: &faucet_core::ConnectorDescriptor,
+    kind: &str,
+    config: &Value,
+    source: &S,
+) {
+    assert_eq!(descriptor.kind(), kind, "descriptor kind");
+    assert_eq!(
+        descriptor.capabilities(config),
+        source.capabilities(),
+        "[{kind}] the descriptor and the built source disagree for config {config}"
+    );
+}
+
+/// The sink counterpart of [`assert_descriptor_matches_source`].
+pub fn assert_descriptor_matches_sink<S: Sink + ?Sized>(
+    descriptor: &faucet_core::ConnectorDescriptor,
+    kind: &str,
+    config: &Value,
+    sink: &S,
+) {
+    assert_eq!(descriptor.kind(), kind, "descriptor kind");
+    assert_eq!(
+        descriptor.capabilities(config),
+        sink.capabilities(),
+        "[{kind}] the descriptor and the built sink disagree for config {config}"
+    );
+}
+
 /// The sink counterpart of [`assert_preflight_check_wellformed`].
 pub async fn assert_sink_preflight_check_wellformed<S: Sink + ?Sized>(
     sink: &S,

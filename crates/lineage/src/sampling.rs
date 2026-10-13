@@ -276,6 +276,9 @@ impl Sink for SamplingSink {
     fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
         self.inner.sink_guarantee()
     }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::decorated_sink(self, &self.inner.capabilities())
+    }
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
@@ -602,6 +605,9 @@ impl Source for SamplingSource {
     }
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()
+    }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::decorated_source(self, &self.inner.capabilities())
     }
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
