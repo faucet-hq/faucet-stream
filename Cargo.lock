@@ -5111,7 +5111,10 @@ dependencies = [
 name = "faucet-common-gcs"
 version = "1.1.2"
 dependencies = [
+ "async-trait",
+ "base64 0.22.1",
  "crc32c",
+ "faucet-common-file",
  "faucet-core",
  "google-cloud-auth",
  "google-cloud-gax",
@@ -5120,7 +5123,9 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
  "urlencoding",
  "wiremock",
 ]
@@ -5747,16 +5752,12 @@ name = "faucet-sink-gcs"
 version = "1.4.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "base64 0.22.1",
- "bytes",
  "faucet-common-file",
  "faucet-common-gcs",
  "faucet-conformance",
  "faucet-core",
  "futures",
- "google-cloud-gax",
- "google-cloud-storage",
  "parquet 58.3.0",
  "reqwest 0.13.3",
  "schemars 1.2.1",
@@ -5765,9 +5766,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
- "tracing",
  "urlencoding",
- "uuid",
  "wiremock",
 ]
 
