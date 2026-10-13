@@ -1,0 +1,5 @@
+faucet-sink-file: local filesystem only, no backend round trip to bound
+faucet-sink-jsonl: deprecated local file sink, no backend round trip to bound
+faucet-sink-csv: deprecated local file sink, no backend round trip to bound
+faucet-source-csv: deprecated local file source, no backend round trip to bound
+faucet-sink-stdout: writes to the process's own stdout/stderr, no backend round trip to bound
