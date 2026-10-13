@@ -6233,23 +6233,28 @@ mod tests {
     #[test]
     fn body_round_trips_the_row_account() {
         let mut rec = RunRecord::queued("r1".into(), None, Default::default(), None, Utc::now());
-        let inv: crate::serve::history::InvocationRecord = serde_json::from_value(serde_json::json!({
-            "row_id": "r",
-            "parent_record_key": null,
-            "records_written": 2,
-            "error": null,
-            "rows": { "offered": 3, "accepted": 2, "failed": 1 }
-        }))
-        .unwrap();
+        let inv: crate::serve::history::InvocationRecord =
+            serde_json::from_value(serde_json::json!({
+                "row_id": "r",
+                "parent_record_key": null,
+                "records_written": 2,
+                "error": null,
+                "rows": { "offered": 3, "accepted": 2, "failed": 1 }
+            }))
+            .unwrap();
         rec.invocations.push(inv);
         let decoded = decode_body(&encode_body(&rec).unwrap()).unwrap();
         let rows = decoded.invocations[0].rows.expect("rows persisted");
         assert_eq!((rows.offered, rows.accepted, rows.failed), (3, 2, 1));
-        let old: crate::serve::history::InvocationRecord = serde_json::from_value(serde_json::json!({
-            "row_id": "r", "parent_record_key": null, "records_written": 0, "error": null
-        }))
-        .unwrap();
-        assert!(old.rows.is_none(), "a record written before #879 still loads");
+        let old: crate::serve::history::InvocationRecord =
+            serde_json::from_value(serde_json::json!({
+                "row_id": "r", "parent_record_key": null, "records_written": 0, "error": null
+            }))
+            .unwrap();
+        assert!(
+            old.rows.is_none(),
+            "a record written before #879 still loads"
+        );
     }
 
     /// A minimal [`sqlx::error::DatabaseError`] so the `Database` arm can be

@@ -68,7 +68,10 @@ fn plugin_connectors_are_confined_from_their_schema() {
 
     assert!(source_is_sandboxed("boxed-sql") && sink_is_sandboxed("boxed-sink"));
     assert!(!source_is_sandboxed("plugin-tap") && !source_is_sandboxed("no-such-kind"));
-    assert_eq!(&*sandbox_fields(true, "boxed-sql"), &["lockdown".to_string()]);
+    assert_eq!(
+        &*sandbox_fields(true, "boxed-sql"),
+        &["lockdown".to_string()]
+    );
 
     let mut cfg = PipelineConfig::from_text(
         "version: 1\npipeline:\n  source: { type: boxed-sql, config: { query: x, lockdown: false } }\n  sink: { type: boxed-sink, config: {} }\n",
@@ -80,7 +83,8 @@ fn plugin_connectors_are_confined_from_their_schema() {
     assert_eq!(p.source.as_ref().unwrap().config["lockdown"], true);
     assert_eq!(p.sink.as_ref().unwrap().config["lockdown"], true);
 
-    let doc = json!({"pipeline": {"source": {"type": "plugin-tap"}, "sink": {"type": "boxed-sink"}}});
+    let doc =
+        json!({"pipeline": {"source": {"type": "plugin-tap"}, "sink": {"type": "boxed-sink"}}});
     assert_eq!(
         subprocess_kinds_in(&doc).into_iter().collect::<Vec<_>>(),
         vec!["plugin-tap".to_string()]

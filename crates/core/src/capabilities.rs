@@ -684,7 +684,11 @@ mod tests {
         let off = c.to_builder().columnar(false).build();
         assert!(!off.columnar());
         assert!(!c.table_routing() && !c.read_side_effects());
-        let cdc = c.to_builder().table_routing(true).read_side_effects(true).build();
+        let cdc = c
+            .to_builder()
+            .table_routing(true)
+            .read_side_effects(true)
+            .build();
         assert!(cdc.table_routing() && cdc.read_side_effects());
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["schema_report"], "drops_unknown_fields");

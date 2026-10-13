@@ -43,7 +43,8 @@ impl BodyOrigin {
 /// from the same schema `faucet schema` prints, so a plugin connector that
 /// declares one is confined like a built-in.
 pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
-    type Cache = std::sync::RwLock<std::collections::HashMap<(bool, String), std::sync::Arc<[String]>>>;
+    type Cache =
+        std::sync::RwLock<std::collections::HashMap<(bool, String), std::sync::Arc<[String]>>>;
     static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let key = (is_source, kind.to_string());
@@ -1532,7 +1533,10 @@ mod tests {
     fn sandboxed_kinds_are_read_from_the_schema() {
         assert_eq!(&*sandbox_fields(true, "sqlite"), &["sandbox".to_string()]);
         assert!(source_is_sandboxed("sqlite"));
-        assert!(!sink_is_sandboxed("sqlite"), "the sqlite sink runs no caller SQL");
+        assert!(
+            !sink_is_sandboxed("sqlite"),
+            "the sqlite sink runs no caller SQL"
+        );
         assert!(!source_is_sandboxed("no-such-kind"));
         let mut cfg = json!({});
         force_override_value(&mut cfg);
@@ -1548,7 +1552,11 @@ mod tests {
         assert!(none.is_none(), "an unconfined kind gets no override block");
     }
 
-    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[test]
     fn every_sql_connector_position_is_sandboxed() {
         let doc = json!({
@@ -1622,7 +1630,11 @@ mod tests {
         assert!(on(&b.dlq.as_ref().unwrap().sink.config));
     }
 
-    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[test]
     fn topology_nodes_fan_out_sources_and_the_mirror_snapshot_are_sandboxed() {
         let topo = json!({
@@ -1697,7 +1709,11 @@ mod tests {
         assert!(!BodyOrigin::ServerFile.confines_sql());
     }
 
-    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[tokio::test]
     async fn a_loaded_submission_is_sandboxed_unless_it_came_from_a_server_file() {
         let body = json!({
@@ -2125,7 +2141,11 @@ schedule:
         assert!(refuse_server_paths(&fine, &[], caller).is_ok());
     }
 
-    #[cfg(all(feature = "source-duckdb", feature = "sink-duckdb", feature = "source-sqlite"))]
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[test]
     fn bound_probes_and_the_verify_destination_are_sandboxed() {
         let mut cfg = cfg_of(

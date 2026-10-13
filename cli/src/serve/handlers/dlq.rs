@@ -314,7 +314,11 @@ struct ReplayRecord {
 impl ReplayRecord {
     /// Write the replay's terminal state. A failed write is logged: the
     /// replay itself already finished.
-    async fn finish(mut self, outcome: &Result<dlq_replay::ReplayOutcome, CliError>, cancelled: bool) {
+    async fn finish(
+        mut self,
+        outcome: &Result<dlq_replay::ReplayOutcome, CliError>,
+        cancelled: bool,
+    ) {
         let Some(mut rec) = self.rec.take() else {
             return;
         };
@@ -621,7 +625,10 @@ mod tests {
         assert_eq!(rec.status, RunStatus::Running);
         assert_eq!(rec.replay_of.as_deref(), Some("/dlq"));
         assert_eq!(rec.tenant.as_deref(), Some("acme"));
-        assert_eq!(rec.labels.get(LABEL_DLQ_REPLAY).map(String::as_str), Some("true"));
+        assert_eq!(
+            rec.labels.get(LABEL_DLQ_REPLAY).map(String::as_str),
+            Some("true")
+        );
 
         let req: crate::serve::runner::SubmitRequest =
             serde_json::from_value(serde_json::json!({"config": "x"})).unwrap();
@@ -657,9 +664,13 @@ mod tests {
         let state = tenant_state(Some(1)).await;
         let mut req = request(cfg, from.clone());
         req.id = Some("rp-2".into());
-        let out = replay(State(state.clone()), Extension(actor(Some("acme"))), Json(req))
-            .await
-            .unwrap();
+        let out = replay(
+            State(state.clone()),
+            Extension(actor(Some("acme"))),
+            Json(req),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.0["tenant"], "acme");
         let rec = state.history().get("rp-2").await.unwrap().unwrap();
         assert_eq!(rec.status, RunStatus::Completed);
