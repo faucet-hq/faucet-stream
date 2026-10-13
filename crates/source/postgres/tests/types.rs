@@ -47,12 +47,13 @@ async fn types_without_a_native_decode_are_read_as_text() {
         rows[0],
         json!({
             "id": 1, "tags": "{a,b}", "m": "happy", "span": "1 day 02:00:00",
-            "addr": "10.0.0.1", "cash": "$12.50", "f": "NaN", "n": "NaN",
+            "addr": "10.0.0.1", "cash": "12.50", "f": null, "n": null,
             "at": "24:00:00", "tz": "10:00:00+02", "r": "[1,5)", "x": "<a/>",
             "b": "AAE=", "missing": null
         })
     );
-    assert_eq!(rows[1]["f"], json!("-Infinity"));
+    // MONEY reads as its exact amount; NaN / ±Infinity as a counted null (#885).
+    assert_eq!(rows[1]["f"], json!(null));
     assert_eq!(rows[1]["n"], json!("1.50"));
     assert_eq!(rows[1]["tags"], json!(null));
 
@@ -90,7 +91,8 @@ async fn types_without_a_native_decode_are_read_as_text() {
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
 
     // #862 L-073: the fallback decoder (duplicate names skip the text cast)
-    // never renders a NUMERIC in exponent notation.
+    // never renders a NUMERIC in exponent notation, and keeps the declared
+    // scale (#885) as the server's own text output does.
     let tiny = PostgresSource::new(PostgresSourceConfig::new(
         &url,
         "SELECT 0.0000001::numeric(20,10) AS n, 0.0000001::numeric(20,10) AS n",
@@ -98,7 +100,7 @@ async fn types_without_a_native_decode_are_read_as_text() {
     .await
     .expect("source");
     let row = &tiny.fetch_all().await.expect("fetch")[0];
-    assert_eq!(row["n"], json!("0.00000010"));
+    assert_eq!(row["n"], json!("0.0000001000"));
 
     // #862 M-066: a trailing semicolon or line comment survives the text-cast
     // wrapper a NUMERIC column triggers.
@@ -149,7 +151,7 @@ async fn infinite_dates_reals_and_partitions() {
         json!({"d": "-infinity", "ts": "-infinity", "tz": "infinity", "r": null})
     );
     assert_eq!(rows[2]["d"], json!("2024-01-02"));
-    assert_eq!(rows[2]["r"], json!("NaN"));
+    assert_eq!(rows[2]["r"], json!(null));
 
     let names: Vec<String> = source
         .discover()

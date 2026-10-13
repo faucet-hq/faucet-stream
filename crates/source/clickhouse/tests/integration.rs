@@ -330,9 +330,10 @@ async fn datetimes_carry_their_zone_and_denormals_survive() {
     .expect("source");
     let rows = source.fetch_all().await.expect("fetch_all");
     assert_eq!(rows[0]["at"], json!("2024-01-01T04:30:00Z"));
-    assert_eq!(rows[0]["f"], json!("nan"));
-    assert_eq!(rows[1]["f"], json!("inf"));
-    assert_eq!(rows[2]["f"], json!("-inf"));
+    // NaN and the infinities have no JSON number: a counted null (#885).
+    assert_eq!(rows[0]["f"], json!(null));
+    assert_eq!(rows[1]["f"], json!(null));
+    assert_eq!(rows[2]["f"], json!(null));
 
     let incremental = ClickHouseSource::new(
         ClickHouseSourceConfig::new(
