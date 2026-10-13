@@ -710,15 +710,15 @@ mod tests {
         );
         let dlq = c.pipeline.dlq.clone().unwrap();
         let config = crate::executor::build_dlq_config(&dlq).await.unwrap();
-        let err = topology_dlq(
+        let Err(err) = topology_dlq(
             &Governance::new(),
             &c,
             &["w", "default", "stdout"],
             &dlq,
             config,
-        )
-        .err()
-        .expect("a bad rule is refused");
+        ) else {
+            panic!("a bad rule is refused");
+        };
         assert!(err.to_string().contains("masking"), "{err}");
     }
 

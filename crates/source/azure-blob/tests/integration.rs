@@ -566,13 +566,10 @@ async fn missing_blobs_spent_contexts_and_recorded_roundtrips() {
         .expect("source new");
         let ctx = HashMap::new();
         let mut batches = missing.stream_batches(&ctx, 100);
-        let err = batches
-            .next()
-            .await
-            .expect("an item")
-            .err()
-            .expect("a missing blob fails")
-            .to_string();
+        let Some(Err(err)) = batches.next().await else {
+            panic!("a missing blob fails");
+        };
+        let err = err.to_string();
         assert!(err.contains("azure head error"), "{err}");
     }
 
