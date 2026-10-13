@@ -52,8 +52,29 @@
 //! 13. [`assert_cancellation_flushes`] — a mid-run cancel stops at a page
 //!     boundary and flushes the sink, so buffered output survives (#146 H16).
 //!
+//! Declared-capability checks (RFC 0013, #878) — each proves a sink behaves as
+//! a capability it declares says it does:
+//! 15. [`assert_partial_outcomes_truthful`] — `write_batch_partial` reports one
+//!     outcome per row and an `Ok` row is in the destination.
+//! 16. [`assert_reported_rows_truthful`] — `write_batch_reported` accounts for
+//!     every row offered and `accepted` equals what landed.
+//! 17. [`assert_replay_safe`] — a replay-safe plain write retried after a lost
+//!     response does not duplicate rows.
+//! 18. [`assert_overwrite_lifecycle`] — `write_mode: overwrite` stages until
+//!     commit, and an abort leaves the destination as it was.
+//! 19. [`assert_batch_atomicity_truthful`] — a failed write of a batch
+//!     declared atomic lands no row; a per-row batch lands exactly its `Ok`
+//!     rows.
+//!
 //! Each check has both a passing and a `#[should_panic]` failing test in this
 //! crate — a check that cannot fail is worthless.
+//!
+//! # Which checks a connector must run
+//!
+//! [`required::REQUIREMENTS`] maps each declared capability to the assertions
+//! that prove it; `scripts/conformance-coverage.py` fails CI when a built-in
+//! connector declares a capability and its `tests/conformance.rs` calls none
+//! of them.
 //!
 //! # Reliability suites
 //!
@@ -83,13 +104,20 @@
 //! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule.
 
 pub mod calls;
+mod checks;
 #[cfg(feature = "containers")]
 pub mod containers;
 pub mod doubles;
 pub mod fidelity;
 pub mod forwarding;
 pub mod hung;
+pub mod required;
 pub mod scripted;
+
+pub use checks::{
+    assert_batch_atomicity_truthful, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
+    assert_replay_safe, assert_reported_rows_truthful,
+};
 
 use std::collections::HashMap;
 

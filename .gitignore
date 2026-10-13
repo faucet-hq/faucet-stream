@@ -70,6 +70,8 @@ docs/superpowers/
 !/scripts/test_example_coverage.py
 !/scripts/plugin-version.py
 !/scripts/test_plugin_version.py
+!/scripts/conformance-coverage.py
+!/scripts/test_conformance_coverage.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
 /.bench-venv/

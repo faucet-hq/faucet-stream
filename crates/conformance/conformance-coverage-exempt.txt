@@ -1,0 +1,24 @@
+# Declared capabilities whose conformance assertion a connector's
+# tests/conformance.rs does not call, each with the reason (#878, RFC 0013).
+# Format: `<crate> <requirement-id>: <reason>`. Requirement ids are the `id`s of
+# faucet_conformance::required::REQUIREMENTS; `scripts/conformance-coverage.py`
+# fails on an entry that does not apply or is already met. The call-deadline
+# requirement reads crates/conformance/call-deadline-exempt.txt instead.
+
+# Connectors that open a connection inside `new()`: they cannot be built
+# without a backend, so `src/descriptor.rs` unit tests pin every capability for
+# every config branch and faucet-cli's `registry_capability_parity` test probes
+# them whenever they build (see the faucet-conformance README).
+faucet-source-postgres descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-source-mysql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-source-mssql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-source-oracle descriptor: connects in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
+faucet-source-mysql-cdc descriptor: connection preflight in new(); pinned by src/descriptor.rs unit tests
+faucet-source-mssql-cdc descriptor: connection preflight in new(); pinned by src/descriptor.rs unit tests
+faucet-source-oracle-cdc descriptor: connection preflight in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
+faucet-source-mongodb-cdc descriptor: `hello` round trip in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-postgres descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-mysql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-mssql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
+faucet-sink-oracle descriptor: connects in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
+faucet-sink-redis descriptor: the connection manager opens in new(); pinned by src/descriptor.rs unit tests
