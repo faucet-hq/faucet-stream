@@ -88,6 +88,8 @@ async fn cdc_captures_crud_then_resumes_without_replay() {
     }
 
     let source = MongoCdcSource::new(config(&uri)).await.expect("source");
+    let caps = source.capabilities();
+    assert!(caps.reports_lag() && caps.table_routing());
 
     // Concurrent writer: wait for the stream to open, then c / u / d on _id=1.
     let writer_uri = uri.clone();
