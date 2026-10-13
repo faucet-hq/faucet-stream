@@ -75,6 +75,7 @@ pub mod shard;
 pub mod stage;
 pub mod staging;
 pub mod state;
+pub mod state_key;
 pub mod state_version;
 pub mod tls;
 pub mod topology;
@@ -217,6 +218,7 @@ pub use staging::{
     StagingSpec, serialize_records,
 };
 pub use state::{FileStateStore, MemoryStateStore, StateExport, StateStore};
+pub use state_key::{KEY_SCHEME_VERSION, KeyMigration, KeySuffix, StateKey, migrate_state_key};
 pub use state_version::{
     ResolvedState, STATE_FORMAT, StateCompat, StoredState, check_compat, peel_versioned,
     resolve_for_source, wrap_versioned,

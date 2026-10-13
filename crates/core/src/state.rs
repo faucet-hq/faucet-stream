@@ -116,7 +116,7 @@ pub const STATE_EXPORT_VERSION: u32 = 1;
 
 /// The key prefix every state key of pipeline `name` starts with.
 pub fn namespace_prefix(pipeline: &str) -> String {
-    format!("{pipeline}::")
+    crate::state_key::StateKey::pipeline(pipeline).children_prefix()
 }
 
 /// A portable snapshot of one pipeline's durable state — every key under its

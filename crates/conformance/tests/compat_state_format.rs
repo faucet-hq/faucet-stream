@@ -348,3 +348,120 @@ fn every_pre_envelope_fixture_still_resolves_as_a_legacy_bookmark() {
         assert_eq!(resolved.data, fixture(name), "{name} is read as-is");
     }
 }
+
+// ── State keys (#882) ────────────────────────────────────────────────────────
+//
+// A bookmark is found by its key. A key rendered differently from the one a
+// release wrote under looks exactly like a first run, so every rendering a
+// scheme produced is frozen here.
+
+fn key_from(entry: &Value) -> faucet_core::StateKey {
+    use faucet_core::{KeySuffix, StateKey};
+    let field = |k: &str| entry.get(k).and_then(Value::as_str);
+    let mut key =
+        StateKey::pipeline(field("pipeline").expect("pipeline")).with_tenant(field("tenant"));
+    if let Some(row) = field("row") {
+        key = key.with_row(row);
+    }
+    if let Some(parent) = field("parent_key") {
+        key = key.with_parent_key(parent);
+    }
+    if let Some(sub) = field("sub") {
+        key = key.with_sub(sub);
+    }
+    if let Some(shard) = field("shard") {
+        key = key.with_shard(shard);
+    }
+    let arg = || field("arg").expect("arg").to_string();
+    if let Some(suffix) = field("suffix") {
+        key = key.with_suffix(match suffix {
+            "sla" => KeySuffix::Sla,
+            "profiling" => KeySuffix::Profiling,
+            "rollback_index" => KeySuffix::RollbackIndex,
+            "rollback_run" => KeySuffix::RollbackRun(arg()),
+            "status" => KeySuffix::Status,
+            "lease" => KeySuffix::Lease,
+            "replication" => KeySuffix::Replication,
+            "backfill" => KeySuffix::Backfill(arg()),
+            "serve_backfill" => KeySuffix::ServeBackfill(arg()),
+            other => panic!("unknown suffix {other}"),
+        });
+    }
+    key
+}
+
+fn key_fixture(name: &str) -> (u32, Vec<Value>) {
+    let doc = fixture(name);
+    let scheme = doc["scheme"].as_u64().expect("scheme") as u32;
+    (scheme, doc["keys"].as_array().expect("keys").clone())
+}
+
+#[test]
+fn every_key_the_current_scheme_wrote_still_renders_the_same() {
+    let (scheme, keys) = key_fixture("key-renderings-v2.json");
+    assert!(scheme <= faucet_core::KEY_SCHEME_VERSION);
+    for entry in &keys {
+        let want = entry["key"].as_str().unwrap();
+        let key = key_from(entry);
+        assert_eq!(
+            key.render_scheme(scheme),
+            want,
+            "{}: scheme {scheme} must keep rendering what it wrote",
+            entry["name"]
+        );
+        assert!(
+            key.render() == want || key.legacy_renderings().iter().any(|k| k == want),
+            "{}: '{want}' is neither the current key nor a key the migration moves from — \
+             a rendering change needs a KEY_SCHEME_VERSION bump and a legacy rendering",
+            entry["name"]
+        );
+        faucet_core::state::validate_state_key(want).unwrap();
+        let (tenant, pipeline) = (
+            entry.get("tenant").and_then(Value::as_str),
+            entry["pipeline"].as_str().unwrap(),
+        );
+        let parsed = faucet_core::StateKey::parse(tenant, pipeline, want)
+            .unwrap_or_else(|| panic!("{want} must parse"));
+        assert_eq!(parsed.render(), want, "parse must round-trip");
+    }
+}
+
+#[test]
+fn every_key_an_earlier_scheme_wrote_is_migrated_from() {
+    let (scheme, keys) = key_fixture("key-renderings-v1.json");
+    assert!(scheme < faucet_core::KEY_SCHEME_VERSION);
+    for entry in &keys {
+        let want = entry["key"].as_str().unwrap();
+        let key = key_from(entry);
+        assert_eq!(key.render_scheme(scheme), want, "{}", entry["name"]);
+        assert!(
+            key.render() == want || key.legacy_renderings().iter().any(|k| k == want),
+            "{}: a bookmark under '{want}' would be orphaned",
+            entry["name"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bookmark_under_an_earlier_key_moves_to_the_current_one() {
+    use faucet_core::StateStore;
+    let store = faucet_core::MemoryStateStore::new();
+    let key = faucet_core::StateKey::invocation("orders", "lines").with_parent_key("x::y");
+    store
+        .put("orders::lines::x::y", &fixture("bare-bookmark-v1.json"))
+        .await
+        .unwrap();
+    let moved = faucet_core::migrate_state_key(&store, &key.render(), &key.legacy_renderings())
+        .await
+        .unwrap();
+    assert_eq!(
+        moved,
+        faucet_core::KeyMigration::Moved {
+            from: "orders::lines::x::y".into()
+        }
+    );
+    assert_eq!(
+        store.get(&key.render()).await.unwrap(),
+        Some(fixture("bare-bookmark-v1.json"))
+    );
+}

@@ -36,7 +36,9 @@ impl ReplicationState {
 
 /// State key holding the replication phase marker.
 pub fn marker_key(pipeline_name: &str) -> String {
-    format!("{pipeline_name}::__replication__")
+    faucet_core::StateKey::pipeline(pipeline_name)
+        .with_suffix(faucet_core::KeySuffix::Replication)
+        .render()
 }
 
 /// State key the CDC node will read/advance (must match the executor's key for

@@ -82,10 +82,13 @@ impl StateScope {
     /// The first segments of every state key: `{namespace}::{pipeline}` or
     /// just the pipeline name.
     pub fn prefix(&self, pipeline_name: &str) -> String {
-        match &self.namespace {
-            Some(ns) => format!("{ns}::{pipeline_name}"),
-            None => pipeline_name.to_string(),
-        }
+        self.key(pipeline_name).namespace()
+    }
+
+    /// The pipeline-level [`StateKey`](faucet_core::StateKey) every key of a
+    /// run of `pipeline_name` is built from.
+    pub fn key(&self, pipeline_name: &str) -> faucet_core::StateKey {
+        faucet_core::StateKey::pipeline(pipeline_name).with_tenant(self.namespace.as_deref())
     }
 }
 
@@ -740,18 +743,13 @@ async fn run_expanded_unredacted(
             match &node.role {
                 NodeRole::Root => {
                     let uses_state = node.state.is_some() || opts.state_path_override.is_some();
-                    let state_key = build_state_key(
-                        &opts.state_scope.prefix(&opts.pipeline_name),
-                        &node.id,
-                        None,
-                    );
+                    let key = opts.state_scope.key(&opts.pipeline_name);
+                    let state_key = key.clone().with_row(node.id.as_str()).render();
                     validate_unit_state_key(&node.id, uses_state, &state_key)?;
                     let legacy_state_keys = node
                         .legacy_state_ids
                         .iter()
-                        .map(|id| {
-                            build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), id, None)
-                        })
+                        .map(|id| key.clone().with_row(id.as_str()).render())
                         .collect();
                     units.push(Unit {
                         node: node.clone(),
@@ -767,11 +765,11 @@ async fn run_expanded_unredacted(
                         // One-level discovery (#501): one invocation; run_unit
                         // intercepts it to enumerate the dimension. State is
                         // unused, so the key is a placeholder.
-                        let state_key = build_state_key(
-                            &opts.state_scope.prefix(&opts.pipeline_name),
-                            &node.id,
-                            None,
-                        );
+                        let state_key = opts
+                            .state_scope
+                            .key(&opts.pipeline_name)
+                            .with_row(node.id.as_str())
+                            .render();
                         units.push(Unit {
                             node: node.clone(),
                             parent_record: None,
@@ -793,11 +791,12 @@ async fn run_expanded_unredacted(
                         for ctx in crate::discovery_matrix::cartesian(&resolved) {
                             let suffix =
                                 crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                            let state_key = build_state_key(
-                                &opts.state_scope.prefix(&opts.pipeline_name),
-                                &node.id,
-                                Some(&suffix),
-                            );
+                            let state_key = opts
+                                .state_scope
+                                .key(&opts.pipeline_name)
+                                .with_row(node.id.as_str())
+                                .with_sub(suffix.as_str())
+                                .render();
                             units.push(Unit {
                                 node: node.clone(),
                                 parent_record: None,
@@ -840,11 +839,12 @@ async fn run_expanded_unredacted(
                         crate::discovery_matrix::inject_collected(&mut ctx, &collected_dims);
                         let suffix =
                             crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                        let state_key = build_state_key(
-                            &opts.state_scope.prefix(&opts.pipeline_name),
-                            &node.id,
-                            Some(&suffix),
-                        );
+                        let state_key = opts
+                            .state_scope
+                            .key(&opts.pipeline_name)
+                            .with_row(node.id.as_str())
+                            .with_sub(suffix.as_str())
+                            .render();
                         if let Err(e) =
                             check_unit_state_key(&node.id, uses_state, &state_key, &mut seen_keys)
                         {
@@ -888,7 +888,7 @@ async fn run_expanded_unredacted(
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
                         let (state_key, legacy_state_keys) = child_state_keys(
-                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            opts.state_scope.key(&opts.pipeline_name),
                             &node.id,
                             &pk_string,
                         );
@@ -1932,57 +1932,37 @@ fn boxed_run_one_invocation<'a>(
 /// The durable store the run lease and run-outcome marker are written to —
 /// `None` for preview / `--limit` / shard runs and memory or absent state,
 /// whose markers would describe nothing durable.
-/// A child invocation's state key, and the key releases before #840 used —
-/// the parent-key value verbatim — when that differs and is a valid key
-/// (#862 M-021).
-fn child_state_keys(prefix: &str, row: &str, parent_key: &str) -> (String, Vec<String>) {
-    let current = build_state_key(
-        prefix,
-        row,
-        Some(&crate::discovery_matrix::state_key_component(
-            parent_key, true,
-        )),
-    );
-    let verbatim = build_state_key(prefix, row, Some(parent_key));
-    let legacy = (verbatim != current && faucet_core::state::validate_state_key(&verbatim).is_ok())
-        .then_some(verbatim)
-        .into_iter()
-        .collect();
-    (current, legacy)
+/// A child invocation's state key, and the keys earlier key schemes rendered
+/// for it (the pre-#840 verbatim parent key, #862 M-021).
+fn child_state_keys(
+    base: impl Into<StateKeyBase>,
+    row: &str,
+    parent_key: &str,
+) -> (String, Vec<String>) {
+    let key = base.into().0.with_row(row).with_parent_key(parent_key);
+    (key.render(), key.legacy_renderings())
 }
 
-/// Move a bookmark stored under a key an earlier release used to `key`, when
-/// `key` holds none (#862 M-021/M-025). A failure leaves both keys as they were.
+/// The pipeline-level key a child key is built from.
+struct StateKeyBase(faucet_core::StateKey);
+
+impl From<faucet_core::StateKey> for StateKeyBase {
+    fn from(k: faucet_core::StateKey) -> Self {
+        Self(k)
+    }
+}
+
+impl From<&str> for StateKeyBase {
+    fn from(pipeline: &str) -> Self {
+        Self(faucet_core::StateKey::pipeline(pipeline))
+    }
+}
+
+/// Move a bookmark an earlier key scheme or a renamed row left behind to `key`,
+/// when `key` holds none (#882). A failure leaves both keys as they were.
 async fn adopt_legacy_state(store: &dyn StateStore, key: &str, legacy: &[String]) {
-    if legacy.is_empty() {
-        return;
-    }
-    match store.get(key).await {
-        Ok(None) => {}
-        Ok(Some(_)) => return,
-        Err(e) => {
-            tracing::warn!(key, error = %e, "state unreadable; legacy state key not checked");
-            return;
-        }
-    }
-    for old in legacy {
-        let value = match store.get(old).await {
-            Ok(Some(v)) => v,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(key = %old, error = %e, "legacy state key unreadable");
-                return;
-            }
-        };
-        if let Err(e) = store.put(key, &value).await {
-            tracing::warn!(key, error = %e, "could not move state from its legacy key");
-            return;
-        }
-        if let Err(e) = store.delete(old).await {
-            tracing::warn!(key = %old, error = %e, "legacy state key could not be removed");
-        }
-        tracing::info!(from = %old, to = key, "moved state from the key an earlier release used");
-        return;
+    if let Err(e) = faucet_core::migrate_state_key(store, key, legacy).await {
+        tracing::warn!(key, error = %e, "state key migration skipped");
     }
 }
 
@@ -2109,15 +2089,13 @@ async fn run_discovery(
     }
 }
 
-/// Produce `{pipeline_name}::{row_id}` or `{pipeline_name}::{row_id}::{key}`.
-pub(crate) fn build_state_key(
-    pipeline_name: &str,
-    row_id: &str,
-    parent_key: Option<&str>,
-) -> String {
-    match parent_key {
-        None => format!("{pipeline_name}::{row_id}"),
-        Some(k) => format!("{pipeline_name}::{row_id}::{k}"),
+/// `{pipeline_name}::{row_id}` or `{pipeline_name}::{row_id}::{sub}`, rendered
+/// through [`faucet_core::StateKey`]; `sub` is already in key form.
+pub(crate) fn build_state_key(pipeline_name: &str, row_id: &str, sub: Option<&str>) -> String {
+    let key = faucet_core::StateKey::invocation(pipeline_name, row_id);
+    match sub {
+        None => key.render(),
+        Some(sub) => key.with_sub(sub).render(),
     }
 }
 
@@ -2866,7 +2844,9 @@ async fn run_one_invocation(
     // Per-shard bookmark: suffix the state key with the shard id so a reassigned
     // shard resumes where its dead owner left off, independent of sibling shards.
     let effective_state_key = match &opts.shard {
-        Some(shard) => format!("{state_key}::{}", shard.id),
+        Some(shard) => faucet_core::StateKey::from_rendered(state_key)
+            .with_shard(shard.id.as_str())
+            .render(),
         None => state_key.to_owned(),
     };
     if let (Some(hook), Some(spec), Some(_)) = (&opts.state_scope.on_key, &node.state, &state)

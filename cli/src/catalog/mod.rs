@@ -56,10 +56,9 @@ pub struct CatalogHandle {
 impl CatalogHandle {
     /// The pipeline name catalog rows are recorded under.
     pub fn scoped_pipeline(&self, pipeline: &str) -> String {
-        match &self.tenant {
-            Some(t) => format!("{t}::{pipeline}"),
-            None => pipeline.to_string(),
-        }
+        faucet_core::StateKey::pipeline(pipeline)
+            .with_tenant(self.tenant.as_deref())
+            .namespace()
     }
 }
 

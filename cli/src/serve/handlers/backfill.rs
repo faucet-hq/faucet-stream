@@ -92,7 +92,9 @@ struct SubmittedRange {
 }
 
 fn submitted_range_key(base_name: &str, hash: &str) -> String {
-    format!("{base_name}::__serve_backfill__::{hash}")
+    faucet_core::StateKey::pipeline(base_name)
+        .with_suffix(faucet_core::KeySuffix::ServeBackfill(hash.to_owned()))
+        .render()
 }
 
 fn unit_idempotency_key(hash: &str, generation: u32, unit: &str) -> String {

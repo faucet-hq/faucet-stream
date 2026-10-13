@@ -28,7 +28,7 @@ test checks and which stays green through a real regression.
 | Tier | What it covers | Docker? | Runs |
 |---|---|---|---|
 | **Engine guarantees** | Bookmark ordering, exactly-once (both mechanisms), overwrite atomicity, cleanup safety, cancel-still-flushes, panic isolation on every transfer path | No | Every PR, **required** |
-| **State compatibility** | Bookmarks / exactly-once envelopes / versioned state envelopes / commit tokens written by a release still load; an older bookmark shape migrates; a newer one is refused | No | Every PR, **required** |
+| **State compatibility** | Bookmarks / exactly-once envelopes / versioned state envelopes / commit tokens written by a release still load; an older bookmark shape migrates; a newer one is refused; every state **key** a release wrote still renders, or is migrated from | No | Every PR, **required** |
 | **Connector conformance** | Per-connector battery (capabilities truthful, bounded memory, idempotent replay, …) | Per connector | Every PR |
 | **Drift policy matrix** | All five `on_drift` policies against a live evolving destination | No | Every PR, **required** |
 | **Containerized integration** | Real databases, Kafka, object stores; CDC replication | Yes | Every PR, reported |
@@ -158,6 +158,19 @@ fixture must still resolve as a legacy schema-0 bookmark. Each resumable
 source (`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, `kafka`,
 `kinesis`) keeps its own released bookmark shapes under
 `crates/source/<kind>/tests/fixtures/state/`, read by its `state_compat.rs`.
+
+State **keys** are frozen the same way (#882). A bookmark is found by its key,
+and a key rendered differently from the one a release wrote under looks exactly
+like a first run — a full re-sync, or a skipped incremental range — with a green
+run. `key-renderings-v<scheme>.json` lists, per key scheme
+(`faucet_core::KEY_SCHEME_VERSION`), each key's components and the key that
+scheme rendered: the current scheme's keys must render byte-for-byte, and every
+key an earlier scheme rendered must be one of `StateKey::legacy_renderings()` —
+the keys the executor's run-start migration moves a bookmark from. Changing a
+rendering without bumping the scheme and keeping the old rendering reachable
+fails these tests. `cli/tests/state_key_construction.rs` complements them: it
+fails when a state key in the CLI or core is assembled with `format!` instead of
+`StateKey`.
 
 ### State migration (`reliability_state_migration`)
 
