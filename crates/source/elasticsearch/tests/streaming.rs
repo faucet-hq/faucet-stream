@@ -471,3 +471,18 @@ async fn a_hung_search_times_out() {
     assert!(source.fetch_all().await.is_err());
     assert!(started.elapsed() < Duration::from_secs(10));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_counts_scroll_calls_on_the_installed_recorder() {
+    let server = MockServer::start().await;
+    mount_paged_responder(
+        &server,
+        PagedResponder::new(vec![ScrollPage {
+            docs: make_docs(0, 3),
+        }]),
+    )
+    .await;
+    let source =
+        ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test")).unwrap();
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+}

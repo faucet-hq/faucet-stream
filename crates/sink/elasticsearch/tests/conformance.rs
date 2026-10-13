@@ -304,3 +304,18 @@ async fn conformance_overwrite_lifecycle() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [{"index": {"status": 201}}]
+        })))
+        .mount(&server)
+        .await;
+    let sink = ElasticsearchSink::new(ElasticsearchSinkConfig::new(server.uri(), "idx")).unwrap();
+    faucet_conformance::calls::assert_sink_records_roundtrips(&sink, &[json!({"id": 1})]).await;
+}
