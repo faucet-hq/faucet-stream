@@ -85,3 +85,53 @@ async fn conformance_descriptor_matches_built_sink() {
         &built,
     );
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+/// A local SQLite catalog over an `s3://` warehouse whose endpoint never
+/// answers: the table's metadata write is the hung backend call.
+#[cfg(feature = "catalog-sql")]
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    use faucet_sink_iceberg::{IcebergSink, IcebergSinkConfig};
+
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let make = || {
+        let db = dir.path().join(format!(
+            "catalog-{}.db",
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let cfg: IcebergSinkConfig = serde_json::from_value(serde_json::json!({
+            "catalog": {
+                "type": "sql",
+                "uri": format!("sqlite:{}?mode=rwc", db.display()),
+                "warehouse": "s3://hung/warehouse",
+                "properties": {
+                    "s3.endpoint": endpoint,
+                    "s3.access-key-id": "k",
+                    "s3.secret-access-key": "s",
+                    "s3.region": "us-east-1",
+                    "s3.path-style-access": "true",
+                    "s3.disable-config-load": "true",
+                    "s3.disable-ec2-metadata": "true"
+                }
+            },
+            "namespace": ["db"],
+            "table": "hung",
+            "create_if_missing": true,
+            "batch_size": 0
+        }))
+        .expect("sink config parse");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(IcebergSink::new(cfg))
+        })
+        .expect("IcebergSink::new")
+    };
+    faucet_conformance::calls::assert_sink_call_deadline(make, &[serde_json::json!({"id": 1})])
+        .await;
+}

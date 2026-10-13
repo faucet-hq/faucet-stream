@@ -35,6 +35,8 @@ fn source_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Source(format!("iceberg: {context}: {e}"))
 }
 
+use faucet_core::CallExt as _;
+
 /// A source that reads an Apache Iceberg table.
 pub struct IcebergSource {
     config: IcebergSourceConfig,
@@ -43,6 +45,9 @@ pub struct IcebergSource {
     catalog: OnceCell<Arc<dyn Catalog>>,
     bookmark: Mutex<Option<i64>>,
     shard: Mutex<Option<HashShard>>,
+    /// Backend-call context (#880): catalog calls, scan planning and every
+    /// batch read run through it.
+    calls: faucet_core::CallSlot,
 }
 
 impl IcebergSource {
@@ -74,6 +79,7 @@ impl IcebergSource {
             catalog,
             bookmark: Mutex::new(None),
             shard: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -85,11 +91,15 @@ impl IcebergSource {
     }
 
     async fn load_table(&self) -> Result<Table, FaucetError> {
-        self.catalog()
-            .await?
-            .load_table(&self.ident)
+        self.calls
+            .call_once("load", async {
+                self.catalog()
+                    .await?
+                    .load_table(&self.ident)
+                    .await
+                    .map_err(|e| source_err(&format!("could not load table {}", self.ident), e))
+            })
             .await
-            .map_err(|e| source_err(&format!("could not load table {}", self.ident), e))
     }
 
     fn plan_options(&self) -> Result<PlanOptions, FaucetError> {
@@ -177,13 +187,17 @@ impl IcebergSource {
             .with_batch_size(self.batch_size())
             .build()
             .map_err(|e| source_err("could not build the table scan", e))?;
-        let tasks: Vec<FileScanTask> = scan
-            .plan_files()
-            .await
-            .map_err(|e| source_err("could not plan the scan", e))?
-            .try_collect()
-            .await
-            .map_err(|e| source_err("could not plan the scan", e))?;
+        let tasks: Vec<FileScanTask> = self
+            .calls
+            .call_once("plan", async {
+                scan.plan_files()
+                    .await
+                    .map_err(|e| source_err("could not plan the scan", e))?
+                    .try_collect()
+                    .await
+                    .map_err(|e| source_err("could not plan the scan", e))
+            })
+            .await?;
         let shard = *self.shard.lock().expect("shard lock");
         let tasks = select_tasks(tasks, added, shard)?;
         tracing::debug!(
@@ -223,10 +237,15 @@ impl IcebergSource {
                         continue;
                     }
                     Step::Full { snapshot_id, checkpoint } => (snapshot_id, None, checkpoint),
-                    Step::Append(id) => (id, Some(self.files_added_by(&table, id).await?), true),
+                    Step::Append(id) => (
+                        id,
+                        Some(self.calls.call_once("plan", self.files_added_by(&table, id)).await?),
+                        true,
+                    ),
                 };
                 let mut batches = self.scan(&table, snapshot_id, added.as_ref()).await?;
-                while let Some(batch) = batches.next().await {
+                let reads = self.calls.get().with_roundtrip_metering(false);
+                while let Some(batch) = batches.next().within_ctx(&reads, "read").await? {
                     let batch = batch.map_err(|e| source_err("read error", e))?;
                     if batch.num_rows() > 0 {
                         yield Event::Batch(batch);
@@ -249,6 +268,17 @@ impl faucet_core::Source for IcebergSource {
 
     fn connector_name(&self) -> &'static str {
         "iceberg"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -294,15 +324,20 @@ impl faucet_core::Source for IcebergSource {
     }
 
     async fn discover(&self) -> Result<Vec<faucet_core::discover::DatasetDescriptor>, FaucetError> {
-        let catalog = self.catalog().await?;
+        let catalog = self.calls.call_once("catalog", self.catalog()).await?;
         let mut queue: Vec<NamespaceIdent> = catalog
             .list_namespaces(None)
-            .await
+            .within(&self.calls, "list")
+            .await?
             .map_err(|e| source_err("could not list namespaces", e))?;
         let mut seen: HashSet<NamespaceIdent> = queue.iter().cloned().collect();
         let mut out = Vec::new();
         while let Some(ns) = queue.pop() {
-            if let Ok(children) = catalog.list_namespaces(Some(&ns)).await {
+            if let Ok(children) = catalog
+                .list_namespaces(Some(&ns))
+                .within(&self.calls, "list")
+                .await?
+            {
                 for child in children {
                     if seen.insert(child.clone()) {
                         queue.push(child);
@@ -311,12 +346,14 @@ impl faucet_core::Source for IcebergSource {
             }
             let tables = catalog
                 .list_tables(&ns)
-                .await
+                .within(&self.calls, "list")
+                .await?
                 .map_err(|e| source_err(&format!("could not list tables in {ns}"), e))?;
             for ident in tables {
                 let table = catalog
                     .load_table(&ident)
-                    .await
+                    .within(&self.calls, "load")
+                    .await?
                     .map_err(|e| source_err(&format!("could not load table {ident}"), e))?;
                 let metadata = table.metadata();
                 let rows = metadata

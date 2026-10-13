@@ -48,6 +48,7 @@
 //! When `create_if_missing: false` the table is loaded at `new()` time; a
 //! missing table produces a `FaucetError::Sink` immediately.
 
+use faucet_core::CallExt as _;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -174,6 +175,9 @@ pub struct IcebergSink {
     config: IcebergSinkConfig,
     catalog: Arc<dyn Catalog>,
     state: Mutex<SinkState>,
+    /// Backend-call context (#880): catalog calls, data-file writes and the
+    /// snapshot commit run through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 impl std::fmt::Debug for IcebergSink {
@@ -217,6 +221,11 @@ impl IcebergSink {
             config,
             catalog,
             state: Mutex::new(SinkState::new(preloaded)),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -278,7 +287,17 @@ impl IcebergSink {
         if let Some(ref table) = state.table {
             return Ok(table.clone());
         }
+        let table = self
+            .calls
+            .call_once("catalog", self.load_or_create_table(records))
+            .await?;
+        state.table = Some(table.clone());
+        Ok(table)
+    }
 
+    /// Load the target table, creating it (and its namespace) from `records`
+    /// when it does not exist.
+    async fn load_or_create_table(&self, records: &[Value]) -> Result<Table, FaucetError> {
         // Table not yet resolved — infer + create.
         let arrow_schema = infer_arrow_schema(records, records.len().min(100))?;
         let iceberg_schema = arrow_to_iceberg_schema(&arrow_schema)?;
@@ -348,8 +367,6 @@ impl IcebergSink {
                     .await
                     .map_err(|e| FaucetError::Sink(format!("iceberg: create_table failed: {e}")))?
             };
-
-        state.table = Some(table.clone());
         Ok(table)
     }
 
@@ -358,8 +375,13 @@ impl IcebergSink {
     async fn ensure_writer(&self, state: &mut SinkState, table: &Table) -> Result<(), FaucetError> {
         if state.writer.is_none() {
             let compression = compression_from_str(&self.config.parquet.compression)?;
-            let writer =
-                TableWriter::new(table, compression, self.config.target_file_size_mb).await?;
+            let writer = self
+                .calls
+                .call_once(
+                    "write",
+                    TableWriter::new(table, compression, self.config.target_file_size_mb),
+                )
+                .await?;
             state.writer = Some(writer);
         }
         Ok(())
@@ -396,7 +418,7 @@ impl IcebergSink {
         for batch in batches {
             row_count += batch.num_rows();
             let writer = state.writer.as_mut().expect("writer is set above");
-            if let Err(e) = writer.write(batch).await {
+            if let Err(e) = self.calls.call_once("write", writer.write(batch)).await {
                 state.poison(&e);
                 return Err(e);
             }
@@ -420,6 +442,12 @@ impl IcebergSink {
     /// data has been written), `Ok(Some(table))` if it exists, or `Err` on a
     /// catalog communication failure.
     async fn load_table_readonly(&self) -> Result<Option<Table>, FaucetError> {
+        self.calls
+            .call_once("catalog", self.read_table_readonly())
+            .await
+    }
+
+    async fn read_table_readonly(&self) -> Result<Option<Table>, FaucetError> {
         let ns = NamespaceIdent::from_strs(self.config.namespace.iter().map(String::as_str))
             .map_err(|e| FaucetError::Sink(format!("iceberg: invalid namespace: {e}")))?;
         let tid = TableIdent::new(ns, self.config.table.clone());
@@ -543,9 +571,25 @@ impl IcebergSink {
             }
         };
 
-        let updated_table = match tx.commit(self.catalog.as_ref()).await {
-            Ok(updated_table) => updated_table,
-            Err(e) => {
+        let committed = tx
+            .commit(self.catalog.as_ref())
+            .within(&self.calls, "commit")
+            .await;
+        let updated_table = match committed {
+            Ok(Ok(updated_table)) => updated_table,
+            Err(spent) => {
+                // The commit may have landed: never clean up after it.
+                maybe_cleanup_orphans(
+                    table.file_io(),
+                    &self.config.table,
+                    self.config.cleanup_orphans_on_failure,
+                    false,
+                    &file_paths,
+                )
+                .await;
+                return Err(spent);
+            }
+            Ok(Err(e)) => {
                 maybe_cleanup_orphans(
                     table.file_io(),
                     &self.config.table,
@@ -702,6 +746,17 @@ impl faucet_core::Sink for IcebergSink {
         "iceberg"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(IcebergSinkConfig))
             .expect("schema serialization infallible")
@@ -750,7 +805,18 @@ impl faucet_core::Sink for IcebergSink {
             Ok(t) => t,
         };
 
-        let probe_result = tokio::time::timeout(ctx.timeout, self.catalog.table_exists(&tid)).await;
+        let probe_result = tokio::time::timeout(
+            ctx.timeout,
+            self.catalog
+                .table_exists(&tid)
+                .within(&self.calls, "catalog"),
+        )
+        .await
+        .map(|r| match r {
+            Ok(Ok(exists)) => Ok(exists),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(spent) => Err(spent.to_string()),
+        });
 
         let probe = match probe_result {
             // The catalog responded — it's reachable, so the probe passes
@@ -852,7 +918,9 @@ impl faucet_core::Sink for IcebergSink {
             .commit(self.catalog.as_ref())
             .await
             .map_err(evolve_schema_err)?;
-        Self::close_writer(&mut state).await?;
+        self.calls
+            .call_once("write", Self::close_writer(&mut state))
+            .await?;
         state.table = Some(evolved);
         Ok(())
     }
@@ -969,7 +1037,9 @@ impl faucet_core::Sink for IcebergSink {
         state.check_poisoned()?;
 
         // Step 1: close the open writer and collect its data files.
-        Self::close_writer(&mut state).await?;
+        self.calls
+            .call_once("write", Self::close_writer(&mut state))
+            .await?;
 
         // Step 2 + 3: commit pending files (or no-op when empty).
         self.commit_pending(&mut state).await?;

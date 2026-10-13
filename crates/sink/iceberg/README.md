@@ -398,6 +398,15 @@ already landed a second time). See
 
 Declares `append`, idempotent writes (exactly-once) and additive schema evolution (`schema_report: reported`). `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+Catalog calls, data-file writes and the snapshot commit run through the
+pipeline's `CallContext` (#880): each is made once (iceberg-rust's own commit
+retry is unchanged), any caller deadline ends it, and each is metered as a round
+trip (`catalog`, `write`, `commit`). A commit the deadline cut short is treated
+as ambiguous: its data files are never cleaned up, whatever
+`cleanup_orphans_on_failure` says.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
