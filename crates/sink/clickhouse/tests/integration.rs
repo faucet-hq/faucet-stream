@@ -460,3 +460,30 @@ async fn a_later_field_becomes_a_column_or_fails_loudly() {
         .expect_err("no column for the field");
     assert!(err.to_string().contains("surprise"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inserts_are_metered_on_the_installed_recorder() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE metered (id UInt32) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "metered")).expect("sink");
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "clickhouse",
+        )
+        .with_meter(meter.clone()),
+    ));
+    sink.write_batch(&[json!({"id": 1})]).await.expect("write");
+    sink.flush().await.expect("flush");
+    assert_eq!(count_of(&base, "SELECT count() AS n FROM metered").await, 1);
+    let trips = meter.snapshot().sink_roundtrips;
+    assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
+}

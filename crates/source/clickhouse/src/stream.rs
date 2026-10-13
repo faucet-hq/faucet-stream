@@ -100,20 +100,8 @@ async fn next_chunk<S>(
 where
     S: futures::Stream + Unpin,
 {
-    let mut read = Some(body.next());
-    calls
-        .call("read", || {
-            let attempt = read.take();
-            async move {
-                match attempt {
-                    Some(f) => Ok(f.await),
-                    None => Err(FaucetError::Source(
-                        "ClickHouse: a body read is not retried".into(),
-                    )),
-                }
-            }
-        })
-        .await
+    let read = body.next();
+    calls.call_once("read", async { Ok(read.await) }).await
 }
 
 /// The user-facing incremental-cursor token, normalised into a `{key}`
