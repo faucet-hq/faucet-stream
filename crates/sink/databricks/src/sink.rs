@@ -327,21 +327,10 @@ impl DatabricksSink {
         };
         let stager = self.stager(loc)?;
         let path = loc.object_path(&name.rel());
-        let mut upload = Some(stager.put(&path, body));
         self.calls
             .get()
             .with_roundtrip_metering(false)
-            .call("stage", || {
-                let attempt = upload.take();
-                async move {
-                    match attempt {
-                        Some(f) => f.await,
-                        None => Err(FaucetError::Sink(
-                            "databricks sink: a staged upload is sent once".into(),
-                        )),
-                    }
-                }
-            })
+            .call_once("stage", stager.put(&path, body))
             .await?;
         let (sql, replay) = make_sql(loc, &name);
         let result = self.exec(sql, replay).await;
