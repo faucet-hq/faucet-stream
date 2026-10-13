@@ -10,16 +10,18 @@ use crate::lineage::{
     Planner, capture_bookmark, detect_gaps, ids_and_parents, stale_empty_shards, start_for,
     unverified_empty_shards,
 };
-use crate::scan::{ScanEvent, expressions, run_segment};
+use crate::scan::{ScanEvent, expressions, run_segment_in};
 use crate::sched::Scheduler;
 use crate::state::{ScanBookmark, SegmentCursor, StreamBookmark, state_key};
 use crate::streams::{
-    IteratorOutcome, ShardEvent, acquire_iterator, describe_shards, peek_oldest, read_slice,
+    IteratorOutcome, ShardEvent, acquire_iterator_in, describe_shards_in, peek_oldest_in,
+    read_slice_in,
 };
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::TableDescription;
 use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use faucet_common_dynamodb::{KeyAttribute, key_of, key_schema, sdk_error_parts};
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, ShardSpec, Stream, StreamPage};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -38,6 +40,7 @@ pub struct DynamoDbSource {
     shard: Mutex<Option<(u32, u32)>>,
     lag: Mutex<LagTracker>,
     lag_warned: std::sync::atomic::AtomicBool,
+    calls: CallSlot,
 }
 
 /// Parse a `{segment, total_segments}` shard descriptor. Pure.
@@ -69,11 +72,15 @@ pub(crate) fn plan_segment_shards(total: u32) -> Vec<ShardSpec> {
         .collect()
 }
 
-/// Sleep until `at`, or forever when there is nothing to wait for.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
-async fn sleep_until(at: Option<Instant>) {
+/// Wait until `at` through `calls` (ended by its cancel token / deadline),
+/// or forever when there is nothing to wait for.
+async fn wait_until(calls: &CallContext, at: Option<Instant>) -> Result<(), FaucetError> {
     match at {
-        Some(t) => tokio::time::sleep_until(t.into()).await,
+        Some(t) => {
+            calls
+                .wait(t.saturating_duration_since(Instant::now()))
+                .await
+        }
         None => std::future::pending().await,
     }
 }
@@ -106,16 +113,22 @@ impl DynamoDbSource {
             shard: Mutex::new(None),
             lag: Mutex::new(LagTracker::default()),
             lag_warned: std::sync::atomic::AtomicBool::new(false),
+            calls: CallSlot::new(CallContext::new()),
         })
     }
 
     async fn describe_table(&self) -> Result<TableDescription, FaucetError> {
         let out = self
-            .client
-            .describe_table()
-            .table_name(&self.config.table_name)
-            .send()
-            .await
+            .calls
+            .call("describe_table", || async {
+                Ok(self
+                    .client
+                    .describe_table()
+                    .table_name(&self.config.table_name)
+                    .send()
+                    .await)
+            })
+            .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
                     "dynamodb: DescribeTable '{}' failed: {}",
@@ -195,9 +208,11 @@ impl DynamoDbSource {
                 let config = self.config.clone();
                 let exprs = exprs.clone();
                 let tx = tx.clone();
+                let calls = self.calls.get();
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                    run_segment(client, config, exprs, segment, total, cursor, tx).await;
+                    run_segment_in(calls, client, config, exprs, segment, total, cursor, tx)
+                        .await;
                 }));
             }
             drop(tx);
@@ -254,15 +269,16 @@ impl DynamoDbSource {
     /// Lag from the bookmark, without consuming: peek each open shard's
     /// oldest unread record.
     async fn probe_lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let calls = self.calls.get();
         let arn = self.resolve_stream_arn().await?;
-        let described = describe_shards(&self.streams, &arn).await?;
+        let described = describe_shards_in(&calls, &self.streams, &arn).await?;
         let bm = self
             .start_bookmark()
             .map(|v| StreamBookmark::from_value(&v))
             .unwrap_or_default();
         let mut tracker = LagTracker::default();
         for (shard, start) in probe_starts(&bm, &described, self.config.start_position) {
-            match peek_oldest(&self.streams, &self.config, &arn, &shard, &start).await? {
+            match peek_oldest_in(&calls, &self.streams, &self.config, &arn, &shard, &start).await? {
                 Some(ts) => tracker.observe(&shard, ts),
                 None => tracker.caught_up(&shard),
             }
@@ -280,8 +296,9 @@ impl DynamoDbSource {
         let chunk = chunk_size(self.config.batch_size);
         Box::pin(async_stream::try_stream! {
             self.with_lag(|t| *t = LagTracker::default());
+            let calls = self.calls.get();
             let arn = self.resolve_stream_arn().await?;
-            let described = describe_shards(&self.streams, &arn).await?;
+            let described = describe_shards_in(&calls, &self.streams, &arn).await?;
             let mut bm = self
                 .start_bookmark()
                 .map(|v| StreamBookmark::from_value(&v))
@@ -306,7 +323,7 @@ impl DynamoDbSource {
                 for (id, seq) in bm.shards.iter().filter(|(id, s)| !s.is_empty() && ids.contains(*id)) {
                     let start = crate::lineage::StartAt::After(seq.clone());
                     if let IteratorOutcome::Trimmed =
-                        acquire_iterator(&self.streams, &arn, id, &start).await?
+                        acquire_iterator_in(&calls, &self.streams, &arn, id, &start).await?
                     {
                         gaps.push(format!("shard {id} was trimmed past sequence {seq}"));
                     }
@@ -375,7 +392,8 @@ impl DynamoDbSource {
                     break 'consume;
                 }
                 for lease in sched.dispatch(now) {
-                    workers.spawn(read_slice(
+                    workers.spawn(read_slice_in(
+                        calls.clone(),
                         self.streams.clone(),
                         self.config.clone(),
                         arn.clone(),
@@ -387,10 +405,13 @@ impl DynamoDbSource {
                     break 'consume;
                 }
                 let wakeup = sched.next_wakeup();
-                let event = tokio::select! {
-                    ev = rx.recv() => ev,
-                    _ = sleep_until(wakeup) => continue 'consume,
-                    _ = sleep_until(idle_deadline) => continue 'consume,
+                let woke = tokio::select! {
+                    ev = rx.recv() => Ok(Some(ev)),
+                    r = wait_until(&calls, wakeup) => r.map(|()| None),
+                    r = wait_until(&calls, idle_deadline) => r.map(|()| None),
+                };
+                let Some(event) = woke? else {
+                    continue 'consume;
                 };
                 match event {
                     Some(ShardEvent::Records { shard_id, records }) => {
@@ -429,7 +450,7 @@ impl DynamoDbSource {
                         bm.finish(&shard_id);
                         sched.finished(&shard_id);
                         if !sched.planner().has_children(&shard_id) {
-                            match describe_shards(&self.streams, &arn).await {
+                            match describe_shards_in(&calls, &self.streams, &arn).await {
                                 Ok(fresh) => sched.planner().merge(fresh),
                                 Err(e) => tracing::warn!(error = %e,
                                     "dynamodb streams: shard refresh failed"),
@@ -518,7 +539,7 @@ impl faucet_core::Source for DynamoDbSource {
             return Ok(None);
         }
         let arn = self.resolve_stream_arn().await?;
-        let described = describe_shards(&self.streams, &arn).await?;
+        let described = describe_shards_in(&self.calls.get(), &self.streams, &arn).await?;
         Ok(Some(capture_bookmark(&arn, &described).to_value()))
     }
 
@@ -602,11 +623,16 @@ impl faucet_core::Source for DynamoDbSource {
         let mut start: Option<String> = None;
         loop {
             let out = self
-                .client
-                .list_tables()
-                .set_exclusive_start_table_name(start.clone())
-                .send()
-                .await
+                .calls
+                .call("list_tables", || async {
+                    Ok(self
+                        .client
+                        .list_tables()
+                        .set_exclusive_start_table_name(start.clone())
+                        .send()
+                        .await)
+                })
+                .await?
                 .map_err(|e| {
                     FaucetError::Source(format!(
                         "dynamodb: ListTables failed: {}",
@@ -622,11 +648,11 @@ impl faucet_core::Source for DynamoDbSource {
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             let desc = self
-                .client
-                .describe_table()
-                .table_name(&name)
-                .send()
-                .await
+                .calls
+                .call("describe_table", || async {
+                    Ok(self.client.describe_table().table_name(&name).send().await)
+                })
+                .await?
                 .map_err(|e| {
                     FaucetError::Source(format!(
                         "dynamodb: DescribeTable '{name}' failed: {}",
@@ -645,6 +671,17 @@ impl faucet_core::Source for DynamoDbSource {
 
     fn connector_name(&self) -> &'static str {
         "dynamodb"
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn record_table(&self, record: &Value) -> Option<String> {
@@ -719,14 +756,25 @@ impl faucet_core::Source for DynamoDbSource {
                     "table has no stream — enable DynamoDB Streams (NEW_AND_OLD_IMAGES)",
                 ),
                 Some(arn) => {
-                    let fut = self
-                        .streams
-                        .describe_stream()
-                        .stream_arn(arn)
-                        .limit(1)
-                        .send();
-                    match tokio::time::timeout(ctx.timeout, fut).await {
-                        Err(_) => Probe::fail("describe_stream", start.elapsed(), "timed out"),
+                    let sent = self
+                        .calls
+                        .get()
+                        .with_timeout(ctx.timeout)
+                        .call("describe_stream", || async {
+                            Ok(self
+                                .streams
+                                .describe_stream()
+                                .stream_arn(&arn)
+                                .limit(1)
+                                .send()
+                                .await)
+                        })
+                        .await;
+                    match sent {
+                        Err(FaucetError::Timeout { .. }) => {
+                            Probe::fail("describe_stream", start.elapsed(), "timed out")
+                        }
+                        Err(e) => Probe::fail("describe_stream", start.elapsed(), e.to_string()),
                         Ok(Ok(_)) => Probe::pass("describe_stream", start.elapsed()),
                         Ok(Err(e)) => {
                             Probe::fail("describe_stream", start.elapsed(), sdk_error_parts(&e).1)
@@ -951,6 +999,7 @@ mod tests {
             shard: Mutex::new(None),
             lag: Mutex::new(LagTracker::default()),
             lag_warned: std::sync::atomic::AtomicBool::new(false),
+            calls: CallSlot::default(),
         }
     }
 

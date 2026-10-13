@@ -9,6 +9,7 @@ use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use faucet_common_dynamodb::{ErrorClass, classify_error, sdk_error_parts};
 use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -63,20 +64,35 @@ pub(crate) fn iterator_request(start: &StartAt) -> (ShardIteratorType, Option<St
     }
 }
 
-/// Enumerate every shard of a stream (paged `DescribeStream`).
+/// [`describe_shards_in`] outside a run.
+#[cfg(test)]
 pub(crate) async fn describe_shards(
+    client: &StreamsClient,
+    stream_arn: &str,
+) -> Result<Vec<ShardInfo>, FaucetError> {
+    describe_shards_in(&CallContext::new(), client, stream_arn).await
+}
+
+/// Enumerate every shard of a stream (paged `DescribeStream`), each page a
+/// `describe_stream` call through `calls`.
+pub(crate) async fn describe_shards_in(
+    calls: &CallContext,
     client: &StreamsClient,
     stream_arn: &str,
 ) -> Result<Vec<ShardInfo>, FaucetError> {
     let mut shards = Vec::new();
     let mut start: Option<String> = None;
     loop {
-        let out = client
-            .describe_stream()
-            .stream_arn(stream_arn)
-            .set_exclusive_start_shard_id(start.clone())
-            .send()
-            .await
+        let out = calls
+            .call("describe_stream", || async {
+                Ok(client
+                    .describe_stream()
+                    .stream_arn(stream_arn)
+                    .set_exclusive_start_shard_id(start.clone())
+                    .send()
+                    .await)
+            })
+            .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
                     "dynamodb streams: DescribeStream {stream_arn} failed: {}",
@@ -111,22 +127,38 @@ pub(crate) enum IteratorOutcome {
     Trimmed,
 }
 
-/// Acquire a shard iterator at `start`.
+/// [`acquire_iterator_in`] outside a run.
+#[cfg(test)]
 pub(crate) async fn acquire_iterator(
     client: &StreamsClient,
     stream_arn: &str,
     shard_id: &str,
     start: &StartAt,
 ) -> Result<IteratorOutcome, FaucetError> {
+    acquire_iterator_in(&CallContext::new(), client, stream_arn, shard_id, start).await
+}
+
+/// Acquire a shard iterator at `start` (a `get_shard_iterator` call).
+pub(crate) async fn acquire_iterator_in(
+    calls: &CallContext,
+    client: &StreamsClient,
+    stream_arn: &str,
+    shard_id: &str,
+    start: &StartAt,
+) -> Result<IteratorOutcome, FaucetError> {
     let (kind, seq) = iterator_request(start);
-    match client
-        .get_shard_iterator()
-        .stream_arn(stream_arn)
-        .shard_id(shard_id)
-        .shard_iterator_type(kind)
-        .set_sequence_number(seq)
-        .send()
-        .await
+    match calls
+        .call("get_shard_iterator", || async {
+            Ok(client
+                .get_shard_iterator()
+                .stream_arn(stream_arn)
+                .shard_id(shard_id)
+                .shard_iterator_type(kind.clone())
+                .set_sequence_number(seq.clone())
+                .send()
+                .await)
+        })
+        .await?
     {
         Ok(out) => Ok(IteratorOutcome::Ready(
             out.shard_iterator().map(str::to_string),
@@ -172,11 +204,24 @@ pub(crate) enum ShardEvent {
     },
 }
 
+/// [`read_slice_in`] outside a run.
+#[cfg(test)]
+pub(crate) async fn read_slice(
+    client: StreamsClient,
+    config: DynamoDbSourceConfig,
+    stream_arn: String,
+    lease: Lease,
+    tx: tokio::sync::mpsc::Sender<ShardEvent>,
+) {
+    read_slice_in(CallContext::new(), client, config, stream_arn, lease, tx).await;
+}
+
 /// Read one bounded slice of a shard: up to [`MAX_BATCHES_PER_SLICE`]
 /// batches, ending early when the shard is caught up (requeued after the poll
-/// interval), throttled (requeued after a backoff) or closed.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
-pub(crate) async fn read_slice(
+/// interval), throttled (requeued after a backoff) or closed. Every request
+/// and backoff goes through `calls` (#880).
+pub(crate) async fn read_slice_in(
+    calls: CallContext,
     client: StreamsClient,
     config: DynamoDbSourceConfig,
     stream_arn: String,
@@ -191,7 +236,7 @@ pub(crate) async fn read_slice(
         if lease.position == StartAt::Latest && lease.latest_since_ms.is_none() {
             lease.latest_since_ms = Some(unix_now_ms());
         }
-        match acquire_iterator(&client, &stream_arn, &shard_id, &start).await {
+        match acquire_iterator_in(&calls, &client, &stream_arn, &shard_id, &start).await {
             Ok(IteratorOutcome::Ready(it)) => lease.iterator = it,
             Ok(IteratorOutcome::Trimmed) => {
                 let _ = tx.send(fail(shard_id.clone(), gap_error(&shard_id))).await;
@@ -220,13 +265,24 @@ pub(crate) async fn read_slice(
                 .await;
             return;
         }
-        match client
-            .get_records()
-            .shard_iterator(&current)
-            .limit(config.records_per_request as i32)
-            .send()
-            .await
-        {
+        let response = calls
+            .call("get_records", || async {
+                Ok(client
+                    .get_records()
+                    .shard_iterator(&current)
+                    .limit(config.records_per_request as i32)
+                    .send()
+                    .await)
+            })
+            .await;
+        let response = match response {
+            Ok(r) => r,
+            Err(error) => {
+                let _ = tx.send(fail(shard_id, error)).await;
+                return;
+            }
+        };
+        match response {
             Ok(out) => {
                 attempts = 0;
                 lease.throttles = 0;
@@ -296,7 +352,9 @@ pub(crate) async fn read_slice(
                     Some("ExpiredIteratorException") => {
                         let start = reacquire_position(&lease);
                         lease.replaying_from_trim = replays_from_trim(&lease, &start);
-                        match acquire_iterator(&client, &stream_arn, &shard_id, &start).await {
+                        match acquire_iterator_in(&calls, &client, &stream_arn, &shard_id, &start)
+                            .await
+                        {
                             Ok(IteratorOutcome::Ready(it)) => {
                                 lease.iterator = it;
                                 continue;
@@ -338,7 +396,10 @@ pub(crate) async fn read_slice(
                         attempts += 1;
                         tracing::warn!(shard = %shard_id, error = %message, attempt = attempts,
                             "dynamodb streams: GetRecords failed; retrying");
-                        tokio::time::sleep(delay).await;
+                        if let Err(error) = calls.wait(delay).await {
+                            let _ = tx.send(fail(shard_id, error)).await;
+                            return;
+                        }
                     }
                     _ => {
                         let error = FaucetError::Source(format!(
@@ -353,10 +414,8 @@ pub(crate) async fn read_slice(
     }
 }
 
-/// Peek one record at `start` without consuming anything: the creation time
-/// (ms) of the oldest unread record, or `None` when the shard has nothing
-/// to read. Throttled / transient failures retry per `config.retry`.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
+/// [`peek_oldest_in`] outside a run.
+#[cfg(test)]
 pub(crate) async fn peek_oldest(
     client: &StreamsClient,
     config: &DynamoDbSourceConfig,
@@ -364,19 +423,45 @@ pub(crate) async fn peek_oldest(
     shard_id: &str,
     start: &StartAt,
 ) -> Result<Option<i64>, FaucetError> {
-    let iterator = match acquire_iterator(client, stream_arn, shard_id, start).await? {
+    peek_oldest_in(
+        &CallContext::new(),
+        client,
+        config,
+        stream_arn,
+        shard_id,
+        start,
+    )
+    .await
+}
+
+/// Peek one record at `start` without consuming anything: the creation time
+/// (ms) of the oldest unread record, or `None` when the shard has nothing
+/// to read. Throttled / transient failures retry per `config.retry`.
+pub(crate) async fn peek_oldest_in(
+    calls: &CallContext,
+    client: &StreamsClient,
+    config: &DynamoDbSourceConfig,
+    stream_arn: &str,
+    shard_id: &str,
+    start: &StartAt,
+) -> Result<Option<i64>, FaucetError> {
+    let iterator = match acquire_iterator_in(calls, client, stream_arn, shard_id, start).await? {
         IteratorOutcome::Ready(Some(it)) => it,
         IteratorOutcome::Ready(None) => return Ok(None),
         IteratorOutcome::Trimmed => return Err(gap_error(shard_id)),
     };
     let mut attempt = 0u32;
     loop {
-        match client
-            .get_records()
-            .shard_iterator(&iterator)
-            .limit(1)
-            .send()
-            .await
+        match calls
+            .call("get_records", || async {
+                Ok(client
+                    .get_records()
+                    .shard_iterator(&iterator)
+                    .limit(1)
+                    .send()
+                    .await)
+            })
+            .await?
         {
             Ok(out) => {
                 return Ok(out.records().first().and_then(|r| {
@@ -396,7 +481,9 @@ pub(crate) async fn peek_oldest(
                         "dynamodb streams: lag probe GetRecords on {shard_id} failed: {message}"
                     )));
                 }
-                tokio::time::sleep(config.retry.delay(attempt).min(MAX_THROTTLE_BACKOFF)).await;
+                calls
+                    .wait(config.retry.delay(attempt).min(MAX_THROTTLE_BACKOFF))
+                    .await?;
                 attempt += 1;
             }
         }

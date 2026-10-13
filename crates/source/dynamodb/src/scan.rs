@@ -9,6 +9,7 @@ use faucet_common_dynamodb::{
     item_to_typed_json, json_to_attribute, sdk_error_parts, typed_json_to_item,
 };
 use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -138,8 +139,35 @@ async fn fetch_page(
     })
 }
 
-/// Read one segment to its end, pushing a [`ScanEvent`] per response page.
+/// [`run_segment_in`] outside a run (no call context installed).
+#[cfg(test)]
 pub(crate) async fn run_segment(
+    client: Client,
+    config: DynamoDbSourceConfig,
+    exprs: Expressions,
+    segment: u32,
+    total: u32,
+    cursor: Option<SegmentCursor>,
+    tx: tokio::sync::mpsc::Sender<ScanEvent>,
+) {
+    run_segment_in(
+        CallContext::new(),
+        client,
+        config,
+        exprs,
+        segment,
+        total,
+        cursor,
+        tx,
+    )
+    .await;
+}
+
+/// Read one segment to its end, pushing a [`ScanEvent`] per response page.
+/// Each request is a `scan` / `query` call through `calls` (#880).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_segment_in(
+    calls: CallContext,
     client: Client,
     config: DynamoDbSourceConfig,
     exprs: Expressions,
@@ -160,19 +188,18 @@ pub(crate) async fn run_segment(
     loop {
         let page = config
             .retry
-            .run(&what, || {
-                fetch_page(&client, &config, &exprs, segment, total, start.clone())
-            })
+            .run_in(
+                &calls,
+                config.mode.as_str(),
+                &what,
+                FaucetError::Source,
+                || fetch_page(&client, &config, &exprs, segment, total, start.clone()),
+            )
             .await;
         let page = match page {
             Ok(p) => p,
-            Err(message) => {
-                let _ = tx
-                    .send(ScanEvent::Failed {
-                        segment,
-                        error: FaucetError::Source(message),
-                    })
-                    .await;
+            Err(error) => {
+                let _ = tx.send(ScanEvent::Failed { segment, error }).await;
                 return;
             }
         };

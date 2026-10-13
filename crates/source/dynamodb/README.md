@@ -153,6 +153,16 @@ table with its key attributes as the schema, `ItemCount` as the row estimate and
 
 Declares dataset discovery for every mode; sharding only under `mode: scan` (parallel segments) and lag reporting only under `mode: streams`. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every DynamoDB and DynamoDB Streams request runs through the pipeline's
+`CallContext` (#880): each attempt is bounded by the default 300 s call timeout
+and any caller deadline, the run's cancel token stops an in-flight request, a
+backoff and the shard scheduler's poll wait, and each attempt is metered as a
+round trip (`scan` / `query`, `describe_table`, `list_tables`,
+`describe_stream`, `get_shard_iterator`, `get_records`). The throttle-aware
+`retry:` policy is unchanged; its backoffs wait through the same context.
+
 ## License
 
 MIT OR Apache-2.0
