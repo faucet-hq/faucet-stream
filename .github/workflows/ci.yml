@@ -348,11 +348,21 @@ jobs:
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
-      - name: Run workspace tests
+      - name: Run workspace tests (libraries and connectors)
         # Integration tests boot Docker containers via testcontainers, whose
         # in-process (bollard) image pull intermittently fails. Only that is
         # retried: any other failure — a flaky test included — fails at once.
-        run: scripts/retry-on-image-pull.sh cargo test --workspace --all-features
+        # Split from faucet-cli: building every test binary of the workspace
+        # at once, plus the test containers' images, exhausts the runner disk.
+        run: scripts/retry-on-image-pull.sh cargo test --workspace --exclude faucet-cli --all-features
+      - name: Free disk taken by the library test binaries and containers
+        run: |
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x -delete
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
+      - name: Run workspace tests (faucet-cli)
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-cli --all-features
       - name: Free disk taken by the workspace test binaries
         # The next step rebuilds faucet-cli with other features; the runner
         # runs out of disk if the workspace run's test executables stay.
