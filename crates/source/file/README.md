@@ -224,3 +224,11 @@ let rows = faucet_source_file::read_records("./out/orders.jsonl").await?;
 ## Capabilities
 
 Discovers one dataset per file; shardable except for an `http(s)://` path; columnar (with `arrow`) only for an explicit `format: avro`, `orc` or `parquet`. Not exactly-once. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+An `http(s)://` path is fetched through the pipeline's `CallContext` (#880):
+the run's cancel token stops an in-flight request and the backoff between
+retries, and any caller deadline ends both. `http_retries`, the connect /
+read timeouts and the `get` / `head` round-trip and throttle metrics are
+unchanged. Local paths make no backend calls.

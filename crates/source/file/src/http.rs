@@ -6,6 +6,7 @@
 //! source like the API sources.
 
 use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
 use faucet_core::observability::RecorderSlot;
 use faucet_core::resilience::RetryClass;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -80,12 +81,36 @@ impl HttpFetcher {
         url: &str,
         slot: &RecorderSlot,
     ) -> Result<reqwest::Response, FaucetError> {
-        self.send(reqwest::Method::GET, url, "get", slot).await
+        self.get_in(url, slot, &unbounded()).await
+    }
+
+    /// [`get`](Self::get) with every attempt and backoff made through `calls`
+    /// (#880): the context's cancel token and deadline end it.
+    pub async fn get_in(
+        &self,
+        url: &str,
+        slot: &RecorderSlot,
+        calls: &CallContext,
+    ) -> Result<reqwest::Response, FaucetError> {
+        self.send(reqwest::Method::GET, url, "get", slot, calls)
+            .await
     }
 
     /// `HEAD` the file for its modification time.
     pub async fn head(&self, url: &str, slot: &RecorderSlot) -> Result<HttpMeta, FaucetError> {
-        let resp = self.send(reqwest::Method::HEAD, url, "head", slot).await?;
+        self.head_in(url, slot, &unbounded()).await
+    }
+
+    /// [`head`](Self::head) through `calls` (see [`get_in`](Self::get_in)).
+    pub async fn head_in(
+        &self,
+        url: &str,
+        slot: &RecorderSlot,
+        calls: &CallContext,
+    ) -> Result<HttpMeta, FaucetError> {
+        let resp = self
+            .send(reqwest::Method::HEAD, url, "head", slot, calls)
+            .await?;
         Ok(HttpMeta {
             last_modified_ns: resp
                 .headers()
@@ -101,18 +126,29 @@ impl HttpFetcher {
         url: &str,
         op: &'static str,
         slot: &RecorderSlot,
+        calls: &CallContext,
     ) -> Result<reqwest::Response, FaucetError> {
+        // `slot` counts the round trips; the context bounds them.
+        let calls = calls.clone().with_roundtrip_metering(false);
         let mut attempt = 0u32;
         loop {
             slot.record(op);
-            let result = self
-                .client
-                .send(
-                    self.client
-                        .request(method.clone(), url)
-                        .headers(self.headers.clone()),
+            let result = match calls
+                .call_once(
+                    op,
+                    self.client.send(
+                        self.client
+                            .request(method.clone(), url)
+                            .headers(self.headers.clone()),
+                    ),
                 )
-                .await;
+                .await
+            {
+                Err(spent @ (FaucetError::Cancelled { .. } | FaucetError::Timeout { .. })) => {
+                    return Err(spent);
+                }
+                other => other,
+            };
             let (class, wait, detail) = match result {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
@@ -157,15 +193,19 @@ impl HttpFetcher {
             slot.retry(class);
             if class == RetryClass::RateLimited {
                 let _timer = slot.throttle_wait_timer();
-                #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
-                tokio::time::sleep(wait).await;
+                calls.wait(wait).await?;
             } else {
-                #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
-                tokio::time::sleep(wait).await;
+                calls.wait(wait).await?;
             }
             attempt += 1;
         }
     }
+}
+
+/// The context a fetcher call runs in when the caller gives none: no attempt
+/// bound beyond the client's own timeouts.
+fn unbounded() -> CallContext {
+    CallContext::new().without_timeout()
 }
 
 fn backoff(attempt: u32) -> Duration {

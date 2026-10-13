@@ -74,6 +74,8 @@ pub struct FileSource {
     start: Mutex<Option<Bookmark>>,
     shard: Mutex<Option<HashShard>>,
     roundtrips: RecorderSlot,
+    /// Backend-call context (#880) for `http(s)://` paths.
+    calls: faucet_core::CallSlot,
     #[cfg(feature = "encryption")]
     encryption: Option<faucet_core::CompiledEncryption>,
 }
@@ -98,6 +100,7 @@ impl FileSource {
             start: Mutex::new(None),
             shard: Mutex::new(None),
             roundtrips: RecorderSlot::new(),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
             #[cfg(feature = "encryption")]
             encryption: config
                 .encryption
@@ -147,7 +150,9 @@ impl FileSource {
                 let needs_mtime = matches!(self.by(), Some(IncrementalBy::Mtime))
                     || self.config.stable_for_secs.is_some();
                 let mtime_ns = if needs_mtime {
-                    let meta = http.head(root, &self.roundtrips).await?;
+                    let meta = http
+                        .head_in(root, &self.roundtrips, &self.calls.get())
+                        .await?;
                     Some(meta.last_modified_ns.ok_or_else(|| {
                         FaucetError::Source(format!(
                             "file source: {} sends no Last-Modified header, which `incremental: \
@@ -206,7 +211,9 @@ impl FileSource {
     async fn open_raw(&self, path: &str) -> Result<Reader, FaucetError> {
         Ok(match &self.http {
             Some(http) => {
-                let resp = http.get(path, &self.roundtrips).await?;
+                let resp = http
+                    .get_in(path, &self.roundtrips, &self.calls.get())
+                    .await?;
                 let body = resp
                     .bytes_stream()
                     .map(|r| r.map_err(std::io::Error::other));
@@ -654,6 +661,10 @@ impl faucet_core::Source for FileSource {
         self.roundtrips.install(recorder);
     }
 
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
     fn dataset_uri(&self) -> String {
         if self.http.is_some() {
             return faucet_core::util::redact_uri_credentials(&self.config.path);
@@ -750,7 +761,7 @@ impl faucet_core::Source for FileSource {
         if let Some(http) = &self.http {
             let probe = match tokio::time::timeout(
                 ctx.timeout,
-                http.head(&self.config.path, &self.roundtrips),
+                http.head_in(&self.config.path, &self.roundtrips, &self.calls.get()),
             )
             .await
             {
