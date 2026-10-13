@@ -273,3 +273,159 @@ pub async fn discard(
     let outcome = outcome?.map_err(cli_to_serve)?;
     Ok(Json(serde_json::to_value(outcome).unwrap_or(Value::Null)))
 }
+
+#[cfg(all(test, feature = "source-csv", feature = "sink-jsonl"))]
+mod tests {
+    use super::*;
+
+    fn actor(tenant: Option<&str>) -> AuthContext {
+        AuthContext {
+            principal: "alice".into(),
+            role: crate::serve::rbac::Role::Admin,
+            source_ip: None,
+            tenant: tenant.map(str::to_string),
+        }
+    }
+
+    /// A DLQ file with `n` envelopes and a config replaying it into `out`.
+    fn fixture(dir: &std::path::Path, n: usize, budget: &str) -> (String, String) {
+        let dlq = dir.join("dlq.jsonl");
+        let lines: Vec<String> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "error": {"kind": "Sink", "message": "boom"},
+                    "reason": "partial",
+                    "payload": {"id": i},
+                    "ts_ms": 1, "sink": "jsonl", "pipeline": "p", "row": "", "record_index": i,
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(&dlq, lines.join("\n") + "\n").unwrap();
+        let cfg = format!(
+            "version: 1\n{budget}pipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            dir.join("out.jsonl").display()
+        );
+        (cfg, dlq.display().to_string())
+    }
+
+    fn request(cfg: String, from: String) -> DlqReplayRequest {
+        serde_json::from_value(serde_json::json!({
+            "config": cfg, "from": from,
+            "failed_dlq": format!("{from}.failed.jsonl"),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_replay_reports_its_id_and_the_id_cannot_be_reused_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 2, "");
+        let state = crate::serve::test_support::test_state();
+        let out = replay(
+            State(state.clone()),
+            Extension(actor(None)),
+            Json(request(cfg.clone(), from.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(out.0["id"].as_str().unwrap().starts_with("dlq-replay-"));
+        assert_eq!(out.0["records_written"], 2);
+        assert!(!state.registry().is_registered(out.0["id"].as_str().unwrap()));
+
+        state
+            .registry()
+            .register("busy".into(), tokio_util::sync::CancellationToken::new());
+        let mut req = request(cfg, from);
+        req.id = Some("busy".into());
+        let err = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        state.registry().deregister("busy");
+        assert!(!state.registry().is_registered("busy"));
+    }
+
+    /// #871: the replay runs on a token registered under its id, a child of
+    /// the server's: cancelled, it stops at its first page boundary.
+    #[tokio::test]
+    async fn a_cancelled_replay_stops_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 3, "");
+        let state = crate::serve::test_support::test_state();
+        state.shutdown_token().cancel();
+        let out = replay(State(state), Extension(actor(None)), Json(request(cfg, from)))
+            .await
+            .unwrap();
+        assert_eq!(out.0["records_written"], 0);
+    }
+
+    /// #871: the config's own `budget:` bounds a replay.
+    #[tokio::test]
+    async fn a_replay_stops_at_the_config_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 3, "budget: { max_records: 2 }\n");
+        let state = crate::serve::test_support::test_state();
+        let err = replay(State(state), Extension(actor(None)), Json(request(cfg, from)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("max_records"), "{err:?}");
+    }
+
+    /// #871: a tenant's replay is admitted against its limits, whose per-run
+    /// ceiling bounds it; a suspended tenant's replay is refused.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_tenant_replay_counts_against_the_tenants_limits() {
+        use crate::serve::history::tenants::TenantRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 3, "");
+        let state = crate::serve::test_support::test_state();
+        state.set_tenants(crate::serve::tenants::TenantsRuntime::new(
+            Some(
+                crate::serve::tenants::vault::Vault::new("0123456789abcdef0123456789abcdef", &[])
+                    .unwrap(),
+            ),
+            Default::default(),
+        ));
+        let now = chrono::Utc::now();
+        let mut t = TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: Default::default(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            notifications_sealed: None,
+            suspended: false,
+            created_at: now,
+            updated_at: now,
+            created_by: "t".into(),
+        };
+        t.limits.max_records_per_run = Some(2);
+        state.history().tenant_upsert(&t).await.unwrap();
+
+        let mut req = request(cfg.clone(), from.clone());
+        req.tenant = Some("acme".into());
+        let err = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("max_records"), "{err:?}");
+
+        // A principal confined to another tenant cannot name this one.
+        let mut req = request(cfg.clone(), from.clone());
+        req.tenant = Some("acme".into());
+        let err = replay(State(state.clone()), Extension(actor(Some("other"))), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::NotFound), "{err:?}");
+
+        t.suspended = true;
+        state.history().tenant_upsert(&t).await.unwrap();
+        let mut req = request(cfg, from);
+        req.tenant = Some("acme".into());
+        let err = replay(State(state), Extension(actor(None)), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+    }
+}

@@ -738,21 +738,14 @@ async fn repair_node(
     Ok((written, deleted))
 }
 
-/// Run one repair pass: a copy of the row whose source is the given records
-/// and whose sink is forced to `write_mode`. Transforms are cleared and
-/// masking and profiling opted out (the rows are already shaped and masked,
-/// and corrections must not shift the profile baseline), state is dropped (no
-/// bookmark to advance), delivery is at-least-once (keyed writes are
-/// idempotent). The budget, cancellation token and resilience policy come from
-/// `guards` (#871).
-async fn run_repair(
+/// The node a repair pass runs: `node` reading `records`, its sink forced to
+/// keyed `write_mode`, masking and profiling opted out by name (#871, #875).
+fn repair_target(
     node: &ExpandedNode,
     key: &[String],
     write_mode: &str,
     records: Vec<Value>,
-    inputs: &VerifyInputs,
-    guards: &RunGuards,
-) -> CliResult<u64> {
+) -> ExpandedNode {
     let mut repair = node.clone();
     repair.source = ConnectorSpec {
         kind: "verify-repair".into(),
@@ -781,6 +774,25 @@ async fn run_repair(
         );
         m.remove("delete_marker");
     }
+    repair
+}
+
+/// Run one repair pass: a copy of the row whose source is the given records
+/// and whose sink is forced to `write_mode`. Transforms are cleared and
+/// masking and profiling opted out (the rows are already shaped and masked,
+/// and corrections must not shift the profile baseline), state is dropped (no
+/// bookmark to advance), delivery is at-least-once (keyed writes are
+/// idempotent). The budget, cancellation token and resilience policy come from
+/// `guards` (#871).
+async fn run_repair(
+    node: &ExpandedNode,
+    key: &[String],
+    write_mode: &str,
+    records: Vec<Value>,
+    inputs: &VerifyInputs,
+    guards: &RunGuards,
+) -> CliResult<u64> {
+    let repair = repair_target(node, key, write_mode, records);
     // The repair runs the executor from inside the executor's own post-run
     // pass; `run_expanded_boxed` breaks the recursive future type.
     let summary = crate::executor::run_expanded_boxed(
@@ -840,6 +852,81 @@ pub fn digests_comparable(a: &ServerDigest, b: &ServerDigest) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #871: a repair runs under its caller's budget and never feeds the
+    /// profile baseline (profiling and masking are opted out by name).
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn a_repair_runs_under_the_callers_budget_and_never_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("mirror.db");
+        std::fs::File::create(&db).unwrap();
+        let yaml = format!(
+            "version: 1\nname: m\npipeline:\n  source: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", query: \"SELECT 1 AS id\" }} }}\n  sink: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", table_name: t, column_mapping: auto_map, create_table: true, write_mode: upsert, key: [id] }} }}\n  state: {{ type: memory }}\nprofiling: {{}}\n",
+            db = db.display()
+        );
+        let cfg = PipelineConfig::from_text(&yaml, std::path::Path::new("m.yaml")).unwrap();
+        let node = expand(&cfg).unwrap().remove(0);
+        assert!(node.profiling.is_some());
+        let key = vec!["id".to_string()];
+        let rows = || vec![json!({"id": 1}), json!({"id": 2})];
+
+        let target = repair_target(&node, &key, "upsert", rows());
+        let opts = ExecuteOptions::for_tests("m-verify-repair");
+        let built = crate::governance::governance_for(crate::governance::GovernanceRequest {
+            node: &target,
+            opts: &opts,
+            pipeline: "m",
+            row: &target.id,
+            run_id: "r",
+            cancel: &tokio_util::sync::CancellationToken::new(),
+            meter: None,
+        })
+        .await
+        .unwrap();
+        assert!(built.profiler.is_none());
+        assert!(built.governance.opted_out(faucet_core::Pass::Profiling).is_some());
+        assert!(built.governance.opted_out(faucet_core::Pass::Masking).is_some());
+
+        let inputs = VerifyInputs {
+            row: None,
+            repair: true,
+            allow_delete: false,
+            dry_run: false,
+            pipeline_name: "m".into(),
+            execution: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+        };
+        let tight = RunGuards {
+            budget: Some(faucet_core::BudgetSpec {
+                max_records: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = run_repair(&node, &key, "upsert", rows(), &inputs, &tight)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("max_records"), "{err}");
+        let written = run_repair(&node, &key, "upsert", rows(), &inputs, &RunGuards::default())
+            .await
+            .unwrap();
+        assert_eq!(written, 2);
+    }
+
+    #[test]
+    fn guards_from_a_config_carry_its_budget_and_resilience() {
+        let cfg = PipelineConfig::from_text(
+            "version: 1\nbudget: { max_records: 5 }\nresilience: { retry: { max_attempts: 2 } }\npipeline:\n  source: { type: rest, config: { url: \"http://x\" } }\n  sink: { type: stdout, config: {} }\n",
+            std::path::Path::new("g.yaml"),
+        )
+        .unwrap();
+        let g = RunGuards::from_config(&cfg).unwrap();
+        assert_eq!(g.budget.unwrap().max_records, Some(5));
+        assert_eq!(g.resilience.unwrap().retry.max_attempts, 2);
+        assert!(g.cancel.is_none());
+    }
 
     #[test]
     fn shard_key_is_injected_once() {

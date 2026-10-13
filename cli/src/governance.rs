@@ -418,3 +418,259 @@ pub fn dlq_only_masking(
     });
     (!only.rules.is_empty()).then_some(only)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PipelineConfig;
+    use crate::executor::ExecuteOptions;
+
+    fn cfg(extra: &str) -> PipelineConfig {
+        let dir = std::env::temp_dir();
+        let yaml = format!(
+            "version: 1\nname: g\npipeline:\n  source: {{ type: rest, config: {{ url: \"http://x\" }} }}\n  sink: {{ type: stdout, config: {{}}, attributes: {{ residency: eu }} }}\n{extra}",
+        );
+        let _ = dir;
+        PipelineConfig::from_text(&yaml, std::path::Path::new("g.yaml")).unwrap()
+    }
+
+    fn node(c: &PipelineConfig) -> ExpandedNode {
+        crate::expand::expand(c).unwrap().remove(0)
+    }
+
+    async fn build(n: &ExpandedNode, opts: &ExecuteOptions) -> CliResult<GovernanceBuild> {
+        governance_for(GovernanceRequest {
+            node: n,
+            opts,
+            pipeline: "g",
+            row: &n.id,
+            run_id: "r",
+            cancel: &CancellationToken::new(),
+            meter: Some(Arc::new(faucet_core::UsageMeter::new())),
+        })
+        .await
+    }
+
+    const DLQ: &str = "  dlq:\n    sink: { type: jsonl, config: { path: /tmp/faucet-gov-test-dlq.jsonl }, attributes: { residency: us } }\n";
+
+    /// #875: one function builds every pass the node and its caller's options
+    /// configure — budget, policy, cancel, metering, resilience, the page
+    /// passes, metadata columns, profiling and the governed DLQ.
+    #[cfg(feature = "sink-jsonl")]
+    #[tokio::test]
+    async fn every_configured_pass_is_built() {
+        let c = cfg(&format!(
+            "{DLQ}  quality:\n    record:\n      - {{ type: not_null, field: id, on_failure: quarantine }}\n  contract:\n    version: \"1\"\n    fields:\n      - {{ name: id, type: integer }}\n  masking:\n    rules:\n      - {{ match: {{ fields: [email] }}, action: {{ type: hash }} }}\n      - {{ match: {{ fields: [note] }}, action: {{ type: redact }}, applies_to: [dlq] }}\n  schema: {{ on_drift: warn }}\n  state: {{ type: memory }}\nmetadata_columns: {{}}\nprofiling: {{}}\npolicy:\n  classifications:\n    - {{ label: pii, fields: [email] }}\n  rules:\n    - {{ name: pii-eu, when: {{ label: pii }}, require: {{ residency: [eu] }}, on_runtime: quarantine }}\n"
+        ));
+        let n = node(&c);
+        let mut opts = ExecuteOptions::for_tests("g");
+        opts.budget = Some(faucet_core::BudgetSpec {
+            max_records: Some(10),
+            ..Default::default()
+        });
+        opts.resilience = Some(faucet_core::ResiliencePolicy::default());
+        let built = build(&n, &opts).await.unwrap();
+        let g = &built.governance;
+        for p in [
+            Pass::Budget,
+            Pass::Cancel,
+            Pass::Metering,
+            Pass::Resilience,
+            Pass::Quality,
+            Pass::Contract,
+            Pass::Masking,
+            Pass::SchemaDrift,
+            Pass::Metadata,
+            Pass::Profiling,
+            Pass::Policy,
+            Pass::Dlq,
+        ] {
+            assert!(g.is_active(p), "{p}");
+        }
+        assert!(g.opt_outs().is_empty(), "{:?}", g.opt_outs());
+        assert!(built.profiler.is_some());
+        assert!(g.policy_quarantines());
+        let dlq = g.dlq().unwrap();
+        assert_eq!(dlq.facts.as_ref().unwrap().id, DLQ_ID);
+        assert!(dlq.masking.is_some(), "the rule naming the DLQ reaches it");
+        assert!(g.dlq_config().is_some());
+    }
+
+    /// A pass that does not apply is opted out by name, never left out.
+    #[tokio::test]
+    async fn out_of_scope_passes_are_opted_out_with_a_reason() {
+        let c = cfg("  state: { type: memory }\nprofiling: {}\n");
+        let mut n = node(&c);
+        n.opt_outs.push(faucet_core::OptOut {
+            pass: Pass::Masking,
+            reason: "already masked".into(),
+        });
+        let mut opts = ExecuteOptions::for_tests("g");
+        opts.dry_run = true;
+        let built = build(&n, &opts).await.unwrap();
+        assert!(built.profiler.is_none());
+        assert!(
+            built
+                .governance
+                .opted_out(Pass::Profiling)
+                .is_some_and(|r| r.contains("--dry-run"))
+        );
+        assert_eq!(
+            built.governance.opted_out(Pass::Masking),
+            Some("already masked")
+        );
+        let mut repair = n.clone();
+        repair.opt_outs.push(faucet_core::OptOut {
+            pass: Pass::Profiling,
+            reason: "repair".into(),
+        });
+        let built = build(&repair, &ExecuteOptions::for_tests("g")).await.unwrap();
+        assert!(built.profiler.is_none(), "an opt-out drops the profiler");
+        assert_eq!(built.governance.opted_out(Pass::Profiling), Some("repair"));
+    }
+
+    #[test]
+    fn profiling_scope_names_why_it_does_not_apply() {
+        let n = node(&cfg(""));
+        let mut opts = ExecuteOptions::for_tests("g");
+        assert!(profiling_scope_opt_out(&n, &opts).is_none());
+        opts.limit = Some(1);
+        assert!(profiling_scope_opt_out(&n, &opts).unwrap().contains("--limit"));
+        opts.limit = None;
+        opts.shard = Some(faucet_core::ShardSpec::whole());
+        assert!(profiling_scope_opt_out(&n, &opts).unwrap().contains("shard"));
+        let mut child = n.clone();
+        child.role = NodeRole::Child {
+            parent_id: "p".into(),
+            parent_key: "id".into(),
+        };
+        assert!(
+            profiling_scope_opt_out(&child, &ExecuteOptions::for_tests("g"))
+                .unwrap()
+                .contains("root")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_quarantine_needs_a_dlq() {
+        let c = cfg(
+            "policy:\n  classifications:\n    - { label: pii, fields: [email] }\n  rules:\n    - { name: r, when: { label: pii }, require: { residency: [eu] }, on_runtime: quarantine }\n",
+        );
+        let err = build(&node(&c), &ExecuteOptions::for_tests("g"))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("needs a `dlq:` block"), "{err}");
+    }
+
+    #[test]
+    fn dlq_only_masking_keeps_the_rules_that_name_only_the_dlq() {
+        let c = cfg(&format!(
+            "{DLQ}  masking:\n    rules:\n      - {{ match: {{ fields: [a] }}, action: {{ type: redact }} }}\n      - {{ match: {{ fields: [b] }}, action: {{ type: redact }}, applies_to: [dlq] }}\n      - {{ match: {{ fields: [c] }}, action: {{ type: redact }}, applies_to: [jsonl] }}\n      - {{ match: {{ fields: [d] }}, action: {{ type: redact }}, applies_to: [dlq, stdout] }}\n"
+        ));
+        let n = node(&c);
+        let dlq = n.dlq.as_ref().unwrap();
+        let only = dlq_only_masking(
+            n.masking.as_ref().unwrap(),
+            &[n.sink_ref.as_str(), n.sink.kind.as_str()],
+            dlq,
+        )
+        .unwrap();
+        let fields: Vec<String> = only
+            .rules
+            .iter()
+            .flat_map(|r| r.matcher.fields.clone())
+            .collect();
+        assert_eq!(fields, ["b", "c"]);
+        assert_eq!(dlq_ids(dlq), ["dlq", "jsonl"]);
+        let none = cfg(&format!(
+            "{DLQ}  masking:\n    rules:\n      - {{ match: {{ fields: [a] }}, action: {{ type: redact }} }}\n"
+        ));
+        let n = node(&none);
+        assert!(
+            dlq_only_masking(n.masking.as_ref().unwrap(), &["default"], n.dlq.as_ref().unwrap())
+                .is_none()
+        );
+    }
+
+    /// A topology sink node gets the same sink layers, with the preview opt-outs.
+    #[tokio::test]
+    async fn a_topology_sink_node_gets_the_same_layers() {
+        let c = cfg(
+            "metadata_columns: {}\nprofiling: {}\npolicy:\n  classifications:\n    - { label: pii, fields: [email] }\n  rules:\n    - { name: r, when: { label: pii }, require: { residency: [eu] } }\n",
+        );
+        let budget = faucet_core::BudgetSpec {
+            max_records: Some(3),
+            ..Default::default()
+        };
+        let req = |dry_run: bool, preview: bool| TopologySinkRequest {
+            cfg: &c,
+            node_id: "w",
+            kind: "stdout",
+            template: "default",
+            attributes: Default::default(),
+            run_id: "r",
+            source_label: "rest".into(),
+            budget: Some(&budget),
+            cancel: CancellationToken::new(),
+            dry_run,
+            preview,
+        };
+        let live = topology_sink_governance(req(false, false)).unwrap();
+        for p in [Pass::Budget, Pass::Policy, Pass::Profiling, Pass::Metadata, Pass::Cancel] {
+            assert!(live.governance.is_active(p), "{p}");
+        }
+        assert!(live.profiler.is_some());
+        let dry = topology_sink_governance(req(true, true)).unwrap();
+        assert!(dry.profiler.is_none());
+        for p in [Pass::Budget, Pass::Policy, Pass::Profiling] {
+            assert!(!dry.governance.is_active(p), "{p}");
+            assert!(dry.governance.opted_out(p).is_some(), "{p}");
+        }
+        let quarantine = cfg(
+            "policy:\n  classifications:\n    - { label: pii, fields: [email] }\n  rules:\n    - { name: r, when: { label: pii }, require: { residency: [eu] }, on_runtime: quarantine }\n",
+        );
+        let err = topology_sink_governance(TopologySinkRequest {
+            cfg: &quarantine,
+            ..req(false, false)
+        })
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("needs a `dlq:` block"));
+    }
+
+    #[cfg(feature = "sink-jsonl")]
+    #[tokio::test]
+    async fn a_topology_dlq_is_governed_with_the_nodes_budget() {
+        let c = cfg(DLQ);
+        let dlq = c.pipeline.dlq.clone().unwrap();
+        let g = Governance::new().with_budget(faucet_core::BudgetSpec {
+            max_records: Some(1),
+            ..Default::default()
+        });
+        let config = crate::executor::build_dlq_config(&dlq).await.unwrap();
+        let governed = topology_dlq(&g, &c, &["w", "default", "stdout"], &dlq, config).unwrap();
+        let err = governed
+            .sink
+            .write_batch(&[serde_json::json!({}), serde_json::json!({})])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, faucet_core::FaucetError::BudgetExceeded { .. }), "{err}");
+    }
+
+    /// A preview writes nothing: only masking applies, the rest is opted out.
+    #[test]
+    fn a_preview_masks_and_opts_out_of_the_write_side() {
+        let spec: faucet_core::MaskingSpec = serde_json::from_value(serde_json::json!({
+            "rules": [{"match": {"fields": ["email"]}, "action": {"type": "redact"},
+                       "applies_to": ["elsewhere"]}]
+        }))
+        .unwrap();
+        let g = preview_governance(Some(&spec)).unwrap();
+        assert!(g.is_active(Pass::Masking), "every rule applies to a preview");
+        for p in [Pass::Budget, Pass::Policy, Pass::Dlq, Pass::Profiling, Pass::Cancel] {
+            assert!(g.opted_out(p).is_some(), "{p}");
+        }
+        assert!(!preview_governance(None).unwrap().is_active(Pass::Masking));
+    }
+}
