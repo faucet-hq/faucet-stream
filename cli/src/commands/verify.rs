@@ -37,7 +37,8 @@ pub async fn run(args: VerifyArgs) -> CliResult<()> {
         spec.max_differences = n;
     }
 
-    let outcome = crate::verify::verify(
+    let outcome = crate::runtime::local::verify(
+        &crate::runtime::Principal::local(),
         &cfg,
         &spec,
         VerifyInputs {

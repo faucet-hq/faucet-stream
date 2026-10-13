@@ -4,7 +4,7 @@
 //! grants a bounded flush grace before hard-dropping it; the task then finalizes
 //! an authoritative terminal status. See spec §7 + §20.
 
-use crate::executor::{ExecuteOptions, RunSummary, run_expanded};
+use crate::executor::RunSummary;
 use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
@@ -119,34 +119,6 @@ pub fn stored_origin(rec: &RunRecord) -> BodyOrigin {
     }
 }
 
-/// The reference policy a run's HTTP clients check their requests and
-/// redirect hops against (#881): the caller policy for a config the request
-/// carried, none (metadata redirects are still refused) for an operator's.
-pub(crate) fn runtime_reference_policy(
-    caller_config: bool,
-    tenant: Option<&str>,
-) -> Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>> {
-    caller_config.then(|| {
-        std::sync::Arc::new(crate::serve::references::installed().for_origin(
-            BodyOrigin::Caller {
-                allow_subprocess: false,
-            },
-            tenant,
-        ))
-    })
-}
-
-/// Run `fut` under `policy` ([`runtime_reference_policy`]).
-async fn under_reference_policy<F: std::future::Future>(
-    policy: Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>>,
-    fut: F,
-) -> F::Output {
-    match policy {
-        Some(p) => faucet_core::http::with_reference_policy(p, fut).await,
-        None => fut.await,
-    }
-}
-
 /// What a gated submission produced (#703).
 #[derive(Debug)]
 pub enum SubmitOutcome {
@@ -167,39 +139,32 @@ pub fn pending_approval_body(change: &crate::serve::changes::ChangeRequest) -> s
     })
 }
 
-/// [`submit`] behind the approval gate (#703): when the server requires
-/// approval for runs, or the request asks for it, a change request is
-/// created instead and returned as `PendingApproval`. An executing change
-/// request marks its submission `approved_change` and passes straight
-/// through.
+/// [`submit`] behind the approval gate (#703): the runtime's `submit`
+/// (`crate::runtime::server::submit`) for `actor` with a config the request
+/// carried (or the operator's, when `trusted_config`).
 pub async fn submit_gated(
     state: ServerState,
     req: SubmitRequest,
     actor: AuthContext,
 ) -> Result<SubmitOutcome, ServeError> {
-    let gated = req.approved_change.is_none()
-        && (req.require_approval
-            || state.requires_approval(crate::serve::changes::ChangeKind::Run));
-    if gated {
-        let reason = req.reason.clone();
-        let budget = req.budget.clone();
-        let payload =
-            serde_json::to_value(&req).map_err(|e| ServeError::Internal(e.to_string()))?;
-        let change = crate::serve::changes::create(
-            &state,
-            &actor,
-            crate::serve::changes::NewChange {
-                kind: crate::serve::changes::ChangeKind::Run,
-                payload,
-                reason,
-                budget,
-                trusted_config: req.trusted_config,
-            },
-        )
-        .await?;
-        return Ok(SubmitOutcome::PendingApproval(Box::new(change)));
-    }
-    Ok(SubmitOutcome::Accepted(submit(state, req, actor).await?))
+    let principal = submit_principal(&state, &req, actor);
+    crate::runtime::server::submit(
+        &state,
+        &principal,
+        req,
+        crate::runtime::server::Approval::Required,
+    )
+    .await
+}
+
+/// The principal a submission runs as: its config's origin decides how it is
+/// screened.
+fn submit_principal(
+    state: &ServerState,
+    req: &SubmitRequest,
+    actor: AuthContext,
+) -> crate::runtime::Principal {
+    crate::runtime::Principal::new(actor, crate::runtime::Origin::from(req.origin(state)))
 }
 
 /// The 409 message of an idempotency key reused with a different payload.
@@ -287,111 +252,6 @@ pub fn usage_options(
 /// Run label naming the pipeline (`cfg.name`, else `serve`) a run belongs to.
 pub const LABEL_PIPELINE: &str = "pipeline";
 
-/// [`load_for`], narrowed to `selection`'s rows (#741). A bad selection —
-/// an unknown row or tag, an empty run set, a missing ancestor, a topology
-/// config — is a 400 naming the valid rows.
-pub(crate) async fn load_selected(
-    state: &ServerState,
-    body: &str,
-    format: ConfigFormat,
-    tenant: Option<&str>,
-    selection: Option<&crate::select::SelectionRequest>,
-    origin: BodyOrigin,
-) -> Result<LoadedSubmission, ServeError> {
-    if selection.is_some() && is_topology_body(body, format) {
-        return Err(ServeError::BadConfig(
-            crate::select::TOPOLOGY_REFUSAL.to_string(),
-        ));
-    }
-    let mut loaded = load_for(state, body, format, tenant, origin).await?;
-    if let Some(sel) = selection {
-        let nodes = std::mem::take(&mut loaded.nodes);
-        let bad = |e: crate::error::CliError| {
-            ServeError::BadConfig(crate::secrets::registry::redact(&e.to_string()).into_owned())
-        };
-        let auth = loaded.auth_catalog().map_err(bad)?;
-        loaded.nodes = sel
-            .apply_resolved(&loaded.cfg, nodes, &auth)
-            .await
-            .map_err(bad)?;
-    }
-    Ok(loaded)
-}
-
-/// Whether a submitted body is a topology config (`pipeline.nodes`).
-fn is_topology_body(body: &str, format: ConfigFormat) -> bool {
-    let doc: Option<serde_json::Value> = match format {
-        ConfigFormat::Yaml => serde_yaml::from_str(body).ok(),
-        ConfigFormat::Json => serde_json::from_str(body).ok(),
-    };
-    doc.and_then(|d| d.pointer("/pipeline/nodes").cloned())
-        .is_some_and(|n| match n {
-            serde_json::Value::Object(o) => !o.is_empty(),
-            serde_json::Value::Array(a) => !a.is_empty(),
-            _ => false,
-        })
-}
-
-/// Load a submission for a run, scoped to `tenant` when it is set (#709):
-/// the tenant's connections, `${tenant.*}` values and state namespace.
-pub(crate) async fn load_for(
-    state: &ServerState,
-    body: &str,
-    format: ConfigFormat,
-    tenant: Option<&str>,
-    origin: BodyOrigin,
-) -> Result<LoadedSubmission, ServeError> {
-    let scope = match tenant {
-        None => None,
-        Some(t) => Some(tenant_scope(state, t).await?),
-    };
-    crate::serve::load::load_submission_with(
-        body,
-        format,
-        state.default_base().as_ref(),
-        server_policy(state).as_deref(),
-        origin,
-        scope,
-        &state.references(),
-    )
-    .await
-}
-
-#[cfg(feature = "tenants")]
-async fn tenant_scope(
-    state: &ServerState,
-    tenant: &str,
-) -> Result<std::sync::Arc<crate::serve::load::TenantScope>, ServeError> {
-    crate::serve::tenants::scope(state, tenant)
-        .await
-        .map(std::sync::Arc::new)
-}
-
-#[cfg(not(feature = "tenants"))]
-async fn tenant_scope(
-    _state: &ServerState,
-    tenant: &str,
-) -> Result<std::sync::Arc<crate::serve::load::TenantScope>, ServeError> {
-    Err(ServeError::BadConfig(format!(
-        "run for tenant '{tenant}' refused: this server was built without the `tenants` feature"
-    )))
-}
-
-/// The per-run budget: the config's own `budget:` merged with the tenant's
-/// limits (the stricter of each ceiling).
-fn run_budget(
-    cfg: &crate::config::PipelineConfig,
-    tenant: Option<&crate::serve::load::TenantScope>,
-) -> Option<faucet_core::BudgetSpec> {
-    match (cfg.budget.clone(), tenant.and_then(|t| t.budget.clone())) {
-        (Some(a), Some(b)) => {
-            let kinds = crate::budget::sink_template_kinds(cfg);
-            Some(a.merge_with(&b, &|name: &str| kinds.get(name).cloned()))
-        }
-        (a, b) => a.or(b),
-    }
-}
-
 /// Wire enum mirroring `load::ConfigFormat` with serde rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -467,17 +327,7 @@ fn resume_claimed(
             .await;
             return;
         };
-        let format = rec.config_format.unwrap_or_default();
-        let loaded = match load_selected(
-            &state,
-            body,
-            format,
-            rec.tenant.as_deref(),
-            rec.selection.as_ref(),
-            stored_origin(&rec),
-        )
-        .await
-        {
+        let loaded = match crate::runtime::server::reload(&state, &rec, body).await {
             Ok(l) => l,
             Err(e) => {
                 finalize(
@@ -537,11 +387,12 @@ fn resume_claimed(
         // calling registry.cancel) reaches this run.
         let run_token = CancellationToken::new();
         state.registry().register(run_id.clone(), run_token.clone());
-        let policy = runtime_reference_policy(rec.caller_config, rec.tenant.as_deref());
-        under_reference_policy(
-            policy,
+        let principal = crate::runtime::Principal::stored(AuthContext::runtime(), &rec);
+        crate::runtime::under(
+            &principal.clone(),
             execute_run(
                 state.clone(),
+                principal,
                 loaded,
                 run_id,
                 run_token,
@@ -674,17 +525,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             maybe_finalize_parent(&state, &run_id).await;
             return;
         };
-        let format = run.config_format.unwrap_or_default();
-        let loaded = match load_selected(
-            &state,
-            &body,
-            format,
-            run.tenant.as_deref(),
-            run.selection.as_ref(),
-            stored_origin(&run),
-        )
-        .await
-        {
+        let loaded = match crate::runtime::server::reload(&state, &run, &body).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(
@@ -733,11 +574,12 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let policy = runtime_reference_policy(run.caller_config, run.tenant.as_deref());
-        let (outcome, shutdown) = under_reference_policy(
-            policy,
+        let principal = crate::runtime::Principal::stored(AuthContext::runtime(), &run);
+        let (outcome, shutdown) = crate::runtime::under(
+            &principal,
             execute_shard(
                 &state,
+                &principal,
                 loaded,
                 &run_id,
                 &shard_id,
@@ -811,6 +653,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn execute_shard(
     state: &ServerState,
+    principal: &crate::runtime::Principal,
     loaded: LoadedSubmission,
     run_id: &str,
     shard_id: &str,
@@ -829,9 +672,6 @@ async fn execute_shard(
         }
     };
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
-    let pipeline_name = cfg.name.clone().unwrap_or_else(|| "serve".to_string());
-    let state_scope = tenant.as_ref().map(|t| t.state_scope()).unwrap_or_default();
-    let budget = run_budget(&cfg, tenant.as_deref());
     let clock = match resolve_clock(clock_flag.as_deref(), submitted_at) {
         Ok(c) => c,
         Err(e) => {
@@ -844,79 +684,40 @@ async fn execute_shard(
             return (ShardOutcome::Failed, false);
         }
     };
-    let resilience = match &cfg.resilience {
-        Some(spec) => match spec.to_policy() {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::error!(run_id, shard_id, "shard resilience: {e}");
-                return (ShardOutcome::Failed, false);
-            }
-        },
-        None => None,
-    };
-    #[cfg(feature = "lineage")]
-    let lineage = match crate::lineage_glue::build_emitter(cfg.lineage.as_ref()) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(run_id, shard_id, "shard lineage: {e}");
-            return (ShardOutcome::Failed, false);
-        }
-    };
-
     // `coop` is the per-shard cancel token registered by `resume_claimed_shard`;
     // a cross-instance cancel (F10), a server shutdown, or a timeout all fire it
-    // so the shard's pipeline flushes at its next page boundary.
-    let usage = match usage_options(&cfg) {
-        Ok(u) => u,
+    // so the shard's pipeline flushes at its next page boundary. A shard is not
+    // recorded in the catalog: its records and URIs are a slice of the row's.
+    let opts = match crate::runtime::server::governed_options(
+        state,
+        &cfg,
+        tenant.as_deref(),
+        crate::runtime::server::GovernedRun {
+            run_id: run_id.to_string(),
+            auth,
+            clock,
+            cancel: coop.clone(),
+            concurrency,
+            shard: Some(shard),
+            #[cfg(feature = "notify")]
+            notifier: None,
+            catalog: false,
+        },
+    ) {
+        Ok(o) => o,
         Err(e) => {
-            tracing::error!(run_id, shard_id, "shard usage: {e}");
+            tracing::error!(run_id, shard_id, "shard {e}");
             return (ShardOutcome::Failed, false);
         }
-    };
-    let opts = ExecuteOptions {
-        legacy_state_writes: state.cluster().legacy_state_writes(),
-        force_lease: false,
-        pipeline_name,
-        // Correlate notifications to the submitted run (#480). Every shard of a
-        // sharded run reports the same `run_id`; they differ by `invocation_id`.
-        run_id: Some(run_id.to_string()),
-        execution: cfg.execution.clone(),
-        concurrency,
-        dry_run: false,
-        limit: None,
-        state_path_override: None,
-        state_scope,
-        shard: Some(shard),
-        auth,
-        clock,
-        cancel: Some(coop.clone()),
-        resilience,
-        // Inert under `shard: Some(..)` (a shard's volume is not the row's) —
-        // carried for uniformity with the whole-run path below.
-        sla: cfg.sla.clone(),
-        reconcile: cfg.reconcile.clone(),
-        verify: cfg.verify.clone(),
-        rollback: cfg.rollback.clone(),
-        #[cfg(feature = "lineage")]
-        lineage,
-        #[cfg(feature = "lineage")]
-        lineage_cfg: cfg.lineage.clone(),
-        #[cfg(feature = "notify")]
-        notifier: None,
-        // Inert under `shard: Some(..)` — a shard's records/URIs are a slice
-        // of the row's; the catalog records whole runs only.
-        #[cfg(feature = "catalog")]
-        catalog: None,
-        usage,
-        budget,
     };
 
     let server_shutdown = state.shutdown_token();
     let span = tracing::info_span!(parent: None, "faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
     let audit_state = state.clone();
     let audit_run_id = run_id.to_string();
+    let principal = principal.clone();
     let work = async move {
-        let result = run_expanded(nodes, opts).await;
+        let result = crate::runtime::run(&principal, nodes, opts).await;
         audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
         classify_run(result)
     }
@@ -1096,61 +897,42 @@ async fn release_orphaned_claim(state: &ServerState, req: &SubmitRequest, run_id
     }
 }
 
-/// Validate, idempotency-claim, queue, and spawn a submission.
+/// Submit a run without the approval gate: the runtime's `submit`
+/// (`crate::runtime::server::submit`) under a standing approval, for `actor`.
 pub async fn submit(
     state: ServerState,
     req: SubmitRequest,
     actor: AuthContext,
 ) -> Result<SubmitResponse, ServeError> {
-    // A draining server takes no new work (#789 SERVE-25).
-    if state.is_draining() {
-        return Err(ServeError::Draining);
-    }
-    // `0` is rejected rather than clamped: under the house sentinel it reads as
-    // "unlimited", but here it would mean "no connections" — far enough apart
-    // that guessing either way would be wrong (#610).
-    if req.concurrency == Some(0) {
-        return Err(ServeError::Unprocessable {
-            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
-                .into(),
-            details: None,
-        });
-    }
-
-    // A run for a tenant (#709) must be admitted first: the tenant exists and
-    // is not suspended, it is under its concurrency limit (the guard is held
-    // until the run is recorded, so two submissions cannot both take the last
-    // slot on this instance), and its per-run limits join the request budget
-    // so the stored body carries them.
-    #[allow(unused_mut)]
-    let mut req = req;
-    #[cfg(feature = "tenants")]
-    let _admission = match actor.tenant.as_deref() {
-        Some(t) => Some(crate::serve::tenants::admit(&state, t, &mut req).await?),
-        None => None,
-    };
-    // A request-level budget (#703) becomes part of the document before it is
-    // loaded or stored.
-    let mut req = apply_request_budget(req)?;
-    // The selection names the run (#741): a label for listings, and — being
-    // a label — part of the idempotency fingerprint, so the same key with a
-    // different subset is a conflict rather than a replay.
-    if let Some(sel) = &req.selection {
-        req.labels
-            .entry(crate::select::LABEL_SELECTION.to_string())
-            .or_insert_with(|| sel.canonical());
-    }
-    let format: ConfigFormat = req.config_format.into();
-    let loaded = load_selected(
+    let principal = submit_principal(&state, &req, actor);
+    crate::runtime::server::submit(
         &state,
-        &req.config,
-        format,
-        actor.tenant.as_deref(),
-        req.selection.as_ref(),
-        req.origin(&state),
+        &principal,
+        req,
+        crate::runtime::server::Approval::Standing,
     )
-    .await?;
-    policy_gate(&state, &actor, &loaded).await?;
+    .await?
+    .accepted()
+}
+
+/// The execution stage of an admitted submission: validate what only a
+/// queued run needs (sharding, the callback), reserve a queue slot, run the
+/// `doctor_first` preflight, claim the idempotency key, record the run and
+/// spawn it — or store it pending for a cluster peer. Called only by the
+/// runtime, after every gate.
+pub(crate) async fn enqueue(
+    state: &ServerState,
+    principal: &crate::runtime::Principal,
+    admitted: crate::runtime::server::Admitted,
+    req: SubmitRequest,
+) -> Result<SubmitResponse, ServeError> {
+    let state = state.clone();
+    let actor = principal.actor();
+    let crate::runtime::server::Admitted {
+        loaded,
+        admission: _admission,
+        ..
+    } = admitted;
 
     // At-least-once duplicate-write warning for clustered / source-sharded runs
     // with an append-mode destination (F26/F39).
@@ -1169,7 +951,7 @@ pub async fn submit(
     // malformed or refused destination costs nothing and surfaces as a 422 on
     // the submission rather than as a silent no-op when the run finishes.
     if let Some(cb) = req.callback.as_ref() {
-        cb.validate_for(state.callback_allow_hosts(), actor.tenant.is_some())
+        cb.validate_for(state.callback_allow_hosts(), principal.tenant().is_some())
             .map_err(|message| ServeError::Unprocessable {
                 message,
                 details: None,
@@ -1223,7 +1005,7 @@ pub async fn submit(
             req.concurrency,
             &req.labels,
         );
-        let key = idempotency_scope(actor.tenant.as_deref(), key);
+        let key = idempotency_scope(principal.tenant(), key);
         match state
             .history()
             .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
@@ -1268,10 +1050,10 @@ pub async fn submit(
     );
     rec.doctor_report = doctor_report;
     rec.callback = req.callback.clone();
-    rec.tenant = actor.tenant.clone();
+    rec.tenant = principal.tenant().map(str::to_string);
     rec.selection = req.selection.clone();
     rec.host_access = req.server_file;
-    rec.caller_config = matches!(req.origin(&state), BodyOrigin::Caller { .. });
+    rec.caller_config = principal.caller_body();
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -1362,6 +1144,7 @@ pub async fn submit(
     reservation.defuse();
     spawn_run(
         state.clone(),
+        principal.clone(),
         loaded,
         req,
         run_id.clone(),
@@ -1398,60 +1181,6 @@ async fn link_tenant_run(state: &ServerState, rec: &RunRecord) -> Result<(), Ser
             .map_err(|e| ServeError::Internal(format!("recording the run's tenant: {e}")))?;
     }
     Ok(())
-}
-
-/// Data-flow policy gate (#702): refuse a submission that would move a
-/// labelled column somewhere its rules forbid — before any queue reservation,
-/// so a refusal costs nothing, and audited as `policy.denied`. Shared by
-/// `submit` and a change request's plan (#703).
-pub(crate) async fn policy_gate(
-    state: &ServerState,
-    actor: &AuthContext,
-    loaded: &LoadedSubmission,
-) -> Result<(), ServeError> {
-    #[cfg(feature = "policy")]
-    if let Some(spec) = loaded.cfg.policy.as_ref() {
-        let report = if loaded.is_topology() {
-            crate::policy::evaluate_topology(spec, &loaded.cfg)
-        } else {
-            crate::policy::evaluate_nodes(spec, &loaded.nodes, &Default::default())
-        }
-        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
-        if report.violated() {
-            let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
-            let fp = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
-            crate::policy::record_metrics(loaded.cfg.name.as_deref().unwrap_or("serve"), &report);
-            crate::serve::audit::write(state, actor, "policy.denied", None, Some(fp), "denied")
-                .await;
-            return Err(ServeError::Unprocessable {
-                message: format!(
-                    "policy: {} violation(s) — {}",
-                    report.violations,
-                    report
-                        .all_violations()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-                details: serde_json::to_value(&report).ok(),
-            });
-        }
-    }
-    #[cfg(not(feature = "policy"))]
-    let _ = (state, actor, loaded);
-    Ok(())
-}
-
-/// The server-wide data-flow policy handed to the submission loader (#702).
-#[cfg(feature = "policy")]
-pub(crate) fn server_policy(
-    state: &ServerState,
-) -> Option<std::sync::Arc<faucet_core::PolicySpec>> {
-    state.policy()
-}
-#[cfg(not(feature = "policy"))]
-pub(crate) fn server_policy(_state: &ServerState) -> Option<std::sync::Arc<()>> {
-    None
 }
 
 /// Run the `doctor_first` probes; on any failure return 422 with the report.
@@ -1843,6 +1572,7 @@ fn resolve_clock(
 /// finalize the terminal status.
 fn spawn_run(
     state: ServerState,
+    principal: crate::runtime::Principal,
     loaded: LoadedSubmission,
     req: SubmitRequest,
     run_id: String,
@@ -1869,14 +1599,11 @@ fn spawn_run(
             }
             permit = state.semaphore().acquire_owned() => permit.expect("semaphore not closed"),
         };
-        let policy = runtime_reference_policy(
-            matches!(req.origin(&state), BodyOrigin::Caller { .. }),
-            loaded.tenant.as_ref().map(|t| t.values.id.as_str()),
-        );
-        under_reference_policy(
-            policy,
+        crate::runtime::under(
+            &principal.clone(),
             execute_run(
                 state,
+                principal,
                 loaded,
                 run_id,
                 run_token,
@@ -1901,6 +1628,7 @@ fn spawn_run(
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn execute_run(
     state: ServerState,
+    principal: crate::runtime::Principal,
     loaded: LoadedSubmission,
     run_id: String,
     run_token: CancellationToken,
@@ -1913,10 +1641,8 @@ async fn execute_run(
     let server_shutdown = state.shutdown_token();
     let auth_result = loaded.auth_catalog();
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
-    let state_scope = tenant.as_ref().map(|t| t.state_scope()).unwrap_or_default();
     #[cfg(feature = "catalog")]
     let catalog_tenant = tenant.as_ref().map(|t| t.values.id.clone());
-    let budget = run_budget(&cfg, tenant.as_deref());
 
     // Queued → running. From here the guard guarantees `mark_finished` (and a
     // gauge refresh) on EVERY exit, including early returns and panics.
@@ -1941,7 +1667,6 @@ async fn execute_run(
     metrics::set_run_gauges(&state);
 
     // Build execution options (auth/clock failures finalize as Failed).
-    let pipeline_name = cfg.name.clone().unwrap_or_else(|| "serve".to_string());
     let auth = match auth_result {
         Ok(a) => a,
         Err(e) => {
@@ -1982,50 +1707,6 @@ async fn execute_run(
     // page boundary on cancel / timeout / shutdown — instead of having its
     // future hard-dropped, which flushes nothing (#146 H16).
     let coop = CancellationToken::new();
-    // Resilience policy from the (merged) submitted config. A malformed
-    // `resilience:` block finalizes the run as Failed, mirroring the
-    // auth/clock failure handling above.
-    let resilience = match &cfg.resilience {
-        Some(spec) => match spec.to_policy() {
-            Ok(p) => Some(p),
-            Err(e) => {
-                finalize(
-                    &state,
-                    &run_id,
-                    started,
-                    Terminal::Failed {
-                        reason: format!("resilience: {e}"),
-                        records: 0,
-                        invs: Vec::new(),
-                    },
-                )
-                .await;
-                return;
-            }
-        },
-        None => None,
-    };
-    // Build the per-run OpenLineage emitter from the (merged) submitted
-    // config. A malformed `lineage:` block finalizes the run as Failed,
-    // mirroring the auth/clock failure handling above.
-    #[cfg(feature = "lineage")]
-    let lineage = match crate::lineage_glue::build_emitter(cfg.lineage.as_ref()) {
-        Ok(l) => l,
-        Err(e) => {
-            finalize(
-                &state,
-                &run_id,
-                started,
-                Terminal::Failed {
-                    reason: format!("lineage: {e}"),
-                    records: 0,
-                    invs: Vec::new(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
     // Notifier from the submitted config's `notifications:` block. A malformed
     // block disables notifications for this run (logged) rather than failing an
     // already-accepted run.
@@ -2038,16 +1719,34 @@ async fn execute_run(
     if let Some(n) = &notifier {
         state.log_export().register_notifier(&run_id, n.clone());
     }
-    // Cost & usage pricing (#704) from the submitted config's `usage:` block.
-    let usage = match usage_options(&cfg) {
-        Ok(u) => u,
-        Err(e) => {
+    // The governed options (budget, state namespace, resilience, lineage,
+    // pricing, catalog); a malformed block finalizes the run as Failed,
+    // mirroring the auth/clock failure handling above. Every serve run is
+    // recorded in the Data Movement Catalog (#279) under its run id.
+    let opts = match crate::runtime::server::governed_options(
+        &state,
+        &cfg,
+        tenant.as_deref(),
+        crate::runtime::server::GovernedRun {
+            run_id: run_id.clone(),
+            auth,
+            clock,
+            cancel: coop.clone(),
+            concurrency,
+            shard: None,
+            #[cfg(feature = "notify")]
+            notifier,
+            catalog: true,
+        },
+    ) {
+        Ok(o) => o,
+        Err(reason) => {
             finalize(
                 &state,
                 &run_id,
                 started,
                 Terminal::Failed {
-                    reason: format!("usage: {e}"),
+                    reason,
                     records: 0,
                     invs: Vec::new(),
                 },
@@ -2055,48 +1754,6 @@ async fn execute_run(
             .await;
             return;
         }
-    };
-    let opts = ExecuteOptions {
-        legacy_state_writes: state.cluster().legacy_state_writes(),
-        force_lease: false,
-        pipeline_name,
-        // The id returned by `POST /v1/runs`, so a completion notification can be
-        // matched back to the submission (#480).
-        run_id: Some(run_id.clone()),
-        execution: cfg.execution.clone(),
-        concurrency,
-        dry_run: false,
-        limit: None,
-        state_path_override: None,
-        state_scope,
-        shard: None,
-        auth,
-        clock,
-        cancel: Some(coop.clone()),
-        resilience,
-        sla: cfg.sla.clone(),
-        reconcile: cfg.reconcile.clone(),
-        verify: cfg.verify.clone(),
-        rollback: cfg.rollback.clone(),
-        #[cfg(feature = "lineage")]
-        lineage,
-        #[cfg(feature = "lineage")]
-        lineage_cfg: cfg.lineage.clone(),
-        #[cfg(feature = "notify")]
-        notifier,
-        // Record every serve run into the Data Movement Catalog (#279),
-        // stored alongside the run history (`--history` backend) and
-        // attributed to this serve run id.
-        #[cfg(feature = "catalog")]
-        catalog: Some(crate::catalog::CatalogHandle {
-            store: state.history(),
-            run_id: Some(run_id.clone()),
-            sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
-            annotations: Vec::new(),
-            tenant: catalog_tenant.clone(),
-        }),
-        usage,
-        budget,
     };
 
     let span = tracing::info_span!(parent: None, "faucet.serve.run", serve_run_id = %run_id);
@@ -2142,7 +1799,7 @@ async fn execute_run(
         tracing::info!("pipeline run starting");
         let result = match &topology {
             Some((cfg, auth, run)) => crate::topology::run_topology(cfg, auth, run.clone()).await,
-            None => run_expanded(nodes, opts).await,
+            None => crate::runtime::run(&principal, nodes, opts).await,
         };
         audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
         #[cfg(feature = "catalog")]
@@ -2392,17 +2049,25 @@ mod tests {
     /// it, so its HTTP clients check every request and redirect hop (#881).
     #[tokio::test]
     async fn a_caller_run_executes_under_the_caller_reference_policy() {
-        assert!(runtime_reference_policy(false, None).is_none());
-        let policy = runtime_reference_policy(true, None).expect("a caller run is scoped");
+        use crate::runtime::{Origin, Principal};
+        let trusted = Principal::new(AuthContext::system("t"), Origin::Trusted);
+        assert!(trusted.reference_policy().is_none());
+        let caller = Principal::new(
+            AuthContext::system("t"),
+            Origin::Caller {
+                allow_subprocess: false,
+            },
+        );
+        let policy = caller.reference_policy().expect("a caller run is scoped");
         assert!(policy.check_url("http://169.254.169.254/").is_err());
         assert!(!policy.allows_subprocess());
-        let seen = under_reference_policy(Some(policy), async {
+        let seen = crate::runtime::under(&caller, async {
             faucet_core::http::current_reference_policy()
         })
         .await;
         assert!(seen.is_some());
         assert!(
-            under_reference_policy(None, async {
+            crate::runtime::under(&trusted, async {
                 faucet_core::http::current_reference_policy()
             })
             .await
@@ -3417,6 +3082,7 @@ mod tests {
             // exercising the apply_shard call + per-shard state-key path end-to-end.
             let ok = execute_shard(
                 &state,
+                &crate::runtime::Principal::local(),
                 l,
                 "r",
                 "0",
@@ -3515,6 +3181,7 @@ mod tests {
                 async move {
                     execute_shard(
                         &state,
+                        &crate::runtime::Principal::local(),
                         loaded(&yaml).await,
                         "r",
                         "0",
@@ -3695,6 +3362,7 @@ mod tests {
             let l = loaded(&yaml).await;
             let ok = execute_shard(
                 &state,
+                &crate::runtime::Principal::local(),
                 l,
                 "r",
                 "0",

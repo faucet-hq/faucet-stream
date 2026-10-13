@@ -13,8 +13,9 @@
 //! A tenant-scoped principal reaches only its own tenant's routes (the auth
 //! middleware answers `404` for another tenant's, so existence does not leak).
 
+use crate::runtime::server::{TriggerOutcome, trigger_template};
 use crate::serve::error::ServeError;
-use crate::serve::handlers::templates::{TriggerBody, TriggerOutcome, trigger_template_outcome};
+use crate::serve::handlers::templates::TriggerBody;
 use crate::serve::history::tenants::{
     ConnectionRecord, ConnectionStatus, TenantLimits, TenantRecord, TenantSelector,
     validate_connection_name, validate_tenant_id,
@@ -507,7 +508,15 @@ pub async fn submit_tenant_run(
         ));
     }
     let actor = for_tenant(&actor, &tenant);
-    match runner::submit_gated(state, req, actor).await? {
+    let principal = crate::runtime::Principal::caller(&state, actor);
+    match crate::runtime::server::submit(
+        &state,
+        &principal,
+        req,
+        crate::runtime::server::Approval::Required,
+    )
+    .await?
+    {
         SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         SubmitOutcome::PendingApproval(change) => Ok((
             StatusCode::ACCEPTED,
@@ -524,7 +533,14 @@ pub async fn trigger_tenant_template(
     Json(body): Json<TriggerBody>,
 ) -> Result<Response, ServeError> {
     let actor = for_tenant(&actor, &tenant);
-    match trigger_template_outcome(state, actor, id, body).await? {
+    match trigger_template(
+        state,
+        crate::runtime::Principal::new(actor, crate::runtime::Origin::Trusted),
+        id,
+        body,
+    )
+    .await?
+    {
         TriggerOutcome::Run(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         TriggerOutcome::PendingApproval(change) => Ok((
             StatusCode::ACCEPTED,
@@ -678,7 +694,13 @@ pub async fn fan_out(
         }
         set.spawn(async move {
             let _permit = permit;
-            let outcome = trigger_template_outcome(state, actor, id, trigger).await;
+            let outcome = trigger_template(
+                state,
+                crate::runtime::Principal::new(actor, crate::runtime::Origin::Trusted),
+                id,
+                trigger,
+            )
+            .await;
             match outcome {
                 Ok(TriggerOutcome::Run(r)) => FanoutResult {
                     tenant,

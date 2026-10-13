@@ -47,7 +47,8 @@ pub async fn run(args: RollbackArgs) -> CliResult<()> {
         .run
         .ok_or_else(|| CliError::Config("rollback: --run <id> is required (or --list)".into()))?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
-    let report = crate::rollback::rollback(
+    let report = crate::runtime::local::rollback(
+        &crate::runtime::Principal::local(),
         &cfg,
         RollbackInputs {
             run_id,

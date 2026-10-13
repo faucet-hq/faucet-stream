@@ -794,8 +794,9 @@ async fn run_repair(
 ) -> CliResult<u64> {
     let repair = repair_target(node, key, write_mode, records);
     // The repair runs the executor from inside the executor's own post-run
-    // pass; `run_expanded_boxed` breaks the recursive future type.
-    let summary = crate::executor::run_expanded_boxed(
+    // pass; `run_boxed` breaks the recursive future type.
+    let summary = crate::runtime::run_boxed(
+        crate::runtime::Principal::local(),
         vec![repair],
         ExecuteOptions {
             legacy_state_writes: false,

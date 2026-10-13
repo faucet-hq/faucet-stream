@@ -6,25 +6,14 @@
 //! (operator+) — see [`crate::serve::rbac::required_permission`]. Audited as
 //! `verify`.
 
-use crate::auth_catalog::build_auth_catalog;
-use crate::error::CliError;
 use crate::serve::error::ServeError;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
-use crate::verify::VerifyInputs;
 use axum::Json;
 use axum::extract::{Extension, State};
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
-
-fn cli_to_serve(e: CliError) -> ServeError {
-    match e {
-        CliError::Config(m) => ServeError::BadConfig(m),
-        other => ServeError::Internal(other.to_string()),
-    }
-}
 
 /// `POST /v1/verify` request body.
 #[derive(Debug, Deserialize)]
@@ -51,58 +40,15 @@ pub struct VerifyRequest {
 }
 
 /// `POST /v1/verify` → 200 with the verification outcome (`differences` may be
-/// non-empty — a mismatch is a result, not an error).
+/// non-empty — a mismatch is a result, not an error): the runtime's `verify`
+/// for a config the request carried.
 pub async fn verify(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = state
-        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
-        .await?;
-    if req.repair && !req.dry_run {
-        crate::serve::runner::refuse_unapproved_write(&state, "verify repair")?;
-        crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;
-    }
-    let _permit = crate::serve::runner::inline_permit(&state)?;
-    let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;
-    let pipeline_name = loaded
-        .cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| "verify".to_string());
-    let mut spec = loaded.cfg.verify.clone().unwrap_or_default();
-    if let Some(n) = req.max_differences {
-        spec.max_differences = n;
-    }
-    let outcome = crate::verify::verify(
-        &loaded.cfg,
-        &spec,
-        VerifyInputs {
-            row: req.row,
-            repair: req.repair,
-            allow_delete: req.allow_delete,
-            dry_run: req.dry_run,
-            pipeline_name,
-            execution: loaded.cfg.execution.clone(),
-            auth,
-            clock: Utc::now().fixed_offset(),
-        },
-    )
-    .await
-    .map_err(cli_to_serve)?;
-    crate::serve::audit::write(
-        &state,
-        &actor,
-        "verify",
-        None,
-        None,
-        if outcome.report.equal() {
-            "equal"
-        } else {
-            "different"
-        },
-    )
-    .await;
-    Ok(Json(serde_json::to_value(outcome).unwrap_or(Value::Null)))
+    let principal = crate::runtime::Principal::caller(&state, actor);
+    crate::runtime::server::verify(&state, &principal, req)
+        .await
+        .map(Json)
 }

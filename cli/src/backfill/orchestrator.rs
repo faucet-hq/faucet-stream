@@ -23,7 +23,7 @@ use crate::backfill::state::{
 };
 use crate::config::{ExecutionSpec, PipelineConfig};
 use crate::error::{CliError, CliResult};
-use crate::executor::{ExecuteOptions, run_expanded};
+use crate::executor::ExecuteOptions;
 use crate::expand::{ExpandedNode, expand};
 use chrono::{DateTime, FixedOffset};
 use faucet_core::{FaucetError, StateStore, Stream, StreamPage, json_gt};
@@ -694,7 +694,8 @@ async fn run_one_unit(
         }
     }
 
-    let summary = run_expanded(vec![node], make_opts(opts, unit.start, cancel.clone())).await?;
+    let summary =
+        crate::runtime::run_local(vec![node], make_opts(opts, unit.start, cancel.clone())).await?;
     if let Some(held) = summary.lease_refusal() {
         return Err(held);
     }

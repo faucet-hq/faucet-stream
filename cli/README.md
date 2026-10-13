@@ -285,6 +285,8 @@ cargo install faucet-cli --features schedule     # explicit, no-default-features
 
 `faucet serve` runs a **long-running HTTP control plane**: it accepts pipeline configs over REST, executes them under bounded concurrency (reusing the same executor as `faucet run`), and exposes submit / poll / list / cancel / SSE-log endpoints plus `/healthz`, `/readyz`, and `/metrics`. It takes **no config file** — configs arrive per request.
 
+Every way into the server — an HTTP endpoint, an MCP tool, a trigger, an approved change request — goes through one runtime API (`faucet_cli::runtime`, #887) that applies load → trust (reference policy) → data-flow policy → budget → tenant admission → governance → execution in that order, so the same config gets the same answer however it arrives. The CLI commands run the same operations as the local principal.
+
 ```bash
 FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --listen 0.0.0.0:8080      # bearer auth (preferred)
 faucet serve --no-auth                                                 # explicit no-auth opt-in (required if no token)

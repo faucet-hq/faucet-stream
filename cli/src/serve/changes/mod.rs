@@ -35,7 +35,7 @@ pub use policy::{ApprovalPolicy, ApprovalRule, EffectiveRule};
 use crate::serve::error::ServeError;
 use crate::serve::history::HistoryError;
 use crate::serve::rbac::{AuthContext, Role};
-use crate::serve::runner::{self, SubmitRequest};
+use crate::serve::runner::SubmitRequest;
 use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
 use faucet_core::{BudgetSpec, JsonSchema};
@@ -484,17 +484,22 @@ async fn plan_run(
     actor: &AuthContext,
     req: &SubmitRequest,
 ) -> Result<ChangePlan, ServeError> {
-    let format: crate::serve::load::ConfigFormat = req.config_format.into();
-    let loaded = runner::load_selected(
+    // Load, trust and the policy gate, as the run would pass them; the
+    // budget and tenant admission apply when the approved run is submitted.
+    let principal = crate::runtime::Principal::for_body(state, actor.clone(), req.trusted_config);
+    let loaded = crate::runtime::server::admit(
         state,
-        &req.config,
-        format,
-        actor.tenant.as_deref(),
-        req.selection.as_ref(),
-        state.origin(req.trusted_config),
+        &principal,
+        crate::runtime::server::Submission::new(&req.config, req.config_format.into())
+            .selected(req.selection.as_ref()),
+        crate::runtime::server::Gates {
+            policy: true,
+            budget: None,
+            admit: false,
+        },
     )
-    .await?;
-    runner::policy_gate(state, actor, &loaded).await?;
+    .await?
+    .loaded;
     loaded.require_matrix()?;
     let auth = loaded
         .auth_catalog()
@@ -961,13 +966,14 @@ async fn notify_requested(state: &ServerState, change: &ChangeRequest) {
     };
     // Load the config the way the plan did, so `${env:…}` webhook URLs and the
     // `--default-config` base resolve before the notifier is built.
-    let loaded = match runner::load_selected(
+    let mut requester = AuthContext::system("change");
+    requester.tenant = change.tenant.clone();
+    let principal = crate::runtime::Principal::for_body(state, requester, change.trusted_config);
+    let loaded = match crate::runtime::server::load(
         state,
-        &req.config,
-        req.config_format.into(),
-        change.tenant.as_deref(),
-        req.selection.as_ref(),
-        state.origin(change.trusted_config),
+        &principal,
+        crate::runtime::server::Submission::new(&req.config, req.config_format.into())
+            .selected(req.selection.as_ref()),
     )
     .await
     {
@@ -1231,9 +1237,19 @@ async fn execute(
             // interrupted one) replays this run instead of starting another.
             req.idempotency_key
                 .get_or_insert_with(|| format!("change:{}", change.id));
-            runner::submit(state.clone(), req, requester.clone())
-                .await
-                .map(|r| (Some(r.run_id), None))
+            // The approved run, as its requester: every stage runs again
+            // at submission, and the approval was granted (`approved_change`).
+            let principal =
+                crate::runtime::Principal::for_body(state, requester.clone(), req.trusted_config);
+            crate::runtime::server::submit(
+                state,
+                &principal,
+                req,
+                crate::runtime::server::Approval::Required,
+            )
+            .await
+            .and_then(|o| o.accepted())
+            .map(|r| (Some(r.run_id), None))
         }
         #[cfg(feature = "templates")]
         ChangeKind::TemplateRegister => {

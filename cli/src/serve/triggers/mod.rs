@@ -1,7 +1,7 @@
 //! Event-driven pipeline triggers for `faucet serve` (#196).
 //!
 //! A static `--triggers <file>` defines watchers (object-arrival / webhook /
-//! queue-depth) that, on fire, enqueue a run via [`crate::serve::runner::submit`]
+//! queue-depth) that, on fire, submit a run through [`crate::runtime::server::submit`]
 //! — reusing the whole queue/executor/idempotency pipeline. Pure decision logic
 //! (spec validation, `${trigger.*}` substitution, cursors, edge detection) is
 //! separated from the IO shell (watchers, fire path, webhook route).

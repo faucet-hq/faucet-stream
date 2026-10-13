@@ -317,6 +317,34 @@ config fingerprint (submit), source IP, timestamp, and result. Admins read it vi
 for the SQL backends; an in-memory ring otherwise) and expire with the
 `--retain-terminal-runs-secs` window.
 
+### One order of checks for every operation
+
+Every endpoint, MCP tool, trigger fire and approved change request that loads
+or runs a config goes through the same runtime operations (#887), on behalf of
+the calling principal (its identity, role, tenant, and whether the config came
+from the request or from the server's operator). Each applies the same checks
+in the same order and stops at the first refusal:
+
+1. **load** — parse, merge `--default-config`, bind params, resolve secrets;
+2. **trust** — screen the config for its origin, bind the tenant's scope, and
+   check its references against the [reference policy](#reference-policy);
+3. **policy** — the [data-flow policy](../cookbook/policies.md) (`422`,
+   audited as `policy.denied`) — for every operation that writes;
+4. **budget** — the request's `budget` (and a tenant's per-run ceilings)
+   merged into the config's, the stricter winning;
+5. **tenant** — a run for a tenant is admitted against its limits (`409`
+   suspended, `429` at `max_concurrent_runs`);
+6. **governance** — the run's governed options (budget, state namespace,
+   resilience, lineage, pricing, catalog);
+7. **execution**.
+
+An operation that writes nothing (`/v1/plan`, `/v1/doctor`, a status read, a
+`dry_run`) skips the policy, budget and tenant checks, never the trust check.
+So a malformed config answers `400` / `422` before a tenant limit answers
+`409` / `429`, and the same config gets the same answer through
+`POST /v1/runs`, the MCP `run_pipeline` tool, a change request, or (for a
+template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
+
 ## Endpoints
 
 | Method | Path | Success | Notes |
@@ -1183,8 +1211,10 @@ cookbook](../cookbook/rollback.md).
 
 `200` with the report: `applied`, `blocked`, `mode`, `deleted`, `restored`,
 `conflicts`, `bookmark_rewound`, `token_rewound`, `note`. `blocked: true`
-means a later run changed the keys and nothing was touched — pass `force`. `409` while the run is still running. Admin-only (`Rollback`
-permission); audited as `run.rollback`.
+means a later run changed the keys and nothing was touched — pass `force`. `409` while the run is still running. A rollback that writes
+(not `dry_run`) passes the data-flow policy and, for a tenant's run, the
+tenant's admission (`409` suspended, `429` at its run limit), like any write.
+Admin-only (`Rollback` permission); audited as `run.rollback`.
 
 ## Completion callbacks
 
