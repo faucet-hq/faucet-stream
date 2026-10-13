@@ -732,3 +732,173 @@ async fn a_field_missing_from_the_table_fails_instead_of_vanishing() {
         "nothing is written"
     );
 }
+
+fn running_query(job_id: &str) -> serde_json::Value {
+    json!({
+        "kind": "bigquery#queryResponse",
+        "jobComplete": false,
+        "jobReference": {"projectId": PROJECT_ID, "jobId": job_id}
+    })
+}
+
+/// A failed `jobs.getQueryResults` poll fails the write: the commit cannot be
+/// confirmed.
+#[tokio::test]
+async fn a_failed_results_poll_fails_the_write() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running_query("job-p")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-p")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": 400, "message": "bad poll",
+                      "errors": [{"reason": "invalid", "message": "bad poll"}]}
+        })))
+        .mount(&server)
+        .await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("an unconfirmable job fails the write");
+    assert!(err.to_string().contains("getQueryResults"), "{err}");
+}
+
+/// A job that `jobs.query` reports incomplete is polled through
+/// `getQueryResults` until it completes, then confirmed.
+#[tokio::test]
+async fn an_incomplete_query_is_polled_to_completion() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running_query("job-q")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-q")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#getQueryResultsResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-q"}
+        })))
+        .mount(&server)
+        .await;
+    mount_job_done(&server, "job-q").await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let n = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("the polled job completes");
+    assert_eq!(n, 1);
+}
+
+/// A `jobs.cancel` that fails leaves the job possibly committing, and the
+/// write says so.
+#[tokio::test]
+async fn a_failed_cancel_reports_the_job_may_still_commit() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running_query("job-k")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-k")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running_query("job-k")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-k/cancel")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": 403, "message": "denied",
+                      "errors": [{"reason": "accessDenied", "message": "denied"}]}
+        })))
+        .mount(&server)
+        .await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+        c.job_timeout = std::time::Duration::from_millis(300);
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("a job past job_timeout fails the write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cancel failed") && msg.contains("may still commit"),
+        "{msg}"
+    );
+}
+
+/// The wait between cancel-confirmation polls honours the call deadline: a
+/// deadline that ends it reports the job as possibly still committing.
+#[tokio::test]
+async fn a_deadline_during_cancel_confirmation_fails_as_unconfirmed() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running_query("job-c")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-c")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running_query("job-c")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-c/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#jobCancelResponse",
+            "job": {"jobReference": {"projectId": PROJECT_ID, "jobId": "job-c"}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-c")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-c"},
+            "status": {"state": "RUNNING"}
+        })))
+        .mount(&server)
+        .await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+        c.job_timeout = std::time::Duration::from_millis(300);
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    sink.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(1200)),
+    );
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("an unconfirmed cancel fails the write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cancel requested but not confirmed") && msg.contains("may still commit"),
+        "{msg}"
+    );
+}
