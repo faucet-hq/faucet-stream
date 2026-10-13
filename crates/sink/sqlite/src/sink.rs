@@ -1384,13 +1384,14 @@ impl faucet_core::Sink for SqliteSink {
                     format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}"),
                     format!("DROP TABLE {staging}"),
                 ] {
-                    sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
-                        FaucetError::Sink(format!("sqlite overwrite swap failed: {e}"))
-                    })?;
+                    sqlx::query(&stmt)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sink_err("sqlite overwrite swap failed"))?;
                 }
-                tx.commit().await.map_err(|e| {
-                    FaucetError::Sink(format!("sqlite overwrite: commit swap: {e}"))
-                })?;
+                tx.commit()
+                    .await
+                    .map_err(sink_err("sqlite overwrite: commit swap"))?;
                 Ok(())
             })
             .await
