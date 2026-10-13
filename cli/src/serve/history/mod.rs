@@ -109,6 +109,11 @@ pub struct InvocationRecord {
     /// The source's lag when the invocation ended (#733).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_lag: Option<faucet_core::SourceLag>,
+    /// Where every row went (#879): offered, accepted, coalesced, failed to
+    /// the DLQ, quarantined, dropped — the same view `faucet run --output
+    /// json` prints. Absent when nothing was offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<faucet_core::RowAccountsSnapshot>,
     /// The invocation never ran: its parent or a `depends_on` row failed or
     /// was skipped. `error` says which; it is not a failure of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -130,6 +135,7 @@ impl From<&InvocationOutcome> for InvocationRecord {
             usage: o.usage.clone(),
             batches: o.metrics.as_ref().and_then(|m| m.batches),
             source_lag: o.metrics.as_ref().and_then(|m| m.source_lag),
+            rows: o.metrics.as_ref().and_then(|m| m.rows),
             skipped: o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
         }
     }

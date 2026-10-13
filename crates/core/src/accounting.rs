@@ -120,6 +120,7 @@ pub struct RowAccounts {
 /// A point-in-time copy of [`RowAccounts`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct RowAccountsSnapshot {
     /// Rows entering the transform chain.
     pub transform_in: u64,

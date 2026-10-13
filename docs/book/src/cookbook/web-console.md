@@ -100,6 +100,12 @@ payloads through its transforms / quality / contract / sink, with a dry-run
 toggle. This is the [DLQ replay](./dlq.md) workflow, in the browser (backed by
 `POST /v1/dlq/{inspect,replay,discard}`).
 
+The invocations table's **rows** column says where each invocation's rows went
+— `98 ok · 2 dlq`, plus any rows merged by a keyed write, skipped by the sink,
+quarantined, dropped or `unaccounted` (red: a sink lost them and the run
+failed); hovering it shows how many rows were offered and how many the
+transforms filtered out ([row accounting](../reference/http-api.md#get-v1runsid--runrecord)).
+
 The invocations table carries each invocation's own **run id** — the value of
 the `_faucet_run_id` column and what a rollback undoes — and a finished run
 made with a `rollback:` block gets a **Roll back…** button (admin-only) that
