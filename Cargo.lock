@@ -5307,6 +5307,8 @@ version = "1.0.8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "faucet-common-file",
+ "faucet-conformance",
  "faucet-core",
  "hmac 0.12.1",
  "russh",
@@ -5316,8 +5318,10 @@ dependencies = [
  "serde_json",
  "sha1 0.10.6",
  "tempfile",
+ "testcontainers",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6130,21 +6134,17 @@ name = "faucet-sink-sftp"
 version = "1.1.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "faucet-common-file",
  "faucet-common-sftp",
  "faucet-conformance",
  "faucet-core",
  "futures",
- "russh-sftp",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "tempfile",
  "testcontainers",
  "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
