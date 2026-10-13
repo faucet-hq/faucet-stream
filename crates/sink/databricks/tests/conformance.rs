@@ -257,12 +257,12 @@ impl Respond for Warehouse {
         } else if sql.starts_with("INSERT INTO") || sql.starts_with("DELETE FROM") {
             let mut rows = self.rows.lock().unwrap();
             let pred = eo_predicate(sql);
-            if sql.contains(" REPLACE WHERE ") || sql.starts_with("DELETE FROM") {
-                if let Some((scope, seq)) = &pred {
-                    rows.retain(|(s, n)| {
-                        s.as_deref() != Some(scope.as_str()) || n.is_none_or(|n| n < *seq)
-                    });
-                }
+            if (sql.contains(" REPLACE WHERE ") || sql.starts_with("DELETE FROM"))
+                && let Some((scope, seq)) = &pred
+            {
+                rows.retain(|(s, n)| {
+                    s.as_deref() != Some(scope.as_str()) || n.is_none_or(|n| n < *seq)
+                });
             }
             let tag: Row = match &pred {
                 Some((s, n)) => (Some(s.clone()), Some(*n)),

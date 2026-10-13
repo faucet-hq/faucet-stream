@@ -4,9 +4,11 @@
 //! (`faucet_conformance::required`) and every built-in connector's kind-level
 //! capabilities. This test fails when the committed copy drifts.
 //!
-//! Regenerate (the build compiles every built-in connector):
+//! Regenerate (the build must compile every built-in connector, since some
+//! capabilities depend on cargo features — `columnar` needs `arrow`):
 //!   cargo test -p faucet-cli --features full --test declared_capabilities -- --ignored regenerate
-//! A slimmer build updates only the connectors it compiles and keeps the rest.
+//! A slimmer build only checks the requirement table and that every compiled
+//! kind is in the snapshot.
 
 use std::collections::BTreeMap;
 
@@ -88,8 +90,11 @@ fn committed_snapshot_matches_the_declarations() {
     );
     for role in ["sources", "sinks"] {
         let committed = committed_role(&doc, role);
-        for (kind, caps) in compiled(role) {
-            assert_eq!(committed.get(&kind), Some(&caps), "{hint}\n{role}.{kind}");
+        for kind in compiled(role).keys() {
+            assert!(
+                committed.contains_key(kind),
+                "{hint}\nmissing {role}.{kind}"
+            );
         }
     }
 }
@@ -97,14 +102,9 @@ fn committed_snapshot_matches_the_declarations() {
 #[test]
 #[ignore = "writes the snapshot; run explicitly to regenerate"]
 fn regenerate() {
-    let mut sources = BTreeMap::new();
-    let mut sinks = BTreeMap::new();
-    if !every_builtin_compiled() {
-        let doc: Value = serde_json::from_str(COMMITTED).unwrap_or(Value::Null);
-        sources = committed_role(&doc, "sources");
-        sinks = committed_role(&doc, "sinks");
-    }
-    sources.extend(compiled("sources"));
-    sinks.extend(compiled("sinks"));
-    std::fs::write(PATH, render(sources, sinks)).expect("write snapshot");
+    assert!(
+        every_builtin_compiled(),
+        "regenerate with every built-in connector compiled (`--features full`)"
+    );
+    std::fs::write(PATH, render(compiled("sources"), compiled("sinks"))).expect("write snapshot");
 }

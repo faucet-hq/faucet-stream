@@ -1,6 +1,7 @@
 //! `faucet-conformance` battery — Check 1 (config schema validity) and
 //! Check 10 (connector_name non-empty). Passing this battery in CI is the
 //! Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive raw clients directly
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Sink as _;
 use faucet_sink_gcs::{GcsCredentials, GcsSink, GcsSinkConfig};
