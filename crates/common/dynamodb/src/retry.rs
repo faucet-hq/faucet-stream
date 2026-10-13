@@ -110,6 +110,7 @@ impl RetryPolicy {
     /// Run `op` until it succeeds, a fatal error occurs, or the retry budget is
     /// spent. `op` returns the error's `(code, message)`; `what` names the call
     /// in the final error message (the caller picks the `FaucetError` variant).
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     pub async fn run<T, F, Fut>(&self, what: &str, mut op: F) -> Result<T, String>
     where
         F: FnMut() -> Fut,

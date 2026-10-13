@@ -615,6 +615,7 @@ pub(crate) fn owned_headers(map: &serde_json::Map<String, Value>) -> OwnedHeader
 /// `_message_timeout` is kept in the signature for callers that track it but
 /// is not needed with `send_result()`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 async fn send_with_queue_full_retry(
     producer: &FutureProducer,
     topic: &str,

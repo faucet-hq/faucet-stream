@@ -273,6 +273,7 @@ pub async fn write_columnar_media_with_schema(
 /// error in the body — the trap `await_query_complete` also guards). The
 /// error's flag is `false` only when the job timed out and may still be
 /// running.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 async fn await_load_job(
     client: &Client,
     config: &BigQuerySinkConfig,

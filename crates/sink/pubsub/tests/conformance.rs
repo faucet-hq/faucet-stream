@@ -9,6 +9,7 @@
 //! The destination count is read back by draining a subscription created on the
 //! target topic before the sink publishes. Passing this battery in CI is the
 //! Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

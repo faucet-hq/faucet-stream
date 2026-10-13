@@ -1183,6 +1183,7 @@ impl Sink for MssqlSink {
         self.config.batch_atomicity()
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);

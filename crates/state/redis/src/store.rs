@@ -428,6 +428,7 @@ impl RedisStateStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     #[test]
     fn keeps_its_auto_traits() {

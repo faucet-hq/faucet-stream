@@ -17,6 +17,7 @@
 //! The container-backed version of these (toxiproxy in front of a real
 //! database) is a nightly tier; this suite covers the engine contract with no
 //! Docker so it can gate every PR.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::time::Duration;

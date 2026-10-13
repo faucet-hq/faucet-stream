@@ -474,6 +474,7 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
 }
 
 /// The authorization-code grant (RFC 6749 §4.1.3) with the PKCE verifier.
+#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 async fn exchange(provider: &ConnectProvider, code: &str, verifier: &str) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(EXCHANGE_TIMEOUT)

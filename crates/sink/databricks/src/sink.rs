@@ -146,6 +146,7 @@ impl DatabricksSink {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn run(
         &self,
         req: StatementRequest,

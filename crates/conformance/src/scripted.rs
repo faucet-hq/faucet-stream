@@ -458,6 +458,7 @@ impl ScriptedSink {
         s.boundary == Boundary::CommitOverwrite
     }
 
+    #[allow(clippy::disallowed_methods)] // test-harness timing
     async fn record_write(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if let Some(d) = self.write_delay {
             tokio::time::sleep(d).await;
@@ -501,6 +502,7 @@ impl Sink for ScriptedSink {
         self.record_write(records).await
     }
 
+    #[allow(clippy::disallowed_methods)] // test-harness timing
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         if let Some(d) = self.write_delay {
             tokio::time::sleep(d).await;
@@ -570,6 +572,7 @@ impl Sink for ScriptedSink {
         self.atomicity
     }
 
+    #[allow(clippy::disallowed_methods)] // test-harness timing
     async fn write_batch_idempotent(
         &self,
         records: &[Value],

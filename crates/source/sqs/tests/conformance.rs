@@ -8,6 +8,7 @@
 //! Check 3 (bookmark round-trip) does not apply: the SQS source drains the
 //! queue with no resumable bookmark (every page carries an informational
 //! `{queue, consumed}` bookmark only so the pipeline flushes before deleting).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};
 use faucet_source_sqs::{SqsCredentials, SqsSource, SqsSourceConfig};

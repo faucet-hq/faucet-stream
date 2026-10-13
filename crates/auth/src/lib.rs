@@ -45,12 +45,12 @@ use serde_json::Value;
 /// a hung or unreachable IdP with no timeout would wedge that mutex — and thus
 /// every connector sharing the provider — indefinitely. A bounded timeout lets
 /// the fetch fail and release the lock so callers can retry (audit #146 H11).
-pub(crate) fn auth_http_client() -> reqwest::Client {
+pub(crate) fn auth_http_client() -> faucet_core::http::Client {
     const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-    reqwest::Client::builder()
+    faucet_core::http::Client::builder()
         .timeout(AUTH_HTTP_TIMEOUT)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("an HTTP client with only a timeout set always builds")
 }
 
 pub use flow::{FLOW_SESSION_KEY, FlowProvider};

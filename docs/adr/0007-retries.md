@@ -75,6 +75,20 @@ jitter seeded per call so concurrent retries don't realign. Only transient
 - Richer per-sink idempotency hints to safely retry more write shapes
   ([RFC 0001](../../rfcs/0001-capability-traits.md)).
 
+## Update — the call layer (#880)
+
+Source-side retries now run through one primitive, `faucet_core::io::CallContext::call`
+(RFC 0013): the per-attempt timeout, deadline, classified retry with
+`Retry-After`, cancellation and metering live there, built on the same runner
+as the sink side. The REST source's bespoke loop is folded into it: its
+"rate limits don't use attempts, at most ten in a row" rule is
+`CallContext::with_rate_limit_retries`, so REST's semantics are unchanged while
+the code is shared. The duplication-safety rule is untouched: the pipeline
+never hands a sink a retry policy, so a connector retries a write inside
+`write_batch` only when it chose to, and the page-level `with_retry_write!`
+gate still decides whether a whole page is replayed. A sink's call context
+also never carries the run's cancel token, so a cancelled run still flushes.
+
 ## Related
 
 - [Retries](../architecture/retries.md) · [resilience](../architecture/resilience.md) · [recovery](../architecture/recovery.md)

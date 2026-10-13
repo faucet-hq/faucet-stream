@@ -1,7 +1,7 @@
 //! Integration tests for `faucet-sink-gcs` against `fake-gcs-server`.
 //!
 //! Requires Docker. Skips automatically when Docker is unavailable.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(not(target_os = "windows"))]
 
 use faucet_core::Sink;

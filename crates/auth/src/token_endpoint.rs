@@ -2,9 +2,9 @@
 //! endpoint and extract it from the JSON response via JSONPath.
 
 use async_trait::async_trait;
+use faucet_core::http::Client;
 use faucet_core::{AuthProvider, Credential, FaucetError};
 use jsonpath_rust::JsonPath;
-use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -136,7 +136,7 @@ impl TokenEndpointProvider {
     }
 
     async fn fetch(&self) -> Result<(String, Option<u64>), FaucetError> {
-        let reply = crate::retry::send_token_request(|| {
+        let reply = crate::retry::send_token_request(&self.http, || {
             let mut req = self.http.request(self.method.clone(), &self.url);
             if let Some(body) = &self.body {
                 req = match self.encoding {

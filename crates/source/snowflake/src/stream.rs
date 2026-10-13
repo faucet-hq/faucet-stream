@@ -332,6 +332,7 @@ impl SnowflakeSource {
 
     /// Poll the same handle as a partition-less GET until the response is
     /// 200 + `code: "090001"`. Used after a 202 from the initial POST.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn poll_until_ready(&self, handle: &str) -> Result<StatementResponse, FaucetError> {
         let url = format!("{}/api/v2/statements/{}", self.base_url(), handle);
         let poll_timeout = self.config.poll_timeout;

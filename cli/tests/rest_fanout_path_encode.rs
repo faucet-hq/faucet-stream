@@ -2,6 +2,7 @@
 //! percent-encoded into one segment (#862 L-122); a `path` that is exactly one
 //! token takes the value raw.
 #![cfg(all(feature = "source-rest", feature = "sink-stdout"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::json;
 use wiremock::matchers::{method, path};

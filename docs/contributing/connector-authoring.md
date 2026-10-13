@@ -119,6 +119,14 @@ Every one of these has a default implementation, so existing connectors never
 break when a new capability lands. That is the whole point of the
 [progressive-trait design](../adr/0003-builder-pattern.md).
 
+### Backend calls
+
+Route every backend call through a `faucet_core::io::CallSlot` /
+`CallContext::call` and build HTTP clients with `faucet_core::http::Client`;
+the workspace `clippy.toml` refuses `reqwest::Client::new` / `builder` and
+`tokio::time::sleep` outside sanctioned sites. See
+[Backend calls](../book/src/extending/authoring-connectors.md#backend-calls-callcontext-httpclient-batching).
+
 ## Wiring checklist (CI enforces most of this)
 
 Implementing the trait is half the job. A connector isn't shipped until it's

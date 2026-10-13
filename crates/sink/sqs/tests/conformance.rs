@@ -9,6 +9,7 @@
 //!   `delivery: exactly_once`).
 //!
 //! Check 5 requires Docker (LocalStack via testcontainers), mirroring `sink.rs`.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Sink;

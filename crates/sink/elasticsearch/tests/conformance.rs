@@ -227,3 +227,20 @@ async fn conformance_descriptor_matches_built_sink() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || ElasticsearchSink::new(ElasticsearchSinkConfig::new(uri.clone(), "idx")).unwrap(),
+        &[json!({"id": 1})],
+    )
+    .await;
+}

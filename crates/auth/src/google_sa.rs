@@ -5,8 +5,8 @@
 //! The token is cached and refreshed single-flight, like the other providers.
 
 use async_trait::async_trait;
+use faucet_core::http::Client;
 use faucet_core::{AuthProvider, Credential, FaucetError};
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -177,7 +177,7 @@ impl GoogleServiceAccountProvider {
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
         let assertion = self.assertion(jsonwebtoken::get_current_timestamp())?;
-        let reply = crate::retry::send_token_request(|| {
+        let reply = crate::retry::send_token_request(&self.http, || {
             Ok(self
                 .http
                 .post(&self.token_uri)

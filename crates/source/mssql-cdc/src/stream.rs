@@ -550,6 +550,7 @@ fn opt_lsn(row: &tiberius::Row, col: &str) -> Result<Option<Lsn>, FaucetError> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl MssqlCdcSource {
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages_impl<'a>(
         &'a self,
         _ctx: &'a HashMap<String, Value>,

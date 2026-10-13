@@ -35,6 +35,7 @@ pub fn backoff(base: Duration, consecutive_failures: u64) -> Duration {
 }
 
 /// Run a watcher until `shutdown` fires. Never returns an error (logs instead).
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run_supervised<W: Watcher>(
     mut watcher: W,
     state: ServerState,

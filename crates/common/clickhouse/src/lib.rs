@@ -164,11 +164,10 @@ pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// interface, with connect and idle-read timeouts. Kept in one place so both
 /// connectors share the client-construction path and connection pool.
 pub fn build_client(_conn: &ClickHouseConnection) -> Result<reqwest::Client, FaucetError> {
-    reqwest::Client::builder()
+    faucet_core::http::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
-        .build()
-        .map_err(FaucetError::Http)
+        .build_reqwest()
 }
 
 /// Build the ordered `(key, value)` query parameters for a ClickHouse HTTP

@@ -1,5 +1,6 @@
 //! Long-read behaviour: per-request auth, gzip partitions, temporal decoding
 //! and server-side cancel of abandoned statements.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::io::Write;
 use std::sync::Arc;

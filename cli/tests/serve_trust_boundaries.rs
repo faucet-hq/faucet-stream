@@ -5,6 +5,7 @@
 //! config, `--require-approval` gates the template lifecycle, and a gated
 //! template trigger stores no resolved secret.
 #![cfg(all(feature = "serve", feature = "source-csv", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};

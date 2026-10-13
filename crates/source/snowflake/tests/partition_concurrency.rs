@@ -9,6 +9,7 @@
 //! Overlap is measured by counting **simultaneously open requests**, not by a
 //! wall-clock ratio: a timing ratio is a race on a loaded runner, which is how
 //! the equivalent object-store test first failed.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

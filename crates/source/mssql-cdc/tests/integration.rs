@@ -11,6 +11,7 @@
 //! Change capture is asynchronous, so every test seeds its writes, waits for the
 //! capture job to move them into the change table, and then drains the source
 //! with `start_position: earliest` (a static, fully-populated change set).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::time::Duration;
 

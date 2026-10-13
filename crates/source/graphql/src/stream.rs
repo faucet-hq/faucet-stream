@@ -6,6 +6,8 @@ use crate::config::{
 };
 use async_trait::async_trait;
 use base64::Engine as _;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::{
     filter_incremental_path_inclusive, max_replication_value_path, max_value,
 };
@@ -15,7 +17,6 @@ use faucet_core::{
     Stream, StreamPage,
 };
 use jsonpath_rust::JsonPath;
-use reqwest::Client;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -38,8 +39,10 @@ pub struct GraphqlStream {
     /// reproduce the legacy `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`
     /// constants; overridable via [`with_retry_policy`](Self::with_retry_policy).
     retry_policy: faucet_core::RetryPolicy,
-    /// Round-trip / throttling recorder installed by the pipeline (#638, #734).
-    roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): this source's retry policy over the run's
+    /// cancel token, recorder and deadline. Meters `request` round trips and
+    /// throttling (#638, #734).
+    calls: CallSlot,
     /// Bookmark restored by the pipeline before a run (#751); wins over
     /// `start_replication_value`.
     runtime_start: std::sync::Mutex<Option<Value>>,
@@ -153,27 +156,28 @@ impl GraphqlStream {
         }
         if let Some(tls) = &config.tls {
             tls.validate()?;
-            builder = apply_client_tls(builder, tls)?;
+            builder = builder.try_configure(|b| apply_client_tls(b, tls))?;
         }
         let client = builder.build().map_err(|e| {
             FaucetError::Config(format!("graphql: failed to build HTTP client: {e}"))
         })?;
+        // Reproduce the legacy `execute_with_retry(RETRY_MAX_ATTEMPTS,
+        // RETRY_BASE_BACKOFF, …)` behavior exactly: `max_retries` is
+        // retries-after-first, so `max_attempts = RETRY_MAX_ATTEMPTS + 1`.
+        let retry_policy = faucet_core::RetryPolicy {
+            max_attempts: RETRY_MAX_ATTEMPTS + 1,
+            backoff: faucet_core::BackoffKind::Exponential,
+            base: RETRY_BASE_BACKOFF,
+            max: Duration::from_secs(60),
+            jitter: true,
+            retry_on: faucet_core::RetryClassSet::default(),
+        };
         Ok(Self {
             config,
             client,
             auth_provider: None,
-            // Reproduce the legacy `execute_with_retry(RETRY_MAX_ATTEMPTS,
-            // RETRY_BASE_BACKOFF, …)` behavior exactly: `max_retries` is
-            // retries-after-first, so `max_attempts = RETRY_MAX_ATTEMPTS + 1`.
-            retry_policy: faucet_core::RetryPolicy {
-                max_attempts: RETRY_MAX_ATTEMPTS + 1,
-                backoff: faucet_core::BackoffKind::Exponential,
-                base: RETRY_BASE_BACKOFF,
-                max: Duration::from_secs(60),
-                jitter: true,
-                retry_on: faucet_core::RetryClassSet::default(),
-            },
-            roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: CallSlot::new(CallContext::new().with_retry(retry_policy.clone())),
+            retry_policy,
             runtime_start: std::sync::Mutex::new(None),
         })
     }
@@ -183,6 +187,8 @@ impl GraphqlStream {
     /// `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`. Used by the CLI to inject a
     /// pipeline-level `resilience:` policy into the source.
     pub fn with_retry_policy(mut self, policy: faucet_core::RetryPolicy) -> Self {
+        self.calls
+            .set_local(self.calls.local().clone().with_retry(policy.clone()));
         self.retry_policy = policy;
         self
     }
@@ -372,11 +378,13 @@ impl GraphqlStream {
                                         "invalid custom header name {name:?}: {e}"
                                     ))
                                 })?;
-                            let v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                                FaucetError::Auth(format!(
-                                    "invalid custom header value for {name:?}: {e}"
-                                ))
-                            })?;
+                            let mut v =
+                                reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                                    FaucetError::Auth(format!(
+                                        "invalid custom header value for {name:?}: {e}"
+                                    ))
+                                })?;
+                            v.set_sensitive(true);
                             hm.insert(n, v);
                         }
                         req = req.headers(hm);
@@ -390,11 +398,8 @@ impl GraphqlStream {
                 // rule marks them as throttling (#767), which retries the whole
                 // request here.
                 let matches = std::sync::atomic::AtomicU32::new(0);
-                faucet_core::execute_with_policy_recorded(
-                    &self.retry_policy,
-                    None,
-                    self.roundtrips.recorder().as_ref(),
-                    || {
+                self.calls
+                    .call("request", || {
                         let attempt = req.try_clone();
                         let matches = &matches;
                         async move {
@@ -403,21 +408,19 @@ impl GraphqlStream {
                                     "graphql: request is not cloneable for retry".into(),
                                 )
                             })?;
-                            self.roundtrips.record("request");
-                            let resp = req.send().await.map_err(FaucetError::Http)?;
+                            let resp = self.client.send(req).await?;
                             if self.config.retry_on_response.is_empty() {
                                 let resp = util::check_http_response_rate_limited(
                                     resp,
                                     DEFAULT_ERROR_BODY_MAX_LEN,
                                 )
                                 .await?;
-                                return resp.json().await.map_err(FaucetError::Http);
+                                return self.client.json(resp).await;
                             }
                             self.read_with_matchers(resp, matches).await
                         }
-                    },
-                )
-                .await
+                    })
+                    .await
             }
         })
         .await?;
@@ -447,7 +450,7 @@ impl GraphqlStream {
         let status = resp.status().as_u16();
         let url = resp.url().to_string();
         let headers = resp.headers().clone();
-        let text = resp.text().await.map_err(FaucetError::Http)?;
+        let text = self.client.text(resp).await?;
         if let Some(rule) = faucet_core::resilience::find_match(
             &self.config.retry_on_response,
             status,
@@ -743,7 +746,11 @@ impl faucet_core::Source for GraphqlStream {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {

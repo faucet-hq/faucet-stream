@@ -740,6 +740,7 @@ fn map_ssh_err(e: russh::Error) -> FaucetError {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

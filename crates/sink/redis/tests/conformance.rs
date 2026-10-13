@@ -10,6 +10,7 @@
 //!
 //! Checks 4 and 5 boot a real Redis container (reusing `exactly_once.rs`'s
 //! setup), so they require Docker.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 use faucet_conformance::assert_config_schema_valid_value;
 
 #[test]

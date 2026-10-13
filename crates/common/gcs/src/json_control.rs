@@ -35,7 +35,9 @@ impl JsonApiControl {
     pub(crate) fn new(endpoint: &str) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: faucet_core::http::Client::builder()
+                .build_reqwest()
+                .expect("a default HTTP client always builds"),
         }
     }
 

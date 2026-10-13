@@ -1,6 +1,6 @@
 //! Shared Oracle Free container harness. Tests skip (return `None`) when the
 //! Oracle Instant Client library cannot be loaded or Docker is unavailable.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![allow(dead_code)]
 
 use std::time::Duration;

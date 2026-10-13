@@ -10,6 +10,7 @@
 //!
 //! Run explicitly with:
 //! `cargo test -p faucet-sink-clickhouse --test integration`.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 

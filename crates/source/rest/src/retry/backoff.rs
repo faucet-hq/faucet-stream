@@ -1,7 +1,9 @@
-//! Exponential backoff retry executor with jitter.
+//! Exponential backoff retry executor with jitter, over
+//! [`CallContext`] (#880).
 
-use faucet_core::observability::{RoundtripRecorder, throttle_sleep};
-use faucet_core::{FaucetError, RetryClass};
+use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
+use faucet_core::observability::RoundtripRecorder;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +13,7 @@ use std::time::Duration;
 /// and retried (not counting against `max_retries`), but a perpetually
 /// rate-limited endpoint must not loop forever (#78/#14). The counter resets
 /// whenever any non-429 outcome occurs.
-const MAX_CONSECUTIVE_RATE_LIMITS: u32 = 10;
+pub(crate) const MAX_CONSECUTIVE_RATE_LIMITS: u32 = 10;
 
 /// Execute an async operation with exponential backoff retries and jitter.
 ///
@@ -41,71 +43,33 @@ where
 /// `faucet_source_retries_total`, and the time actually slept on a rate limit
 /// as `faucet_source_throttle_wait_seconds` (measured, not the `Retry-After`
 /// value; a sleep interrupted by the run being dropped records what elapsed).
+/// Round trips themselves are not counted here — the operation counts its own.
 pub async fn execute_with_retry_recorded<F, Fut, T>(
     max_retries: u32,
     base_backoff: Duration,
     recorder: Option<Arc<RoundtripRecorder>>,
-    mut operation: F,
+    operation: F,
 ) -> Result<T, FaucetError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    let mut attempt = 0u32;
-    let mut rate_limited = 0u32;
-    loop {
-        let outcome = operation().await;
-        let class = outcome.as_ref().err().and_then(faucet_core::classify);
-        let throttled = class == Some(RetryClass::RateLimited);
-        if throttled && let Some(r) = &recorder {
-            r.throttled();
-        }
-        match outcome {
-            Ok(val) => return Ok(val),
-            Err(FaucetError::RateLimited(wait)) => {
-                if rate_limited >= MAX_CONSECUTIVE_RATE_LIMITS {
-                    tracing::error!("rate limited {rate_limited} consecutive times; giving up");
-                    return Err(FaucetError::RateLimited(wait));
-                }
-                rate_limited += 1;
-                tracing::warn!(
-                    "rate limited; retrying after {wait:?} ({rate_limited}/{MAX_CONSECUTIVE_RATE_LIMITS})"
-                );
-                if let Some(r) = &recorder {
-                    r.retry(RetryClass::RateLimited);
-                }
-                throttle_sleep(recorder.clone(), wait, None).await;
-                // Rate-limited waits do not count as a `max_retries` attempt.
-            }
-            Err(e) if e.is_retriable() && attempt < max_retries => {
-                // A non-429 outcome breaks the consecutive-429 streak.
-                rate_limited = 0;
-                tracing::warn!(
-                    "request failed (attempt {}/{}): {e}",
-                    attempt + 1,
-                    max_retries + 1
-                );
-                if let (Some(r), Some(c)) = (&recorder, class) {
-                    r.retry(c);
-                }
-                let wait = faucet_core::retry::backoff_with_jitter(base_backoff, attempt);
-                if throttled {
-                    throttle_sleep(recorder.clone(), wait, None).await;
-                } else {
-                    tokio::time::sleep(wait).await;
-                }
-                attempt += 1;
-            }
-            Err(e) => {
-                if !e.is_retriable() {
-                    tracing::error!("non-retriable error: {e}");
-                } else {
-                    tracing::error!("request failed after {} attempts: {e}", attempt + 1);
-                }
-                return Err(e);
-            }
-        }
+    let mut ctx = CallContext::new()
+        .without_timeout()
+        .with_retry(faucet_core::RetryPolicy {
+            max_attempts: max_retries.saturating_add(1),
+            backoff: faucet_core::BackoffKind::Exponential,
+            base: base_backoff,
+            max: Duration::from_secs(60),
+            jitter: true,
+            retry_on: faucet_core::RetryClassSet::default(),
+        })
+        .with_rate_limit_retries(MAX_CONSECUTIVE_RATE_LIMITS)
+        .with_roundtrip_metering(false);
+    if let Some(r) = recorder {
+        ctx = ctx.with_recorder(r);
     }
+    ctx.call("request", operation).await
 }
 
 // Backoff + jitter now lives in `faucet_core::retry::backoff_with_jitter` (capped

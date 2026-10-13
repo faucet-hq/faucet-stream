@@ -20,7 +20,7 @@ Retries happen in two distinct places, for two distinct reasons:
 %%{init: {'theme':'base','flowchart':{'curve':'basis','nodeSpacing':50,'rankSpacing':72,'padding':14},'themeVariables':{'fontFamily':'-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif','fontSize':'14px','lineColor':'#a5b4c4','clusterBkg':'#f8fafc','clusterBorder':'#e2e8f0'}}}%%
 flowchart TD
     subgraph Source side
-      REST[rest / xml / graphql] -->|with_retry_policy| RS[execute_with_retry]
+      REST[connectors] -->|CallSlot| RS["CallContext call"]
     end
     subgraph Sink side
       RS2[run_stream with_retry! macro] --> WB[write_batch* / flush / state_put]
@@ -33,11 +33,16 @@ flowchart TD
     class WB sink
 ```
 
-1. **Source side** — HTTP sources (`rest`, `xml`, `graphql`) retry their own
-   requests. The `rest` source predates the unified policy and keeps its own
-   `max_retries` / `retry_backoff` plus special `429` / `Retry-After` handling;
-   `xml` / `graphql` use the shared `execute_with_retry` (`crates/core/src/retry.rs`).
-   A `ResiliencePolicy` is injected via `Source::with_retry_policy`.
+1. **Connector side** — every backend call runs through
+   `faucet_core::io::CallContext::call` (#880): per-attempt timeout, the run's
+   deadline, classified retry (a `RateLimited` waits its stated time),
+   cancellation and metering, on the same runner as the sink side. The retry
+   policy is the connector's own (`rest` / `xml` / `graphql` take an injected
+   `ResiliencePolicy` via `Source::with_retry_policy`); the `rest` source keeps
+   its `max_retries` / `retry_backoff` and its "a `429` doesn't use an attempt,
+   at most ten in a row" rule through `CallContext::with_rate_limit_retries`.
+   The pipeline never hands a connector a retry policy, and never hands a sink
+   the run's cancel token.
 2. **Sink side** — `run_stream` wraps every `write_batch*`, `flush`, and
    `StateStore::put` in a `with_retry!` macro gated on the attached
    `ResiliencePolicy`. With no policy the macro is a bare `.await`, so the write path
@@ -94,11 +99,12 @@ retried — retrying it would only waste time and delay the real failure.
 
 ## Trade-offs
 
-- **REST keeps its own retry runner** for back-compat; when its `max_retries` /
-  `retry_backoff` are at defaults the injected policy's `max_attempts` + `base`
-  apply, but `retry_on` / `max` / `jitter` are inert on REST (honoured in full on
-  `xml`/`graphql` and every sink-side write). This asymmetry is a deliberate
-  compatibility concession, documented in [resilience](./resilience.md).
+- **REST keeps its retry semantics** for back-compat: it runs on the shared
+  `CallContext` runner, but when its `max_retries` / `retry_backoff` are at
+  defaults only the injected policy's `max_attempts` + `base` apply; `retry_on` /
+  `max` / `jitter` stay inert on REST (honoured in full on `xml`/`graphql` and
+  every sink-side write). This asymmetry is a deliberate compatibility
+  concession, documented in [resilience](./resilience.md).
 - **Declining to retry non-idempotent writes** means a transient sink blip aborts
   the run (to be replayed) rather than silently retrying — the safe default, at the
   cost of a restart.
@@ -116,8 +122,8 @@ retried — retrying it would only waste time and delay the real failure.
 
 ## Future evolution
 
-- Folding the bespoke REST retry runner into the unified policy so `retry_on` /
-  `jitter` apply uniformly.
+- Letting the injected policy's `retry_on` / `jitter` apply to REST too, now
+  that REST runs on the shared `CallContext` runner (#880).
 - Per-sink idempotency hints richer than the current boolean, enabling safe retry of
   more write shapes ([RFC 0001](../../rfcs/0001-capability-traits.md)).
 

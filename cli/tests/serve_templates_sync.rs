@@ -4,7 +4,7 @@
 //! `POST /v1/templates/sync` (dry-run and real), and writes a version back on
 //! `POST /v1/templates/{id}/publish`. A server without origins refuses both
 //! with a 422 that names the flag.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(feature = "templates-sync")]
 
 use std::time::Duration;

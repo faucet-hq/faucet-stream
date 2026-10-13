@@ -487,6 +487,7 @@ pub async fn publish(
 /// Spawn one periodic pull task per origin that declares `interval_secs`.
 /// Each runs until `shutdown` fires; failures are logged and counted, never
 /// fatal.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub fn spawn_interval_syncs(
     store: TemplateStore,
     file: Arc<SyncFile>,
@@ -530,6 +531,7 @@ pub fn spawn_interval_syncs(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::serve::history::memory::MemoryHistory;

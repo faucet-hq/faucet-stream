@@ -3,6 +3,7 @@
 //! (`403` for a viewer's write, `200` for its read) and that mutating / denied
 //! actions land in the admin-only audit log. Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

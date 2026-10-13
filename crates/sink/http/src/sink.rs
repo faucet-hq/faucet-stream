@@ -2,6 +2,8 @@
 
 use crate::config::{HttpBatchMode, HttpSinkAuth, HttpSinkConfig};
 use async_trait::async_trait;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response_rate_limited};
 use faucet_core::{AuthSpec, Credential, FaucetError, SharedAuthProvider};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -26,49 +28,66 @@ fn credential_to_auth(cred: Credential) -> HttpSinkAuth {
 /// An HTTP sink that sends records to an HTTP endpoint.
 pub struct HttpSink {
     config: HttpSinkConfig,
-    client: reqwest::Client,
+    client: Client,
     /// Optional shared auth provider. When set, it takes precedence over inline
     /// auth. Set via [`HttpSink::with_auth_provider`].
     auth_provider: Option<SharedAuthProvider>,
+    /// Backend-call context (#880): `max_retries` over the run's recorder and
+    /// deadline; meters each `send` round trip.
+    calls: CallSlot,
 }
 
-/// Base delay for a retried request; the cap and jitter come from
-/// [`faucet_core::retry::backoff_with_jitter`], so this sink cannot drift from
-/// the rest of the repo's backoff behaviour.
+/// Base delay for a retried request; the cap and jitter come from the core
+/// retry runner, so this sink cannot drift from the rest of the repo's backoff
+/// behaviour.
 const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Sleep before re-sending. A `RateLimited` error carries the server's own
-/// `Retry-After`, which always wins; everything else gets capped, jittered
-/// exponential backoff. Retrying with **no** delay (the previous behaviour)
+/// The retry policy for `max_retries`: a `RateLimited` error waits the
+/// server's own `Retry-After`; everything else gets capped, jittered
+/// exponential backoff. Retrying with **no** delay (the original behaviour)
 /// turned a brief upstream 503 into an amplifying burst of requests within
 /// microseconds — the thundering herd core's backoff exists to prevent.
-fn retry_wait(err: &FaucetError, attempt: u32) -> std::time::Duration {
-    match err {
-        FaucetError::RateLimited(d) => *d,
-        _ => faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt),
+fn retry_policy(max_retries: usize) -> faucet_core::RetryPolicy {
+    faucet_core::RetryPolicy {
+        max_attempts: u32::try_from(max_retries)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1),
+        backoff: faucet_core::BackoffKind::Exponential,
+        base: RETRY_BASE,
+        max: std::time::Duration::from_secs(60),
+        jitter: true,
+        retry_on: faucet_core::RetryClassSet::default(),
     }
-}
-
-async fn retry_delay(err: &FaucetError, attempt: u32) {
-    tokio::time::sleep(retry_wait(err, attempt)).await;
 }
 
 impl HttpSink {
     /// Create a new HTTP sink from the given configuration.
     pub fn new(config: HttpSinkConfig) -> Self {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = Client::builder();
         if let Some(t) = config.timeout {
             builder = builder.timeout(t);
         }
         if let Some(t) = config.connect_timeout {
             builder = builder.connect_timeout(t);
         }
+        if let HttpSinkAuth::Custom { headers } = match &config.auth {
+            AuthSpec::Inline(a) => a,
+            AuthSpec::Reference(_) => &HttpSinkAuth::None,
+        } {
+            for name in headers.keys() {
+                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok() {
+                    builder = builder.sensitive_header(name);
+                }
+            }
+        }
+        let calls = CallSlot::new(CallContext::new().with_retry(retry_policy(config.max_retries)));
         Self {
-            config,
             client: builder
                 .build()
                 .expect("an HTTP client with only timeouts set always builds"),
+            config,
             auth_provider: None,
+            calls,
         }
     }
 
@@ -131,9 +150,10 @@ impl HttpSink {
                         reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                             FaucetError::Auth(format!("invalid custom header name {name:?}: {e}"))
                         })?;
-                    let v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                    let mut v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
                         FaucetError::Auth(format!("invalid custom header value for {name:?}: {e}"))
                     })?;
+                    v.set_sensitive(true);
                     hm.insert(n, v);
                 }
                 req = req.headers(hm);
@@ -157,39 +177,19 @@ impl HttpSink {
     }
 
     /// Send a single request with retry logic, using the pre-resolved `auth`.
+    /// A transport error and a retriable status take the same retry path.
     async fn send_with_retry(&self, body: &Value, auth: &HttpSinkAuth) -> Result<(), FaucetError> {
-        let mut last_error = None;
-
-        for attempt in 0..=self.config.max_retries {
-            let req = self.build_request_with_auth(body, auth)?;
-
-            // One retry path for both failure kinds — a transport error and a
-            // retriable status differ only in how the error is obtained.
-            let err = match req.send().await {
-                Ok(resp) => {
-                    match check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
-                        Ok(_) => return Ok(()),
-                        Err(FaucetError::Source(message)) => FaucetError::Sink(message),
-                        Err(e) => e,
-                    }
+        self.calls
+            .call("send", || async {
+                let req = self.build_request_with_auth(body, auth)?;
+                let resp = self.client.send(req).await?;
+                match check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
+                    Ok(_) => Ok(()),
+                    Err(FaucetError::Source(message)) => Err(FaucetError::Sink(message)),
+                    Err(e) => Err(e),
                 }
-                Err(e) => FaucetError::Http(e),
-            };
-            if attempt < self.config.max_retries && err.is_retriable() {
-                tracing::warn!(
-                    attempt = attempt + 1,
-                    max_retries = self.config.max_retries,
-                    error = %err,
-                    "retrying request"
-                );
-                retry_delay(&err, attempt as u32).await;
-                last_error = Some(err);
-                continue;
-            }
-            return Err(err);
-        }
-
-        Err(last_error.unwrap_or_else(|| FaucetError::Sink("max retries exhausted".into())))
+            })
+            .await
     }
 
     /// [`send_with_retry`](Self::send_with_retry), re-authenticating once when
@@ -231,6 +231,17 @@ impl faucet_core::Sink for HttpSink {
 
     fn connector_name(&self) -> &'static str {
         "http"
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -289,7 +300,7 @@ impl faucet_core::Sink for HttpSink {
             }
         };
 
-        let probe = match tokio::time::timeout(ctx.timeout, req.send()).await {
+        let probe = match tokio::time::timeout(ctx.timeout, self.client.send(req)).await {
             // Any HTTP response means DNS + TCP + TLS + the host all work.
             Ok(Ok(_)) => Probe::pass("network", started.elapsed()),
             // Transport/connection error: no response received.
@@ -340,14 +351,8 @@ impl faucet_core::Sink for HttpSink {
                 // whatever upstream handed us as a single JSON-array POST,
                 // preserving `StreamPage` framing. Otherwise re-chunk into
                 // `batch_size` slices and issue one POST per chunk.
-                let effective_chunk = if self.config.batch_size == 0 {
-                    records.len()
-                } else {
-                    self.config.batch_size
-                };
-
                 let mut total = 0;
-                for chunk in records.chunks(effective_chunk) {
+                for chunk in faucet_core::batching::chunks(records, self.config.batch_size) {
                     let array = Value::Array(chunk.to_vec());
                     self.send(&array, &auth, sent).await?;
                     total += chunk.len();
@@ -443,15 +448,9 @@ impl faucet_core::Sink for HttpSink {
                 // chunk — mirroring `write_batch`, but tracking per-chunk
                 // delivery so a late failure doesn't poison earlier chunks that
                 // were already delivered.
-                let effective_chunk = if self.config.batch_size == 0 {
-                    records.len()
-                } else {
-                    self.config.batch_size
-                };
-
                 let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
                 let mut delivered = 0usize;
-                let mut chunks = records.chunks(effective_chunk);
+                let mut chunks = faucet_core::batching::chunks(records, self.config.batch_size);
                 let mut failed_chunk: Option<FaucetError> = None;
 
                 for chunk in chunks.by_ref() {
@@ -614,32 +613,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_wait_prefers_the_servers_retry_after_then_falls_back_to_jittered_backoff() {
-        use super::{RETRY_BASE, retry_wait};
-        use std::time::Duration;
+    fn retry_policy_backs_off_with_jitter_from_the_base() {
+        use super::{RETRY_BASE, retry_policy};
 
-        // A server-supplied Retry-After always wins — guessing over it is how
-        // you get throttled harder.
-        let after = Duration::from_secs(7);
-        assert_eq!(retry_wait(&FaucetError::RateLimited(after), 3), after);
-
-        // Everything else gets core's capped, jittered exponential backoff.
-        // Jitter is [0.5, 1.5), so assert the band rather than an exact value —
-        // and crucially assert it is NOT zero, which was the bug: retrying with
-        // no delay turned a brief 503 into an amplifying burst.
-        let err = FaucetError::HttpStatus {
-            status: 503,
-            url: "u".into(),
-            body: String::new(),
-        };
-        for attempt in 0..4u32 {
-            let w = retry_wait(&err, attempt);
-            assert!(
-                w > Duration::ZERO,
-                "attempt {attempt} must not be a hot loop"
-            );
-            let ceiling = RETRY_BASE * 2u32.pow(attempt + 1);
-            assert!(w < ceiling, "attempt {attempt}: {w:?} exceeds {ceiling:?}");
-        }
+        // `max_retries` counts retries after the first attempt; the backoff is
+        // core's capped, jittered exponential from a non-zero base (a zero
+        // delay turned a brief 503 into an amplifying burst). A `RateLimited`
+        // error waits its own `Retry-After` in the core runner.
+        let p = retry_policy(3);
+        assert_eq!(p.max_attempts, 4);
+        assert_eq!(p.base, RETRY_BASE);
+        assert!(p.jitter);
+        assert_eq!(p.backoff, faucet_core::BackoffKind::Exponential);
+        assert_eq!(retry_policy(0).max_attempts, 1);
+        assert_eq!(retry_policy(usize::MAX).max_attempts, u32::MAX);
     }
 }

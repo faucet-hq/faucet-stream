@@ -5,6 +5,7 @@
 //! already-committed pages with zero duplicates.
 //!
 //! These tests require Docker.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 

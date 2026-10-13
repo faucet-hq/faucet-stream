@@ -122,7 +122,7 @@ async fn fetch_oauth2_token_inner(
     client_secret: &str,
     scopes: &[String],
 ) -> Result<(String, Option<u64>), FaucetError> {
-    let client = Client::new();
+    let client = super::token_client();
     fetch_oauth2_token_inner_with_client(&client, token_url, client_id, client_secret, scopes).await
 }
 
@@ -179,6 +179,7 @@ async fn fetch_oauth2_token_inner_with_client(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // the public token API takes a caller-built reqwest client
 mod tests {
     use super::*;
     use wiremock::matchers::{body_string_contains, method, path};

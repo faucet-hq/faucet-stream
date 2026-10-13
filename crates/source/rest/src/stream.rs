@@ -6,7 +6,6 @@ use crate::auth::token_endpoint::TokenEndpointCache;
 use crate::config::{RestStreamConfig, TlsClientConfig};
 use crate::extract;
 use crate::pagination::{PaginationState, PaginationStyle};
-use crate::retry;
 use async_trait::async_trait;
 use faucet_core::replication::{
     BindTarget, OnMissingKey, ReplicationKey, ReplicationMethod, max_replication_value_path,
@@ -17,8 +16,9 @@ use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, Shared
 
 /// faucet-auth's `FLOW_SESSION_KEY`: the captured key naming a flow session.
 const FLOW_SESSION_KEY: &str = "__session__";
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use futures_core::Stream;
-use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
@@ -59,8 +59,8 @@ pub struct RestStream {
     run_clock: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     /// Retry policy for transient request failures. Built in `new()` from the
     /// REST source's own `config.max_retries` / `config.retry_backoff`. Fed into
-    /// the REST `retry::execute_with_retry` runner (which keeps its 429 /
-    /// `Retry-After` handling). Overridable via
+    /// [`call_ctx`](Self::call_ctx) (which keeps the 429 / `Retry-After`
+    /// budget). Overridable via
     /// [`with_retry_policy`](Self::with_retry_policy) — but the REST connector's
     /// own legacy `max_retries` / `retry_backoff` fields take precedence when the
     /// user has set them away from their defaults.
@@ -74,11 +74,11 @@ pub struct RestStream {
     /// (see [`metadata_xml`](Self::metadata_xml)). Instance-owned by design —
     /// no process-global cache state.
     metadata_xml_cache: tokio::sync::OnceCell<Arc<String>>,
-    /// Upstream round-trip counter (#638), installed once by the pipeline via
-    /// [`Source::set_roundtrip_recorder`]. `OnceLock` rather than a field on
-    /// the config because the labels are only known at run time, and because
-    /// the hook takes `&self`.
-    roundtrips: std::sync::OnceLock<Arc<faucet_core::observability::RoundtripRecorder>>,
+    /// Backend-call context (#880): the run's recorder (#638), cancel token
+    /// and deadline, installed by the pipeline; the attempt timeout is
+    /// `config.timeout`. Retries are layered on per call from
+    /// [`retry_policy`](Self::retry_policy) by [`call_ctx`](Self::call_ctx).
+    calls: CallSlot,
     /// `config.replication_key`, compiled once (#747).
     replication_key: Option<ReplicationKey>,
     /// Set once the missing-key warning has been logged (once per instance).
@@ -550,10 +550,24 @@ impl RestStream {
         if let Some(tls) = &config.tls {
             tls.validate()?;
         }
-        let new_builder = || -> Result<reqwest::ClientBuilder, FaucetError> {
-            let builder = Client::builder().gzip(true).brotli(true).deflate(true);
+        let mut sensitive: Vec<&str> = config.headers.keys().map(String::as_str).collect();
+        match &config.auth {
+            AuthSpec::Inline(Auth::ApiKey { header, .. }) => sensitive.push(header),
+            AuthSpec::Inline(Auth::Custom { headers }) => {
+                sensitive.extend(headers.keys().map(String::as_str))
+            }
+            _ => {}
+        }
+        let new_builder = || -> Result<faucet_core::http::ClientBuilder, FaucetError> {
+            let mut builder =
+                Client::builder().configure(|b| b.gzip(true).brotli(true).deflate(true));
+            for name in &sensitive {
+                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok() {
+                    builder = builder.sensitive_header(name);
+                }
+            }
             match &config.tls {
-                Some(tls) => apply_client_tls(builder, tls),
+                Some(tls) => builder.try_configure(|b| apply_client_tls(b, tls)),
                 None => Ok(builder),
             }
         };
@@ -567,9 +581,9 @@ impl RestStream {
             stream_builder = stream_builder.connect_timeout(t).read_timeout(t);
         }
         // Build the default retry policy from REST's own legacy reliability
-        // fields so behavior is unchanged when no policy is injected. The REST
-        // `retry::execute_with_retry` runner is driven by `max_retries`
-        // (retries-after-first) + `base`, so `max_attempts = max_retries + 1`.
+        // fields so behavior is unchanged when no policy is injected. The call
+        // context is driven by `max_retries` (retries-after-first) + `base`, so
+        // `max_attempts = max_retries + 1`.
         let retry_policy = faucet_core::RetryPolicy {
             max_attempts: config.max_retries.saturating_add(1),
             backoff: faucet_core::BackoffKind::Exponential,
@@ -584,6 +598,10 @@ impl RestStream {
             .as_deref()
             .map(ReplicationKey::parse)
             .transpose()?;
+        let calls = CallSlot::new(match config.timeout {
+            Some(t) => CallContext::new().with_timeout(t),
+            None => CallContext::new(),
+        });
         Ok(Self {
             config,
             client: builder.build()?,
@@ -597,7 +615,7 @@ impl RestStream {
             retry_policy,
             static_headers,
             metadata_xml_cache: tokio::sync::OnceCell::new(),
-            roundtrips: std::sync::OnceLock::new(),
+            calls,
             replication_key,
             missing_key_warned: std::sync::atomic::AtomicBool::new(false),
             matcher_hits: std::sync::atomic::AtomicU32::new(0),
@@ -695,7 +713,7 @@ impl RestStream {
         if missing == 0 {
             return;
         }
-        if let Some(r) = self.roundtrips.get() {
+        if let Some(r) = self.calls.recorder() {
             r.replication_key_missing(missing as u64);
         }
         if !self
@@ -953,9 +971,28 @@ impl RestStream {
     /// (#638). `op` is drawn from this connector's closed set:
     /// `submit` / `poll` / `fetch` / `page`.
     fn roundtrip(&self, op: &'static str) {
-        if let Some(r) = self.roundtrips.get() {
-            r.record(op);
-        }
+        self.calls.record(op);
+    }
+
+    /// The context a retried request runs under: the run's context with this
+    /// source's retry policy (#880). A `RateLimited` outcome waits its stated
+    /// time without using an attempt, up to [`MAX_CONSECUTIVE_RATE_LIMITS`]
+    /// in a row; the policy's `max` (60 s), jitter and `retry_on` are fixed,
+    /// which keeps REST's documented semantics. Round trips are counted by the
+    /// request builders themselves, so the call does not count them again.
+    fn call_ctx(&self, max_retries: u32) -> CallContext {
+        self.calls
+            .get()
+            .with_retry(faucet_core::RetryPolicy {
+                max_attempts: max_retries.saturating_add(1),
+                backoff: faucet_core::BackoffKind::Exponential,
+                base: self.retry_policy.base,
+                max: Duration::from_secs(60),
+                jitter: true,
+                retry_on: faucet_core::RetryClassSet::default(),
+            })
+            .with_rate_limit_retries(crate::retry::backoff::MAX_CONSECUTIVE_RATE_LIMITS)
+            .with_roundtrip_metering(false)
     }
 
     /// Run the row-count probe and read the count out of its response (#629).
@@ -1433,16 +1470,12 @@ impl RestStream {
                     let params_clone = params.clone();
                     let ctx_ref = owned_context.as_ref();
                     let is_first_page = pages_fetched == 0;
-                    let (body, resp_headers) = retry::execute_with_retry_recorded(
-                        // The REST runner takes retries-after-first; the policy holds
-                        // total attempts. Feed both knobs from the resolved policy so
-                        // an injected `resilience:` policy (when legacy fields are
-                        // untouched) governs the retry budget + base backoff while the
-                        // runner keeps its 429 / `Retry-After` handling.
-                        self.retry_policy.max_attempts.saturating_sub(1),
-                        self.retry_policy.base,
-                        self.roundtrips.get().cloned(),
-                        || {
+                    // The resolved policy (an injected `resilience:` policy when the
+                    // legacy fields are untouched) sets the retry budget + base
+                    // backoff; rate limits keep their own budget.
+                    let (body, resp_headers) = self
+                        .call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+                        .call("page", || {
                             self.execute_request(
                                 &params_clone,
                                 url_override.as_deref(),
@@ -1451,9 +1484,8 @@ impl RestStream {
                                 &body_params,
                                 &pass_window_binds,
                             )
-                        },
-                    )
-                    .await?;
+                        })
+                        .await?;
 
                     let raw_records = self.extract_page(&body)?;
                     let raw_count = raw_records.len();
@@ -1582,7 +1614,7 @@ impl RestStream {
                     }
 
                     if let Some(delay) = self.config.request_delay {
-                        tokio::time::sleep(delay).await;
+                        self.calls.wait(delay).await?;
                     }
                 }
 
@@ -1829,24 +1861,20 @@ impl RestStream {
         // submitted job, and a connection dropped mid-body is retried the same
         // way the pagination path retries a page. Same policy knobs as the
         // pagination runner.
-        retry::execute_with_retry_recorded(
-            self.retry_policy.max_attempts.saturating_sub(1),
-            self.retry_policy.base,
-            self.roundtrips.get().cloned(),
-            || async {
+        self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+            .call(op, || async {
                 let resp = self
                     .job_request_response_once(op, method, url, headers, query, json, false)
                     .await?;
                 let status = resp.status().as_u16();
                 let resp_headers = resp.headers().clone();
-                let bytes = resp.bytes().await.map_err(FaucetError::Http)?;
+                let bytes = self.client.bytes(resp).await?;
                 if let Some(e) = self.classify_success_response(status, &resp_headers, &bytes) {
                     return Err(e);
                 }
-                Ok((bytes.to_vec(), resp_headers))
-            },
-        )
-        .await
+                Ok((bytes, resp_headers))
+            })
+            .await
     }
 
     /// Send a fetch request and return the raw [`reqwest::Response`] with its body
@@ -1865,13 +1893,11 @@ impl RestStream {
         query: &HashMap<String, String>,
         json: Option<&Value>,
     ) -> Result<reqwest::Response, FaucetError> {
-        retry::execute_with_retry_recorded(
-            self.retry_policy.max_attempts.saturating_sub(1),
-            self.retry_policy.base,
-            self.roundtrips.get().cloned(),
-            || self.job_request_response_once(op, method, url, headers, query, json, true),
-        )
-        .await
+        self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+            .call(op, || {
+                self.job_request_response_once(op, method, url, headers, query, json, true)
+            })
+            .await
     }
 
     /// One unretried attempt — the shared request-building core of
@@ -1931,7 +1957,7 @@ impl RestStream {
         // runner's `is_retriable` classification sees connect/timeout failures —
         // stringifying them into `Source(...)` would silently make every
         // transient network blip fatal to a 30-minute bulk job.
-        let resp = req.send().await.map_err(FaucetError::Http)?;
+        let resp = client.send(req).await?;
         let status = resp.status();
         if !status.is_success() && !self.config.retry_on_response.is_empty() {
             let headers = resp.headers().clone();
@@ -2118,7 +2144,7 @@ impl RestStream {
                 "async_job: submit rejected while another job runs; retrying"
             );
             let wait = Duration::from_secs(se.retry_interval_secs).min(limit - waited);
-            tokio::time::sleep(wait).await;
+            self.calls.wait(wait).await?;
         }
     }
 
@@ -2195,7 +2221,7 @@ impl RestStream {
                             job.poll.timeout_secs
                         )));
                     }
-                    tokio::time::sleep(poll_delay).await;
+                    self.calls.wait(poll_delay).await?;
                     poll_delay = next_poll_delay(poll_delay, poll_cap);
                 }
             }
@@ -2325,7 +2351,7 @@ impl RestStream {
                     let token = self
                         .token_cache
                         .get_or_refresh(
-                            &self.client,
+                            self.client.inner(),
                             token_url,
                             client_id,
                             client_secret,
@@ -2349,7 +2375,7 @@ impl RestStream {
                     let token = self
                         .token_endpoint_cache
                         .get_or_refresh_with_encoding(
-                            &self.client,
+                            self.client.inner(),
                             token_url,
                             token_method,
                             token_headers,
@@ -2516,7 +2542,7 @@ impl RestStream {
                     let token = self
                         .token_cache
                         .get_or_refresh(
-                            &self.client,
+                            self.client.inner(),
                             token_url,
                             client_id,
                             client_secret,
@@ -2540,7 +2566,7 @@ impl RestStream {
                     let token = self
                         .token_endpoint_cache
                         .get_or_refresh_with_encoding(
-                            &self.client,
+                            self.client.inner(),
                             token_url,
                             token_method,
                             token_headers,
@@ -2769,7 +2795,7 @@ impl RestStream {
         // One data-page request against the API (#638). Counted per attempt,
         // so a 429-then-retry counts twice — it consumed two calls of quota.
         self.roundtrip("page");
-        let resp = req.send().await?;
+        let resp = self.client.send(req).await?;
         let status = resp.status();
 
         // 429 Too Many Requests: honour Retry-After before retrying, unless a
@@ -2848,7 +2874,7 @@ impl RestStream {
         // non-retriable decode error ("EOF while parsing a value") that aborts
         // the run; treat it as an empty page ("no data") instead (#146 M10). A
         // non-empty body that isn't valid JSON still surfaces as a parse error.
-        let bytes = resp.bytes().await?;
+        let bytes = self.client.bytes(resp).await?;
         if let Some(e) = self.classify_success_response(status.as_u16(), &resp_headers, &bytes) {
             return Err(e);
         }
@@ -3136,7 +3162,11 @@ impl faucet_core::Source for RestStream {
         // First install wins; the pipeline installs exactly once per run, and
         // ignoring a second call keeps a re-used source instance from losing
         // the labels it is already counting under.
-        let _ = self.roundtrips.set(recorder);
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -3658,13 +3688,9 @@ impl RestStream {
             return self.discover_get_text_once(url, what).await;
         }
         // Only a `retry_on_response` match (a rate limit) is retried here.
-        retry::execute_with_retry_recorded(
-            0,
-            self.retry_policy.base,
-            self.roundtrips.get().cloned(),
-            || self.discover_get_text_once(url, what),
-        )
-        .await
+        self.call_ctx(0)
+            .call("discover", || self.discover_get_text_once(url, what))
+            .await
     }
 
     async fn discover_get_text_once(&self, url: &str, what: &str) -> Result<String, FaucetError> {
@@ -3686,9 +3712,7 @@ impl RestStream {
         self.roundtrip("discover");
         let resp = self
             .client
-            .get(url)
-            .headers(headers)
-            .send()
+            .send(self.client.get(url).headers(headers))
             .await
             .map_err(|e| FaucetError::Source(format!("rest: {what} request failed: {e}")))?;
         let status = resp.status();
@@ -3769,32 +3793,26 @@ impl RestStream {
             for (k, v) in self.metadata_headers(&url).await?.iter() {
                 headers.insert(k.clone(), v.clone());
             }
-            let resp = self
-                .client
-                .get(&url)
-                .headers(headers)
-                .query(&[
-                    ("cross-company", "true"),
-                    ("$orderby", &format!("{key} {dir}")),
-                    ("$top", "1"),
-                    ("$select", key),
-                    ("$format", "json"),
-                ])
-                .send()
-                .await
-                .map_err(|e| {
-                    FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
-                })?;
+            let request = self.client.get(&url).headers(headers).query(&[
+                ("cross-company", "true"),
+                ("$orderby", &format!("{key} {dir}")),
+                ("$top", "1"),
+                ("$select", key),
+                ("$format", "json"),
+            ]);
+            let resp = self.client.send(request).await.map_err(|e| {
+                FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+            })?;
             if !resp.status().is_success() {
                 return Err(FaucetError::Source(format!(
                     "rest: OData key-bounds returned HTTP {}",
                     resp.status().as_u16()
                 )));
             }
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))?;
+            let body: serde_json::Value =
+                self.client.json(resp).await.map_err(|e| {
+                    FaucetError::Source(format!("rest: OData key-bounds body: {e}"))
+                })?;
             let Some(row) = body
                 .get("value")
                 .and_then(|v| v.as_array())

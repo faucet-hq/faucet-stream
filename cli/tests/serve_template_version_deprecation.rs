@@ -2,7 +2,7 @@
 //! backend (through the fallback wrapper the server always uses): retire one
 //! version, see `newest` skip it, trigger it pinned (it runs, with a warning),
 //! be refused a launch, revive it, and have a delete clear the marker.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(all(feature = "templates", feature = "serve-history-sqlite"))]
 
 use std::time::Duration;

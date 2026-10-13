@@ -7,6 +7,7 @@
 //! idempotent-watermark / keyed-upsert mechanism), so check 5 takes the
 //! honest-`false` branch: Append works and no phantom commit token is recorded.
 //! Passing this battery in CI is the Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 

@@ -10,6 +10,7 @@
 //! corrects this by appending the per-signal path when it is absent, so a
 //! conventional bare base endpoint (e.g. `http://collector:4318`) reaches the
 //! right route on the collector. This test uses the bare base to prove that.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use axum::{Router, body::Bytes, extract::State, routing::post};
 use faucet_core::observability::otel::{

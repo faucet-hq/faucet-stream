@@ -945,6 +945,7 @@ async fn stop_cycle<T>(cancel: &CancellationToken, task: &mut AbortOnDrop<T>) {
     let _ = tokio::time::timeout(CYCLE_STOP_GRACE, &mut task.0).await;
 }
 
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> {
     let mut d = Driver {
         shared,

@@ -174,6 +174,7 @@ pub(crate) enum ShardEvent {
 /// exhausted. Each `GetRecords` call holds one `permits` permit, so a stream
 /// with more shards than permits still reads every shard in turn. Returns
 /// `true` when the shard was fully drained.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) async fn run_shard(
     client: Client,
     config: KinesisSourceConfig,

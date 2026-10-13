@@ -1,6 +1,7 @@
 //! Integration tests for event-driven triggers (#196). Drive the serve runner
 //! in-process against an in-memory history backend.
 #![cfg(all(feature = "triggers", feature = "source-csv", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::time::Duration;

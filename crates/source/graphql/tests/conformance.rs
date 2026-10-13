@@ -202,3 +202,26 @@ fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(60))
+                .set_body_json(json!({ "data": { "users": [] } })),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        GraphqlStream::new(GraphqlStreamConfig::new(
+            uri.clone(),
+            "query { users { id } }",
+        ))
+    })
+    .await;
+}

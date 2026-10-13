@@ -24,6 +24,7 @@
 //! general `cargo test` run skips them (only the offline schema check runs). Run
 //! them explicitly with `cargo test -p faucet-source-mssql-cdc -- --ignored`.
 //! The offline `conformance_config_schema_valid` check always runs.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::time::Duration;
 

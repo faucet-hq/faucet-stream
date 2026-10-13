@@ -164,6 +164,8 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     /// Store bookmarks bare instead of in the versioned envelope (#736): a
     /// cluster member that predates the envelope is still live.
     legacy_state_writes: bool,
+    /// The base the run's call contexts are built from (#880).
+    call_context: Option<crate::io::CallContext>,
 }
 
 /// Build and install the source/sink round-trip recorders for one run (#638).
@@ -177,7 +179,7 @@ pub(crate) fn install_roundtrip_recorders(
     pipeline: &str,
     row: &str,
     meter: Option<&Arc<crate::usage::UsageMeter>>,
-) -> Arc<crate::observability::ThrottleTally> {
+) -> InstalledRecorders {
     use crate::observability::{RoundtripRecorder, RoundtripSide};
     let mut src = RoundtripRecorder::new(
         RoundtripSide::Source,
@@ -196,9 +198,41 @@ pub(crate) fn install_roundtrip_recorders(
         snk = snk.with_meter(Arc::clone(m));
     }
     let throttle = src.throttle_tally();
-    source.set_roundtrip_recorder(Arc::new(src));
-    sink.set_roundtrip_recorder(Arc::new(snk));
-    throttle
+    let (src, snk) = (Arc::new(src), Arc::new(snk));
+    source.set_roundtrip_recorder(Arc::clone(&src));
+    sink.set_roundtrip_recorder(Arc::clone(&snk));
+    InstalledRecorders {
+        throttle,
+        source: src,
+        sink: snk,
+    }
+}
+
+/// The recorders [`install_roundtrip_recorders`] handed out.
+pub(crate) struct InstalledRecorders {
+    pub(crate) throttle: Arc<crate::observability::ThrottleTally>,
+    pub(crate) source: Arc<crate::observability::RoundtripRecorder>,
+    pub(crate) sink: Arc<crate::observability::RoundtripRecorder>,
+}
+
+/// Build and install the run's call contexts (#880) from `base`: each side gets
+/// its round-trip recorder, and the source gets the run's cancel token unless
+/// it drains on cancel itself. The sink never gets the token — a cancelled run
+/// still flushes it.
+pub(crate) fn install_call_contexts(
+    source: &dyn Source,
+    sink: &dyn Sink,
+    base: Option<&crate::io::CallContext>,
+    recorders: &InstalledRecorders,
+    source_cancel: Option<&tokio_util::sync::CancellationToken>,
+) {
+    let base = base.cloned().unwrap_or_default();
+    let mut src = base.clone().with_recorder(Arc::clone(&recorders.source));
+    if let Some(token) = source_cancel {
+        src = src.with_cancel(token.clone());
+    }
+    source.set_call_context(src);
+    sink.set_call_context(base.with_recorder(Arc::clone(&recorders.sink)));
 }
 
 impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
@@ -230,6 +264,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             allow_dlq_all_duplicates: false,
             lag_observer: None,
             legacy_state_writes: false,
+            call_context: None,
         }
     }
 
@@ -427,6 +462,15 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// Set the base of the call contexts handed to the source and sink (#880):
+    /// a default attempt timeout or a deadline for every backend call. The
+    /// pipeline adds the round-trip recorders and, for the source, the cancel
+    /// token; connector settings still take precedence.
+    pub fn with_call_context(mut self, ctx: crate::io::CallContext) -> Self {
+        self.call_context = Some(ctx);
+        self
+    }
+
     /// Attach a usage meter (#704): the run's records, estimated bytes,
     /// backend round trips and cost signals accumulate there for accounting
     /// and budgets. Without one, nothing is counted beyond the metrics.
@@ -522,7 +566,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         // decorators forward it down to the connector that does the I/O. A
         // connector that never records emits nothing.
         let run_started = std::time::Instant::now();
-        let throttle = install_roundtrip_recorders(
+        let recorders = install_roundtrip_recorders(
             &wrapped_source,
             &wrapped_sink,
             &name,
@@ -533,6 +577,14 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             .cancel
             .as_ref()
             .is_some_and(|token| wrapped_source.set_cancel(token.clone()));
+        install_call_contexts(
+            &wrapped_source,
+            &wrapped_sink,
+            self.call_context.as_ref(),
+            &recorders,
+            self.cancel.as_ref().filter(|_| !source_drains_on_cancel),
+        );
+        let throttle = recorders.throttle;
         let wrapped_state_store: Option<Arc<dyn StateStore>> = self.state_store.as_ref().map(|s| {
             Arc::new(InstrumentedStateStore::new(
                 Arc::clone(s),
@@ -3076,6 +3128,7 @@ fn quarantine_drift_rows(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -8863,5 +8916,94 @@ mod overwrite_flush_tests {
                 .is_err()
         );
         assert_eq!(flushes(&fail_events), 2);
+    }
+}
+
+#[cfg(test)]
+mod call_context_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Seen(Mutex<Option<crate::io::CallContext>>);
+
+    struct CtxSource {
+        seen: Seen,
+        drains: bool,
+    }
+
+    #[async_trait]
+    impl Source for CtxSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![json!({"a": 1})])
+        }
+        fn set_cancel(&self, _cancel: crate::CancellationToken) -> bool {
+            self.drains
+        }
+        fn set_call_context(&self, ctx: crate::io::CallContext) {
+            *self.seen.0.lock().unwrap() = Some(ctx);
+        }
+    }
+
+    #[derive(Default)]
+    struct CtxSink(Seen);
+
+    #[async_trait]
+    impl Sink for CtxSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        fn set_call_context(&self, ctx: crate::io::CallContext) {
+            *self.0.0.lock().unwrap() = Some(ctx);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_installs_call_contexts() {
+        for drains in [false, true] {
+            let source = CtxSource {
+                seen: Seen::default(),
+                drains,
+            };
+            let sink = CtxSink::default();
+            let token = crate::CancellationToken::new();
+            Pipeline::new(&source, &sink)
+                .with_cancel(token)
+                .with_call_context(
+                    crate::io::CallContext::new().with_timeout(std::time::Duration::from_secs(7)),
+                )
+                .run()
+                .await
+                .unwrap();
+            let src = source.seen.0.lock().unwrap().clone().unwrap();
+            let snk = sink.0.0.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                src.cancel().is_some(),
+                !drains,
+                "draining sources keep their own cancel"
+            );
+            assert!(
+                snk.cancel().is_none(),
+                "a sink is never cancelled mid-flush"
+            );
+            assert!(src.recorder().is_some() && snk.recorder().is_some());
+            assert_eq!(src.timeout(), Some(std::time::Duration::from_secs(7)));
+            assert_eq!(snk.timeout(), Some(std::time::Duration::from_secs(7)));
+            assert!(src.retry().is_none() && snk.retry().is_none());
+        }
+        let source = CtxSource {
+            seen: Seen::default(),
+            drains: false,
+        };
+        let sink = CtxSink::default();
+        Pipeline::new(&source, &sink).run().await.unwrap();
+        let src = source.seen.0.lock().unwrap().clone().unwrap();
+        assert!(src.cancel().is_none());
+        assert_eq!(src.timeout(), Some(crate::io::DEFAULT_CALL_TIMEOUT));
     }
 }

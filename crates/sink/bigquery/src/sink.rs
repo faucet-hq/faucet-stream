@@ -82,6 +82,7 @@ pub(crate) enum CancelOutcome {
 /// Request `jobs.cancel` for a job that outlived `job_timeout`, then poll it
 /// (up to [`CANCEL_CONFIRM`]) until it stops (SQL-96). A job that won the race
 /// and succeeded is reported as such instead of as a failure.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) async fn cancel_timed_out_job(
     client: &Client,
     config: &BigQuerySinkConfig,
@@ -204,6 +205,7 @@ fn is_transient_bq_error(err: &BQError) -> bool {
 /// is typed over `FaucetError`, and these call sites need the **typed
 /// `BQError`** after retrying (e.g. `tables.get` 404 → "table absent", a
 /// legitimate `Ok(None)` outcome, not a failure).
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 async fn retry_control_plane<F, Fut, T>(what: &str, mut call: F) -> Result<T, BQError>
 where
     F: FnMut() -> Fut,
@@ -856,6 +858,7 @@ pub(crate) const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration
 pub(crate) const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A `reqwest` builder with the upload clients' timeouts.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) fn upload_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
@@ -1393,6 +1396,7 @@ impl BigQuerySink {
     /// query path uses. A non-`DONE` terminal state or a present `errorResult`
     /// is an error, so the overwrite never swaps in a partially-loaded staging
     /// table.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn await_load_job(
         &self,
         job_id: &str,
@@ -1962,6 +1966,7 @@ impl BigQuerySink {
 
     /// [`await_query_job`](Self::await_query_job) that also says whether a
     /// failed job was a transaction BigQuery aborted for a concurrent update.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn await_query_job_classified(
         &self,
         initial: QueryResponse,
@@ -2074,6 +2079,7 @@ impl BigQuerySink {
     /// table (SQL-95): an aborted transaction committed nothing, so running it
     /// again is safe. A retry gets a fresh `requestId`, or BigQuery would hand
     /// back the aborted job.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn run_transaction(&self, mut req: QueryRequest, what: &str) -> Result<Job, FaucetError> {
         let base_id = req.request_id.clone();
         let mut delay = Duration::from_millis(200);

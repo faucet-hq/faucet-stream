@@ -610,7 +610,7 @@ impl Session {
 
 /// A composable multi-step auth flow provider.
 pub struct FlowProvider {
-    http: reqwest::Client,
+    http: faucet_core::http::Client,
     config: FlowConfig,
     state: Mutex<Option<Session>>,
     /// Logins so far; each session's number is exposed as [`FLOW_SESSION_KEY`].
@@ -706,7 +706,7 @@ impl FlowProvider {
                 let (name, value) = sign_header(sign, &sign_ctx);
                 builder = builder.header(name.as_str(), value);
             }
-            let resp = builder.send().await.map_err(|e| {
+            let resp = self.http.send(builder).await.map_err(|e| {
                 FaucetError::Auth(format!("flow auth: step {i} request failed: {e}"))
             })?;
             let status = resp.status();
@@ -722,7 +722,7 @@ impl FlowProvider {
             let needs_json = step.capture.values().any(|c| c.kind() == CaptureFrom::Json);
             let needs_xml = step.capture.values().any(|c| c.kind() == CaptureFrom::Xml);
             let text: Option<String> = if needs_json || needs_xml {
-                Some(resp.text().await.map_err(|e| {
+                Some(self.http.text(resp).await.map_err(|e| {
                     FaucetError::Auth(format!(
                         "flow auth: step {i} failed to read response body: {e}"
                     ))

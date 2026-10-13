@@ -7,6 +7,7 @@
     feature = "sink-mongodb",
     feature = "transform-cdc-unwrap"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::config::PipelineConfig;
 use faucet_cli::replication::compiled::CompiledReplication;

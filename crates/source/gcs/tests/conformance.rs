@@ -5,7 +5,7 @@
 //! Checks 2, 9 and 12 run against `fake-gcs-server`: a plaintext storage host
 //! lists over the JSON API (see `faucet-common-gcs`), so the emulator serves
 //! the full list + read path. They skip when Docker is unavailable.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(not(target_os = "windows"))]
 
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};

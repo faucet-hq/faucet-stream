@@ -3,10 +3,11 @@
 use crate::config::{XmlAuth, XmlPagination, XmlStreamConfig};
 use crate::convert;
 use async_trait::async_trait;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
 use faucet_core::{Stream, StreamPage};
-use reqwest::Client;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
@@ -99,9 +100,12 @@ fn substitute_captured(s: &str, captured: &BTreeMap<String, String>) -> String {
 /// A SOAP endpoint's HTTP 500: a `<Fault>` body is returned for fault handling
 /// (never retried — re-POSTing a failed operation is not safe, API-46); any
 /// other 500 is the usual retriable status error.
-async fn soap_fault_or_error(resp: reqwest::Response) -> Result<String, FaucetError> {
+async fn soap_fault_or_error(
+    client: &Client,
+    resp: reqwest::Response,
+) -> Result<String, FaucetError> {
     let url = resp.url().to_string();
-    let text = resp.text().await.map_err(FaucetError::Http)?;
+    let text = client.text(resp).await?;
     if convert::xml_to_json(&text)
         .ok()
         .and_then(|doc| convert::detect_soap_fault(&doc))
@@ -140,8 +144,10 @@ pub struct XmlStream {
     /// reproduce the legacy `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`
     /// constants; overridable via [`with_retry_policy`](Self::with_retry_policy).
     retry_policy: faucet_core::RetryPolicy,
-    /// Round-trip / throttling recorder installed by the pipeline (#638, #734).
-    roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): this source's retry policy over the run's
+    /// cancel token, recorder and deadline. Meters `request` round trips and
+    /// throttling (#638, #734).
+    calls: CallSlot,
 }
 
 /// Attach a mutual-TLS client identity to the HTTP client builder (#495). Only
@@ -244,27 +250,28 @@ impl XmlStream {
         }
         if let Some(tls) = &config.tls {
             tls.validate()?;
-            builder = apply_client_tls(builder, tls)?;
+            builder = builder.try_configure(|b| apply_client_tls(b, tls))?;
         }
         let client = builder
             .build()
             .map_err(|e| FaucetError::Config(format!("xml: failed to build HTTP client: {e}")))?;
+        // Reproduce the legacy `execute_with_retry(RETRY_MAX_ATTEMPTS,
+        // RETRY_BASE_BACKOFF, …)` behavior exactly: `max_retries` is
+        // retries-after-first, so `max_attempts = RETRY_MAX_ATTEMPTS + 1`.
+        let retry_policy = faucet_core::RetryPolicy {
+            max_attempts: RETRY_MAX_ATTEMPTS + 1,
+            backoff: faucet_core::BackoffKind::Exponential,
+            base: RETRY_BASE_BACKOFF,
+            max: Duration::from_secs(60),
+            jitter: true,
+            retry_on: faucet_core::RetryClassSet::default(),
+        };
         Ok(Self {
             config,
             client,
             auth_provider: None,
-            // Reproduce the legacy `execute_with_retry(RETRY_MAX_ATTEMPTS,
-            // RETRY_BASE_BACKOFF, …)` behavior exactly: `max_retries` is
-            // retries-after-first, so `max_attempts = RETRY_MAX_ATTEMPTS + 1`.
-            retry_policy: faucet_core::RetryPolicy {
-                max_attempts: RETRY_MAX_ATTEMPTS + 1,
-                backoff: faucet_core::BackoffKind::Exponential,
-                base: RETRY_BASE_BACKOFF,
-                max: Duration::from_secs(60),
-                jitter: true,
-                retry_on: faucet_core::RetryClassSet::default(),
-            },
-            roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: CallSlot::new(CallContext::new().with_retry(retry_policy.clone())),
+            retry_policy,
         })
     }
 
@@ -273,6 +280,8 @@ impl XmlStream {
     /// `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`. Used by the CLI to inject a
     /// pipeline-level `resilience:` policy into the source.
     pub fn with_retry_policy(mut self, policy: faucet_core::RetryPolicy) -> Self {
+        self.calls
+            .set_local(self.calls.local().clone().with_retry(policy.clone()));
         self.retry_policy = policy;
         self
     }
@@ -704,11 +713,12 @@ impl XmlStream {
                                 ))
                             },
                         )?;
-                        let v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                        let mut v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
                             FaucetError::Auth(format!(
                                 "invalid custom header value for {name:?}: {e}"
                             ))
                         })?;
+                        v.set_sensitive(true);
                         hm.insert(n, v);
                     }
                     req = req.headers(hm);
@@ -748,31 +758,26 @@ impl XmlStream {
         // Retry transient failures (5xx / connection resets) with jittered
         // backoff, matching the REST source's reliability layer (#78/#16).
         // The request body is a String, so `try_clone` always succeeds.
-        faucet_core::execute_with_policy_recorded(
-            &self.retry_policy,
-            None,
-            self.roundtrips.recorder().as_ref(),
-            || {
+        self.calls
+            .call("request", || {
                 let attempt = req.try_clone();
                 async move {
                     let req = attempt.ok_or_else(|| {
                         FaucetError::Source("xml: request is not cloneable for retry".into())
                     })?;
-                    self.roundtrips.record("request");
-                    let resp = req.send().await.map_err(FaucetError::Http)?;
+                    let resp = self.client.send(req).await?;
                     if self.config.soap.is_some()
                         && resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR
                     {
-                        return soap_fault_or_error(resp).await;
+                        return soap_fault_or_error(&self.client, resp).await;
                     }
                     let resp =
                         util::check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN)
                             .await?;
-                    resp.text().await.map_err(FaucetError::Http)
+                    self.client.text(resp).await
                 }
-            },
-        )
-        .await
+            })
+            .await
     }
 }
 
@@ -850,7 +855,11 @@ impl faucet_core::Source for XmlStream {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {

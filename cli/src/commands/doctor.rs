@@ -1152,6 +1152,7 @@ fn render_lints(path: &Path, findings: &[LintFinding], json: bool) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

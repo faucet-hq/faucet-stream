@@ -12,6 +12,7 @@
 //!   and *flush*, so a buffered sink (a Parquet footer, an S3 multipart) commits
 //!   what it accepted instead of orphaning it. The difference between this and
 //!   a dropped future is the whole point.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::time::Duration;

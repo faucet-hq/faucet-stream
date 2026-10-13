@@ -188,7 +188,7 @@ pub async fn fetch_token_from_endpoint(
     token_path: &str,
     response_validator: Option<&ResponseValidator>,
 ) -> Result<String, FaucetError> {
-    let client = Client::new();
+    let client = super::token_client();
     let (token, _) = fetch_token(
         &client,
         url,
@@ -320,7 +320,8 @@ async fn fetch_token(
 /// runner cannot observe.
 pub(crate) async fn token_backoff(attempt: u32) {
     let delay = faucet_core::retry::backoff_with_jitter(TOKEN_RETRY_BASE, attempt);
-    tokio::time::sleep(delay).await;
+    // No cancel token or deadline is attached, so the wait always completes.
+    let _ = faucet_core::CallContext::new().wait(delay).await;
 }
 
 /// Flatten a JSON object body into form-encoded `(key, value)` pairs for
@@ -367,6 +368,7 @@ fn extract_u64(body: &Value, path: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // the public token API takes a caller-built reqwest client
 mod tests {
     use super::*;
     use serde_json::json;

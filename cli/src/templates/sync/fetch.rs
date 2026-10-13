@@ -336,6 +336,7 @@ struct ContentsEntry {
 }
 
 impl GithubFetcher {
+    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     pub fn new(cfg: &GithubSource) -> CliResult<Self> {
         if cfg.repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
             return Err(CliError::Config(format!(

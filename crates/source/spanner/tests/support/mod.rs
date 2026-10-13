@@ -5,6 +5,7 @@
 //! own admin client — no `gcloud` sidecar, no `SPANNER_EMULATOR_HOST` env var
 //! (the emulator endpoint rides the connector's `emulator_host` config field,
 //! so parallel tests never race on process-global state).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_source_spanner::{SpannerConnection, SpannerCredentials};
 use gcloud_googleapis::spanner::admin::database::v1::CreateDatabaseRequest;

@@ -11,6 +11,7 @@
     feature = "mcp",
     feature = "serve-history-sqlite"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::time::Duration;
 

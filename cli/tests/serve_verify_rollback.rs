@@ -4,6 +4,7 @@
 //! submitted through the control plane is undone by its recorded invocation
 //! id, and RBAC is enforced (viewer cannot verify; operator cannot roll back).
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::time::Duration;

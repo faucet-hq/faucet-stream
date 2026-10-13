@@ -4,6 +4,7 @@
 //! clustered instance that cannot renew its leases cancels its own runs before
 //! a peer could reclaim them.
 #![cfg(all(feature = "serve", feature = "templates", feature = "triggers"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use async_trait::async_trait;
 use faucet_cli::serve::config::{AuthMode, HistoryBackendSpec, ServeConfig};

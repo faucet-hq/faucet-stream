@@ -12,6 +12,7 @@
 //! unit-tested in `faucet_core::cleanup`. What could not be tested there is the
 //! gate itself: these tests drive the real `Pipeline::run` and assert that
 //! `cleanup_scope` is *not even called* in each unsafe situation.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -2,9 +2,10 @@
 
 use crate::config::{ElasticsearchAuth, ElasticsearchSourceConfig};
 use async_trait::async_trait;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Stream, StreamPage};
-use reqwest::Client;
 use serde_json::{Value, json};
 use std::pin::Pin;
 
@@ -20,6 +21,10 @@ pub struct ElasticsearchSource {
     /// auth. Injected by the CLI (to resolve `auth: { ref }`) or directly by
     /// library callers who want to share one token across multiple sources.
     auth_provider: Option<SharedAuthProvider>,
+    /// Backend-call context (#880): `request_timeout_secs` per attempt over
+    /// the run's cancel token, recorder and deadline. One attempt — a retried
+    /// scroll call could skip a page. Meters `search` / `scroll` / `discover`.
+    calls: CallSlot,
 }
 
 impl ElasticsearchSource {
@@ -30,15 +35,17 @@ impl ElasticsearchSource {
         config.validate()?;
         // Bounded timeouts: a half-open connection or a wedged node must fail
         // the request, not hang the run (#789 MSG-58).
+        let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs))
-            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
+            .timeout(request_timeout)
             .build()
             .map_err(|e| FaucetError::Config(format!("elasticsearch HTTP client: {e}")))?;
         Ok(Self {
             config,
             client,
             auth_provider: None,
+            calls: CallSlot::new(CallContext::new().with_timeout(request_timeout)),
         })
     }
 
@@ -208,11 +215,15 @@ impl faucet_core::Source for ElasticsearchSource {
                 "{}/{}/_search?scroll={}&size={}",
                 self.config.base_url, index, self.config.scroll_timeout, size
             );
-            let req = self.client.post(&url).json(&json!({"query": query}));
-            let req = Self::apply_auth_value(req, &auth);
-            let resp = req.send().await?;
-            let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-            let body: Value = resp.json().await?;
+            let body: Value = self
+                .calls
+                .call("search", || async {
+                    let req = self.client.post(&url).json(&json!({"query": query}));
+                    let resp = self.client.send(Self::apply_auth_value(req, &auth)).await?;
+                    let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+                    self.client.json(resp).await
+                })
+                .await?;
 
             let records = Self::extract_hits(&body);
             guard.update(Self::extract_scroll_id(&body));
@@ -236,14 +247,18 @@ impl faucet_core::Source for ElasticsearchSource {
                     let auth = self.resolve_auth().await?;
                     guard.set_auth(auth.clone());
                     let scroll_url = format!("{}/_search/scroll", self.config.base_url);
-                    let req = self.client.post(&scroll_url).json(&json!({
-                        "scroll": self.config.scroll_timeout,
-                        "scroll_id": sid,
-                    }));
-                    let req = Self::apply_auth_value(req, &auth);
-                    let resp = req.send().await?;
-                    let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                    let body: Value = resp.json().await?;
+                    let body: Value = self
+                        .calls
+                        .call("scroll", || async {
+                            let req = self.client.post(&scroll_url).json(&json!({
+                                "scroll": self.config.scroll_timeout,
+                                "scroll_id": sid,
+                            }));
+                            let resp = self.client.send(Self::apply_auth_value(req, &auth)).await?;
+                            let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+                            self.client.json(resp).await
+                        })
+                        .await?;
 
                     let records = Self::extract_hits(&body);
                     guard.update(Self::extract_scroll_id(&body));
@@ -286,6 +301,17 @@ impl faucet_core::Source for ElasticsearchSource {
         })
     }
 
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
     fn connector_name(&self) -> &'static str {
         "elasticsearch"
     }
@@ -319,12 +345,18 @@ impl faucet_core::Source for ElasticsearchSource {
             "{}/_cat/indices?format=json&h=index,docs.count",
             self.config.base_url
         );
-        let req = Self::apply_auth_value(self.client.get(&url), &auth);
-        let resp = req.send().await.map_err(|e| {
-            FaucetError::Source(format!("elasticsearch: catalog discovery failed: {e}"))
-        })?;
+        let resp = self
+            .calls
+            .call("discover", || {
+                self.client
+                    .send(Self::apply_auth_value(self.client.get(&url), &auth))
+            })
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("elasticsearch: catalog discovery failed: {e}"))
+            })?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let cat: Value = resp.json().await.map_err(|e| {
+        let cat: Value = self.client.json(resp).await.map_err(|e| {
             FaucetError::Source(format!("elasticsearch: catalog discovery failed: {e}"))
         })?;
 
@@ -335,10 +367,16 @@ impl faucet_core::Source for ElasticsearchSource {
         // Data streams live in hidden `.ds-*` backing indices, which `_cat`
         // filtering drops; list them by name (#789 MSG-94).
         let url = format!("{}/_data_stream", self.config.base_url);
-        let req = Self::apply_auth_value(self.client.get(&url), &auth);
-        if let Ok(resp) = req.send().await
+        let resp = self
+            .calls
+            .call("discover", || {
+                self.client
+                    .send(Self::apply_auth_value(self.client.get(&url), &auth))
+            })
+            .await;
+        if let Ok(resp) = resp
             && resp.status().is_success()
-            && let Ok(body) = resp.json::<Value>().await
+            && let Ok(body) = self.client.json::<Value>(resp).await
         {
             entries.extend(
                 parse_data_streams(&body)
@@ -378,14 +416,20 @@ impl ElasticsearchSource {
             self.config.base_url,
             urlencoding::encode(index)
         );
-        let req = Self::apply_auth_value(self.client.get(&url), auth);
-        let resp = req.send().await.map_err(|e| {
-            FaucetError::Source(format!(
-                "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
-            ))
-        })?;
+        let resp = self
+            .calls
+            .call("discover", || {
+                self.client
+                    .send(Self::apply_auth_value(self.client.get(&url), auth))
+            })
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
+                ))
+            })?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        resp.json().await.map_err(|e| {
+        self.client.json(resp).await.map_err(|e| {
             FaucetError::Source(format!(
                 "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
             ))
@@ -562,7 +606,7 @@ impl ScrollGuard {
                 let url = format!("{base_url}/_search/scroll");
                 let req = client.delete(&url).json(&json!({"scroll_id": sid}));
                 let req = apply_auth_to(req, &auth);
-                if let Err(e) = req.send().await {
+                if let Err(e) = client.send(req).await {
                     tracing::warn!(error = %e, "failed to clear Elasticsearch scroll context");
                 }
             });
@@ -582,7 +626,7 @@ impl Drop for ScrollGuard {
                 let url = format!("{base_url}/_search/scroll");
                 let req = client.delete(&url).json(&json!({"scroll_id": sid}));
                 let req = apply_auth_to(req, &auth);
-                if let Err(e) = req.send().await {
+                if let Err(e) = client.send(req).await {
                     tracing::warn!(
                         error = %e,
                         "failed to clear Elasticsearch scroll context (drop path)",

@@ -8,6 +8,7 @@
     feature = "source-sqlite",
     feature = "sink-jsonl"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};

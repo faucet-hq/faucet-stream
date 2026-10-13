@@ -303,6 +303,7 @@ fn event_label(ev: EventType) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::config::{EmitOn, LineageConfig, Transport};

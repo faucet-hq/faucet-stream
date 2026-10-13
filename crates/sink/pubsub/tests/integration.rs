@@ -14,6 +14,7 @@
 //! connector's `build_client` — reads it and switches to the emulator
 //! environment, no auth), so the tests are serialized by [`EMULATOR_LOCK`] and
 //! the variable is rewritten under that lock for each test's own port.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::{CheckContext, Sink};
 use faucet_sink_pubsub::{

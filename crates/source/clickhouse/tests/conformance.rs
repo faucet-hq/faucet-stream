@@ -6,6 +6,7 @@
 //! cleanly when Docker is unavailable (so `cargo test` passes on a Docker-less
 //! host) and runs for real in CI, where Docker is present. Passing this battery
 //! in CI is the Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 

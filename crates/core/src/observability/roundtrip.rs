@@ -304,6 +304,7 @@ impl Drop for ThrottleWait {
 /// Sleep `wait` on behalf of a rate limit, recording the time actually slept
 /// (#734). Returns `false` when `cancel` fired first; the partial wait is still
 /// recorded.
+#[allow(clippy::disallowed_methods)] // the sanctioned rate-limit sleep
 pub async fn throttle_sleep(
     recorder: Option<Arc<RoundtripRecorder>>,
     wait: Duration,
@@ -385,6 +386,7 @@ pub fn describe_roundtrip_metrics() {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

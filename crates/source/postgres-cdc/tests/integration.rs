@@ -8,6 +8,7 @@
 //!
 //! Each test boots its own container and creates schema/publication/slot
 //! independently, so the tests are fully isolated.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Source;
 use faucet_source_postgres_cdc::{PostgresCdcSource, PostgresCdcSourceConfig};

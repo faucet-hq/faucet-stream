@@ -1,4 +1,5 @@
 //! Integration tests for `KinesisSink` against LocalStack (Docker).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Sink;
 use faucet_sink_kinesis::{KinesisCredentials, KinesisSink, KinesisSinkConfig, PartitionKey};

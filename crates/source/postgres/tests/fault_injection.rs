@@ -17,6 +17,7 @@
 //! 2. it fails with a **typed** error naming the source, not a panic;
 //! 3. it **terminates** — asserted under a hard ceiling, because a retry loop
 //!    with no bound is indistinguishable from a hang to whoever is watching.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::time::Duration;
 

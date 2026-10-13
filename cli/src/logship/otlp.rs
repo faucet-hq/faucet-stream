@@ -167,6 +167,7 @@ pub fn http_logs_endpoint(base: &str) -> String {
 impl OtlpLogExporter {
     /// A client for `cfg`'s endpoint. Connects lazily, so a collector that is
     /// down at startup is retried on every export.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     pub fn new(cfg: &OtelConfig) -> Result<Self, String> {
         let endpoint = cfg.resolve_endpoint();
         let timeout = Duration::from_secs(cfg.timeout_secs.max(1));

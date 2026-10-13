@@ -4,6 +4,7 @@
 //! entry run the node graph instead of a synthetic default row; a failed node is
 //! reported on every sink it feeds.
 #![cfg(all(feature = "source-csv", feature = "sink-jsonl", feature = "transforms"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use assert_cmd::Command;
 use faucet_cli::auth_catalog::build_auth_catalog;

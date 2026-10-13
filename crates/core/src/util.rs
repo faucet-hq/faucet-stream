@@ -753,6 +753,7 @@ mod snake_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     #[test]
     fn redacted_uri_authority_keeps_only_scheme_and_hosts() {

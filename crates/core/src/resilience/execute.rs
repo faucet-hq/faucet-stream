@@ -7,6 +7,7 @@ use crate::resilience::classify::{RetryClass, classify};
 use crate::resilience::policy::RetryPolicy;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Per-op labels for the metered runner. Identifies which pipeline / matrix row
@@ -42,7 +43,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, None, None, op).await
+    run_with_policy(policy, cancel, None, None, None, op).await
 }
 
 /// Like [`execute_with_policy`], but reports source-side throttling to a
@@ -64,7 +65,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, None, recorder, op).await
+    run_with_policy(policy, cancel, None, recorder, None, op).await
 }
 
 /// Like [`execute_with_policy`], but emits the resilience metrics
@@ -83,24 +84,62 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, Some(metrics), None, op).await
+    run_with_policy(policy, cancel, Some(metrics), None, None, op).await
+}
+
+/// The runner behind [`CallContext::call`](crate::io::CallContext::call):
+/// [`execute_with_policy_recorded`] plus an optional separate budget of
+/// consecutive [`FaucetError::RateLimited`] retries that do not use attempts.
+pub(crate) async fn run_call<F, Fut, T>(
+    policy: &RetryPolicy,
+    cancel: Option<&CancellationToken>,
+    recorder: Option<&Arc<RoundtripRecorder>>,
+    rate_limit_retries: Option<u32>,
+    op: F,
+) -> Result<T, FaucetError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, FaucetError>>,
+{
+    run_with_policy(policy, cancel, None, recorder, rate_limit_retries, op).await
+}
+
+/// Sleep `wait`, or return `false` as soon as `cancel` fires.
+#[allow(clippy::disallowed_methods)] // the sanctioned backoff sleep
+async fn cancellable_sleep(wait: Duration, cancel: Option<&CancellationToken>) -> bool {
+    match cancel {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => false,
+                _ = tokio::time::sleep(wait) => true,
+            }
+        }
+        None => {
+            tokio::time::sleep(wait).await;
+            true
+        }
+    }
 }
 
 /// Shared retry loop backing both the bare and metered public runners. When
 /// `metrics` is `Some`, emits per-attempt retry / sleep / give-up metrics; when
 /// `None`, the metric calls are skipped entirely (zero overhead on the
-/// connector-facing path).
+/// connector-facing path). `rate_limit_retries` gives
+/// [`FaucetError::RateLimited`] outcomes their own consecutive budget.
 async fn run_with_policy<F, Fut, T>(
     policy: &RetryPolicy,
     cancel: Option<&CancellationToken>,
     metrics: Option<&RetryMetrics>,
     recorder: Option<&Arc<RoundtripRecorder>>,
+    rate_limit_retries: Option<u32>,
     mut op: F,
 ) -> Result<T, FaucetError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
+    let mut rate_limited = 0u32;
     // `max_attempts` is documented as "total attempts including the first
     // (1 = no retry)". A caller-supplied `0` is meaningless — the loop always
     // runs `op()` at least once before consulting the guard — so clamp it to 1
@@ -117,6 +156,24 @@ where
         {
             r.throttled();
         }
+        if let (Some(budget), Err(FaucetError::RateLimited(wait))) = (rate_limit_retries, &outcome)
+        {
+            if rate_limited >= budget {
+                tracing::error!("rate limited {rate_limited} consecutive times; giving up");
+                return outcome;
+            }
+            rate_limited += 1;
+            tracing::warn!("rate limited; retrying after {wait:?} ({rate_limited}/{budget})");
+            if let Some(r) = recorder {
+                r.retry(RetryClass::RateLimited);
+            }
+            let _throttle_timer = ThrottleWait::start(recorder.cloned());
+            if !cancellable_sleep(*wait, cancel).await {
+                return outcome;
+            }
+            continue;
+        }
+        rate_limited = 0;
         match outcome {
             Ok(val) => return Ok(val),
             Err(e) if policy.is_retriable(&e) && attempt + 1 < max_attempts => {
@@ -152,26 +209,13 @@ where
                 }
                 let _throttle_timer = (class == Some(RetryClass::RateLimited))
                     .then(|| ThrottleWait::start(recorder.cloned()));
-                if !wait.is_zero() {
-                    match cancel {
-                        Some(token) => {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => {
-                                    // Cancelled mid-backoff: the op was retriable but
-                                    // we are abandoning it — count as a give-up.
-                                    if let Some(m) = metrics {
-                                        crate::observability::resilience::giveup(
-                                            &m.pipeline, &m.row, m.op,
-                                        );
-                                    }
-                                    return Err(e);
-                                }
-                                _ = tokio::time::sleep(wait) => {}
-                            }
-                        }
-                        None => tokio::time::sleep(wait).await,
+                if !wait.is_zero() && !cancellable_sleep(wait, cancel).await {
+                    // Cancelled mid-backoff: the op was retriable but we are
+                    // abandoning it — count as a give-up.
+                    if let Some(m) = metrics {
+                        crate::observability::resilience::giveup(&m.pipeline, &m.row, m.op);
                     }
+                    return Err(e);
                 }
                 attempt += 1;
             }
@@ -191,6 +235,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::resilience::policy::BackoffKind;

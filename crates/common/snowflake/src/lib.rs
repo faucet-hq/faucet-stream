@@ -138,11 +138,11 @@ pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// partitions after the first arrive gzip-encoded) with connect and idle-read
 /// timeouts, so a half-open connection fails instead of hanging the run.
 pub fn http_client() -> Result<reqwest::Client, FaucetError> {
-    reqwest::Client::builder()
+    faucet_core::http::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
-        .gzip(true)
-        .build()
+        .configure(|b| b.gzip(true))
+        .build_reqwest()
         .map_err(|e| FaucetError::Config(format!("snowflake: cannot build HTTP client: {e}")))
 }
 

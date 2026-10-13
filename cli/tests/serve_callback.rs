@@ -4,6 +4,7 @@
 //! asserts the callback lands at a wiremock receiver with the right body — plus
 //! the refusals (bad egress target, backfill fan-out, reserved keys).
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

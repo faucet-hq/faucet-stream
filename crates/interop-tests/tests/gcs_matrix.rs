@@ -7,6 +7,7 @@
     feature = "compression",
     feature = "encryption"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod remote_matrix;
 

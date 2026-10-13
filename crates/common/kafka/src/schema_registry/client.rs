@@ -51,9 +51,9 @@ pub struct SchemaRegistryClient {
 impl SchemaRegistryClient {
     pub fn new(config: &SchemaRegistryConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let http = reqwest::Client::builder()
+        let http = faucet_core::http::Client::builder()
             .timeout(config.request_timeout)
-            .build()
+            .build_reqwest()
             .map_err(|e| FaucetError::Config(format!("schema-registry HTTP client: {e}")))?;
         let capacity = NonZeroUsize::new(config.cache_capacity).unwrap();
         Ok(Self {

@@ -154,6 +154,15 @@ pub enum FaucetError {
         after: Duration,
     },
 
+    /// A backend call was abandoned because the run was cancelled
+    /// ([`CallContext::call`](crate::io::CallContext::call)). Not retriable:
+    /// the caller is stopping.
+    #[error("{operation} cancelled")]
+    Cancelled {
+        /// What was being waited on, e.g. `"page call"`.
+        operation: String,
+    },
+
     /// A custom error from a third-party connector.
     ///
     /// Use this to wrap your own error types without losing the error chain:
@@ -283,6 +292,15 @@ mod tests {
             body: "Too Many Requests".into(),
         };
         assert!(err.is_retriable());
+    }
+
+    #[test]
+    fn cancelled_is_not_retriable() {
+        let err = FaucetError::Cancelled {
+            operation: "page call".into(),
+        };
+        assert!(!err.is_retriable());
+        assert_eq!(err.to_string(), "page call cancelled");
     }
 
     #[test]

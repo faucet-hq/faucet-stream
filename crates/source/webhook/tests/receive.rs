@@ -1,5 +1,6 @@
 //! End-to-end receive loop: signature verification, path validation and the
 //! window-close refusal, driven over real HTTP.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Source;
 use faucet_source_webhook::{WebhookSource, WebhookSourceConfig};

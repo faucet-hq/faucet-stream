@@ -403,6 +403,7 @@ async fn open_lock_file(path: &Path) -> Result<std::fs::File, FaucetError> {
         .await)
 }
 
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
     let started = tokio::time::Instant::now();
     let mut file = open_lock_file(path).await?;
@@ -1093,6 +1094,7 @@ impl FileStateStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use serde_json::json;

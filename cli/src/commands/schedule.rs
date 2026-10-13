@@ -582,6 +582,7 @@ async fn run_once(
 
 /// The scheduling loop.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn run_loop(
     mut compiled: CompiledSchedule,
     mut nodes: Rows,
@@ -972,6 +973,7 @@ async fn graceful_shutdown(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::schedule::spec::ScheduleSpec;

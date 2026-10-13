@@ -785,6 +785,7 @@ impl Topology {
     /// `run_reported` would have returned. A sink that a failed node feeds is
     /// reported as failed too: its input closing looked like a normal end of
     /// stream, but it never received its complete input.
+    #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
     pub async fn run_attributed(
         self,
         opts: TopologyOptions,
@@ -3951,6 +3952,7 @@ mod delivery_and_report_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod graph_safety_tests {
     use super::tests::{CollectSink, FailingSink, VecSource, recs};
     use super::*;

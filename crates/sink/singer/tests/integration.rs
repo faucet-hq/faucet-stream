@@ -2,6 +2,7 @@
 
 //! End-to-end tests for `faucet-sink-singer` against real target subprocesses
 //! (a dependency-free fake Singer target written in Python).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

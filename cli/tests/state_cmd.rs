@@ -4,6 +4,7 @@
 //! same verbs against Redis and Postgres state stores (Docker; skipped when no
 //! Docker daemon is reachable).
 #![cfg(all(feature = "source-csv", feature = "sink-sqlite"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use clap::Parser;
 use faucet_cli::cli::Cli;

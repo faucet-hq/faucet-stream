@@ -5,6 +5,7 @@
 //! in for `/logs` to capture anything. The server runs at `log_level = info` so
 //! the run-start line passes the `EnvFilter`. Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

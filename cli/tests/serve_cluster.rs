@@ -1,7 +1,7 @@
 //! Clustered-serve integration tests (#197). The in-process tests share one
 //! SQLite file between two backends (two "instances"); the two-process test
 //! spawns real `faucet serve --cluster` children.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(all(feature = "serve", feature = "serve-history-sqlite"))]
 
 use faucet_cli::serve::history::sqlite::SqliteHistory;

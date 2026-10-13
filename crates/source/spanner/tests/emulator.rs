@@ -2,6 +2,7 @@
 //! resume, discover, and PK-range sharding. Each test provisions its own
 //! database inside a fresh emulator container and skips cleanly when Docker
 //! is unavailable.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod support;
 

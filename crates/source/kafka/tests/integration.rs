@@ -7,6 +7,7 @@
 //! Import notes for testcontainers-modules 0.15:
 //! - `Kafka` lives at `testcontainers_modules::kafka::apache::Kafka`
 //! - The port constant is `testcontainers_modules::kafka::apache::KAFKA_PORT`
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_common_kafka::{KafkaAuth, KafkaValueFormat, OnDecodeError};
 use faucet_core::{DEFAULT_BATCH_SIZE, Source};

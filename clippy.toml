@@ -1,0 +1,13 @@
+# RFC 0013 / #880: backend I/O goes through faucet-core's primitives.
+# Build HTTP clients with `faucet_core::http::Client`, and wait through
+# `faucet_core::io::CallContext` (retry backoff, rate-limit waits) rather than
+# sleeping by hand. A site that genuinely needs one of these carries
+# `#[allow(clippy::disallowed_methods)] // <reason>`.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "build HTTP clients with faucet_core::http::Client (redirect credential stripping, bounded reads)" },
+    { path = "reqwest::Client::builder", reason = "build HTTP clients with faucet_core::http::Client::builder()" },
+    { path = "reqwest::ClientBuilder::new", reason = "build HTTP clients with faucet_core::http::Client::builder()" },
+    { path = "tokio::time::sleep", reason = "wait through faucet_core::io::CallContext (cancel-aware, metered, deadline-bounded)" },
+    { path = "tokio::time::sleep_until", reason = "wait through faucet_core::io::CallContext (cancel-aware, metered, deadline-bounded)" },
+    { path = "std::thread::sleep", reason = "blocks the async runtime; wait through faucet_core::io::CallContext" },
+]

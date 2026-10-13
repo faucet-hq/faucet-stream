@@ -1,6 +1,7 @@
 //! Phase-1 smoke test: the server boots on an ephemeral port, answers
 //! `/healthz` and `/metrics` without auth, and shuts down on signal.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::serve::{ServeConfig, run_server};
 use std::time::Duration;

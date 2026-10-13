@@ -3,6 +3,7 @@
 //!
 //! These tests require Docker. Each test boots its own container so they are
 //! fully isolated and safe to run in parallel.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::check::{CheckContext, ProbeStatus};
 use faucet_core::state::StateStore;

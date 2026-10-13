@@ -111,6 +111,16 @@ and `SINK_HOOKS` are the canonical hook lists; a test in this crate checks them
 against the trait definitions, so a hook added to either trait without being
 added to the harness fails CI.
 
+## Call deadlines and cancellation
+
+A connector that runs its backend calls through `faucet_core::io::CallContext`
+(#880) proves it with `faucet_conformance::calls`: point the connector at a
+backend that never answers (a wiremock server with a long `set_delay`) and
+call `assert_source_call_deadline(|| make_source())` or
+`assert_sink_call_deadline(|| make_sink(), &records)`. Each installs a context
+with a short deadline, then one with a cancel token, and fails if the read or
+write does not end within `CALL_BOUND`.
+
 ## Doubles
 
 `faucet_conformance::doubles` provides a `CountingSource` (lazily emits N

@@ -202,6 +202,7 @@ impl faucet_core::Source for SqsSource {
         Ok(all)
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages<'a>(
         &'a self,
         _context: &'a std::collections::HashMap<String, Value>,

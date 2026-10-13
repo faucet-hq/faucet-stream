@@ -120,6 +120,7 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

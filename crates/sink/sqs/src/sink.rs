@@ -213,6 +213,7 @@ impl SqsSink {
     /// Send one chunk, retrying per-entry partial failures with backoff.
     /// Returns per-entry outcomes keyed by input index; a whole-request failure
     /// that outlives the retry budget is the outer `Err`.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn put_chunk(
         &self,
         mut pending: Vec<Encoded>,

@@ -2322,6 +2322,7 @@ static RETRY_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// of writers that collided on attempt 1 spreads out instead of colliding again.
 /// Worst case across the whole budget is a few hundred milliseconds — cheap next
 /// to failing a write the caller expected to succeed.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn retry_backoff(attempt: usize) {
     if attempt <= 1 {
         return;

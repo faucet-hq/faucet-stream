@@ -13,6 +13,7 @@
 //!          `assert_bounded_memory` drives the stream; the source's
 //!          `idle_timeout` (5 s of quiet) terminates the drain (and flushes the
 //!          trailing partial page) once the writer finishes.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::{
     assert_bookmark_roundtrip, assert_bounded_memory, assert_config_schema_valid_value,

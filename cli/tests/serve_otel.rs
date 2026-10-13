@@ -2,6 +2,7 @@
 //! `faucet serve --otel-config` exports OTLP traces through the trace-layer
 //! slot at the bottom of the serve subscriber, and OTLP metrics alongside the
 //! Prometheus recorder `/metrics` renders.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use axum::{Router, body::Bytes, extract::State, routing::post};
 use faucet_cli::cli::LogFormat;

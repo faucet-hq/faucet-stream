@@ -4,6 +4,7 @@
 //! they don't depend on being the first installer of the Prometheus recorder.
 //! Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

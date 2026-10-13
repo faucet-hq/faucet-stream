@@ -128,6 +128,7 @@ impl GithubHub {
     /// `api_base` is `https://api.github.com` in production and a mock server
     /// in tests. A `GITHUB_TOKEN` in the environment is used when present, so a
     /// private catalog works and the unauthenticated rate limit is avoided.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     pub fn new(loc: &HubLocation, api_base: &str) -> CliResult<Self> {
         let HubLocation::Github { repo, r#ref, path } = loc else {
             return Err(CliError::Internal(

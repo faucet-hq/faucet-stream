@@ -4,6 +4,7 @@
 //! redaction. Runs in its own binary: it installs the CLI's capture layer as the
 //! process-global subscriber.
 #![cfg(all(feature = "otel", feature = "schedule"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 #[path = "support/otlp_mock.rs"]
 mod otlp_mock;

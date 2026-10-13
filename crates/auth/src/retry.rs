@@ -4,7 +4,11 @@
 //! routine IdP blip does not fail every connector sharing the provider.
 
 use faucet_core::FaucetError;
+use faucet_core::http::Client;
+use faucet_core::io::CallContext;
 use reqwest::RequestBuilder;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Attempts per token request, the first included.
@@ -58,37 +62,53 @@ pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Durati
 
 /// Send the request `make` builds, retrying transient failures, and return
 /// the final reply (success, a permanent failure, or the last transient one).
+///
+/// Runs through [`CallContext::call`](faucet_core::io::CallContext::call): a
+/// transient reply becomes a [`FaucetError::RateLimited`] carrying its wait
+/// (the capped `Retry-After`, else jittered backoff), and a connect / timeout
+/// failure is retried by class.
 pub(crate) async fn send_token_request(
+    http: &Client,
     make: impl Fn() -> Result<RequestBuilder, FaucetError>,
 ) -> Result<TokenReply, FaucetError> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let last = attempt >= MAX_ATTEMPTS;
-        let resp = match make()?.send().await {
-            Ok(r) => r,
-            Err(e) if !last && (e.is_timeout() || e.is_connect()) => {
-                tokio::time::sleep(faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt))
-                    .await;
-                continue;
+    let ctx = CallContext::new().with_retry(faucet_core::RetryPolicy {
+        max_attempts: MAX_ATTEMPTS,
+        backoff: faucet_core::BackoffKind::Exponential,
+        base: RETRY_BASE,
+        max: Duration::from_secs(60),
+        jitter: true,
+        retry_on: faucet_core::RetryClassSet::default(),
+    });
+    let last_transient: Mutex<Option<TokenReply>> = Mutex::new(None);
+    let attempt = AtomicU32::new(0);
+    let outcome = ctx
+        .call("token", || async {
+            let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
+            let resp = http.send(make()?).await?;
+            let status = resp.status().as_u16();
+            let wait = retry_after(resp.headers());
+            let body = http.bytes(resp).await?;
+            if (200..300).contains(&status) || !is_transient(status, &body) {
+                return Ok(TokenReply { status, body });
             }
-            Err(e) => return Err(e.into()),
-        };
-        let status = resp.status().as_u16();
-        let wait = retry_after(resp.headers());
-        let body = resp.bytes().await?.to_vec();
-        if !(200..300).contains(&status) && !last && is_transient(status, &body) {
             tracing::warn!(
                 status,
-                attempt,
+                attempt = n,
                 "token endpoint transient failure; retrying after backoff"
             );
-            let delay = wait
-                .unwrap_or_else(|| faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt));
-            tokio::time::sleep(delay).await;
-            continue;
-        }
-        return Ok(TokenReply { status, body });
+            let delay =
+                wait.unwrap_or_else(|| faucet_core::retry::backoff_with_jitter(RETRY_BASE, n));
+            *last_transient.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(TokenReply { status, body });
+            Err(FaucetError::RateLimited(delay))
+        })
+        .await;
+    match outcome {
+        Err(FaucetError::RateLimited(_)) => last_transient
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| FaucetError::Auth("token endpoint retries exhausted".into())),
+        other => other,
     }
 }
 
@@ -96,7 +116,7 @@ pub(crate) async fn send_token_request(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
     #[test]
@@ -144,15 +164,19 @@ mod tests {
             .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
+        let client = Client::new().unwrap();
         let url = format!("{}/t", server.uri());
-        let reply = send_token_request(|| Ok(client.post(&url))).await.unwrap();
+        let reply = send_token_request(&client, || Ok(client.post(&url)))
+            .await
+            .unwrap();
         assert!(reply.is_success());
         assert_eq!(reply.text(), "ok");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         let url = format!("{}/p", server.uri());
-        let reply = send_token_request(|| Ok(client.post(&url))).await.unwrap();
+        let reply = send_token_request(&client, || Ok(client.post(&url)))
+            .await
+            .unwrap();
         assert_eq!(reply.status, 401);
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
@@ -164,15 +188,17 @@ mod tests {
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
+        let client = Client::new().unwrap();
         let url = format!("{}/t", server.uri());
-        let reply = send_token_request(|| Ok(client.post(&url))).await.unwrap();
+        let reply = send_token_request(&client, || Ok(client.post(&url)))
+            .await
+            .unwrap();
         assert_eq!(reply.status, 429);
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             MAX_ATTEMPTS as usize
         );
-        let err = send_token_request(|| Err(FaucetError::Config("bad body".into())))
+        let err = send_token_request(&client, || Err(FaucetError::Config("bad body".into())))
             .await
             .err()
             .unwrap();
@@ -181,8 +207,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_connect_failure_is_retried_then_surfaced() {
-        let client = reqwest::Client::new();
-        let err = send_token_request(|| Ok(client.post("http://127.0.0.1:1/t")))
+        let client = Client::new().unwrap();
+        let err = send_token_request(&client, || Ok(client.post("http://127.0.0.1:1/t")))
             .await
             .err()
             .unwrap();
