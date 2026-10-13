@@ -291,12 +291,7 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         columns: &[TableColumn],
         table: &str,
     ) -> FaucetError {
-        let fields: Vec<&String> = obj.keys().collect();
-        let names: Vec<&String> = columns.iter().map(|c| &c.name).collect();
-        FaucetError::Sink(
-            self.dialect
-                .no_matching_column_message(index, &fields, &names, table),
-        )
+        FaucetError::Sink(no_match_message(&self.dialect, index, obj, columns, table))
     }
 
     fn warn_unmatched(
@@ -462,35 +457,14 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         require_match: bool,
         validate: impl Fn(usize, &TableColumn, &Value) -> Option<String>,
     ) -> SplitPage {
-        let matching = self.dialect.column_matching();
-        let mut outcomes = Vec::with_capacity(records.len());
-        let mut writable = Vec::with_capacity(records.len());
-        let mut positions = Vec::with_capacity(records.len());
-        for (idx, record) in records.iter().enumerate() {
-            let failure = record.as_object().and_then(|obj| {
-                let cells = match_record(columns, obj, matching);
-                if require_match && cells.is_empty() {
-                    return Some(self.no_match_error(idx, obj, columns, &target.name));
-                }
-                cells
-                    .iter()
-                    .find_map(|(i, v)| validate(idx, &columns[*i], v))
-                    .map(FaucetError::Sink)
-            });
-            match failure {
-                Some(e) => outcomes.push(Err(e)),
-                None => {
-                    outcomes.push(Ok(()));
-                    writable.push(record.clone());
-                    positions.push(idx);
-                }
-            }
-        }
-        SplitPage {
-            outcomes,
-            writable,
-            positions,
-        }
+        split_page(
+            &self.dialect,
+            &target.name,
+            records,
+            columns,
+            require_match,
+            validate,
+        )
     }
 
     /// The DDL steps of a schema evolution. `existing` (the live column
@@ -740,6 +714,62 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         ))
         .await?;
         Ok(())
+    }
+}
+
+/// The dialect's error text for the record at `index` matching no column of
+/// `table`.
+pub fn no_match_message<D: SqlDialect + ?Sized>(
+    dialect: &D,
+    index: usize,
+    obj: &serde_json::Map<String, Value>,
+    columns: &[TableColumn],
+    table: &str,
+) -> String {
+    let fields: Vec<&String> = obj.keys().collect();
+    let names: Vec<&String> = columns.iter().map(|c| &c.name).collect();
+    dialect.no_matching_column_message(index, &fields, &names, table)
+}
+
+/// [`SqlSinkEngine::split_writable`] for callers holding only a dialect:
+/// split a page into the rows to write and per-row failures (a record
+/// matching no column of `table` when `require_match`, or one `validate`
+/// refuses).
+pub fn split_page<D: SqlDialect + ?Sized>(
+    dialect: &D,
+    table: &str,
+    records: &[Value],
+    columns: &[TableColumn],
+    require_match: bool,
+    validate: impl Fn(usize, &TableColumn, &Value) -> Option<String>,
+) -> SplitPage {
+    let matching = dialect.column_matching();
+    let mut outcomes = Vec::with_capacity(records.len());
+    let mut writable = Vec::with_capacity(records.len());
+    let mut positions = Vec::with_capacity(records.len());
+    for (idx, record) in records.iter().enumerate() {
+        let failure = record.as_object().and_then(|obj| {
+            let cells = match_record(columns, obj, matching);
+            if require_match && cells.is_empty() {
+                return Some(no_match_message(dialect, idx, obj, columns, table));
+            }
+            cells
+                .iter()
+                .find_map(|(i, v)| validate(idx, &columns[*i], v))
+        });
+        match failure {
+            Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
+            None => {
+                outcomes.push(Ok(()));
+                writable.push(record.clone());
+                positions.push(idx);
+            }
+        }
+    }
+    SplitPage {
+        outcomes,
+        writable,
+        positions,
     }
 }
 

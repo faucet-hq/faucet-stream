@@ -47,6 +47,7 @@ pub mod statement;
 pub use dialect::{SqlDialect, TableTarget};
 pub use engine::{
     EngineOptions, EvolutionStep, SplitPage, SqlExecutor, SqlSinkEngine, check_cleanup_columns,
+    no_match_message, split_page,
 };
 pub use mapping::{ColumnMatching, MapError, MatchedRow, TableColumn};
 pub use statement::{Param, Statement, StatementKind};
