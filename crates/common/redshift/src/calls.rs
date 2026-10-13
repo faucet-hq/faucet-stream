@@ -16,20 +16,7 @@ pub async fn once<T, Fut>(calls: &CallContext, op: &'static str, fut: Fut) -> Re
 where
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    let mut fut = Some(Box::pin(fut));
-    calls
-        .call(op, || {
-            let attempt = fut.take();
-            async move {
-                match attempt {
-                    Some(f) => f.await,
-                    None => Err(FaucetError::Custom(Box::new(std::io::Error::other(
-                        "redshift: a database round trip is not retried",
-                    )))),
-                }
-            }
-        })
-        .await
+    calls.call_once(op, Box::pin(fut)).await
 }
 
 /// Up to `max` rows from `rows`, read as one call `op` through `calls`. Fewer
@@ -64,6 +51,27 @@ mod tests {
 
     fn err(e: sqlx::Error) -> FaucetError {
         FaucetError::Source(e.to_string())
+    }
+
+    #[tokio::test]
+    async fn once_never_resends_under_a_retrying_context() {
+        let fast = Duration::from_millis(1);
+        let ctx = CallContext::new().with_retry(faucet_core::RetryPolicy {
+            max_attempts: 2,
+            base: fast,
+            max: fast,
+            jitter: false,
+            ..Default::default()
+        });
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let e = once::<(), _>(&ctx, "query", async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(FaucetError::RateLimited(fast))
+        })
+        .await
+        .expect_err("the one attempt fails");
+        assert!(matches!(e, FaucetError::RateLimited(_)), "{e:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

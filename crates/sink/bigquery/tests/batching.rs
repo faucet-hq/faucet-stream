@@ -228,3 +228,14 @@ async fn write_batch_empty_input_makes_no_http_call() {
     let calls = count_insert_calls(&server.received_requests().await.unwrap());
     assert_eq!(calls, 0, "empty batch must not hit the wire");
 }
+
+#[tokio::test]
+async fn write_batch_empty_input_with_batch_size_zero_makes_no_insert_call() {
+    let server = MockServer::start().await;
+    mount_happy_path(&server).await;
+    let (sink, _sa_file) = build_sink(&server, 0).await;
+
+    assert_eq!(sink.write_batch(&[]).await.expect("write succeeds"), 0);
+    let calls = count_insert_calls(&server.received_requests().await.unwrap());
+    assert_eq!(calls, 0, "an empty page sends no insertAll");
+}

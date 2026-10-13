@@ -211,3 +211,58 @@ async fn batch_size_zero_reads_one_page_per_file() {
         assert_eq!(batches, vec![3_000]);
     }
 }
+
+/// A data file that is not Parquet fails the read naming the file, on both
+/// the row and the columnar path; opening the table is metered on the
+/// installed recorder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_data_file_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("part-0.parquet"), b"not parquet at all").unwrap();
+    write_log(
+        dir.path(),
+        json!([{"name": "id", "type": "long", "nullable": true, "metadata": {}}]),
+        &[],
+        json!({}),
+        &[("part-0.parquet".into(), json!({}))],
+        plain_protocol(),
+    );
+    let src = DeltaSource::new(source(dir.path())).await.unwrap();
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    src.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "delta",
+        )
+        .with_meter(meter.clone()),
+    ));
+    let ctx = std::collections::HashMap::new();
+    let err = std::pin::pin!(
+        src.stream_pages(&ctx, 0)
+            .filter_map(|p| async move { p.err() })
+    )
+    .next()
+    .await
+    .expect("the row path fails");
+    assert!(
+        err.to_string().contains("could not open data file"),
+        "{err}"
+    );
+    assert!(meter.snapshot().source_roundtrips.values().sum::<u64>() >= 1);
+    #[cfg(feature = "arrow")]
+    {
+        let err = std::pin::pin!(
+            src.stream_batches(&ctx, 0)
+                .filter_map(|p| async move { p.err() })
+        )
+        .next()
+        .await
+        .expect("the columnar path fails");
+        assert!(
+            err.to_string().contains("could not open data file"),
+            "{err}"
+        );
+    }
+}

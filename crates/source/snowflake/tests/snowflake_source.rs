@@ -125,6 +125,35 @@ async fn fetch_all_returns_first_partition_when_no_partitions() {
 }
 
 #[tokio::test]
+async fn statements_are_metered_on_the_installed_recorder() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "090001",
+            "statementHandle": "handle-1",
+            "resultSetMetaData": metadata(1),
+            "data": rows_for_partition(0),
+        })))
+        .mount(&server)
+        .await;
+    let src = build_source(cfg(), &server);
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    src.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "snowflake",
+        )
+        .with_meter(meter.clone()),
+    ));
+    assert_eq!(src.fetch_all().await.unwrap().len(), 5);
+    let trips = meter.snapshot().source_roundtrips;
+    assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
+}
+
+#[tokio::test]
 async fn fetch_all_paginates_across_partitions() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

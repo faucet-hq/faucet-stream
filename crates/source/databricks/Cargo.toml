@@ -34,7 +34,7 @@ bytes = { workspace = true, optional = true }
 arrow = ["faucet-core/arrow", "dep:arrow", "dep:bytes"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }
 wiremock = "0.6"
 faucet-conformance.workspace = true
 serde_json.workspace = true

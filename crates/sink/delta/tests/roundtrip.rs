@@ -131,3 +131,79 @@ async fn a_column_null_in_the_sample_creates_the_table() {
     sink.flush().await.unwrap();
     assert_eq!(committed_rows(&dir.path().join("sparse")), 2);
 }
+
+/// Make `path` read-only (or writable again) for its owner.
+#[cfg(unix)]
+fn set_read_only(path: &std::path::Path, read_only: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if read_only { 0o555 } else { 0o755 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A data file that cannot be written fails the commit, poisons the sink, and
+/// the metered calls reach the installed recorder.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_that_cannot_write_its_files_fails_the_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "ro_commit");
+    let sink = DeltaSink::new(DeltaSinkConfig::new(&uri)).await.unwrap();
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "delta",
+        )
+        .with_meter(meter.clone()),
+    ));
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    sink.flush().await.unwrap();
+    assert!(meter.snapshot().sink_roundtrips.values().sum::<u64>() >= 1);
+
+    let root = dir.path().join("ro_commit");
+    set_read_only(&root, true);
+    sink.write_batch(&[json!({"id": 2})]).await.unwrap();
+    let err = sink.flush().await.unwrap_err();
+    set_read_only(&root, false);
+    assert!(err.to_string().contains("commit failed"), "{err}");
+    assert_eq!(committed_rows(&root), 1);
+}
+
+/// A page written after the run's deadline has passed fails with that
+/// timeout and poisons the sink, so nothing half-buffered is committed.
+#[tokio::test]
+async fn a_write_after_the_deadline_fails_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "late_write");
+    let sink = DeltaSink::new(DeltaSinkConfig::new(&uri)).await.unwrap();
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    sink.set_call_context(
+        faucet_core::CallContext::new().with_deadline(tokio::time::Instant::now()),
+    );
+    let err = sink.write_batch(&[json!({"id": 2})]).await.unwrap_err();
+    assert!(
+        matches!(err, faucet_core::FaucetError::Timeout { .. }),
+        "{err:?}"
+    );
+    assert!(sink.flush().await.is_err(), "the sink is poisoned");
+}
+
+/// A commit started after the run's deadline has passed fails with that
+/// timeout.
+#[tokio::test]
+async fn a_commit_after_the_deadline_fails_the_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "late_commit");
+    let sink = DeltaSink::new(DeltaSinkConfig::new(&uri)).await.unwrap();
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    sink.set_call_context(
+        faucet_core::CallContext::new().with_deadline(tokio::time::Instant::now()),
+    );
+    let err = sink.flush().await.unwrap_err();
+    assert!(
+        matches!(err, faucet_core::FaucetError::Timeout { .. }),
+        "{err:?}"
+    );
+}
