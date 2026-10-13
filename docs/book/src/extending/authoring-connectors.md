@@ -389,6 +389,14 @@ connector-defined set — `query`, `page`, `put`). Use `ctx.wait(d)` for a pause
 that is not a retry (a poll interval, a pacing delay): it ends early on cancel
 and at the deadline.
 
+`ctx.call_once(op, fut)` runs a call that cannot be rebuilt — a statement on a
+borrowed transaction or connection, a step of a cursor or row stream, a
+non-idempotent write — in exactly one attempt, with the same timeout, deadline,
+cancel, metering and redaction. When the backend's client is not cancel-safe
+(a TDS connection dropped mid-response, a query running on a blocking thread),
+check whether the call was cut short (`FaucetError::Timeout` / `Cancelled`) and
+repair what it left behind: replace the connection, interrupt the query.
+
 A sink's context never carries the run's cancel token — a cancelled run still
 flushes its sinks — and neither side gets a retry policy from the pipeline.
 
