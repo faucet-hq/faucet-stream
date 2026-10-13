@@ -22,9 +22,6 @@ use crate::copy::{
     s3_uri, serialize_csv, serialize_jsonl,
 };
 
-/// Redshift caps bind parameters per statement; keep multi-row `INSERT`s under
-/// this by sub-chunking.
-const MAX_REDSHIFT_PARAMS: usize = 32_767;
 
 /// A sink that loads JSON records into an Amazon Redshift table.
 pub struct RedshiftSink {
@@ -470,7 +467,12 @@ impl RedshiftSink {
         }
 
         let num_cols = present.len();
-        let max_rows = (MAX_REDSHIFT_PARAMS / num_cols).max(1);
+        // Redshift caps bind parameters per statement; the dialect sizes each
+        // multi-row INSERT under it.
+        let max_rows = faucet_common_sql::SqlDialect::rows_per_statement(
+            &faucet_common_sql::dialects::Redshift,
+            num_cols,
+        );
         let mut total = 0usize;
 
         for sub in insertable.chunks(max_rows) {

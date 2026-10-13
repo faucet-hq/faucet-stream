@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-sql.workspace = true
 faucet-common-redshift.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
