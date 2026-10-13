@@ -224,3 +224,23 @@ async fn conformance_errors_not_panics() {
     faucet_conformance::assert_errors_not_panics(&source).await;
     // _container stays alive to here
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A statement the server sits on stands in for a hung backend (#880).
+    let _serial = SERIAL.lock().await;
+    let (_container, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut scfg = MssqlSourceConfig::new(
+            cfg.connection_url.clone().unwrap(),
+            "WAITFOR DELAY '00:01:00'; SELECT 1 AS x",
+        );
+        scfg.connection.tls = cfg.tls.clone();
+        built.push(MssqlSource::new(scfg).await.expect("source"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

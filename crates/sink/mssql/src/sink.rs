@@ -40,7 +40,7 @@ pub(crate) use crate::statements::Prepared;
 use crate::statements::{
     cleanup_key_typing, delete_statements, insert_statements, key_load_statements,
     merge_statements, overwrite_swap_sql, poison_check, prepare_rows, staging_create_sql,
-    staging_relax_sql, with_timeout, writable,
+    staging_relax_sql, with_call, writable,
 };
 
 /// Microsoft SQL Server sink.
@@ -66,6 +66,9 @@ pub struct MssqlSink {
     /// Monotonic part counter for staged objects.
     #[cfg(feature = "staging")]
     pub(crate) stage_seq: std::sync::atomic::AtomicUsize,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 impl MssqlSink {
@@ -94,6 +97,7 @@ impl MssqlSink {
             faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
         ))?;
         let pool = build_pool(&config.connection, config.max_connections).await?;
+        let statement_timeout_secs = config.statement_timeout_secs;
 
         let sink = Self {
             config,
@@ -102,6 +106,9 @@ impl MssqlSink {
             staging_table_quoted,
             columns_cache: Mutex::new(None),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            calls: faucet_core::CallSlot::new(faucet_common_mssql::statement_call_context(
+                statement_timeout_secs,
+            )),
             table_ready: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "staging")]
             stage_run_id: crate::staged::new_stage_run_id(),
@@ -112,11 +119,44 @@ impl MssqlSink {
         Ok(sink)
     }
 
-    fn timeout(&self) -> Option<Duration> {
-        match self.config.statement_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
+    /// Run one statement on `conn` as a backend call named `op`. A statement
+    /// the call context cut short was dropped mid-TDS, so the connection is
+    /// replaced before the error returns. `bounded: false` lifts the statement
+    /// timeout (a bulk copy or swap may legitimately run longer); the run's
+    /// deadline still applies.
+    pub(crate) async fn on_conn<T>(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+        op: &'static str,
+        bounded: bool,
+        f: impl AsyncFnOnce(&mut MssqlPooledConnection<'_>) -> Result<T, FaucetError>,
+    ) -> Result<T, FaucetError> {
+        let ctx = self.calls.get();
+        let ctx = if bounded { ctx } else { ctx.without_timeout() };
+        let (result, cut_short) = with_call(&ctx, op, f(&mut *conn), |e| e).await;
+        if cut_short {
+            self.recover_desynced(conn).await;
         }
+        result
+    }
+
+    /// Run a transaction-control or DDL statement and drain its (empty) result.
+    pub(crate) async fn control(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+        stmt: &str,
+    ) -> Result<(), FaucetError> {
+        let op = control_op(stmt);
+        self.on_conn(conn, op, op != "statement", async |c| {
+            c.simple_query(stmt)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL {stmt} failed: {e}")))?
+                .into_results()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL {stmt} failed: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Create the target at construction time when its shape does not depend
@@ -208,19 +248,20 @@ impl MssqlSink {
 
     async fn table_exists(&self, table_literal: &str) -> Result<bool, FaucetError> {
         let mut conn = self.checkout().await?;
-        let rows = conn
-            .simple_query(
-                format!(
-                    "SELECT OBJECT_ID(N'{}', N'U')",
-                    table_literal.replace('\'', "''")
-                )
-                .as_str(),
-            )
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?
-            .into_first_result()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?;
+        let probe = format!(
+            "SELECT OBJECT_ID(N'{}', N'U')",
+            table_literal.replace('\'', "''")
+        );
+        let rows = self
+            .on_conn(&mut conn, "query", true, async |c| {
+                c.simple_query(probe.as_str())
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?
+                    .into_first_result()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))
+            })
+            .await?;
         Ok(rows
             .first()
             .and_then(|r| r.try_get::<i32, _>(0).ok().flatten())
@@ -231,20 +272,29 @@ impl MssqlSink {
     /// failure to the same typed error.
     async fn run_ddl(&self, sql: &str, what: &str) -> Result<(), FaucetError> {
         let mut conn = self.checkout().await?;
-        conn.simple_query(sql)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))?
-            .into_results()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))?;
-        Ok(())
+        self.on_conn(&mut conn, "statement", false, async |c| {
+            c.simple_query(sql)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))?
+                .into_results()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn checkout(&self) -> Result<MssqlPooledConnection<'_>, FaucetError> {
-        self.pool
+        self.calls
             .get()
+            .with_roundtrip_metering(false)
+            .call_once("checkout", async {
+                self.pool
+                    .get()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL pool checkout failed: {e}")))
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL pool checkout failed: {e}")))
     }
 
     /// Bare (un-quoted) staging table literal, for `OBJECT_ID(N'…')` lookups.
@@ -292,13 +342,16 @@ impl MssqlSink {
     /// empty when the table does not exist.
     async fn fetch_column_infos(&self, table: &str) -> Result<Vec<ColumnInfo>, FaucetError> {
         let mut conn = self.checkout().await?;
-        let rows = conn
-            .query(COLUMN_INFO_SQL, &[&table])
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL column discovery failed: {e}")))?
-            .into_first_result()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL column discovery failed: {e}")))?;
+        let rows = self
+            .on_conn(&mut conn, "query", true, async |c| {
+                c.query(COLUMN_INFO_SQL, &[&table])
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL column discovery failed: {e}")))?
+                    .into_first_result()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL column discovery failed: {e}")))
+            })
+            .await?;
         let mut cols = Vec::with_capacity(rows.len());
         for row in &rows {
             let (Some(name), Some(type_name)) =
@@ -353,7 +406,7 @@ impl MssqlSink {
         if timed_out {
             self.recover_desynced(conn).await;
         } else {
-            let _ = control(conn, "ROLLBACK TRAN").await;
+            let _ = self.control(conn, "ROLLBACK TRAN").await;
         }
     }
 
@@ -409,8 +462,8 @@ impl MssqlSink {
             };
             // On timeout the connection is desynced; the caller must NOT issue
             // ROLLBACK on it (mirrors `insert_chunk`).
-            let (result, timed_out) = with_timeout(self.timeout(), exec, || {
-                FaucetError::Sink("MSSQL insert timed out".into())
+            let (result, timed_out) = with_call(&self.calls.get(), "insert", exec, |e| {
+                FaucetError::Sink(format!("MSSQL insert: {e}"))
             })
             .await;
             result.map_err(|e| (e, timed_out))?;
@@ -440,7 +493,7 @@ impl MssqlSink {
             tbl = faucet_core::idempotency::COMMIT_TOKEN_TABLE,
             w = SCOPE_COL_WIDTH,
         ));
-        control(conn, &sql).await
+        self.control(conn, &sql).await
     }
 
     /// Insert one chunk, splitting into ≤2100-parameter sub-INSERTs wrapped in a
@@ -467,7 +520,7 @@ impl MssqlSink {
         // H6). Forcing a transaction makes the chunk atomic so re-running is safe.
         let txn = self.config.transaction_per_batch || rows.len() > per_insert;
         if txn {
-            control(conn, "BEGIN TRAN").await?;
+            self.control(conn, "BEGIN TRAN").await?;
         }
 
         for (sql, range) in insert_statements(
@@ -499,22 +552,22 @@ impl MssqlSink {
             // run on a corrupt stream. A *normal* error leaves the connection in
             // sync, so ROLLBACK is safe and releases the transaction promptly.
             // Outcome unknown on timeout: the server may have committed.
-            let (result, timed_out) = with_timeout(self.timeout(), exec, || {
-                FaucetError::Sink("MSSQL insert timed out".into()).into()
+            let (result, timed_out) = with_call(&self.calls.get(), "insert", exec, |e| {
+                FaucetError::Sink(format!("MSSQL insert: {e}")).into()
             })
             .await;
             if let Err(e) = result {
                 if timed_out {
                     self.recover_desynced(conn).await;
                 } else if txn {
-                    let _ = control(conn, "ROLLBACK TRAN").await;
+                    let _ = self.control(conn, "ROLLBACK TRAN").await;
                 }
                 return Err(e);
             }
         }
 
         if txn {
-            control(conn, "COMMIT TRAN").await?;
+            self.control(conn, "COMMIT TRAN").await?;
         }
         Ok(rows.len())
     }
@@ -531,7 +584,7 @@ impl MssqlSink {
         conn: &mut MssqlPooledConnection<'_>,
         sql: &str,
         refs: &[&dyn ToSql],
-        what: &str,
+        what: &'static str,
     ) -> Result<u64, (FaucetError, bool)> {
         let exec = async {
             conn.execute(sql, refs)
@@ -539,8 +592,8 @@ impl MssqlSink {
                 .map(|r| r.total())
                 .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))
         };
-        let (result, timed_out) = with_timeout(self.timeout(), exec, || {
-            FaucetError::Sink(format!("MSSQL {what} timed out"))
+        let (result, timed_out) = with_call(&self.calls.get(), what, exec, |e| {
+            FaucetError::Sink(format!("MSSQL {what}: {e}"))
         })
         .await;
         result.map_err(|e| (e, timed_out))
@@ -625,11 +678,11 @@ impl MssqlSink {
         // `max_connections: 1` pool.
         self.column_infos().await?;
         let mut conn = self.checkout().await?;
-        control(&mut conn, "BEGIN TRAN").await?;
+        self.control(&mut conn, "BEGIN TRAN").await?;
 
         match self.apply_plans_no_txn(&mut conn, plans).await {
             Ok(affected) => {
-                control(&mut conn, "COMMIT TRAN").await?;
+                self.control(&mut conn, "COMMIT TRAN").await?;
                 Ok(affected)
             }
             Err((e, timed_out)) => {
@@ -695,9 +748,9 @@ impl MssqlSink {
         // outlives one cleanup, so clear any leftover from a previous run on this
         // connection. Outside the transaction: it is a cleanup of *our* scratch
         // state, not part of the atomic unit below.
-        control(&mut conn, &drop_sql).await?;
+        self.control(&mut conn, &drop_sql).await?;
 
-        control(&mut conn, "BEGIN TRAN").await?;
+        self.control(&mut conn, "BEGIN TRAN").await?;
         match self
             .cleanup_in_txn(
                 &mut conn,
@@ -713,10 +766,10 @@ impl MssqlSink {
             .await
         {
             Ok(deleted) => {
-                control(&mut conn, "COMMIT TRAN").await?;
+                self.control(&mut conn, "COMMIT TRAN").await?;
                 // Best-effort: free the scratch table so the connection returns to
                 // the pool clean. The pre-drop above is the real guarantee.
-                let _ = control(&mut conn, &drop_sql).await;
+                let _ = self.control(&mut conn, &drop_sql).await;
                 Ok(deleted)
             }
             Err((e, timed_out)) => {
@@ -747,7 +800,7 @@ impl MssqlSink {
     ) -> Result<u64, (FaucetError, bool)> {
         let key = &self.config.write.key;
 
-        control(conn, stmts.create).await.map_err(|e| {
+        self.control(conn, stmts.create).await.map_err(|e| {
             (
                 FaucetError::Sink(format!("cleanup: temp table creation failed: {e}")),
                 false,
@@ -837,15 +890,19 @@ struct CleanupStatements<'a> {
     key_binary: &'a [bool],
 }
 
-/// Run a transaction-control statement and drain its (empty) result.
-async fn control(conn: &mut MssqlPooledConnection<'_>, stmt: &str) -> Result<(), FaucetError> {
-    conn.simple_query(stmt)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("MSSQL {stmt} failed: {e}")))?
-        .into_results()
-        .await
-        .map_err(|e| FaucetError::Sink(format!("MSSQL {stmt} failed: {e}")))?;
-    Ok(())
+/// The round-trip label of a control statement.
+fn control_op(stmt: &str) -> &'static str {
+    match stmt
+        .split_whitespace()
+        .next()
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("BEGIN") => "begin",
+        Some("COMMIT") => "commit",
+        Some("ROLLBACK") => "rollback",
+        _ => "statement",
+    }
 }
 
 /// Map a [`SqlBaseType`](faucet_core::SqlBaseType) to the MSSQL type keyword used when adding/widening a
@@ -1179,11 +1236,21 @@ const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(50);
 
 #[async_trait]
 impl Sink for MssqlSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -1273,7 +1340,7 @@ impl Sink for MssqlSink {
                             error = %e.err,
                             "MSSQL chunk was rolled back server-side; re-running"
                         );
-                        tokio::time::sleep(wait).await;
+                        self.calls.wait(wait).await?;
                     }
                     Err(e) => return Err(e.err),
                 }
@@ -1459,7 +1526,7 @@ impl Sink for MssqlSink {
         let target = &self.table_quoted;
         let staging_lit = self.staging_literal().replace('\'', "''");
         let mut conn = self.checkout().await?;
-        control(
+        self.control(
             &mut conn,
             &format!("IF OBJECT_ID(N'{staging_lit}', N'U') IS NOT NULL DROP TABLE {staging}"),
         )
@@ -1467,7 +1534,7 @@ impl Sink for MssqlSink {
         if first_run {
             return Ok(());
         }
-        control(
+        self.control(
             &mut conn,
             &staging_create_sql(staging, target, &target_infos)?,
         )
@@ -1479,7 +1546,7 @@ impl Sink for MssqlSink {
             ))
         })?;
         if let Some(sql) = staging_relax_sql(staging, &target_infos)? {
-            control(&mut conn, &sql).await?;
+            self.control(&mut conn, &sql).await?;
         }
         Ok(())
     }
@@ -1496,7 +1563,7 @@ impl Sink for MssqlSink {
             // A run that wrote nothing has no staging either, and leaves no table.
             if self.table_exists(&self.staging_literal()).await? {
                 let mut conn = self.checkout().await?;
-                control(
+                self.control(
                     &mut conn,
                     &sp_rename_sql(&self.staging_literal(), &self.config.table),
                 )
@@ -1514,16 +1581,16 @@ impl Sink for MssqlSink {
         swap.push(format!("DROP TABLE {staging}"));
 
         let mut conn = self.checkout().await?;
-        control(&mut conn, "BEGIN TRAN").await?;
+        self.control(&mut conn, "BEGIN TRAN").await?;
         for stmt in swap {
-            if let Err(e) = control(&mut conn, &stmt).await {
-                let _ = control(&mut conn, "ROLLBACK TRAN").await;
+            if let Err(e) = self.control(&mut conn, &stmt).await {
+                let _ = self.control(&mut conn, "ROLLBACK TRAN").await;
                 return Err(FaucetError::Sink(format!(
                     "mssql overwrite swap failed: {e}"
                 )));
             }
         }
-        control(&mut conn, "COMMIT TRAN").await?;
+        self.control(&mut conn, "COMMIT TRAN").await?;
         Ok(())
     }
 
@@ -1539,7 +1606,7 @@ impl Sink for MssqlSink {
         let staging = &self.staging_table_quoted;
         let staging_lit = self.staging_literal().replace('\'', "''");
         let mut conn = self.checkout().await?;
-        control(
+        self.control(
             &mut conn,
             &format!("IF OBJECT_ID(N'{staging_lit}', N'U') IS NOT NULL DROP TABLE {staging}"),
         )
@@ -1597,7 +1664,7 @@ impl Sink for MssqlSink {
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
             let sql = build_add_column_sql(&self.table_quoted, &self.config.table, &c.name, t)?;
-            control(&mut conn, &sql).await.map_err(|e| {
+            self.control(&mut conn, &sql).await.map_err(|e| {
                 FaucetError::Sink(format!("MSSQL ADD COLUMN {} failed: {e}", c.name))
             })?;
         }
@@ -1624,7 +1691,7 @@ impl Sink for MssqlSink {
                 widened_keyword(from, t),
                 nullable,
             )?;
-            control(&mut conn, &sql).await.map_err(|e| {
+            self.control(&mut conn, &sql).await.map_err(|e| {
                 FaucetError::Sink(format!("MSSQL ALTER COLUMN {} failed: {e}", c.name))
             })?;
         }
@@ -1644,7 +1711,7 @@ impl Sink for MssqlSink {
                     ))
                 })?;
                 let sql = build_alter_null_sql(&self.table_quoted, col, &kw)?;
-                control(&mut conn, &sql).await.map_err(|e| {
+                self.control(&mut conn, &sql).await.map_err(|e| {
                     FaucetError::Sink(format!("MSSQL relax NULL {col} failed: {e}"))
                 })?;
             }
@@ -1660,19 +1727,20 @@ impl Sink for MssqlSink {
         let mut conn = self.checkout().await?;
         self.ensure_commit_table(&mut conn).await?;
         for scope_owned in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
-            let rows = conn
-                .query(
-                    &format!(
-                        "SELECT [token] FROM [{}] WHERE [scope] = @P1",
-                        faucet_core::idempotency::COMMIT_TOKEN_TABLE
-                    ),
-                    &[&scope_owned],
-                )
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?
-                .into_first_result()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?;
+            let sql = format!(
+                "SELECT [token] FROM [{}] WHERE [scope] = @P1",
+                faucet_core::idempotency::COMMIT_TOKEN_TABLE
+            );
+            let rows = self
+                .on_conn(&mut conn, "query", true, async |c| {
+                    c.query(&sql, &[&scope_owned])
+                        .await
+                        .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?
+                        .into_first_result()
+                        .await
+                        .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))
+                })
+                .await?;
             if let Some(token) = rows.first().and_then(|r| r.get::<&str, _>("token")) {
                 return Ok(Some(token.to_string()));
             }
@@ -1718,7 +1786,7 @@ impl Sink for MssqlSink {
         }
         let mut conn = self.checkout().await?;
         self.ensure_commit_table(&mut conn).await?;
-        control(&mut conn, "BEGIN TRAN").await?;
+        self.control(&mut conn, "BEGIN TRAN").await?;
 
         // Data write and the commit-token MERGE share ONE transaction so the
         // page is committed atomically with its watermark. For upsert/delete the
@@ -1750,7 +1818,7 @@ impl Sink for MssqlSink {
                 }
                 Ok(None) => 0,
                 Err(e) => {
-                    let _ = control(&mut conn, "ROLLBACK TRAN").await;
+                    let _ = self.control(&mut conn, "ROLLBACK TRAN").await;
                     return Err(e);
                 }
             },
@@ -1767,24 +1835,36 @@ impl Sink for MssqlSink {
         );
         let (scope_owned, token_owned) = (scope_key(scope), token.to_string());
         let refs: Vec<&dyn ToSql> = vec![&scope_owned, &token_owned];
-        if let Err(e) = conn.execute(merge.as_str(), &refs).await {
-            let _ = control(&mut conn, "ROLLBACK TRAN").await;
-            return Err(FaucetError::Sink(format!("MSSQL token merge failed: {e}")));
+        let merged = self
+            .on_conn(&mut conn, "merge", true, async |c| {
+                c.execute(merge.as_str(), &refs)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL token merge failed: {e}")))
+            })
+            .await;
+        if let Err(e) = merged {
+            let _ = self.control(&mut conn, "ROLLBACK TRAN").await;
+            return Err(e);
         }
         if let Some(legacy) = legacy_scope_key(scope) {
             let delete = format!(
                 "DELETE FROM [{}] WHERE [scope] = @P1",
                 faucet_core::idempotency::COMMIT_TOKEN_TABLE
             );
-            if let Err(e) = conn.execute(delete.as_str(), &[&legacy]).await {
-                let _ = control(&mut conn, "ROLLBACK TRAN").await;
-                return Err(FaucetError::Sink(format!(
-                    "MSSQL legacy token delete failed: {e}"
-                )));
+            let deleted = self
+                .on_conn(&mut conn, "delete", true, async |c| {
+                    c.execute(delete.as_str(), &[&legacy]).await.map_err(|e| {
+                        FaucetError::Sink(format!("MSSQL legacy token delete failed: {e}"))
+                    })
+                })
+                .await;
+            if let Err(e) = deleted {
+                let _ = self.control(&mut conn, "ROLLBACK TRAN").await;
+                return Err(e);
             }
         }
 
-        control(&mut conn, "COMMIT TRAN").await?;
+        self.control(&mut conn, "COMMIT TRAN").await?;
         Ok(written)
     }
 

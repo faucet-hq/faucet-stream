@@ -94,6 +94,10 @@ use an `amqps://` url.
 
 Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+The connect (channel, QoS, topology, consumer), the waits for the next delivery, the page acks and rejects run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or an idle wait promptly with an error (the pipeline has already stopped reading and flushed what it took; unacked deliveries are requeued by the broker). Each call counts as one round trip (`connect`, `ack`, `reject`) in `faucet_source_roundtrips_total`; nothing is retried.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

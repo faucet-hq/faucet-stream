@@ -240,3 +240,17 @@ async fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+/// A broker that cannot be reached stands in for a hung backend (#880): the
+/// poll loop waits until the deadline or the cancel.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let mut built = Vec::new();
+    for i in 0..2 {
+        let cfg = source_config("127.0.0.1:1", "t", &format!("g-deadline-{i}"), 100, 250);
+        built.push(KafkaSource::new(cfg).await.expect("source new"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

@@ -200,7 +200,7 @@ pub(crate) fn offsets_stable(committed_high: &[i64], log_end: &[i64]) -> bool {
 /// reading at that point returns an older token for this scope and the resume
 /// rewrites a committed page (#789 MSG-73). Transactions opened after the
 /// snapshot do not extend the wait.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
+#[allow(clippy::disallowed_methods)] // a poll on the blocking pool, bounded by stable_wait(timeout); the caller's call context ends the wait for it
 fn wait_for_stable_offsets(
     cfg: &ClientConfig,
     committed: &BaseConsumer,
@@ -456,8 +456,8 @@ pub(crate) fn fold_token_for_scope(
 /// full queue is expected on a slow cluster: the producer keeps delivering in
 /// the background, and we wait for room for up to `budget` (the configured
 /// `message_timeout`) rather than `max_retries × backoff` (#789 MSG-56).
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) async fn enqueue_in_txn(
+    calls: &faucet_core::CallContext,
     producer: &FutureProducer,
     topic: &str,
     value_bytes: Vec<u8>,
@@ -488,7 +488,7 @@ pub(crate) async fn enqueue_in_txn(
                     )));
                 }
                 tracing::debug!("kafka send: QueueFull inside a transaction, waiting for room");
-                tokio::time::sleep(backoff).await;
+                calls.wait(backoff).await?;
             }
             Err((e, _)) => return Err(FaucetError::Sink(format!("kafka send: {e}"))),
         }

@@ -307,6 +307,10 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+The connect and every command (`LRANGE`, `XRANGE`, `SCAN`, `MGET`, the pipelined `TYPE`) run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or command promptly, and each command counts as one round trip (`connect`, `lrange`, `xrange`, `scan`, `mget`, `type`) in `faucet_source_roundtrips_total`. The connection manager's own reconnect settings are unchanged; reads are not retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

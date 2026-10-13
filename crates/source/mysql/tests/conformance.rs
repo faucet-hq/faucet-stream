@@ -162,3 +162,20 @@ async fn conformance_errors_not_panics() {
     faucet_conformance::assert_errors_not_panics(&source).await;
     // _container stays alive to here
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A query the server sits on stands in for a hung backend (#880).
+    let (_container, url) = start_mysql().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            MysqlSource::new(MysqlSourceConfig::new(&url, "SELECT SLEEP(60) AS s"))
+                .await
+                .expect("source new"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

@@ -140,6 +140,10 @@ logged once and reported as no lag — it never fails a run.
 
 Declares `exactly_once` (deterministic replay from the LSN bookmarks) and `reports_lag` (unread change transactions and their age). `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every statement runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end an in-flight query, a stalled change-row read or the wait between polls promptly, and `statement_timeout_secs` still bounds each metadata query and the opening of each change query. A statement cut short leaves its connection mid-response, so the connection is replaced before it returns to the pool. Each query counts as one `query` round trip in `faucet_source_roundtrips_total`. Reads are not retried; the bookmark only moves past changes the pipeline persisted.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

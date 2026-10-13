@@ -3,7 +3,6 @@
 //! the keyed and cleanup paths, and the timeout contract. Pure — no I/O.
 
 use std::future::Future;
-use std::time::Duration;
 
 use faucet_common_mssql::quote_ident_mssql;
 use faucet_core::{FaucetError, KeyTuple};
@@ -341,23 +340,22 @@ pub(crate) fn key_load_statements(
         .collect()
 }
 
-/// Run `fut` under the statement timeout. Returns its result and whether it
-/// timed out: a timed-out statement was dropped mid-TDS, so its connection is
-/// desynced and must be replaced, never rolled back.
-pub(crate) async fn with_timeout<T, E, F>(
-    timeout: Option<Duration>,
+/// Run `fut` as one backend call through `ctx` (#880): the statement timeout,
+/// the run's deadline and a cancel all end it. Returns its result and whether
+/// the call cut it short: a statement dropped mid-TDS leaves its connection
+/// desynced, so it must be replaced, never rolled back.
+pub(crate) async fn with_call<T, E, F>(
+    ctx: &faucet_core::CallContext,
+    op: &'static str,
     fut: F,
-    timed_out: impl FnOnce() -> E,
+    timed_out: impl FnOnce(FaucetError) -> E,
 ) -> (Result<T, E>, bool)
 where
     F: Future<Output = Result<T, E>>,
 {
-    match timeout {
-        Some(t) => match tokio::time::timeout(t, fut).await {
-            Ok(inner) => (inner, false),
-            Err(_) => (Err(timed_out()), true),
-        },
-        None => (fut.await, false),
+    match ctx.call_once(op, async { Ok(fut.await) }).await {
+        Ok(inner) => (inner, false),
+        Err(e) => (Err(timed_out(e)), true),
     }
 }
 
@@ -366,6 +364,7 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     fn info(name: &str, ty: &str, identity: bool) -> ColumnInfo {
         ColumnInfo {
@@ -577,28 +576,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_timeout_reports_which_side_fired() {
-        let ok = with_timeout(None, async { Ok::<_, FaucetError>(1) }, || {
-            FaucetError::Sink("late".into())
-        })
+    async fn with_call_reports_which_side_fired() {
+        let unbounded = faucet_core::CallContext::new().without_timeout();
+        let ok = with_call(
+            &unbounded,
+            "insert",
+            async { Ok::<_, FaucetError>(1) },
+            |e| e,
+        )
         .await;
         assert_eq!((ok.0.unwrap(), ok.1), (1, false));
-        let fast = with_timeout(
-            Some(Duration::from_secs(5)),
+        let bounded = faucet_core::CallContext::new().with_timeout(Duration::from_secs(5));
+        let fast = with_call(
+            &bounded,
+            "insert",
             async { Err::<u8, _>(FaucetError::Sink("boom".into())) },
-            || FaucetError::Sink("late".into()),
+            |e| e,
         )
         .await;
         assert!(!fast.1 && fast.0.unwrap_err().to_string().contains("boom"));
-        let slow = with_timeout(
-            Some(Duration::from_millis(10)),
+        let short = faucet_core::CallContext::new().with_timeout(Duration::from_millis(10));
+        let slow = with_call(
+            &short,
+            "insert",
             async {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 Ok::<u8, FaucetError>(0)
             },
-            || FaucetError::Sink("late".into()),
+            |e| FaucetError::Sink(format!("late: {e}")),
         )
         .await;
-        assert!(slow.1 && slow.0.unwrap_err().to_string().contains("late"));
+        let err = slow.0.unwrap_err().to_string();
+        assert!(
+            slow.1 && err.contains("late") && err.contains("timed out"),
+            "{err}"
+        );
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        let cancelled = faucet_core::CallContext::new().with_cancel(token);
+        let gone = with_call(
+            &cancelled,
+            "insert",
+            async { Ok::<_, FaucetError>(2) },
+            |e| e,
+        )
+        .await;
+        assert!(gone.1 && matches!(gone.0, Err(FaucetError::Cancelled { .. })));
     }
 }

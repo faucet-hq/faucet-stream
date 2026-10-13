@@ -35,13 +35,19 @@ use std::time::{Duration, Instant};
 /// opened on the first poll, so an unreachable broker fails there.
 pub struct RabbitMqSource {
     config: RabbitMqSourceConfig,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 impl RabbitMqSource {
     /// Create a new RabbitMQ source. Validates the config; does not connect.
     pub async fn new(config: RabbitMqSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+        })
     }
 
     /// Open a channel, apply QoS, declare the queue/bindings, and start the
@@ -204,6 +210,17 @@ enum Polled {
 
 #[async_trait]
 impl Source for RabbitMqSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -243,7 +260,10 @@ impl Source for RabbitMqSource {
         let deferred = cfg.ack_mode == AckMode::OnSinkConfirm;
 
         Box::pin(async_stream::try_stream! {
-            let (conn, channel, mut consumer) = self.open().await?;
+            let calls = self.calls.get();
+            let (conn, channel, mut consumer) = calls.call_once("connect", self.open()).await?;
+            // A wait for the next delivery is not a round trip of its own.
+            let steps = calls.clone().with_roundtrip_metering(false);
             let mut acks = AckTracker::default();
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
             let mut total = 0usize;
@@ -251,14 +271,19 @@ impl Source for RabbitMqSource {
 
             loop {
                 if let Some(tag) = acks.take_durable() {
-                    ack(&channel, tag).await?;
+                    calls.call_once("ack", ack(&channel, tag)).await?;
                     last_at = Instant::now();
                 }
 
                 let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
                 // Shutdown is the pipeline's cancel token: a library must not
                 // install a process-wide signal handler (#789 MSG-89).
-                let polled = match tokio::time::timeout(budget, consumer.next()).await {
+                // The run's deadline and cancel token end the wait with an
+                // error (#880); unacked deliveries are requeued by the broker.
+                let next = steps
+                    .call_once("poll", async { Ok(tokio::time::timeout(budget, consumer.next()).await) })
+                    .await?;
+                let polled = match next {
                     Ok(Some(Ok(delivery))) => Polled::Delivery(Box::new(delivery)),
                     Ok(Some(Err(e))) => Polled::Failed(amqp_error("consume", e)),
                     Ok(None) => Polled::Closed,
@@ -294,13 +319,17 @@ impl Source for RabbitMqSource {
                                         "rabbitmq source: undecodable message rejected"
                                     );
                                     if deferred {
-                                        channel
-                                            .basic_reject(
-                                                delivery.delivery_tag,
-                                                BasicRejectOptions { requeue: false },
-                                            )
-                                            .await
-                                            .map_err(|e| amqp_error("reject", e))?;
+                                        calls
+                                            .call_once("reject", async {
+                                                channel
+                                                    .basic_reject(
+                                                        delivery.delivery_tag,
+                                                        BasicRejectOptions { requeue: false },
+                                                    )
+                                                    .await
+                                                    .map_err(|e| amqp_error("reject", e))
+                                            })
+                                            .await?;
                                     }
                                 }
                             },
@@ -336,13 +365,13 @@ impl Source for RabbitMqSource {
             }
 
             if let Some(tag) = acks.take_durable() {
-                ack(&channel, tag).await?;
+                calls.call_once("ack", ack(&channel, tag)).await?;
             }
             if !buffer.is_empty() {
                 acks.seal();
                 yield StreamPage { records: buffer, bookmark: page_bookmark(deferred, &cfg.queue, total) };
                 if let Some(tag) = acks.take_durable() {
-                    ack(&channel, tag).await?;
+                    calls.call_once("ack", ack(&channel, tag)).await?;
                 }
             }
             if let Err(e) = channel.close(200, "faucet run complete".into()).await {

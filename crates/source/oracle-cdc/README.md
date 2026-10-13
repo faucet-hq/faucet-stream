@@ -122,6 +122,10 @@ Pair with `cdc_unwrap` and an upsert-capable sink (`write_mode: upsert`, `delete
 
 Declares `exactly_once` (deterministic replay from the SCN bookmark) and `reports_lag` (seconds behind the current SCN). `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+The wait for each captured page, the pause between LogMiner polls and the lag and capture-position queries run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end an idle cycle promptly with an error (the pipeline has already stopped reading and flushed what it took), and the capture thread stops at its next poll. Queries count as `query` round trips in `faucet_source_roundtrips_total`. Nothing is retried; the next run resumes from the last persisted SCN.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

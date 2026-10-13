@@ -44,13 +44,16 @@ impl MssqlSink {
 
         let run = async {
             let mut conn = self.checkout().await?;
-            conn.simple_query(sql.as_str())
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MSSQL COPY INTO failed: {e}")))?
-                .into_results()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MSSQL COPY INTO failed: {e}")))?;
-            Ok::<(), FaucetError>(())
+            self.on_conn(&mut conn, "copy", false, async |c| {
+                c.simple_query(sql.as_str())
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL COPY INTO failed: {e}")))?
+                    .into_results()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MSSQL COPY INTO failed: {e}")))?;
+                Ok(())
+            })
+            .await
         }
         .await;
         uploader

@@ -271,3 +271,42 @@ async fn conformance_bookmark_roundtrip() {
     // bookmark; no new writes occur, so the resumed drain yields zero.
     assert_bookmark_roundtrip(&source).await;
 }
+
+// ── Check: backend calls honour the deadline and cancel (#880) ───────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a SQL Server (mssql) container: the ~2 GB image is too heavy/slow \
+            to come up reliably on the shared CI runner (unlike the lighter \
+            Postgres/MySQL/ClickHouse ones). Run explicitly with \
+            `cargo test -p faucet-source-mssql-cdc -- --ignored`."]
+async fn conformance_call_deadline() {
+    let _serial = SERIAL.lock().await;
+    let Some((_c, port)) = start_mssql_cdc().await else {
+        return;
+    };
+    let conn = setup_cdc(port, 3).await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            MssqlCdcSource::new(build_config(&conn))
+                .await
+                .expect("source new"),
+        );
+    }
+    // A change table another session holds an exclusive lock on stands in for
+    // a hung backend: reading the changes waits on the lock.
+    let pool = build_pool(&conn, 1).await.expect("pool");
+    let mut blocker = pool.get().await.expect("blocker");
+    blocker
+        .simple_query(format!(
+            "BEGIN TRAN; SELECT * FROM cdc.{CAPTURE_INSTANCE}_CT WITH (TABLOCKX, HOLDLOCK)"
+        ))
+        .await
+        .expect("lock")
+        .into_results()
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

@@ -32,6 +32,8 @@ pub struct MysqlSink {
     table_ready: std::sync::atomic::AtomicBool,
     /// Whether the rollback journal table is known to exist.
     pub(crate) journal_ready: std::sync::atomic::AtomicBool,
+    /// Backend-call context (#880): the run's deadline and recorder.
+    pub(crate) calls: faucet_core::CallSlot,
 }
 
 /// Quote a MySQL identifier using backticks.
@@ -874,6 +876,18 @@ fn on_duplicate_clause(key: &[String], all_cols: &[String]) -> String {
 }
 
 impl MysqlSink {
+    /// Run `fut` as the sink operation `what`: one backend call (#880) under
+    /// the run's deadline, bounded by `write_timeout_secs`.
+    async fn guarded<T>(
+        &self,
+        what: &'static str,
+        fut: impl std::future::Future<Output = Result<T, FaucetError>>,
+    ) -> Result<T, FaucetError> {
+        self.calls
+            .call_once(what, bounded(self.config.write_timeout_secs, what, fut))
+            .await
+    }
+
     /// A column's definition and whether it is nullable, or `None` when the
     /// column does not exist.
     async fn column_definition(
@@ -1011,6 +1025,7 @@ impl MysqlSink {
             config,
             pool,
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
             journal_ready: std::sync::atomic::AtomicBool::new(false),
         };
 
@@ -1912,6 +1927,17 @@ impl faucet_core::Sink for MysqlSink {
         self.config.batch_atomicity()
     }
 
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn connector_name(&self) -> &'static str {
         "mysql"
     }
@@ -1973,7 +1999,9 @@ impl faucet_core::Sink for MysqlSink {
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
+        self.calls
+            .call_once("cleanup_scope", self.cleanup_scope_impl(scope, seen))
+            .await
     }
 
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
@@ -1999,7 +2027,7 @@ impl faucet_core::Sink for MysqlSink {
     /// sink-instance memory, because the CLI runs begin, the writes and the
     /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "begin_overwrite", async {
+        self.guarded("begin_overwrite", async {
             let first_run =
                 self.config.create_table && !self.table_exists(&self.config.table_name).await?;
             let staging = quote_ident_mysql(&self.staging_table_name());
@@ -2045,7 +2073,7 @@ impl faucet_core::Sink for MysqlSink {
     /// staging → target` publishes the freshly-loaded staging table as the new
     /// target in one step; the old table is then dropped.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "commit_overwrite", async {
+        self.guarded("commit_overwrite", async {
             let staging = quote_ident_mysql(&self.staging_table_name());
             let old = quote_ident_mysql(&self.old_table_name());
             let target = quote_ident_mysql(&self.config.table_name);
@@ -2144,23 +2172,19 @@ impl faucet_core::Sink for MysqlSink {
     /// Probe for the `<table>__faucet_ovw` staging table, or the
     /// `<table>__faucet_ovw_old` a swap interrupted mid-`RENAME` leaves (read-only).
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "overwrite_staging_exists",
-            async {
-                Ok(Some(
-                    self.table_exists(&self.staging_table_name()).await?
-                        || self.table_exists(&self.old_table_name()).await?,
-                ))
-            },
-        )
+        self.guarded("overwrite_staging_exists", async {
+            Ok(Some(
+                self.table_exists(&self.staging_table_name()).await?
+                    || self.table_exists(&self.old_table_name()).await?,
+            ))
+        })
         .await
     }
 
     /// Drop the staging (and any old) table so a failed/cancelled overwrite
     /// leaves nothing behind. Best-effort — the destination was never touched.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "abort_overwrite", async {
+        self.guarded("abort_overwrite", async {
             let staging = quote_ident_mysql(&self.staging_table_name());
             let old = quote_ident_mysql(&self.old_table_name());
             let mut conn = self
@@ -2196,14 +2220,14 @@ impl faucet_core::Sink for MysqlSink {
         run_id: &str,
         opts: &faucet_core::rollback::RollbackOptions,
     ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.rollback_run_impl(run_id, opts).await
+        self.calls
+            .call_once("rollback_run", self.rollback_run_impl(run_id, opts))
+            .await
     }
 
     async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "forget_run", async {
-            self.forget_run_impl(run_id).await
-        })
-        .await
+        self.guarded("forget_run", async { self.forget_run_impl(run_id).await })
+            .await
     }
 
     async fn rewind_commit_token(
@@ -2211,11 +2235,9 @@ impl faucet_core::Sink for MysqlSink {
         scope: &str,
         token: Option<&str>,
     ) -> Result<(), FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "rewind_commit_token",
-            async { self.rewind_commit_token_impl(scope, token).await },
-        )
+        self.guarded("rewind_commit_token", async {
+            self.rewind_commit_token_impl(scope, token).await
+        })
         .await
     }
 
@@ -2235,7 +2257,7 @@ impl faucet_core::Sink for MysqlSink {
     /// qualifier to thread. `DATA_TYPE` / `IS_NULLABLE` round-trip through
     /// `mysql_data_type_to_json_schema`.
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
-        bounded(self.config.write_timeout_secs, "current_schema", async {
+        self.guarded("current_schema", async {
             // JSON-column mode stores each record whole; the physical columns are
             // not the record's fields, so there is nothing to drift against
             // (#789 SQL-20).
@@ -2268,7 +2290,7 @@ impl faucet_core::Sink for MysqlSink {
     /// relaxations re-emit the column as its current mapped type with an
     /// explicit `NULL`.
     async fn evolve_schema(&self, evolution: &SchemaEvolution) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "evolve_schema", async {
+        self.guarded("evolve_schema", async {
             let table_ref = quote_ident_mysql(&self.config.table_name);
 
             // Read the current columns up front: needed for ADD-COLUMN idempotency
@@ -2364,12 +2386,8 @@ impl faucet_core::Sink for MysqlSink {
     /// through it under autocommit (no explicit transaction), preserving the
     /// pre-refactor observable behaviour.
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "write_batch",
-            self.write_batch_unbounded(records),
-        )
-        .await
+        self.guarded("write_batch", self.write_batch_unbounded(records))
+            .await
     }
 
     /// Write a batch and report per-row outcomes.
@@ -2384,8 +2402,7 @@ impl faucet_core::Sink for MysqlSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
+        self.guarded(
             "write_batch_partial",
             self.write_batch_partial_unbounded(records),
         )
@@ -2397,30 +2414,26 @@ impl faucet_core::Sink for MysqlSink {
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "last_committed_token",
-            async {
-                self.ensure_commit_table().await?;
-                let sql = format!(
-                    "SELECT {k} FROM {t} WHERE {s} = ?",
-                    t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-                    k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-                    s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-                );
-                for key in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
-                    let row = sqlx::query(&sql)
-                        .bind(key)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
-                    if let Some(r) = row {
-                        return Ok(Some(r.get::<String, _>(0)));
-                    }
+        self.guarded("last_committed_token", async {
+            self.ensure_commit_table().await?;
+            let sql = format!(
+                "SELECT {k} FROM {t} WHERE {s} = ?",
+                t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+                k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
+                s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+            );
+            for key in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
+                let row = sqlx::query(&sql)
+                    .bind(key)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
+                if let Some(r) = row {
+                    return Ok(Some(r.get::<String, _>(0)));
                 }
-                Ok(None)
-            },
-        )
+            }
+            Ok(None)
+        })
         .await
     }
 
@@ -2430,8 +2443,7 @@ impl faucet_core::Sink for MysqlSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
+        self.guarded(
             "write_batch_idempotent",
             self.write_batch_idempotent_unbounded(records, scope, token),
         )

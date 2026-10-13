@@ -474,6 +474,10 @@ already landed a second time). See
 
 Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert, schema evolution with a reported schema, and a scoped `overwrite.scope`. Cleanup and rollback need `column_mapping: auto_map`; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every sink operation runs through the pipeline's `CallContext` (#880) as one backend call named after the operation (`write_batch`, `write_batch_partial`, `write_batch_idempotent`, `last_committed_token`, the overwrite, schema, cleanup and rollback steps): the run's deadline ends it promptly and its transaction rolls back, `write_timeout_secs` still bounds it, and it counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The sink never retries a write itself; a `resilience:` policy retries a page only when the write is replay-safe (a keyed upsert).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

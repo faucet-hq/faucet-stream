@@ -179,6 +179,10 @@ Windows builds.
 
 ---
 
+## Timeouts, cancellation and retries
+
+`SchemaRegistryClient` requests run through a `CallContext` (#880) the connector forwards with `set_call_context` / `set_roundtrip_recorder`: the run's deadline ends a hung registry request, and each request counts as one round trip (`schema`, `register`). `request_timeout` still bounds each request.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)

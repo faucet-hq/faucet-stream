@@ -59,6 +59,10 @@ pub struct PostgresCdcSource {
     /// Partition root of every relation oid looked up so far (`None`: not a
     /// partition), kept across fetch cycles so each oid is queried once.
     partition_roots: std::sync::Mutex<HashMap<u32, Option<String>>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder for the connect, slot and catalog calls and the
+    /// replication stream.
+    calls: faucet_core::CallSlot,
 }
 
 /// Split `oids` into the roots already known from `cache` and the oids still
@@ -117,6 +121,7 @@ impl PostgresCdcSource {
             confirmed_lsn: Mutex::new(initial_lsn),
             emitted_lsn: std::sync::atomic::AtomicU64::new(0),
             partition_roots: std::sync::Mutex::new(HashMap::new()),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -158,17 +163,32 @@ impl PostgresCdcSource {
     /// active (in use by a live replication connection). Call this when
     /// decommissioning a `permanent` slot so it doesn't leak WAL (#78/#12).
     pub async fn drop_slot(&self) -> Result<(), FaucetError> {
-        replication::drop_slot(
-            &self.config.connection_url,
-            &self.config.slot_name,
-            &self.config.tls,
-        )
-        .await
+        self.calls
+            .call_once(
+                "slot",
+                replication::drop_slot(
+                    &self.config.connection_url,
+                    &self.config.slot_name,
+                    &self.config.tls,
+                ),
+            )
+            .await
     }
 }
 
 #[async_trait]
 impl Source for PostgresCdcSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         ctx: &HashMap<String, Value>,
@@ -265,26 +285,36 @@ impl Source for PostgresCdcSource {
                     .into(),
             ));
         }
-        let lsn = replication::ensure_slot_and_current_lsn(
-            &self.config.connection_url,
-            &self.config.slot_name,
-            self.config.create_slot_if_missing,
-            self.config.slot_type,
-            &self.config.tls,
-        )
-        .await?;
+        let lsn = self
+            .calls
+            .call_once(
+                "slot",
+                replication::ensure_slot_and_current_lsn(
+                    &self.config.connection_url,
+                    &self.config.slot_name,
+                    self.config.create_slot_if_missing,
+                    self.config.slot_type,
+                    &self.config.tls,
+                ),
+            )
+            .await?;
         Ok(Some(crate::state::Bookmark::from_u64(lsn).to_value()?))
     }
 
     async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
         let local = (*self.confirmed_lsn.lock().await)
             .max(self.emitted_lsn.load(std::sync::atomic::Ordering::Relaxed));
-        let positions = replication::slot_positions(
-            &self.config.connection_url,
-            &self.config.slot_name,
-            &self.config.tls,
-        )
-        .await?;
+        let positions = self
+            .calls
+            .call_once(
+                "query",
+                replication::slot_positions(
+                    &self.config.connection_url,
+                    &self.config.slot_name,
+                    &self.config.tls,
+                ),
+            )
+            .await?;
         Ok(positions.map(|(current, confirmed)| {
             faucet_core::SourceLag::bytes(slot_lag_bytes(current, confirmed, local))
         }))
@@ -521,16 +551,21 @@ impl PostgresCdcSource {
                 max_buffered_events: self.config.max_buffered_events,
                 max_buffered_bytes: self.config.max_buffered_bytes,
             };
-            let client = replication::connect(&params).await?;
-            replication::ensure_slot(
-                &client,
-                &self.config.connection_url,
-                &self.config.slot_name,
-                self.config.create_slot_if_missing,
-                self.config.slot_type,
-                &self.config.tls,
-            )
-            .await?;
+            let calls = self.calls.get();
+            let client = calls.call_once("connect", replication::connect(&params)).await?;
+            calls
+                .call_once(
+                    "slot",
+                    replication::ensure_slot(
+                        &client,
+                        &self.config.connection_url,
+                        &self.config.slot_name,
+                        self.config.create_slot_if_missing,
+                        self.config.slot_type,
+                        &self.config.tls,
+                    ),
+                )
+                .await?;
 
             // Advance the slot's confirmed_flush_lsn to the durable resume
             // point BEFORE opening the stream. For a logical slot,
@@ -547,7 +582,7 @@ impl PostgresCdcSource {
                 // to be inactive; on a rapid re-run the prior connection may not
                 // have released it yet ("slot is active"). Retry with bounded
                 // backoff instead of failing the whole run (#146 M12).
-                replication::retry_on_slot_active(self.config.slot_acquire_retries, || {
+                replication::retry_on_slot_active_in(&calls, "slot", self.config.slot_acquire_retries, || {
                     replication::advance_slot(
                         &self.config.connection_url,
                         &self.config.slot_name,
@@ -558,7 +593,9 @@ impl PostgresCdcSource {
                 .await?;
             }
 
-            let mut duplex = replication::retry_on_slot_active(
+            let mut duplex = replication::retry_on_slot_active_in(
+                &calls,
+                "start",
                 self.config.slot_acquire_retries,
                 || async {
                     replication::ensure_slot_inactive(
@@ -600,6 +637,17 @@ impl PostgresCdcSource {
             let flush_after = self.config.status_update_interval;
 
             loop {
+                // The run's deadline and cancel token end the stream with an
+                // error (#880); the pipeline has already stopped reading.
+                if calls
+                    .deadline()
+                    .is_some_and(|d| tokio::time::Instant::now() >= d)
+                {
+                    Err(FaucetError::Timeout {
+                        operation: "postgres-cdc replication stream (deadline)".into(),
+                        after: Duration::ZERO,
+                    })?;
+                }
                 let idle_deadline = last_message_at + idle_timeout;
                 let deadline = batch.deadline(flush_after).map_or(idle_deadline, |d| d.min(idle_deadline));
                 let budget = deadline
@@ -619,9 +667,19 @@ impl PostgresCdcSource {
                         tracing::info!("postgres-cdc: ctrl_c received, stopping cleanly");
                         stop = true;
                     }
-                    ev = tokio::time::timeout(budget, recv(&mut duplex)) => {
+                    _ = async {
+                        match calls.cancel() {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        fatal = Some(FaucetError::Cancelled {
+                            operation: "postgres-cdc replication stream".into(),
+                        });
+                    }
+                    ev = recv(&mut duplex) => {
                         match ev {
-                            Ok(Ok(Some(event))) => {
+                            Ok(Some(event)) => {
                                 // Reset on any server activity, not just committed
                                 // output, so idle_timeout never fires mid-transaction
                                 // while WAL is still flowing.
@@ -649,19 +707,24 @@ impl PostgresCdcSource {
                                     just_committed = Some((lsn, committed_records));
                                 }
                             }
-                            Ok(Ok(None)) => {
+                            Ok(None) => {
                                 unexpected_end = true;
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 fatal = Some(e);
                             }
-                            Err(_timeout) if Instant::now() < idle_deadline => {}
-                            Err(_timeout) => {
+                        }
+                    }
+                    waited = calls.wait(budget) => {
+                        match waited {
+                            Ok(()) if Instant::now() < idle_deadline => {}
+                            Ok(()) => {
                                 tracing::debug!(
                                     "postgres-cdc: idle_timeout reached, stopping"
                                 );
                                 stop = true;
                             }
+                            Err(e) => fatal = Some(e),
                         }
                     }
                 }
@@ -671,8 +734,8 @@ impl PostgresCdcSource {
                 }
                 let unresolved = registry.take_unresolved();
                 if !unresolved.is_empty() {
-                    let roots = self
-                        .resolve_partition_roots(&unresolved, &mut control)
+                    let roots = calls
+                        .call_once("query", self.resolve_partition_roots(&unresolved, &mut control))
                         .await?;
                     registry.set_roots(&unresolved, roots);
                 }

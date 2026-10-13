@@ -32,6 +32,9 @@ pub struct KafkaSink {
     /// falling back to the value's (#789 MSG-95).
     #[cfg(feature = "schema-registry")]
     key_sr_client: Option<SchemaRegistryClient>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder
+    /// for produces, transaction calls and the token read.
+    calls: faucet_core::CallSlot,
 }
 
 impl KafkaSink {
@@ -60,6 +63,7 @@ impl KafkaSink {
             sr_client,
             #[cfg(feature = "schema-registry")]
             key_sr_client,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -190,10 +194,16 @@ impl KafkaSink {
                 // init_transactions is a blocking FFI call.
                 let p = producer.clone();
                 let timeout = self.config.message_timeout;
-                tokio::task::spawn_blocking(move || p.init_transactions(timeout))
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("kafka init_transactions task: {e}")))?
-                    .map_err(|e| FaucetError::Sink(format!("kafka init_transactions: {e}")))?;
+                let init = tokio::task::spawn_blocking(move || p.init_transactions(timeout));
+                self.calls
+                    .call_once("init", async {
+                        init.await
+                            .map_err(|e| {
+                                FaucetError::Sink(format!("kafka init_transactions task: {e}"))
+                            })?
+                            .map_err(|e| FaucetError::Sink(format!("kafka init_transactions: {e}")))
+                    })
+                    .await?;
 
                 Ok::<_, FaucetError>(producer)
             })
@@ -225,6 +235,25 @@ fn build_sr_client(
 
 #[async_trait]
 impl Sink for KafkaSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        #[cfg(feature = "schema-registry")]
+        for client in [&self.sr_client, &self.key_sr_client].into_iter().flatten() {
+            client.set_call_context(ctx.clone());
+        }
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        #[cfg(feature = "schema-registry")]
+        for client in [&self.sr_client, &self.key_sr_client].into_iter().flatten() {
+            client.set_roundtrip_recorder(std::sync::Arc::clone(&recorder));
+        }
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -248,6 +277,7 @@ impl Sink for KafkaSink {
         &self,
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let calls = self.calls.get();
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut produced = 0usize;
         let mut skipped = 0usize;
@@ -306,9 +336,11 @@ impl Sink for KafkaSink {
             let message_timeout = self.config.message_timeout;
             let retries = self.config.queue_full_max_retries;
             let backoff = self.config.queue_full_backoff;
+            let calls = calls.clone();
 
             in_flight.push(async move {
                 send_with_queue_full_retry(
+                    &calls,
                     &producer,
                     &topic_owned,
                     value_bytes,
@@ -368,12 +400,22 @@ impl Sink for KafkaSink {
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let base = crate::idempotent::client_config_base(&self.config)?;
-        crate::idempotent::ensure_commit_topic(&self.config, &base).await?;
+        self.calls
+            .call_once(
+                "metadata",
+                crate::idempotent::ensure_commit_topic(&self.config, &base),
+            )
+            .await?;
         // init_transactions fences and aborts this scope's own transaction
         // left open by a crash, which would otherwise hold the side-topic's
         // stable offset until the broker's timeout sweep.
         self.txn_producer(scope).await?;
-        crate::idempotent::read_last_token(&self.config, &base, scope).await
+        self.calls
+            .call_once(
+                "read_token",
+                crate::idempotent::read_last_token(&self.config, &base, scope),
+            )
+            .await
     }
 
     async fn write_batch_idempotent(
@@ -383,6 +425,7 @@ impl Sink for KafkaSink {
         token: &str,
     ) -> Result<usize, FaucetError> {
         let producer = self.txn_producer(scope).await?;
+        let calls = self.calls.get();
 
         producer
             .begin_transaction()
@@ -451,6 +494,7 @@ impl Sink for KafkaSink {
             };
 
             if let Err(e) = crate::idempotent::enqueue_in_txn(
+                &calls,
                 &producer,
                 &topic,
                 value_bytes,
@@ -477,6 +521,7 @@ impl Sink for KafkaSink {
         let eo = self.config.exactly_once_spec();
         let token_key = crate::idempotent::token_key(eo.transactional_id_prefix.as_deref(), scope);
         if let Err(e) = crate::idempotent::enqueue_in_txn(
+            &calls,
             &producer,
             &eo.commit_token_topic,
             token.as_bytes().to_vec(),
@@ -497,9 +542,24 @@ impl Sink for KafkaSink {
         // Commit atomically (blocking FFI). Errors → abort + propagate.
         let p = producer.clone();
         let timeout = self.config.message_timeout;
-        let commit = tokio::task::spawn_blocking(move || p.commit_transaction(timeout))
+        let commit = tokio::task::spawn_blocking(move || p.commit_transaction(timeout));
+        let commit = match calls
+            .call_once("commit", async {
+                commit
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("kafka commit task: {e}")))
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("kafka commit task: {e}")))?;
+        {
+            Ok(commit) => commit,
+            // The run's deadline cut the commit: its outcome is unknown, and
+            // aborting fails harmlessly when it already committed.
+            Err(e) => {
+                let _ = crate::idempotent::abort_txn(producer.clone(), self.config.message_timeout)
+                    .await;
+                return Err(e);
+            }
+        };
         if let Err(e) = commit {
             let _ =
                 crate::idempotent::abort_txn(producer.clone(), self.config.message_timeout).await;
@@ -624,8 +684,8 @@ pub(crate) fn owned_headers(map: &serde_json::Map<String, Value>) -> OwnedHeader
 /// `_message_timeout` is kept in the signature for callers that track it but
 /// is not needed with `send_result()`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 async fn send_with_queue_full_retry(
+    calls: &faucet_core::CallContext,
     producer: &FutureProducer,
     topic: &str,
     value_bytes: Vec<u8>,
@@ -653,7 +713,10 @@ async fn send_with_queue_full_retry(
         match producer.send_result(record) {
             Ok(delivery_future) => {
                 // Record enqueued — await the delivery confirmation.
-                match delivery_future.await {
+                let delivered = calls
+                    .call_once("produce", async { Ok(delivery_future.await) })
+                    .await?;
+                match delivered {
                     Ok(Ok(_delivery)) => return Ok(()),
                     Ok(Err((
                         KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge),
@@ -680,7 +743,7 @@ async fn send_with_queue_full_retry(
                     )));
                 }
                 tracing::warn!(attempts, "kafka send: QueueFull, backing off");
-                tokio::time::sleep(backoff).await;
+                calls.wait(backoff).await?;
                 attempts += 1;
             }
             Err((e, _record)) => {

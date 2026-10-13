@@ -220,6 +220,28 @@ async fn conformance_errors_not_panics() {
     assert_errors_not_panics(&source).await;
 }
 
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the replication connect waits on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let url = format!("postgres://postgres@{addr}/postgres");
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(PostgresCdcSource::new(cfg(&url)).await.expect("lazy new"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}
+
 #[tokio::test]
 async fn descriptor_matches_the_built_source() {
     for v in [

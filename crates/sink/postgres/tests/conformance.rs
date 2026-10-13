@@ -125,3 +125,31 @@ async fn conformance_capabilities_truthful() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A table another session holds locked stands in for a hung backend (#880).
+    let (_container, url, first) = fresh_sink().await;
+    let mut cfg = PostgresSinkConfig::new(&url, "t")
+        .column_mapping(PostgresColumnMapping::AutoMap)
+        .with_batch_size(0);
+    cfg.write_timeout_secs = 0;
+    let second = PostgresSink::new(cfg).await.expect("sink");
+    let mut lock = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::query("BEGIN")
+        .execute(&mut lock)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE t IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut lock)
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}

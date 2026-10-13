@@ -337,6 +337,10 @@ already landed a second time). See
 
 Declares `write_mode: append | upsert | delete | overwrite`, idempotent (exactly-once) writes, keyed upsert and scoped cleanup; it dedups by key only when the config sets `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every sink operation runs through the pipeline's `CallContext` (#880) as one backend call named after it (`write_batch`, `write_batch_idempotent`, `last_committed_token`, the overwrite and cleanup steps; each `insert_many` of the per-row path is an `insert`): the run's deadline ends it promptly and it counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The per-row path still re-sends a batch that failed without per-document errors (the documents keep their `_id`, so a re-send cannot insert one twice); the backoff between re-sends also ends at the deadline.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

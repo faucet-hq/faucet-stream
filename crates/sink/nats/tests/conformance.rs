@@ -193,3 +193,38 @@ async fn conformance_descriptor_matches_built_sink() {
         );
     }
 }
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the lazy connect waits on it.
+async fn silent_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("nats://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let server = silent_server().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = NatsSinkConfig::new("events");
+        cfg.connection.servers = vec![server.clone()];
+        built.push(
+            faucet_sink_nats::NatsSink::new(cfg)
+                .await
+                .expect("lazy construction"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}

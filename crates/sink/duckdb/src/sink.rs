@@ -178,6 +178,11 @@ pub struct DuckdbSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// Interrupts a write the call context cuts short, so the blocking task
+    /// stops (and its transaction rolls back) instead of running on.
+    interrupt: Arc<duckdb::InterruptHandle>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 /// One DuckDB database instance per file in this process (#789 SQL-07).
@@ -599,11 +604,14 @@ impl DuckdbSink {
         })
         .await
         .map_err(|e| FaucetError::Sink(format!("duckdb open task panicked: {e}")))??;
+        let interrupt = conn.interrupt_handle();
         Ok(Self {
             config,
             conn: Arc::new(Mutex::new(conn)),
             _instance: instance,
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            interrupt,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -648,6 +656,17 @@ impl DuckdbSink {
 
 #[async_trait]
 impl faucet_core::Sink for DuckdbSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -677,9 +696,22 @@ impl faucet_core::Sink for DuckdbSink {
         let conn = self.conn.clone();
         let config = self.config.clone();
         let owned = records.to_vec();
-        let n = tokio::task::spawn_blocking(move || write_all_blocking(&conn, &config, &owned))
+        let task = tokio::task::spawn_blocking(move || write_all_blocking(&conn, &config, &owned));
+        let n = self
+            .calls
+            .call_once("write", async {
+                task.await
+                    .map_err(|e| FaucetError::Sink(format!("duckdb write task panicked: {e}")))?
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("duckdb write task panicked: {e}")))??;
+            .inspect_err(|e| {
+                if matches!(
+                    e,
+                    FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
+                ) {
+                    self.interrupt.interrupt();
+                }
+            })?;
         tracing::info!(
             table = %self.config.table_name,
             rows = n,
@@ -762,6 +794,36 @@ mod tests {
     use super::*;
     use faucet_core::Sink as _;
     use serde_json::json;
+
+    /// A connection another holder keeps locked stands in for a hung backend
+    /// (#880): the write's blocking task waits on the lock while the call ends
+    /// at the deadline and on cancel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_ends_at_the_call_deadline_and_on_cancel() {
+        let mut built = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let sink = sink_with_table(
+                "CREATE TABLE t (id BIGINT)",
+                "t",
+                DuckdbColumnMapping::AutoMap,
+            )
+            .await;
+            // Confirm the table first, so the write under test goes straight
+            // to its blocking task.
+            sink.write_batch(&[json!({"id": 0})]).await.unwrap();
+            held.push(Arc::clone(&sink.conn));
+            built.push(sink);
+        }
+        let guards: Vec<_> = held.iter().map(|c| c.lock().unwrap()).collect();
+        let built = std::sync::Mutex::new(built);
+        faucet_conformance::calls::assert_sink_call_deadline(
+            || built.lock().unwrap().pop().unwrap(),
+            &[json!({"id": 1})],
+        )
+        .await;
+        drop(guards);
+    }
 
     async fn sink_with_table(ddl: &str, table: &str, mapping: DuckdbColumnMapping) -> DuckdbSink {
         let sink =

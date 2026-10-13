@@ -89,6 +89,10 @@ let rows = source.fetch_all().await?;
 
 Declares `discover`, and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every query (and the discovery and shard-bounds reads) runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end the wait promptly, while `statement_timeout_secs` still bounds the blocking call on the server. Each query counts as one round trip (`query`, `discover`) in `faucet_source_roundtrips_total`. Reads are not retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

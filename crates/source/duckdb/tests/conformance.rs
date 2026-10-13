@@ -95,3 +95,23 @@ async fn descriptor_matches_the_built_source() {
         );
     }
 }
+
+/// A query that would run for hours stands in for a hung backend (#880): the
+/// call ends at the deadline and on cancel, and interrupts the query.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            DuckdbSource::new(DuckdbSourceConfig::new(
+                ":memory:",
+                "SELECT count(*) AS n FROM range(1000000000000) a",
+            ))
+            .await
+            .expect("source"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

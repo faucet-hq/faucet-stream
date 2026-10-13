@@ -29,7 +29,10 @@ use futures::TryStreamExt;
 use serde_json::Value;
 use tiberius::{QueryItem, ToSql};
 
-use faucet_common_mssql::{MssqlPool, MssqlPooledConnection, build_pool, with_statement_timeout};
+use faucet_common_mssql::{
+    MssqlPool, MssqlPooledConnection, build_pool, call_statement, replace_connection,
+    statement_call_context,
+};
 
 use crate::change::{
     LSN_ALIAS, LsnBounds, OP_COLUMN, OpAction, PollPlan, SEQVAL_ALIAS, build_change_envelope,
@@ -54,6 +57,9 @@ pub struct MssqlCdcSource {
     /// The bookmark map last handed to the pipeline this run — where
     /// [`Source::lag`] measures from (#733).
     emitted: Mutex<Option<Bookmarks>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder; `statement_timeout_secs` bounds each statement.
+    calls: faucet_core::CallSlot,
 }
 
 impl MssqlCdcSource {
@@ -67,6 +73,8 @@ impl MssqlCdcSource {
         }
         let pool = build_pool(&config.connection, config.pool_size()).await?;
         let state_key_value = config.resolved_state_key();
+        let calls =
+            faucet_core::CallSlot::new(statement_call_context(config.statement_timeout_secs));
 
         let mut conn = pool
             .get()
@@ -107,6 +115,7 @@ impl MssqlCdcSource {
             tables,
             pending_bookmark: Mutex::new(None),
             emitted: Mutex::new(None),
+            calls,
         })
     }
 
@@ -116,10 +125,42 @@ impl MssqlCdcSource {
             secs => Some(Duration::from_secs(secs)),
         }
     }
+
+    /// Check a connection out of the pool under the call context.
+    async fn checkout(&self, what: &str) -> Result<MssqlPooledConnection<'_>, FaucetError> {
+        self.calls
+            .get()
+            .with_roundtrip_metering(false)
+            .call_once("checkout", async {
+                self.pool.get().await.map_err(|e| {
+                    FaucetError::Source(format!("mssql-cdc: {what} checkout failed: {e}"))
+                })
+            })
+            .await
+    }
+
+    /// Replace a connection a cut-short statement left desynced, so the pool
+    /// never hands it out again.
+    async fn recover(&self, conn: &mut MssqlPooledConnection<'_>) {
+        if let Err(e) = replace_connection(&self.config.connection, conn).await {
+            tracing::warn!(error = %e, "mssql-cdc: could not replace a desynced connection");
+        }
+    }
 }
 
 #[async_trait]
 impl Source for MssqlCdcSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     /// Drain a single fetch cycle into a flat `Vec` using the `batch_size = 0`
     /// aggregate sentinel (matches the convenience-API contract).
     async fn fetch_with_context(
@@ -179,11 +220,7 @@ impl Source for MssqlCdcSource {
         else {
             return Ok(None);
         };
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| FaucetError::Source(format!("mssql-cdc: lag checkout failed: {e}")))?;
+        let mut conn = self.checkout("lag").await?;
         const SQL: &str = "DECLARE @from BINARY(10) = CONVERT(BINARY(10), @P1, 2); \
              DECLARE @max BINARY(10) = sys.fn_cdc_get_max_lsn(); \
              SELECT COUNT_BIG(*) AS pending, \
@@ -214,9 +251,7 @@ impl Source for MssqlCdcSource {
     /// capture instance, without consuming any changes. Used by
     /// `faucet replicate` to anchor CDC before a bulk snapshot (#189).
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        let mut conn = self.pool.get().await.map_err(|e| {
-            FaucetError::Source(format!("mssql-cdc: capture_position checkout failed: {e}"))
-        })?;
+        let mut conn = self.checkout("capture_position").await?;
         let max_lsn = match self.query_max_lsn(&mut conn).await? {
             Some(lsn) => lsn,
             // No CDC activity yet: no position to anchor. A fresh CDC run will
@@ -409,7 +444,7 @@ impl MssqlCdcSource {
         &self,
         conn: &'c mut MssqlPooledConnection<'_>,
         q: &ChangeQuery,
-    ) -> Result<tiberius::QueryStream<'c>, FaucetError> {
+    ) -> (Result<tiberius::QueryStream<'c>, FaucetError>, bool) {
         let sql = changes_sql(&q.ci);
         let (from_hex, to_hex) = (q.from.to_hex(), q.to.to_hex());
         let params: [&dyn ToSql; 2] = [&from_hex, &to_hex];
@@ -420,19 +455,19 @@ impl MssqlCdcSource {
             ))
         };
         let query_fut = conn.query(&sql, &params);
-        match self.timeout() {
-            Some(t) => {
-                with_statement_timeout(t, async { query_fut.await.map_err(failed) }, || {
-                    FaucetError::Source("mssql-cdc: get_all_changes timed out".into())
-                })
-                .await
-            }
-            None => query_fut.await.map_err(failed),
-        }
+        call_statement(
+            &self.calls.get(),
+            "query",
+            self.timeout(),
+            async { query_fut.await.map_err(failed) },
+            || FaucetError::Source("mssql-cdc: get_all_changes timed out".into()),
+        )
+        .await
     }
 
-    /// Run a query and collect its first result set, honouring the statement
-    /// timeout.
+    /// Run a query and collect its first result set, as one backend call
+    /// honouring the statement timeout; a call cut short replaces the
+    /// connection.
     async fn run_collect(
         &self,
         conn: &mut MssqlPooledConnection<'_>,
@@ -447,15 +482,14 @@ impl MssqlCdcSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("mssql-cdc: result read failed: {e}")))
         };
-        match self.timeout() {
-            Some(t) => {
-                with_statement_timeout(t, run, || {
-                    FaucetError::Source("mssql-cdc: query timed out".into())
-                })
-                .await
-            }
-            None => run.await,
+        let (out, cut) = call_statement(&self.calls.get(), "query", self.timeout(), run, || {
+            FaucetError::Source("mssql-cdc: query timed out".into())
+        })
+        .await;
+        if cut {
+            self.recover(conn).await;
         }
+        out
     }
 }
 
@@ -550,7 +584,6 @@ fn opt_lsn(row: &tiberius::Row, col: &str) -> Result<Option<Lsn>, FaucetError> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl MssqlCdcSource {
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages_impl<'a>(
         &'a self,
         _ctx: &'a HashMap<String, Value>,
@@ -584,9 +617,7 @@ impl MssqlCdcSource {
                 // before the change streams open.
                 let mut queries: Vec<ChangeQuery> = Vec::new();
                 {
-                    let mut conn = self.pool.get().await.map_err(|e| {
-                        FaucetError::Source(format!("mssql-cdc: pool checkout failed: {e}"))
-                    })?;
+                    let mut conn = self.checkout("pool").await?;
                     for ci in &self.config.capture_instances {
                         let bounds = self.query_lsn_bounds(&mut conn, ci).await?;
                         match plan_instance(ci, &self.tables, bounds, &mut marks, start_position, self.config.on_gap)? {
@@ -612,38 +643,68 @@ impl MssqlCdcSource {
                     // touches several tables is emitted whole, in its own order.
                     let mut conns = Vec::with_capacity(queries.len());
                     for _ in &queries {
-                        conns.push(self.pool.get().await.map_err(|e| {
-                            FaucetError::Source(format!("mssql-cdc: pool checkout failed: {e}"))
-                        })?);
+                        conns.push(self.checkout("pool").await?);
                     }
-                    let mut streams = Vec::with_capacity(queries.len());
-                    for (conn, q) in conns.iter_mut().zip(&queries) {
-                        streams.push(self.open_changes(conn, q).await?);
-                    }
-                    let mut heads = Vec::with_capacity(streams.len());
-                    for (stream, q) in streams.iter_mut().zip(&queries) {
-                        heads.push(next_change(stream, &q.ci).await?);
-                    }
-
+                    // The change streams borrow the connections; any failure
+                    // leaves a stream undrained (its connection desynced), so
+                    // every connection is replaced once the borrows end.
+                    let steps = self.calls.get().without_timeout().with_roundtrip_metering(false);
                     let mut tx = TxAssembler::new(max_staged);
-                    while let Some(i) = next_head(&heads) {
-                        let change = heads[i].take().expect("next_head picks a present head");
-                        heads[i] = next_change(&mut streams[i], &queries[i].ci).await?;
-                        if let Some((prev, recs)) = tx.push(change, &queries[i])? {
-                            advance_marks(&mut marks, &queries, prev);
-                            if per_transaction {
-                                yield StreamPage {
-                                    records: recs,
-                                    bookmark: Some(self.note_emitted(&marks)?),
-                                };
-                            } else {
-                                agg.extend(recs);
-                                agg_dirty = true;
+                    let failure: Option<FaucetError> = 'read: {
+                        let mut streams = Vec::with_capacity(queries.len());
+                        for (conn, q) in conns.iter_mut().zip(&queries) {
+                            match self.open_changes(conn, q).await.0 {
+                                Ok(stream) => streams.push(stream),
+                                Err(e) => break 'read Some(e),
                             }
                         }
+                        let mut heads = Vec::with_capacity(streams.len());
+                        for (stream, q) in streams.iter_mut().zip(&queries) {
+                            match steps.call_once("query", next_change(stream, &q.ci)).await {
+                                Ok(head) => heads.push(head),
+                                Err(e) => break 'read Some(e),
+                            }
+                        }
+
+                        while let Some(i) = next_head(&heads) {
+                            let change = heads[i].take().expect("next_head picks a present head");
+                            heads[i] = match steps
+                                .call_once("query", next_change(&mut streams[i], &queries[i].ci))
+                                .await
+                            {
+                                Ok(head) => head,
+                                Err(e) => break 'read Some(e),
+                            };
+                            let closed = match tx.push(change, &queries[i]) {
+                                Ok(closed) => closed,
+                                Err(e) => break 'read Some(e),
+                            };
+                            if let Some((prev, recs)) = closed {
+                                advance_marks(&mut marks, &queries, prev);
+                                if per_transaction {
+                                    let bookmark = match self.note_emitted(&marks) {
+                                        Ok(b) => b,
+                                        Err(e) => break 'read Some(e),
+                                    };
+                                    yield StreamPage {
+                                        records: recs,
+                                        bookmark: Some(bookmark),
+                                    };
+                                } else {
+                                    agg.extend(recs);
+                                    agg_dirty = true;
+                                }
+                            }
+                        }
+                        None
+                    };
+                    if let Some(e) = failure {
+                        for conn in conns.iter_mut() {
+                            self.recover(conn).await;
+                        }
+                        Err(e)?;
                     }
                     any_rows |= tx.emitted;
-                    drop(streams);
                     drop(conns);
 
                     consume_all(&mut marks, &queries);
@@ -668,7 +729,7 @@ impl MssqlCdcSource {
                 if last_activity.elapsed() >= idle_timeout {
                     break;
                 }
-                tokio::time::sleep(poll_interval).await;
+                self.calls.wait(poll_interval).await?;
             }
 
             // Aggregate mode: one trailing page with everything and the final map.

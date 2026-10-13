@@ -99,6 +99,10 @@ sink.write_batch(&[json!({"ID": 1, "NAME": "a"})]).await?;
 
 Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema. Keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every sink operation runs on the blocking pool as one backend call named after it (`write_batch`, `write_batch_partial`, `write_batch_idempotent`, `last_committed_token`, the overwrite and schema steps) through the pipeline's `CallContext` (#880): the run's deadline ends the wait promptly, `statement_timeout_secs` still bounds the work on the server, and each counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The sink never retries a write itself.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

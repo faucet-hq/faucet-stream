@@ -76,3 +76,25 @@ async fn conformance_live_battery() {
     })
     .await;
 }
+
+/// A query that would run for a long time stands in for a hung backend
+/// (#880): the call ends at the deadline and on cancel.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = OracleSourceConfig::new(
+            conn.clone(),
+            "SELECT COUNT(*) AS N FROM DUAL A CONNECT BY LEVEL <= 100000000000",
+        );
+        // Bounds the abandoned statement on the server after the call returns.
+        cfg.statement_timeout_secs = 20;
+        built.push(OracleSource::new(cfg).await.expect("source"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

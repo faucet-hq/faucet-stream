@@ -128,6 +128,9 @@ pub struct MongoCdcSource {
     /// event, or the stream's post-batch token when it went idle. 0 = none
     /// yet. Where [`Source::lag`] measures from (#733).
     position_secs: std::sync::atomic::AtomicU64,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder for the watch opens, queries and stream polls.
+    calls: faucet_core::CallSlot,
 }
 
 impl MongoCdcSource {
@@ -152,6 +155,7 @@ impl MongoCdcSource {
             state_key_value,
             pending_bookmark: Mutex::new(None),
             position_secs: std::sync::atomic::AtomicU64::new(0),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 }
@@ -242,6 +246,17 @@ pub(crate) fn build_pipeline(config: &MongoCdcSourceConfig) -> Result<Vec<Docume
 
 #[async_trait]
 impl Source for MongoCdcSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         ctx: &HashMap<String, Value>,
@@ -280,7 +295,10 @@ impl Source for MongoCdcSource {
     }
 
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        let token = self.capture_now_token().await?;
+        let token = self
+            .calls
+            .call_once("watch", self.capture_now_token())
+            .await?;
         Ok(Some(Bookmark::from_token(&token)?.to_value()?))
     }
 
@@ -302,17 +320,25 @@ impl Source for MongoCdcSource {
             let Some(bm) = pending else {
                 return Ok(None);
             };
-            match self.first_unread_secs(&bm).await? {
+            match self
+                .calls
+                .call_once("watch", self.first_unread_secs(&bm))
+                .await?
+            {
                 Some(secs) => position = secs,
                 None => return Ok(None),
             }
         }
         let hello = self
-            .client
-            .database("admin")
-            .run_command(bson::doc! { "hello": 1 })
-            .await
-            .map_err(|e| FaucetError::Source(format!("mongodb-cdc lag: hello failed: {e}")))?;
+            .calls
+            .call_once("query", async {
+                self.client
+                    .database("admin")
+                    .run_command(bson::doc! { "hello": 1 })
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("mongodb-cdc lag: hello failed: {e}")))
+            })
+            .await?;
         let Ok(now) = hello.get_timestamp("operationTime") else {
             return Ok(None);
         };
@@ -521,8 +547,12 @@ impl MongoCdcSource {
             // anchors at its initial post-batch token; a separate capture
             // stream could consume the first event (#862 L-070).
             let anchor_now = start == StartPosition::Now;
+            let calls = self.calls.get();
             if start == StartPosition::Earliest {
-                start = StartPosition::AtOperationTime(self.oldest_oplog_time().await);
+                let oldest = calls
+                    .call_once("query", async { Ok(self.oldest_oplog_time().await) })
+                    .await?;
+                start = StartPosition::AtOperationTime(oldest);
             }
             let pipeline = build_pipeline(&self.config)?;
             let report_invalidate = reports_invalidate(&self.config);
@@ -531,7 +561,7 @@ impl MongoCdcSource {
             // Each arm resolves to a ChangeStream<ChangeStreamEvent<Document>>.
             let change_stream: mongodb::change_stream::ChangeStream<
                 mongodb::change_stream::event::ChangeStreamEvent<Document>,
-            > = match &self.config.scope {
+            > = calls.call_once("watch", async { Ok(match &self.config.scope {
                 crate::config::Scope::Collection { database, collection } => {
                     let coll: mongodb::Collection<Document> =
                         self.client.database(database).collection(collection);
@@ -601,8 +631,10 @@ impl MongoCdcSource {
                     w.await
                         .map_err(|e| FaucetError::Source(format!("mongodb-cdc watch failed: {e}")))?
                 }
-            };
+            }) }).await?;
             let mut change_stream = change_stream;
+            // A poll waits on the server; it is not a round trip of its own.
+            let steps = calls.with_roundtrip_metering(false);
             if let Some(tok) = change_stream.resume_token().filter(|_| anchor_now) {
                 yield StreamPage {
                     records: Vec::new(),
@@ -645,7 +677,14 @@ impl MongoCdcSource {
                     }
                     break;
                 }
-                match tokio::time::timeout(poll_bound, change_stream.next_if_any()).await {
+                // The run's deadline and cancel token end the stream with an
+                // error (#880); the pipeline has already stopped reading.
+                let polled = steps
+                    .call_once("poll", async {
+                        Ok(tokio::time::timeout(poll_bound, change_stream.next_if_any()).await)
+                    })
+                    .await?;
+                match polled {
                     Ok(Ok(Some(event))) => {
                         last_event_at = std::time::Instant::now();
                         if let Some(ts) = &event.cluster_time {

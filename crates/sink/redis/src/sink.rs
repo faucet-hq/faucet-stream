@@ -15,6 +15,8 @@ pub struct RedisSink {
     /// Reconnects after the server connection drops (a failover), where a
     /// bare multiplexed connection failed every later command (#789 MSG-78).
     conn: std::panic::AssertUnwindSafe<ConnectionManager>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder.
+    calls: std::panic::AssertUnwindSafe<faucet_core::CallSlot>,
 }
 
 /// The exactly-once write: every data command and the watermark in one Lua
@@ -67,6 +69,9 @@ impl RedisSink {
         Ok(Self {
             config,
             conn: std::panic::AssertUnwindSafe(conn),
+            calls: std::panic::AssertUnwindSafe(faucet_core::CallSlot::new(
+                faucet_core::CallContext::new().without_timeout(),
+            )),
         })
     }
 
@@ -91,9 +96,13 @@ impl RedisSink {
                 }
                 pipe.add_command(cmd);
             }
-            pipe.query_async::<()>(&mut conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("Redis pipeline execution failed: {e}")))?;
+            self.calls
+                .call_once("pipeline", async {
+                    pipe.query_async::<()>(&mut conn).await.map_err(|e| {
+                        FaucetError::Sink(format!("Redis pipeline execution failed: {e}"))
+                    })
+                })
+                .await?;
         }
         Ok(())
     }
@@ -101,6 +110,17 @@ impl RedisSink {
 
 #[async_trait]
 impl faucet_core::Sink for RedisSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -228,12 +248,17 @@ impl faucet_core::Sink for RedisSink {
                 script.arg(a);
             }
         }
-        script.invoke_async::<i64>(&mut conn).await.map_err(|e| {
-            FaucetError::Sink(format!(
-                "Redis exactly-once write failed (the watermark was not advanced; commands \
-                 before the failure may have been applied and are re-sent on retry): {e}"
-            ))
-        })?;
+        self.calls
+            .call_once("script", async {
+                script.invoke_async::<i64>(&mut conn).await.map_err(|e| {
+                    FaucetError::Sink(format!(
+                        "Redis exactly-once write failed (the watermark was not advanced; \
+                         commands before the failure may have been applied and are re-sent \
+                         on retry): {e}"
+                    ))
+                })
+            })
+            .await?;
 
         tracing::debug!(
             records = records.len(),
@@ -247,11 +272,15 @@ impl faucet_core::Sink for RedisSink {
         let mut conn = self.conn.0.clone();
         // The token is opaque to the sink (it may carry an embedded resume
         // bookmark after a '#'); never parse it here — just hand it back.
-        redis::cmd("GET")
-            .arg(commit_token_key(scope))
-            .query_async::<Option<String>>(&mut conn)
+        self.calls
+            .call_once("get", async {
+                redis::cmd("GET")
+                    .arg(commit_token_key(scope))
+                    .query_async::<Option<String>>(&mut conn)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("Redis commit-token read failed: {e}")))
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("Redis commit-token read failed: {e}")))
     }
 }
 

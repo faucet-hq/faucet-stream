@@ -1,0 +1,8 @@
+faucet-sink-csv: local file writes only (buffered, on spawn_blocking); no backend call can hang
+faucet-sink-duckdb: in-process engine; the deadline/cancel proof is a unit test in src/sink.rs that holds the private connection lock
+faucet-sink-file: local file writes only (staged and renamed on the local filesystem); no backend call can hang
+faucet-sink-jsonl: local file writes only (buffered); no backend call can hang
+faucet-sink-parquet: local path writes are local file I/O; the deprecated S3 destination streams through object_store, whose own request timeouts bound it
+faucet-sink-stdout: writes to the process's own stdout/stderr; no backend
+faucet-source-csv: local file reads only; no backend call can hang
+faucet-source-parquet: local path reads are local file I/O; the deprecated S3 location reads through object_store, whose own request timeouts bound it

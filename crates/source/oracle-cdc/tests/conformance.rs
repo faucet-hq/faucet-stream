@@ -57,3 +57,31 @@ async fn conformance_live_battery() {
     source.apply_start_bookmark(anchor).await.unwrap();
     assert_bookmark_roundtrip(&source).await;
 }
+
+/// A quiet database stands in for a hung backend (#880): capture waits
+/// between polls until the deadline or the cancel ends the read.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let Some((container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::enable_logminer(&container, &conn).await;
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE EVQ (ID NUMBER PRIMARY KEY)",
+            "ALTER TABLE EVQ ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
+        ],
+    )
+    .await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = OracleCdcSourceConfig::new(conn.clone(), vec!["FAUCET.EVQ".into()]);
+        cfg.idle_timeout = Duration::from_secs(600);
+        cfg.poll_interval = Duration::from_secs(60);
+        built.push(OracleCdcSource::new(cfg).await.expect("source"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

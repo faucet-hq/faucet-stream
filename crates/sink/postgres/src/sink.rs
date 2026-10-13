@@ -632,9 +632,23 @@ pub struct PostgresSink {
     /// Whether the target has been confirmed present (created or probed) for
     /// this sink instance (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// Backend-call context (#880): the run's deadline and recorder.
+    pub(crate) calls: faucet_core::CallSlot,
 }
 
 impl PostgresSink {
+    /// Run `fut` as the sink operation `what`: one backend call (#880) under
+    /// the run's deadline, bounded by `write_timeout_secs`.
+    async fn guarded<T>(
+        &self,
+        what: &'static str,
+        fut: impl std::future::Future<Output = Result<T, FaucetError>>,
+    ) -> Result<T, FaucetError> {
+        self.calls
+            .call_once(what, bounded(self.config.write_timeout_secs, what, fut))
+            .await
+    }
+
     /// Make sure the target table exists before the first write (#580).
     ///
     /// Runs once per sink instance. With `create_table: true` (the default) a
@@ -766,6 +780,7 @@ impl PostgresSink {
             config,
             pool,
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -1658,6 +1673,17 @@ impl faucet_core::Sink for PostgresSink {
         self.config.batch_atomicity()
     }
 
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn connector_name(&self) -> &'static str {
         "postgres"
     }
@@ -1685,7 +1711,9 @@ impl faucet_core::Sink for PostgresSink {
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
+        self.calls
+            .call_once("cleanup_scope", self.cleanup_scope_impl(scope, seen))
+            .await
     }
 
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
@@ -1711,7 +1739,7 @@ impl faucet_core::Sink for PostgresSink {
     /// sink-instance memory, because the CLI runs begin, the writes and the
     /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "begin_overwrite", async {
+        self.guarded("begin_overwrite", async {
             let first_run =
                 self.config.create_table && !self.table_exists(&self.config.table_name).await?;
             let staging =
@@ -1771,96 +1799,98 @@ impl faucet_core::Sink for PostgresSink {
     /// preserved. Postgres runs TRUNCATE and DDL transactionally, so a failure
     /// rolls the whole swap back and the prior rows survive.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        if !self.table_exists(&self.config.table_name).await? {
-            // First run: staging holds everything; publish it as the target.
-            // A run that wrote nothing has no staging either, and leaves no table.
-            if self.table_exists(&self.staging_table_name()).await? {
+        self.calls
+            .call_once("commit_overwrite", async {
+                if !self.table_exists(&self.config.table_name).await? {
+                    // First run: staging holds everything; publish it as the target.
+                    // A run that wrote nothing has no staging either, and leaves no table.
+                    if self.table_exists(&self.staging_table_name()).await? {
+                        let staging =
+                            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+                        sqlx::query(&format!(
+                            "ALTER TABLE {staging} RENAME TO {}",
+                            quote_ident(&self.config.table_name)
+                        ))
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("postgres overwrite: publish staging: {e}"))
+                        })?;
+                    }
+                    return Ok(());
+                }
                 let staging =
                     qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-                sqlx::query(&format!(
-                    "ALTER TABLE {staging} RENAME TO {}",
-                    quote_ident(&self.config.table_name)
-                ))
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("postgres overwrite: publish staging: {e}"))
-                })?;
-            }
-            return Ok(());
-        }
-        let staging =
-            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-        let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: begin swap: {e}")))?;
-        // A scope replaces only the matching rows, and only in-scope staged
-        // rows may land: a row outside the window would duplicate one the
-        // delete never touched (#789 SQL-51).
-        let window = self
-            .config
-            .scope
-            .as_ref()
-            .map(|scope| scope.render_where_literal(&quote_ident(scope.column())));
-        let clear = match &window {
-            Some(pred) => {
-                let outside: i64 = sqlx::query_scalar(&format!(
-                    "SELECT count(*) FROM {staging} WHERE ({pred}) IS NOT TRUE"
-                ))
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("postgres overwrite: check scope: {e}")))?;
-                if outside > 0 {
-                    return Err(FaucetError::Sink(format!(
-                        "postgres overwrite: {outside} staged row(s) fall outside the overwrite \
-                         scope ({pred}); nothing was replaced. Filter the source to the window"
-                    )));
+                let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("postgres overwrite: begin swap: {e}")))?;
+                // A scope replaces only the matching rows, and only in-scope staged
+                // rows may land: a row outside the window would duplicate one the
+                // delete never touched (#789 SQL-51).
+                let window = self
+                    .config
+                    .scope
+                    .as_ref()
+                    .map(|scope| scope.render_where_literal(&quote_ident(scope.column())));
+                let clear = match &window {
+                    Some(pred) => {
+                        let outside: i64 = sqlx::query_scalar(&format!(
+                            "SELECT count(*) FROM {staging} WHERE ({pred}) IS NOT TRUE"
+                        ))
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| FaucetError::Sink(format!("postgres overwrite: check scope: {e}")))?;
+                        if outside > 0 {
+                            return Err(FaucetError::Sink(format!(
+                                "postgres overwrite: {outside} staged row(s) fall outside the overwrite \
+                                 scope ({pred}); nothing was replaced. Filter the source to the window"
+                            )));
+                        }
+                        vec![format!("DELETE FROM {target} WHERE {pred}")]
+                    }
+                    None => clear_statements(&target, &referencing_foreign_keys(&mut tx, &target).await?)?,
+                };
+                // `rollback.keep_previous`: snapshot the rows about to be replaced, in
+                // the same transaction, so a rollback can swap them back (#706).
+                if self.config.write.keeps_previous() {
+                    self.keep_previous_copy(&mut tx).await?;
                 }
-                vec![format!("DELETE FROM {target} WHERE {pred}")]
-            }
-            None => clear_statements(&target, &referencing_foreign_keys(&mut tx, &target).await?)?,
-        };
-        // `rollback.keep_previous`: snapshot the rows about to be replaced, in
-        // the same transaction, so a rollback can swap them back (#706).
-        if self.config.write.keeps_previous() {
-            self.keep_previous_copy(&mut tx).await?;
-        }
-        let roles = column_roles(&mut tx, &target).await?;
-        let staged: Vec<String> = self
-            .discover_columns(&mut tx, &staging)
-            .await?
-            .into_iter()
-            .map(|(c, _)| c)
-            .collect();
-        let copy = roles.copy_statements(&target, &staging, window.as_deref(), |c| {
-            staged.iter().any(|s| s == c)
-        });
-        let statements = clear
-            .into_iter()
-            .chain(copy)
-            .chain([format!("DROP TABLE {staging}")]);
-        for stmt in statements {
-            sqlx::query(&stmt)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("postgres overwrite swap failed: {e}")))?;
-        }
-        tx.commit()
+                let roles = column_roles(&mut tx, &target).await?;
+                let staged: Vec<String> = self
+                    .discover_columns(&mut tx, &staging)
+                    .await?
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect();
+                let copy = roles.copy_statements(&target, &staging, window.as_deref(), |c| {
+                    staged.iter().any(|s| s == c)
+                });
+                let statements = clear
+                    .into_iter()
+                    .chain(copy)
+                    .chain([format!("DROP TABLE {staging}")]);
+                for stmt in statements {
+                    sqlx::query(&stmt)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| FaucetError::Sink(format!("postgres overwrite swap failed: {e}")))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("postgres overwrite: commit swap: {e}")))?;
+                Ok(())
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: commit swap: {e}")))?;
-        Ok(())
     }
 
     /// Probe for the `<table>__faucet_ovw` staging table (read-only).
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "overwrite_staging_exists",
-            async { Ok(Some(self.table_exists(&self.staging_table_name()).await?)) },
-        )
+        self.guarded("overwrite_staging_exists", async {
+            Ok(Some(self.table_exists(&self.staging_table_name()).await?))
+        })
         .await
     }
 
@@ -1868,7 +1898,7 @@ impl faucet_core::Sink for PostgresSink {
     /// behind. Best-effort — the destination was never touched (on a first run
     /// it was never created).
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "abort_overwrite", async {
+        self.guarded("abort_overwrite", async {
             let staging =
                 qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
             let mut conn =
@@ -1899,14 +1929,14 @@ impl faucet_core::Sink for PostgresSink {
         run_id: &str,
         opts: &faucet_core::rollback::RollbackOptions,
     ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.rollback_run_impl(run_id, opts).await
+        self.calls
+            .call_once("rollback_run", self.rollback_run_impl(run_id, opts))
+            .await
     }
 
     async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "forget_run", async {
-            self.forget_run_impl(run_id).await
-        })
-        .await
+        self.guarded("forget_run", async { self.forget_run_impl(run_id).await })
+            .await
     }
 
     async fn rewind_commit_token(
@@ -1914,11 +1944,9 @@ impl faucet_core::Sink for PostgresSink {
         scope: &str,
         token: Option<&str>,
     ) -> Result<(), FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "rewind_commit_token",
-            async { self.rewind_commit_token_impl(scope, token).await },
-        )
+        self.guarded("rewind_commit_token", async {
+            self.rewind_commit_token_impl(scope, token).await
+        })
         .await
     }
 
@@ -1938,7 +1966,7 @@ impl faucet_core::Sink for PostgresSink {
     /// relation via `to_regclass`), additionally reading `a.attnotnull` so
     /// nullability round-trips through `pg_udt_to_json_schema`.
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
-        bounded(self.config.write_timeout_secs, "current_schema", async {
+        self.guarded("current_schema", async {
             // JSON-column mode stores each record whole; the physical columns are
             // not the record's fields, so there is nothing to drift against
             // (#789 SQL-20).
@@ -1992,7 +2020,7 @@ impl faucet_core::Sink for PostgresSink {
         &self,
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
-        bounded(self.config.write_timeout_secs, "evolve_schema", async {
+        self.guarded("evolve_schema", async {
             let table_ref =
                 qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
             let mut conn =
@@ -2096,12 +2124,8 @@ impl faucet_core::Sink for PostgresSink {
     /// same connection for the entire call (avoids repeated pool-checkout
     /// overhead on large batches).
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "write_batch",
-            self.write_batch_unbounded(records),
-        )
-        .await
+        self.guarded("write_batch", self.write_batch_unbounded(records))
+            .await
     }
 
     /// Write a batch and report per-row outcomes.
@@ -2116,8 +2140,7 @@ impl faucet_core::Sink for PostgresSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
+        self.guarded(
             "write_batch_partial",
             self.write_batch_partial_unbounded(records),
         )
@@ -2129,25 +2152,21 @@ impl faucet_core::Sink for PostgresSink {
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
-            "last_committed_token",
-            async {
-                self.ensure_commit_table().await?;
-                let sql = format!(
-                    "SELECT {k} FROM {t} WHERE {s} = $1",
-                    t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-                    k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-                    s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-                );
-                let row = sqlx::query(&sql)
-                    .bind(scope)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("PostgreSQL token read failed: {e}")))?;
-                Ok(row.map(|r| r.get::<String, _>(0)))
-            },
-        )
+        self.guarded("last_committed_token", async {
+            self.ensure_commit_table().await?;
+            let sql = format!(
+                "SELECT {k} FROM {t} WHERE {s} = $1",
+                t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+                k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
+                s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+            );
+            let row = sqlx::query(&sql)
+                .bind(scope)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("PostgreSQL token read failed: {e}")))?;
+            Ok(row.map(|r| r.get::<String, _>(0)))
+        })
         .await
     }
 
@@ -2157,8 +2176,7 @@ impl faucet_core::Sink for PostgresSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        bounded(
-            self.config.write_timeout_secs,
+        self.guarded(
             "write_batch_idempotent",
             self.write_batch_idempotent_unbounded(records, scope, token),
         )

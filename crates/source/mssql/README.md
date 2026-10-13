@@ -378,6 +378,10 @@ Outside the cluster coordinator the `shard` config has **no effect** — a plain
 
 Declares `discover` and `range_read` (`faucet verify` reads one integer-key range), and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every statement runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end an in-flight query, or a stalled row read, promptly, and `statement_timeout_secs` still bounds each statement and each wait for a row. A statement cut short leaves its connection mid-response, so the connection is replaced before it returns to the pool. Each query counts as one `query` round trip in `faucet_source_roundtrips_total` (`describe` for the result-shape probe). Reads are not retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

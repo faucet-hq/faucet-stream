@@ -130,3 +130,27 @@ async fn descriptor_matches_the_built_source() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A file another connection holds an exclusive lock on stands in for a
+    // hung backend (#880): the read waits on the lock.
+    let (_dir, url) = seed(3).await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            SqliteSource::new(SqliteSourceConfig::new(&url, "SELECT id FROM t"))
+                .await
+                .expect("source"),
+        );
+    }
+    let mut lock = <sqlx::SqliteConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::Executor::execute(&mut lock, "BEGIN EXCLUSIVE")
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

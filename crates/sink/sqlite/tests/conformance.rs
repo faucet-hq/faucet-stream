@@ -56,6 +56,37 @@ async fn fresh_sink() -> (TempDir, String, SqliteSink) {
     (dir, url, sink)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A file another connection holds an exclusive lock on stands in for a
+    // hung backend (#880): the write waits on the lock (busy_timeout 60 s).
+    let (_dir, url, first) = fresh_sink().await;
+    let second = SqliteSink::new(SqliteSinkConfig {
+        database_url: url.clone(),
+        table_name: "t".to_string(),
+        column_mapping: SqliteColumnMapping::AutoMap,
+        batch_size: 1000,
+        max_connections: 1,
+        create_table: true,
+        busy_timeout_secs: 60,
+        write: WriteSpec::default(),
+    })
+    .await
+    .expect("sink");
+    let mut lock = <sqlx::SqliteConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::Executor::execute(&mut lock, "BEGIN EXCLUSIVE")
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}
+
 async fn count_rows(url: &str) -> usize {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

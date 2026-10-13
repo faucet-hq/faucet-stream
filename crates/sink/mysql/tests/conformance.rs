@@ -140,3 +140,24 @@ async fn conformance_capabilities_truthful() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A table another session holds locked stands in for a hung backend (#880).
+    let (_container, _permit, url, first) = fresh_sink().await;
+    let mut cfg = MysqlSinkConfig::new(&url, "t").column_mapping(MysqlColumnMapping::AutoMap);
+    cfg.write_timeout_secs = 0;
+    let second = MysqlSink::new(cfg).await.expect("sink");
+    let mut lock = <sqlx::MySqlConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::Executor::execute(&mut lock, "LOCK TABLES t WRITE")
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}
