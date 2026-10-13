@@ -47,17 +47,16 @@ impl Notifier {
     /// Build a notifier from the config `notifications:` list. Returns `Ok(None)`
     /// when the list is empty (no overhead / no client). Validates the rules
     /// fail-fast (duplicate names, empty channel fields).
-    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     pub fn from_specs(specs: &[NotificationSpec]) -> CliResult<Option<Arc<Notifier>>> {
         if specs.is_empty() {
             return Ok(None);
         }
         validate_all(specs)?;
-        let client = reqwest::Client::builder()
+        let client = faucet_core::http::Client::builder()
             // A generous ceiling; the per-attempt `timeout` below is the real
             // bound. Never let a hung notifier wedge the process on drop.
             .timeout(DEFAULT_TIMEOUT * MAX_ATTEMPTS + Duration::from_secs(5))
-            .build()
+            .build_reqwest()
             .map_err(|e| crate::error::CliError::Internal(format!("notify http client: {e}")))?;
         Ok(Some(Arc::new(Notifier {
             rules: specs.to_vec(),
@@ -198,7 +197,6 @@ impl Notifier {
     }
 
     /// Bounded-retry, per-attempt-timeout delivery of one message.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     async fn send_with_retry(
         &self,
         rule: &NotificationSpec,
@@ -206,13 +204,15 @@ impl Notifier {
         action: PdAction,
         dedup_key: &str,
     ) -> Result<(), String> {
+        let calls = faucet_core::CallContext::new().with_timeout(self.timeout);
         let mut last = String::from("no attempt made");
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
-                tokio::time::sleep(RETRY_BACKOFF).await;
+                // No cancel token or deadline: the wait always completes.
+                let _ = calls.wait(RETRY_BACKOFF).await;
             }
             let fut = self.dispatch_once(rule, event, action, dedup_key);
-            match tokio::time::timeout(self.timeout, fut).await {
+            match calls.call_once("notify", async { Ok(fut.await) }).await {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(e)) => last = e,
                 Err(_) => last = format!("timed out after {:?}", self.timeout),
