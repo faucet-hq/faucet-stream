@@ -390,6 +390,17 @@ pub async fn build_source(
     auth: &AuthCatalog,
     retry_policy: Option<&faucet_core::RetryPolicy>,
 ) -> CliResult<Box<dyn Source>> {
+    // Boxed: the dispatch over every compiled connector makes this future
+    // large, and callers run on 2 MiB worker and test thread stacks.
+    Box::pin(build_source_inner(kind, config, auth, retry_policy)).await
+}
+
+async fn build_source_inner(
+    kind: &str,
+    config: Value,
+    auth: &AuthCatalog,
+    retry_policy: Option<&faucet_core::RetryPolicy>,
+) -> CliResult<Box<dyn Source>> {
     let config = crate::interpolate::unescaped(config);
     // Third-party connectors registered via `PluginRegistry` win first. Names
     // can never collide with a built-in (registration rejects that), so this is
@@ -748,6 +759,15 @@ pub async fn build_source(
 /// carries `auth: { ref: <name> }`, the named provider is resolved from `auth`
 /// (the catalog) and injected into the connector.
 pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliResult<Box<dyn Sink>> {
+    // Boxed for the same reason as `build_source`.
+    Box::pin(build_sink_inner(kind, config, auth)).await
+}
+
+async fn build_sink_inner(
+    kind: &str,
+    config: Value,
+    auth: &AuthCatalog,
+) -> CliResult<Box<dyn Sink>> {
     let config = crate::interpolate::unescaped(config);
     if let Some(entry) = global().sinks.get(kind) {
         reject_unknown_config_keys("sink", kind, kind, &config, &(entry.schema)())?;

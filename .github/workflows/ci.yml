@@ -13,6 +13,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-C debuginfo=0"
+  # Test threads get the stack `faucet` gives its runtime workers
+  # (`faucet_cli::RUNTIME_THREAD_STACK`): a debug build with every connector
+  # compiled in nests pipeline futures deeper than the 2 MiB default allows.
+  RUST_MIN_STACK: "8388608"
   # Harden against transient crates.io connectivity drops seen on GitHub-hosted
   # runners (`curl failed` / `SSL_read: unexpected eof` / connection reset) that
   # abort cargo during dependency download. Retry more, and disable HTTP/2

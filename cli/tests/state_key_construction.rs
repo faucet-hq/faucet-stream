@@ -40,7 +40,16 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// The part of a file before its unit-test module.
 fn non_test(text: &str) -> &str {
-    text.find("#[cfg(test)]\nmod ").map_or(text, |i| &text[..i])
+    for (i, _) in text.match_indices("#[cfg(test)]\n") {
+        let mut rest = &text[i + "#[cfg(test)]\n".len()..];
+        while rest.starts_with("#[") {
+            rest = rest.split_once('\n').map_or("", |(_, r)| r);
+        }
+        if rest.starts_with("mod ") {
+            return &text[..i];
+        }
+    }
+    text
 }
 
 /// `format!` calls whose first string literal is `s`.
@@ -180,4 +189,8 @@ fn the_scan_finds_a_raw_key() {
     assert!(looks_like_key("let state_key = x;", 1));
     assert!(!looks_like_key("let label = x;", 1));
     assert_eq!(non_test("a\n#[cfg(test)]\nmod tests {}"), "a\n");
+    assert_eq!(
+        non_test("a\n#[cfg(test)]\n#[allow(dead_code)] // why\nmod tests {}"),
+        "a\n"
+    );
 }

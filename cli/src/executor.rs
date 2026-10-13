@@ -2760,7 +2760,13 @@ async fn run_one_invocation(
     //    one (which is shared across all matrix rows of the same kind).
     let state = match prebuilt_state {
         Some(store) => Some(store),
-        None => build_state_for_node(node, opts.state_path_override.as_deref()).await?,
+        None => {
+            Box::pin(build_state_for_node(
+                node,
+                opts.state_path_override.as_deref(),
+            ))
+            .await?
+        }
     };
     // Preview modes must not persist bookmarks: the counting/truncating sinks
     // return `Ok` without a real write, so a persisted (advanced) bookmark would
@@ -2962,7 +2968,7 @@ async fn run_one_invocation(
                 && !cancel.is_cancelled() =>
         {
             let written = r.records_written as u64;
-            match crate::reconcile::run(spec, &opts.auth, written).await {
+            match Box::pin(crate::reconcile::run(spec, &opts.auth, written)).await {
                 Ok(()) => result,
                 Err(e) => Err(e),
             }
@@ -3149,7 +3155,7 @@ async fn run_one_invocation(
             },
             Err(_) => crate::sla::RunOutcome::Failure,
         };
-        let mut v = crate::sla::evaluate_post_run(
+        let mut v = Box::pin(crate::sla::evaluate_post_run(
             spec,
             sla_store.as_ref(),
             state_key,
@@ -3157,7 +3163,7 @@ async fn run_one_invocation(
             &obs_labels.row,
             outcome,
             chrono::Utc::now().timestamp(),
-        )
+        ))
         .await;
         v.extend(crate::sla::evaluate_lag_post_run(
             spec,
@@ -3179,7 +3185,7 @@ async fn run_one_invocation(
         (Some(p), Some(spec), Ok(_)) if is_notifiable_root => {
             let profile = p.lock().map(|g| g.finish()).unwrap_or_default();
             Some(
-                crate::profiling::evaluate_post_run(
+                Box::pin(crate::profiling::evaluate_post_run(
                     spec,
                     sla_store.as_ref(),
                     state_key,
@@ -3188,7 +3194,7 @@ async fn run_one_invocation(
                     &run_id,
                     profile,
                     chrono::Utc::now(),
-                )
+                ))
                 .await,
             )
         }
@@ -3362,7 +3368,7 @@ async fn run_one_invocation(
             },
             column_lineage,
         };
-        crate::catalog::record(handle, &update).await;
+        Box::pin(crate::catalog::record(handle, &update)).await;
     }
 
     // Column profile → catalog (#708): a browsable copy of this run's profile
@@ -3386,7 +3392,12 @@ async fn run_one_invocation(
             drift: o.drift.clone(),
             baseline_runs: o.baseline_runs,
         };
-        crate::catalog::record_profile(handle, &dataset_id(&uri), &record).await;
+        Box::pin(crate::catalog::record_profile(
+            handle,
+            &dataset_id(&uri),
+            &record,
+        ))
+        .await;
     }
 
     // Local sink outputs (#587): record the concrete files this invocation's
