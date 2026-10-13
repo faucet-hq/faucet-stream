@@ -29,5 +29,5 @@ pub use lines::{
 };
 pub use message::{SingerMessage, parse_line};
 pub use redact::{Redactor, secret_like_values};
-pub use spawn::spawn_command;
+pub use spawn::{spawn_command, spawn_command_in};
 pub use temp::write_private_json;

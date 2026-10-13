@@ -27,6 +27,8 @@ use crate::config::{MalformedPolicy, SingerSourceConfig};
 use crate::message::SingerMessage;
 use crate::process::{Line, Recv, TapProcess};
 
+use faucet_core::CallExt as _;
+
 /// A source that runs a Singer tap and adapts its output into faucet records.
 ///
 /// **Tier-2 / experimental.** This reintroduces a runtime (usually Python)
@@ -38,6 +40,9 @@ pub struct SingerSource {
     /// Resume bookmark (the last persisted STATE `value`), injected by the
     /// pipeline via [`apply_start_bookmark`](Source::apply_start_bookmark).
     start_bookmark: Mutex<Option<Value>>,
+    /// Backend-call context (#880): every read of the tap's output waits
+    /// through it, so the run's cancel token and deadline stop the tap.
+    calls: faucet_core::CallSlot,
 }
 
 impl SingerSource {
@@ -46,6 +51,11 @@ impl SingerSource {
         Self {
             config,
             start_bookmark: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .with_roundtrip_metering(false),
+            ),
         }
     }
 }
@@ -88,8 +98,17 @@ impl Source for SingerSource {
                 assembler = assembler.with_alias(alias);
             }
 
+            let reads = self.calls.get();
             loop {
-                match process.recv(idle).await {
+                let received = match process.recv(idle).within_ctx(&reads, "read").await {
+                    Ok(received) => received,
+                    Err(spent) => {
+                        process.shutdown().await;
+                        Err(spent)?;
+                        return;
+                    }
+                };
+                match received {
                     Recv::Line(Line::Parsed(msg)) => match msg {
                         SingerMessage::Record { stream, record } => {
                             if let Some(page) = assembler.on_record(&stream, record) {
@@ -163,6 +182,17 @@ impl Source for SingerSource {
 
     fn connector_name(&self) -> &'static str {
         "singer"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn state_key(&self) -> Option<String> {

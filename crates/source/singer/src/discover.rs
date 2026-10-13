@@ -38,7 +38,12 @@ pub async fn discover(config: &SingerSourceConfig) -> Result<Value, FaucetError>
             redactor.redact(&config.executable)
         ))
     };
-    let child = faucet_common_singer::spawn_command(&mut command).map_err(spawn_err)?;
+    let child = faucet_common_singer::spawn_command_in(
+        &mut command,
+        &faucet_core::CallContext::new().without_timeout(),
+    )
+    .await
+    .map_err(spawn_err)?;
     let run = child.wait_with_output();
     let output = match config.idle_timeout_secs {
         Some(secs) => tokio::time::timeout(std::time::Duration::from_secs(secs), run)

@@ -55,6 +55,9 @@ pub struct SingerSink {
     redactor: Redactor,
     inner: Mutex<Inner>,
     version: OnceLock<i64>,
+    /// Backend-call context (#880): every write to the target and every wait
+    /// for its confirmation run through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 #[derive(Default)]
@@ -96,6 +99,11 @@ impl SingerSink {
             config,
             inner: Mutex::new(Inner::default()),
             version: OnceLock::new(),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -262,7 +270,10 @@ impl Sink for SingerSink {
         let earlier = inner.unconfirmed_pages;
         inner.interrupted = true;
         inner.unconfirmed_pages += 1;
-        let result = self.write_page(&mut inner, records).await;
+        let result = self
+            .calls
+            .call_once("write", self.write_page(&mut inner, records))
+            .await;
         inner.interrupted = false;
         if let Err(e) = result {
             self.stop(&mut inner).await;
@@ -277,7 +288,10 @@ impl Sink for SingerSink {
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
-        let result = self.confirm(&mut inner).await;
+        let result = self
+            .calls
+            .call_once("confirm", self.confirm(&mut inner))
+            .await;
         if let Err(e) = &result {
             inner.sent_schema = None;
             inner.poison(e);
@@ -317,7 +331,11 @@ impl Sink for SingerSink {
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
-        if let Err(e) = self.confirm(&mut inner).await {
+        if let Err(e) = self
+            .calls
+            .call_once("confirm", self.confirm(&mut inner))
+            .await
+        {
             inner.poison(&e);
             return Err(e);
         }
@@ -345,9 +363,12 @@ impl Sink for SingerSink {
         write_activate_version(&mut buf, stream, self.activate_version());
         inner.flush_seq += 1;
         write_state(&mut buf, &flush_marker(stream, inner.flush_seq));
-        process.write(&buf).await?;
-        process
-            .finish_confirmed(inner.flush_seq, self.timeout())
+        let seq = inner.flush_seq;
+        self.calls
+            .call_once("confirm", async {
+                process.write(&buf).await?;
+                process.finish_confirmed(seq, self.timeout()).await
+            })
             .await
     }
 
@@ -366,6 +387,17 @@ impl Sink for SingerSink {
 
     fn connector_name(&self) -> &'static str {
         "singer"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
