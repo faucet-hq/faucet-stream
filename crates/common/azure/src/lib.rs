@@ -9,6 +9,10 @@
 //! both directions. ADLS Gen2 and classic Blob share the same
 //! `MicrosoftAzureBuilder`, so a single code path serves both.
 
+mod backend;
+
+pub use backend::{AzureBackend, AzureBackendBuilder, PART_BYTES};
+
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;

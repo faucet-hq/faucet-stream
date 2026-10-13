@@ -4994,11 +4994,17 @@ dependencies = [
 name = "faucet-common-azure"
 version = "1.1.1"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "faucet-common-file",
  "faucet-core",
+ "futures",
  "object_store",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -5542,10 +5548,8 @@ name = "faucet-sink-azure-blob"
 version = "1.1.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "azure_storage",
  "azure_storage_blobs",
- "bytes",
  "faucet-common-azure",
  "faucet-common-file",
  "faucet-conformance",
@@ -5559,8 +5563,6 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
- "tracing",
- "uuid",
  "wiremock",
 ]
 
