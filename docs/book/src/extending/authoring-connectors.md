@@ -92,6 +92,75 @@ name — it is the `connector` metric label) and `dataset_uri` (the lineage
 identity; credential-free — `faucet_core::redact_uri_credentials` strips
 userinfo from a URL).
 
+### Wrapping another connector
+
+A **wrapper** holds an inner source or sink and changes part of its behaviour:
+it stamps a column, caps the row count, samples records, overrides the state
+key. Every hook the wrapper does not define falls back to its trait default,
+which turns the feature behind it off for everything the wrapper holds:
+exactly-once, upsert, the columnar fast path, multi-table routing. Don't write
+the pass-throughs by hand. `forward_source!` / `forward_sink!` generate the
+forwarding body of every hook, so you write only the hooks you change, and a
+hook added to the trait in a later release reaches the inner connector without
+any change to your wrapper:
+
+```rust,ignore
+use faucet_core::{async_trait, forward_sink, FaucetError, Sink, Value};
+
+struct Counted {
+    inner: Box<dyn Sink>,
+    rows: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Sink for Counted {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        let n = self.inner.write_batch(records).await?;
+        self.rows.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+    // The other write paths must be counted too, so they take the trait
+    // default (which calls `write_batch` above) instead of being forwarded.
+    forward_sink!(inner; except write_batch, write_batch_partial,
+        write_batch_idempotent, supports_idempotent_writes,
+        supports_columnar, write_batch_columnar,
+        native_load_capabilities, load_native);
+}
+```
+
+The list after `except` is exact. A name that is not a hook of the trait does
+not compile, and a hook you define without listing it is a duplicate
+definition. A listed hook you don't define takes the trait default, which is
+how you switch a path off.
+
+Forwarding is verbatim. That includes the convenience hooks whose default calls
+another hook (`fetch_all`, `stream_pages`, `check`, `write_batch_partial`,
+`write_batch_idempotent`). If your wrapper changes a hook, list the other hooks
+that must go through the change rather than straight to the inner connector.
+
+Then prove it with the forwarding harness from `faucet-conformance`.
+`HookSource` / `HookSink` answer every hook differently from the default and
+record which hooks were reached. The assertion calls every hook through your
+wrapper and names any that never got to the inner connector, except the ones
+you list as deliberately not forwarded:
+
+```rust,ignore
+use faucet_conformance::forwarding::{HookSink, assert_sink_forwards_every_hook};
+
+#[tokio::test]
+async fn counted_forwards_every_hook_it_does_not_count() {
+    let probe = HookSink::default();
+    let wrapped = Counted { inner: Box::new(probe.clone()), rows: Default::default() };
+    assert_sink_forwards_every_hook(
+        &wrapped,
+        &probe,
+        &["supports_idempotent_writes", "supports_columnar", "write_batch_columnar",
+          "native_load_capabilities", "load_native"],
+    )
+    .await;
+}
+```
+
 ## Crate layout
 
 Follow the same module layout as the built-in connectors:

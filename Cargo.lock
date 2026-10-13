@@ -4829,6 +4829,7 @@ dependencies = [
 name = "faucet-cli"
 version = "1.13.3"
 dependencies = [
+ "arrow 58.3.0",
  "assert_cmd",
  "async-stream",
  "async-trait",
@@ -5356,6 +5357,7 @@ dependencies = [
 name = "faucet-conformance"
 version = "1.4.0"
 dependencies = [
+ "arrow 58.3.0",
  "async-stream",
  "async-trait",
  "faucet-core",
@@ -5496,6 +5498,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-trait",
  "chrono",
+ "faucet-conformance",
  "faucet-core",
  "futures",
  "indexmap 2.14.0",

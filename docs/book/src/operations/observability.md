@@ -128,7 +128,9 @@ metrics for `faucet schedule` and `faucet serve`.
 
 - **Drop-guard timers** sample durations even when a task is cancelled.
 - **Panic isolation** — a panicking connector surfaces as a `Panic` error kind
-  rather than crashing the process.
+  rather than crashing the process, on the row path and on the columnar and
+  native fast paths alike: a panic while writing an Arrow batch, loading native
+  bytes, or opening or polling a fast-path stream fails that run only.
 - **Idempotent install** — installing the recorder/subscriber twice warns rather
   than panics.
 

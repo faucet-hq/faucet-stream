@@ -31,7 +31,6 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -371,6 +370,12 @@ impl Drop for BudgetTimer {
 
 #[async_trait]
 impl Sink for BudgetSink {
+    // A native byte load cannot be counted before it lands, so it stays off;
+    // everything else reaches the wrapped sink.
+    crate::forward_sink!(inner; except
+        admit_page, write_batch, write_batch_partial, write_batch_idempotent, write_batch_columnar,
+        native_load_capabilities, load_native);
+
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
         if let Some(v) = self.state.verdict() {
             return Err(v.error());
@@ -406,124 +411,6 @@ impl Sink for BudgetSink {
             .await?;
         self.account(n as u64, bytes);
         Ok(n)
-    }
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    async fn local_outputs(&self) -> Vec<crate::local_outputs::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-    fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-    fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
-        &self,
-        evolution: &crate::drift::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    fn supports_staged_load(&self) -> bool {
-        self.inner.supports_staged_load()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &BTreeMap<String, Value>,
-        seen: &crate::cleanup::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &crate::rollback::RollbackOptions,
-    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-    fn set_roundtrip_recorder(&self, recorder: Arc<crate::observability::RoundtripRecorder>) {
-        self.inner.set_roundtrip_recorder(recorder)
-    }
-    async fn check(
-        &self,
-        ctx: &crate::check::CheckContext,
-    ) -> Result<crate::check::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
-    }
-    // Columnar and native pages are admitted by row count only (their byte
-    // size is the batch's, not a JSON estimate); a `max_bytes` budget makes
-    // the executor take the row path, so this is the records ceiling.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
     }
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(
@@ -719,7 +606,10 @@ mod tests {
         assert!(!sink.supports_cleanup());
         assert!(!sink.supports_staged_load());
         let _ = sink
-            .cleanup_scope(&BTreeMap::new(), &crate::cleanup::SeenKeys::new())
+            .cleanup_scope(
+                &std::collections::BTreeMap::new(),
+                &crate::cleanup::SeenKeys::new(),
+            )
             .await;
         assert!(!sink.is_overwrite());
         let _ = sink.begin_overwrite().await;
@@ -982,13 +872,13 @@ mod tests {
 
     #[tokio::test]
     async fn budget_sink_forwards_every_hook_but_native() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let (sink, _s, _t) = BudgetSink::wrap(
             Box::new(probe.clone()),
             BudgetSpec::default(),
             CancellationToken::new(),
         );
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &sink,
             &probe,
             &["native_load_capabilities", "load_native"],
