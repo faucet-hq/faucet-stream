@@ -643,7 +643,7 @@ mod tests {
             integer_text("x").unwrap_err().to_string(),
             "\"x\" is not an integer"
         );
-        assert!(MAX_SAFE_INTEGER == 9_007_199_254_740_991);
+        const { assert!(MAX_SAFE_INTEGER == 9_007_199_254_740_991) };
     }
 
     #[test]

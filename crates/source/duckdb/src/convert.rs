@@ -107,7 +107,7 @@ pub(crate) fn array_to_values(array: &ArrayRef, duck_type: &str) -> Result<Vec<V
         DataType::Float32 => prim::<Float32Type, _>(array, f32_value),
         DataType::Float64 => prim::<Float64Type, _>(array, f64_value),
         DataType::Decimal128(_, 0) if duck_type.eq_ignore_ascii_case("HUGEINT") => {
-            prim::<Decimal128Type, _>(array, |v| faucet_core::fidelity::integer_i128(v))
+            prim::<Decimal128Type, _>(array, faucet_core::fidelity::integer_i128)
         }
         DataType::Decimal128(..) => {
             let a = array.as_primitive::<Decimal128Type>();
