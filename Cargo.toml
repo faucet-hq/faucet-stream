@@ -19,6 +19,7 @@ members = [
     "crates/common/pubsub",
     "crates/common/clickhouse",
     "crates/common/azure",
+    "crates/common/s3",
     "crates/source/rest",
     "crates/source/singer",
     "crates/common/singer",
@@ -227,6 +228,7 @@ faucet-common-clickhouse = { path = "crates/common/clickhouse", version = "1" }
 faucet-source-clickhouse = { path = "crates/source/clickhouse", version = "1" }
 faucet-sink-clickhouse = { path = "crates/sink/clickhouse", version = "1" }
 faucet-common-azure = { path = "crates/common/azure", version = "1" }
+faucet-common-s3 = { path = "crates/common/s3", version = "1" }
 faucet-source-azure-blob = { path = "crates/source/azure-blob", version = "1" }
 faucet-sink-azure-blob = { path = "crates/sink/azure-blob", version = "1" }
 faucet-source-duckdb = { path = "crates/source/duckdb", version = "1" }

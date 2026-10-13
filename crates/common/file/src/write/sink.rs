@@ -1,10 +1,13 @@
-//! [`WriterSink`]: the one `Sink` implementation over a [`FileWriter`],
-//! shared by every file-writing sink. A connector supplies only what is its
-//! own — its name, config schema, dataset URI and preflight probe — through
+//! [`FileSink`]: the one `Sink` implementation over a [`FileWriter`],
+//! shared by every file-writing sink and generic over the
+//! [`StorageBackend`] it writes to. A connector supplies only what is its
+//! own — its name, config schema, dataset URI and readback source — through
 //! [`SinkIdentity`], and forwards its `Sink` impl with
 //! [`delegate_sink!`](crate::delegate_sink).
 
-use super::writer::FileWriter;
+use super::backend::StorageBackend;
+use super::layout::NameTemplate;
+use super::writer::{FileWriter, WriteSettings};
 use faucet_core::check::{CheckContext, CheckReport};
 use faucet_core::observability::RoundtripRecorder;
 use faucet_core::{Capabilities, FaucetError, FileFormat, SchemaReport, Sink, WriteMode};
@@ -23,7 +26,8 @@ pub trait SinkIdentity: Send + Sync {
     fn config_schema(&self) -> Value;
     /// The dataset the sink writes, for lineage.
     fn dataset_uri(&self) -> String;
-    /// A non-mutating preflight probe. Default: not implemented.
+    /// A non-mutating preflight probe, used when the backend has none.
+    /// Default: not implemented.
     async fn check(&self, _ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
         Ok(CheckReport::not_implemented())
     }
@@ -31,36 +35,73 @@ pub trait SinkIdentity: Send + Sync {
     fn readback_source(&self) -> Option<(String, Value)> {
         None
     }
-    /// Install the round-trip recorder the connector's client reports to.
-    /// Default: the connector counts nothing.
+    /// Install the round-trip recorder the connector's client reports to,
+    /// beside the backend's. Default: the connector counts nothing.
     fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {}
     /// Install the run's call context (#880) the connector's requests run
-    /// through. Default: the connector has no backend calls.
+    /// through, beside the backend's. Default: the connector has no calls of
+    /// its own.
     fn set_call_context(&self, _ctx: faucet_core::io::CallContext) {}
 }
 
-/// A [`Sink`] over a [`FileWriter`]: batch writes, flush, the overwrite
-/// lifecycle, the end-of-run prune and the columnar path, in one place.
+/// The one [`Sink`] over a [`FileWriter`], generic over the storage it
+/// writes to (RFC 0013, #886): batch writes, flush, the overwrite lifecycle,
+/// the end-of-run prune and the columnar path, in one place. The local file
+/// sink is a `FileSink<LocalBackend>`; the S3, GCS, Azure Blob and SFTP
+/// sinks are `FileSink`s over their stores' backends.
+///
+/// Requests the backend makes run through the run's call context and report
+/// to its round-trip recorder ([`StorageBackend::set_call_context`],
+/// [`StorageBackend::set_roundtrip_recorder`]); the preflight probe is the
+/// backend's ([`StorageBackend::check`]) and falls back to the identity's.
 ///
 /// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
 /// minor release; any change is called out in the changelog.
-pub struct WriterSink {
+pub struct FileSink<B: StorageBackend + ?Sized + 'static = dyn StorageBackend> {
     writer: FileWriter,
+    backend: Arc<B>,
     identity: Box<dyn SinkIdentity>,
 }
 
-impl WriterSink {
-    /// A sink writing through `writer`, described by `identity`.
-    pub fn new(writer: FileWriter, identity: impl SinkIdentity + 'static) -> Self {
+impl<B: StorageBackend + 'static> FileSink<B> {
+    /// A sink writing `settings` / `template` to `backend`, described by
+    /// `identity`.
+    pub fn build(
+        settings: WriteSettings,
+        template: NameTemplate,
+        backend: Arc<B>,
+        identity: impl SinkIdentity + 'static,
+    ) -> Result<Self, FaucetError> {
+        let dynamic: Arc<dyn StorageBackend> = backend.clone();
+        let writer = FileWriter::new(settings, template, dynamic)?;
+        Ok(Self {
+            writer,
+            backend,
+            identity: Box::new(identity),
+        })
+    }
+}
+
+impl FileSink<dyn StorageBackend> {
+    /// A sink over an already-built `writer`, described by `identity`.
+    pub fn from_writer(writer: FileWriter, identity: impl SinkIdentity + 'static) -> Self {
         Self {
+            backend: writer.backend().clone(),
             writer,
             identity: Box::new(identity),
         }
     }
+}
 
+impl<B: StorageBackend + ?Sized + 'static> FileSink<B> {
     /// The writer.
     pub fn writer(&self) -> &FileWriter {
         &self.writer
+    }
+
+    /// The storage backend.
+    pub fn backend(&self) -> &Arc<B> {
+        &self.backend
     }
 
     /// The format the output is written in.
@@ -70,7 +111,7 @@ impl WriterSink {
 }
 
 #[faucet_core::async_trait]
-impl Sink for WriterSink {
+impl<B: StorageBackend + ?Sized + 'static> Sink for FileSink<B> {
     fn connector_name(&self) -> &'static str {
         self.identity.connector_name()
     }
@@ -84,15 +125,20 @@ impl Sink for WriterSink {
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.backend.set_roundtrip_recorder(recorder.clone());
         self.identity.set_roundtrip_recorder(recorder);
     }
 
     fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.backend.set_call_context(ctx.clone());
         self.identity.set_call_context(ctx);
     }
 
     async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
-        self.identity.check(ctx).await
+        match self.backend.check(ctx).await? {
+            Some(report) => Ok(report),
+            None => self.identity.check(ctx).await,
+        }
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
@@ -188,110 +234,48 @@ impl Sink for WriterSink {
     }
 }
 
+/// A [`FileSink`] whose backend type is not named, built from a writer.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+pub struct WriterSink {
+    inner: FileSink,
+}
+
+impl WriterSink {
+    /// A sink writing through `writer`, described by `identity`.
+    pub fn new(writer: FileWriter, identity: impl SinkIdentity + 'static) -> Self {
+        Self {
+            inner: FileSink::from_writer(writer, identity),
+        }
+    }
+
+    /// The writer.
+    pub fn writer(&self) -> &FileWriter {
+        self.inner.writer()
+    }
+
+    /// The format the output is written in.
+    pub fn format(&self) -> FileFormat {
+        self.inner.format()
+    }
+}
+
+#[faucet_core::async_trait]
+impl Sink for WriterSink {
+    faucet_core::forward_sink!(inner);
+}
+
 /// Implement `Sink` for a connector type by forwarding every method to its
-/// [`WriterSink`] field: `delegate_sink!(S3Sink, inner);`. The columnar
-/// methods are forwarded when the calling crate's `arrow` feature is on.
+/// [`FileSink`] (or [`WriterSink`]) field: `delegate_sink!(S3Sink, inner);`.
+/// Every hook is forwarded ([`faucet_core::forward_sink!`]), so a hook the
+/// trait gains later reaches the shared sink without touching the connector.
 #[macro_export]
 macro_rules! delegate_sink {
     ($ty:ty, $field:ident) => {
         #[$crate::__private::async_trait]
         impl $crate::__private::Sink for $ty {
-            fn connector_name(&self) -> &'static str {
-                $crate::__private::Sink::connector_name(&self.$field)
-            }
-            fn config_schema(&self) -> $crate::__private::Value {
-                $crate::__private::Sink::config_schema(&self.$field)
-            }
-            fn dataset_uri(&self) -> ::std::string::String {
-                $crate::__private::Sink::dataset_uri(&self.$field)
-            }
-            fn set_roundtrip_recorder(
-                &self,
-                recorder: ::std::sync::Arc<$crate::__private::RoundtripRecorder>,
-            ) {
-                $crate::__private::Sink::set_roundtrip_recorder(&self.$field, recorder)
-            }
-            fn set_call_context(&self, ctx: $crate::__private::CallContext) {
-                $crate::__private::Sink::set_call_context(&self.$field, ctx)
-            }
-            async fn check(
-                &self,
-                ctx: &$crate::__private::CheckContext,
-            ) -> ::std::result::Result<$crate::__private::CheckReport, $crate::__private::FaucetError>
-            {
-                $crate::__private::Sink::check(&self.$field, ctx).await
-            }
-            fn readback_source(
-                &self,
-            ) -> ::std::option::Option<(::std::string::String, $crate::__private::Value)> {
-                $crate::__private::Sink::readback_source(&self.$field)
-            }
-            fn batch_atomicity(&self) -> $crate::__private::BatchAtomicity {
-                $crate::__private::Sink::batch_atomicity(&self.$field)
-            }
-            fn supported_write_modes(&self) -> &'static [$crate::__private::WriteMode] {
-                $crate::__private::Sink::supported_write_modes(&self.$field)
-            }
-            fn capabilities(&self) -> $crate::__private::Capabilities {
-                let caps = $crate::__private::Sink::capabilities(&self.$field);
-                if cfg!(feature = "arrow") {
-                    caps
-                } else {
-                    caps.to_builder().columnar(false).build()
-                }
-            }
-            fn is_overwrite(&self) -> bool {
-                $crate::__private::Sink::is_overwrite(&self.$field)
-            }
-            async fn begin_overwrite(
-                &self,
-            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
-                $crate::__private::Sink::begin_overwrite(&self.$field).await
-            }
-            async fn commit_overwrite(
-                &self,
-            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
-                $crate::__private::Sink::commit_overwrite(&self.$field).await
-            }
-            async fn abort_overwrite(
-                &self,
-            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
-                $crate::__private::Sink::abort_overwrite(&self.$field).await
-            }
-            async fn overwrite_staging_exists(
-                &self,
-            ) -> ::std::result::Result<::std::option::Option<bool>, $crate::__private::FaucetError>
-            {
-                $crate::__private::Sink::overwrite_staging_exists(&self.$field).await
-            }
-            async fn complete_run(
-                &self,
-            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
-                $crate::__private::Sink::complete_run(&self.$field).await
-            }
-            async fn local_outputs(&self) -> ::std::vec::Vec<$crate::__private::LocalOutput> {
-                $crate::__private::Sink::local_outputs(&self.$field).await
-            }
-            async fn write_batch(
-                &self,
-                records: &[$crate::__private::Value],
-            ) -> ::std::result::Result<usize, $crate::__private::FaucetError> {
-                $crate::__private::Sink::write_batch(&self.$field, records).await
-            }
-            async fn flush(&self) -> ::std::result::Result<(), $crate::__private::FaucetError> {
-                $crate::__private::Sink::flush(&self.$field).await
-            }
-            #[cfg(feature = "arrow")]
-            fn supports_columnar(&self) -> bool {
-                $crate::__private::Sink::supports_columnar(&self.$field)
-            }
-            #[cfg(feature = "arrow")]
-            async fn write_batch_columnar(
-                &self,
-                batch: &::arrow::array::RecordBatch,
-            ) -> ::std::result::Result<usize, $crate::__private::FaucetError> {
-                $crate::__private::Sink::write_batch_columnar(&self.$field, batch).await
-            }
+            $crate::__private::forward_sink!($field);
         }
     };
 }

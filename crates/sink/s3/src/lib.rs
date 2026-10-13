@@ -12,7 +12,6 @@ mod descriptor;
 pub use descriptor::DESCRIPTOR;
 
 pub mod config;
-mod object;
 pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};

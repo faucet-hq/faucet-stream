@@ -13,16 +13,11 @@ categories.workspace = true
 [dependencies]
 faucet-core.workspace = true
 faucet-common-file.workspace = true
+faucet-common-s3.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-async-trait.workspace = true
-tracing.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
 aws-sdk-s3 = { workspace = true }
-aws-config = { workspace = true }
-uuid.workspace = true
-futures.workspace = true
 # Arrow columnar path (opt-in `arrow` feature, RFC 0002 / #375): encode Arrow
 # `RecordBatch`es to Parquet objects for the row + columnar lanes. Optional so
 # default builds pull neither `parquet` nor `arrow`.

@@ -5275,6 +5275,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-common-s3"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "faucet-common-file",
+ "faucet-core",
+ "futures",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "faucet-common-sftp"
 version = "1.0.8"
 dependencies = [
@@ -6089,11 +6105,11 @@ name = "faucet-sink-s3"
 version = "1.5.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "aws-config",
  "aws-sdk-s3",
  "bytes",
  "faucet-common-file",
+ "faucet-common-s3",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -6105,8 +6121,6 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
- "tracing",
- "uuid",
  "wiremock",
 ]
 
