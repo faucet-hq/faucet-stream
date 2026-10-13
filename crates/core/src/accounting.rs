@@ -367,9 +367,11 @@ mod tests {
             s.summary_line(),
             "rows: offered 10, accepted 9, quarantined 1, filtered by transforms 2"
         );
-        let mut expanded = RowAccountsSnapshot::default();
-        expanded.transform_in = 1;
-        expanded.transform_out = 3;
+        let expanded = RowAccountsSnapshot {
+            transform_in: 1,
+            transform_out: 3,
+            ..Default::default()
+        };
         assert_eq!(expanded.filtered(), 0);
     }
 }
