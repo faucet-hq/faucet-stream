@@ -5340,6 +5340,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-common-sql"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "faucet-common-sqs"
 version = "1.1.1"
 dependencies = [
