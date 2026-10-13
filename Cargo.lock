@@ -5019,6 +5019,7 @@ dependencies = [
 name = "faucet-common-clickhouse"
 version = "1.1.1"
 dependencies = [
+ "faucet-common-sql",
  "faucet-core",
  "reqwest 0.13.3",
  "schemars 1.2.1",
@@ -5220,6 +5221,7 @@ version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "faucet-common-sql",
  "faucet-core",
  "oracle",
  "schemars 1.2.1",
@@ -5563,6 +5565,7 @@ dependencies = [
  "bytes",
  "faucet-common-bigquery",
  "faucet-common-gcs",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "flate2",
@@ -5587,6 +5590,7 @@ version = "1.2.1"
 dependencies = [
  "async-trait",
  "faucet-common-clickhouse",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "object_store",
@@ -5625,6 +5629,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "faucet-common-databricks",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -5666,6 +5671,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "duckdb",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "schemars 1.2.1",
@@ -5966,6 +5972,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "faucet-common-oracle",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "schemars 1.2.1",
@@ -6084,6 +6091,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "faucet-common-redshift",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "schemars 1.2.1",
@@ -6171,6 +6179,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "faucet-common-snowflake",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "object_store",
