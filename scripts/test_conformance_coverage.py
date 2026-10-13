@@ -111,6 +111,13 @@ class CoverageTest(unittest.TestCase):
         r.crate("sink", "x", "", ALL_SINK_CALLS + "// assert_idempotent_replay(&s, c).await;")
         self.assertEqual(len(r.check()), 1)
 
+    def test_interop_conformance_file_counts(self):
+        r = self.repo(sinks={"x-y": sink_caps(idempotent_writes=True)})
+        r.crate("sink", "x-y", "", ALL_SINK_CALLS)
+        self.assertEqual(len(r.check()), 1)
+        r.write("crates/interop-tests/tests/x_y_sink_conformance.rs", "assert_idempotent_replay(&s, c).await;")
+        self.assertEqual(r.check(), [])
+
     def test_turbofish_call_counts(self):
         r = self.repo(sinks={"x": sink_caps(idempotent_writes=True)})
         r.crate("sink", "x", "", ALL_SINK_CALLS + "assert_idempotent_replay::<X, _, _>(&s, c).await;")

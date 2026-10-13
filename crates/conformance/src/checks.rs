@@ -218,8 +218,14 @@ pub async fn assert_batch_atomicity_truthful<S, F, Fut>(
     let before = distinct_count().await;
     match declared {
         BatchAtomicity::Atomic => {
-            let outcome = sink.write_batch(poison_page).await;
-            let _ = sink.flush().await;
+            // A buffering sink reports the failure when it flushes.
+            let outcome = match sink.write_batch(poison_page).await {
+                Ok(_) => sink.flush().await,
+                Err(e) => {
+                    let _ = sink.flush().await;
+                    Err(e)
+                }
+            };
             assert!(
                 outcome.is_err(),
                 "[{label}] the poison page was written without error — it must hold a row \

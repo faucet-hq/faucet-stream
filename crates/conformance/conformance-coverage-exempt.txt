@@ -22,3 +22,20 @@ faucet-sink-mysql descriptor: eager connection pool in new(); pinned by src/desc
 faucet-sink-mssql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
 faucet-sink-oracle descriptor: connects in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
 faucet-sink-redis descriptor: the connection manager opens in new(); pinned by src/descriptor.rs unit tests
+
+# The Singer target bridge forwards `key_properties` and `ACTIVATE_VERSION` to an
+# external target: whether rows converge by key, or stay hidden until the
+# version is activated, is that target's behaviour, not the bridge's. The sink
+# declares neither keyed_upsert nor keyed dedup for that reason.
+faucet-sink-singer keyed_write_modes: upsert passes key_properties to an external target; convergence is the target's, which the bridge cannot vouch for (it declares no keyed_upsert)
+faucet-sink-singer overwrite: ACTIVATE_VERSION makes the target drop older versions at commit; rows of the new version are visible as the target loads them, so staging is the target's
+
+# Warehouse sinks without an emulator are tested against a wiremock fake of
+# their statements API. The fake applies appends and keeps the watermark, which
+# proves the sink's side of exactly-once and per-row outcomes; key
+# convergence, MERGE and INSERT OVERWRITE semantics are the warehouse's own, so
+# a fake would only test itself. Their SQL is pinned by the src/sql.rs unit
+# tests instead.
+faucet-sink-databricks keyed_write_modes: MERGE semantics are the warehouse's (no emulator); the MERGE text is pinned by src/sql.rs unit tests and the fake-warehouse tests in tests/integration.rs
+faucet-sink-databricks replay_safe: a replayed MERGE converges by the warehouse's key semantics (no emulator); the statement is sent as Replay::Safe only for MERGE and REPLACE WHERE, pinned by tests/integration.rs
+faucet-sink-databricks overwrite: staging and INSERT OVERWRITE run in the warehouse (no emulator); the lifecycle statements are pinned by tests/integration.rs

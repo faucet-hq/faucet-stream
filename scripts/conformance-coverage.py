@@ -7,8 +7,11 @@ from the committed snapshot `crates/conformance/declared-capabilities.json`
 (kept fresh by `cli/tests/declared_capabilities.rs` in the Test job, so this
 job builds no Rust). It then reads each connector crate's `src/` for the
 declarations a descriptor does not carry (trait-method overrides, a buffering
-`flush`, a declared `BatchAtomicity`) and its `tests/conformance.rs` for
-assertion calls.
+`flush`, a declared `BatchAtomicity`) and its conformance tests for assertion
+calls: the crate's `tests/conformance.rs`, plus
+`crates/interop-tests/tests/<kind>_conformance.rs` /
+`<kind>_<role>_conformance.rs` for checks that need a second connector (a sink
+counted back through its source).
 
 A requirement applies to a connector when any of its triggers holds:
   always                 every connector of the role
@@ -18,7 +21,7 @@ A requirement applies to a connector when any of its triggers holds:
   buffered_flush         the crate defines an `async fn flush` whose body is
                          more than `Ok(())`, or uses `faucet_common_file::delegate_sink!`
   declares <variant>     the crate's non-test `src/` names `BatchAtomicity::<variant>`
-and is met when `tests/conformance.rs` calls any of its assertions.
+and is met when one of those test files calls any of its assertions.
 
 Exemptions: `crates/conformance/conformance-coverage-exempt.txt`, one
 `<crate> <requirement-id>: <reason>` per line; the `call_deadline` requirement
@@ -37,6 +40,7 @@ import sys
 SNAPSHOT = "crates/conformance/declared-capabilities.json"
 EXEMPT = "crates/conformance/conformance-coverage-exempt.txt"
 CALL_EXEMPT = "crates/conformance/call-deadline-exempt.txt"
+INTEROP = "crates/interop-tests/tests"
 ROLE_DIRS = {"sources": ("source", "crates/source"), "sinks": ("sink", "crates/sink")}
 
 
@@ -150,11 +154,16 @@ def check(root="."):
             crate = crate_name(crate_dir)
             known.add(crate)
             src = crate_sources(crate_dir)
-            test_path = os.path.join(crate_dir, "tests", "conformance.rs")
+            stem = kind.replace("-", "_")
             test_src = ""
-            if os.path.exists(test_path):
-                with open(test_path, encoding="utf-8") as fh:
-                    test_src = strip_comments(fh.read())
+            for test_path in (
+                os.path.join(crate_dir, "tests", "conformance.rs"),
+                os.path.join(root, INTEROP, f"{stem}_conformance.rs"),
+                os.path.join(root, INTEROP, f"{stem}_{role}_conformance.rs"),
+            ):
+                if os.path.exists(test_path):
+                    with open(test_path, encoding="utf-8") as fh:
+                        test_src += strip_comments(fh.read())
             for req in reqs:
                 if not any(applies(t, caps, src) for t in req["triggers"]):
                     continue
@@ -165,14 +174,14 @@ def check(root="."):
                     used.add(key)
                     if met:
                         errors.append(
-                            f"{crate} {req['id']}: exempt, but tests/conformance.rs already calls "
+                            f"{crate} {req['id']}: exempt, but its conformance tests already call "
                             f"{' / '.join(req['assertions'])} — remove the exemption"
                         )
                     continue
                 if not met:
                     errors.append(
                         f"{crate} declares `{req['id']}` ({req['summary']}) but "
-                        f"{base}/{kind}/tests/conformance.rs calls none of: {', '.join(req['assertions'])}"
+                        f"its conformance tests call none of: {', '.join(req['assertions'])}"
                     )
 
     for key, _reason in sorted(exemptions.items()):

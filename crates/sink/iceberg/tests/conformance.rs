@@ -1,17 +1,12 @@
 //! `faucet-conformance` battery for the Iceberg sink.
 //!
-//! **Check 1** (`assert_config_schema_valid_value`) and **check 10**
-//! (`connector_name()` non-empty, gated on `catalog-sql`) run here, so the
-//! Iceberg sink stays **Tier-2** for now. The effectively-once check (check 4)
-//! does not fit this sink cleanly on `iceberg-rust` 0.9.1: the sink is
-//! append-only and only materialises rows on `flush()` (it buffers in
-//! `write_batch_idempotent`), while the battery drives an interleaved
-//! write→count→write→count sequence and never flushes. Bridging that with a
-//! flush-inside-count shim makes the cumulative `total-records` snapshot summary
-//! non-monotonic across the two commits, so the "forward progress after a new
-//! token" assertion cannot be satisfied deterministically. Promoting Iceberg to
-//! Tier-1 is tracked separately (needs an upstream append/commit model that the
-//! watermark-replay check can observe without a terminal flush).
+//! Check 1 (`assert_config_schema_valid_value`), check 10 (`connector_name()`
+//! non-empty), the descriptor agreement and the call deadline run here, offline
+//! against a SQLite catalog. The checks that count the table back through the
+//! Iceberg source — idempotent replay, schema evolution, cancellation flushes
+//! and per-row outcomes — live in
+//! `crates/interop-tests/tests/iceberg_sink_conformance.rs`, since a connector
+//! crate may not depend on another connector.
 use faucet_conformance::assert_config_schema_valid_value;
 
 #[test]

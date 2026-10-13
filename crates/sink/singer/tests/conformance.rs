@@ -50,3 +50,29 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+/// The sink confirms a page only when the target exits or echoes a STATE, so
+/// a cancelled run must still flush (#878). The fake target appends every
+/// record to `path` and closes the file on exit.
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_cancellation_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.jsonl");
+    let mut cfg = SingerSinkConfig::new(format!(
+        "{}/tests/fake_targets/fake_target.py",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    cfg.target_config = json!({ "path": out });
+    cfg.stream = Some("orders".into());
+    let sink = SingerSink::new(cfg).unwrap();
+    faucet_conformance::assert_cancellation_flushes(&sink, || {
+        let out = out.clone();
+        async move {
+            std::fs::read_to_string(&out)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0)
+        }
+    })
+    .await;
+}

@@ -54,3 +54,28 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// #878: the sink commits at flush, so a cancelled run must still flush; and a
+/// batch it declares atomic lands nothing when one row cannot be converted.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_cancellation_flushes_and_atomic_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "cancel");
+    let sink = DeltaSink::new(DeltaSinkConfig::new(&uri))
+        .await
+        .expect("sink");
+    let uri_ref = uri.as_str();
+    faucet_conformance::assert_cancellation_flushes(&sink, move || async move {
+        count_committed(uri_ref).await
+    })
+    .await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        move || async move { count_committed(uri_ref).await },
+        &[
+            serde_json::json!({"id": 953, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+}

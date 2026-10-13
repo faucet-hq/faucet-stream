@@ -325,8 +325,9 @@ async fn drain<S: Source + ?Sized>(
 /// under test must be configured `write_mode: upsert` with `key: ["id"]`.
 ///
 /// Dispatches on the mechanism the sink advertises:
-/// - `supports_idempotent_writes()` → the **atomic-watermark** path: writing a
-///   page durably records a commit token; a crash-replay (guarded by
+/// - `supports_idempotent_writes()` → the **atomic-watermark** path: writing
+///   and flushing a page (as the pipeline does before it checkpoints) durably
+///   records a commit token; a crash-replay (guarded by
 ///   `last_committed_token`, exactly as the pipeline guards it) does not
 ///   re-write, and forward progress still advances.
 /// - else `dedups_by_key()` → the **keyed-upsert** path: overlapping keys across
@@ -375,6 +376,9 @@ where
     sink.write_batch_idempotent(&p1, scope, &t1)
         .await
         .unwrap_or_else(|e| panic!("[{label}] write_batch_idempotent(page 1) errored: {e}"));
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] flush after page 1 errored: {e}"));
     let after_first = count().await;
     assert_eq!(
         after_first - before,
@@ -416,6 +420,9 @@ where
     sink.write_batch_idempotent(&p2, scope, &t2)
         .await
         .unwrap_or_else(|e| panic!("[{label}] write_batch_idempotent(page 2) errored: {e}"));
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] flush after page 2 errored: {e}"));
     let after_second = count().await;
     assert_eq!(
         after_second - after_first,
