@@ -14,6 +14,7 @@ use faucet_common_spanner::decode::SpannerJson;
 use faucet_common_spanner::encode::{EncodedKind, canonical_kind, encode_to_kind};
 use faucet_common_spanner::quote_ident_spanner;
 use faucet_common_spanner::types::{SpannerType, parse_spanner_type, spanner_type_to_json_schema};
+use faucet_core::CallExt as _;
 use faucet_core::FaucetError;
 use gcloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
 use gcloud_googleapis::spanner::v1::Mutation;
@@ -484,6 +485,9 @@ pub struct SpannerSink {
     token_table_ready: tokio::sync::OnceCell<()>,
     /// Record fields already warned-about as having no matching column.
     warned_fields: std::sync::Mutex<HashSet<String>>,
+    /// Backend-call context (#880): every read, commit and DDL operation runs
+    /// through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 impl SpannerSink {
@@ -498,12 +502,22 @@ impl SpannerSink {
             meta: tokio::sync::RwLock::new(None),
             token_table_ready: tokio::sync::OnceCell::new(),
             warned_fields: std::sync::Mutex::new(HashSet::new()),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
+    }
+
+    /// [`read_meta`](Self::read_meta) as one `metadata` call (#880).
+    async fn fetch_meta(&self) -> Result<Option<TableMeta>, FaucetError> {
+        self.calls.call_once("metadata", self.read_meta()).await
     }
 
     /// Read `(columns, pk)` for the target table from `INFORMATION_SCHEMA`.
     /// Returns `Ok(None)` when the table does not exist.
-    async fn fetch_meta(&self) -> Result<Option<TableMeta>, FaucetError> {
+    async fn read_meta(&self) -> Result<Option<TableMeta>, FaucetError> {
         let mut columns: Vec<(String, SpannerType, bool)> = Vec::new();
         {
             let mut tx = self
@@ -717,6 +731,12 @@ impl SpannerSink {
     /// Run DDL statements through the admin API, bounded by
     /// `ddl_timeout_secs`.
     async fn run_ddl(&self, statements: Vec<String>) -> Result<(), FaucetError> {
+        self.calls
+            .call_once("ddl", self.submit_ddl(statements))
+            .await
+    }
+
+    async fn submit_ddl(&self, statements: Vec<String>) -> Result<(), FaucetError> {
         let admin = self.config.connection.connect_admin().await?;
         let mut op = admin
             .database()
@@ -820,22 +840,27 @@ impl SpannerSink {
             seen: seen_fingerprints,
         });
         let (_, outcome) = self
-            .client
-            .read_write_transaction(move |tx| {
-                let plan = Arc::clone(&plan);
-                // The nested `Result` is deliberate: a *logical* failure (an
-                // undecodable key, a delete set over the cell budget) comes back
-                // as `Ok(Err(msg))` with **nothing buffered**, so the transaction
-                // commits no mutations and the message survives intact. The outer
-                // `Err` stays reserved for the client's own transport/ABORTED
-                // handling, whose retry semantics must not be disturbed.
-                Box::pin(async move {
-                    Ok::<Result<u64, String>, gcloud_spanner::client::Error>(
-                        run_cleanup_txn(tx, &plan).await,
-                    )
-                })
+            .calls
+            .call_once("commit", async {
+                Ok(self
+                    .client
+                    .read_write_transaction(move |tx| {
+                        let plan = Arc::clone(&plan);
+                        // The nested `Result` is deliberate: a *logical* failure (an
+                        // undecodable key, a delete set over the cell budget) comes back
+                        // as `Ok(Err(msg))` with **nothing buffered**, so the transaction
+                        // commits no mutations and the message survives intact. The outer
+                        // `Err` stays reserved for the client's own transport/ABORTED
+                        // handling, whose retry semantics must not be disturbed.
+                        Box::pin(async move {
+                            Ok::<Result<u64, String>, gcloud_spanner::client::Error>(
+                                run_cleanup_txn(tx, &plan).await,
+                            )
+                        })
+                    })
+                    .await)
             })
-            .await
+            .await?
             .map_err(|e| sink_err("cleanup", e))?;
         let deleted = outcome.map_err(|e| FaucetError::Sink(format!("spanner cleanup: {e}")))?;
 
@@ -937,6 +962,17 @@ impl faucet_core::Sink for SpannerSink {
 
     fn connector_name(&self) -> &'static str {
         "spanner"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
@@ -1071,13 +1107,23 @@ impl faucet_core::Sink for SpannerSink {
 
         let started = std::time::Instant::now();
         let select_one = async {
-            let mut tx = self.client.single().await.map_err(|e| e.to_string())?;
-            let mut iter = tx
-                .query(Statement::new("SELECT 1"))
+            let ping = async {
+                let mut tx = self.client.single().await.map_err(|e| e.to_string())?;
+                let mut iter = tx
+                    .query(Statement::new("SELECT 1"))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                iter.next().await.map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
+            };
+            match self
+                .calls
+                .call_once("query", async { Ok(ping.await) })
                 .await
-                .map_err(|e| e.to_string())?;
-            iter.next().await.map_err(|e| e.to_string())?;
-            Ok::<(), String>(())
+            {
+                Ok(r) => r,
+                Err(e) => Err(e.to_string()),
+            }
         };
         let auth = match tokio::time::timeout(ctx.timeout, select_one).await {
             Ok(Ok(())) => Probe::pass("auth", started.elapsed()),
@@ -1164,7 +1210,8 @@ impl faucet_core::Sink for SpannerSink {
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
                 .apply(chunk)
-                .await
+                .within(&self.calls, "commit")
+                .await?
                 .map_err(|e| sink_err("commit", e))?;
         }
         tracing::info!(
@@ -1216,7 +1263,8 @@ impl faucet_core::Sink for SpannerSink {
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
                 .apply(chunk)
-                .await
+                .within(&self.calls, "commit")
+                .await?
                 .map_err(|e| sink_err("commit", e))?;
         }
 
@@ -1243,6 +1291,31 @@ impl faucet_core::Sink for SpannerSink {
     /// `faucet_commit_token` table. `Ok(None)` when the table (or row) does
     /// not exist yet.
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+        self.calls
+            .call_once("query", self.read_committed_token(scope))
+            .await
+    }
+
+    /// Commit the page's mutations **and** the `(scope, token)` watermark in
+    /// one read-write transaction — on crash either both land or neither
+    /// does. The whole page is a single commit here (no re-chunking), so it
+    /// is bounded by Spanner's ~80,000-cell commit limit: size the source's
+    /// `batch_size` down for very wide tables.
+    async fn write_batch_idempotent(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<usize, FaucetError> {
+        self.calls
+            .call_once("commit", self.commit_idempotent(records, scope, token))
+            .await
+    }
+}
+
+impl SpannerSink {
+    /// Read the last committed watermark token for `scope`.
+    async fn read_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let mut tx = self
             .client
             .single()
@@ -1275,12 +1348,8 @@ impl faucet_core::Sink for SpannerSink {
         }
     }
 
-    /// Commit the page's mutations **and** the `(scope, token)` watermark in
-    /// one read-write transaction — on crash either both land or neither
-    /// does. The whole page is a single commit here (no re-chunking), so it
-    /// is bounded by Spanner's ~80,000-cell commit limit: size the source's
-    /// `batch_size` down for very wide tables.
-    async fn write_batch_idempotent(
+    /// The transaction behind [`write_batch_idempotent`](faucet_core::Sink::write_batch_idempotent).
+    async fn commit_idempotent(
         &self,
         records: &[Value],
         scope: &str,

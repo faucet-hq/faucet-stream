@@ -25,6 +25,8 @@ use serde_json::Value;
 
 use crate::config::{SpannerReplication, SpannerSourceConfig};
 
+use faucet_core::CallExt as _;
+
 /// Google Cloud Spanner query source.
 pub struct SpannerSource {
     config: SpannerSourceConfig,
@@ -35,6 +37,9 @@ pub struct SpannerSource {
     /// Shard applied by the cluster coordinator (Mode B), if any. `None` (or
     /// the whole-dataset shard) means the full query is streamed.
     applied_shard: Mutex<Option<PkShardBounds>>,
+    /// Backend-call context (#880): the transaction begin, the query and
+    /// every page of rows run through it.
+    calls: faucet_core::CallSlot,
 }
 
 impl SpannerSource {
@@ -47,6 +52,7 @@ impl SpannerSource {
             client,
             start_bookmark: Mutex::new(None),
             applied_shard: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -70,17 +76,22 @@ impl SpannerSource {
     /// Open the single-use read-only transaction this run reads through,
     /// honoring `exact_staleness_secs`.
     async fn read_txn(&self) -> Result<ReadOnlyTransaction, FaucetError> {
-        let result = match self.config.exact_staleness_secs {
-            Some(secs) => {
-                self.client
-                    .single_with_timestamp_bound(TimestampBound::exact_staleness(
-                        Duration::from_secs(secs),
-                    ))
-                    .await
+        let begin = async {
+            match self.config.exact_staleness_secs {
+                Some(secs) => {
+                    self.client
+                        .single_with_timestamp_bound(TimestampBound::exact_staleness(
+                            Duration::from_secs(secs),
+                        ))
+                        .await
+                }
+                None => self.client.single().await,
             }
-            None => self.client.single().await,
         };
-        result.map_err(|e| FaucetError::Source(format!("spanner: transaction begin failed: {e}")))
+        begin
+            .within(&self.calls, "begin")
+            .await?
+            .map_err(|e| FaucetError::Source(format!("spanner: transaction begin failed: {e}")))
     }
 }
 
@@ -302,19 +313,35 @@ impl Source for SpannerSource {
             };
             let mut iter = tx
                 .query_with_option(stmt, opts)
-                .await
+                .within(&self.calls, "query")
+                .await?
                 .map_err(|e| FaucetError::Source(format!("spanner: query failed: {e}")))?;
 
             let mut fields: Option<std::sync::Arc<Vec<_>>> = None;
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
             let mut running_max: Option<Value> = None;
             let mut total = 0usize;
+            let reads = self.calls.get().with_roundtrip_metering(false);
 
-            while let Some(row) = iter
-                .next()
-                .await
-                .map_err(|e| FaucetError::Source(format!("spanner: row stream failed: {e}")))?
-            {
+            loop {
+            // A page of rows per call: the run's cancel and deadline end a
+            // stalled stream without a per-row call.
+            let rows = reads
+                .call_once("read", async {
+                    let mut rows = Vec::new();
+                    while rows.len() < chunk {
+                        match iter.next().await.map_err(|e| {
+                            FaucetError::Source(format!("spanner: row stream failed: {e}"))
+                        })? {
+                            Some(row) => rows.push(row),
+                            None => break,
+                        }
+                    }
+                    Ok(rows)
+                })
+                .await?;
+            let exhausted = rows.len() < chunk;
+            for row in rows {
                 let fields = fields.get_or_insert_with(|| iter.columns_metadata().clone());
                 let record = row_to_json(&row, fields)
                     .map_err(|e| FaucetError::Source(format!("spanner: row decode failed: {e}")))?;
@@ -327,6 +354,10 @@ impl Source for SpannerSource {
                         yield StreamPage { records: kept, bookmark: None };
                     }
                 }
+            }
+            if exhausted {
+                break;
+            }
             }
 
             // Final page carries the bookmark so the pipeline persists only
@@ -349,6 +380,17 @@ impl Source for SpannerSource {
 
     fn connector_name(&self) -> &'static str {
         "spanner"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -406,11 +448,17 @@ impl Source for SpannerSource {
         let mut tx = self.read_txn().await?;
         let mut iter = tx
             .query(Statement::new(CATALOG_SQL))
-            .await
+            .within(&self.calls, "query")
+            .await?
             .map_err(|e| map_err(e.to_string()))?;
 
         let mut catalog: Vec<CatalogRow> = Vec::new();
-        while let Some(row) = iter.next().await.map_err(|e| map_err(e.to_string()))? {
+        while let Some(row) = iter
+            .next()
+            .within(&self.calls, "read")
+            .await?
+            .map_err(|e| map_err(e.to_string()))?
+        {
             let table: String = row
                 .column_by_name("TABLE_NAME")
                 .map_err(|e| map_err(e.to_string()))?;
@@ -470,8 +518,16 @@ impl Source for SpannerSource {
 
         let stmt = build_statement(&bounds_sql, &params)?;
         let mut tx = self.read_txn().await?;
-        let mut iter = tx.query(stmt).await.map_err(|e| map_err(e.to_string()))?;
-        let row = iter.next().await.map_err(|e| map_err(e.to_string()))?;
+        let mut iter = tx
+            .query(stmt)
+            .within(&self.calls, "query")
+            .await?
+            .map_err(|e| map_err(e.to_string()))?;
+        let row = iter
+            .next()
+            .within(&self.calls, "read")
+            .await?
+            .map_err(|e| map_err(e.to_string()))?;
         let Some(row) = row else {
             return Ok(vec![ShardSpec::whole()]);
         };

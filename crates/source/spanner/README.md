@@ -136,6 +136,14 @@ programmatically against the emulator via testcontainers.
 
 Declares `discover`, and `shardable` when the config has a `shard:` block. `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+The transaction begin, the query and every page of rows run through the
+pipeline's `CallContext` (#880): the run's cancel token stops a stalled read,
+any caller deadline ends it, and the begin and query are metered as round trips
+(`begin`, `query`). Rows are read a page at a time per call, so the per-row cost
+is unchanged; nothing is retried by faucet.
+
 ## License
 
 MIT OR Apache-2.0

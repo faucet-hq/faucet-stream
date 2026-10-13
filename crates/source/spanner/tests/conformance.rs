@@ -194,3 +194,43 @@ async fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// The client opens its session pool while it is built, so the backend hangs
+/// only once the source exists: a proxy forwards to the emulator during
+/// `new()` and then stops answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(
+        &emu.host,
+        "deadline",
+        &["CREATE TABLE t (id INT64 NOT NULL) PRIMARY KEY (id)"],
+    )
+    .await;
+    let proxy = faucet_conformance::hung::HangingProxy::start(&emu.host)
+        .await
+        .expect("proxy");
+    let host = proxy.addr().to_string();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        proxy.resume();
+        let mut cfg = SpannerSourceConfig::new(
+            support::PROJECT,
+            support::INSTANCE,
+            "deadline",
+            "SELECT id FROM t",
+        );
+        cfg.connection = support::connection(&host, "deadline");
+        let source = block_on(SpannerSource::new(cfg)).expect("source builds");
+        proxy.hang();
+        source
+    })
+    .await;
+}
