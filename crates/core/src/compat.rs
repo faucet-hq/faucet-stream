@@ -276,7 +276,8 @@ pub const EO_WITH_OVERWRITE: &str =
 /// Refusal: an exactly-once watermark run with policy quarantine.
 pub const EO_WITH_POLICY_QUARANTINE: &str = "a policy rule with on_runtime: quarantine is not \
      compatible with delivery: exactly_once (atomic watermark): a quarantined row would fail \
-     the whole page's atomic commit instead of reaching the DLQ";
+     the whole page's atomic commit instead of reaching the DLQ (only a rule whose `when` can \
+     match the row's sink kind and attributes counts)";
 /// Refusal: `on_drift: fail` against a sink that drops unknown fields.
 pub const DRIFT_FAIL_DROPS_FIELDS: &str = "schema.on_drift: fail cannot be enforced against \
      this sink: it reports no destination schema and silently drops fields its schema lacks, so \

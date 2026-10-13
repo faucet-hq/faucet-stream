@@ -1250,7 +1250,16 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         #[cfg(feature = "policy")]
         if delivery == faucet_core::DeliveryMode::ExactlyOnce
             && !keyed_upsert_configured
-            && cfg.policy.as_ref().is_some_and(crate::policy::quarantines)
+            && cfg.policy.as_ref().is_some_and(|p| {
+                crate::policy::quarantines_at(
+                    p,
+                    &faucet_core::SinkFacts {
+                        id: sink_ref.clone(),
+                        kind: merged_sink.kind.clone(),
+                        attributes: merged_sink.attributes.clone(),
+                    },
+                )
+            })
         {
             return Err(CliError::Config(format!(
                 "row '{}': {}; use `on_runtime: fail`, or `write_mode: upsert` + `key` for \
