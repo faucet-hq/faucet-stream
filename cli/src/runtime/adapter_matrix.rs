@@ -232,8 +232,7 @@ async fn submit(
                 }),
             };
             let out = if adapter == Adapter::Mcp {
-                crate::mcp::tools::call_tool(&ctx, "run_pipeline", &json!({ "config": body }))
-                    .await
+                crate::mcp::tools::call_tool(&ctx, "run_pipeline", &json!({ "config": body })).await
             } else {
                 register(state, body).await;
                 crate::mcp::tools::call_tool(
@@ -260,7 +259,8 @@ async fn submit(
                 (Some(PipelineRef::Inline(doc)), None)
             } else {
                 register(state, body).await;
-                let t: TemplateTrigger = serde_json::from_value(json!({ "id": "tpl", "version": "newest" })).unwrap();
+                let t: TemplateTrigger =
+                    serde_json::from_value(json!({ "id": "tpl", "version": "newest" })).unwrap();
                 (None, Some(t))
             };
             let compiled = crate::serve::triggers::compiled::CompiledTrigger {
@@ -400,7 +400,12 @@ async fn a_callers_body_meets_the_reference_policy_and_an_operators_does_not() {
     for adapter in SERVE.into_iter().chain([Adapter::Cli]) {
         let dir = tempfile::tempdir().unwrap();
         let state = fresh().await;
-        let body = config(dir.path(), "refs", "vars:\n  home: \"${env:HOME}\"\n", false);
+        let body = config(
+            dir.path(),
+            "refs",
+            "vars:\n  home: \"${env:HOME}\"\n",
+            false,
+        );
         let out = submit(adapter, &state, dir.path(), &body, None, None).await;
         if adapter.caller_body() {
             let err = out.expect_err(&format!("{adapter:?} loaded a caller's ${{env:HOME}}"));
@@ -458,7 +463,11 @@ async fn every_adapter_runs_under_the_budget_and_records_the_submission() {
             Ok(None) => panic!("{adapter:?} ran past its budget"),
             Err(e) => assert!(adapter == Adapter::Cli, "{adapter:?}: {e}"),
         }
-        assert_eq!(lines(dir.path(), "capped"), 0, "{adapter:?} wrote past the budget");
+        assert_eq!(
+            lines(dir.path(), "capped"),
+            0,
+            "{adapter:?} wrote past the budget"
+        );
     }
 }
 
@@ -475,8 +484,8 @@ async fn every_adapter_admits_a_tenant_run_against_its_tenant() {
             .expect_err(&format!("{adapter:?} ran for a suspended tenant"));
         // A trigger commits a refused fire as a no-op so its watcher does not
         // retry the same event.
-        let coalesced = matches!(adapter, Adapter::Trigger | Adapter::TemplateTrigger)
-            && err == "Coalesced";
+        let coalesced =
+            matches!(adapter, Adapter::Trigger | Adapter::TemplateTrigger) && err == "Coalesced";
         assert!(err.contains("suspended") || coalesced, "{adapter:?}: {err}");
         let runs = state
             .history()
@@ -501,7 +510,11 @@ async fn every_adapter_admits_a_tenant_run_against_its_tenant() {
         let rec = finished(&state, &id).await;
         assert_eq!(rec.tenant.as_deref(), Some("acme"), "{adapter:?}");
         assert_eq!(rec.status, RunStatus::Failed, "{adapter:?}");
-        assert_eq!(lines(dir.path(), "t"), 0, "{adapter:?} wrote past the tenant's ceiling");
+        assert_eq!(
+            lines(dir.path(), "t"),
+            0,
+            "{adapter:?} wrote past the tenant's ceiling"
+        );
     }
 }
 
@@ -523,10 +536,9 @@ async fn the_inline_operations_meet_the_same_gates() {
 
     let dlq = dir.path().join("dlq.jsonl");
     std::fs::write(&dlq, "").unwrap();
-    let replay: crate::serve::handlers::dlq::DlqReplayRequest = serde_json::from_value(
-        json!({ "config": body, "from": dlq.display().to_string() }),
-    )
-    .unwrap();
+    let replay: crate::serve::handlers::dlq::DlqReplayRequest =
+        serde_json::from_value(json!({ "config": body, "from": dlq.display().to_string() }))
+            .unwrap();
     let err = super::server::replay_dlq(&state, &principal, replay)
         .await
         .unwrap_err();
@@ -541,10 +553,8 @@ async fn the_inline_operations_meet_the_same_gates() {
     );
     rec.status = RunStatus::Completed;
     state.history().upsert(&rec).await.unwrap();
-    let rollback: crate::serve::handlers::runs::RollbackRequest = serde_json::from_value(
-        json!({ "config": body, "invocation_id": "inv" }),
-    )
-    .unwrap();
+    let rollback: crate::serve::handlers::runs::RollbackRequest =
+        serde_json::from_value(json!({ "config": body, "invocation_id": "inv" })).unwrap();
     let err = super::server::rollback(&state, &principal, "done", rollback)
         .await
         .unwrap_err();
@@ -586,7 +596,9 @@ async fn cancel_is_scoped_to_what_the_principal_sees() {
     ));
     let admin = crate::runtime::Principal::caller(&state, alice(None));
     assert_eq!(
-        super::server::cancel(&state, &admin, "theirs").await.unwrap(),
+        super::server::cancel(&state, &admin, "theirs")
+            .await
+            .unwrap(),
         super::server::CancelOutcome::Finished
     );
     assert!(matches!(

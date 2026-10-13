@@ -32,7 +32,10 @@ const ADAPTER_FORBIDDEN: [(&str, &str); 9] = [
 /// Where each entry point may be called from anywhere in the CLI: its own
 /// definition and the runtime.
 const OWNED: [(&str, &[&str]); 3] = [
-    ("run_expanded", &["cli/src/executor.rs", "cli/src/runtime/mod.rs"]),
+    (
+        "run_expanded",
+        &["cli/src/executor.rs", "cli/src/runtime/mod.rs"],
+    ),
     (
         "load_submission",
         &["cli/src/serve/load.rs", "cli/src/runtime/server.rs"],

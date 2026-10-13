@@ -18,8 +18,11 @@ pub async fn plan(
     auth: &AuthCatalog,
     opts: PlanOptions<'_>,
 ) -> CliResult<PlanReport> {
-    let _ = principal;
-    crate::commands::plan::plan_node(cfg, node, auth, opts).await
+    super::under(
+        principal,
+        crate::commands::plan::plan_node(cfg, node, auth, opts),
+    )
+    .await
 }
 
 /// Compare the destination to the source by content; with `repair`, re-sync

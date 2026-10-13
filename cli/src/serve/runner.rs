@@ -3181,6 +3181,7 @@ mod tests {
                 async move {
                     execute_shard(
                         &state,
+                        &crate::runtime::Principal::local(),
                         loaded(&yaml).await,
                         "r",
                         "0",
