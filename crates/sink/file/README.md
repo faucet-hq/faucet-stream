@@ -203,8 +203,9 @@ and the file sink and compare the output.
 
 The encoding, compression, encryption, rollover and the overwrite swap live in
 `faucet_common_file::write`: this sink maps its config through the shared
-`WriteConfig`, builds a `FileWriter` over `LocalBackend` and forwards its `Sink`
-calls to the shared `WriterSink`, exactly as the object-store sinks do.
+`WriteConfig` and is the shared `FileSink<LocalBackend>` — the one `Sink`
+implementation the S3, GCS, Azure Blob and SFTP sinks are too, over their own
+backends (RFC 0013, #886).
 
 ## Features
 

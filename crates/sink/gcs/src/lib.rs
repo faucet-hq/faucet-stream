@@ -6,7 +6,6 @@ mod descriptor;
 pub use descriptor::DESCRIPTOR;
 
 mod config;
-mod object;
 mod sink;
 
 pub use config::{GcsSinkConfig, GcsSinkFormat};

@@ -18,7 +18,11 @@
 //! minor release; any change is called out in the changelog.
 
 use faucet_core::FaucetError;
+use faucet_core::check::{CheckContext, CheckReport};
+use faucet_core::io::CallContext;
+use faucet_core::observability::RoundtripRecorder;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One of the two places a backend holds files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,4 +153,140 @@ pub trait StorageBackend: Send + Sync {
             "file sink: '{name}' cannot be uploaded in parts by this backend"
         )))
     }
+
+    /// Install the run's round-trip recorder the backend's requests report
+    /// to. Default: the backend counts nothing.
+    fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {}
+
+    /// Install the run's call context (#880) every request of the backend
+    /// runs through. Default: the backend makes no remote calls.
+    fn set_call_context(&self, _ctx: CallContext) {}
+
+    /// A non-mutating preflight probe of the storage (reachability,
+    /// credentials). `None` when the backend has none, so the sink's own
+    /// probe answers. Default: `None`.
+    async fn check(&self, _ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+        Ok(None)
+    }
+}
+
+/// Implement [`StorageBackend`] for a type by forwarding every method to the
+/// backend in one of its fields: `delegate_storage_backend!(S3Backend, remote);`.
+/// A store's common crate wraps a [`RemoteBackend`](super::RemoteBackend) in
+/// its own named type this way.
+#[macro_export]
+macro_rules! delegate_storage_backend {
+    ($ty:ty, $field:ident) => {
+        #[$crate::__private::async_trait]
+        impl $crate::write::StorageBackend for $ty {
+            fn describe(&self, area: $crate::write::Area, name: &str) -> ::std::string::String {
+                $crate::write::StorageBackend::describe(&self.$field, area, name)
+            }
+            fn local_path(
+                &self,
+                area: $crate::write::Area,
+                name: &str,
+            ) -> ::std::option::Option<::std::path::PathBuf> {
+                $crate::write::StorageBackend::local_path(&self.$field, area, name)
+            }
+            fn scratch_path(&self, area: $crate::write::Area, name: &str) -> ::std::path::PathBuf {
+                $crate::write::StorageBackend::scratch_path(&self.$field, area, name)
+            }
+            async fn prepare(
+                &self,
+                area: $crate::write::Area,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::prepare(&self.$field, area).await
+            }
+            async fn list(
+                &self,
+                area: $crate::write::Area,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::list(&self.$field, area).await
+            }
+            async fn exists(
+                &self,
+                area: $crate::write::Area,
+                name: &str,
+            ) -> ::std::result::Result<bool, $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::exists(&self.$field, area, name).await
+            }
+            async fn fetch(
+                &self,
+                area: $crate::write::Area,
+                name: &str,
+                to: &::std::path::Path,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::fetch(&self.$field, area, name, to).await
+            }
+            async fn publish(
+                &self,
+                scratch: &::std::path::Path,
+                area: $crate::write::Area,
+                name: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::publish(&self.$field, scratch, area, name).await
+            }
+            async fn settle(&self) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::settle(&self.$field).await
+            }
+            async fn cancel(&self) {
+                $crate::write::StorageBackend::cancel(&self.$field).await
+            }
+            async fn delete(
+                &self,
+                area: $crate::write::Area,
+                name: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::delete(&self.$field, area, name).await
+            }
+            async fn delete_many(
+                &self,
+                area: $crate::write::Area,
+                names: &[::std::string::String],
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::delete_many(&self.$field, area, names).await
+            }
+            async fn promote(
+                &self,
+                name: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::promote(&self.$field, name).await
+            }
+            fn part_size(&self) -> ::std::option::Option<usize> {
+                $crate::write::StorageBackend::part_size(&self.$field)
+            }
+            async fn open_stream(
+                &self,
+                area: $crate::write::Area,
+                name: &str,
+            ) -> ::std::result::Result<
+                ::std::boxed::Box<dyn $crate::write::PartStream>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::open_stream(&self.$field, area, name).await
+            }
+            fn set_roundtrip_recorder(
+                &self,
+                recorder: ::std::sync::Arc<$crate::__private::RoundtripRecorder>,
+            ) {
+                $crate::write::StorageBackend::set_roundtrip_recorder(&self.$field, recorder)
+            }
+            fn set_call_context(&self, ctx: $crate::__private::CallContext) {
+                $crate::write::StorageBackend::set_call_context(&self.$field, ctx)
+            }
+            async fn check(
+                &self,
+                ctx: &$crate::__private::CheckContext,
+            ) -> ::std::result::Result<
+                ::std::option::Option<$crate::__private::CheckReport>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::check(&self.$field, ctx).await
+            }
+        }
+    };
 }

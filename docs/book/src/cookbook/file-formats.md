@@ -446,7 +446,15 @@ for every field and the mapping from the old sinks' fields.
 
 The same writer (`faucet_common_file::write`) sits under the `s3`, `gcs`,
 `azure-blob` and `sftp` sinks, with a remote storage backend — so they take
-every format and option above with the same field names. The object's name
+every format and option above with the same field names. They are, in fact,
+one sink: the local `file` sink and the four remote sinks are each the shared
+`FileSink` over a storage backend (`LocalBackend`, `S3Backend`, `GcsBackend`,
+`AzureBackend`, `SftpBackend`), and so is the deprecated `parquet` sink's S3
+destination. A backend only stores finished files; every format, codec,
+encryption, rollover, `if_exists` and overwrite rule lives once, above it.
+Each backend's requests run through the run's call deadline and are metered
+as round trips, and `faucet doctor` probes the store (`HeadBucket` on S3, a
+one-object listing on GCS and Azure, opening the SSH session on SFTP). The object's name
 template is `path` (`file_name` on SFTP, whose `path` is the remote
 directory), placed after the existing `prefix`:
 

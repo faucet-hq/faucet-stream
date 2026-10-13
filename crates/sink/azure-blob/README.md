@@ -148,6 +148,11 @@ ORC is read-only, so there is no `orc` format here. Enable with
 
 ## Shared file writer (#777)
 
+The sink is the shared `FileSink<AzureBackend>` (RFC 0013, #886): the one `Sink`
+implementation every file sink is — the local `file` sink over the local
+file system, this one over the `AzureBackend` in
+[`faucet-common-azure`](https://crates.io/crates/faucet-common-azure). Its preflight probe is the backend's listing of the container's first blob.
+
 This sink writes through the same file-writing layer as the local
 [`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
 format and option the file sink does, with the same field names:

@@ -6,11 +6,17 @@ use serde_json::Value;
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("parquet", capabilities);
 
-fn capabilities(_config: &Value) -> Capabilities {
+fn capabilities(config: &Value) -> Capabilities {
+    let s3 = config.pointer("/destination/type").and_then(Value::as_str) == Some("s3");
+    let report = if s3 {
+        SchemaReport::Undeclared
+    } else {
+        SchemaReport::DropsUnknownFields
+    };
     Capabilities::append_only_sink()
         .to_builder()
         .columnar(cfg!(feature = "arrow"))
-        .schema_report(SchemaReport::DropsUnknownFields)
+        .schema_report(report)
         .build()
 }
 
@@ -30,5 +36,12 @@ mod tests {
             assert_eq!(c.schema_report(), SchemaReport::DropsUnknownFields);
             assert!(!c.keyed_dedup() && !c.idempotent_writes());
         }
+    }
+
+    #[test]
+    fn an_s3_destination_widens_instead_of_dropping() {
+        let c = DESCRIPTOR.capabilities(&json!({"destination": {"type": "s3", "bucket": "b"}}));
+        assert_eq!(c.write_modes(), &[WriteMode::Append]);
+        assert_eq!(c.schema_report(), SchemaReport::Undeclared);
     }
 }

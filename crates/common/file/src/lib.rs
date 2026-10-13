@@ -19,6 +19,7 @@ pub mod write;
 pub mod __private {
     pub use faucet_core::async_trait;
     pub use faucet_core::check::{CheckContext, CheckReport};
+    pub use faucet_core::forward_sink;
     pub use faucet_core::io::CallContext;
     pub use faucet_core::observability::RoundtripRecorder;
     pub use faucet_core::{

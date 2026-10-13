@@ -18,6 +18,9 @@
 
 use super::backend::{Area, PartStream, StorageBackend};
 use super::layout::NameTemplate;
+use faucet_core::check::{CheckContext, CheckReport};
+use faucet_core::io::CallContext;
+use faucet_core::observability::RoundtripRecorder;
 use faucet_core::{Compression, FaucetError, FileFormat};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -75,6 +78,17 @@ pub trait ObjectClient: Send + Sync {
         self.download(from, &tmp).await?;
         self.upload(&tmp, to).await?;
         self.delete(from).await
+    }
+    /// Install the run's round-trip recorder the client's requests report
+    /// to. Default: the client counts nothing.
+    fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {}
+    /// Install the run's call context (#880) every request runs through.
+    /// Default: nothing to install.
+    fn set_call_context(&self, _ctx: CallContext) {}
+    /// A non-mutating preflight probe of the store. Default: `None`, no
+    /// probe.
+    async fn check(&self, _ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+        Ok(None)
     }
 }
 
@@ -551,6 +565,18 @@ impl StorageBackend for RemoteBackend {
             next: 1,
             parts: Vec::new(),
         }))
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.client.set_roundtrip_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.client.set_call_context(ctx);
+    }
+
+    async fn check(&self, ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+        self.client.check(ctx).await
     }
 }
 

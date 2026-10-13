@@ -16,6 +16,15 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 object_store = { workspace = true, features = ["azure"] }
+faucet-common-file.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

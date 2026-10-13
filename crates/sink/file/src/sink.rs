@@ -1,7 +1,10 @@
-//! The local file sink: the shared file writer over the local backend.
+//! The local file sink: the shared `FileSink` over the local backend
+//! (RFC 0013, #886).
 
 use crate::config::FileSinkConfig;
-use faucet_common_file::write::{FileWriter, LocalBackend, SinkIdentity, WriterSink};
+use faucet_common_file::write::{
+    FileSink as SharedFileSink, LocalBackend, NameTemplate, SinkIdentity, WriteSettings,
+};
 use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -10,7 +13,7 @@ use std::sync::Arc;
 /// Writes records to local files. See the crate docs.
 pub struct FileSink {
     config: FileSinkConfig,
-    inner: WriterSink,
+    inner: SharedFileSink<LocalBackend>,
 }
 
 impl FileSink {
@@ -24,16 +27,15 @@ impl FileSink {
         }
         let (dir, template) = write.local_layout(&settings)?;
         let local = Arc::new(LocalBackend::new(&dir, &template, config.create_dirs));
-        let writer = FileWriter::new(settings, template, local.clone())?;
         let identity = FileIdentity {
             dataset_uri: dataset_uri(&config.path),
             dir: local.dir().to_path_buf(),
             create_dirs: config.create_dirs,
-            readback: readback_config(&config, &writer, local.dir()),
+            readback: readback_config(&config, &settings, &template, local.dir()),
         };
         Ok(Self {
             config,
-            inner: WriterSink::new(writer, identity),
+            inner: SharedFileSink::build(settings, template, local, identity)?,
         })
     }
 
@@ -58,12 +60,15 @@ fn dataset_uri(path: &str) -> String {
 
 /// The config of a `file` source that reads the output back, or `None` when
 /// the source cannot: pretty-printed JSON Lines is not one record per line.
-fn readback_config(config: &FileSinkConfig, writer: &FileWriter, dir: &Path) -> Option<Value> {
-    let settings = writer.settings();
+fn readback_config(
+    config: &FileSinkConfig,
+    settings: &WriteSettings,
+    template: &NameTemplate,
+    dir: &Path,
+) -> Option<Value> {
     if settings.format == FileFormat::JsonLines && settings.json_lines.pretty {
         return None;
     }
-    let template = writer.template();
     let path = if template.numbered() {
         dir.join(template.name.replace(crate::config::PART_TOKEN, "*"))
     } else {

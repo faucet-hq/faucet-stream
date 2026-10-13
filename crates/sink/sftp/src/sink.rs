@@ -1,14 +1,15 @@
-//! SFTP sink executor: the shared file writer (#777) over an SFTP backend.
+//! SFTP sink executor: the shared [`FileSink`] over an [`SftpBackend`]
+//! (RFC 0013, #886).
 //!
-//! Files are built locally and published by uploading to a hidden temporary
-//! name and renaming it into place, so a consumer watching the directory
-//! never sees a partial file. Construction is lazy — [`SftpSink::new`]
-//! performs no I/O; the SSH transport is opened on the first write and
-//! reused for the life of the sink.
+//! Files are built locally and published by uploading to a hidden
+//! temporary name and renaming it into place, so a consumer watching the
+//! directory never sees a partial file. Construction is lazy —
+//! [`SftpSink::new`] performs no I/O; the SSH transport is opened on the
+//! first write and reused for the life of the sink.
 
 use crate::config::SftpSinkConfig;
-use crate::object::SftpObjects;
-use faucet_common_file::write::{FileWriter, RemoteBackend, SinkIdentity, WriterSink};
+use faucet_common_file::write::{FileSink, SinkIdentity};
+use faucet_common_sftp::SftpBackend;
 use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 /// or raw text. Each file is built in a local scratch file (see
 /// `scratch_dir`) before it is uploaded.
 pub struct SftpSink {
-    inner: WriterSink,
+    inner: FileSink<SftpBackend>,
 }
 
 impl SftpSink {
@@ -33,16 +34,10 @@ impl SftpSink {
         } else {
             base
         };
-        let objects = Arc::new(SftpObjects::new(config.connection.clone()));
-        let calls = objects.calls.clone();
-        let backend = RemoteBackend::new(
-            objects,
-            base,
-            &template,
-            config.scratch_dir.as_deref().map(std::path::Path::new),
-        )?
-        .with_upload_concurrency(config.concurrency);
-        let writer = FileWriter::new(settings, template, Arc::new(backend))?;
+        let backend = SftpBackend::builder(config.connection.clone())
+            .concurrency(config.concurrency)
+            .scratch_dir(config.scratch_dir.as_deref().map(std::path::Path::new))
+            .build(base, &template)?;
         let identity = SftpIdentity {
             dataset_uri: format!(
                 "sftp://{}:{}/{}",
@@ -50,10 +45,9 @@ impl SftpSink {
                 config.connection.port,
                 config.path.trim_start_matches('/')
             ),
-            calls,
         };
         Ok(Self {
-            inner: WriterSink::new(writer, identity),
+            inner: FileSink::build(settings, template, Arc::new(backend), identity)?,
         })
     }
 
@@ -65,13 +59,12 @@ impl SftpSink {
 
 faucet_common_file::delegate_sink!(SftpSink, inner);
 
-/// What the SFTP sink supplies to the shared sink.
+/// What the SFTP sink supplies to the shared sink; requests, metering and
+/// the preflight probe are the backend's.
 struct SftpIdentity {
     dataset_uri: String,
-    calls: Arc<faucet_core::CallSlot>,
 }
 
-#[faucet_core::async_trait]
 impl SinkIdentity for SftpIdentity {
     fn connector_name(&self) -> &'static str {
         "sftp"
@@ -84,14 +77,6 @@ impl SinkIdentity for SftpIdentity {
 
     fn dataset_uri(&self) -> String {
         self.dataset_uri.clone()
-    }
-
-    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
     }
 }
 
@@ -149,6 +134,8 @@ mod tests {
     fn dataset_uri_has_no_credentials() {
         let sink = SftpSink::new(cfg()).unwrap();
         assert_eq!(sink.dataset_uri(), "sftp://h:22/out");
+        assert_eq!(sink.inner.backend().connection().host, "h");
+        assert!(sink.config_schema().is_object());
     }
 
     #[test]

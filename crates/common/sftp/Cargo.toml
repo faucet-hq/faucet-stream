@@ -12,11 +12,13 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-file.workspace = true
+uuid.workspace = true
 schemars.workspace = true
 serde.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "time", "fs", "sync"] }
 russh.workspace = true
 russh-sftp.workspace = true
 base64.workspace = true
@@ -26,6 +28,9 @@ sha1.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
+testcontainers = "0.27"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [package.metadata.docs.rs]
 all-features = true

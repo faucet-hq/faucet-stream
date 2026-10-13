@@ -51,6 +51,25 @@ pub async fn build_storage_control(
 
 `crc32c_of_bytes(&[u8]) -> u32` and `open_with_crc32c(&Path) -> io::Result<(tokio::fs::File, u32)>` (reads the file in chunks, then rewinds it) give an upload's CRC32C so it can be declared up front with `write_object(..).with_known_crc32c(crc)`. `google-cloud-storage` 1.19+ otherwise sends a single-shot upload's checksum as a third multipart part, which a server that reads only metadata + media (`fake-gcs-server`) stores as object content; declared up front, it travels in the metadata part, where every server checks it against the bytes it stored.
 
+## Storage backend for the file writer
+
+`GcsBackend` is the `StorageBackend` the shared file writer in
+[`faucet-common-file`](https://crates.io/crates/faucet-common-file) publishes
+objects through; the [`faucet-sink-gcs`](https://crates.io/crates/faucet-sink-gcs)
+sink is a `FileSink<GcsBackend>` (RFC 0013, #886). Build it with
+`GcsBackend::builder(storage, control, bucket).concurrency(n).scratch_dir(dir).build(base, &template)`.
+
+- Each object is built in a local scratch file and published with one upload —
+  resumable past the client's threshold, finalised only once every byte
+  arrived — carrying its CRC32C, so the store verifies what it received.
+- A move into place (`write_mode: overwrite`) is a `rewrite` resumed with its
+  token until done (at most `MAX_REWRITE_CALLS` calls) and a delete.
+- Every request runs through the run's call context and reports to the run's
+  round-trip recorder (`put`, `get`, `head`, `list`, `copy`, `delete`); a
+  429 / 5xx (or gRPC `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `INTERNAL`) is a
+  typed, retryable `FaucetError::HttpStatus`.
+- The preflight probe lists one object of the bucket.
+
 ## Who depends on this
 
 You usually **don't** depend on this crate directly. End users configure GCS through `faucet-source-gcs` / `faucet-sink-gcs` (both re-export `GcsCredentials`), or through the `faucet` CLI via the `source-gcs` / `sink-gcs` features. Depend on `faucet-common-gcs` only if you are a **third-party connector author** building your own GCS source/sink for the faucet ecosystem and want to stay interchangeable with the first-party connectors' credential shape and client construction.

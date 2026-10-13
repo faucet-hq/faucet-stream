@@ -4994,11 +4994,17 @@ dependencies = [
 name = "faucet-common-azure"
 version = "1.1.1"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "faucet-common-file",
  "faucet-core",
+ "futures",
  "object_store",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -5111,7 +5117,10 @@ dependencies = [
 name = "faucet-common-gcs"
 version = "1.1.2"
 dependencies = [
+ "async-trait",
+ "base64 0.22.1",
  "crc32c",
+ "faucet-common-file",
  "faucet-core",
  "google-cloud-auth",
  "google-cloud-gax",
@@ -5120,7 +5129,9 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
  "urlencoding",
  "wiremock",
 ]
@@ -5275,11 +5286,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-common-s3"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "faucet-common-file",
+ "faucet-core",
+ "futures",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "faucet-common-sftp"
 version = "1.0.8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "faucet-common-file",
+ "faucet-conformance",
  "faucet-core",
  "hmac 0.12.1",
  "russh",
@@ -5289,8 +5318,10 @@ dependencies = [
  "serde_json",
  "sha1 0.10.6",
  "tempfile",
+ "testcontainers",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5521,10 +5552,8 @@ name = "faucet-sink-azure-blob"
 version = "1.1.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "azure_storage",
  "azure_storage_blobs",
- "bytes",
  "faucet-common-azure",
  "faucet-common-file",
  "faucet-conformance",
@@ -5538,8 +5567,6 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
- "tracing",
- "uuid",
  "wiremock",
 ]
 
@@ -5731,16 +5758,12 @@ name = "faucet-sink-gcs"
 version = "1.4.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "base64 0.22.1",
- "bytes",
  "faucet-common-file",
  "faucet-common-gcs",
  "faucet-conformance",
  "faucet-core",
  "futures",
- "google-cloud-gax",
- "google-cloud-storage",
  "parquet 58.3.0",
  "reqwest 0.13.3",
  "schemars 1.2.1",
@@ -5749,9 +5772,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
- "tracing",
  "urlencoding",
- "uuid",
  "wiremock",
 ]
 
@@ -5972,6 +5993,8 @@ dependencies = [
  "arrow-json 58.3.0",
  "async-trait",
  "bytes",
+ "faucet-common-file",
+ "faucet-common-s3",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -5985,6 +6008,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -6089,11 +6113,11 @@ name = "faucet-sink-s3"
 version = "1.5.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "aws-config",
  "aws-sdk-s3",
  "bytes",
  "faucet-common-file",
+ "faucet-common-s3",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -6105,8 +6129,6 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
- "tracing",
- "uuid",
  "wiremock",
 ]
 
@@ -6115,21 +6137,17 @@ name = "faucet-sink-sftp"
 version = "1.1.2"
 dependencies = [
  "arrow 58.3.0",
- "async-trait",
  "faucet-common-file",
  "faucet-common-sftp",
  "faucet-conformance",
  "faucet-core",
  "futures",
- "russh-sftp",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "tempfile",
  "testcontainers",
  "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
