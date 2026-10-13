@@ -16,7 +16,8 @@ use crate::config::parse_timestamp;
 /// One parsed change record.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ChangeRecord {
-    Data(DataChange),
+    /// Boxed: a data change is far larger than the other variants.
+    Data(Box<DataChange>),
     /// Everything in the partition up to this time has been returned.
     Heartbeat(DateTime<Utc>),
     /// The partition ended; these partitions continue it.
@@ -191,7 +192,7 @@ pub(crate) fn parse_children(v: &Value) -> Result<Vec<ChildPartition>, FaucetErr
 pub(crate) fn parse_record_set(set: &Value) -> Result<Vec<ChangeRecord>, FaucetError> {
     let mut out = Vec::new();
     for d in array_field(set, "data_change_record") {
-        out.push(ChangeRecord::Data(parse_data_change(d)?));
+        out.push(ChangeRecord::Data(Box::new(parse_data_change(d)?)));
     }
     for h in array_field(set, "heartbeat_record") {
         out.push(ChangeRecord::Heartbeat(parse_heartbeat(h)?));
@@ -243,7 +244,9 @@ pub(crate) fn parse_pg_row(row: &Value) -> Result<Vec<ChangeRecord>, FaucetError
     let mut out = Vec::new();
     for (tag, body) in obj {
         match tag.as_str() {
-            "data_change_record" => out.push(ChangeRecord::Data(parse_data_change(body)?)),
+            "data_change_record" => {
+                out.push(ChangeRecord::Data(Box::new(parse_data_change(body)?)))
+            }
             "heartbeat_record" => out.push(ChangeRecord::Heartbeat(parse_heartbeat(body)?)),
             "child_partitions_record" => out.push(ChangeRecord::Children(parse_children(body)?)),
             other => return Err(bad(&format!("unknown record kind `{other}`"))),
