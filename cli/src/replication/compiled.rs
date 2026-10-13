@@ -18,7 +18,7 @@ enum CdcReplay {
 }
 
 fn cdc_replay(spec: &ConnectorSpec) -> Option<CdcReplay> {
-    if crate::registry::source_supports_exactly_once(&spec.kind) {
+    if crate::registry::source_capabilities(&spec.kind, &spec.config).exactly_once() {
         return Some(CdcReplay::Deterministic);
     }
     let streams = spec.config.get("mode").and_then(|m| m.as_str()) == Some("streams");
@@ -75,7 +75,9 @@ fn compile_tables(
             cdc.kind
         )));
     }
-    if !crate::registry::source_supports_discover(&snapshot.source.kind) {
+    if !crate::registry::source_capabilities(&snapshot.source.kind, &snapshot.source.config)
+        .discover()
+    {
         return Err(CliError::Config(format!(
             "mirror.snapshot.source '{}' cannot discover tables; a multi-table mirror \
              resolves its table set from the snapshot source's discovery",

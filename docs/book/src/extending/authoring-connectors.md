@@ -182,6 +182,55 @@ goes for every `supports_*` probe and for `supported_write_modes()` — the CLI
 gates configs on them. A sink that lists `Upsert` but can't apply a
 `delete_marker` rejects it as a `Config` error rather than ignoring it.
 
+### Declaring capabilities
+
+The CLI checks a config before it builds anything, so it cannot ask a built
+connector what it supports. Each connector therefore ships a static
+`faucet_core::ConnectorDescriptor` next to its factory: its `type:` name and a
+pure `fn(&Value) -> Capabilities` that answers from the config alone (RFC 0013).
+Every load-time gate — write mode, exactly-once, cleanup, rollback, schema drift,
+`faucet verify` range mode, `faucet discover` — reads it, and `faucet list --json`
+prints it.
+
+```rust
+use faucet_core::capabilities::config;
+use faucet_core::{Capabilities, ConnectorDescriptor, Value, WriteMode};
+
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("acme", capabilities);
+
+fn capabilities(cfg: &Value) -> Capabilities {
+    let modes = [WriteMode::Append, WriteMode::Upsert, WriteMode::Delete];
+    Capabilities::builder()
+        .write_modes(modes)
+        .keyed_upsert(true)
+        // A config fact: true only when *this* config upserts by a key.
+        .keyed_dedup(!cfg.is_null() && config::dedups_by_key(cfg))
+        .build()
+}
+```
+
+- Called with a config object, the function must return exactly what
+  `Sink::capabilities()` / `Source::capabilities()` of a connector built from
+  that config returns. The trait method is defaulted and derives every field
+  from the per-capability methods above, so most connectors only write the
+  descriptor. Override `capabilities()` for what no method expresses —
+  `range_read` / `range_digest` / `reports_lag` on a source,
+  `scoped_overwrite` / `schema_report` on a sink — starting from
+  `Capabilities::of_source(self)` / `of_sink(self)`.
+- Called with `Value::Null`, it returns the kind-level view: every capability
+  some valid config enables (`keyed_dedup` stays `false`).
+- Read fields leniently (`faucet_core::capabilities::config`): a config may still
+  hold `${…}` tokens, and the function must never fail.
+- A sink that silently drops record fields its destination lacks declares
+  `schema_report(SchemaReport::DropsUnknownFields)`: a drift policy cannot see
+  those fields, so `schema.on_drift: fail` is refused at load time
+  ([Feature compatibility](../reference/compatibility.md)).
+- In `tests/conformance.rs`, build the connector from a few configs and call
+  `faucet_conformance::assert_descriptor_matches_source` / `_sink` with each.
+- A custom binary registers it with `register_source_described` /
+  `register_sink_described`; a connector registered without one is treated as
+  append-only with no capabilities.
+
 ### Multi-table mirror hooks
 
 A CDC source joins a multi-table `faucet mirror` (`mirror.tables`) through four

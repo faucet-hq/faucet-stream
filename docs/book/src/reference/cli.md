@@ -513,9 +513,22 @@ e.g. `postgres`) need `--kind source|sink`.
 
 Both `faucet list` and `faucet list --available` accept `--json` for a
 machine-readable listing — `list --json` emits `{ sources, sinks, transforms,
-state_stores }` (each connector entry carries `name`, `description`, and a
-maturity `tier`), and `list --available --json` emits the registry rows with a
-`compiled` flag per connector.
+state_stores }` (each connector entry carries `name`, `description`, a maturity
+`tier`, and the `capabilities` the connector declares), and
+`list --available --json` emits the registry rows with a `compiled` flag per
+connector.
+
+A connector's `capabilities` object is what `faucet validate` checks a config
+against (RFC 0013): `write_modes`, `idempotent_writes` (exactly-once watermark),
+`keyed_upsert`, `cleanup`, `rollback`, `schema_evolution`, `schema_report`
+(`reported`, `schemaless`, `drops_unknown_fields` or `undeclared`),
+`scoped_overwrite`, `direct_overwrite`, `staged_load` for sinks and
+`exactly_once`, `discover`, `shardable`, `range_read`, `range_digest`,
+`reports_lag` for sources, plus `columnar` / `native` for both. The listing
+shows the kind-level view — every capability some config enables; a few depend
+on the config (a SQL sink cleans up and rolls back only with
+`column_mapping: auto_map`), and `faucet validate` reads them from your config.
+`keyed_dedup` (the config dedups by key) is always `false` here.
 
 ## `conformance`
 
@@ -561,8 +574,8 @@ publishing is always complete.
 faucet conformance --export --require-all > connectors.json
 ```
 
-Every capability is derived from the registry allowlists and the connector's
-config schema — the same sources as the capability matrix and the conformance
+Every capability is derived from what the connector declares (its
+`ConnectorDescriptor`, kind-level view) and its config schema — the same sources as the capability matrix and the conformance
 score — never copied by hand. Shape (`version: 1`; additive changes only):
 
 | Field | Meaning |

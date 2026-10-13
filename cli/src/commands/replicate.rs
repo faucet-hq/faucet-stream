@@ -202,7 +202,7 @@ pipeline:
     /// A config WITH a `replication:` block that fails `CompiledReplication::compile`
     /// (here: `state: memory`, which the durable-state rule rejects) must error
     /// before `run_replication` — so no Docker is needed. Gated on the connector
-    /// kinds being compiled in so `source_supports_exactly_once` / `source_schema`
+    /// kinds being compiled in so their declared capabilities / `source_schema`
     /// resolve (otherwise compile would fail earlier on an unknown-kind error,
     /// which is a different, also-acceptable failure but not the branch under test).
     #[cfg(all(

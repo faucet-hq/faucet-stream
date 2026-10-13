@@ -362,7 +362,7 @@ pub fn compose(source: &SourceTemplate, sink: &SinkTemplate) -> CliResult<Compos
     compose_with(
         source,
         sink,
-        crate::registry::sink_supported_write_modes(&sink.sink.kind),
+        crate::registry::sink_kind_capabilities(&sink.sink.kind).write_modes(),
     )
 }
 

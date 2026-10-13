@@ -86,7 +86,8 @@ pub struct ExportedConnector {
     pub init_snippet: Option<String>,
 }
 
-/// Capabilities derived from the registry allowlists and the config schema.
+/// Capabilities from the connector's declared descriptor (kind-level view)
+/// and its config schema.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Capabilities {
     /// Source: `deterministic` / `non_deterministic` replay. Sink:
@@ -134,35 +135,35 @@ fn wire<T: Serialize>(v: T) -> String {
         .unwrap_or_default()
 }
 
-/// Derive a connector's capabilities. Pure over the registry allowlists and
-/// the (optional) config schema.
+/// Derive a connector's capabilities. Pure over the connector's declared
+/// kind-level capabilities and the (optional) config schema.
 pub fn capabilities(kind: &str, is_source: bool, schema: Option<&Value>) -> Capabilities {
     let compression = schema_has(schema, "compression");
     if is_source {
+        let caps = registry::source_kind_capabilities(kind);
         return Capabilities {
-            delivery: wire(registry::source_replay_guarantee(kind)),
-            exactly_once: registry::source_supports_exactly_once(kind),
+            delivery: wire(caps.replay_guarantee()),
+            exactly_once: caps.exactly_once(),
             compression,
-            discover: registry::source_supports_discover(kind),
+            discover: caps.discover(),
             incremental: schema_has(schema, "replication_method"),
-            reports_lag: registry::source_reports_lag(kind),
+            reports_lag: caps.reports_lag(),
             ..Capabilities::default()
         };
     }
-    let modes = registry::sink_supported_write_modes(kind);
+    let caps = registry::sink_kind_capabilities(kind);
+    let modes = caps.write_modes();
     Capabilities {
-        delivery: wire(registry::sink_guarantee(kind)),
-        exactly_once: registry::sink_supports_idempotent_writes(kind),
+        delivery: wire(caps.sink_guarantee()),
+        exactly_once: caps.idempotent_writes(),
         compression,
         write_modes: modes.iter().map(|m| m.as_str().to_string()).collect(),
-        upsert: modes
-            .iter()
-            .any(|m| matches!(m, faucet_core::WriteMode::Upsert)),
-        overwrite: registry::sink_supports_overwrite(kind),
-        cleanup: registry::sink_supports_cleanup(kind),
-        schema_evolution: registry::sink_supports_schema_evolution(kind),
-        staged_load: registry::sink_supports_staged_load(kind),
-        rollback: crate::rollback::ROLLBACK_SINK_KINDS.contains(&kind),
+        upsert: caps.supports_write_mode(faucet_core::WriteMode::Upsert),
+        overwrite: caps.overwrite(),
+        cleanup: caps.cleanup(),
+        schema_evolution: caps.schema_evolution(),
+        staged_load: caps.staged_load(),
+        rollback: caps.rollback(),
         ..Capabilities::default()
     }
 }

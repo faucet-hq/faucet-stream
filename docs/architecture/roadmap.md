@@ -16,9 +16,11 @@ Today, connector capabilities (exactly-once, sharding, discovery, schema
 evolution) are defaulted boolean/methods on the `Source`/`Sink` traits (see
 [extensibility](./extensibility.md)). The direction is to formalize these as
 first-class, composable capability traits with a conformance story, so the
-runtime can reason about a connector's guarantees uniformly and the CLI gates
-become derivations rather than allowlists. Tracked in
-[RFC 0001](../../rfcs/0001-capability-traits.md).
+runtime can reason about a connector's guarantees uniformly. The first step has
+landed: connectors declare a `Capabilities` value and a static
+`ConnectorDescriptor`, and the CLI gates read those instead of allowlists
+([RFC 0013](../../rfcs/0013-structural-core-guarantees.md), which supersedes
+RFC 0001).
 
 ### Arrow-native record model / zero-copy execution
 The record model is `serde_json::Value` ([ADR 0004](../adr/0004-json-record-model.md)),

@@ -63,6 +63,12 @@ fn build_list_json() -> serde_json::Value {
                 let mut obj = serde_json::json!({ "name": name, "description": desc });
                 if let Some(is_source) = is_source {
                     obj["tier"] = serde_json::json!(tier_for(name, is_source).label());
+                    let caps = if is_source {
+                        crate::registry::source_kind_capabilities(name)
+                    } else {
+                        crate::registry::sink_kind_capabilities(name)
+                    };
+                    obj["capabilities"] = serde_json::to_value(caps).unwrap_or_default();
                 }
                 obj
             })
@@ -199,6 +205,24 @@ mod tests {
             v["sources"][0].get("tier").is_some(),
             "source entries should carry a tier"
         );
+        // Every connector entry carries its declared capabilities (#876).
+        let jsonl = v["sinks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "jsonl")
+            .unwrap();
+        assert_eq!(
+            jsonl["capabilities"]["write_modes"],
+            serde_json::json!(["append"])
+        );
+        let rest = v["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "rest")
+            .unwrap();
+        assert_eq!(rest["capabilities"]["exactly_once"], false);
         // State stores always include the built-in memory + file backends.
         let stores: Vec<String> = v["state_stores"]
             .as_array()

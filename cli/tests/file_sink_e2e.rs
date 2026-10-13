@@ -127,9 +127,10 @@ fn the_registry_knows_the_file_sink() {
             .get("path")
             .is_some()
     );
-    assert!(registry::sink_supports_overwrite("file"));
+    let caps = registry::sink_capabilities("file", &json!({"path": "x.jsonl"}));
+    assert!(caps.overwrite());
     assert_eq!(
-        registry::sink_supported_write_modes("file"),
+        caps.write_modes(),
         &[WriteMode::Append, WriteMode::Overwrite]
     );
     assert_eq!(

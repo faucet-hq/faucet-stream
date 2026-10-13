@@ -306,8 +306,8 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         // per-table config a discovered table would get (#731).
         if let Some(tables) = &compiled.tables {
             for node in nodes.iter_mut() {
-                let upsert = crate::registry::sink_supported_write_modes(&node.sink.kind)
-                    .contains(&faucet_core::WriteMode::Upsert);
+                let upsert = crate::registry::sink_kind_capabilities(&node.sink.kind)
+                    .supports_write_mode(faucet_core::WriteMode::Upsert);
                 if let Some(sample) = crate::replication::tables::sample_sink_config(
                     &tables.spec,
                     &node.sink.kind,
@@ -708,7 +708,7 @@ pub(crate) fn config_writes_by_key(kind: &str, config: &serde_json::Value) -> bo
         return false;
     };
     spec.dedups_by_key()
-        && crate::registry::sink_supported_write_modes(kind).contains(&spec.write_mode)
+        && crate::registry::sink_capabilities(kind, config).supports_write_mode(spec.write_mode)
 }
 
 /// Compile every row's transform chain.

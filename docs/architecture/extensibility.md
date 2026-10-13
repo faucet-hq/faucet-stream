@@ -40,6 +40,17 @@ through "does this keep the barrier to a third-party connector low?"
   `faucet_cli::run_main(PluginRegistry::with_builtins().register_source(...).register_sink(...))`;
   the registry is consulted before built-ins by `build_source`/`build_sink`/
   `source_schema`/`sink_schema`. Example: `cli/examples/custom-cli/`.
+- **Declared capabilities** (`crates/core/src/capabilities.rs`, RFC 0013) — a
+  connector declares what it can do as a `Capabilities` value: through
+  `Source::capabilities` / `Sink::capabilities` on a built connector (defaulted,
+  derived from the per-capability methods), and through a static
+  `ConnectorDescriptor { kind, fn(&Value) -> Capabilities }` that answers from
+  the config alone. Every load-time gate reads the descriptor
+  (`registry::source_capabilities` / `sink_capabilities`) — there are no
+  per-kind allowlists in the CLI — so a plugin registered with
+  `register_source_described` / `register_sink_described` is gated exactly like
+  a built-in. `faucet_conformance::assert_descriptor_matches_*` pins the
+  descriptor to the built connector.
 
 ## Capability model
 
@@ -79,8 +90,11 @@ that keeps the trait small while the runtime grows.
 ## Trade-offs
 
 - **Defaulted-method capabilities** mean a capability is invisible unless queried;
-  the CLI's expand-time gates (`registry::source_supports_exactly_once`, etc.)
-  bridge the gap by validating capability requirements before a run.
+  each connector's static `ConnectorDescriptor` answers them from the config
+  alone, so the CLI's expand-time gates (`registry::source_capabilities` /
+  `sink_capabilities`) validate capability requirements before a run — for
+  built-ins and plugins alike. Which features compose with which write path is
+  one table, `faucet_core::compat` ([Feature compatibility](../book/src/reference/compatibility.md)).
 - **`serde_json::Value` record model** keeps authoring trivial at an allocation
   cost — see [performance](./performance.md) and
   [ADR 0004](../adr/0004-json-record-model.md).

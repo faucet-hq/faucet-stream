@@ -76,7 +76,7 @@ fn the_registry_knows_the_file_source() {
             .get("path")
             .is_some()
     );
-    assert!(registry::source_supports_discover("file"));
+    assert!(registry::source_capabilities("file", &serde_json::json!({"path": "x"})).discover());
 }
 
 #[tokio::test]

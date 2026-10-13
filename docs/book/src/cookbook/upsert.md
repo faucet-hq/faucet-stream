@@ -448,7 +448,8 @@ transaction of `DELETE FROM target WHERE <scope>; INSERT INTO target SELECT *
 FROM staging;` — only the in-window rows are replaced; everything outside the
 window is preserved. The window is half-open `[from, to)`.
 
-**Supported sinks (v1):** `postgres`, `bigquery` (`SCOPED_OVERWRITE_SINK_KINDS`).
+**Supported sinks (v1):** `postgres`, `bigquery` — the sinks that declare the
+`scoped_overwrite` capability (`faucet list --json`).
 The other overwrite sinks still support **full** overwrite; scoped overwrite on
 them (and key-set scopes) is a follow-up. `scope` requires `write_mode:
 overwrite` and inherits the overwrite incompatibilities above.

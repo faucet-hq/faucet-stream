@@ -1358,7 +1358,7 @@ struct OverwriteGroup {
 /// its own).
 fn mark_overwrite_staging(kind: &str, cfg: &mut Value, grouped: bool) {
     if grouped
-        && crate::registry::sink_supports_direct_overwrite(kind)
+        && crate::registry::sink_capabilities(kind, cfg).direct_overwrite()
         && let Value::Object(map) = cfg
     {
         map.insert("_overwrite_staging".to_string(), Value::Bool(true));
@@ -1528,7 +1528,7 @@ fn resolved_sink_destination(unit: &Unit, opts: &ExecuteOptions) -> CliResult<Va
         && opts.limit.is_none()
         && opts.shard.is_none()
         && unit.node.state.is_some()
-        && crate::rollback::sink_supports_rollback(&unit.node.sink.kind)
+        && crate::rollback::sink_supports_rollback(&unit.node.sink.kind, &sink_cfg)
     {
         let column = crate::rollback::run_id_column(unit.node.metadata_columns.as_ref());
         crate::rollback::inject_write_spec(&mut sink_cfg, spec, "", &column);
@@ -2574,7 +2574,7 @@ async fn run_one_invocation(
         && opts.limit.is_none()
         && opts.shard.is_none()
         && node.state.is_some()
-        && crate::rollback::sink_supports_rollback(&node.sink.kind);
+        && crate::rollback::sink_supports_rollback(&node.sink.kind, &sink_cfg);
     let run_id_column = crate::rollback::run_id_column(node.metadata_columns.as_ref());
     if rollback_active && let Some(spec) = &opts.rollback {
         crate::rollback::inject_write_spec(&mut sink_cfg, spec, &run_id, &run_id_column);

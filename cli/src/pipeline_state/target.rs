@@ -80,7 +80,7 @@ impl PipelineTarget {
                 .into_iter()
                 .map(|(id, kind, config)| RowTarget {
                     atomic_watermark: atomic
-                        && crate::registry::sink_supports_idempotent_writes(&kind),
+                        && crate::registry::sink_capabilities(&kind, &config).idempotent_writes(),
                     overwrite: is_overwrite(&config),
                     id,
                     role: RowRole::TopologySink,

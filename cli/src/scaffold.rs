@@ -202,9 +202,9 @@ rustdoc-args = ["--cfg", "docsrs"]
         let role = self.kind.as_str();
         let config_ty = self.config_type();
         let conn_ty = self.connector_type();
-        let (trait_reexport, impl_mod) = match self.kind {
-            ConnectorKind::Source => ("Source", "stream"),
-            ConnectorKind::Sink => ("Sink", "sink"),
+        let (trait_reexport, impl_mod, default_caps) = match self.kind {
+            ConnectorKind::Source => ("Source", "stream", "plain_source"),
+            ConnectorKind::Sink => ("Sink", "sink", "append_only_sink"),
         };
         format!(
             r#"#![cfg_attr(docsrs, feature(doc_cfg))]
@@ -221,6 +221,12 @@ pub use faucet_core::{{FaucetError, {trait_reexport}}};
 
 pub use config::{config_ty};
 pub use {impl_mod}::{conn_ty};
+
+/// What this connector can do, answered from its config alone (RFC 0013): the
+/// load-time gates read it, and `tests/conformance.rs` pins it to the built
+/// connector. Replace the function as the connector gains capabilities.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("{name}", faucet_core::capabilities::{default_caps});
 "#
         )
     }
@@ -269,13 +275,20 @@ pub struct {config_ty} {{
 //! resumable, `assert_errors_not_panics` against a config that must fail.
 
 use faucet_conformance::{{
-    assert_config_schema_valid, assert_connector_name_nonempty, assert_preflight_check_wellformed,
+    assert_config_schema_valid, assert_connector_name_nonempty, assert_descriptor_matches_source,
+    assert_preflight_check_wellformed,
 }};
 use faucet_core::check::CheckContext;
-use {krate}::{{{config_ty}, {conn_ty}}};
+use {krate}::{{{config_ty}, {conn_ty}, DESCRIPTOR}};
 
 fn source() -> {conn_ty} {{
     {conn_ty}::new({config_ty} {{ example_setting: None }})
+}}
+
+#[test]
+fn conformance_descriptor_matches() {{
+    let config = faucet_core::serde_json::json!({{ "example_setting": null }});
+    assert_descriptor_matches_source(&DESCRIPTOR, "{name}", &config, &source());
 }}
 
 #[test]
@@ -305,14 +318,21 @@ async fn conformance_preflight_check_wellformed() {{
 
 use faucet_conformance::{{
     assert_batch_atomicity_declared, assert_config_schema_valid_value,
-    assert_connector_name_nonempty_value, assert_sink_preflight_check_wellformed,
+    assert_connector_name_nonempty_value, assert_descriptor_matches_sink,
+    assert_sink_preflight_check_wellformed,
 }};
 use faucet_core::check::CheckContext;
 use faucet_core::Sink;
-use {krate}::{{{config_ty}, {conn_ty}}};
+use {krate}::{{{config_ty}, {conn_ty}, DESCRIPTOR}};
 
 fn sink() -> {conn_ty} {{
     {conn_ty}::new({config_ty} {{ example_setting: None }})
+}}
+
+#[test]
+fn conformance_descriptor_matches() {{
+    let config = faucet_core::serde_json::json!({{ "example_setting": null }});
+    assert_descriptor_matches_sink(&DESCRIPTOR, "{name}", &config, &sink());
 }}
 
 #[test]
@@ -700,11 +720,13 @@ mod tests {
             assert!(conformance.contains(imports), "{conformance}");
             assert!(
                 conformance.contains(&format!(
-                    "use {}::{{{conn}Config, {conn}}};",
+                    "use {}::{{{conn}Config, {conn}, DESCRIPTOR}};",
                     crate_name.replace('-', "_")
                 )),
                 "{conformance}"
             );
+            assert!(conformance.contains("assert_descriptor_matches_"));
+            assert!(file("src/lib.rs").contains("pub const DESCRIPTOR"));
             assert!(conformance.contains("example_setting: None"));
             assert!(conformance.contains("cargo test --test conformance"));
             assert!(file("Cargo.toml").contains("faucet-conformance = \"1\""));

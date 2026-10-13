@@ -74,6 +74,7 @@
 - [Connector catalog](./reference/connectors.md)
 - [Connector conformance & tiers](./reference/conformance.md)
 - [Connector capability matrix](./reference/capability-matrix.md)
+- [Feature compatibility](./reference/compatibility.md)
 - [Choosing a connector](./reference/choosing.md)
 - [CLI commands](./reference/cli.md)
 - [Template Hub — source × sink matrix](./reference/template-hub-matrix.md)

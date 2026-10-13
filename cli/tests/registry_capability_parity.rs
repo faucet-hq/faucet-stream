@@ -1,17 +1,16 @@
-//! #465 Part 1 — cross-check the registry capability *allowlists* against the
-//! trait methods on a real, built connector, so the two can never silently
-//! drift.
+//! #465 Part 1 / #876 — cross-check the static `ConnectorDescriptor` each
+//! connector registers against the `capabilities()` of a real, built connector,
+//! so the two can never silently drift.
 //!
-//! The gates in `expand.rs` / `topology.rs` trust the hand-maintained allowlists
-//! in `registry.rs` (`IDEMPOTENT_SINK_KINDS`, `UPSERT_SINK_KINDS`,
-//! `SCHEMA_EVOLUTION_SINK_KINDS`, `EXACTLY_ONCE_SOURCE_KINDS`,
-//! `DISCOVER_SOURCE_KINDS`). The pipeline and each connector trust the trait
-//! methods (`Sink::supports_idempotent_writes` / `supported_write_modes` /
-//! `supports_schema_evolution`; `Source::supports_exactly_once` /
-//! `supports_discover`). If those two ever disagree the worst case is a run that
-//! passes the exactly-once gate but silently loses the guarantee — the worst bug
-//! class in this project. This test builds each connector and asserts
-//! allowlist == trait on every dimension.
+//! The gates in `expand.rs` / `topology.rs` trust the descriptor
+//! (`registry::source_capabilities` / `sink_capabilities`, answered from the
+//! config alone). The pipeline and each connector trust the built connector's
+//! `capabilities()` and the trait methods it derives from. If those two ever
+//! disagree the worst case is a run that passes the exactly-once gate but
+//! silently loses the guarantee — the worst bug class in this project. This
+//! test builds each connector from a synthesized config and asserts
+//! descriptor == built connector on every capability. Each connector crate's
+//! own `tests/conformance.rs` asserts the same for hand-picked configs.
 //!
 //! **Coverage model.** A connector whose `new()` opens a live connection eagerly
 //! (the sqlx `.connect()` sinks, tiberius, Spanner, the Iceberg catalog, the CDC
@@ -209,6 +208,7 @@ async fn probe_sink(kind: &'static str) -> bool {
     };
     let cfg = minimal_config(&format!("sink:{kind}"), &schema);
     let offline_atomicity = registry::sink_batch_atomicity(kind, &cfg);
+    let cfg_for_caps = cfg.clone();
     // Isolate construction in a task: a `new()` that *panics* (e.g. a reqwest
     // client hitting rustls' "no process-level CryptoProvider" when
     // `--all-features` pulls in two crypto backends) surfaces as a `JoinError`
@@ -225,21 +225,9 @@ async fn probe_sink(kind: &'static str) -> bool {
     };
 
     assert_eq!(
-        registry::sink_supports_idempotent_writes(kind),
-        sink.supports_idempotent_writes(),
-        "{kind}: IDEMPOTENT_SINK_KINDS ({}) disagrees with Sink::supports_idempotent_writes ({})",
-        registry::sink_supports_idempotent_writes(kind),
-        sink.supports_idempotent_writes(),
-    );
-    assert_eq!(
-        registry::sink_supports_schema_evolution(kind),
-        sink.supports_schema_evolution(),
-        "{kind}: SCHEMA_EVOLUTION_SINK_KINDS disagrees with Sink::supports_schema_evolution",
-    );
-    assert_eq!(
-        registry::sink_supported_write_modes(kind),
-        sink.supported_write_modes(),
-        "{kind}: sink_supported_write_modes() disagrees with Sink::supported_write_modes()",
+        registry::sink_capabilities(kind, &cfg_for_caps),
+        sink.capabilities(),
+        "{kind}: the registered descriptor disagrees with the built sink's capabilities()",
     );
     // #737: `faucet validate` decides `dlq_all` safety from the offline answer.
     assert_eq!(
@@ -281,6 +269,7 @@ async fn probe_source(kind: &'static str) -> bool {
         return false;
     };
     let cfg = minimal_config(&format!("source:{kind}"), &schema);
+    let cfg_for_caps = cfg.clone();
     // See `probe_sink` — construction is isolated so a panic in `new()` skips
     // rather than fails; drift assertions stay outside the task.
     let build = tokio::spawn(async move {
@@ -293,14 +282,9 @@ async fn probe_source(kind: &'static str) -> bool {
     };
 
     assert_eq!(
-        registry::source_supports_exactly_once(kind),
-        source.supports_exactly_once(),
-        "{kind}: EXACTLY_ONCE_SOURCE_KINDS disagrees with Source::supports_exactly_once",
-    );
-    assert_eq!(
-        registry::source_supports_discover(kind),
-        source.supports_discover(),
-        "{kind}: DISCOVER_SOURCE_KINDS disagrees with Source::supports_discover",
+        registry::source_capabilities(kind, &cfg_for_caps),
+        source.capabilities(),
+        "{kind}: the registered descriptor disagrees with the built source's capabilities()",
     );
     true
 }
@@ -353,29 +337,68 @@ async fn source_allowlists_match_trait_methods() {
     }
 }
 
-/// The derived capability helpers must agree with their base allowlists for
-/// every allowlist member — a pure, instance-free consistency check that also
-/// covers the connect-required connectors the offline probes skip.
+/// The kind-level view (`ConnectorDescriptor::kind_capabilities`) lists every
+/// capability some config enables, so it must include whatever a synthesized
+/// config declares — covering the connect-required connectors the offline
+/// probes skip.
 #[test]
-fn derived_capability_helpers_agree_with_allowlists() {
-    for kind in registry::IDEMPOTENT_SINK_KINDS {
-        assert!(registry::sink_supports_idempotent_writes(kind), "{kind}");
-        assert_eq!(
-            registry::sink_guarantee(kind),
-            faucet_core::SinkGuarantee::AtomicWatermark,
-            "{kind}: idempotent sink must derive AtomicWatermark"
-        );
+fn kind_capabilities_cover_every_config() {
+    fn flags(c: &faucet_core::Capabilities) -> Vec<(&'static str, bool)> {
+        vec![
+            ("idempotent_writes", c.idempotent_writes()),
+            ("keyed_upsert", c.keyed_upsert()),
+            ("cleanup", c.cleanup()),
+            ("rollback", c.rollback()),
+            ("schema_evolution", c.schema_evolution()),
+            ("scoped_overwrite", c.scoped_overwrite()),
+            ("direct_overwrite", c.direct_overwrite()),
+            ("staged_load", c.staged_load()),
+            ("exactly_once", c.exactly_once()),
+            ("discover", c.discover()),
+            ("shardable", c.shardable()),
+            ("range_read", c.range_read()),
+            ("range_digest", c.range_digest()),
+            ("reports_lag", c.reports_lag()),
+            ("columnar", c.columnar()),
+            ("native", c.native()),
+        ]
     }
-    for kind in registry::UPSERT_SINK_KINDS {
+    let check = |kind: &str,
+                 kind_caps: faucet_core::Capabilities,
+                 caps: faucet_core::Capabilities| {
         assert!(
-            registry::sink_supported_write_modes(kind).contains(&faucet_core::WriteMode::Upsert),
-            "{kind}: UPSERT_SINK_KINDS member must advertise Upsert"
+            !kind_caps.keyed_dedup(),
+            "{kind}: keyed_dedup is config-only"
+        );
+        for m in caps.write_modes() {
+            assert!(
+                kind_caps.supports_write_mode(*m),
+                "{kind}: write mode {m:?}"
+            );
+        }
+        for ((name, at_kind), (_, at_config)) in flags(&kind_caps).into_iter().zip(flags(&caps)) {
+            assert!(
+                at_kind || !at_config,
+                "{kind}: {name} at config but not at kind level"
+            );
+        }
+    };
+    for kind in registry::sink_kinds() {
+        let schema = registry::sink_schema(kind).expect("schema");
+        let cfg = minimal_config(&format!("sink:{kind}"), &schema);
+        check(
+            kind,
+            registry::sink_kind_capabilities(kind),
+            registry::sink_capabilities(kind, &cfg),
         );
     }
-    for kind in registry::EXACTLY_ONCE_SOURCE_KINDS {
-        assert!(registry::source_supports_exactly_once(kind), "{kind}");
-    }
-    for kind in registry::DISCOVER_SOURCE_KINDS {
-        assert!(registry::source_supports_discover(kind), "{kind}");
+    for kind in registry::source_kinds() {
+        let schema = registry::source_schema(kind).expect("schema");
+        let cfg = minimal_config(&format!("source:{kind}"), &schema);
+        check(
+            kind,
+            registry::source_kind_capabilities(kind),
+            registry::source_capabilities(kind, &cfg),
+        );
     }
 }

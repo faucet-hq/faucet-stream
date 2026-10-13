@@ -43,14 +43,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Source kinds whose `apply_shard` narrows a query to a PK range, so the
-/// verifier can read one key range at a time. Mirrors the PK-range shardable
-/// sources (#230/#262).
-pub const RANGE_READ_SOURCE_KINDS: &[&str] = &["postgres", "mysql", "sqlite", "mssql"];
-
-/// Whether a source kind can read one integer-key range at a time.
-pub fn source_reads_ranges(kind: &str) -> bool {
-    RANGE_READ_SOURCE_KINDS.contains(&kind)
+/// Whether a source configured this way reads one integer-key range at a
+/// time through `apply_shard` — its declared `range_read` capability.
+pub fn source_reads_ranges(kind: &str, config: &Value) -> bool {
+    crate::registry::source_capabilities(kind, config).range_read()
 }
 
 /// Per-invocation inputs for [`verify`].
@@ -186,8 +182,9 @@ pub async fn verify_node(
     // key's type is only known to the backend: planning the ranges casts its
     // bounds to an integer, so a text / uuid key fails there and the row is
     // compared in full instead.
-    let mut range_mode =
-        key.len() == 1 && source_reads_ranges(&node.source.kind) && source_reads_ranges(&dest_kind);
+    let mut range_mode = key.len() == 1
+        && source_reads_ranges(&node.source.kind, &source_cfg)
+        && source_reads_ranges(&dest_kind, &dest_cfg);
     if range_mode
         && let Ok(Some(schema)) = sink.current_schema().await
         && !key_is_integer(&schema, &key[0])
@@ -664,8 +661,8 @@ async fn repair_node(
     allow_delete: bool,
     inputs: &VerifyInputs,
 ) -> CliResult<(u64, u64)> {
-    if !crate::registry::sink_supported_write_modes(&node.sink.kind)
-        .contains(&faucet_core::WriteMode::Upsert)
+    if !crate::registry::sink_capabilities(&node.sink.kind, &node.sink.config)
+        .supports_write_mode(faucet_core::WriteMode::Upsert)
     {
         return Err(CliError::Config(format!(
             "verify --repair: sink '{}' does not support keyed writes (write_mode: upsert), so \
@@ -846,10 +843,10 @@ mod tests {
     }
 
     #[test]
-    fn range_read_allowlist() {
-        assert!(source_reads_ranges("postgres"));
-        assert!(source_reads_ranges("sqlite"));
-        assert!(!source_reads_ranges("csv"));
+    fn range_read_is_a_declared_capability() {
+        #[cfg(feature = "source-sqlite")]
+        assert!(source_reads_ranges("sqlite", &json!({})));
+        assert!(!source_reads_ranges("no-such-source", &json!({})));
         let a = ServerDigest {
             algorithm: "x".into(),
             rows: 1,

@@ -26,13 +26,6 @@ use crate::expand::{ExpandedNode, NodeRole};
 use crate::params::{BindMode, SuppliedParams};
 use crate::select::{Resolution, RowDecision, SelectionRequest};
 
-/// Source kinds that can split one read across workers (`Source::is_shardable`
-/// overrides; PK-range for the SQL sources needs `shard: { key }` config).
-pub const SHARDABLE_SOURCE_KINDS: &[&str] = &[
-    "dynamodb", "file", "gcs", "iceberg", "kafka", "mssql", "mysql", "oracle", "parquet",
-    "postgres", "s3", "spanner", "sqlite",
-];
-
 /// Transform kinds that change which field names reach the sink.
 const RENAMING_TRANSFORMS: &[&str] = &["rename_field", "rename_keys", "keys_case", "flatten"];
 /// Transform kinds that remove fields.
@@ -313,16 +306,17 @@ fn replication_of(config: &Value) -> Replication {
 fn read_of(node: &ExpandedNode) -> RowRead {
     let kind = node.source.kind.as_str();
     let replication = replication_of(&node.source.config);
-    let bookmarks = replication.method == "incremental"
-        || crate::registry::EXACTLY_ONCE_SOURCE_KINDS.contains(&kind)
-        || crate::registry::source_reports_lag(kind);
+    let kind_caps = crate::registry::source_kind_capabilities(kind);
+    let bookmarks =
+        replication.method == "incremental" || kind_caps.exactly_once() || kind_caps.reports_lag();
     let durable = node.state.as_ref().is_some_and(|s| s.kind != "memory");
     RowRead {
         source_kind: kind.to_string(),
         replication,
         resumable: bookmarks && durable,
-        shardable: SHARDABLE_SOURCE_KINDS.contains(&kind),
-        supports_discover: crate::registry::source_supports_discover(kind),
+        shardable: kind_caps.shardable(),
+        supports_discover: crate::registry::source_capabilities(kind, &node.source.config)
+            .discover(),
     }
 }
 
@@ -364,7 +358,7 @@ fn shape_of(node: &ExpandedNode) -> RowShape {
 fn guarantees_of(node: &ExpandedNode, mode: WriteMode) -> RowGuarantees {
     RowGuarantees {
         delivery_guarantee: node.delivery_guarantee.to_string(),
-        cleanup_capable: crate::registry::sink_supports_cleanup(&node.sink.kind)
+        cleanup_capable: crate::registry::sink_kind_capabilities(&node.sink.kind).cleanup()
             && mode == WriteMode::Upsert,
     }
 }
@@ -513,7 +507,9 @@ pub fn rows_for_pipeline(doc: &Value) -> CliResult<PipelineRows> {
         let sink = named_or_single("sinks", "sink", sink_ref);
         let shared = pipeline.get("transforms").cloned().unwrap_or(Value::Null);
         let mode = sink_write_mode(&n.sink.config);
-        let offered = crate::registry::sink_supported_write_modes(&n.sink.kind).to_vec();
+        let offered = crate::registry::sink_kind_capabilities(&n.sink.kind)
+            .write_modes()
+            .to_vec();
         let supported = offered.contains(&mode);
         meta.insert(
             n.id.clone(),
@@ -596,7 +592,8 @@ pub fn rows_for_source(
     let mut composed = None;
     if let Some(sink) = sink {
         sink.validate()?;
-        let supported = crate::registry::sink_supported_write_modes(&sink.sink.kind);
+        let caps = crate::registry::sink_kind_capabilities(&sink.sink.kind);
+        let supported = caps.write_modes();
         let aliases = sink.aliases();
         offered = supported.to_vec();
         let truncates = sink.truncates_per_invocation();

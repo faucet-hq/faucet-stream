@@ -97,7 +97,7 @@ pub fn deprecated_spellings(doc: &Value) -> Vec<String> {
 }
 
 /// Sink kinds on the shared file writer, whose `mode` became `if_exists`.
-const FILE_WRITER_SINK_KINDS: &[&str] = &["file", "s3", "gcs", "azure-blob", "sftp"];
+const FILE_WRITER_KINDS: &[&str] = &["file", "s3", "gcs", "azure-blob", "sftp"];
 
 /// `if_exists` values renamed with it: `(old, new)`.
 const IF_EXISTS_RENAMES: &[(&str, &str)] =
@@ -151,7 +151,7 @@ fn file_sink_spellings(doc: &Value, out: &mut BTreeSet<String>) {
             (s, kind)
         }));
     for (sink, kind) in kinds {
-        let Some(kind) = kind.filter(|k| FILE_WRITER_SINK_KINDS.contains(&k.as_str())) else {
+        let Some(kind) = kind.filter(|k| FILE_WRITER_KINDS.contains(&k.as_str())) else {
             continue;
         };
         let Some(cfg) = sink.get("config").and_then(Value::as_object) else {
