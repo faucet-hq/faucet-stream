@@ -43,6 +43,14 @@ async fn oracle_sink_end_to_end() {
     let sink = OracleSink::new(OracleSinkConfig::new(conn.clone(), "EVENTS"))
         .await
         .expect("sink");
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "oracle",
+        ),
+    ));
     let n = sink
         .write_batch(&[
             json!({"ID": 1, "NAME": "a", "AMOUNT": 1.5, "OK": true, "DOC": {"x": 1}}),

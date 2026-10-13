@@ -53,6 +53,14 @@ async fn oracle_query_source_end_to_end() {
     cfg.json_columns = vec!["DOC".into()];
     cfg.batch_size = 2;
     let source = OracleSource::new(cfg).await.expect("source");
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "oracle",
+        ),
+    ));
     let pages = drain(&source).await;
     let rows: Vec<Value> = pages.iter().flat_map(|p| p.records.clone()).collect();
     assert_eq!(rows.len(), 3);
