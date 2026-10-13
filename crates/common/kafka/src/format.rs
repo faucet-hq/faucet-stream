@@ -22,10 +22,11 @@ pub enum KafkaValueFormat {
     ConfluentAvro {
         schema_registry: crate::SchemaRegistryConfig,
         /// How the sink reads a JSON string for an Avro `bytes` / `fixed`
-        /// field: `hex` (default — the shape the Kafka source decodes those
-        /// fields to, so records round-trip) or `utf8` (the string's UTF-8
-        /// bytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte
-        /// numbers is accepted either way. Ignored by the source.
+        /// field: `base64` (default — the shape the Kafka source decodes those
+        /// fields to, so records round-trip), `hex` (the source's rendering
+        /// before #885) or `utf8` (the string's UTF-8 bytes, the reading before
+        /// faucet-common-kafka 1.1.1). A JSON array of byte numbers is accepted
+        /// either way. Ignored by the source.
         #[serde(default)]
         bytes_encoding: faucet_core::file_format::avro::BytesText,
     },

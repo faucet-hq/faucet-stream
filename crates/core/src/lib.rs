@@ -40,6 +40,7 @@ pub mod drift;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;
+pub mod fidelity;
 pub mod file_format;
 pub mod forward;
 pub mod governance;
@@ -146,6 +147,7 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
 pub use error::FaucetError;
+pub use fidelity::{FidelityError, NonFiniteCounter, TimePrecision};
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
     AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, CsvUnknownField, ExcelOptions,

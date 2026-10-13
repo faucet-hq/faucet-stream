@@ -46,7 +46,7 @@ pub async fn encode(
     schema_text: &str,
     value: &Value,
 ) -> Result<Vec<u8>, FaucetError> {
-    encode_with(client, subject, schema_text, value, BytesText::Hex).await
+    encode_with(client, subject, schema_text, value, BytesText::default()).await
 }
 
 /// [`encode`] with an explicit reading of JSON strings for `bytes` / `fixed`
@@ -70,7 +70,7 @@ pub async fn encode_with(
 
 /// Convert an `AvroValue` to JSON against its writer schema, with the same
 /// logical-type mapping as the Avro file format (#789 MSG-27): `decimal` as an
-/// exact decimal string, `bytes`/`fixed` as hex, `date`/`time`/`timestamp` as
+/// exact decimal string, `bytes`/`fixed` as base64, `date`/`time`/`timestamp` as
 /// ISO 8601 strings. apache-avro's generic conversion turned these into int
 /// arrays and day numbers.
 fn avro_to_json(v: &AvroValue, codec: &AvroDatumCodec) -> Result<Value, FaucetError> {
