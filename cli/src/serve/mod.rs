@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod observability;
 pub mod preview;
 pub mod rbac;
+pub mod references;
 pub mod registry;
 pub mod runner;
 pub mod server;

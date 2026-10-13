@@ -44,6 +44,7 @@ pub struct JobRequest {
     /// Required for `submit`. For `fetch`, set **exactly one** of `url` (a fixed
     /// template) or [`url_from`](Self::url_from) (a JSONPath into the poll body).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: Option<String>,
     /// `fetch` only (#543): resolve the download URL from the **last poll
     /// response body** via JSONPath, instead of rendering [`url`](Self::url).
@@ -104,6 +105,7 @@ pub struct PollSpec {
     #[serde(default = "default_get")]
     pub method: String,
     /// Status URL — absolute or `base_url`-relative; `${job_id}` substituted.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
     /// Extra headers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

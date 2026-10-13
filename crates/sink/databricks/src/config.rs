@@ -35,6 +35,7 @@ pub struct DatabricksStagingConfig {
     /// `abfss://container@account.dfs.core.windows.net/prefix`. Cloud locations
     /// need the crate's `staging` feature and ambient cloud credentials for the
     /// upload.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub location: String,
     /// When staged files are deleted after a load. Default `always`.
     #[serde(default)]
@@ -86,6 +87,7 @@ pub const STATEMENT_TEXT_LIMIT: usize = 16 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DatabricksSinkConfig {
     /// Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub workspace_url: String,
     /// Target SQL warehouse id.
     pub warehouse_id: String,

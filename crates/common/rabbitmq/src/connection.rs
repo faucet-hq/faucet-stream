@@ -70,13 +70,16 @@ pub struct RabbitMqTls {
     /// PEM file of extra CA certificates to trust (in addition to the
     /// platform's native root store) — for brokers with a private CA.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub ca_cert_path: Option<PathBuf>,
     /// PEM client certificate for mutual TLS. Must be set together with
     /// `client_key_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub client_cert_path: Option<PathBuf>,
     /// PEM PKCS#8 private key for `client_cert_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub client_key_path: Option<PathBuf>,
 }
 
@@ -91,6 +94,7 @@ pub struct RabbitMqConnectionConfig {
     /// URL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive
     /// with `host`/`port`/`vhost`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: Option<String>,
     /// Broker host. Defaults to `127.0.0.1` when `url` is not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]

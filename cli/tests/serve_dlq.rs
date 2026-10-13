@@ -72,6 +72,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

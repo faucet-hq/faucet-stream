@@ -54,6 +54,7 @@ fn config(listen: &str) -> ServeConfig {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     ServeConfig::from_args(args).unwrap()
 }

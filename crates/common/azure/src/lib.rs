@@ -252,6 +252,7 @@ pub struct AzureConnection {
     pub auth: AzureCredentials,
     /// Custom blob endpoint (e.g. an Azurite emulator or a sovereign cloud).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: Option<String>,
     /// Permit plaintext HTTP (required for a local Azurite emulator).
     #[serde(default)]

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct CsvSinkConfig {
     /// Path to the output CSV file.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub path: String,
     /// Field delimiter byte. Defaults to `b','`.
     #[serde(default = "default_delimiter")]

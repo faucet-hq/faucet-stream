@@ -35,6 +35,7 @@ pub enum BigQueryCredentials {
     /// Path to a service account JSON key file.
     ServiceAccountKeyPath {
         /// Filesystem path to the service-account JSON key.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
     },
     /// Inline service account JSON key content.

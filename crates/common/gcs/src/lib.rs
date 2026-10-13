@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum GcsCredentials {
     /// Path to a service-account JSON key file on disk.
-    ServiceAccountJsonFile { path: String },
+    ServiceAccountJsonFile {
+        #[schemars(extend("x-faucet-resource" = "path"))]
+        path: String,
+    },
     /// Service-account JSON key as an inline string. Useful for
     /// environment-variable injection via `${env:GCP_SA_JSON}` in CLI
     /// configs.

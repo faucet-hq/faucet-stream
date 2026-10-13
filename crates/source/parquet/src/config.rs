@@ -136,7 +136,10 @@ impl ParquetSourceConfig {
 )]
 pub enum ParquetLocation {
     /// A single local file path.
-    LocalPath { path: String },
+    LocalPath {
+        #[schemars(extend("x-faucet-resource" = "path"))]
+        path: String,
+    },
 
     /// A local glob pattern that expands to zero or more files. All matched
     /// files must share the same Arrow schema.
@@ -174,6 +177,7 @@ pub struct ParquetS3Config {
 
     /// Custom endpoint URL for S3-compatible services (MinIO, LocalStack, …).
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
 }
 

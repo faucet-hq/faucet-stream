@@ -178,7 +178,10 @@ pub enum ParquetDestination {
     /// Local filesystem. `path` is either a file path ending in `.parquet`
     /// (single-file mode — only valid without rollover) or a directory; in
     /// directory mode each rolled-over file is named `<uuid>.parquet`.
-    LocalPath { path: String },
+    LocalPath {
+        #[schemars(extend("x-faucet-resource" = "path"))]
+        path: String,
+    },
     /// S3 bucket. Each written object is `<prefix><uuid>.parquet`.
     S3(ParquetS3Destination),
 }
@@ -201,6 +204,7 @@ pub struct ParquetS3Destination {
     pub region: Option<String>,
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO, LocalStack).
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`
     /// URL (e.g. for LocalStack).

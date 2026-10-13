@@ -30,6 +30,7 @@ pub enum RedisSinkType {
 #[serde(deny_unknown_fields)]
 pub struct RedisSinkConfig {
     /// Redis connection URL (e.g. `"redis://127.0.0.1:6379"`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
     /// The type of Redis data structure to write to.
     pub sink_type: RedisSinkType,

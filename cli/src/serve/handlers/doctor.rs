@@ -3,7 +3,6 @@
 //! probes pass, 422 with the report as `details` when any fail.
 
 use crate::serve::error::ServeError;
-use crate::serve::load::load_submission;
 use crate::serve::runner::{ConfigFormatWire, run_doctor_first};
 use crate::serve::state::ServerState;
 use axum::Json;
@@ -23,14 +22,9 @@ pub async fn doctor(
     State(state): State<ServerState>,
     Json(req): Json<DoctorRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = load_submission(
-        &req.config,
-        req.config_format.into(),
-        state.default_base().as_ref(),
-        crate::serve::runner::server_policy(&state).as_deref(),
-        state.caller_origin(),
-    )
-    .await?;
+    let loaded = state
+        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
+        .await?;
     let report = run_doctor_first(&state, &loaded).await?;
     Ok(Json(report))
 }

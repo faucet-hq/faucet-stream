@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct CsvSourceConfig {
     /// Path to the CSV file.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub path: String,
     /// Whether the file has a header row. Defaults to `true`.
     #[serde(default = "default_true")]

@@ -2008,6 +2008,52 @@ impl Default for LogBufferArgs {
     }
 }
 
+/// The reference policy for configs a client submits to `faucet serve`
+/// (#881). Anything not listed is refused; templates and the triggers file
+/// are not restricted.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct ReferenceArgs {
+    /// Directory a submitted config may read or write local files under
+    /// (connector paths and `${file:}`). Repeatable. Default: the server's
+    /// working directory and the system temp directory.
+    #[arg(long = "allow-path-root", value_name = "DIR")]
+    pub allow_path_root: Vec<PathBuf>,
+    /// URL scheme a submitted config may connect with (`https`, `postgres`,
+    /// …). Repeatable or comma-separated. Default: any scheme.
+    #[arg(
+        long = "allow-url-scheme",
+        value_name = "SCHEME",
+        value_delimiter = ','
+    )]
+    pub allow_url_scheme: Vec<String>,
+    /// Host a submitted config may connect to (`api.example.com`,
+    /// `*.example.com`). Repeatable or comma-separated. Default: any host
+    /// except link-local and cloud-metadata addresses, which are reachable
+    /// only when named here.
+    #[arg(long = "allow-url-host", value_name = "HOST", value_delimiter = ',')]
+    pub allow_url_host: Vec<String>,
+    /// Environment variable a submitted config may read through `${env:}` /
+    /// `${secret:}` (`NAME`, or `PREFIX*`). Repeatable or comma-separated.
+    /// Default: none. The server's own credential variables are never
+    /// readable.
+    #[arg(long = "allow-env", value_name = "NAME", value_delimiter = ',')]
+    pub allow_env: Vec<String>,
+    /// Secret-manager scheme a submitted config may resolve with the
+    /// server's credentials (`vault`, `aws-sm`, `gcp-sm`, `azure-kv`).
+    /// Repeatable or comma-separated. Default: none.
+    #[arg(
+        long = "allow-secret-scheme",
+        value_name = "SCHEME",
+        value_delimiter = ','
+    )]
+    pub allow_secret_scheme: Vec<String>,
+    /// Confine the local paths of a config submitted for a tenant to
+    /// `<DIR>/<tenant id>`.
+    #[arg(long = "tenant-path-root", value_name = "DIR")]
+    pub tenant_path_root: Option<PathBuf>,
+}
+
 /// `faucet serve` arguments.
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone, Parser)]
@@ -2278,6 +2324,10 @@ pub struct ServeArgs {
     /// tenant are refused regardless; registered templates are always allowed.
     #[arg(long)]
     pub allow_subprocess_connectors: bool,
+    /// What a config submitted over HTTP or MCP may reach (#881): the
+    /// `--allow-*` reference-policy flags.
+    #[command(flatten)]
+    pub references: ReferenceArgs,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless

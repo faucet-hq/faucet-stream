@@ -9,7 +9,7 @@ use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
 use crate::serve::history::{ClaimedShard, ShardInsert, ShardOutcome};
-use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission, load_submission_scoped};
+use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission};
 use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use crate::serve::{idempotency, metrics};
@@ -317,13 +317,14 @@ pub(crate) async fn load_for(
         None => None,
         Some(t) => Some(tenant_scope(state, t).await?),
     };
-    load_submission_scoped(
+    crate::serve::load::load_submission_with(
         body,
         format,
         state.default_base().as_ref(),
         server_policy(state).as_deref(),
         origin,
         scope,
+        &state.references(),
     )
     .await
 }
@@ -2244,7 +2245,7 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
     rec.elapsed_secs = elapsed;
     rec.records_written = records;
     rec.invocations = invs;
-    rec.error = error;
+    rec.error = error.map(|e| crate::secrets::registry::redact_message(&e));
     if state.cluster().enabled() {
         // Owner-fenced: if another instance reclaimed this run (lease expired),
         // our write is a no-op and we discard our result — the reclaimer is now
@@ -2632,6 +2633,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2729,6 +2731,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2816,6 +2819,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(
@@ -2946,6 +2950,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         // A backend that is degraded from startup (primary unreachable).
         let history = Arc::new(FallbackHistory::degraded_at_startup(
@@ -3064,6 +3069,7 @@ mod tests {
                 vault: None,
                 connect_providers_path: None,
                 allow_subprocess_connectors: false,
+                references: Default::default(),
             };
             ServerState::new(
                 &cfg,

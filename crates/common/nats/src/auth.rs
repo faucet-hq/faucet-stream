@@ -39,6 +39,7 @@ pub enum NatsAuth {
     /// NKey seed bundle as produced by `nsc`.
     CredsFile {
         /// Path to the `.creds` file.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: PathBuf,
     },
 }

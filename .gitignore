@@ -66,6 +66,7 @@ docs/superpowers/
 !/scripts/test_check_skills.py
 !/scripts/example-coverage.py
 !/scripts/example-coverage-allow.txt
+!/scripts/resource-annotation-allow.txt
 !/scripts/test_example_coverage.py
 !/scripts/plugin-version.py
 !/scripts/test_plugin_version.py

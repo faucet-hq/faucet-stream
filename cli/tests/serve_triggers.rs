@@ -51,6 +51,7 @@ fn test_config() -> ServeConfig {
         vault: None,
         connect_providers_path: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 
@@ -753,6 +754,7 @@ async fn spawn_serve_with_triggers(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

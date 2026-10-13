@@ -63,10 +63,12 @@ pub struct CatalogInner {
     /// For HMS: `thrift://hms:9083`.
     /// For SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub uri: Option<String>,
 
     /// Object-storage warehouse root, e.g. `s3://lake/warehouse`.
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub warehouse: Option<String>,
 
     /// REST bearer token or other catalog-specific credential.

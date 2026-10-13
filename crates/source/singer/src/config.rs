@@ -30,6 +30,7 @@ pub enum MalformedPolicy {
 pub struct SingerSourceConfig {
     /// The tap executable to run (looked up on `PATH`, or an absolute path),
     /// e.g. `tap-github` or `/opt/taps/tap-csv`.
+    #[schemars(extend("x-faucet-resource" = "command"))]
     pub executable: String,
 
     /// Extra positional/flag arguments appended after faucet's own

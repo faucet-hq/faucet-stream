@@ -47,10 +47,13 @@ pub enum KafkaAuth {
     /// SSL/TLS client-certificate authentication (path-based).
     Ssl {
         /// Path to the CA certificate file.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         ca_path: PathBuf,
         /// Path to the client certificate file.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         cert_path: PathBuf,
         /// Path to the client private key file.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         key_path: PathBuf,
         /// Optional passphrase for the private key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +74,7 @@ pub enum KafkaAuth {
     Tls {
         /// CA certificate file to trust; the system trust store when omitted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("x-faucet-resource" = "path"))]
         ca_path: Option<PathBuf>,
     },
 }

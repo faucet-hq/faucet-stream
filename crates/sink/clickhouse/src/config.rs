@@ -103,6 +103,7 @@ pub struct ClickHouseStagingConfig {
     /// Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /
     /// non-AWS stores. Overrides `region`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: Option<String>,
     /// Access key the ClickHouse server uses to **read** the staged objects
     /// (the `s3()`/`gcs()` credentials). Omit to rely on the server's own IAM /

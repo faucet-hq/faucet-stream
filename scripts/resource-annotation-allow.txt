@@ -1,0 +1,89 @@
+# Connector config fields whose name looks like an external resource but that
+# do not name one, so they carry no `x-faucet-resource` annotation (#881).
+# Checked by cli/tests/resource_annotations.rs: a field matching the resource
+# heuristic must be annotated or listed here. One entry per line:
+#   <source|sink>:<kind> <dotted.field.path>  # reason
+# `[]` marks an array element. Keep the reason: an entry without one is refused.
+
+# Remote object keys and remote paths (the host is the configured bucket/server).
+sink:azure-blob path  # object key template inside the configured container
+sink:gcs path  # object key template inside the configured bucket
+sink:s3 path  # object key template inside the configured bucket
+sink:sftp path  # remote path on the configured SFTP server
+source:sftp path  # remote path on the configured SFTP server
+
+# URL path segments and routes resolved against a checked base URL.
+source:rest path  # path appended to the checked `base_url`
+source:xml path  # path appended to the checked `base_url`
+source:webhook path  # HTTP route the source listens on
+
+# Names, not resources.
+sink:bigquery location  # dataset region
+source:bigquery location  # job region
+sink:clickhouse database  # database name on the checked `url`
+source:clickhouse database  # database name on the checked `url`
+sink:mongodb database  # database name on the checked `connection_uri`
+source:mongodb database  # database name on the checked `connection_uri`
+source:mongodb-cdc scope.database  # database name to watch
+sink:redshift database  # database name
+source:redshift database  # database name
+sink:snowflake database  # database name
+source:snowflake database  # database name
+sink:snowflake warehouse  # compute warehouse name
+source:snowflake warehouse  # compute warehouse name
+sink:spanner database  # Spanner database id
+source:spanner database  # Spanner database id
+source:mysql-cdc start_position.file  # binlog file name on the server
+
+# Connection strings in a non-URL syntax (key=value pairs).
+sink:azure-blob auth.config.connection_string  # storage account connection string
+source:azure-blob auth.config.connection_string  # storage account connection string
+sink:mssql connection_string  # ADO.NET connection string
+source:mssql connection_string  # ADO.NET connection string
+source:mssql-cdc connection_string  # ADO.NET connection string
+
+# PEM content, not a file path.
+source:graphql tls.client_cert  # inline PEM certificate
+source:rest tls.client_cert  # inline PEM certificate
+source:xml tls.client_cert  # inline PEM certificate
+
+# JSONPath / JSON-pointer expressions into a record or a response body.
+sink:kafka headers_path  # JSONPath into the record
+sink:kafka key_path  # JSONPath into the record
+sink:kafka partition_path  # JSONPath into the record
+sink:kafka topic.path  # JSONPath into the record
+sink:kinesis explicit_hash_key.path  # JSONPath into the record
+sink:kinesis partition_key.path  # JSONPath into the record
+sink:pubsub ordering_key.path  # JSONPath into the record
+source:graphql pagination.cursor_path  # JSONPath into the response
+source:graphql pagination.has_next_page_path  # JSONPath into the response
+source:graphql records_path  # JSONPath into the response
+source:graphql retry_on_response[].backoff_from.config.path  # JSONPath into the response
+source:graphql retry_on_response[].body_path  # JSONPath into the response
+source:grpc records_path  # path into the response message
+source:rest async_job.count.count_path  # JSONPath into the response
+source:rest async_job.count.records_path  # JSONPath into the response
+source:rest async_job.fetch.records_path  # JSONPath into the response
+source:rest async_job.query_path  # JSON pointer into the request body
+source:rest async_job.status.error_path  # JSONPath into the response
+source:rest async_job.status.path  # JSONPath into the response
+source:rest async_job.submit.records_path  # JSONPath into the response
+source:rest async_job.submit_errors.path  # JSONPath into the response
+source:rest auth.config.expiry_path  # JSONPath into the token response
+source:rest auth.config.token_path  # JSONPath into the token response
+source:rest decode[].parse.records_path  # JSONPath into the decoded body
+source:rest discovery.list.keep_if.path  # JSONPath into a listed item
+source:rest pagination.next_link_path  # JSONPath into the response
+source:rest pagination.next_token_path  # JSONPath into the response
+source:rest pagination.rows_path  # JSONPath into the response
+source:rest pagination.total_path  # JSONPath into the response
+source:rest records_multi[].path  # JSONPath into the response
+source:rest records_path  # JSONPath into the response
+source:rest replication_bind.path  # JSONPath into the record
+source:rest retry_on_response[].backoff_from.config.path  # JSONPath into the response
+source:rest retry_on_response[].body_path  # JSONPath into the response
+source:rest window.lower.path  # JSONPath into the record
+source:rest window.upper.path  # JSONPath into the record
+source:xml decode[].parse.records_path  # path into the decoded body
+source:xml pagination.next_token_path  # path into the response
+source:xml records_element_path  # path into the response

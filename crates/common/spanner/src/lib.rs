@@ -56,6 +56,7 @@ pub enum SpannerCredentials {
     /// Load a service-account key from a JSON file on disk.
     ServiceAccountKeyPath {
         /// Filesystem path to the service-account key JSON.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
     },
     /// Inline service-account key JSON (prefer `${vault:…}` / `${env:…}`

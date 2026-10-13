@@ -63,6 +63,7 @@ pub enum HttpBatchMode {
 #[serde(deny_unknown_fields)]
 pub struct HttpSinkConfig {
     /// Target endpoint URL.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
     /// HTTP method (default: POST).
     #[serde(with = "crate::serde_helpers::http_method", default = "default_method")]

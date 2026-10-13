@@ -24,6 +24,7 @@ pub mod protobuf;
 /// Confluent Schema Registry connection settings.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaRegistryConfig {
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<BasicAuth>,

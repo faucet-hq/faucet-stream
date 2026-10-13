@@ -92,6 +92,7 @@ pub struct RestStreamConfig {
     // ── Core request ──────────────────────────────────────────────────────────
     /// Base URL of the API, e.g. `https://api.example.com/v2`. Required. Joined
     /// with [`path`](Self::path); any trailing slash is handled either way.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub base_url: String,
     /// URL path, relative to `base_url`. May contain `{key}` placeholders that
     /// are substituted per-partition (e.g. `"/orgs/{org_id}/users"`).

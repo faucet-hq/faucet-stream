@@ -83,6 +83,7 @@ pub struct RedshiftCopySpec {
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO) — a testing
     /// aid; production loads use real S3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
 }
 
@@ -178,6 +179,7 @@ pub struct RedshiftSinkConfig {
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO) — testing
     /// aid; production loads use real S3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// Rows per load unit. For `insert`, the per-statement multi-row chunk size;
     /// for `copy`, the number of rows per staged S3 object. Defaults to

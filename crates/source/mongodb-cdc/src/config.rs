@@ -81,6 +81,7 @@ pub enum FullDocumentBeforeChange {
 #[serde(deny_unknown_fields)]
 pub struct MongoCdcSourceConfig {
     /// MongoDB connection URI. Must point at a replica set or sharded cluster.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_uri: String,
     /// Which change stream to open.
     #[serde(default)]
