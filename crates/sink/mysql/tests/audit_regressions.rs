@@ -152,6 +152,14 @@ async fn mysql_audit_regressions() {
     let sink = MysqlSink::new(config(&url, "ev", WriteMode::Append, &[]))
         .await
         .unwrap();
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "mysql",
+        ),
+    ));
     let err = sink
         .write_batch(&[json!({"user_id": 1})])
         .await
