@@ -159,3 +159,12 @@ parquet:
 ## Capabilities
 
 Columnar (with `arrow`) for `format: parquet`, and for `avro` / `orc` with their format features. Not shardable, discoverable or exactly-once. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+The SSH connection, the listing and every file read run through the
+pipeline's `CallContext` (#880): the run's cancel token stops a stalled read
+(a JSON Lines file is read through a reader bound to the context), any caller
+deadline ends it, and the connection, listing and file reads are metered as
+round trips (`connect`, `list`, `get`). The connection's own connect timeout is
+unchanged.

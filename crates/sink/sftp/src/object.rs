@@ -38,6 +38,8 @@ pub(crate) struct SftpObjects {
     /// Use `posix-rename` when the server has it (off only in tests, to
     /// cover the plain-`RENAME` fallback against a server that has it).
     posix_rename: bool,
+    /// The run's call context (#880): every operation runs through it, once.
+    pub calls: Arc<faucet_core::CallSlot>,
 }
 
 fn err(what: &str, path: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -95,6 +97,11 @@ impl SftpObjects {
             session: Mutex::new(None),
             dirs: Mutex::new(HashSet::new()),
             posix_rename: true,
+            calls: Arc::new(faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            )),
         }
     }
 
@@ -179,6 +186,39 @@ impl ObjectClient for SftpObjects {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        self.calls.call_once("list", self.list_now(prefix)).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
+        self.calls.call_once("head", self.exists_now(key)).await
+    }
+
+    async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
+        self.calls
+            .call_once("get", self.download_now(key, to))
+            .await
+    }
+
+    async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
+        self.calls
+            .call_once("put", self.upload_now(from, key))
+            .await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+        self.calls.call_once("delete", self.delete_now(key)).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), FaucetError> {
+        self.calls
+            .call_once("copy", self.rename_now(from, to))
+            .await
+    }
+}
+
+/// The operations behind [`ObjectClient`], each run as one call.
+impl SftpObjects {
+    async fn list_now(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
         let conn = self.connection().await?;
         let (dir, start) = split_prefix(prefix);
         let entries = match conn.session().read_dir(dir.as_str()).await {
@@ -197,7 +237,7 @@ impl ObjectClient for SftpObjects {
             .collect())
     }
 
-    async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
+    async fn exists_now(&self, key: &str) -> Result<bool, FaucetError> {
         let conn = self.connection().await?;
         conn.session()
             .try_exists(key)
@@ -205,7 +245,7 @@ impl ObjectClient for SftpObjects {
             .map_err(|e| err("stat", key, e))
     }
 
-    async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
+    async fn download_now(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
         let conn = self.connection().await?;
         let remote = conn
             .session()
@@ -222,7 +262,7 @@ impl ObjectClient for SftpObjects {
         local.flush().await.map_err(|e| err("download", key, e))
     }
 
-    async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
+    async fn upload_now(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
         let conn = self.connection().await?;
         if let Some(dir) = parent(key) {
             self.create_dirs(&conn, dir).await?;
@@ -258,7 +298,7 @@ impl ObjectClient for SftpObjects {
         result
     }
 
-    async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+    async fn delete_now(&self, key: &str) -> Result<(), FaucetError> {
         let conn = self.connection().await?;
         match conn.session().remove_file(key).await {
             Ok(()) => Ok(()),
@@ -266,7 +306,7 @@ impl ObjectClient for SftpObjects {
         }
     }
 
-    async fn rename(&self, from: &str, to: &str) -> Result<(), FaucetError> {
+    async fn rename_now(&self, from: &str, to: &str) -> Result<(), FaucetError> {
         let conn = self.connection().await?;
         if let Some(dir) = parent(to) {
             self.create_dirs(&conn, dir).await?;

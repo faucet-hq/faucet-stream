@@ -34,6 +34,7 @@ impl SftpSink {
             base
         };
         let objects = Arc::new(SftpObjects::new(config.connection.clone()));
+        let calls = objects.calls.clone();
         let backend = RemoteBackend::new(
             objects,
             base,
@@ -49,6 +50,7 @@ impl SftpSink {
                 config.connection.port,
                 config.path.trim_start_matches('/')
             ),
+            calls,
         };
         Ok(Self {
             inner: WriterSink::new(writer, identity),
@@ -66,6 +68,7 @@ faucet_common_file::delegate_sink!(SftpSink, inner);
 /// What the SFTP sink supplies to the shared sink.
 struct SftpIdentity {
     dataset_uri: String,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 #[faucet_core::async_trait]
@@ -81,6 +84,14 @@ impl SinkIdentity for SftpIdentity {
 
     fn dataset_uri(&self) -> String {
         self.dataset_uri.clone()
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
     }
 }
 
