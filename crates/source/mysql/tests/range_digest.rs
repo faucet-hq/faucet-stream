@@ -63,6 +63,17 @@ async fn range_digest_reflects_content_and_bounds() {
     ))
     .await
     .unwrap();
+    let caps = a.capabilities();
+    assert!(caps.range_read() && caps.range_digest());
+    a.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "mysql",
+        ),
+    ));
+
     let da = a
         .range_digest(&KeyRange::ALL, "id", &cols)
         .await

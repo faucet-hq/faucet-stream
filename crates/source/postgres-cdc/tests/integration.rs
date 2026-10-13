@@ -101,6 +101,14 @@ async fn insert_round_trip() {
     let source = PostgresCdcSource::new(cfg(&url, "faucet_slot", "faucet_pub"))
         .await
         .expect("source");
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "postgres-cdc",
+        ),
+    ));
 
     // Warm-up fetch: creates the slot, idle_timeout drains 0 records.
     let _ = source.fetch_all_incremental().await.expect("warm-up");

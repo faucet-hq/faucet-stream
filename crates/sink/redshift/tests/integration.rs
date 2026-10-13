@@ -502,3 +502,191 @@ async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
     assert_eq!(row_count(&pool, "events").await, 3);
     pool.close().await;
 }
+
+/// With `schema:` set, `create_table` creates the schema before the table,
+/// and every statement is metered on the installed round-trip recorder.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_table_creates_the_schema_and_meters_round_trips() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    let mut cfg = insert_config(port, "events", 1000);
+    cfg.schema = Some("landing".into());
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "redshift",
+        )
+        .with_meter(meter.clone()),
+    ));
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write");
+    sink.flush().await.expect("flush");
+    assert_eq!(row_count(&pool, "landing.events").await, 1);
+    let trips = meter.snapshot().sink_roundtrips;
+    assert!(
+        trips.get("execute").is_some_and(|n| *n >= 3),
+        "CREATE SCHEMA, CREATE TABLE and INSERT are metered: {trips:?}"
+    );
+    pool.close().await;
+}
+
+/// A field another writer already added as a column is accepted: the failed
+/// `ADD COLUMN` is re-checked against the table and the write goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_another_writer_added_first_is_accepted() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let sink = RedshiftSink::new(insert_config(port, "events", 1000))
+        .await
+        .expect("sink builds");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("first");
+    sink.flush().await.expect("flush");
+    sqlx::query("ALTER TABLE events ADD COLUMN extra TEXT")
+        .execute(&pool)
+        .await
+        .expect("concurrent add");
+    sink.write_batch(&[json!({"id": 2, "extra": "x"})])
+        .await
+        .expect("the concurrently added column is used");
+    sink.flush().await.expect("flush");
+    let extra: Option<String> = sqlx::query_scalar("SELECT extra FROM events WHERE id = 2")
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
+    assert_eq!(extra.as_deref(), Some("x"));
+    pool.close().await;
+}
+
+/// An `ADD COLUMN` that fails for any other reason fails the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_add_column_fails_the_write() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    for sql in [
+        "CREATE TABLE events (id BIGINT)",
+        "CREATE ROLE writer LOGIN PASSWORD 'writer'",
+        "GRANT CREATE ON SCHEMA public TO writer",
+        "GRANT SELECT, INSERT ON events TO writer",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    // A role that may insert but does not own the table cannot ALTER it.
+    let mut cfg = insert_config(port, "events", 1000);
+    cfg.connection = RedshiftConnection::new("127.0.0.1", "postgres", "writer", "writer");
+    cfg.connection.port = port;
+    cfg.connection.tls = false;
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+    let err = sink
+        .write_batch(&[json!({"id": 2, "extra": "x"})])
+        .await
+        .expect_err("the column cannot be added");
+    assert!(err.to_string().contains("ADD COLUMN failed"), "{err}");
+    pool.close().await;
+}
+
+/// An `ADD COLUMN` blocked past the call deadline ends the write with that
+/// timeout instead of being mistaken for a concurrent add.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_add_column_times_out() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let sink = RedshiftSink::new(insert_config(port, "events", 1000))
+        .await
+        .expect("sink builds");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("first");
+    sink.flush().await.expect("flush");
+    let mut lock = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE events IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock");
+    // The sink sets no per-attempt timeout of its own, so the run's deadline
+    // is what bounds the statement.
+    sink.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(1500)),
+    );
+    let err = sink
+        .write_batch(&[json!({"id": 2, "extra": "x"})])
+        .await
+        .expect_err("the blocked ALTER runs out of time");
+    assert!(
+        matches!(err, faucet_core::FaucetError::Timeout { .. }),
+        "{err:?}"
+    );
+    lock.rollback().await.expect("release");
+    pool.close().await;
+}
+
+/// The `copy` strategy stages the page to S3, runs `COPY`, and removes the
+/// staged object whether or not `COPY` succeeded. Postgres cannot run a
+/// Redshift `COPY … FROM 's3://…'`, so the load fails after the upload and
+/// the object is still deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_stages_the_page_and_removes_it_when_copy_fails() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let s3 = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&s3)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&s3)
+        .await;
+    // SAFETY: tests in this binary run serially under `serial()`, and no other
+    // thread reads these variables concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let mut cfg = insert_config(port, "events", 1000);
+    cfg.write_strategy = RedshiftWriteStrategy::Copy;
+    cfg.copy = Some(
+        serde_json::from_value(json!({
+            "staging_bucket": "staging",
+            "iam_role": "arn:aws:iam::123456789012:role/load",
+            "region": "us-east-1",
+            "endpoint_url": s3.uri(),
+        }))
+        .expect("copy spec"),
+    );
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+    let err = match sink.write_batch(&[json!({"id": 1})]).await {
+        Err(e) => e,
+        Ok(_) => sink
+            .flush()
+            .await
+            .expect_err("Postgres cannot run a Redshift COPY"),
+    };
+    assert!(err.to_string().contains("COPY failed"), "{err}");
+    s3.verify().await;
+    pool.close().await;
+}

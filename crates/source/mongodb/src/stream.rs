@@ -13,6 +13,23 @@ use std::pin::Pin;
 /// representative schema. Kept small — discovery must stay cheap.
 const DISCOVER_SAMPLE_SIZE: i64 = 10;
 
+/// A driver error as a [`FaucetError::Source`] prefixed with `context`.
+fn source_err(context: &'static str) -> impl FnOnce(mongodb::error::Error) -> FaucetError {
+    move |e| FaucetError::Source(format!("{context}: {e}"))
+}
+
+/// A discovery-step error naming the step and the collection.
+fn discover_err<'a>(
+    step: &'static str,
+    name: &'a str,
+) -> impl FnOnce(mongodb::error::Error) -> FaucetError + 'a {
+    move |e| {
+        FaucetError::Source(format!(
+            "mongodb: catalog discovery failed ({step} for {name:?}): {e}"
+        ))
+    }
+}
+
 /// A configured MongoDB source that connects to a collection and fetches documents.
 ///
 /// The MongoDB `Client` is created once during construction and reused across
@@ -81,12 +98,14 @@ impl MongoSource {
 
                 let mut records = Vec::new();
 
-                while cursor.advance().await.map_err(|e| {
-                    FaucetError::Source(format!("MongoDB cursor advance failed: {e}"))
-                })? {
-                    let doc = cursor.deserialize_current().map_err(|e| {
-                        FaucetError::Source(format!("MongoDB deserialization failed: {e}"))
-                    })?;
+                while cursor
+                    .advance()
+                    .await
+                    .map_err(source_err("MongoDB cursor advance failed"))?
+                {
+                    let doc = cursor
+                        .deserialize_current()
+                        .map_err(source_err("MongoDB deserialization failed"))?;
 
                     let value = bson_document_to_json_value(&doc)?;
                     records.push(value);
@@ -161,12 +180,14 @@ impl faucet_core::Source for MongoSource {
                     .map_err(|e| FaucetError::Source(format!("MongoDB find failed: {e}")))?;
 
                 let mut records = Vec::new();
-                while cursor.advance().await.map_err(|e| {
-                    FaucetError::Source(format!("MongoDB cursor advance failed: {e}"))
-                })? {
-                    let doc = cursor.deserialize_current().map_err(|e| {
-                        FaucetError::Source(format!("MongoDB deserialization failed: {e}"))
-                    })?;
+                while cursor
+                    .advance()
+                    .await
+                    .map_err(source_err("MongoDB cursor advance failed"))?
+                {
+                    let doc = cursor
+                        .deserialize_current()
+                        .map_err(source_err("MongoDB deserialization failed"))?;
                     records.push(bson_document_to_json_value(&doc)?);
                 }
                 Ok(records)
@@ -342,11 +363,10 @@ impl faucet_core::Source for MongoSource {
                 let mut datasets = Vec::with_capacity(names.len());
                 for name in names {
                     let collection = db.collection::<Document>(&name);
-                    let estimated = collection.estimated_document_count().await.map_err(|e| {
-                        FaucetError::Source(format!(
-                            "mongodb: catalog discovery failed (count for {name:?}): {e}"
-                        ))
-                    })?;
+                    let estimated = collection
+                        .estimated_document_count()
+                        .await
+                        .map_err(discover_err("count", &name))?;
 
                     // Bounded sample for schema inference — the same BSON→JSON
                     // conversion the fetch path uses, capped at DISCOVER_SAMPLE_SIZE.
@@ -354,22 +374,16 @@ impl faucet_core::Source for MongoSource {
                         .find(Document::new())
                         .limit(DISCOVER_SAMPLE_SIZE)
                         .await
-                        .map_err(|e| {
-                            FaucetError::Source(format!(
-                                "mongodb: catalog discovery failed (sample for {name:?}): {e}"
-                            ))
-                        })?;
+                        .map_err(discover_err("sample", &name))?;
                     let mut sample = Vec::new();
-                    while cursor.advance().await.map_err(|e| {
-                        FaucetError::Source(format!(
-                            "mongodb: catalog discovery failed (sample for {name:?}): {e}"
-                        ))
-                    })? {
-                        let doc = cursor.deserialize_current().map_err(|e| {
-                            FaucetError::Source(format!(
-                                "mongodb: catalog discovery failed (decode for {name:?}): {e}"
-                            ))
-                        })?;
+                    while cursor
+                        .advance()
+                        .await
+                        .map_err(discover_err("sample", &name))?
+                    {
+                        let doc = cursor
+                            .deserialize_current()
+                            .map_err(discover_err("decode", &name))?;
                         sample.push(bson_document_to_json_value(&doc)?);
                     }
 
@@ -473,6 +487,22 @@ pub(crate) fn collection_uri(connection_uri: &str, database: &str, collection: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_errors_name_the_step() {
+        let e = || mongodb::error::Error::custom("boom");
+        let msg = source_err("MongoDB cursor advance failed")(e()).to_string();
+        assert!(
+            msg.starts_with("Source error: MongoDB cursor advance failed: ")
+                || msg.contains("MongoDB cursor advance failed: "),
+            "{msg}"
+        );
+        let msg = discover_err("decode", "orders")(e()).to_string();
+        assert!(
+            msg.contains("catalog discovery failed (decode for \"orders\")"),
+            "{msg}"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

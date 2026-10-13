@@ -478,3 +478,26 @@ async fn tiny_numerics_stay_out_of_exponent_notation() {
     assert!(!n.contains(['e', 'E']), "{n}");
     assert!(n.starts_with("0.0000001"), "{n}");
 }
+
+/// Queries are metered on the installed round-trip recorder.
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_are_metered_on_the_installed_recorder() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let source =
+        RedshiftSource::new(full_config(port, "SELECT 1 AS n", 1000)).expect("source builds");
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "redshift",
+        )
+        .with_meter(meter.clone()),
+    ));
+    let rows = source.fetch_all().await.expect("query runs");
+    assert_eq!(rows.len(), 1);
+    let trips = meter.snapshot().source_roundtrips;
+    assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
+}

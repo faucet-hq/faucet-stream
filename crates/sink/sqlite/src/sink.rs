@@ -371,6 +371,11 @@ impl SqlExecutor for SqliteExec<'_> {
 /// before `./out` exists — as every other file-writing sink does (#822).
 /// `create_if_missing` creates only the file. In-memory databases (and a bare
 /// file name in the working directory) have no directory to create.
+/// A `sqlx` error as a [`FaucetError::Sink`] prefixed with `context`.
+fn sink_err(context: &'static str) -> impl FnOnce(sqlx::Error) -> FaucetError {
+    move |e| FaucetError::Sink(format!("{context}: {e}"))
+}
+
 fn ensure_database_dir(filename: &std::path::Path) -> Result<(), FaucetError> {
     if filename.as_os_str() == ":memory:" {
         return Ok(());
@@ -849,9 +854,7 @@ impl faucet_core::Sink for SqliteSink {
                         .bind(&self.config.table_name)
                         .fetch_optional(&self.pool)
                         .await
-                        .map_err(|e| {
-                            FaucetError::Sink(format!("sqlite overwrite: read target definition: {e}"))
-                        })?;
+                        .map_err(sink_err("sqlite overwrite: read target definition"))?;
                 let create_sql = create_sql.ok_or_else(|| {
                     FaucetError::Sink(format!(
                         "sqlite overwrite: create staging from '{}': the table does not exist",
@@ -881,9 +884,11 @@ impl faucet_core::Sink for SqliteSink {
                     // First run: staging holds everything; publish it as the target.
                     // A run that wrote nothing has no staging either, and leaves no table.
                     if self.table_exists(&self.staging_table()).await? {
-                        let mut tx = self.pool.begin_with(BEGIN_WRITE).await.map_err(|e| {
-                            FaucetError::Sink(format!("sqlite overwrite: begin publish: {e}"))
-                        })?;
+                        let mut tx = self
+                            .pool
+                            .begin_with(BEGIN_WRITE)
+                            .await
+                            .map_err(sink_err("sqlite overwrite: begin publish"))?;
                         // An empty previous copy makes the first run undoable: its
                         // rollback empties the table it created (#789 SQL-151).
                         if self.config.write.keeps_previous() {
@@ -892,11 +897,10 @@ impl faucet_core::Sink for SqliteSink {
                                 format!("DROP TABLE IF EXISTS {prev}"),
                                 format!("CREATE TABLE {prev} AS SELECT * FROM {staging} WHERE 0"),
                             ] {
-                                sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
-                                    FaucetError::Sink(format!(
-                                        "sqlite overwrite: keep previous copy: {e}"
-                                    ))
-                                })?;
+                                sqlx::query(&stmt)
+                                    .execute(&mut *tx)
+                                    .await
+                                    .map_err(sink_err("sqlite overwrite: keep previous copy"))?;
                             }
                         }
                         sqlx::query(&format!(
@@ -905,20 +909,19 @@ impl faucet_core::Sink for SqliteSink {
                         ))
                         .execute(&mut *tx)
                         .await
-                        .map_err(|e| {
-                            FaucetError::Sink(format!("sqlite overwrite: publish staging: {e}"))
-                        })?;
-                        tx.commit().await.map_err(|e| {
-                            FaucetError::Sink(format!("sqlite overwrite: commit publish: {e}"))
-                        })?;
+                        .map_err(sink_err("sqlite overwrite: publish staging"))?;
+                        tx.commit()
+                            .await
+                            .map_err(sink_err("sqlite overwrite: commit publish"))?;
                     }
                     return Ok(());
                 }
                 let target = quote_ident_sqlite(&self.config.table_name);
-                let mut tx =
-                    self.pool.begin_with(BEGIN_WRITE).await.map_err(|e| {
-                        FaucetError::Sink(format!("sqlite overwrite: begin swap: {e}"))
-                    })?;
+                let mut tx = self
+                    .pool
+                    .begin_with(BEGIN_WRITE)
+                    .await
+                    .map_err(sink_err("sqlite overwrite: begin swap"))?;
                 // `rollback.keep_previous`: snapshot the rows about to be replaced, in
                 // the same transaction, so a rollback can swap them back (#706).
                 if self.config.write.keeps_previous() {
@@ -931,13 +934,14 @@ impl faucet_core::Sink for SqliteSink {
                     format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}"),
                     format!("DROP TABLE {staging}"),
                 ] {
-                    sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
-                        FaucetError::Sink(format!("sqlite overwrite swap failed: {e}"))
-                    })?;
+                    sqlx::query(&stmt)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sink_err("sqlite overwrite swap failed"))?;
                 }
-                tx.commit().await.map_err(|e| {
-                    FaucetError::Sink(format!("sqlite overwrite: commit swap: {e}"))
-                })?;
+                tx.commit()
+                    .await
+                    .map_err(sink_err("sqlite overwrite: commit swap"))?;
                 Ok(())
             })
             .await
@@ -999,9 +1003,7 @@ impl faucet_core::Sink for SqliteSink {
                 ))
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("sqlite current_schema query failed: {e}"))
-                })?;
+                .map_err(sink_err("sqlite current_schema query failed"))?;
 
                 if rows.is_empty() {
                     return Ok(None); // table does not exist yet (or has no columns)
@@ -1593,5 +1595,99 @@ mod tests {
             sqlite_affinity_to_json_schema("integer", true),
             json!({"type":["integer","null"], "x-faucet-also-accepts":["boolean"]})
         );
+    }
+
+    fn auto_map_cfg(url: &str, mode: faucet_core::WriteMode, key: &[&str]) -> SqliteSinkConfig {
+        let mut config =
+            SqliteSinkConfig::new(url, "t").column_mapping(SqliteColumnMapping::AutoMap);
+        config.write.write_mode = mode;
+        config.write.key = key.iter().map(|k| k.to_string()).collect();
+        config
+    }
+
+    #[tokio::test]
+    async fn sqlx_errors_name_the_failed_step() {
+        let sink = SqliteSink::new(auto_map_cfg(
+            "sqlite::memory:",
+            faucet_core::WriteMode::Append,
+            &[],
+        ))
+        .await
+        .unwrap();
+        sink.pool.close().await;
+        let err = sink.current_schema().await.unwrap_err().to_string();
+        assert!(
+            err.contains("sqlite current_schema query failed: "),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_column_to_a_view_reports_the_column() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("v.db").display());
+        let sink = SqliteSink::new(auto_map_cfg(&url, faucet_core::WriteMode::Append, &[]))
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIEW t AS SELECT 1 AS id")
+            .execute(&sink.pool)
+            .await
+            .unwrap();
+        let evolution = SchemaEvolution {
+            additions: vec![faucet_core::ColumnChange {
+                name: "extra".into(),
+                from: None,
+                to: serde_json::json!({"type": "string"}),
+            }],
+            widenings: vec![],
+            relax_nullability: vec![],
+        };
+        let err = sink
+            .evolve_schema(&evolution)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sqlite ADD COLUMN extra failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn idempotent_upsert_refuses_a_row_without_its_key_before_writing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("k.db").display());
+        let sink = SqliteSink::new(auto_map_cfg(&url, faucet_core::WriteMode::Upsert, &["id"]))
+            .await
+            .unwrap();
+        let err = sink
+            .write_batch_idempotent(&[serde_json::json!({"name": "x"})], "scope", "0001")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sqlite upsert: row 0"), "{err}");
+        assert_eq!(sink.last_committed_token("scope").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn idempotent_append_in_auto_map_mode_commits_rows_and_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("a.db").display());
+        let sink = SqliteSink::new(auto_map_cfg(&url, faucet_core::WriteMode::Append, &[]))
+            .await
+            .unwrap();
+        let rows = [serde_json::json!({"id": 1}), serde_json::json!({"id": 2})];
+        assert_eq!(
+            sink.write_batch_idempotent(&rows, "scope", "0001")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sink.last_committed_token("scope").await.unwrap().as_deref(),
+            Some("0001")
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+            .fetch_one(&sink.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
     }
 }

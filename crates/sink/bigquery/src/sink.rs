@@ -90,19 +90,7 @@ pub(crate) async fn call_once<T, Fut>(
 where
     Fut: std::future::Future<Output = Result<T, FaucetError>>,
 {
-    let mut fut = Some(Box::pin(fut));
-    Box::pin(calls.call(op, || {
-        let attempt = fut.take();
-        async move {
-            match attempt {
-                Some(f) => f.await,
-                None => Err(FaucetError::Sink(format!(
-                    "BigQuery {op}: the request is sent once"
-                ))),
-            }
-        }
-    }))
-    .await
+    Box::pin(calls.call_once(op, Box::pin(fut))).await
 }
 
 /// [`call_once`] for a client call that keeps its typed `BQError`; the context
@@ -3286,6 +3274,31 @@ mod tests {
             .collect();
         fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
     }
+
+    #[tokio::test]
+    async fn call_once_never_resends_under_a_retrying_context() {
+        let fast = std::time::Duration::from_millis(1);
+        let calls = faucet_core::CallContext::new().with_retry(faucet_core::RetryPolicy {
+            max_attempts: 2,
+            base: fast,
+            max: fast,
+            jitter: false,
+            ..Default::default()
+        });
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let err = super::call_once::<(), _>(&calls, "insert", async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(faucet_core::FaucetError::RateLimited(fast))
+        })
+        .await
+        .expect_err("the one attempt fails");
+        assert!(
+            matches!(err, faucet_core::FaucetError::RateLimited(_)),
+            "the attempt's own error surfaces: {err:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn concurrent_update_aborts_are_recognised_and_jitter_is_bounded() {
         use gcp_bigquery_client::model::error_proto::ErrorProto;

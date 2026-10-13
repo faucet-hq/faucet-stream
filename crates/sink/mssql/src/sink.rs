@@ -1593,6 +1593,12 @@ impl Sink for MssqlSink {
         &self,
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
+        // Read before checking out the DDL connection (a one-connection pool).
+        let current = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
+            Vec::new()
+        } else {
+            self.discover_column_types().await?
+        };
         let mut conn = self.checkout().await?;
 
         for c in &evolution.additions {
@@ -1603,11 +1609,6 @@ impl Sink for MssqlSink {
                 FaucetError::Sink(format!("MSSQL ADD COLUMN {} failed: {e}", c.name))
             })?;
         }
-        let current = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
-            Vec::new()
-        } else {
-            self.discover_column_types().await?
-        };
         for c in &evolution.widenings {
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);

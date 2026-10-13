@@ -1055,18 +1055,24 @@ jobs:
           # Libraries and connectors first, then faucet-cli, with the first
           # batch's test executables and containers dropped in between: all of
           # them at once (plus the instrumented build) exhausts the runner disk.
+          # The staged-load execution shims need a live warehouse that can reach
+          # a live bucket, so they are excluded here, in codecov.yml, and in
+          # scripts/patch-coverage.py (all three kept in sync).
           retry cargo test --workspace --exclude faucet-cli --all-features --test '*'
+          # Report this batch before deleting its executables: llvm-cov maps the
+          # profile data through the binaries, so a deleted binary's counts are lost.
+          cargo llvm-cov report --lcov --output-path integration-libs.lcov --ignore-filename-regex "$IGNORE_RE"
           cargo test --workspace --exclude faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
             | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+          rm -f target/*.profraw
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
           retry cargo test -p faucet-cli --all-features --test '*'
-          # The staged-load execution shims need a live warehouse that can reach
-          # a live bucket, so they are excluded here, in codecov.yml, and in
-          # scripts/patch-coverage.py (all three kept in sync).
-          cargo llvm-cov report --lcov --output-path integration.lcov --ignore-filename-regex "$IGNORE_RE"
+          cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE"
+          # Both scripts merge a file's records across reports (a line hit in either counts).
+          cat integration-libs.lcov integration-cli.lcov > integration.lcov
 
           echo "::group::teardown before the unit phase"
           df -h /
@@ -1082,6 +1088,19 @@ jobs:
           retry cargo test --workspace --all-features --lib --bins
           cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
           cat integration.lcov unit.lcov > lcov.info
+      - name: Keep the coverage reports
+        # So a failing coverage gate can be read line by line (Codecov only
+        # receives the report after the gates pass).
+        if: ${{ always() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: |
+            lcov.info
+            integration.lcov
+            unit.lcov
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Test the coverage gate scripts
         if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py'

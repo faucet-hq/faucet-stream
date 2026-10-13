@@ -219,3 +219,180 @@ fn crc32c_of(bytes: &[u8]) -> u32 {
     }
     !crc
 }
+
+async fn mount_token(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(FakeToken {
+            access_token: "fake-token",
+            token_type: "bearer",
+            expires_in: 9_999_999,
+        }))
+        .mount(server)
+        .await;
+}
+
+fn one_column_batch(values: Vec<&str>) -> RecordBatch {
+    RecordBatch::try_from_iter(vec![(
+        "id",
+        Arc::new(StringArray::from(values)) as ArrayRef,
+    )])
+    .expect("batch")
+}
+
+/// A staging upload the storage backend refuses fails the write before any
+/// load job is inserted.
+#[tokio::test]
+async fn a_refused_staging_upload_fails_the_columnar_write() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": 403, "message": "forbidden"}
+        })))
+        .mount(&server)
+        .await;
+    let sink = build_sink(&server).await;
+    let err = sink
+        .write_batch_columnar(&one_column_batch(vec!["1"]))
+        .await
+        .expect_err("a refused upload fails the write");
+    assert!(err.to_string().contains("staging upload failed"), "{err}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.url.path() == format!("/projects/{PROJECT_ID}/jobs")),
+        "no load job after a failed upload"
+    );
+}
+
+/// A load job still running past `job_timeout` is polled, then cancelled; a
+/// cancel that lands fails the write as cancelled.
+#[tokio::test]
+async fn a_load_job_past_job_timeout_is_cancelled() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
+        .respond_with(EchoDeclaredCrc)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": { "projectId": PROJECT_ID, "jobId": JOB_ID },
+            "status": { "state": "RUNNING" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/{JOB_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": { "projectId": PROJECT_ID, "jobId": JOB_ID },
+            "status": { "state": "RUNNING" }
+        })))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/{JOB_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": { "projectId": PROJECT_ID, "jobId": JOB_ID },
+            "status": {
+                "state": "DONE",
+                "errorResult": {"reason": "stopped", "message": "Job cancelled"}
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/{JOB_ID}/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#jobCancelResponse",
+            "job": {"jobReference": {"projectId": PROJECT_ID, "jobId": JOB_ID}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let sink = build_sink_with(&server, |c| {
+        c.job_timeout = std::time::Duration::from_millis(300);
+    })
+    .await;
+    let err = sink
+        .write_batch_columnar(&one_column_batch(vec!["1", "2"]))
+        .await
+        .expect_err("a load past job_timeout fails");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("job_timeout") && msg.contains("cancelled"),
+        "{msg}"
+    );
+}
+
+/// The public `write_columnar` entry point stages nothing for an empty batch.
+#[tokio::test]
+async fn write_columnar_with_an_empty_batch_is_a_no_op() {
+    let server = MockServer::start().await;
+    let (client, config) = build_parts(&server, |_| {}).await;
+    let n = faucet_sink_bigquery::load::write_columnar(
+        &client,
+        &config,
+        &tokio::sync::OnceCell::new(),
+        &one_column_batch(vec![]),
+    )
+    .await
+    .expect("empty batch");
+    assert_eq!(n, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+async fn build_parts(
+    server: &MockServer,
+    f: impl FnOnce(&mut BigQuerySinkConfig),
+) -> (gcp_bigquery_client::Client, BigQuerySinkConfig) {
+    let sa_file = tempfile::NamedTempFile::new().expect("sa tempfile");
+    std::fs::write(
+        sa_file.path(),
+        serde_json::to_string_pretty(&dummy_service_account_json(&server.uri())).unwrap(),
+    )
+    .expect("write sa");
+    let client = ClientBuilder::new()
+        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
+        .with_v2_base_url(server.uri())
+        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .await
+        .expect("build client");
+    let mut config = BigQuerySinkConfig::new(
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ServiceAccountKey {
+            json: serde_json::to_string(&dummy_service_account_json(&server.uri())).unwrap(),
+        },
+    );
+    config.upload_base_url = Some(server.uri());
+    config.bulk_load = Some(
+        serde_json::from_value(json!({
+            "staging_bucket": BUCKET,
+            "gcs_auth": { "type": "anonymous" },
+            "storage_host": server.uri(),
+        }))
+        .expect("bulk_load config"),
+    );
+    f(&mut config);
+    (client, config)
+}
+
+async fn build_sink_with(
+    server: &MockServer,
+    f: impl FnOnce(&mut BigQuerySinkConfig),
+) -> BigQuerySink {
+    let (client, config) = build_parts(server, f).await;
+    BigQuerySink::from_parts(config, client)
+}

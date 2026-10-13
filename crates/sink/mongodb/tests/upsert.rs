@@ -11,6 +11,7 @@ use faucet_core::{DeleteMarker, Sink, WriteMode, WriteSpec};
 use faucet_sink_mongodb::{MongoSink, MongoSinkConfig};
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
+use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
 
@@ -233,4 +234,57 @@ async fn keys_of_different_json_types_are_two_documents() {
         .await
         .expect("the integer key's document");
     assert_eq!(int_doc.get_str("v").unwrap(), "a");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_without_its_key_fails_the_page() {
+    let (_container, uri) = start_mongo().await;
+    let sink = MongoSink::new(upsert_config(&uri, None)).await.unwrap();
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "mongodb",
+        ),
+    ));
+    let err = sink
+        .write_batch(&[json!({"name": "no key"})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mongodb upsert: row 0"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_insert_cut_before_anything_landed_fails_whole() {
+    let (_container, uri) = start_mongo().await;
+    let sink = MongoSink::new(MongoSinkConfig::new(&uri, "testdb", "cut"))
+        .await
+        .unwrap();
+    sink.set_call_context(
+        faucet_core::CallContext::new().with_deadline(tokio::time::Instant::now()),
+    );
+    assert!(sink.write_batch_partial(&[json!({"a": 1})]).await.is_err());
+    assert_eq!(count_docs(&uri, "testdb", "cut").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_send_backoff_past_the_deadline_fails_whole() {
+    let (_container, uri) = start_mongo().await;
+    let sink = MongoSink::new(MongoSinkConfig::new(&uri, "testdb", "big"))
+        .await
+        .unwrap();
+    sink.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(300)),
+    );
+    // Larger than the server's document limit: refused by the driver, not
+    // per document, so the batch is re-sent after a backoff the deadline cuts.
+    let huge = "x".repeat(17 * 1024 * 1024);
+    assert!(
+        sink.write_batch_partial(&[json!({"blob": huge})])
+            .await
+            .is_err()
+    );
 }

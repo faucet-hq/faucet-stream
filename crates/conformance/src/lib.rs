@@ -113,6 +113,7 @@ pub mod forwarding;
 pub mod hung;
 pub mod required;
 pub mod scripted;
+pub mod tds;
 
 /// Stack size [`block_on_large_stack`] gives its thread.
 pub const LARGE_STACK: usize = 32 << 20;

@@ -129,6 +129,29 @@ async fn write_batch_smaller_than_batch_size_makes_one_request() {
     assert_eq!(requests.len(), 1);
 }
 
+#[tokio::test]
+async fn requests_are_metered_on_the_installed_recorder() {
+    let server = mock_server_with_success().await;
+    let sink = SnowflakeSink::new(sample_config())
+        .unwrap()
+        .with_endpoint(endpoint(&server));
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "snowflake",
+        )
+        .with_meter(meter.clone()),
+    ));
+    sink.write_batch(&make_records(3)).await.unwrap();
+    sink.flush().await.unwrap();
+    let sent = server.received_requests().await.unwrap().len() as u64;
+    let trips = meter.snapshot().sink_roundtrips;
+    assert_eq!(trips.values().sum::<u64>(), sent, "{trips:?}");
+}
+
 /// Requests other than the sink's one-time `information_schema` column
 /// lookup, which these tests do not count.
 fn without_describe(requests: Vec<wiremock::Request>) -> Vec<wiremock::Request> {

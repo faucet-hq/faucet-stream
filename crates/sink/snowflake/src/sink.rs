@@ -1160,19 +1160,8 @@ impl faucet_core::Sink for SnowflakeSink {
             .get_or_try_init(|| async { crate::bulk::resolve_store(stage) })
             .await?;
         let file = format!("faucet-{}.parquet", uuid::Uuid::new_v4());
-        let mut upload = Some(crate::bulk::upload(store, &file, bytes));
         self.calls
-            .call("stage", || {
-                let attempt = upload.take();
-                async move {
-                    match attempt {
-                        Some(f) => f.await,
-                        None => Err(FaucetError::Sink(
-                            "snowflake stage upload is sent once".into(),
-                        )),
-                    }
-                }
-            })
+            .call_once("stage", crate::bulk::upload(store, &file, bytes))
             .await?;
 
         // Load the staged Parquet file into the target table.

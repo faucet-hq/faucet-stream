@@ -1331,6 +1331,35 @@ async fn resumable_chunk_non_308_errors() {
     assert!(err.to_string().contains("expected 308"), "got: {err}");
 }
 
+/// A 308 whose `Range` header cannot be read fails the upload rather than
+/// guessing how much of the chunk persisted.
+#[tokio::test]
+async fn resumable_chunk_with_an_unreadable_range_errors() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/range").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/range"))
+        .and(MidChunk)
+        .respond_with(ResponseTemplate::new(308).insert_header("range", "bytes=garbage"))
+        .mount(&server)
+        .await;
+
+    let mut config = direct_media_config(&server);
+    config.resumable_chunk = Some(512);
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.begin_overwrite().await.expect("begin");
+    let err = sink
+        .write_batch(&bulky_rows(20_000))
+        .await
+        .expect_err("an unreadable Range must error");
+    assert!(
+        err.to_string().contains("unreadable Range header"),
+        "got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn resumable_init_http_error_surfaces() {
     let server = MockServer::start().await;

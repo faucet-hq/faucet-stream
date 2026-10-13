@@ -69,6 +69,29 @@ async fn append_auto_creates_table_then_inserts() {
 }
 
 #[tokio::test]
+async fn statements_are_metered_on_the_installed_recorder() {
+    let wh = Warehouse::start().await;
+    let s = sink(&wh, |_| {});
+    let meter = Arc::new(faucet_core::UsageMeter::new());
+    s.set_roundtrip_recorder(Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "databricks",
+        )
+        .with_meter(meter.clone()),
+    ));
+    s.write_batch(&[json!({"id": 1})]).await.unwrap();
+    let trips = meter.snapshot().sink_roundtrips;
+    assert_eq!(
+        trips.get("submit").copied(),
+        Some(wh.statements().len() as u64),
+        "one round trip per statement: {trips:?}"
+    );
+}
+
+#[tokio::test]
 async fn append_casts_to_declared_types_and_chunks() {
     let wh = Warehouse::start().await;
     wh.on(

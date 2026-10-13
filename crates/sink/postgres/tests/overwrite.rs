@@ -254,3 +254,27 @@ async fn aborted_first_overwrite_leaves_no_table_behind() {
     sink().await.unwrap().abort_overwrite().await.unwrap();
     assert!(!target_present(&url).await);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_overwrite_that_cannot_publish_staging_names_the_step() {
+    let (_container, url) = start_postgres().await;
+    let sink = PostgresSink::new(overwrite_config(&url)).await.unwrap();
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "postgres",
+        ),
+    ));
+    assert!(sink.capabilities().scoped_overwrite());
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .unwrap();
+    // A domain holds the type name without being a relation, so the target
+    // still reads as missing while the rename collides with it.
+    seed(&url, "CREATE DOMAIN kv AS INT").await;
+    let err = sink.commit_overwrite().await.unwrap_err().to_string();
+    assert!(err.contains("postgres overwrite: publish staging"), "{err}");
+}
