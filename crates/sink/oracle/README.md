@@ -103,6 +103,12 @@ Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (e
 
 Every sink operation runs on the blocking pool as one backend call named after it (`write_batch`, `write_batch_partial`, `write_batch_idempotent`, `last_committed_token`, the overwrite and schema steps) through the pipeline's `CallContext` (#880): the run's deadline ends the wait promptly, `statement_timeout_secs` still bounds the work on the server, and each counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The sink never retries a write itself.
 
+## Shared SQL layer
+
+This sink takes its identifier rules (quoted, refusing `"`, NUL, empty and over-long names), `:n` placeholders, column types, the single-row `MERGE` upsert, keyed delete, create-table, add/widen/relax DDL wrapped in the `ORA-` swallowing block, the commit-token SQL and the upper-case field folding from the `Oracle` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Execution stays here: the driver is blocking and writes run as array DML (one statement bound for a whole chunk), which the engine's statement-per-chunk executor does not model.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

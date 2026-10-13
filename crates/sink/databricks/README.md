@@ -222,3 +222,9 @@ ends it, and each is metered as a round trip (`submit`, `poll`, `files`). The
 HTTP client's connect / idle-read timeouts, `statement_timeout_secs`, the
 `429` / `503` retry and the concurrent-commit re-submit (`max_retries`,
 `retry_backoff_ms`) are unchanged; their pauses wait through the same context.
+
+## Shared SQL layer
+
+This sink takes its identifier quoting, literal escaping and column types from the `Databricks` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Rows travel inline (`FROM VALUES` of literals with per-column casts) or from a staged file, upserts use a presence-flag `MERGE` over nested types, and exactly-once uses idempotent page writes — none of which is the engine's bind-per-cell model.

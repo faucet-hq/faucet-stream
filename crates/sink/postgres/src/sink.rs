@@ -5,6 +5,11 @@ use crate::config::{
 };
 use crate::copy::{build_auto_map_payload, build_jsonb_payload, copy_statement};
 use async_trait::async_trait;
+use faucet_common_sql::dialects::Postgres;
+use faucet_common_sql::{
+    EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine, Statement, StatementKind, TableColumn,
+    TableTarget,
+};
 use faucet_core::FaucetError;
 use faucet_core::util::quote_ident;
 use serde_json::Value;
@@ -17,12 +22,15 @@ pub(crate) fn no_matching_column_message(
     obj: &serde_json::Map<String, Value>,
     columns: &[(String, String)],
 ) -> String {
-    format!(
-        "postgres: record {idx} has no field matching a column of the target table \
-         (record fields: {:?}; table columns: {:?}) — column names are case-sensitive",
-        obj.keys().collect::<Vec<_>>(),
-        columns.iter().map(|(c, _)| c).collect::<Vec<_>>()
-    )
+    faucet_common_sql::no_match_message(&Postgres, idx, obj, &table_columns(columns), "")
+}
+
+/// `(name, udt)` pairs as engine columns.
+pub(crate) fn table_columns(columns: &[(String, String)]) -> Vec<TableColumn> {
+    columns
+        .iter()
+        .map(|(name, udt)| TableColumn::new(name.clone(), udt.clone()))
+        .collect()
 }
 
 /// Split a page into per-row outcomes, the records to write, and each written
@@ -35,31 +43,19 @@ pub(crate) fn split_writable(
     binary: BinaryEncoding,
     require_match: bool,
 ) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
-    let mut outcomes = Vec::with_capacity(records.len());
-    let mut writable = Vec::with_capacity(records.len());
-    let mut positions = Vec::with_capacity(records.len());
-    for (idx, record) in records.iter().enumerate() {
-        let failure = match record.as_object() {
-            Some(obj) if require_match && !columns.iter().any(|(c, _)| obj.contains_key(c)) => {
-                Some(no_matching_column_message(idx, obj, columns))
-            }
-            Some(obj) => columns.iter().find_map(|(col, udt)| {
-                pg_bind_text_with(obj.get(col), udt, binary)
-                    .err()
-                    .map(|e| format!("row {idx}: column {col}: {e}"))
-            }),
-            None => None,
-        };
-        match failure {
-            Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
-            None => {
-                outcomes.push(Ok(()));
-                writable.push(record.clone());
-                positions.push(idx);
-            }
-        }
-    }
-    (outcomes, writable, positions)
+    let split = faucet_common_sql::split_page(
+        &Postgres,
+        "",
+        records,
+        &table_columns(columns),
+        require_match,
+        |idx, col, v| {
+            pg_bind_text_with(Some(v), &col.sql_type, binary)
+                .err()
+                .map(|e| format!("row {idx}: column {}: {e}", col.name))
+        },
+    );
+    (split.outcomes, split.writable, split.positions)
 }
 
 /// Render a JSON value as the text to bind for a PostgreSQL column whose
@@ -497,24 +493,14 @@ pub(crate) fn clear_statements(
 /// Non-key columns are SET from EXCLUDED. If every column is a key column,
 /// emit `DO NOTHING`.
 pub(crate) fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String {
-    let key_list = key
-        .iter()
-        .map(|k| quote_ident(k))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let updates: Vec<String> = all_cols
-        .iter()
-        .filter(|c| !key.iter().any(|k| k == *c))
-        .map(|c| format!("{q} = EXCLUDED.{q}", q = quote_ident(c)))
-        .collect();
-    if updates.is_empty() {
-        format!("ON CONFLICT ({key_list}) DO NOTHING")
-    } else {
-        format!(
-            "ON CONFLICT ({key_list}) DO UPDATE SET {}",
-            updates.join(", ")
-        )
-    }
+    Postgres
+        .upsert_tail(key, all_cols)
+        .expect("postgres upserts with ON CONFLICT")
+}
+
+/// The engine target for an already-quoted relation reference.
+fn target_ref(table_ref: &str) -> TableTarget {
+    TableTarget::new(table_ref, table_ref)
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
@@ -522,88 +508,61 @@ pub(crate) fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String 
 /// `IF NOT EXISTS` rather than a probe-then-create: two matrix rows writing the
 /// same table would otherwise race between the probe and the DDL, and the
 /// loser's `CREATE` would fail a run that had nothing wrong with it.
+#[cfg(test)]
 fn build_create_table_sql(
     table_ref: &str,
     columns: &[faucet_core::PlannedColumn],
     json_column: Option<&str>,
     key: &[String],
 ) -> String {
-    let cols = match json_column {
-        // JSONB mode stores the whole record in one column, so the page's own
-        // shape is irrelevant — the table is the same whatever arrives.
-        Some(col) => format!(
-            "{} bigserial PRIMARY KEY, {} jsonb NOT NULL",
-            quote_ident("id"),
-            quote_ident(col)
-        ),
-        None => {
-            let defs = faucet_core::render_columns(columns, quote_ident, pg_keyword);
-            // A keyed write needs a PRIMARY KEY for its ON CONFLICT target (#676).
-            match faucet_core::render_primary_key(key, quote_ident) {
-                Some(pk) => format!("{defs}, {pk}"),
-                None => defs,
-            }
-        }
-    };
-    format!("CREATE TABLE IF NOT EXISTS {table_ref} ({cols})")
-}
-
-/// Map a [`faucet_core::SqlBaseType`] to the PostgreSQL type keyword used when
-/// adding/widening a column during schema evolution (issue #194). Integers
-/// always widen to `bigint` and floats to `double precision` so a later, wider
-/// value never overflows a narrower column.
-fn pg_keyword(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "bigint",
-        Double => "double precision",
-        Boolean => "boolean",
-        Text => "text",
-        Json => "jsonb",
+    match json_column {
+        Some(col) => Postgres.create_json_table_sql(&target_ref(table_ref), col),
+        None => Postgres.create_table_sql(&target_ref(table_ref), columns, key),
     }
+    .expect("postgres CREATE TABLE")
 }
 
 /// `ALTER TABLE <ref> ADD COLUMN IF NOT EXISTS "<col>" <kw>` — idempotent column
 /// addition. `table_ref` is already quoted (`"schema"."table"`).
 fn build_add_column_sql(table_ref: &str, col: &str, t: faucet_core::SqlBaseType) -> String {
-    format!(
-        "ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS {} {}",
-        quote_ident(col),
-        pg_keyword(t)
-    )
+    Postgres
+        .add_column_sql(&target_ref(table_ref), col, t)
+        .expect("postgres ADD COLUMN")
 }
 
 /// `ALTER TABLE <ref> ALTER COLUMN "<col>" TYPE <kw> USING "<col>"::<kw>` — widen
 /// an existing column's type. Naturally idempotent (re-running the same TYPE
 /// change is a no-op).
 fn build_alter_type_sql(table_ref: &str, col: &str, kw: &str) -> String {
-    let q = quote_ident(col);
-    format!("ALTER TABLE {table_ref} ALTER COLUMN {q} TYPE {kw} USING {q}::{kw}")
+    Postgres
+        .alter_column_type_sql(&target_ref(table_ref), col, kw)
+        .ok()
+        .flatten()
+        .expect("postgres ALTER TYPE")
 }
 
 /// The type a widening rewrites a column to. An integer column that starts
 /// receiving fractions becomes exact `numeric`, never `double precision`,
 /// which would silently round every stored value above 2^53 (#789 SQL-78).
+#[cfg(test)]
 fn widened_keyword(change: &faucet_core::ColumnChange) -> &'static str {
-    use faucet_core::SqlBaseType::{Double, Integer, Text};
-    let to = faucet_core::json_schema_base_type(&change.to).unwrap_or(Text);
+    let to =
+        faucet_core::json_schema_base_type(&change.to).unwrap_or(faucet_core::SqlBaseType::Text);
     let from = change
         .from
         .as_ref()
         .and_then(faucet_core::json_schema_base_type);
-    match (from, to) {
-        (Some(Integer), Double) => "numeric",
-        _ => pg_keyword(to),
-    }
+    Postgres.widened_type_name(from, to)
 }
 
 /// `ALTER TABLE <ref> ALTER COLUMN "<col>" DROP NOT NULL` — relax a NOT NULL
 /// constraint. Naturally idempotent.
 fn build_drop_not_null_sql(table_ref: &str, col: &str) -> String {
-    format!(
-        "ALTER TABLE {table_ref} ALTER COLUMN {} DROP NOT NULL",
-        quote_ident(col)
-    )
+    Postgres
+        .drop_not_null_sql(&target_ref(table_ref), col)
+        .ok()
+        .flatten()
+        .expect("postgres DROP NOT NULL")
 }
 
 /// Map a PostgreSQL type name (`pg_type.typname`, e.g. `int4`, `float8`, `bool`,
@@ -632,8 +591,98 @@ pub struct PostgresSink {
     /// Whether the target has been confirmed present (created or probed) for
     /// this sink instance (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// The shared SQL planning engine (#884).
+    pub(crate) engine: SqlSinkEngine<Postgres>,
     /// Backend-call context (#880): the run's deadline and recorder.
     pub(crate) calls: faucet_core::CallSlot,
+}
+
+/// The engine's view of one PostgreSQL connection (or open transaction).
+/// Every value binds as text through its placeholder's `::<udt>` cast, so the
+/// destination column's input function parses it (#146 C1).
+pub(crate) struct PgExec<'c> {
+    pub(crate) conn: &'c mut sqlx::PgConnection,
+    pub(crate) sink: &'c PostgresSink,
+}
+
+#[async_trait]
+impl SqlExecutor for PgExec<'_> {
+    async fn columns(&mut self, target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        Ok(table_columns(
+            &self
+                .sink
+                .discover_columns(&mut *self.conn, &target.reference)
+                .await?,
+        ))
+    }
+
+    /// The key columns' underlying types drive the `::udt` casts; a key the
+    /// table lacks binds as `text`.
+    async fn key_types(
+        &mut self,
+        target: &TableTarget,
+        key: &[String],
+    ) -> Result<Vec<Option<String>>, FaucetError> {
+        let udts: std::collections::HashMap<String, String> = self
+            .sink
+            .discover_columns(&mut *self.conn, &target.reference)
+            .await?
+            .into_iter()
+            .collect();
+        Ok(key
+            .iter()
+            .map(|k| Some(udts.get(k).cloned().unwrap_or_else(|| "text".to_string())))
+            .collect())
+    }
+
+    async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+        let binary = self.sink.config.binary_encoding;
+        let mut q = sqlx::query(&stmt.sql);
+        for p in &stmt.params {
+            let udt = p.sql_type.unwrap_or("text");
+            let value = Some(p.value.as_ref());
+            q = q.bind(match stmt.kind {
+                StatementKind::Insert | StatementKind::Upsert => {
+                    pg_bind_text_with(value, udt, binary).map_err(|e| {
+                        FaucetError::Sink(format!(
+                            "PostgreSQL insert failed: column {}: {e}",
+                            p.column
+                        ))
+                    })?
+                }
+                StatementKind::Delete | StatementKind::CleanupLoad => {
+                    pg_bind_text_with(value, udt, binary)
+                        .map_err(|e| FaucetError::Sink(format!("key column {}: {e}", p.column)))?
+                }
+                StatementKind::CleanupDelete => pg_bind_text(value, udt),
+                _ => p.value.as_str().map(str::to_string),
+            });
+        }
+        let context = match stmt.kind {
+            StatementKind::Insert | StatementKind::InsertJson | StatementKind::Upsert => {
+                "PostgreSQL insert failed"
+            }
+            StatementKind::Delete => "PostgreSQL delete failed",
+            StatementKind::CleanupDrop => "cleanup: temp table drop failed",
+            StatementKind::CleanupCreate => "cleanup: temp table creation failed",
+            StatementKind::CleanupLoad => "cleanup: loading keys failed",
+            StatementKind::CleanupDelete => "cleanup: delete failed",
+            StatementKind::TokenTable => "PostgreSQL commit-table create failed",
+            _ => "PostgreSQL token upsert failed",
+        };
+        q.execute(&mut *self.conn)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| FaucetError::Sink(format!("{context}: {e}")))
+    }
+
+    async fn journal_plan(
+        &mut self,
+        plan: &faucet_core::WritePlan,
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        self.sink.journal_plan(&mut *self.conn, plan, run_id).await
+    }
 }
 
 impl PostgresSink {
@@ -678,23 +727,18 @@ impl PostgresSink {
             PostgresColumnMapping::AutoMap => None,
             PostgresColumnMapping::Jsonb { column } => Some(column.as_str()),
         };
+        // An overwrite writes to staging. On a first run (no target) nothing
+        // else creates staging, so it is created here from the page (#676).
         // AutoMap needs a page to infer from; a page with nothing inferable
         // leaves the table uncreated so the next page can try, rather than
         // emitting a zero-column CREATE.
-        let key: &[String] = if self.config.write.dedups_by_key() {
-            &self.config.write.key
-        } else {
-            &[]
-        };
-        let planned = if key.is_empty() {
-            faucet_core::plan_columns(records)
-        } else {
-            faucet_core::plan_keyed_columns(records, key)
-        };
-        let columns = match (json_column, planned) {
-            (Some(_), _) => Vec::new(),
-            (None, Some(c)) => c,
-            (None, None) => return Ok(()),
+        let create_ref =
+            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
+        let Some(create) =
+            self.engine
+                .create_table_sql(&target_ref(&create_ref), records, json_column)?
+        else {
+            return Ok(());
         };
 
         let mut statements = Vec::with_capacity(2);
@@ -704,16 +748,7 @@ impl PostgresSink {
                 quote_ident(schema)
             ));
         }
-        // An overwrite writes to staging. On a first run (no target) nothing
-        // else creates staging, so it is created here from the page (#676).
-        let create_ref =
-            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        statements.push(build_create_table_sql(
-            &create_ref,
-            &columns,
-            json_column,
-            key,
-        ));
+        statements.push(create);
         let mut conn = self
             .pool
             .acquire()
@@ -776,10 +811,12 @@ impl PostgresSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL connection failed: {e}")))?;
 
+        let engine = SqlSinkEngine::new(Postgres, config.write.clone());
         Ok(Self {
             config,
             pool,
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            engine,
             calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
@@ -933,223 +970,58 @@ impl PostgresSink {
         Ok(records.len())
     }
 
-    /// Insert a batch of records using auto-mapped columns, on the given connection.
+    /// The engine target of the relation the data writes go to.
+    fn write_target(&self) -> TableTarget {
+        target_ref(&qualified_table_ref(
+            self.config.schema.as_deref(),
+            &self.effective_table_name(),
+        ))
+    }
+
+    /// The engine target of the configured table itself (keyed writes and
+    /// cleanup never go to the overwrite staging table).
+    fn table_target(&self) -> TableTarget {
+        target_ref(&qualified_table_ref(
+            self.config.schema.as_deref(),
+            &self.config.table_name,
+        ))
+    }
+
+    /// Insert a batch of records using auto-mapped columns, on the given
+    /// connection (a pooled connection under autocommit, or the idempotent
+    /// path's open transaction).
     ///
-    /// Accepts `&mut sqlx::PgConnection` so the same logic runs both standalone
-    /// (via a pool-acquired connection, autocommit) and inside the idempotent
-    /// transaction (where `&mut *tx` is passed — `Transaction<'_, Postgres>`
-    /// derefs to `PgConnection`). Running the column-discovery query on the same
-    /// connection is harmless and avoids any cross-connection visibility surprise.
+    /// The engine discovers each column's name and underlying type for the
+    /// exact relation the INSERT targets (`to_regclass`, #146 M13), maps
+    /// fields to columns by exact name, refuses a record matching no column
+    /// (#789 SQL-50), and writes the union of carried columns — a row missing
+    /// one binds NULL (#146 H1) — in multi-row INSERTs sub-chunked at the
+    /// 65535-parameter cap. Each placeholder is `$N::<udt>` and the value is
+    /// bound as text (see [`pg_bind_text`]), so the column's input function
+    /// parses it (#146 C1).
     ///
-    /// Discovers each column's name *and* underlying type (`udt_name`) from the
-    /// table schema and maps top-level JSON fields to columns. Each placeholder
-    /// is emitted as `$N::<udt>` and the value is bound as text (see
-    /// [`pg_bind_text`]), so the destination column's input function parses it —
-    /// numbers, booleans, timestamps, uuids, and JSON all land in their native
-    /// column types. (Previously every value was bound as `serde_json::Value`,
-    /// which sqlx encodes as `jsonb`, so an insert into any non-`jsonb` column
-    /// failed at runtime — audit #146 C1.) Uses a single multi-row INSERT
-    /// (sub-chunked at the 65535-parameter cap) for efficiency.
-    ///
-    /// When `conflict_key` is `Some(key)`, each sub-chunk's INSERT is given an
-    /// `ON CONFLICT (key) DO UPDATE …` tail so it upserts by the key columns
-    /// (last-write-wins within the batch is already handled by the planner's
-    /// dedup, so a single sub-chunk never double-hits the same conflict target).
+    /// With `upsert`, each group of rows carrying the same columns gets an
+    /// `ON CONFLICT (key) DO UPDATE …` tail, so an absent column keeps its
+    /// stored value.
     pub(crate) async fn insert_auto_map_with_conflict(
         &self,
         conn: &mut sqlx::PgConnection,
         records: &[Value],
-        conflict_key: Option<&[String]>,
+        upsert: bool,
     ) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        // Get column names AND their underlying types for the *exact* relation
-        // the INSERT will target. Scoping by `to_regclass(<qualified ref>)`
-        // resolves the relation the same way the INSERT does — by the configured
-        // schema if set, otherwise by the connection's `search_path` — so a
-        // table of the same name in another schema can no longer pollute the
-        // column set with duplicate/wrong columns (#146 M13). The previous query
-        // filtered `information_schema.columns` by `table_name` alone (no schema
-        // predicate), merging every same-named table across all schemas.
-        //
-        // `pg_type.typname` is the concrete type (`int4`, `timestamptz`,
-        // `numeric`, `jsonb`, `uuid`, `text`, …) — identical to the old
-        // `information_schema.columns.udt_name` — used as the per-placeholder
-        // cast target below.
-        let table_ref =
-            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        let columns = self.discover_columns(&mut *conn, &table_ref).await?;
-
-        // Pre-validate all records and collect matched (column, udt, value)
-        // triples per record. The INSERT column set is the UNION of table
-        // columns present in ANY record (in declared table order), not just the
-        // first record's keys — otherwise a field present only in a later record
-        // of the batch would be silently dropped (audit #146 H1). A row missing
-        // a unioned column binds SQL NULL.
-        let mut matched_rows: Vec<Vec<(&String, &String, &Value)>> =
-            Vec::with_capacity(records.len());
-        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-        for (idx, record) in records.iter().enumerate() {
-            let obj = record
-                .as_object()
-                .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
-
-            let matching: Vec<(&String, &String, &Value)> = columns
-                .iter()
-                .filter_map(|(col, udt)| obj.get(col).map(|v| (col, udt, v)))
-                .collect();
-
-            if matching.is_empty() {
-                // Never a silent skip (#789 SQL-50).
-                return Err(FaucetError::Sink(no_matching_column_message(
-                    idx, obj, &columns,
-                )));
-            }
-
-            for (c, _, _) in &matching {
-                used.insert(c.as_str());
-            }
-            matched_rows.push(matching);
-        }
-
-        if matched_rows.is_empty() {
-            return Ok(0);
-        }
-
-        let num_rows = matched_rows.len();
-        match conflict_key {
-            // Grouped by present columns so an absent column is never overwritten with NULL.
-            Some(_) => {
-                let mut groups: Vec<(Vec<usize>, Vec<_>)> = Vec::new();
-                for row in &matched_rows {
-                    let present: Vec<usize> = columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, (c, _))| row.iter().any(|(rc, _, _)| *rc == c))
-                        .map(|(i, _)| i)
-                        .collect();
-                    match groups.iter_mut().find(|(p, _)| *p == present) {
-                        Some((_, rows)) => rows.push(row),
-                        None => groups.push((present, vec![row])),
-                    }
-                }
-                for (present, rows) in groups {
-                    let insert_columns: Vec<(String, String)> =
-                        present.iter().map(|i| columns[*i].clone()).collect();
-                    self.insert_rows(conn, &table_ref, &insert_columns, &rows, conflict_key)
-                        .await?;
-                }
-            }
-            None => {
-                // Table columns (in declared order, with their udt) present in
-                // at least one record; a row missing one binds SQL NULL.
-                let insert_columns: Vec<(String, String)> = columns
-                    .iter()
-                    .filter(|(c, _)| used.contains(c.as_str()))
-                    .cloned()
-                    .collect();
-                let rows: Vec<&Vec<(&String, &String, &Value)>> = matched_rows.iter().collect();
-                self.insert_rows(conn, &table_ref, &insert_columns, &rows, None)
-                    .await?;
-            }
-        }
-        Ok(num_rows)
+        let mut exec = PgExec { conn, sink: self };
+        self.engine
+            .insert(&mut exec, &self.write_target(), records, upsert)
+            .await
     }
 
-    /// One multi-row `INSERT` (chunked under the bind-parameter cap) of `rows`
-    /// over `insert_columns`, with the upsert tail when `conflict_key` is set.
-    async fn insert_rows(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        table_ref: &str,
-        insert_columns: &[(String, String)],
-        rows: &[&Vec<(&String, &String, &Value)>],
-        conflict_key: Option<&[String]>,
-    ) -> Result<(), FaucetError> {
-        let num_cols = insert_columns.len();
-        let col_names: Vec<String> = insert_columns.iter().map(|(c, _)| quote_ident(c)).collect();
-
-        // PostgreSQL caps bind parameters per statement at 65535. A multi-row
-        // INSERT binds `rows × num_cols` parameters, so a wide table at a large
-        // batch_size can exceed it and fail at runtime (#78/#21). Split into
-        // sub-INSERTs of at most floor(MAX_PARAMS / num_cols) rows.
-        const MAX_PG_PARAMS: usize = 65535;
-        let max_rows_per_insert = (MAX_PG_PARAMS / num_cols).max(1);
-
-        for sub in rows.chunks(max_rows_per_insert) {
-            // Build multi-row VALUES clause with per-column casts so the column
-            // type's input function parses the bound text:
-            //   ($1::int4, $2::timestamptz), ($3::int4, $4::timestamptz), ...
-            let mut value_tuples: Vec<String> = Vec::with_capacity(sub.len());
-            for row_idx in 0..sub.len() {
-                let start = row_idx * num_cols + 1;
-                let placeholders: Vec<String> = (0..num_cols)
-                    .map(|c| format!("${}::{}", start + c, insert_columns[c].1))
-                    .collect();
-                value_tuples.push(format!("({})", placeholders.join(", ")));
-            }
-
-            let query = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                table_ref,
-                col_names.join(", "),
-                value_tuples.join(", ")
-            );
-            let query = match conflict_key {
-                Some(key) => format!(
-                    "{query} {}",
-                    on_conflict_clause(
-                        key,
-                        &insert_columns
-                            .iter()
-                            .map(|(c, _)| c.clone())
-                            .collect::<Vec<_>>()
-                    )
-                ),
-                None => query,
-            };
-
-            let mut q = sqlx::query(&query);
-            for matched in sub {
-                // Bind values in the fixed column order, as text matching each
-                // column's type. A record missing a column binds SQL NULL.
-                for (col, udt) in insert_columns {
-                    let val = matched
-                        .iter()
-                        .find(|(c, _, _)| *c == col)
-                        .map(|(_, _, v)| *v);
-                    q = q.bind(
-                        pg_bind_text_with(val, udt, self.config.binary_encoding).map_err(|e| {
-                            FaucetError::Sink(format!(
-                                "PostgreSQL insert failed: column {col}: {e}"
-                            ))
-                        })?,
-                    );
-                }
-            }
-
-            q.execute(&mut *conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("PostgreSQL insert failed: {e}")))?;
-        }
-        Ok(())
-    }
-
-    /// Insert a batch of records using auto-mapped columns, on the given
-    /// connection, with plain append semantics (no `ON CONFLICT` tail).
-    ///
-    /// Thin wrapper over [`insert_auto_map_with_conflict`](Self::insert_auto_map_with_conflict)
-    /// so the append path and the idempotent-write path keep their original
-    /// signature.
+    /// Auto-mapped append on the given connection (no `ON CONFLICT` tail).
     async fn insert_auto_map(
         &self,
         conn: &mut sqlx::PgConnection,
         records: &[Value],
     ) -> Result<usize, FaucetError> {
-        self.insert_auto_map_with_conflict(conn, records, None)
+        self.insert_auto_map_with_conflict(conn, records, false)
             .await
     }
 
@@ -1161,256 +1033,59 @@ impl PostgresSink {
         conn: &mut sqlx::PgConnection,
         deletes: &[faucet_core::KeyTuple],
     ) -> Result<usize, FaucetError> {
-        if deletes.is_empty() {
-            return Ok(0);
-        }
-        let key = &self.config.write.key;
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-
-        // Underlying types for the key columns → drives the ::udt casts, same
-        // source the insert path uses.
-        let udts: std::collections::HashMap<String, String> = self
-            .discover_columns(&mut *conn, &table_ref)
-            .await?
-            .into_iter()
-            .collect();
-        let key_udts: Vec<String> = key
-            .iter()
-            .map(|k| udts.get(k).cloned().unwrap_or_else(|| "text".to_string()))
-            .collect();
-        let col_list = key
-            .iter()
-            .map(|k| quote_ident(k))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        const MAX_PG_PARAMS: usize = 65535;
-        let per = (MAX_PG_PARAMS / key.len().max(1)).max(1);
-        let mut total = 0usize;
-        for chunk in deletes.chunks(per) {
-            let mut ph = 1usize;
-            let tuples: Vec<String> = chunk
-                .iter()
-                .map(|_| {
-                    let group = key_udts
-                        .iter()
-                        .map(|udt| {
-                            let p = format!("${ph}::{udt}");
-                            ph += 1;
-                            p
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("({group})")
-                })
-                .collect();
-            let sql = format!(
-                "DELETE FROM {table_ref} WHERE ({col_list}) IN ({})",
-                tuples.join(", ")
-            );
-            let mut q = sqlx::query(&sql);
-            for kt in chunk {
-                for ((col, v), udt) in kt.0.iter().zip(key_udts.iter()) {
-                    q = q.bind(
-                        pg_bind_text_with(Some(v), udt, self.config.binary_encoding)
-                            .map_err(|e| FaucetError::Sink(format!("key column {col}: {e}")))?,
-                    );
-                }
-            }
-            let res = q
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("PostgreSQL delete failed: {e}")))?;
-            total += res.rows_affected() as usize;
-        }
-        Ok(total)
+        let mut exec = PgExec { conn, sink: self };
+        self.engine
+            .delete(&mut exec, &self.table_target(), deletes)
+            .await
     }
 
     /// Delete rows in `scope` whose key was not written by this run (#478).
     ///
-    /// Uses a temp table + `NOT EXISTS` rather than `key NOT IN (…)` because the
-    /// written-key set routinely exceeds PostgreSQL's 65535 bind-parameter limit
-    /// (the cleanup ceiling defaults to 100k rows). It also makes the whole thing
-    /// one transaction, so the delete is all-or-nothing: a partial delete would
-    /// remove rows the run actually wrote.
-    ///
-    /// An empty `seen` set is meaningful, not a no-op — it means the source
-    /// reported the scope as empty, so every row in it is stale and must go. That
-    /// is the case this feature exists for.
+    /// The engine loads the written keys into an `ON COMMIT DROP` temp table
+    /// typed like the key columns and deletes with `NOT EXISTS` — the key set
+    /// routinely exceeds the 65535-parameter limit — in one transaction, so
+    /// the delete is all-or-nothing. An empty `seen` set deletes the whole
+    /// scope: the source reported it empty.
     async fn cleanup_scope_impl(
         &self,
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
-        let key = &self.config.write.key;
-        if key.is_empty() {
-            return Err(FaucetError::Sink(
-                "cleanup requires a non-empty `key`".to_string(),
-            ));
-        }
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-
+        self.engine.check_cleanup_key()?;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL begin failed: {e}")))?;
-
-        let udts: std::collections::HashMap<String, String> = self
-            .discover_columns(&mut tx, &table_ref)
-            .await?
-            .into_iter()
-            .collect();
-
-        // Fail with a clear message rather than letting PostgreSQL reject an
-        // unknown column mid-DELETE. The scope is written in *destination* terms,
-        // so a name that isn't a real column is a config error worth naming.
-        for col in scope.keys().chain(key.iter()) {
-            if !udts.contains_key(col) {
-                return Err(FaucetError::Sink(format!(
-                    "cleanup: column '{col}' does not exist on {table_ref} — the \
-                     completeness claim and `key` are in destination column terms"
-                )));
-            }
-        }
-        let udt_of = |c: &str| udts.get(c).cloned().unwrap_or_else(|| "text".to_string());
-
-        // Temp table mirroring the key columns' types. `ON COMMIT DROP` scopes it
-        // to this transaction, so concurrent cleanups on other connections cannot
-        // collide on the name.
-        let temp_cols = key
-            .iter()
-            .map(|k| format!("{} {}", quote_ident(k), udt_of(k)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sqlx::query(&format!(
-            "CREATE TEMP TABLE faucet_cleanup_keys ({temp_cols}) ON COMMIT DROP"
-        ))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("cleanup: temp table creation failed: {e}")))?;
-
-        // Load the written keys.
-        const MAX_PG_PARAMS: usize = 65535;
-        let per = (MAX_PG_PARAMS / key.len()).max(1);
-        let key_udts: Vec<String> = key.iter().map(|k| udt_of(k)).collect();
-        let col_list = key
-            .iter()
-            .map(|k| quote_ident(k))
-            .collect::<Vec<_>>()
-            .join(", ");
-        for chunk in seen.keys().chunks(per) {
-            let mut ph = 1usize;
-            let tuples: Vec<String> = chunk
-                .iter()
-                .map(|_| {
-                    let group = key_udts
-                        .iter()
-                        .map(|udt| {
-                            let s = format!("${ph}::{udt}");
-                            ph += 1;
-                            s
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("({group})")
-                })
-                .collect();
-            let sql = format!(
-                "INSERT INTO faucet_cleanup_keys ({col_list}) VALUES {}",
-                tuples.join(", ")
-            );
-            let mut q = sqlx::query(&sql);
-            for kt in chunk {
-                for ((col, v), udt) in kt.0.iter().zip(key_udts.iter()) {
-                    q = q.bind(
-                        pg_bind_text_with(Some(v), udt, self.config.binary_encoding)
-                            .map_err(|e| FaucetError::Sink(format!("key column {col}: {e}")))?,
-                    );
-                }
-            }
-            q.execute(&mut *tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("cleanup: loading keys failed: {e}")))?;
-        }
-
-        // DELETE everything in scope that isn't in the written-key set.
-        let mut ph = 1usize;
-        let scope_pred = scope
-            .keys()
-            .map(|c| {
-                let s = format!("t.{} = ${}::{}", quote_ident(c), ph, udt_of(c));
-                ph += 1;
-                s
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let join_pred = key
-            .iter()
-            .map(|k| {
-                let q = quote_ident(k);
-                format!("c.{q} = t.{q}")
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let sql = format!(
-            "DELETE FROM {table_ref} t WHERE {scope_pred} \
-             AND NOT EXISTS (SELECT 1 FROM faucet_cleanup_keys c WHERE {join_pred})"
-        );
-        let mut q = sqlx::query(&sql);
-        for (col, v) in scope {
-            q = q.bind(pg_bind_text(Some(v), &udt_of(col)));
-        }
-        let res = q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: delete failed: {e}")))?;
-
+        let deleted = {
+            let mut exec = PgExec {
+                conn: &mut tx,
+                sink: self,
+            };
+            self.engine
+                .cleanup(&mut exec, &self.table_target(), scope, seen)
+                .await?
+        };
         tx.commit()
             .await
             .map_err(|e| FaucetError::Sink(format!("cleanup: commit failed: {e}")))?;
-        Ok(res.rows_affected())
+        Ok(deleted)
     }
 
-    /// Apply a planned upsert/delete batch on one connection. With
-    /// `rollback.journal` set, the before-image of every touched key is
-    /// journaled first, on the same connection, so the caller's transaction
-    /// commits the journal together with the writes (#706).
-    async fn apply_plan(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        plan: &faucet_core::WritePlan,
-    ) -> Result<usize, FaucetError> {
-        if self.config.write.journals()
-            && let Some(run_id) = self.config.write.rollback_run_id()
-        {
-            self.journal_plan(&mut *conn, plan, run_id).await?;
-        }
-        let mut affected = 0usize;
-        if !plan.upserts.is_empty() {
-            affected += self
-                .insert_auto_map_with_conflict(conn, &plan.upserts, Some(&self.config.write.key))
-                .await?;
-        }
-        if !plan.deletes.is_empty() {
-            affected += self.delete_by_keys(conn, &plan.deletes).await?;
-        }
-        Ok(affected)
-    }
-
-    /// Each plan in page order on one connection. Plans come from
-    /// [`faucet_core::plan_writes_ordered`], so a delete that precedes an
+    /// Each plan in page order on one connection: its journal (with
+    /// `rollback.journal`, on the same connection so the caller's transaction
+    /// commits it with the writes, #706), upserts, then deletes. Plans come
+    /// from [`faucet_core::plan_writes_ordered`], so a delete that precedes an
     /// upsert of a key equal under a nondeterministic collation runs first.
     async fn apply_plans(
         &self,
         conn: &mut sqlx::PgConnection,
         plans: &[faucet_core::WritePlan],
     ) -> Result<usize, FaucetError> {
-        let mut affected = 0usize;
-        for plan in plans {
-            affected += self.apply_plan(&mut *conn, plan).await?;
-        }
-        Ok(affected)
+        let mut exec = PgExec { conn, sink: self };
+        self.engine
+            .apply_plans(&mut exec, &self.table_target(), plans)
+            .await
     }
 
     /// Apply plans outside an exactly-once transaction. A journaled write or
@@ -1441,12 +1116,7 @@ impl PostgresSink {
 
     /// Ensure the commit-token watermark table exists.
     pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {t} ({s} TEXT PRIMARY KEY, {k} TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT now())",
-            t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-            s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-            k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-        );
+        let sql = Postgres.commit_token_table_sql();
         let mut conn = self
             .pool
             .acquire()
@@ -1473,28 +1143,26 @@ impl PostgresSink {
 
 impl PostgresSink {
     async fn write_batch_unbounded(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.write_batch_reported_unbounded(records)
+            .await
+            .map(|r| r.accepted)
+    }
+
+    /// Write a page and report what happened to each offered row: a keyed
+    /// page accepts one row per planned upsert/delete and coalesces the rest.
+    async fn write_batch_reported_unbounded(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok(faucet_core::WriteReport::accepted(0));
         }
         self.ensure_table_ready(records).await?;
 
-        if matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "postgres {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return self
-                .apply_plans_standalone(&faucet_core::plan_writes_ordered(
-                    records,
-                    &self.config.write,
-                ))
-                .await;
+        if self.engine.is_keyed() {
+            let plans = self.engine.plan_keyed(records)?;
+            let written = self.apply_plans_standalone(&plans).await?;
+            return Ok(self.engine.report(records.len(), written, &plans));
         }
         // Append and overwrite are insert-shaped; overwrite writes land in the
         // staging table via `effective_table_name`.
@@ -1538,7 +1206,7 @@ impl PostgresSink {
             rows = total,
             "PostgreSQL write complete"
         );
-        Ok(total)
+        Ok(self.engine.report(records.len(), total, &[]))
     }
 
     async fn write_batch_partial_unbounded(
@@ -1580,18 +1248,11 @@ impl PostgresSink {
         drop(conn);
         let (mut outcomes, writable, positions) =
             split_writable(records, &columns, self.config.binary_encoding, false);
-        let plan = faucet_core::plan_writes(&writable, &self.config.write);
-        self.apply_plans_standalone(&faucet_core::plan_writes_ordered(
-            &writable,
-            &self.config.write,
-        ))
-        .await?;
+        let (plans, failed) = self.engine.plan_keyed_partial(&writable);
+        self.apply_plans_standalone(&plans).await?;
 
-        for (idx, msg) in &plan.failed {
-            outcomes[positions[*idx]] = Err(FaucetError::Sink(format!(
-                "postgres {}: {msg}",
-                self.config.write.write_mode.as_str()
-            )));
+        for (idx, e) in failed {
+            outcomes[positions[idx]] = Err(e);
         }
         Ok(outcomes)
     }
@@ -1608,17 +1269,10 @@ impl PostgresSink {
 
         // For upsert/delete modes, plan the page before opening the transaction
         // so a key-extraction failure aborts without leaving an open tx.
-        let plan = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+        let plans = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
             None
         } else {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "postgres {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            Some(plan)
+            Some(self.engine.plan_keyed(records)?)
         };
 
         let mut tx =
@@ -1631,14 +1285,8 @@ impl PostgresSink {
         // both land or neither does, which is what makes a replay skip-on-resume
         // produce zero duplicates. For upsert/delete this means the planned
         // upserts/deletes commit together with the watermark in the same tx.
-        let written = match &plan {
-            Some(_) => {
-                self.apply_plans(
-                    &mut tx,
-                    &faucet_core::plan_writes_ordered(records, &self.config.write),
-                )
-                .await?
-            }
+        let written = match &plans {
+            Some(plans) => self.apply_plans(&mut tx, plans).await?,
             None => match &self.config.column_mapping {
                 PostgresColumnMapping::Jsonb { column } => {
                     self.insert_jsonb(&mut tx, records, column).await?
@@ -1647,18 +1295,13 @@ impl PostgresSink {
             },
         };
 
-        let upsert = format!(
-            "INSERT INTO {t} ({s}, {k}) VALUES ($1, $2) ON CONFLICT ({s}) DO UPDATE SET {k} = EXCLUDED.{k}, updated_at = now()",
-            t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-            s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-            k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-        );
-        sqlx::query(&upsert)
-            .bind(scope)
-            .bind(token)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL token upsert failed: {e}")))?;
+        {
+            let mut exec = PgExec {
+                conn: &mut tx,
+                sink: self,
+            };
+            self.engine.write_token(&mut exec, scope, token).await?;
+        }
 
         tx.commit()
             .await
@@ -2028,35 +1671,30 @@ impl faucet_core::Sink for PostgresSink {
                     FaucetError::Sink(format!("postgres evolve acquire failed: {e}"))
                 })?;
 
-            for c in &evolution.additions {
-                let t = faucet_core::json_schema_base_type(&c.to)
-                    .unwrap_or(faucet_core::SqlBaseType::Text);
-                sqlx::query(&build_add_column_sql(&table_ref, &c.name, t))
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("postgres ADD COLUMN {} failed: {e}", c.name))
-                    })?;
-            }
-            for c in &evolution.widenings {
-                sqlx::query(&build_alter_type_sql(
-                    &table_ref,
-                    &c.name,
-                    widened_keyword(c),
-                ))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("postgres ALTER TYPE {} failed: {e}", c.name))
+            for step in self.engine.evolution_steps(evolution, None) {
+                let (sql, what, column) = match step {
+                    EvolutionStep::Add { column, base } => (
+                        build_add_column_sql(&table_ref, &column, base),
+                        "ADD COLUMN",
+                        column,
+                    ),
+                    EvolutionStep::Widen {
+                        column, type_name, ..
+                    } => (
+                        build_alter_type_sql(&table_ref, &column, type_name),
+                        "ALTER TYPE",
+                        column,
+                    ),
+                    EvolutionStep::Relax { column } => (
+                        build_drop_not_null_sql(&table_ref, &column),
+                        "DROP NOT NULL",
+                        column,
+                    ),
+                    _ => continue,
+                };
+                sqlx::query(&sql).execute(&mut *conn).await.map_err(|e| {
+                    FaucetError::Sink(format!("postgres {what} {column} failed: {e}"))
                 })?;
-            }
-            for col in &evolution.relax_nullability {
-                sqlx::query(&build_drop_not_null_sql(&table_ref, col))
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("postgres DROP NOT NULL {col} failed: {e}"))
-                    })?;
             }
             Ok(())
         })
@@ -2128,6 +1766,14 @@ impl faucet_core::Sink for PostgresSink {
             .await
     }
 
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        self.guarded("write_batch", self.write_batch_reported_unbounded(records))
+            .await
+    }
+
     /// Write a batch and report per-row outcomes.
     ///
     /// In append mode this delegates to [`write_batch`](faucet_core::Sink::write_batch) and
@@ -2154,13 +1800,7 @@ impl faucet_core::Sink for PostgresSink {
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         self.guarded("last_committed_token", async {
             self.ensure_commit_table().await?;
-            let sql = format!(
-                "SELECT {k} FROM {t} WHERE {s} = $1",
-                t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-                k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-                s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-            );
-            let row = sqlx::query(&sql)
+            let row = sqlx::query(&Postgres.commit_token_select_sql())
                 .bind(scope)
                 .fetch_optional(&self.pool)
                 .await
