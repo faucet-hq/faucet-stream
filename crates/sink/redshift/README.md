@@ -122,3 +122,10 @@ already landed a second time). See
 ## Capabilities
 
 Append only, with a staged load (`write_strategy: copy` bulk-loads through S3). `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every statement (`INSERT`, `COPY`, DDL, the catalog lookups) and every S3
+staging request runs through the pipeline's `CallContext` (#880): each is sent
+once, any caller deadline ends it, and each is metered as a round trip
+(`execute`, `query`, `stage`). The pool's connect timeout still applies.

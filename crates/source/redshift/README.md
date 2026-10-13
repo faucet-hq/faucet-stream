@@ -75,3 +75,11 @@ License: MIT OR Apache-2.0
 ## Capabilities
 
 A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+The query and every page of rows read from its cursor run through the
+pipeline's `CallContext` (#880): the run's cancel token stops a stalled read,
+any caller deadline ends it, and the query is metered as a `query` round trip.
+Rows are read a page at a time per call, so the per-row cost is unchanged; the
+pool's connect timeout still applies and nothing is retried.

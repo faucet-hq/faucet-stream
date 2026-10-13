@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use faucet_core::replication::{filter_incremental, max_value};
 use faucet_core::util::substitute_context_bind_params;
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
-use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -27,6 +26,9 @@ pub struct RedshiftSource {
     pool: PgPool,
     /// Bookmark applied via [`Source::apply_start_bookmark`] (incremental only).
     start_bookmark: Mutex<Option<Value>>,
+    /// Backend-call context (#880): the query and every page of rows run
+    /// through it.
+    calls: faucet_core::CallSlot,
 }
 
 /// Client-side incremental filter context (column + effective lower bound).
@@ -47,6 +49,7 @@ impl RedshiftSource {
             config,
             pool,
             start_bookmark: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -133,6 +136,17 @@ impl Source for RedshiftSource {
         "redshift"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(RedshiftSourceConfig))
             .expect("schema serialization")
@@ -201,6 +215,9 @@ impl Source for RedshiftSource {
             let query = bind_params(sqlx::query(&query_str), &binds)?;
 
             let mut rows = query.fetch(&self.pool);
+            let calls = self.calls.get();
+            calls.record("query");
+            let reads = calls.with_roundtrip_metering(false);
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let cap = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
@@ -208,11 +225,17 @@ impl Source for RedshiftSource {
             let mut running_max: Option<Value> = incr.as_ref().map(|ic| ic.start.clone());
             let mut total = 0usize;
 
-            while let Some(row) = rows
-                .try_next()
-                .await
-                .map_err(|e| FaucetError::Source(format!("redshift query failed: {e}")))?
-            {
+            loop {
+            let fetched = faucet_common_redshift::calls::next_rows(
+                &reads,
+                "fetch",
+                &mut rows,
+                chunk,
+                |e| FaucetError::Source(format!("redshift query failed: {e}")),
+            )
+            .await?;
+            let exhausted = fetched.len() < chunk;
+            for row in fetched {
                 let obj = row_to_json(&row)?;
                 // Track the running max BEFORE the client-side filter so the
                 // persisted bookmark reflects the full scan.
@@ -233,6 +256,10 @@ impl Source for RedshiftSource {
                         yield StreamPage { records: kept, bookmark: None };
                     }
                 }
+            }
+            if exhausted {
+                break;
+            }
             }
 
             // Final page carries the new bookmark (incremental only).
@@ -261,24 +288,28 @@ impl Source for RedshiftSource {
         use faucet_core::check::{CheckReport, Probe};
 
         let started = std::time::Instant::now();
-        let probe =
-            match tokio::time::timeout(ctx.timeout, sqlx::query("SELECT 1").execute(&self.pool))
+        let calls = self.calls.get();
+        let ping = faucet_common_redshift::calls::once(&calls, "query", async {
+            sqlx::query("SELECT 1")
+                .execute(&self.pool)
                 .await
-            {
-                Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
-                Ok(Err(e)) => Probe::fail_hint(
-                    "auth",
-                    started.elapsed(),
-                    e.to_string(),
-                    "check host/port/database/user/credentials and that the cluster is reachable",
-                ),
-                Err(_) => Probe::fail_hint(
-                    "auth",
-                    started.elapsed(),
-                    "timed out",
-                    "check host/port/database/user/credentials and that the cluster is reachable",
-                ),
-            };
+                .map_err(|e| FaucetError::Source(e.to_string()))
+        });
+        let probe = match tokio::time::timeout(ctx.timeout, ping).await {
+            Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check host/port/database/user/credentials and that the cluster is reachable",
+            ),
+            Err(_) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                "timed out",
+                "check host/port/database/user/credentials and that the cluster is reachable",
+            ),
+        };
         Ok(CheckReport::single(probe))
     }
 }

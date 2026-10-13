@@ -15,9 +15,10 @@ faucet-core.workspace = true
 serde = { workspace = true, features = ["derive"] }
 schemars.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+futures.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 serde_json.workspace = true
 
 [package.metadata.docs.rs]
