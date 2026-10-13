@@ -251,6 +251,16 @@ config with *neither* a table nor SQL is rejected.
 
 Declares `discover`. Columnar (Arrow) output is declared only when the crate is built with the `arrow` feature and the config sets `read_api: true`. `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+Every request — `jobs.query`, `jobs.getQueryResults`, `jobs.get`, the
+discovery listings and the Storage Read gRPC session and row streams — runs
+through the pipeline's `CallContext` (#880): each is bounded by the default
+300 s call timeout and any caller deadline, and the run's cancel token stops an
+in-flight request or the job-poll pause. Round trips are still metered as
+`query` / `poll` / `job` (see Usage signals); nothing is retried by faucet —
+`poll_timeout` still caps how long an unfinished job is polled.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

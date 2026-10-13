@@ -259,7 +259,7 @@ pub(crate) fn http_client_bq() -> Result<reqwest_bq::Client, BQError> {
     http_client().map_err(|e| BQError::ConnectionPoolError(e.to_string()))
 }
 
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
+#[allow(clippy::disallowed_methods)] // the BigQuery SDK takes its own reqwest major, not faucet_core::http's
 fn http_client() -> Result<reqwest_bq::Client, FaucetError> {
     reqwest_bq::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
