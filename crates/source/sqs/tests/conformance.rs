@@ -416,3 +416,19 @@ async fn conformance_call_deadline() {
     };
     faucet_conformance::calls::assert_source_call_deadline(make).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_roundtrips_recorded() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    let queue_url = create_queue(&client, "recorded").await;
+    seed(&client, &queue_url, 3).await;
+    let mut cfg = SqsSourceConfig::new(&queue_url);
+    cfg.region = Some("us-east-1".into());
+    cfg.endpoint_url = Some(endpoint.clone());
+    cfg.credentials = test_credentials();
+    cfg.wait_time_seconds = 1;
+    cfg.idle_timeout_secs = Some(2);
+    let source = SqsSource::new(cfg).await.expect("source");
+    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+}

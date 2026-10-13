@@ -232,3 +232,43 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+/// The installed recorder counts publishes; a run cancelled before a publish
+/// group confirms fails every row of it with the cancellation.
+#[tokio::test(flavor = "multi_thread")]
+async fn roundtrips_are_recorded_and_a_cancelled_publish_fails_its_rows() {
+    use faucet_core::Sink as _;
+    use testcontainers_modules::nats::Nats;
+    let container = faucet_conformance::containers::start(Nats::default).await;
+    let port = container.get_host_port_ipv4(4222).await.expect("nats port");
+    let server = format!("nats://127.0.0.1:{port}");
+    for _ in 0..50 {
+        if async_nats::connect(&server).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let sink = || {
+        let mut cfg = NatsSinkConfig::new("recorded");
+        cfg.connection.servers = vec![server.clone()];
+        faucet_sink_nats::NatsSink::new(cfg)
+    };
+    let recorded = sink().await.expect("sink");
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &recorded,
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+
+    let cut = sink().await.expect("sink");
+    let token = faucet_core::CancellationToken::new();
+    token.cancel();
+    cut.set_call_context(faucet_core::CallContext::new().with_cancel(token));
+    match cut
+        .write_batch_partial(&[serde_json::json!({"id": 2}), serde_json::json!({"id": 3})])
+        .await
+    {
+        Ok(outcomes) => assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}"),
+        Err(e) => assert!(e.to_string().contains("cancelled"), "{e}"),
+    }
+}
