@@ -635,6 +635,52 @@ pipeline:
     assert_eq!(history.runs.len(), 2);
 }
 
+/// An `sla:` block is evaluated per sink node in topology mode (#459): the
+/// node's history is kept under `{pipeline}::{node}`.
+#[tokio::test]
+async fn sla_history_is_kept_per_sink_node() {
+    use faucet_core::StateStore;
+    let dir = TempDir::new().unwrap();
+    let csv = dir.path().join("orders.csv");
+    write(&csv, "order_id,amount\n1,10\n2,5\n");
+    let state = dir.path().join("state");
+    let cfg = parse(&format!(
+        r#"version: 1
+name: topo_sla
+sla: {{ max_staleness_secs: 3600, min_rows_per_run: 1 }}
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out}, append: false }} }}
+  state: {{ type: file, config: {{ path: {state} }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+        csv = csv.display(),
+        out = dir.path().join("o.jsonl").display(),
+        state = state.display()
+    ));
+    let auth = build_auth_catalog(None).unwrap();
+    let summary = faucet_cli::topology::run_topology(
+        &cfg,
+        &auth,
+        faucet_cli::topology::TopologyRunOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let store = faucet_core::FileStateStore::new(&state);
+    let key = faucet_cli::sla::state::sla_state_key("topo_sla::w");
+    assert!(
+        store.get(&key).await.unwrap().is_some(),
+        "SLA history keyed by sink node"
+    );
+}
+
 #[tokio::test]
 async fn rejects_missing_default_template() {
     // A source node with no `ref` defaults to the `default` template; with only

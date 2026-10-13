@@ -100,7 +100,6 @@ pub fn classify(pipeline: &str, key: &str) -> Option<ClassifiedKey> {
         kind,
     };
     let kind = match parsed.suffix() {
-        None => KeyKind::Bookmark,
         Some(KeySuffix::Replication) => return Some(pipeline_level(KeyKind::Replication)),
         Some(KeySuffix::Backfill(h)) => {
             return Some(pipeline_level(KeyKind::BackfillMarker(h.clone())));
@@ -114,7 +113,7 @@ pub fn classify(pipeline: &str, key: &str) -> Option<ClassifiedKey> {
         Some(KeySuffix::RollbackRun(r)) => KeyKind::RollbackRun(r.clone()),
         Some(KeySuffix::Status) => KeyKind::Status,
         Some(KeySuffix::Lease) => KeyKind::Lease,
-        Some(_) => KeyKind::Bookmark,
+        None | Some(_) => KeyKind::Bookmark,
     };
     let row = parsed.row()?.to_string();
     // A backfill unit's row id is `backfill::{range_hash}::{unit}`.

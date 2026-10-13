@@ -1042,6 +1042,7 @@ mod tests {
             fb.get("r1").await.unwrap().is_some(),
             "runs keep going in memory"
         );
+        assert!(!fb.insert_new(&run).await.unwrap(), "r1 is already held");
 
         assert!(!fb.try_recover().await, "still down");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);

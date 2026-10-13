@@ -2434,6 +2434,17 @@ schedule:
         }
     }
 
+    /// A `${scheme:…}` that is no credential reference is not screened, and a
+    /// load-time directive in a local path takes no value from records.
+    #[test]
+    fn unknown_schemes_pass_and_load_time_paths_are_static() {
+        let deny = ReferencePolicy::deny_all();
+        screen_references(&serde_json::json!({"a": "${nope:x}"}), &deny).unwrap();
+        assert!(!takes_record_value("/data/${env:HOME}/x.jsonl"));
+        assert!(!takes_record_value("/data/${now.date}/x.jsonl"));
+        assert!(takes_record_value("/data/${parent.id}/x.jsonl"));
+    }
+
     #[test]
     fn references_go_through_the_policy_after_the_credential_overlay() {
         let deny = ReferencePolicy::deny_all();

@@ -4238,10 +4238,12 @@ mod tests {
             inner: Box::new(probe.clone()),
             ctx: HashMap::from([("faucet_bind_0".to_string(), Value::from(1))]),
         };
-        let mut skip = vec!["fetch_all", "fetch_all_incremental"];
-        if !cfg!(feature = "arrow") {
-            skip.extend(["supports_columnar", "stream_batches"]);
-        }
+        let arrow_hooks = if cfg!(feature = "arrow") { 0 } else { 2 };
+        let skip = [
+            &["fetch_all", "fetch_all_incremental"][..],
+            &["supports_columnar", "stream_batches"][..arrow_hooks],
+        ]
+        .concat();
         assert_source_forwards_every_hook(&wrapped, &probe, &skip).await;
     }
 
@@ -7572,6 +7574,13 @@ matrix:
                     actual: 2,
                 },
                 "budget_exceeded",
+            ),
+            (
+                FaucetError::RowsUnaccounted {
+                    offered: 2,
+                    accepted: 1,
+                },
+                "rows_unaccounted",
             ),
             (FaucetError::Transform("x".into()), "error"),
         ];

@@ -1231,6 +1231,27 @@ pipeline:
         assert!(evaluate_topology(&bad, &cfg).is_err());
     }
 
+    /// A topology's DLQ is a destination of its own: each sink node's
+    /// columns are evaluated again against the DLQ's attributes (#870).
+    #[test]
+    fn a_topology_dlq_is_evaluated_per_sink_node() {
+        let clean = topology_cfg("", "");
+        let base = evaluate_topology(&policy(), &clean).unwrap().violations;
+        let cfg = topology_cfg(
+            "",
+            "  dlq:\n    sink: { type: jsonl, config: { path: /tmp/d.jsonl }, attributes: { residency: us } }\n",
+        );
+        let report = evaluate_topology(&policy(), &cfg).unwrap();
+        assert!(report.violations > base, "{report:?}");
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|r| r.violations.iter().any(|v| v.sink == "dlq")),
+            "{report:?}"
+        );
+    }
+
     #[test]
     fn doctor_probes_report_each_static_violation() {
         let cfg = mk_cfg(

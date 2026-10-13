@@ -1249,3 +1249,28 @@ async fn verify_takes_the_run_clock_for_a_dated_destination() {
         "today's table was never written"
     );
 }
+
+/// A post-run repair runs under what is left of the run's budget (#871): a
+/// generous ceiling lets the repair heal the drift.
+#[tokio::test]
+async fn a_post_run_repair_runs_under_the_remaining_budget() {
+    let d = fresh().await;
+    let base = load(&config_yaml(&d.src, &d.dst, &d.state, "upsert", ""));
+    assert!(!run(&base).await.had_failures());
+    exec(&d.dst, "INSERT INTO dst (id, name) VALUES (9, 'ghost')").await;
+    let healing = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "verify:\n  repair: true\n  allow_delete: true",
+    ));
+    let mut o = opts("mirror", &healing);
+    o.budget = Some(faucet_core::BudgetSpec {
+        max_records: Some(1_000),
+        ..Default::default()
+    });
+    let summary = run_expanded(expand(&healing).unwrap(), o).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert_eq!(rows(&d.dst).await.len(), 4, "the ghost row was deleted");
+}

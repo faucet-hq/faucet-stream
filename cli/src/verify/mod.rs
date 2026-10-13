@@ -930,6 +930,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(written, 2);
+
+        // The unguarded entry point compares the same node: the source holds
+        // only id 1, so the destination's id 2 is a difference.
+        let plan = VerifyInputs {
+            repair: false,
+            ..inputs
+        };
+        let outcome = verify_node(&node, &VerifySpec::default(), &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.key, key);
+        assert!(!outcome.report.differences.is_empty(), "{outcome:?}");
     }
 
     #[test]

@@ -2120,6 +2120,55 @@ mod tests {
         }
     }
 
+    /// Only the required methods, over a memory store, so the default
+    /// `insert_new` (read, then write) is the one that runs.
+    struct ReadThenWrite(memory::MemoryHistory);
+
+    #[async_trait]
+    impl RunHistory for ReadThenWrite {
+        async fn claim_idempotency(
+            &self,
+            key: &str,
+            fingerprint: &str,
+            run_id: &str,
+            window: Duration,
+        ) -> Result<Claim, HistoryError> {
+            self.0
+                .claim_idempotency(key, fingerprint, run_id, window)
+                .await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError> {
+            self.0.upsert(rec).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError> {
+            self.0.get(id).await
+        }
+        async fn list(&self, filter: &ListFilter) -> Result<ListPage, HistoryError> {
+            self.0.list(filter).await
+        }
+        async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError> {
+            self.0.delete(id).await
+        }
+        async fn purge_expired(&self, retain_for: Duration) -> Result<usize, HistoryError> {
+            self.0.purge_expired(retain_for).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            self.0.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_insert_new_writes_only_an_unknown_id() {
+        let h = ReadThenWrite(memory::MemoryHistory::new(Duration::from_secs(60)));
+        let rec = RunRecord::queued("r1".into(), None, Default::default(), None, Utc::now());
+        assert!(h.insert_new(&rec).await.unwrap());
+        assert!(!h.insert_new(&rec).await.unwrap(), "the id is taken");
+        assert!(h.get("r1").await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn log_delivery_defaults_are_inert() {
         let h = Bare;
