@@ -70,7 +70,7 @@ Values are encoded against the destination column types read once from `INFORMAT
 | Spanner column | Accepted JSON | Notes |
 |---|---|---|
 | `INT64` | integer, integer-string | String-encoded on the wire — lossless above 2^53. |
-| `FLOAT64` / `FLOAT32` | number, `"NaN"`/`"Infinity"`/`"-Infinity"` | |
+| `FLOAT64` / `FLOAT32` | number, `"NaN"`/`"Infinity"`/`"-Infinity"` | Faucet sources emit a non-finite float as `null`; the strings are still written as the float. |
 | `BOOL` | boolean | |
 | `STRING` | any | Scalars coerce to text; containers serialize as JSON text. |
 | `TIMESTAMP` / `DATE` | RFC 3339 string | |

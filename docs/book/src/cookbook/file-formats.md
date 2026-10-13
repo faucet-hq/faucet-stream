@@ -265,7 +265,7 @@ fallback:
 | `local-timestamp-*` | naive ISO 8601 | `Timestamp(unit)` without a zone |
 | `uuid` | canonical string | `Utf8` |
 | `duration` | `{months, days, millis}` | `Struct` |
-| `bytes` / `fixed` | lowercase hex, the same as the Arrow JSON writer | `Binary` / `FixedSizeBinary` |
+| `bytes` / `fixed` | standard base64, the same as an Arrow binary column | `Binary` / `FixedSizeBinary` |
 | `enum` | the symbol | `Utf8` |
 
 A union of `null` and one type is that type, nullable. A union of several
@@ -273,8 +273,11 @@ non-null types reads as whichever branch the value holds. On the columnar path,
 where a column has one type, it becomes a `Utf8` column holding the value's
 JSON. A recursive record is a nested object on the record path and JSON text
 on the columnar path, because Arrow has no recursive types. `NaN` and the
-infinities, which JSON cannot hold, read as the strings `"NaN"`, `"Infinity"`
-and `"-Infinity"`.
+infinities, which JSON cannot hold, read as a `null` counted in the run
+summary; on the columnar path they stay floats. These are the canonical
+renderings of [value fidelity](../reference/value-fidelity.md). A sink reads a
+`bytes` / `fixed` string as base64; `bytes_encoding: hex` (Kafka) reads the
+lowercase hex earlier releases wrote.
 
 **Writing.** A sink encodes each object against `avro.schema`, or against a
 schema inferred from that object's records:

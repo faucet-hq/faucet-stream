@@ -52,7 +52,7 @@ With the `host` form, faucet renders a connect descriptor, rejecting values cont
 | Oracle | JSON |
 |---|---|
 | `NUMBER`, `INTEGER`, `FLOAT` | number when exact (fits `i64`/`u64`, or the decimal survives `f64`), otherwise the exact decimal **string** — a `NUMBER(38)` key never loses digits |
-| `BINARY_FLOAT` / `BINARY_DOUBLE` | number (`BINARY_FLOAT` through its shortest decimal form, so `0.1` stays `0.1`; `Inf`/`NaN` as text, so the schema is `number \| string`) |
+| `BINARY_FLOAT` / `BINARY_DOUBLE` | number (`BINARY_FLOAT` through its shortest decimal form, so `0.1` stays `0.1`; `Inf`/`NaN` as a `null` counted in the run summary (`non_finite`), so the schema is `number \| null`) |
 | `VARCHAR2`, `CHAR`, `NVARCHAR2`, `CLOB`, `NCLOB`, `LONG`, `ROWID` | string |
 | `RAW`, `LONG RAW`, `BLOB` | base64 string |
 | `DATE` | `2024-01-02T03:04:05` |

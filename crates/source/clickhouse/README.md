@@ -76,8 +76,9 @@ non-UTC column zone never shifts them. ClickHouse will not compare a
 `DateTime` column with an RFC 3339 string literal directly, so wrap the
 bookmark in `parseDateTime64BestEffort(@bookmark)` for a `DateTime` cursor, and
 write `initial_value` in the same RFC 3339 form so the client-side filter
-orders it correctly. Float `NaN` / `±Inf` are emitted as the strings `"nan"`,
-`"inf"` and `"-inf"` rather than `null`.
+orders it correctly. Float `NaN` / `±Inf` have no JSON number and are emitted as a `null`
+counted in the run summary (`non_finite`); a `Decimal` keeps its declared
+scale (`1.50`).
 
 Put the literal `@bookmark` token in the `WHERE` clause to push the cursor down
 to the server (efficient); it is substituted as an injection-safe SQL literal.

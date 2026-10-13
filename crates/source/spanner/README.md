@@ -51,7 +51,7 @@ Each row becomes one JSON object keyed by column name:
 | Spanner type | JSON |
 |---|---|
 | `INT64` | integer (lossless — Spanner string-encodes it on the wire) |
-| `FLOAT64` / `FLOAT32` | number (`NaN` / `Infinity` become strings) |
+| `FLOAT64` / `FLOAT32` | number (`NaN` / `Infinity` become a `null` counted in the run summary (`non_finite`)) |
 | `BOOL` | boolean |
 | `STRING` / `TIMESTAMP` (RFC 3339) / `DATE` / `UUID` / `INTERVAL` | string |
 | `BYTES` / `PROTO` | base64 string |

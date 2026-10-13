@@ -159,7 +159,7 @@ Configured via `value_format` (and optionally `key_format`); all use a `type` di
 | `json` | Parse value bytes as a JSON document. **Default.** | base |
 | `raw_string` | Decode value bytes as a UTF-8 string into `value`. | base |
 | `bytes` | Pass bytes through as a **base64-encoded string** in `value`; no parsing. | base |
-| `confluent_avro` | Confluent wire-format Avro: `[0x00][schema_id 4B][Avro binary]`. Logical types map like the Avro file format: `decimal` → exact decimal string, `bytes`/`fixed` → hex, `date`/`time`/`timestamp` → ISO 8601 strings. | `schema-registry` |
+| `confluent_avro` | Confluent wire-format Avro: `[0x00][schema_id 4B][Avro binary]`. Logical types map like the Avro file format: `decimal` → exact decimal string, `bytes`/`fixed` → base64, `date`/`time`/`timestamp` → ISO 8601 strings. | `schema-registry` |
 | `confluent_protobuf` | Confluent wire-format Protobuf (single-message schemas). Every field is emitted, proto3 defaults (`0`, `false`, `""`) included, under its `.proto` field name (`order_id`, not `orderId`); 64-bit integers follow the proto3 JSON mapping (strings). | `schema-registry` |
 | `confluent_json_schema` | Confluent wire-format JSON: `[0x00][schema_id 4B][JSON bytes]`; optional validation. | `schema-registry` |
 

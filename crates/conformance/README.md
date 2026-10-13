@@ -115,6 +115,18 @@ async fn streams_with_bounded_memory() {
 Sinks use the value form of check 1:
 `conf::assert_config_schema_valid_value(&sink.config_schema(), sink.connector_name())`.
 
+## Value fidelity
+
+`fidelity` holds the corpus of values that have broken a pipeline somewhere —
+integers past 2^53, `-0.0`, `1e±300`, quote/backslash/padding strings, offset
+and pre-epoch timestamps, nested and empty containers, and the canonical
+renderings of `faucet_core::fidelity` (exact decimals, big integers, base64) —
+plus `assert_round_trip` / `diff_round_trip` and the one-sided helpers
+`assert_corpus_read` (a source over a seeded backend) and
+`assert_corpus_written` (a sink, read back). Every built-in connector runs it
+(`scripts/fidelity-coverage.py`); a `Tolerance` names what a destination
+genuinely cannot hold.
+
 ## Reliability suites
 
 `tests/reliability_*.rs` run the real `Pipeline::run` against scripted doubles
