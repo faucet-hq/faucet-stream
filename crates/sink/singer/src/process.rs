@@ -75,7 +75,28 @@ pub struct TargetProcess {
 
 impl TargetProcess {
     /// Spawn the target with `--config <0600 temp file>` plus `args` and `env`.
+    ///
+    /// An `ETXTBSY` retry blocks the thread for at most 150 ms; async callers
+    /// use [`spawn_in`](Self::spawn_in).
     pub fn spawn(cfg: &SingerSinkConfig, redactor: &Redactor) -> Result<Self, FaucetError> {
+        let (mut command, config_file) = Self::command(cfg)?;
+        let child = faucet_common_singer::spawn_command(&mut command);
+        Self::start(cfg, redactor, child, config_file)
+    }
+
+    /// [`spawn`](Self::spawn) without blocking the thread: an `ETXTBSY` retry
+    /// waits through `calls`, so a cancel or deadline ends it (#880).
+    pub async fn spawn_in(
+        cfg: &SingerSinkConfig,
+        redactor: &Redactor,
+        calls: &faucet_core::CallContext,
+    ) -> Result<Self, FaucetError> {
+        let (mut command, config_file) = Self::command(cfg)?;
+        let child = faucet_common_singer::spawn_command_in(&mut command, calls).await;
+        Self::start(cfg, redactor, child, config_file)
+    }
+
+    fn command(cfg: &SingerSinkConfig) -> Result<(Command, tempfile::NamedTempFile), FaucetError> {
         let config_file =
             write_private_json("config", &cfg.target_config).map_err(FaucetError::Sink)?;
         let mut command = Command::new(&cfg.target_command);
@@ -92,7 +113,16 @@ impl TargetProcess {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         tracing::debug!(target_command = %cfg.target_command, stream = %cfg.stream_name(), "spawning singer target");
-        let mut child = faucet_common_singer::spawn_command(&mut command).map_err(|e| {
+        Ok((command, config_file))
+    }
+
+    fn start(
+        cfg: &SingerSinkConfig,
+        redactor: &Redactor,
+        child: std::io::Result<Child>,
+        config_file: tempfile::NamedTempFile,
+    ) -> Result<Self, FaucetError> {
+        let mut child = child.map_err(|e| {
             FaucetError::Sink(format!(
                 "failed to spawn singer target '{}': {e}",
                 redactor.redact(&cfg.target_command)
@@ -428,5 +458,33 @@ mod tests {
         assert_eq!(marker_seq(&m), Some(3));
         assert_eq!(marker_seq(&json!({"bookmarks": {}})), None);
         assert_eq!(marker_seq(&json!({"faucet_flush": {"seq": "x"}})), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_and_spawn_in_both_start_the_target() {
+        let redactor = Redactor::default();
+        let cfg = SingerSinkConfig::new("true");
+        let mut sync = TargetProcess::spawn(&cfg, &redactor).unwrap();
+        sync.finish(Duration::from_secs(10)).await.unwrap();
+        let ctx = faucet_core::CallContext::new();
+        let mut in_ctx = TargetProcess::spawn_in(&cfg, &redactor, &ctx)
+            .await
+            .unwrap();
+        in_ctx.finish(Duration::from_secs(10)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_in_reports_a_missing_executable() {
+        let cfg = SingerSinkConfig::new("/nonexistent/faucet-target");
+        let err =
+            TargetProcess::spawn_in(&cfg, &Redactor::default(), &faucet_core::CallContext::new())
+                .await
+                .err()
+                .expect("spawn fails");
+        assert!(
+            err.to_string().contains("failed to spawn singer target"),
+            "{err}"
+        );
     }
 }

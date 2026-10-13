@@ -78,6 +78,19 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.dedups_by_key());
 }
 
+/// The sink buffers until flush: a cancelled run must still flush (#878).
+#[tokio::test]
+async fn conformance_cancellation_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.csv");
+    let sink = CsvSink::new(CsvSinkConfig::new(path.to_str().unwrap()).write_headers(false));
+    faucet_conformance::assert_cancellation_flushes(&sink, || {
+        let path = path.clone();
+        async move { count_rows(&path) }
+    })
+    .await;
+}
+
 // ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
 #[test]
 fn descriptor_matches_built_sink() {

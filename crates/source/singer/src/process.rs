@@ -69,10 +69,35 @@ impl TapProcess {
     /// `start_state` is the resume bookmark loaded from the state store (the
     /// STATE `value` blob), materialized to a `state.json` and passed as
     /// `--state` when present.
+    ///
+    /// An `ETXTBSY` retry blocks the thread for at most 150 ms; async callers
+    /// use [`spawn_in`](Self::spawn_in).
     pub fn spawn(
         cfg: &SingerSourceConfig,
         start_state: Option<&Value>,
     ) -> Result<Self, FaucetError> {
+        let (mut command, temp_files, redactor) = Self::command(cfg, start_state)?;
+        let child = faucet_common_singer::spawn_command(&mut command);
+        Self::start(cfg, child, temp_files, redactor)
+    }
+
+    /// [`spawn`](Self::spawn) without blocking the thread: an `ETXTBSY` retry
+    /// waits through `calls`, so the run's cancel token or deadline ends it
+    /// (#880).
+    pub async fn spawn_in(
+        cfg: &SingerSourceConfig,
+        start_state: Option<&Value>,
+        calls: &faucet_core::CallContext,
+    ) -> Result<Self, FaucetError> {
+        let (mut command, temp_files, redactor) = Self::command(cfg, start_state)?;
+        let child = faucet_common_singer::spawn_command_in(&mut command, calls).await;
+        Self::start(cfg, child, temp_files, redactor)
+    }
+
+    fn command(
+        cfg: &SingerSourceConfig,
+        start_state: Option<&Value>,
+    ) -> Result<(Command, Vec<tempfile::NamedTempFile>, Redactor), FaucetError> {
         let redactor = Redactor::from_config(&cfg.tap_config);
         let mut temp_files = Vec::new();
 
@@ -108,8 +133,16 @@ impl TapProcess {
             stream = %cfg.stream,
             "spawning singer tap"
         );
+        Ok((command, temp_files, redactor))
+    }
 
-        let mut child = faucet_common_singer::spawn_command(&mut command).map_err(|e| {
+    fn start(
+        cfg: &SingerSourceConfig,
+        child: std::io::Result<Child>,
+        temp_files: Vec<tempfile::NamedTempFile>,
+        redactor: Redactor,
+    ) -> Result<Self, FaucetError> {
+        let mut child = child.map_err(|e| {
             FaucetError::Source(format!(
                 "failed to spawn tap '{}': {}",
                 redactor.redact(&cfg.executable),
@@ -298,5 +331,43 @@ mod tests {
             let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    fn echo_tap(dir: &std::path::Path) -> SingerSourceConfig {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("tap.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho '{\"type\":\"RECORD\",\"stream\":\"s\",\"record\":{\"id\":1}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SingerSourceConfig::new(path.to_string_lossy(), "s")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_and_spawn_in_both_start_the_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = echo_tap(dir.path());
+        let mut sync = TapProcess::spawn(&cfg, Some(&json!({"b": 1}))).unwrap();
+        assert!(matches!(sync.recv(None).await, Recv::Line(Line::Parsed(_))));
+        let ctx = faucet_core::CallContext::new();
+        let mut in_ctx = TapProcess::spawn_in(&cfg, None, &ctx).await.unwrap();
+        assert!(matches!(
+            in_ctx.recv(None).await,
+            Recv::Line(Line::Parsed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_in_reports_a_missing_executable() {
+        let cfg = SingerSourceConfig::new("/nonexistent/faucet-tap", "s");
+        let err = TapProcess::spawn_in(&cfg, None, &faucet_core::CallContext::new())
+            .await
+            .err()
+            .expect("spawn fails");
+        assert!(err.to_string().contains("failed to spawn tap"), "{err}");
     }
 }

@@ -423,7 +423,10 @@ impl AzureBlobSource {
         let byte_stream = result
             .into_stream()
             .map_err(|e| std::io::Error::other(e.to_string()));
-        let reader = tokio_util::io::StreamReader::new(byte_stream);
+        let reader = self
+            .calls
+            .get()
+            .reader(tokio_util::io::StreamReader::new(byte_stream));
         // Wrap the RAW byte stream in the verifier first so the byte count
         // covers the stored bytes (below any client-side decompression).
         let verified = faucet_core::VerifyingReader::new(reader, checks);

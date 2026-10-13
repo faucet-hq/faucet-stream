@@ -131,3 +131,32 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+/// The blob's headers arrive, then its body stops mid-stream: the read must
+/// still end at the deadline and on cancel, because the body is read under the
+/// call context too (#880), not only the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline_bounds_a_stalled_body() {
+    use faucet_conformance::hung::{Reply, StallingBodyServer};
+    let server = StallingBodyServer::start(|_method, _target| {
+        Reply::stall_body("application/octet-stream", "{\"id\":1}\n", 4096)
+            .header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
+            .header("etag", "\"0x1\"")
+            .header("x-ms-blob-type", "BlockBlob")
+    })
+    .await
+    .expect("server");
+    let endpoint = server.http_url();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let config = AzureBlobSourceConfig::new("stalled")
+            .account("devstoreaccount1")
+            .auth(AzureCredentials::AccountKey {
+                account_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".into(),
+            })
+            .endpoint(&endpoint)
+            .allow_http(true)
+            .object_keys(vec!["a.jsonl".into()]);
+        block_on(AzureBlobSource::new(config)).expect("source builds offline")
+    })
+    .await;
+}

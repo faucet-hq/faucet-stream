@@ -489,7 +489,8 @@ impl S3Source {
         // body in the verifier first so length/checksum cover the stored bytes
         // (below any decompression), then `BufReader` so `.lines()` is usable
         // and ownership is `Unpin`.
-        let verified = faucet_core::VerifyingReader::new(response.body.into_async_read(), checks);
+        let body = self.calls.get().reader(response.body.into_async_read());
+        let verified = faucet_core::VerifyingReader::new(body, checks);
         let buffered = tokio::io::BufReader::new(verified);
         #[cfg(feature = "compression")]
         {

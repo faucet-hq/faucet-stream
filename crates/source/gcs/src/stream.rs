@@ -438,7 +438,9 @@ impl GcsSource {
         // Wrap the RAW byte stream in the verifier first so length/checksum
         // cover the stored bytes (below any client-side decompression).
         let verified = faucet_core::VerifyingReader::new(
-            tokio_util::io::StreamReader::new(bytes_stream),
+            self.calls
+                .get()
+                .reader(tokio_util::io::StreamReader::new(bytes_stream)),
             checks,
         );
         let buffered = tokio::io::BufReader::new(verified);
