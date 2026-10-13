@@ -6211,6 +6211,7 @@ version = "1.8.2"
 dependencies = [
  "async-stream",
  "async-trait",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "futures",

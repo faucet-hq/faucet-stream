@@ -2,7 +2,12 @@
 
 use crate::config::{SqliteColumnMapping, SqliteSinkConfig};
 use async_trait::async_trait;
-use faucet_core::{FaucetError, SchemaEvolution, SqlBaseType, json_schema_base_type};
+use faucet_common_sql::dialects::{Sqlite, sqlite};
+use faucet_common_sql::{
+    EngineOptions, EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine, Statement,
+    StatementKind, TableColumn, TableTarget,
+};
+use faucet_core::{FaucetError, SchemaEvolution, SqlBaseType};
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -21,120 +26,53 @@ use std::time::Duration;
 /// proper "no such column" error. Embedded backticks are doubled, preventing
 /// identifier injection. Mirrors `quote_ident_sqlite` in `faucet-source-sqlite`.
 pub(crate) fn quote_ident_sqlite(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+    sqlite::quote_ident(name)
 }
 
-/// Transient table holding the key tuples this run wrote, joined against by the
-/// scoped-cleanup DELETE (#478).
-///
-/// Always created in — and referenced through — the `temp` schema, so it can
-/// never be confused with (or, on the defensive `DROP`, destroy) a real table of
-/// the same name in the main database.
-const CLEANUP_KEYS_TABLE: &str = "faucet_cleanup_keys";
-
-/// Schema-qualified, quoted reference to [`CLEANUP_KEYS_TABLE`].
-fn cleanup_keys_ref() -> String {
-    format!("temp.{}", quote_ident_sqlite(CLEANUP_KEYS_TABLE))
+/// The quoted target of `table`, as the engine addresses it.
+pub(crate) fn target(table: &str) -> TableTarget {
+    TableTarget::new(table, quote_ident_sqlite(table))
 }
 
-/// A declared SQLite column type (`PRAGMA table_info.type`) that is safe to
-/// re-emit verbatim in the cleanup temp table's DDL, or `None`.
-///
-/// The declared type comes from the database's own catalog, but SQLite lets a
-/// column be declared with *arbitrary quoted text*, so it is filtered to the
-/// shape real type specs take (`VARCHAR(255)`, `DOUBLE PRECISION`,
-/// `DECIMAL(10, 2)`) rather than pasted in blind. `None` means "declare the temp
-/// column without a type" — legal in SQLite, and only costs the column its type
-/// affinity.
-fn safe_type_spec(declared: &str) -> Option<&str> {
-    let t = declared.trim();
-    if t.is_empty() {
-        return None;
-    }
-    t.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '(' | ')' | ',' | '.'))
-        .then_some(t)
-}
+#[cfg(test)]
+use faucet_common_sql::dialects::sqlite::safe_type_spec;
 
-/// `CREATE TEMP TABLE temp.`faucet_cleanup_keys` (…)` — one column per key
-/// column, mirroring the destination column's declared type so the join
-/// comparison sees matching type affinities.
+#[cfg(test)]
 fn build_cleanup_temp_table_sql(key_types: &[(String, String)]) -> String {
-    let cols = key_types
-        .iter()
-        .map(|(col, declared)| match safe_type_spec(declared) {
-            Some(t) => format!("{} {t}", quote_ident_sqlite(col)),
-            None => quote_ident_sqlite(col),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("CREATE TEMP TABLE {} ({cols})", cleanup_keys_ref())
+    let key: Vec<String> = key_types.iter().map(|(k, _)| k.clone()).collect();
+    let types: Vec<Option<&str>> = key_types.iter().map(|(_, t)| Some(t.as_str())).collect();
+    Sqlite
+        .cleanup_create_sql(&target(""), &key, &types)
+        .expect("sqlite cleanup DDL")
 }
 
-/// `INSERT INTO temp.`faucet_cleanup_keys` (…) VALUES (?, …), …` for `rows`
-/// key tuples. The caller chunks `rows` to stay under SQLite's bind-variable
-/// cap.
+#[cfg(test)]
 fn build_cleanup_insert_sql(key: &[String], rows: usize) -> String {
-    let col_list = key
-        .iter()
-        .map(|k| quote_ident_sqlite(k))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let tuple = format!("({})", vec!["?"; key.len()].join(", "));
-    let tuples = vec![tuple; rows].join(", ");
-    format!(
-        "INSERT INTO {} ({col_list}) VALUES {tuples}",
-        cleanup_keys_ref()
-    )
+    Sqlite
+        .cleanup_insert_sql(key, &[], rows)
+        .expect("sqlite cleanup insert")
 }
 
-/// The cleanup DELETE: every row matching the scope (equality predicates,
-/// AND-ed, one bind each) whose key is absent from the written-key table.
-///
-/// The target table is referenced by name rather than an alias — a single-table
-/// `DELETE … AS alias` is a newer SQLite grammar, and the correlated reference
-/// works identically through the table name.
+#[cfg(test)]
 fn build_cleanup_delete_sql(table: &str, scope_cols: &[String], key: &[String]) -> String {
-    let t = quote_ident_sqlite(table);
-    let scope_pred = scope_cols
-        .iter()
-        .map(|c| format!("{t}.{} = ?", quote_ident_sqlite(c)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let join_pred = key
-        .iter()
-        .map(|k| {
-            let q = quote_ident_sqlite(k);
-            format!("{t}.{q} = c.{q}")
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    format!(
-        "DELETE FROM {t} WHERE {scope_pred} AND NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
-        cleanup_keys_ref()
-    )
+    Sqlite
+        .cleanup_delete_sql(&target(table), scope_cols, &[], key)
+        .expect("sqlite cleanup delete")
 }
 
-/// Check that every scope and key column exists on the destination table.
-///
-/// Fails with a clear message rather than letting SQLite reject an unknown
-/// column mid-DELETE. The scope is written in *destination* terms, so a name
-/// that isn't a real column is a config error worth naming.
+#[cfg(test)]
 fn validate_cleanup_columns(
     existing: &std::collections::HashSet<String>,
     scope_cols: &[String],
     key: &[String],
     table: &str,
 ) -> Result<(), FaucetError> {
-    for col in scope_cols.iter().chain(key.iter()) {
-        if !existing.contains(col) {
-            return Err(FaucetError::Sink(format!(
-                "cleanup: column '{col}' does not exist on table '{table}' — the \
-                 completeness claim and `key` are in destination column terms"
-            )));
-        }
-    }
-    Ok(())
+    faucet_common_sql::check_cleanup_columns(
+        |c| existing.contains(c),
+        scope_cols,
+        key,
+        &Sqlite.cleanup_table_display(&target(table)),
+    )
 }
 
 /// Bind one JSON value to a SQLite query as its native type.
@@ -188,123 +126,11 @@ pub(crate) async fn table_columns(
     Ok(columns)
 }
 
-/// The `(column, value)` pairs a record carries, in table order. SQLite column
-/// names are case-insensitive, so a field matches its column exactly first and
-/// otherwise ignoring ASCII case (#789 SQL-70).
-fn match_columns<'a>(
-    columns: &'a [String],
-    obj: &'a serde_json::Map<String, Value>,
-) -> Vec<(&'a String, &'a Value)> {
-    columns
-        .iter()
-        .filter_map(|col| {
-            obj.get(col)
-                .or_else(|| {
-                    obj.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(col))
-                        .map(|(_, v)| v)
-                })
-                .map(|v| (col, v))
-        })
-        .collect()
-}
-
-/// Record fields that match no column (exactly or ignoring ASCII case).
-fn unmatched_fields<'a>(
-    obj: &'a serde_json::Map<String, Value>,
-    columns: &[String],
-) -> Vec<&'a str> {
-    obj.keys()
-        .filter(|k| !columns.iter().any(|c| c.eq_ignore_ascii_case(k)))
-        .map(String::as_str)
-        .collect()
-}
-
-/// The per-row error for a record that matches no column of `table`.
-fn no_matching_column_error(
-    idx: usize,
-    obj: &serde_json::Map<String, Value>,
-    columns: &[String],
-    table: &str,
-) -> FaucetError {
-    FaucetError::Sink(format!(
-        "sqlite: record {idx} has no field matching a column of table '{table}' \
-         (record fields: {:?}; table columns: {columns:?})",
-        obj.keys().collect::<Vec<_>>()
-    ))
-}
-
-/// Rows grouped by the exact set of table columns they carry, in first-seen
-/// order: an upsert of one group never names a column its rows omit, so an
-/// absent column keeps its stored value instead of becoming NULL (#789 SQL-69).
-type RowCells<'a> = Vec<(&'a String, &'a Value)>;
-type ColumnGroup<'r, 'a> = (Vec<String>, Vec<&'r RowCells<'a>>);
-
-fn group_by_present_columns<'r, 'a>(
-    columns: &[String],
-    rows: &'r [RowCells<'a>],
-) -> Vec<ColumnGroup<'r, 'a>> {
-    let mut groups: Vec<ColumnGroup<'r, 'a>> = Vec::new();
-    for row in rows {
-        let present: Vec<String> = columns
-            .iter()
-            .filter(|c| row.iter().any(|(rc, _)| *rc == *c))
-            .cloned()
-            .collect();
-        match groups.iter_mut().find(|(p, _)| *p == present) {
-            Some((_, members)) => members.push(row),
-            None => groups.push((present, vec![row])),
-        }
-    }
-    groups
-}
-
-/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
-///
-/// `IF NOT EXISTS` rather than probe-then-create: two matrix rows writing the
-/// same table would otherwise race between the probe and the DDL.
-fn build_create_table_sql(
-    table: &str,
-    columns: &[faucet_core::PlannedColumn],
-    json_column: Option<&str>,
-    key: &[String],
-) -> String {
-    let cols = match json_column {
-        // JSON mode stores the whole record in one column, so the page's own
-        // shape is irrelevant — the table is the same whatever arrives.
-        Some(col) => format!(
-            "{} INTEGER PRIMARY KEY AUTOINCREMENT, {} TEXT NOT NULL",
-            quote_ident_sqlite("id"),
-            quote_ident_sqlite(col)
-        ),
-        None => {
-            let defs = faucet_core::render_columns(columns, quote_ident_sqlite, sqlite_keyword);
-            // A keyed write needs a PRIMARY KEY for its ON CONFLICT target (#676).
-            match faucet_core::render_primary_key(key, quote_ident_sqlite) {
-                Some(pk) => format!("{defs}, {pk}"),
-                None => defs,
-            }
-        }
-    };
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} ({cols})",
-        quote_ident_sqlite(table)
-    )
-}
-
-/// Map a [`SqlBaseType`] to the SQLite column-type keyword used when adding a
-/// column during schema evolution (issue #194). SQLite uses dynamic typing
-/// (type affinity), so these are advisory affinities rather than strict types:
-/// `Boolean` maps to `INTEGER` (SQLite has no native boolean) and `Json` to
-/// `TEXT` (JSON is stored as text).
+/// The SQLite affinity for a [`SqlBaseType`] (advisory: `Boolean` is
+/// `INTEGER`, `Json` is `TEXT`).
+#[cfg(test)]
 fn sqlite_keyword(t: SqlBaseType) -> &'static str {
-    match t {
-        SqlBaseType::Integer => "INTEGER",
-        SqlBaseType::Double => "REAL",
-        SqlBaseType::Boolean => "INTEGER",
-        SqlBaseType::Text => "TEXT",
-        SqlBaseType::Json => "TEXT",
-    }
+    Sqlite.type_name(t)
 }
 
 /// `ALTER TABLE <table> ADD COLUMN "<col>" <kw>` — SQLite has no
@@ -312,12 +138,9 @@ fn sqlite_keyword(t: SqlBaseType) -> &'static str {
 /// for columns it has already verified are absent (idempotency by pre-check).
 /// `table` is the unquoted table name; it is quoted here via [`quote_ident_sqlite`].
 fn build_add_column_sql(table: &str, col: &str, t: SqlBaseType) -> String {
-    format!(
-        "ALTER TABLE {} ADD COLUMN {} {}",
-        quote_ident_sqlite(table),
-        quote_ident_sqlite(col),
-        sqlite_keyword(t)
-    )
+    Sqlite
+        .add_column_sql(&target(table), col, t)
+        .expect("sqlite ADD COLUMN")
 }
 
 /// Rewrite the target's `CREATE TABLE` text (from `sqlite_master.sql`) so it
@@ -447,24 +270,9 @@ fn sqlite_affinity_to_json_schema(declared: &str, nullable: bool) -> serde_json:
 /// Non-key columns are SET from `excluded`. If every column is a key column,
 /// emit `DO NOTHING`.
 pub(crate) fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String {
-    let key_list = key
-        .iter()
-        .map(|k| quote_ident_sqlite(k))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let updates: Vec<String> = all_cols
-        .iter()
-        .filter(|c| !key.iter().any(|k| k == *c))
-        .map(|c| format!("{q} = excluded.{q}", q = quote_ident_sqlite(c)))
-        .collect();
-    if updates.is_empty() {
-        format!("ON CONFLICT({key_list}) DO NOTHING")
-    } else {
-        format!(
-            "ON CONFLICT({key_list}) DO UPDATE SET {}",
-            updates.join(", ")
-        )
-    }
+    Sqlite
+        .upsert_tail(key, all_cols)
+        .expect("sqlite upserts with ON CONFLICT")
 }
 
 /// How every write transaction starts. A deferred `BEGIN` takes a read lock and
@@ -482,11 +290,79 @@ pub struct SqliteSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
-    /// Whether fields matching no column have been reported for this sink.
-    unmatched_warned: std::sync::atomic::AtomicBool,
+    /// The shared SQL planning engine (#884).
+    pub(crate) engine: SqlSinkEngine<Sqlite>,
     /// Backend-call context (#880): the run's deadline, cancel token and
     /// round-trip recorder.
     calls: faucet_core::CallSlot,
+}
+
+/// The engine's view of one SQLite connection (or open transaction): every
+/// statement of an engine call runs on it, inside the sink's backend call.
+pub(crate) struct SqliteExec<'c> {
+    pub(crate) conn: &'c mut sqlx::SqliteConnection,
+    pub(crate) sink: &'c SqliteSink,
+}
+
+#[async_trait]
+impl SqlExecutor for SqliteExec<'_> {
+    async fn columns(&mut self, target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        Ok(table_columns(self.conn, &target.name)
+            .await?
+            .into_iter()
+            .map(TableColumn::untyped)
+            .collect())
+    }
+
+    /// Declared types from `PRAGMA table_info`, so the cleanup key table
+    /// compares with the destination's type affinities. Empty when the table
+    /// is missing.
+    async fn cleanup_columns(
+        &mut self,
+        target: &TableTarget,
+    ) -> Result<Vec<TableColumn>, FaucetError> {
+        Ok(
+            sqlx::query(&format!("PRAGMA table_info({})", target.reference))
+                .fetch_all(&mut *self.conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("cleanup: table_info query failed: {e}")))?
+                .iter()
+                .map(|row| TableColumn::new(row.get::<String, _>("name"), row.get::<String, _>("type")))
+                .collect(),
+        )
+    }
+
+    async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+        let mut q = sqlx::query(&stmt.sql);
+        for p in &stmt.params {
+            // Native SQLite types so affinity and typed reads round-trip (#78/#4).
+            q = bind_value(q, &p.value);
+        }
+        let context = match stmt.kind {
+            StatementKind::Insert | StatementKind::InsertJson | StatementKind::Upsert => {
+                "SQLite insert failed"
+            }
+            StatementKind::Delete => "SQLite delete failed",
+            StatementKind::CleanupDrop => "cleanup: temp table drop failed",
+            StatementKind::CleanupCreate => "cleanup: temp table creation failed",
+            StatementKind::CleanupLoad => "cleanup: loading keys failed",
+            StatementKind::CleanupDelete => "cleanup: delete failed",
+            StatementKind::TokenTable => "SQLite commit-table create failed",
+            _ => "SQLite token upsert failed",
+        };
+        q.execute(&mut *self.conn)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| FaucetError::Sink(format!("{context}: {e}")))
+    }
+
+    async fn journal_plan(
+        &mut self,
+        plan: &faucet_core::WritePlan,
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        self.sink.journal_plan(self.conn, plan, run_id).await
+    }
 }
 
 /// Create the directory a database file lives in, so `./out/db.sqlite` works
@@ -531,24 +407,16 @@ impl SqliteSink {
             SqliteColumnMapping::AutoMap => None,
             SqliteColumnMapping::Json { column } => Some(column.as_str()),
         };
-        let key: &[String] = if self.config.write.dedups_by_key() {
-            &self.config.write.key
-        } else {
-            &[]
-        };
-        let planned = if key.is_empty() {
-            faucet_core::plan_columns(records)
-        } else {
-            faucet_core::plan_keyed_columns(records, key)
-        };
-        let columns = match (json_column, planned) {
-            (Some(_), _) => Vec::new(),
-            (None, Some(c)) => c,
-            (None, None) => return Ok(()),
-        };
         // An overwrite writes to staging. On a first run (no target) nothing
         // else creates staging, so it is created here from the page (#676).
-        let sql = build_create_table_sql(&self.effective_table(), &columns, json_column, key);
+        // A column-mapped page with nothing to infer from leaves it for the
+        // next page.
+        let Some(sql) =
+            self.engine
+                .create_table_sql(&target(&self.effective_table()), records, json_column)?
+        else {
+            return Ok(());
+        };
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
@@ -620,11 +488,13 @@ impl SqliteSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite connection failed: {e}")))?;
 
+        let engine = SqlSinkEngine::new(Sqlite, config.write.clone())
+            .with_options(EngineOptions::new().warn_unmatched_fields(true));
         Ok(Self {
             config,
             pool,
             table_ready: std::sync::atomic::AtomicBool::new(false),
-            unmatched_warned: std::sync::atomic::AtomicBool::new(false),
+            engine,
             calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
@@ -650,468 +520,146 @@ impl SqliteSink {
         }
     }
 
-    /// Insert JSON-column records within an existing transaction, sub-chunking
-    /// at SQLite's bind-variable cap. JSON mode binds one variable per row.
+    /// Open a write transaction (`BEGIN IMMEDIATE`, see [`BEGIN_WRITE`]).
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, FaucetError> {
+        self.pool
+            .begin_with(BEGIN_WRITE)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))
+    }
+
+    async fn commit_write(tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(), FaucetError> {
+        tx.commit()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))
+    }
+
+    /// Insert JSON-column records on the caller's connection; the engine
+    /// sub-chunks at SQLite's bind-variable cap (one variable per row).
     async fn insert_json_tx(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conn: &mut sqlx::SqliteConnection,
         records: &[Value],
         column: &str,
     ) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        // SQLite caps bind params per statement at 32766 (>=3.32). JSON mode
-        // binds one variable per row, so chunk at that cap.
-        const MAX_SQLITE_VARS: usize = 32766;
-        for chunk in records.chunks(MAX_SQLITE_VARS) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "(?)").collect();
-            let insert_sql = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                quote_ident_sqlite(&self.effective_table()),
-                quote_ident_sqlite(column),
-                placeholders.join(", ")
-            );
-            let mut q = sqlx::query(&insert_sql);
-            for record in chunk {
-                let json_str = serde_json::to_string(record)
-                    .map_err(|e| FaucetError::Sink(format!("failed to serialize record: {e}")))?;
-                q = q.bind(json_str);
-            }
-            q.execute(&mut **tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("SQLite insert failed: {e}")))?;
-        }
-        Ok(records.len())
+        let mut exec = SqliteExec { conn, sink: self };
+        self.engine
+            .insert_json(&mut exec, &target(&self.effective_table()), column, records)
+            .await
     }
 
-    /// Insert a batch of records using JSON column mode.
-    /// Opens its own `BEGIN`/`COMMIT` transaction and delegates to
-    /// [`Self::insert_json_tx`], which sub-chunks at SQLite's bind-variable cap.
+    /// Insert a batch of records using JSON column mode, in its own
+    /// `BEGIN`/`COMMIT` transaction.
     async fn insert_json(&self, records: &[Value], column: &str) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let mut tx = self
-            .pool
-            .begin_with(BEGIN_WRITE)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
+        let mut tx = self.begin_write().await?;
         let n = self.insert_json_tx(&mut tx, records, column).await?;
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))?;
+        Self::commit_write(tx).await?;
         Ok(n)
     }
 
-    /// Insert a batch of records using auto-mapped columns.
-    ///
-    /// Discovers column names from `pragma_table_info` and maps
-    /// top-level JSON fields to columns. Uses a single multi-row INSERT
-    /// wrapped in a transaction.
+    /// Insert a batch of records using auto-mapped columns, in its own
+    /// `BEGIN`/`COMMIT` transaction.
     async fn insert_auto_map(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-
-        let mut tx = self
-            .pool
-            .begin_with(BEGIN_WRITE)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
-
+        let mut tx = self.begin_write().await?;
         let written = self.insert_auto_map_tx(&mut tx, records).await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))?;
-
+        Self::commit_write(tx).await?;
         Ok(written)
     }
 
-    /// Auto-map insert against an in-progress transaction.
-    ///
-    /// This is the reusable core shared by [`Self::insert_auto_map`] (which
-    /// opens its own `BEGIN`/`COMMIT`) and [`faucet_core::Sink::write_batch_idempotent`]
-    /// (which folds the insert and the commit-token upsert into one
-    /// transaction). The read-only `PRAGMA table_info` column-discovery query
-    /// runs on the transaction's own connection (`&mut **tx`), not on
-    /// `&self.pool` — otherwise, with the default single-connection pool, it
-    /// would deadlock waiting for a connection the open transaction is holding.
-    ///
-    /// When `conflict_key` is `Some(key)`, each sub-chunk's INSERT is given an
-    /// `ON CONFLICT(key) DO UPDATE …` tail so it upserts by the key columns
-    /// (last-write-wins within the batch is handled by the planner's dedup,
-    /// so a single sub-chunk never double-hits the same conflict target).
-    pub(crate) async fn insert_auto_map_with_conflict_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        records: &[Value],
-        conflict_key: Option<&[String]>,
-    ) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        // Get column names from the table using pragma_table_info. Use the
-        // transaction's connection so a single-connection pool doesn't deadlock.
-        let effective_table = self.effective_table();
-        let columns = table_columns(tx, &effective_table).await?;
-
-        // A record that matches no column is an error, never a silent skip
-        // (#789 SQL-70); fields matching no column are reported once.
-        let mut matched_rows: Vec<Vec<(&String, &Value)>> = Vec::with_capacity(records.len());
-        for (idx, record) in records.iter().enumerate() {
-            let obj = record
-                .as_object()
-                .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
-            let matching = match_columns(&columns, obj);
-            if matching.is_empty() {
-                return Err(no_matching_column_error(
-                    idx,
-                    obj,
-                    &columns,
-                    &effective_table,
-                ));
-            }
-            self.warn_unmatched_fields(obj, &columns, &effective_table);
-            matched_rows.push(matching);
-        }
-
-        match conflict_key {
-            // Grouped by present columns so an absent column is never
-            // overwritten with NULL (#789 SQL-69).
-            Some(_) => {
-                for (present, rows) in group_by_present_columns(&columns, &matched_rows) {
-                    self.insert_rows(tx, &effective_table, &present, &rows, conflict_key)
-                        .await?;
-                }
-            }
-            None => {
-                // Table columns (in declared order) present in at least one
-                // record; a row missing one binds SQL NULL (audit #146 H1).
-                let insert_columns: Vec<String> = columns
-                    .iter()
-                    .filter(|c| {
-                        matched_rows
-                            .iter()
-                            .any(|row| row.iter().any(|(rc, _)| *rc == *c))
-                    })
-                    .cloned()
-                    .collect();
-                let rows: Vec<&Vec<(&String, &Value)>> = matched_rows.iter().collect();
-                self.insert_rows(tx, &effective_table, &insert_columns, &rows, None)
-                    .await?;
-            }
-        }
-        Ok(matched_rows.len())
-    }
-
-    /// One multi-row `INSERT` (chunked under SQLite's bind-variable cap) of
-    /// `rows` over `insert_columns`, with the upsert tail when `conflict_key`
-    /// is set. A row missing a column binds SQL NULL.
-    async fn insert_rows(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        table: &str,
-        insert_columns: &[String],
-        rows: &[&Vec<(&String, &Value)>],
-        conflict_key: Option<&[String]>,
-    ) -> Result<(), FaucetError> {
-        let num_cols = insert_columns.len();
-        let col_names: Vec<String> = insert_columns
-            .iter()
-            .map(|c| quote_ident_sqlite(c))
-            .collect();
-
-        // SQLite caps bind parameters per statement at SQLITE_MAX_VARIABLE_NUMBER
-        // (32766 since 3.32); split into sub-INSERTs under it (#78/#21).
-        const MAX_SQLITE_VARS: usize = 32766;
-        let max_rows_per_insert = (MAX_SQLITE_VARS / num_cols.max(1)).max(1);
-
-        for sub in rows.chunks(max_rows_per_insert) {
-            let row_placeholder = format!("({})", vec!["?"; num_cols].join(", "));
-            let value_tuples: Vec<&str> =
-                (0..sub.len()).map(|_| row_placeholder.as_str()).collect();
-            let base_query = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                quote_ident_sqlite(table),
-                col_names.join(", "),
-                value_tuples.join(", ")
-            );
-            let query = match conflict_key {
-                Some(key) => format!("{base_query} {}", on_conflict_clause(key, insert_columns)),
-                None => base_query,
-            };
-
-            let mut q = sqlx::query(&query);
-            for matched in sub {
-                for col in insert_columns {
-                    // Native SQLite types so affinity and typed reads round-trip (#78/#4).
-                    q = match matched.iter().find(|(c, _)| *c == col) {
-                        Some((_, v)) => bind_value(q, v),
-                        None => q.bind(None::<String>),
-                    };
-                }
-            }
-
-            q.execute(&mut **tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("SQLite insert failed: {e}")))?;
-        }
-        Ok(())
-    }
-
-    /// Log, once per sink, record fields that match no column of `table`.
-    fn warn_unmatched_fields(
-        &self,
-        obj: &serde_json::Map<String, Value>,
-        columns: &[String],
-        table: &str,
-    ) {
-        use std::sync::atomic::Ordering;
-        if self.unmatched_warned.load(Ordering::Relaxed) {
-            return;
-        }
-        let unmatched = unmatched_fields(obj, columns);
-        if !unmatched.is_empty() && !self.unmatched_warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                table = %table,
-                fields = ?unmatched,
-                "sqlite sink: record fields match no table column and are not written \
-                 (configure a `schema:` drift policy to add or quarantine them)"
-            );
-        }
-    }
-
-    /// Auto-map insert against an in-progress transaction with plain append
-    /// semantics (no `ON CONFLICT` tail).
-    ///
-    /// Thin wrapper over
-    /// [`insert_auto_map_with_conflict_tx`](Self::insert_auto_map_with_conflict_tx)
-    /// so the append path and the idempotent-write path keep their original
-    /// signature.
+    /// Auto-map append on the caller's connection: the engine maps each
+    /// record onto the live columns (`pragma_table_info`, read on the same
+    /// connection so a single-connection pool cannot deadlock), refuses a
+    /// record matching no column (#789 SQL-70), warns once about unmatched
+    /// fields, and writes the union column set in chunks under SQLite's
+    /// bind-variable cap.
     async fn insert_auto_map_tx(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conn: &mut sqlx::SqliteConnection,
         records: &[Value],
     ) -> Result<usize, FaucetError> {
-        self.insert_auto_map_with_conflict_tx(tx, records, None)
+        let mut exec = SqliteExec { conn, sink: self };
+        self.engine
+            .insert(&mut exec, &target(&self.effective_table()), records, false)
             .await
     }
 
-    /// Delete rows whose key columns match any of `deletes`, using
-    /// `DELETE FROM t WHERE (k1, …) IN ((?, …), …)`, chunked at
-    /// SQLite's bind-variable cap. Runs inside the caller's transaction.
+    /// Delete rows whose key columns match any of `deletes`
+    /// (`DELETE … WHERE (k1, …) IN ((?, …), …)`, chunked at the bind cap), on
+    /// the caller's transaction.
     pub(crate) async fn delete_by_keys(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conn: &mut sqlx::SqliteConnection,
         deletes: &[faucet_core::KeyTuple],
     ) -> Result<usize, FaucetError> {
-        if deletes.is_empty() {
-            return Ok(0);
-        }
-        let key = &self.config.write.key;
-        let table_ref = quote_ident_sqlite(&self.config.table_name);
-        let col_list = key
-            .iter()
-            .map(|k| quote_ident_sqlite(k))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        const MAX_SQLITE_VARS: usize = 32766;
-        let per = (MAX_SQLITE_VARS / key.len().max(1)).max(1);
-        let mut total = 0usize;
-
-        for chunk in deletes.chunks(per) {
-            let tuples: Vec<String> = chunk
-                .iter()
-                .map(|_| format!("({})", vec!["?"; key.len()].join(", ")))
-                .collect();
-            let sql = format!(
-                "DELETE FROM {table_ref} WHERE ({col_list}) IN ({})",
-                tuples.join(", ")
-            );
-            let mut q = sqlx::query(&sql);
-            for kt in chunk {
-                for (_, v) in &kt.0 {
-                    // Bind native SQLite types — same logic as in the INSERT path.
-                    q = bind_value(q, v);
-                }
-            }
-            let res = q
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("SQLite delete failed: {e}")))?;
-            total += res.rows_affected() as usize;
-        }
-        Ok(total)
+        let mut exec = SqliteExec { conn, sink: self };
+        self.engine
+            .delete(&mut exec, &target(&self.config.table_name), deletes)
+            .await
     }
 
     /// Apply planned upsert/delete groups inside one `BEGIN`/`COMMIT`
     /// transaction, so they commit atomically.
     async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
-        let mut tx = self
-            .pool
-            .begin_with(BEGIN_WRITE)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
+        let mut tx = self.begin_write().await?;
         let affected = self.apply_plans_in(&mut tx, plans).await?;
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))?;
+        Self::commit_write(tx).await?;
         Ok(affected)
     }
 
-    /// Each plan's upserts then deletes, in page order, on the caller's
-    /// transaction. Plans come from [`faucet_core::plan_writes_ordered`], so a
-    /// delete that precedes an upsert of a key equal under a `NOCASE` key
-    /// column runs before it rather than after.
+    /// Each plan's journal (with `rollback.journal`, #706), upserts, then
+    /// deletes, in page order, on the caller's transaction. Plans come from
+    /// [`faucet_core::plan_writes_ordered`], so a delete that precedes an
+    /// upsert of a key equal under a `NOCASE` key column runs before it.
     async fn apply_plans_in(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conn: &mut sqlx::SqliteConnection,
         plans: &[faucet_core::WritePlan],
     ) -> Result<usize, FaucetError> {
-        let mut affected = 0usize;
-        for plan in plans {
-            // `rollback.journal`: before-images commit with the writes (#706).
-            if self.config.write.journals()
-                && let Some(run_id) = self.config.write.rollback_run_id()
-            {
-                self.journal_plan(tx, plan, run_id).await?;
-            }
-            if !plan.upserts.is_empty() {
-                affected += self
-                    .insert_auto_map_with_conflict_tx(
-                        tx,
-                        &plan.upserts,
-                        Some(&self.config.write.key),
-                    )
-                    .await?;
-            }
-            if !plan.deletes.is_empty() {
-                affected += self.delete_by_keys(tx, &plan.deletes).await?;
-            }
-        }
-        Ok(affected)
+        let mut exec = SqliteExec { conn, sink: self };
+        self.engine
+            .apply_plans(&mut exec, &target(&self.config.table_name), plans)
+            .await
     }
 
     /// Delete rows in `scope` whose key was not written by this run (#478).
     ///
-    /// Uses a temp table + `NOT EXISTS` rather than `key NOT IN (…)` because the
-    /// written-key set routinely exceeds SQLite's 32766 bind-variable limit (the
-    /// cleanup ceiling defaults to 100k rows). It also makes the whole thing one
-    /// transaction, so the delete is all-or-nothing: a partial delete would
-    /// remove rows the run actually wrote.
-    ///
-    /// An empty `seen` set is meaningful, not a no-op — it means the source
-    /// reported the scope as empty, so every row in it is stale and must go. That
-    /// is the case this feature exists for, and `NOT EXISTS` against an empty
-    /// table handles it without a special branch.
-    ///
-    /// Every statement runs on the transaction's own connection: the temp table
-    /// lives in that connection's `temp` schema, and with the default
-    /// single-connection pool any query sent to `&self.pool` instead would
-    /// deadlock waiting for the connection the open transaction is holding.
+    /// The engine loads the written keys into a `temp` key table and deletes
+    /// with `NOT EXISTS` (the key set routinely exceeds the bind cap), all in
+    /// one transaction so the delete is all-or-nothing. Every statement runs
+    /// on the transaction's own connection: the temp table lives in that
+    /// connection's `temp` schema, and with a single-connection pool a query
+    /// sent to the pool instead would deadlock.
     async fn cleanup_scope_impl(
         &self,
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
-        let key = &self.config.write.key;
-        if key.is_empty() {
-            return Err(FaucetError::Sink(
-                "cleanup requires a non-empty `key`".to_string(),
-            ));
-        }
-        let table = &self.config.table_name;
-
-        let mut tx = self
-            .pool
-            .begin_with(BEGIN_WRITE)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
-
-        // Live column set + declared types, from the table this DELETE targets.
-        let declared: std::collections::HashMap<String, String> =
-            sqlx::query(&format!("PRAGMA table_info({})", quote_ident_sqlite(table)))
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("cleanup: table_info query failed: {e}")))?
-                .iter()
-                .map(|row| (row.get::<String, _>("name"), row.get::<String, _>("type")))
-                .collect();
-
-        let scope_cols: Vec<String> = scope.keys().cloned().collect();
-        let existing: std::collections::HashSet<String> = declared.keys().cloned().collect();
-        validate_cleanup_columns(&existing, &scope_cols, key, table)?;
-
-        // A previous cleanup that failed *after* its COMMIT-less DROP could not
-        // leave the table behind (SQLite rolls DDL back), but the pooled
-        // connection is shared, so drop defensively before creating.
-        let keys_ref = cleanup_keys_ref();
-        sqlx::query(&format!("DROP TABLE IF EXISTS {keys_ref}"))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: temp table drop failed: {e}")))?;
-
-        let key_types: Vec<(String, String)> = key
-            .iter()
-            .map(|k| (k.clone(), declared.get(k).cloned().unwrap_or_default()))
-            .collect();
-        sqlx::query(&build_cleanup_temp_table_sql(&key_types))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: temp table creation failed: {e}")))?;
-
-        // Load the written keys, chunked at SQLite's bind-variable cap.
-        const MAX_SQLITE_VARS: usize = 32766;
-        let per = (MAX_SQLITE_VARS / key.len()).max(1);
-        for chunk in seen.keys().chunks(per) {
-            let sql = build_cleanup_insert_sql(key, chunk.len());
-            let mut q = sqlx::query(&sql);
-            for kt in chunk {
-                for (_, v) in &kt.0 {
-                    q = bind_value(q, v);
-                }
-            }
-            q.execute(&mut *tx)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("cleanup: loading keys failed: {e}")))?;
-        }
-
-        // DELETE everything in scope that isn't in the written-key set.
-        let sql = build_cleanup_delete_sql(table, &scope_cols, key);
-        let mut q = sqlx::query(&sql);
-        for v in scope.values() {
-            q = bind_value(q, v);
-        }
-        let res = q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: delete failed: {e}")))?;
-
-        // Drop inside the transaction so the pooled connection goes back clean.
-        sqlx::query(&format!("DROP TABLE IF EXISTS {keys_ref}"))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: temp table drop failed: {e}")))?;
-
+        self.engine.check_cleanup_key()?;
+        let mut tx = self.begin_write().await?;
+        let deleted = {
+            let mut exec = SqliteExec {
+                conn: &mut tx,
+                sink: self,
+            };
+            self.engine
+                .cleanup(&mut exec, &target(&self.config.table_name), scope, seen)
+                .await?
+        };
         tx.commit()
             .await
             .map_err(|e| FaucetError::Sink(format!("cleanup: commit failed: {e}")))?;
-        Ok(res.rows_affected())
+        Ok(deleted)
     }
 
     /// Ensure the commit-token watermark table exists.
     pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {t} ({s} TEXT PRIMARY KEY, {k} TEXT NOT NULL, updated_at TEXT DEFAULT (datetime('now')))",
-            t = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-            s = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-            k = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-        );
-        sqlx::query(&sql)
+        sqlx::query(&Sqlite.commit_token_table_sql())
             .execute(&self.pool)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite commit-table create failed: {e}")))?;
@@ -1501,26 +1049,36 @@ impl faucet_core::Sink for SqliteSink {
                 .map(|row| row.get::<String, _>("name"))
                 .collect();
 
-                for c in &evolution.additions {
-                    if existing.contains(&c.name) {
-                        continue; // already present — ADD COLUMN would error
+                let mut widened = false;
+                for step in self.engine.evolution_steps(evolution, Some(&existing)) {
+                    match step {
+                        EvolutionStep::Add { column, base } => {
+                            sqlx::query(&build_add_column_sql(
+                                &self.config.table_name,
+                                &column,
+                                base,
+                            ))
+                            .execute(&self.pool)
+                            .await
+                            .map_err(|e| {
+                                FaucetError::Sink(format!(
+                                    "sqlite ADD COLUMN {column} failed: {e}"
+                                ))
+                            })?;
+                        }
+                        EvolutionStep::Widen { .. } if !widened => {
+                            widened = true;
+                            tracing::debug!(
+                                "sqlite: type widening is a no-op under dynamic typing"
+                            );
+                        }
+                        EvolutionStep::Relax { column } => {
+                            tracing::debug!(
+                                "sqlite cannot relax NOT NULL in place; column {column} left as-is"
+                            );
+                        }
+                        _ => {}
                     }
-                    let t = json_schema_base_type(&c.to).unwrap_or(SqlBaseType::Text);
-                    sqlx::query(&build_add_column_sql(&self.config.table_name, &c.name, t))
-                        .execute(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            FaucetError::Sink(format!("sqlite ADD COLUMN {} failed: {e}", c.name))
-                        })?;
-                }
-
-                if !evolution.widenings.is_empty() {
-                    tracing::debug!("sqlite: type widening is a no-op under dynamic typing");
-                }
-                for col in &evolution.relax_nullability {
-                    tracing::debug!(
-                        "sqlite cannot relax NOT NULL in place; column {col} left as-is"
-                    );
                 }
 
                 Ok(())
@@ -1531,6 +1089,15 @@ impl faucet_core::Sink for SqliteSink {
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.calls
             .call_once("write_batch", self.write_rows(records))
+            .await
+    }
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        self.calls
+            .call_once("write_batch", self.write_rows_reported(records))
             .await
     }
 
@@ -1560,46 +1127,31 @@ impl faucet_core::Sink for SqliteSink {
                         self.write_rows(records).await?;
                         return Ok(records.iter().map(|_| Ok(())).collect());
                     }
-                    let table = self.effective_table();
+                    let table = target(&self.effective_table());
                     let mut conn = self.pool.acquire().await.map_err(|e| {
                         FaucetError::Sink(format!("SQLite connection acquire failed: {e}"))
                     })?;
-                    let columns = table_columns(&mut conn, &table).await?;
-                    drop(conn);
-                    let mut outcomes: Vec<faucet_core::RowOutcome> =
-                        Vec::with_capacity(records.len());
-                    let mut writable: Vec<Value> = Vec::with_capacity(records.len());
-                    for (idx, record) in records.iter().enumerate() {
-                        match record.as_object() {
-                            Some(obj) if match_columns(&columns, obj).is_empty() => {
-                                outcomes.push(Err(no_matching_column_error(
-                                    idx, obj, &columns, &table,
-                                )));
-                            }
-                            _ => {
-                                outcomes.push(Ok(()));
-                                writable.push(record.clone());
-                            }
-                        }
+                    let columns = SqliteExec {
+                        conn: &mut conn,
+                        sink: self,
                     }
-                    self.write_rows(&writable).await?;
-                    return Ok(outcomes);
+                    .columns(&table)
+                    .await?;
+                    drop(conn);
+                    let split =
+                        self.engine
+                            .split_writable(&table, records, &columns, true, |_, _, _| None);
+                    self.write_rows(&split.writable).await?;
+                    return Ok(split.outcomes);
                 }
 
-                let plan = faucet_core::plan_writes(records, &self.config.write);
-                self.apply_plans(&faucet_core::plan_writes_ordered(
-                    records,
-                    &self.config.write,
-                ))
-                .await?;
+                let (plans, failed) = self.engine.plan_keyed_partial(records);
+                self.apply_plans(&plans).await?;
 
                 let mut outcomes: Vec<faucet_core::RowOutcome> =
                     records.iter().map(|_| Ok(())).collect();
-                for (idx, msg) in &plan.failed {
-                    outcomes[*idx] = Err(FaucetError::Sink(format!(
-                        "sqlite {}: {msg}",
-                        self.config.write.write_mode.as_str()
-                    )));
+                for (idx, e) in failed {
+                    outcomes[idx] = Err(e);
                 }
                 Ok(outcomes)
             })
@@ -1614,13 +1166,7 @@ impl faucet_core::Sink for SqliteSink {
         self.calls
             .call_once("last_committed_token", async {
                 self.ensure_commit_table().await?;
-                let sql = format!(
-                    "SELECT {k} FROM {t} WHERE {s} = ?",
-                    t = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-                    k = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-                    s = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-                );
-                let row = sqlx::query(&sql)
+                let row = sqlx::query(&Sqlite.commit_token_select_sql())
                     .bind(scope)
                     .fetch_optional(&self.pool)
                     .await
@@ -1644,24 +1190,13 @@ impl faucet_core::Sink for SqliteSink {
 
                 // For upsert/delete modes, plan the page before opening the transaction
                 // so a key-extraction failure aborts without leaving an open tx.
-                let plan = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+                let plans = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
                     None
                 } else {
-                    let plan = faucet_core::plan_writes(records, &self.config.write);
-                    if let Some((idx, msg)) = plan.failed.first() {
-                        return Err(FaucetError::Sink(format!(
-                            "sqlite {}: row {idx}: {msg}",
-                            self.config.write.write_mode.as_str()
-                        )));
-                    }
-                    Some(plan)
+                    Some(self.engine.plan_keyed(records)?)
                 };
 
-                let mut tx = self
-                    .pool
-                    .begin_with(BEGIN_WRITE)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
+                let mut tx = self.begin_write().await?;
 
                 // Data write and the commit-token upsert share ONE transaction so the
                 // page is committed atomically with its watermark: on crash either both
@@ -1669,14 +1204,8 @@ impl faucet_core::Sink for SqliteSink {
                 // produce zero duplicates. For upsert/delete the planned upserts/deletes
                 // commit together with the watermark in this same tx (no nested tx —
                 // we reuse `apply_plans_in` directly on this transaction).
-                let written = match &plan {
-                    Some(_) => {
-                        self.apply_plans_in(
-                            &mut tx,
-                            &faucet_core::plan_writes_ordered(records, &self.config.write),
-                        )
-                        .await?
-                    }
+                let written = match &plans {
+                    Some(plans) => self.apply_plans_in(&mut tx, plans).await?,
                     None => match &self.config.column_mapping {
                         SqliteColumnMapping::Json { column } => {
                             self.insert_json_tx(&mut tx, records, column).await?
@@ -1685,22 +1214,15 @@ impl faucet_core::Sink for SqliteSink {
                     },
                 };
 
-                let upsert = format!(
-                    "INSERT INTO {t} ({s}, {k}) VALUES (?, ?) ON CONFLICT({s}) DO UPDATE SET {k} = excluded.{k}, updated_at = datetime('now')",
-                    t = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-                    s = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-                    k = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-                );
-                sqlx::query(&upsert)
-                    .bind(scope)
-                    .bind(token)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("SQLite token upsert failed: {e}")))?;
+                {
+                    let mut exec = SqliteExec {
+                        conn: &mut tx,
+                        sink: self,
+                    };
+                    self.engine.write_token(&mut exec, scope, token).await?;
+                }
 
-                tx.commit()
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))?;
+                Self::commit_write(tx).await?;
                 Ok(written)
             })
             .await
@@ -1709,31 +1231,27 @@ impl faucet_core::Sink for SqliteSink {
 
 impl SqliteSink {
     async fn write_rows(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.write_rows_reported(records).await.map(|r| r.accepted)
+    }
+
+    /// Write a page and report what happened to each offered row: a keyed
+    /// page accepts one row per planned upsert/delete and coalesces the rest.
+    async fn write_rows_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok(faucet_core::WriteReport::accepted(0));
         }
         self.ensure_table_ready(records).await?;
 
         // Upsert/delete modes: plan the writes and apply atomically. Append and
         // overwrite are insert-shaped and fall through (overwrite lands in the
         // staging table via `effective_table`).
-        if matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "sqlite {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return self
-                .apply_plans(&faucet_core::plan_writes_ordered(
-                    records,
-                    &self.config.write,
-                ))
-                .await;
+        if self.engine.is_keyed() {
+            let plans = self.engine.plan_keyed(records)?;
+            let written = self.apply_plans(&plans).await?;
+            return Ok(self.engine.report(records.len(), written, &plans));
         }
 
         // `batch_size = 0` is the "no batching" sentinel: write the entire
@@ -1760,7 +1278,7 @@ impl SqliteSink {
             rows = total,
             "SQLite write complete"
         );
-        Ok(total)
+        Ok(self.engine.report(records.len(), total, &[]))
     }
 }
 

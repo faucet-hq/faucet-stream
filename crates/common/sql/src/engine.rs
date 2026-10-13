@@ -654,15 +654,12 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         let key = &self.write.key;
         let live = exec.cleanup_columns(target).await?;
         let scope_cols: Vec<String> = scope.keys().cloned().collect();
-        for col in scope_cols.iter().chain(key.iter()) {
-            if !live.iter().any(|c| &c.name == col) {
-                return Err(FaucetError::Sink(format!(
-                    "cleanup: column '{col}' does not exist on {} — the \
-                     completeness claim and `key` are in destination column terms",
-                    self.dialect.cleanup_table_display(target)
-                )));
-            }
-        }
+        check_cleanup_columns(
+            |c| live.iter().any(|l| l.name == c),
+            &scope_cols,
+            key,
+            &self.dialect.cleanup_table_display(target),
+        )?;
         let type_of = |c: &str| {
             live.iter()
                 .find(|l| l.name == c)
@@ -744,6 +741,27 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         .await?;
         Ok(())
     }
+}
+
+/// Refuse a scoped cleanup whose scope or key names a column the destination
+/// lacks: both are in destination terms, so a missing one is a configuration
+/// error worth naming before any `DELETE` runs. `table` is how the error names
+/// the destination ([`SqlDialect::cleanup_table_display`]).
+pub fn check_cleanup_columns(
+    exists: impl Fn(&str) -> bool,
+    scope: &[String],
+    key: &[String],
+    table: &str,
+) -> Result<(), FaucetError> {
+    for col in scope.iter().chain(key.iter()) {
+        if !exists(col) {
+            return Err(FaucetError::Sink(format!(
+                "cleanup: column '{col}' does not exist on {table} — the \
+                 completeness claim and `key` are in destination column terms"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Each key tuple's values in key order, row-major, typed per key column.
