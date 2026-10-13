@@ -36,6 +36,7 @@ pub(crate) struct GcsRangeReader {
     len: u64,
     generation: Option<i64>,
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
+    calls: faucet_core::CallContext,
 }
 
 impl GcsRangeReader {
@@ -62,7 +63,14 @@ impl GcsRangeReader {
             len,
             generation: None,
             recorder,
+            calls: faucet_core::CallContext::new(),
         })
+    }
+
+    /// Make every range read through `calls` (#880).
+    pub(crate) fn with_calls(mut self, calls: faucet_core::CallContext) -> Self {
+        self.calls = calls;
+        self
     }
 
     /// Read every range from object generation `generation` (the one whose
@@ -93,20 +101,27 @@ impl GcsRangeReader {
         if let Some(generation) = self.generation {
             request = request.set_generation(generation);
         }
-        let resp = request
-            .send()
+        let fetched = self
+            .calls
+            .call_once("get", async {
+                let resp = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => return Ok(Err(failed(&self.key, &range, "", e))),
+                };
+                let mut buf = Vec::with_capacity(wanted as usize);
+                let mut stream = resp.into_stream();
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        Err(e) => return Ok(Err(failed(&self.key, &range, " mid-stream", e))),
+                    }
+                }
+                Ok(Ok(buf))
+            })
             .await
-            .map_err(|e| failed(&self.key, &range, "", e))?;
-
-        let mut buf = Vec::with_capacity(wanted as usize);
-        let mut stream = resp.into_stream();
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|e| failed(&self.key, &range, " mid-stream", e))?
-        {
-            buf.extend_from_slice(&chunk);
-        }
+            .map_err(|e| ParquetError::External(Box::new(e)))?;
+        let buf = fetched?;
         if buf.len() as u64 != wanted {
             return Err(short(&self.key, &range, buf.len() as u64));
         }

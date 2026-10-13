@@ -60,6 +60,8 @@ enum Fetched {
     Container(Vec<u8>),
 }
 
+use faucet_core::CallExt as _;
+
 /// A GCS source that lists and reads objects from a bucket.
 pub struct GcsSource {
     config: GcsSourceConfig,
@@ -73,6 +75,10 @@ pub struct GcsSource {
     /// `list` (one per listing page), `get` (one per object metadata read
     /// or body read, including each ranged Parquet read).
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): every request runs through it for the
+    /// run's cancel token and deadline. Round trips stay counted by
+    /// `roundtrips`.
+    calls: faucet_core::CallSlot,
     filter: faucet_common_file::ObjectFilter,
 }
 
@@ -91,6 +97,11 @@ impl GcsSource {
             control,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .with_roundtrip_metering(false),
+            ),
             filter,
         })
     }
@@ -129,7 +140,7 @@ impl GcsSource {
 
         let mut paginator = req.by_item();
         let mut names: Vec<String> = Vec::new();
-        while let Some(item) = paginator.next().await {
+        while let Some(item) = paginator.next().within(&self.calls, "list").await? {
             let object = item.map_err(|e| {
                 FaucetError::Source(format!(
                     "GCS list error for bucket '{}': {e}",
@@ -285,7 +296,8 @@ impl GcsSource {
             .set_bucket(self.bucket_path())
             .set_object(key.to_string())
             .send()
-            .await
+            .within(&self.calls, "get")
+            .await?
             .map_err(|e| {
                 FaucetError::Source(format!("GCS get object metadata for '{key}' failed: {e}"))
             })?;
@@ -304,6 +316,7 @@ impl GcsSource {
             self.roundtrips.recorder(),
         )
         .await?
+        .with_calls(self.calls.get())
         .pinned_to(meta.generation);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
@@ -376,7 +389,8 @@ impl GcsSource {
             .storage
             .read_object(self.bucket_path(), key.to_string())
             .send()
-            .await
+            .within(&self.calls, "get")
+            .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
                     "GCS get error for bucket '{}' key '{key}': {e}",
@@ -614,7 +628,12 @@ impl faucet_core::Source for GcsSource {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
     }
     async fn fetch_with_context(
         &self,
@@ -1126,7 +1145,8 @@ impl faucet_core::Source for GcsSource {
         }
         let response = req
             .send()
-            .await
+            .within(&self.calls, "list")
+            .await?
             .map_err(|e| FaucetError::Source(format!("gcs: catalog discovery failed: {e}")))?;
 
         let prefix = self.config.prefix.as_deref().unwrap_or("");

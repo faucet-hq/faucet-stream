@@ -259,3 +259,30 @@ async fn descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    // SAFETY: the same constants every other test here sets.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    }
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let config = S3SourceConfig::new("hung")
+            .endpoint_url(endpoint.clone())
+            .region(REGION.to_string());
+        block_on(S3Source::new(config)).expect("source builds offline")
+    })
+    .await;
+}

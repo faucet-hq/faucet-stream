@@ -54,6 +54,8 @@ fn delete_error_status(code: &str) -> Option<u16> {
     }
 }
 
+use faucet_core::CallExt as _;
+
 type SdkError<E> = aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>;
 
 pub(crate) struct S3Objects {
@@ -62,6 +64,8 @@ pub(crate) struct S3Objects {
     pub concurrency: usize,
     pub part_bytes: usize,
     pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    /// The run's call context (#880) every request runs through, once.
+    pub calls: Arc<faucet_core::CallSlot>,
     /// Part requests in flight across every upload of this sink.
     pub part_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -118,7 +122,8 @@ impl S3Objects {
             .content_type(content_type(key))
             .body(ByteStream::from(body))
             .send()
-            .await
+            .within(&self.calls, "put")
+            .await?
             .map_err(|e| self.sdk_err("put object", key, e))?;
         Ok(())
     }
@@ -132,7 +137,8 @@ impl S3Objects {
             .key(key)
             .content_type(content_type(key))
             .send()
-            .await
+            .within(&self.calls, "put")
+            .await?
             .map_err(|e| self.sdk_err("start multipart", key, e))?;
         let upload_id = created
             .upload_id()
@@ -177,7 +183,8 @@ impl S3Objects {
                     .part_number(number)
                     .body(body)
                     .send()
-                    .await
+                    .within(&self.calls, "put")
+                    .await?
                     .map_err(|e| self.sdk_err("upload part", key, e))?;
                 Ok::<_, FaucetError>(
                     CompletedPart::builder()
@@ -211,7 +218,8 @@ impl ObjectClient for S3Objects {
                 .prefix(prefix)
                 .set_continuation_token(token.take())
                 .send()
-                .await
+                .within(&self.calls, "list")
+                .await?
                 .map_err(|e| self.sdk_err("list", prefix, e))?;
             keys.extend(
                 page.contents()
@@ -233,7 +241,8 @@ impl ObjectClient for S3Objects {
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await
+            .within(&self.calls, "head")
+            .await?
         {
             Ok(_) => Ok(true),
             Err(e) => match e.as_service_error() {
@@ -251,7 +260,8 @@ impl ObjectClient for S3Objects {
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await
+            .within(&self.calls, "get")
+            .await?
             .map_err(|e| self.sdk_err("get object", key, e))?;
         let mut reader = out.body.into_async_read();
         let mut file = tokio::fs::File::create(to)
@@ -287,7 +297,8 @@ impl ObjectClient for S3Objects {
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await
+            .within(&self.calls, "delete")
+            .await?
             .map_err(|e| self.sdk_err("delete object", key, e))?;
         Ok(())
     }
@@ -311,7 +322,8 @@ impl ObjectClient for S3Objects {
             .bucket(&self.bucket)
             .key(from)
             .send()
-            .await
+            .within(&self.calls, "head")
+            .await?
             .map_err(|e| self.sdk_err("head object", from, e))?;
         let len = head.content_length().and_then(|l| u64::try_from(l).ok());
         if let Some(len) = len.filter(|&l| l > MAX_COPY_BYTES) {
@@ -324,7 +336,8 @@ impl ObjectClient for S3Objects {
                 .key(to)
                 .copy_source(copy_source(&self.bucket, from))
                 .send()
-                .await
+                .within(&self.calls, "copy")
+                .await?
                 .map_err(|e| self.sdk_err("copy object", to, e))?;
         }
         self.delete(from).await
@@ -356,7 +369,8 @@ impl S3Objects {
             .bucket(&self.bucket)
             .delete(delete)
             .send()
-            .await
+            .within(&self.calls, "delete")
+            .await?
             .map_err(|e| self.sdk_err("delete objects", first, e))?;
         let Some(failed) = out.errors().first() else {
             return Ok(());
@@ -387,7 +401,8 @@ impl S3Objects {
             .key(to)
             .content_type(content_type(to))
             .send()
-            .await
+            .within(&self.calls, "copy")
+            .await?
             .map_err(|e| self.sdk_err("start multipart copy", to, e))?;
         let upload_id = created
             .upload_id()
@@ -416,7 +431,8 @@ impl S3Objects {
                             .copy_source(source)
                             .copy_source_range(format!("bytes={}-{}", range.start, range.end - 1))
                             .send()
-                            .await
+                            .within(&self.calls, "copy")
+                            .await?
                             .map_err(|e| self.sdk_err("copy part", to, e))?;
                         Ok(CompletedPart::builder()
                             .part_number(number)
@@ -457,7 +473,8 @@ impl S3Objects {
                             .build(),
                     )
                     .send()
-                    .await
+                    .within(&self.calls, "put")
+                    .await?
                     .map_err(|e| self.sdk_err("complete multipart", key, e))?;
                 Ok(())
             }
@@ -469,6 +486,7 @@ impl S3Objects {
                     .key(key)
                     .upload_id(upload_id)
                     .send()
+                    .within(&self.calls, "abort")
                     .await;
                 Err(e)
             }
@@ -503,6 +521,7 @@ mod tests {
             concurrency: 1,
             part_bytes: PART_BYTES,
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::default()),
             part_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }

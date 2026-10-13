@@ -33,11 +33,17 @@ impl GcsSink {
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
         let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
+        let calls = Arc::new(faucet_core::CallSlot::new(
+            faucet_core::CallContext::new()
+                .without_timeout()
+                .with_roundtrip_metering(false),
+        ));
         let objects = Arc::new(GcsObjects {
             storage,
             control: control.clone(),
             bucket: config.bucket.clone(),
             roundtrips: roundtrips.clone(),
+            calls: calls.clone(),
         });
         let backend = RemoteBackend::new(
             objects,
@@ -52,6 +58,7 @@ impl GcsSink {
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
             roundtrips,
+            calls,
         };
         Ok(Self {
             inner: WriterSink::new(writer, identity),
@@ -72,6 +79,7 @@ struct GcsIdentity {
     bucket: String,
     prefix: String,
     roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 #[faucet_core::async_trait]
@@ -89,7 +97,12 @@ impl SinkIdentity for GcsIdentity {
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
     }
 
     /// Preflight probe: a non-mutating `list_objects` call capped at one
@@ -105,9 +118,11 @@ impl SinkIdentity for GcsIdentity {
             .list_objects()
             .set_parent(format!("projects/_/buckets/{}", self.bucket))
             .set_page_size(1_i32);
-        let probe = match tokio::time::timeout(ctx.timeout, request.send()).await {
-            Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
-            Ok(Err(e)) => Probe::fail_hint(
+        let sent = faucet_core::CallExt::within(request.send(), &self.calls, "list");
+        let probe = match tokio::time::timeout(ctx.timeout, sent).await {
+            Ok(Err(e)) => Probe::fail("auth", started.elapsed(), e.to_string()),
+            Ok(Ok(Ok(_))) => Probe::pass("auth", started.elapsed()),
+            Ok(Ok(Err(e))) => Probe::fail_hint(
                 "auth",
                 started.elapsed(),
                 e.to_string(),

@@ -34,6 +34,9 @@ pub trait SinkIdentity: Send + Sync {
     /// Install the round-trip recorder the connector's client reports to.
     /// Default: the connector counts nothing.
     fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {}
+    /// Install the run's call context (#880) the connector's requests run
+    /// through. Default: the connector has no backend calls.
+    fn set_call_context(&self, _ctx: faucet_core::io::CallContext) {}
 }
 
 /// A [`Sink`] over a [`FileWriter`]: batch writes, flush, the overwrite
@@ -82,6 +85,10 @@ impl Sink for WriterSink {
 
     fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
         self.identity.set_roundtrip_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.identity.set_call_context(ctx);
     }
 
     async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
@@ -203,6 +210,9 @@ macro_rules! delegate_sink {
                 recorder: ::std::sync::Arc<$crate::__private::RoundtripRecorder>,
             ) {
                 $crate::__private::Sink::set_roundtrip_recorder(&self.$field, recorder)
+            }
+            fn set_call_context(&self, ctx: $crate::__private::CallContext) {
+                $crate::__private::Sink::set_call_context(&self.$field, ctx)
             }
             async fn check(
                 &self,

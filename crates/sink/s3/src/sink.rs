@@ -28,6 +28,8 @@ pub struct S3Sink {
     inner: WriterSink,
 }
 
+use faucet_core::CallExt as _;
+
 impl S3Sink {
     /// Create a new S3 sink from the given configuration.
     ///
@@ -43,12 +45,18 @@ impl S3Sink {
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
         let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
+        let calls = Arc::new(faucet_core::CallSlot::new(
+            faucet_core::CallContext::new()
+                .without_timeout()
+                .with_roundtrip_metering(false),
+        ));
         let objects = Arc::new(S3Objects {
             client: client.clone(),
             bucket: config.bucket.clone(),
             concurrency: config.concurrency,
             part_bytes: PART_BYTES,
             roundtrips: roundtrips.clone(),
+            calls: calls.clone(),
             part_slots: Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1))),
         });
         let backend = RemoteBackend::new(
@@ -65,6 +73,7 @@ impl S3Sink {
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
             roundtrips,
+            calls,
         };
         Ok(Self {
             inner: WriterSink::new(writer, identity),
@@ -98,6 +107,7 @@ struct S3Identity {
     bucket: String,
     prefix: String,
     roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 #[faucet_core::async_trait]
@@ -115,7 +125,12 @@ impl SinkIdentity for S3Identity {
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
     }
 
     /// Preflight probe: confirm the configured bucket is reachable and the
@@ -127,9 +142,11 @@ impl SinkIdentity for S3Identity {
         use faucet_core::check::{CheckReport, Probe};
         let started = std::time::Instant::now();
         let request = self.client.head_bucket().bucket(&self.bucket);
-        let probe = match tokio::time::timeout(ctx.timeout, request.send()).await {
-            Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
-            Ok(Err(e)) => Probe::fail_hint(
+        let sent = request.send().within(&self.calls, "head");
+        let probe = match tokio::time::timeout(ctx.timeout, sent).await {
+            Ok(Err(e)) => Probe::fail("auth", started.elapsed(), e.to_string()),
+            Ok(Ok(Ok(_))) => Probe::pass("auth", started.elapsed()),
+            Ok(Ok(Err(e))) => Probe::fail_hint(
                 "auth",
                 started.elapsed(),
                 e.to_string(),
@@ -164,7 +181,8 @@ impl MultipartClient for S3Parts {
             .key(key)
             .content_type(content_type(key))
             .send()
-            .await
+            .within(&o.calls, "put")
+            .await?
             .map_err(|e| o.sdk_err("start multipart", key, e))?;
         let upload_id = created
             .upload_id()
@@ -228,7 +246,8 @@ impl MultipartUpload for S3Upload {
                 .part_number(number)
                 .body(ByteStream::from(body))
                 .send()
-                .await
+                .within(&o.calls, "put")
+                .await?
                 .map_err(|e| o.sdk_err("upload part", &key, e))?;
             parts.lock().unwrap_or_else(|p| p.into_inner()).push(
                 CompletedPart::builder()
@@ -258,7 +277,8 @@ impl MultipartUpload for S3Upload {
                         .build(),
                 )
                 .send()
-                .await
+                .within(&o.calls, "put")
+                .await?
                 .map_err(|e| o.sdk_err("complete multipart", &self.key, e))?;
             Ok(())
         })
@@ -273,7 +293,8 @@ impl MultipartUpload for S3Upload {
                 .key(&self.key)
                 .upload_id(&self.upload_id)
                 .send()
-                .await
+                .within(&o.calls, "put")
+                .await?
                 .map_err(|e| o.sdk_err("abort multipart", &self.key, e))?;
             Ok(())
         })

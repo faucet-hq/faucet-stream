@@ -438,6 +438,13 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Timeouts, cancellation and retries
+
+Every object-store request — uploads, listings, copies, deletes, downloads —
+runs through the pipeline's `CallContext` (#880): each is sent once, any caller
+deadline ends it, and round trips are still metered as `put` / `list` / `head` /
+`get` / `copy` / `delete`. The client's own timeouts and retry are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

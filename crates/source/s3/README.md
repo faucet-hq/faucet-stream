@@ -503,6 +503,14 @@ columnar path (`avro → parquet` never builds JSON rows). Enable with
 `file-formats`. Details: the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
 
+## Timeouts, cancellation and retries
+
+Every object-store request — listings, object and metadata reads, each ranged
+Parquet read — runs through the pipeline's `CallContext` (#880): the run's
+cancel token stops an in-flight request, any caller deadline ends it, and round
+trips are still metered as `list` / `get` / `head` (see Usage signals). The
+SDK's own timeouts and retry are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
