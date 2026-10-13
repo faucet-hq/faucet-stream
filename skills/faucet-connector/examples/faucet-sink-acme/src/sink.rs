@@ -27,9 +27,9 @@ impl AcmeSink {
             .path_segments_mut()
             .map_err(|_| FaucetError::Config("acme: base_url cannot take a path".into()))?
             .extend(["records", "bulk"]);
-        let client = reqwest::Client::builder()
+        let client = faucet_core::http::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
-            .build()?;
+            .build_reqwest()?;
         let upsert_key = config.write.key.join(",");
         Ok(Self {
             config,

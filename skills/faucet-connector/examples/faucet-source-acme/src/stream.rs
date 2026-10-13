@@ -37,9 +37,9 @@ impl AcmeSource {
         faucet_core::state::validate_state_key(&config.state_key())
             .map_err(|e| FaucetError::Config(format!("acme: {e}")))?;
         let records_url = records_url(&config.base_url, &config.collection)?;
-        let client = reqwest::Client::builder()
+        let client = faucet_core::http::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
-            .build()?;
+            .build_reqwest()?;
         Ok(Self {
             config,
             client,

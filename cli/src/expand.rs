@@ -47,7 +47,7 @@ pub struct ExpandedNode {
     pub id: String,
     /// Governance passes this node's caller turned off on purpose, with the
     /// reason (#875) — a DLQ replay does not re-mask, a repair does not
-    /// profile. Applied by [`crate::governance::governance_for`]; empty for
+    /// profile. Applied by `governance_for`; empty for
     /// every row a config expands to.
     pub opt_outs: Vec<faucet_core::OptOut>,
     pub row_index: usize,
