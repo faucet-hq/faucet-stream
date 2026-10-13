@@ -1074,6 +1074,19 @@ jobs:
           retry cargo test --workspace --all-features --lib --bins
           cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
           cat integration.lcov unit.lcov > lcov.info
+      - name: Keep the coverage reports
+        # So a failing coverage gate can be read line by line (Codecov only
+        # receives the report after the gates pass).
+        if: ${{ always() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: |
+            lcov.info
+            integration.lcov
+            unit.lcov
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Test the coverage gate scripts
         if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
