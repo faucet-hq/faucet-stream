@@ -166,3 +166,41 @@ async fn conformance_descriptor_matches_built_sink() {
         );
     }
 }
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880); returns a URI whose server selection waits a minute.
+async fn silent_uri() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("mongodb://{addr}/?directConnection=true&serverSelectionTimeoutMS=60000")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let uri = silent_uri().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let v = faucet_core::serde_json::json!({
+            "connection_uri": uri, "database": "d", "collection": "c"
+        });
+        let cfg: faucet_sink_mongodb::MongoSinkConfig =
+            faucet_core::serde_json::from_value(v).expect("config");
+        built.push(
+            faucet_sink_mongodb::MongoSink::new(cfg)
+                .await
+                .expect("lazy client"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
+}

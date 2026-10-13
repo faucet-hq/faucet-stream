@@ -216,6 +216,24 @@ struct InsertStep {
     consumed: usize,
 }
 
+/// The outcome of an `insert_partial` call the call context cut short: an
+/// outer `Err` while nothing was inserted, else every pending document fails
+/// per row (earlier documents committed).
+fn cut_short(
+    e: FaucetError,
+    inserted_any: bool,
+    pending: &[(usize, Document)],
+    mut outcomes: Vec<faucet_core::RowOutcome>,
+) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+    if !inserted_any {
+        return Err(e);
+    }
+    for (i, _) in pending {
+        outcomes[*i] = Err(FaucetError::Sink(format!("MongoDB insert_many: {e}")));
+    }
+    Ok(outcomes)
+}
+
 /// How many times [`insert_partial`](MongoSink) re-sends a batch whose
 /// `insert_many` failed without per-document write errors.
 const INSERT_RESENDS: u32 = 3;
@@ -378,6 +396,8 @@ pub struct MongoSink {
     /// must exist up front on MongoDB < 4.4; pre-creating keeps the
     /// exactly-once path portable and removes a first-run failure mode.
     eo_collections_ready: tokio::sync::OnceCell<()>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 impl MongoSink {
@@ -396,6 +416,7 @@ impl MongoSink {
             config,
             client,
             eo_collections_ready: tokio::sync::OnceCell::new(),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -454,7 +475,6 @@ impl MongoSink {
     /// outer `Err` is returned only while nothing has been inserted, so a
     /// failed call never leaves rows that a DLQ replay would duplicate; after
     /// that, the documents still pending fail per row.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn insert_partial(
         &self,
         records: &[Value],
@@ -497,10 +517,21 @@ impl MongoSink {
             let opts = mongodb::options::InsertManyOptions::builder()
                 .ordered(ordered)
                 .build();
-            let result = collection
-                .insert_many(batch.iter().map(|(_, d)| d))
-                .with_options(opts)
+            let called = self
+                .calls
+                .call_once("insert", async {
+                    Ok(collection
+                        .insert_many(batch.iter().map(|(_, d)| d))
+                        .with_options(opts)
+                        .await)
+                })
                 .await;
+            // The run's deadline cut the call: its outcome is unknown, like a
+            // transport failure without a re-send left.
+            let result = match called {
+                Ok(result) => result,
+                Err(e) => return cut_short(e, inserted_any, pending, outcomes),
+            };
             let rejected: Vec<(usize, i32, String)> = match result {
                 Ok(_) => Vec::new(),
                 Err(e) => match e.kind.as_ref() {
@@ -534,7 +565,10 @@ impl MongoSink {
                     _ if resends < INSERT_RESENDS => {
                         resends += 1;
                         tracing::warn!(error = %e, resends, "MongoDB insert_many failed; re-sending the batch");
-                        tokio::time::sleep(std::time::Duration::from_millis(200 << resends)).await;
+                        let backoff = std::time::Duration::from_millis(200 << resends);
+                        if let Err(e) = self.calls.wait(backoff).await {
+                            return cut_short(e, inserted_any, pending, outcomes);
+                        }
                         continue;
                     }
                     _ if !inserted_any => {
@@ -912,6 +946,17 @@ impl MongoSink {
 
 #[async_trait]
 impl faucet_core::Sink for MongoSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -940,7 +985,11 @@ impl faucet_core::Sink for MongoSink {
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
+        self.calls
+            .call_once("cleanup_scope", async {
+                self.cleanup_scope_impl(scope, seen).await
+            })
+            .await
     }
 
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
@@ -963,16 +1012,20 @@ impl faucet_core::Sink for MongoSink {
     /// no destination yet an empty staging collection is created, so a run
     /// whose source returns no rows still commits (#789 MSG-52).
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        let db = self.client.database(&self.config.database);
-        // Best-effort drop; a missing namespace is not an error for our purpose.
-        if let Err(e) = db
-            .collection::<Document>(&self.staging_collection())
-            .drop()
+        self.calls
+            .call_once("begin_overwrite", async {
+                let db = self.client.database(&self.config.database);
+                // Best-effort drop; a missing namespace is not an error for our purpose.
+                if let Err(e) = db
+                    .collection::<Document>(&self.staging_collection())
+                    .drop()
+                    .await
+                {
+                    tracing::debug!(error = %e, "mongodb overwrite: staging drop before begin (ignored)");
+                }
+                self.clone_destination_shape().await
+            })
             .await
-        {
-            tracing::debug!(error = %e, "mongodb overwrite: staging drop before begin (ignored)");
-        }
-        self.clone_destination_shape().await
     }
 
     /// Atomically replace the destination via MongoDB's `renameCollection` with
@@ -985,49 +1038,61 @@ impl faucet_core::Sink for MongoSink {
     /// in the same database. `renameCollection` is not supported on sharded
     /// collections — a documented limitation of overwrite on MongoDB.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        let from = format!("{}.{}", self.config.database, self.staging_collection());
-        let to = format!("{}.{}", self.config.database, self.config.collection);
-        self.client
-            .database("admin")
-            .run_command(bson::doc! {
-                "renameCollection": from,
-                "to": to,
-                "dropTarget": true,
+        self.calls
+            .call_once("commit_overwrite", async {
+                let from = format!("{}.{}", self.config.database, self.staging_collection());
+                let to = format!("{}.{}", self.config.database, self.config.collection);
+                self.client
+                    .database("admin")
+                    .run_command(bson::doc! {
+                        "renameCollection": from,
+                        "to": to,
+                        "dropTarget": true,
+                    })
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!(
+                            "mongodb overwrite swap (renameCollection) failed: {e}"
+                        ))
+                    })?;
+                Ok(())
             })
             .await
-            .map_err(|e| {
-                FaucetError::Sink(format!(
-                    "mongodb overwrite swap (renameCollection) failed: {e}"
-                ))
-            })?;
-        Ok(())
     }
 
     /// Probe for the `<collection>__faucet_ovw` staging collection (read-only).
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        let names = self
-            .client
-            .database(&self.config.database)
-            .list_collection_names()
-            .filter(bson::doc! { "name": self.staging_collection() })
+        self.calls
+            .call_once("overwrite_staging_exists", async {
+                let names = self
+                    .client
+                    .database(&self.config.database)
+                    .list_collection_names()
+                    .filter(bson::doc! { "name": self.staging_collection() })
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
+                Ok(Some(!names.is_empty()))
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
-        Ok(Some(!names.is_empty()))
     }
 
     /// Drop the staging collection so a failed/cancelled overwrite leaves
     /// nothing behind. Best-effort — the destination was never touched.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        if let Err(e) = self
-            .client
-            .database(&self.config.database)
-            .collection::<Document>(&self.staging_collection())
-            .drop()
+        self.calls
+            .call_once("abort_overwrite", async {
+                if let Err(e) = self
+                    .client
+                    .database(&self.config.database)
+                    .collection::<Document>(&self.staging_collection())
+                    .drop()
+                    .await
+                {
+                    tracing::debug!(error = %e, "mongodb overwrite: staging drop on abort (ignored)");
+                }
+                Ok(())
+            })
             .await
-        {
-            tracing::debug!(error = %e, "mongodb overwrite: staging drop on abort (ignored)");
-        }
-        Ok(())
     }
 
     fn dedups_by_key(&self) -> bool {
@@ -1072,72 +1137,78 @@ impl faucet_core::Sink for MongoSink {
     /// `insert_many` request — useful when upstream `StreamPage`s are already
     /// sized for MongoDB's preferred per-request limits.
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
+        self.calls
+            .call_once("write_batch", async {
+                if records.is_empty() {
+                    return Ok(0);
+                }
 
-        // Upsert / delete routing: plan the page (dedup last-write-wins, strip
-        // the delete marker) and apply per-document `replace_one(upsert)` /
-        // `delete_one` ops. Append falls through to the `insert_many` fast path.
-        if matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            let plan = faucet_core::plan_writes_exact(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "mongodb {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return self.apply_plan(&plan).await;
-        }
+                // Upsert / delete routing: plan the page (dedup last-write-wins, strip
+                // the delete marker) and apply per-document `replace_one(upsert)` /
+                // `delete_one` ops. Append falls through to the `insert_many` fast path.
+                if matches!(
+                    self.config.write.write_mode,
+                    faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
+                ) {
+                    let plan = faucet_core::plan_writes_exact(records, &self.config.write);
+                    if let Some((idx, msg)) = plan.failed.first() {
+                        return Err(FaucetError::Sink(format!(
+                            "mongodb {}: row {idx}: {msg}",
+                            self.config.write.write_mode.as_str()
+                        )));
+                    }
+                    return self.apply_plan(&plan).await;
+                }
 
-        // Append and overwrite are insert-shaped; overwrite inserts land in the
-        // staging collection via `effective_collection`.
-        let collection = self
-            .client
-            .database(&self.config.database)
-            .collection::<Document>(&self.effective_collection());
+                // Append and overwrite are insert-shaped; overwrite inserts land in the
+                // staging collection via `effective_collection`.
+                let collection = self
+                    .client
+                    .database(&self.config.database)
+                    .collection::<Document>(&self.effective_collection());
 
-        // `batch_size = 0` is the "no batching" sentinel: forward whatever
-        // upstream handed us as a single `insert_many`, preserving
-        // `StreamPage` framing. Otherwise re-chunk into `batch_size` slices.
-        let effective_chunk = if self.config.batch_size == 0 {
-            records.len()
-        } else {
-            self.config.batch_size
-        };
+                // `batch_size = 0` is the "no batching" sentinel: forward whatever
+                // upstream handed us as a single `insert_many`, preserving
+                // `StreamPage` framing. Otherwise re-chunk into `batch_size` slices.
+                let effective_chunk = if self.config.batch_size == 0 {
+                    records.len()
+                } else {
+                    self.config.batch_size
+                };
 
-        let mut total_written = 0usize;
+                let mut total_written = 0usize;
 
-        for chunk in records.chunks(effective_chunk) {
-            let docs: Vec<Document> = chunk
-                .iter()
-                .map(Self::value_to_document)
-                .collect::<Result<Vec<_>, _>>()?;
+                for chunk in records.chunks(effective_chunk) {
+                    let docs: Vec<Document> = chunk
+                        .iter()
+                        .map(Self::value_to_document)
+                        .collect::<Result<Vec<_>, _>>()?;
 
-            let opts = mongodb::options::InsertManyOptions::builder()
-                .ordered(self.config.ordered)
-                .build();
-            collection
-                .insert_many(&docs)
-                .with_options(opts)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MongoDB insert_many failed: {e}")))?;
+                    let opts = mongodb::options::InsertManyOptions::builder()
+                        .ordered(self.config.ordered)
+                        .build();
+                    collection
+                        .insert_many(&docs)
+                        .with_options(opts)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("MongoDB insert_many failed: {e}"))
+                        })?;
 
-            total_written += docs.len();
-            tracing::debug!(batch_size = docs.len(), "MongoDB batch inserted");
-        }
+                    total_written += docs.len();
+                    tracing::debug!(batch_size = docs.len(), "MongoDB batch inserted");
+                }
 
-        tracing::info!(
-            records = total_written,
-            database = %self.config.database,
-            collection = %self.config.collection,
-            "MongoDB write complete"
-        );
+                tracing::info!(
+                    records = total_written,
+                    database = %self.config.database,
+                    collection = %self.config.collection,
+                    "MongoDB write complete"
+                );
 
-        Ok(total_written)
+                Ok(total_written)
+            })
+            .await
     }
 
     /// Write a batch and report per-row outcomes.
@@ -1161,7 +1232,9 @@ impl faucet_core::Sink for MongoSink {
         }
 
         let plan = faucet_core::plan_writes_exact(records, &self.config.write);
-        self.apply_plan(&plan).await?;
+        self.calls
+            .call_once("write_batch_partial", self.apply_plan(&plan))
+            .await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
@@ -1182,12 +1255,18 @@ impl faucet_core::Sink for MongoSink {
     /// collection. Returns `Ok(None)` for an unknown scope (or a missing
     /// collection). The token is opaque and returned verbatim — never parsed.
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        let doc = self
-            .commit_token_collection()
-            .find_one(commit_token_filter(scope))
+        self.calls
+            .call_once("last_committed_token", async {
+                let doc = self
+                    .commit_token_collection()
+                    .find_one(commit_token_filter(scope))
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("MongoDB commit-token read failed: {e}"))
+                    })?;
+                doc.map(|d| token_from_commit_doc(&d)).transpose()
+            })
             .await
-            .map_err(|e| FaucetError::Sink(format!("MongoDB commit-token read failed: {e}")))?;
-        doc.map(|d| token_from_commit_doc(&d)).transpose()
     }
 
     /// Write one page and its commit-token watermark **atomically**, inside a
@@ -1215,98 +1294,102 @@ impl faucet_core::Sink for MongoSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        self.ensure_exactly_once_collections().await?;
+        self.calls
+            .call_once("write_batch_idempotent", async {
+                self.ensure_exactly_once_collections().await?;
 
-        // Prepare (plan + convert to BSON) BEFORE the transaction so a
-        // key-extraction or conversion failure aborts without ever opening a
-        // transaction — mirroring the postgres sink's fail-fast on plan errors.
-        let prepared = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            PreparedWrite::Append(
-                records
-                    .iter()
-                    .map(Self::value_to_document)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        } else {
-            let plan = faucet_core::plan_writes_exact(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "mongodb {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            PreparedWrite::Planned(self.build_plan_ops(&plan)?)
-        };
+                // Prepare (plan + convert to BSON) BEFORE the transaction so a
+                // key-extraction or conversion failure aborts without ever opening a
+                // transaction — mirroring the postgres sink's fail-fast on plan errors.
+                let prepared = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+                    PreparedWrite::Append(
+                        records
+                            .iter()
+                            .map(Self::value_to_document)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                } else {
+                    let plan = faucet_core::plan_writes_exact(records, &self.config.write);
+                    if let Some((idx, msg)) = plan.failed.first() {
+                        return Err(FaucetError::Sink(format!(
+                            "mongodb {}: row {idx}: {msg}",
+                            self.config.write.write_mode.as_str()
+                        )));
+                    }
+                    PreparedWrite::Planned(self.build_plan_ops(&plan)?)
+                };
 
-        let mut session = self
-            .client
-            .start_session()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MongoDB session start failed: {e}")))?;
-        // `w: majority` explicitly: with the client default (`w:1` before
-        // MongoDB 5.0 and on arbiter topologies) a committed page and its
-        // watermark can roll back after a failover (#789 MSG-71).
-        session
-            .start_transaction()
-            .write_concern(mongodb::options::WriteConcern::majority())
-            .await
-            .map_err(|e| {
-                classify_transaction_error("MongoDB transaction start failed", &e.to_string())
-            })?;
+                let mut session = self
+                    .client
+                    .start_session()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("MongoDB session start failed: {e}")))?;
+                // `w: majority` explicitly: with the client default (`w:1` before
+                // MongoDB 5.0 and on arbiter topologies) a committed page and its
+                // watermark can roll back after a failover (#789 MSG-71).
+                session
+                    .start_transaction()
+                    .write_concern(mongodb::options::WriteConcern::majority())
+                    .await
+                    .map_err(|e| {
+                        classify_transaction_error("MongoDB transaction start failed", &e.to_string())
+                    })?;
 
-        let written = match self
-            .apply_in_transaction(&mut session, prepared, scope, token)
-            .await
-        {
-            Ok(written) => written,
-            Err(e) => {
-                // Best-effort abort so the server releases the transaction's
-                // locks promptly; the original error is what matters.
-                if let Err(abort_err) = session.abort_transaction().await {
-                    tracing::debug!(error = %abort_err, "MongoDB abort_transaction failed (best-effort)");
-                }
-                return Err(e);
-            }
-        };
-
-        // Driver-recommended commit retry: `commit_transaction` is itself
-        // retryable while the error carries the UnknownTransactionCommitResult
-        // label (e.g. a primary failover mid-commit). Bounded so a persistent
-        // outage surfaces instead of spinning forever.
-        let mut attempt = 0usize;
-        loop {
-            match session.commit_transaction().await {
-                Ok(()) => break,
-                Err(e)
-                    if e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
-                        && attempt < MAX_COMMIT_RETRIES =>
+                let written = match self
+                    .apply_in_transaction(&mut session, prepared, scope, token)
+                    .await
                 {
-                    attempt += 1;
-                    tracing::warn!(
-                        attempt,
-                        error = %e,
-                        "MongoDB commit returned UnknownTransactionCommitResult; retrying commit"
-                    );
-                }
-                Err(e) => {
-                    return Err(classify_transaction_error(
-                        "MongoDB transaction commit failed",
-                        &e.to_string(),
-                    ));
-                }
-            }
-        }
+                    Ok(written) => written,
+                    Err(e) => {
+                        // Best-effort abort so the server releases the transaction's
+                        // locks promptly; the original error is what matters.
+                        if let Err(abort_err) = session.abort_transaction().await {
+                            tracing::debug!(error = %abort_err, "MongoDB abort_transaction failed (best-effort)");
+                        }
+                        return Err(e);
+                    }
+                };
 
-        tracing::info!(
-            records = written,
-            scope,
-            token,
-            database = %self.config.database,
-            collection = %self.config.collection,
-            "MongoDB exactly-once page committed with watermark"
-        );
+                // Driver-recommended commit retry: `commit_transaction` is itself
+                // retryable while the error carries the UnknownTransactionCommitResult
+                // label (e.g. a primary failover mid-commit). Bounded so a persistent
+                // outage surfaces instead of spinning forever.
+                let mut attempt = 0usize;
+                loop {
+                    match session.commit_transaction().await {
+                        Ok(()) => break,
+                        Err(e)
+                            if e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
+                                && attempt < MAX_COMMIT_RETRIES =>
+                        {
+                            attempt += 1;
+                            tracing::warn!(
+                                attempt,
+                                error = %e,
+                                "MongoDB commit returned UnknownTransactionCommitResult; retrying commit"
+                            );
+                        }
+                        Err(e) => {
+                            return Err(classify_transaction_error(
+                                "MongoDB transaction commit failed",
+                                &e.to_string(),
+                            ));
+                        }
+                    }
+                }
 
-        Ok(written)
+                tracing::info!(
+                    records = written,
+                    scope,
+                    token,
+                    database = %self.config.database,
+                    collection = %self.config.collection,
+                    "MongoDB exactly-once page committed with watermark"
+                );
+
+                Ok(written)
+            })
+            .await
     }
 }
 

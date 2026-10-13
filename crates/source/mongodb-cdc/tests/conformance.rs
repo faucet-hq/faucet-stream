@@ -231,3 +231,17 @@ async fn conformance_errors_not_panics() {
         .expect("new + hello succeed against a live replica set");
     assert_errors_not_panics(&source).await;
 }
+
+/// A change stream with nothing to deliver stands in for a hung backend
+/// (#880): each poll waits on the server until the deadline or the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_call_deadline() {
+    let (_container, uri) = start_repl_set().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(MongoCdcSource::new(config(&uri)).await.expect("source"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}
