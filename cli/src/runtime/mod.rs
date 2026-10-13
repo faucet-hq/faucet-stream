@@ -21,6 +21,16 @@
 //! execution of `faucet serve` are adapters over [`server`]; the CLI commands
 //! call [`local`] with [`Principal::local`].
 
+#[cfg(all(
+    test,
+    feature = "tenants",
+    feature = "policy",
+    feature = "mcp",
+    feature = "triggers",
+    feature = "source-csv",
+    feature = "sink-jsonl"
+))]
+mod adapter_matrix;
 pub mod local;
 mod principal;
 #[cfg(feature = "serve")]

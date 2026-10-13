@@ -82,7 +82,7 @@ mod tests {
             "version: 1\nname: rt\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
             csv.display(),
             dir.join("out.jsonl").display()
-        ), dir)
+        ), &dir.join("rt.yaml"))
         .unwrap()
     }
 

@@ -414,8 +414,12 @@ mod tests {
             Some("true")
         );
 
+        // Admission runs after the config is loaded, trusted and policy-gated
+        // (#887), so the refused submission carries a config that loads.
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _) = fixture(dir.path(), 0, "");
         let req: crate::serve::runner::SubmitRequest =
-            serde_json::from_value(serde_json::json!({"config": "x"})).unwrap();
+            serde_json::from_value(serde_json::json!({"config": cfg})).unwrap();
         let err = crate::serve::runner::submit(state.clone(), req, actor(Some("acme")))
             .await
             .unwrap_err();
