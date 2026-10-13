@@ -84,6 +84,10 @@ pub struct CallContext {
     inner: Arc<Inner>,
 }
 
+// Immutable once built; a panic cannot leave it half-updated.
+impl std::panic::UnwindSafe for CallContext {}
+impl std::panic::RefUnwindSafe for CallContext {}
+
 impl fmt::Debug for CallContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CallContext")
@@ -477,6 +481,10 @@ pub struct CallSlot {
     recorder: OnceLock<Arc<RoundtripRecorder>>,
 }
 
+// Set-once cells over immutable contexts; a panic cannot leave a torn value.
+impl std::panic::UnwindSafe for CallSlot {}
+impl std::panic::RefUnwindSafe for CallSlot {}
+
 impl CallSlot {
     /// A slot whose connector-owned settings are `local`.
     pub fn new(local: CallContext) -> Self {
@@ -683,6 +691,13 @@ mod tests {
             url: "http://h/x".into(),
             body: String::new(),
         }
+    }
+
+    #[test]
+    fn call_types_are_unwind_safe() {
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_unwind_safe::<CallContext>();
+        assert_unwind_safe::<CallSlot>();
     }
 
     #[tokio::test]
