@@ -29,6 +29,10 @@ pub struct PubsubSink {
     config: PubsubSinkConfig,
     client: Client,
     publisher: Publisher,
+    /// Backend-call context (#880): every publish confirmation is awaited
+    /// through it. The SDK bundles messages into RPCs itself, so waits are not
+    /// counted as round trips.
+    calls: faucet_core::CallSlot,
 }
 
 /// Encode every record; per-record failures (bad payload, unresolvable
@@ -198,6 +202,12 @@ impl PubsubSink {
             config,
             client,
             publisher,
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry()
+                    .with_roundtrip_metering(false),
+            ),
         })
     }
 
@@ -209,8 +219,11 @@ impl PubsubSink {
     ) -> BTreeMap<usize, Result<(), FaucetError>> {
         use futures::StreamExt;
         // Enqueue every message; the publisher bundles them internally.
+        use faucet_core::CallExt as _;
+        let calls = self.calls.get();
         let mut awaiters = Vec::with_capacity(chunk.len());
         let mut keys: BTreeMap<usize, String> = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
         for (index, p) in chunk {
             if !p.ordering_key.is_empty() {
                 keys.insert(index, p.ordering_key.clone());
@@ -221,19 +234,32 @@ impl PubsubSink {
                 ordering_key: p.ordering_key,
                 ..Default::default()
             };
-            let awaiter = self.publisher.publish(msg).await;
-            awaiters.push((index, awaiter));
+            match self
+                .publisher
+                .publish(msg)
+                .within_ctx(&calls, "publish")
+                .await
+            {
+                Ok(awaiter) => awaiters.push((index, awaiter)),
+                Err(spent) => {
+                    outcomes.insert(index, Err(spent));
+                }
+            }
         }
-        let mut outcomes = BTreeMap::new();
+        let calls = &calls;
         let mut stream =
             futures::stream::iter(awaiters.into_iter().map(|(index, awaiter)| async move {
                 // Bounded: a dropped connection must fail the row, not hang
                 // the run (#789 MSG-60).
-                let result = match tokio::time::timeout(PUBLISH_TIMEOUT, awaiter.get()).await {
-                    Ok(r) => r
+                let confirmed = tokio::time::timeout(PUBLISH_TIMEOUT, awaiter.get())
+                    .within_ctx(calls, "publish")
+                    .await;
+                let result = match confirmed {
+                    Err(spent) => Err(spent),
+                    Ok(Ok(r)) => r
                         .map(|_message_id| ())
                         .map_err(|e| FaucetError::Sink(format!("pubsub: publish failed: {e}"))),
-                    Err(_) => Err(FaucetError::Sink(format!(
+                    Ok(Err(_)) => Err(FaucetError::Sink(format!(
                         "pubsub: publish not confirmed within {PUBLISH_TIMEOUT:?}"
                     ))),
                 };
@@ -340,6 +366,17 @@ impl faucet_core::Sink for PubsubSink {
         "pubsub"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "pubsub://{}/topics/{}",
@@ -360,16 +397,17 @@ impl faucet_core::Sink for PubsubSink {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
         let topic = self.client.topic(&self.config.topic);
-        let fut = topic.exists(None);
+        let fut = faucet_core::CallExt::within(topic.exists(None), &self.calls, "exists");
         let probe = match tokio::time::timeout(ctx.timeout, fut).await {
             Err(_) => Probe::fail("topic_exists", start.elapsed(), "timed out"),
-            Ok(Ok(true)) => Probe::pass("topic_exists", start.elapsed()),
-            Ok(Ok(false)) => Probe::fail(
+            Ok(Err(e)) => Probe::fail("topic_exists", start.elapsed(), e.to_string()),
+            Ok(Ok(Ok(true))) => Probe::pass("topic_exists", start.elapsed()),
+            Ok(Ok(Ok(false))) => Probe::fail(
                 "topic_exists",
                 start.elapsed(),
                 format!("topic '{}' does not exist", self.config.topic),
             ),
-            Ok(Err(e)) => Probe::fail("topic_exists", start.elapsed(), e.to_string()),
+            Ok(Ok(Err(e))) => Probe::fail("topic_exists", start.elapsed(), e.to_string()),
         };
         Ok(CheckReport::single(probe))
     }

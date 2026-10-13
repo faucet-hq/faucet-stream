@@ -96,3 +96,11 @@ already landed a second time). See
 ## Capabilities
 
 Declares `write_mode: append` only; no idempotent writes. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every publish and its confirmation is awaited through the pipeline's
+`CallContext` (#880): any caller deadline ends the wait, and a message not
+confirmed by then fails as a per-row error. The 120 s per-message confirmation
+bound is unchanged; the SDK bundles messages into RPCs itself, so waits are not
+counted as round trips.
