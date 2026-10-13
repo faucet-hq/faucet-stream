@@ -176,7 +176,7 @@ sink:
 
 ### Avro `bytes` / `fixed` fields
 
-A JSON string written to an Avro `bytes` or `fixed` field is read as **lowercase hex** by default (`"cafe"` → the two bytes `0xca 0xfe`), the shape the Kafka source decodes those fields to, so records read from one topic re-encode unchanged; a string that is not hex fails the record. Set `bytes_encoding: utf8` on the `confluent_avro` format to write a string's UTF-8 bytes instead (`"cafe"` → four bytes) — the behaviour of releases before faucet-common-kafka 1.1.1, which a pipeline feeding text into a `bytes` field relied on. A JSON array of byte numbers (`[202, 254]`) is accepted under either setting.
+A JSON string written to an Avro `bytes` or `fixed` field is read as **standard base64** by default (`"yv4="` → the two bytes `0xca 0xfe`), the canonical binary rendering every faucet source emits — the Kafka source decodes those fields to it — so records read from one topic re-encode unchanged; a string that is not base64 fails the record. Set `bytes_encoding: hex` to read the lowercase hex the source emitted before #885 (`"cafe"` → `0xca 0xfe`), or `bytes_encoding: utf8` on the `confluent_avro` format to write a string's UTF-8 bytes instead (`"cafe"` → four bytes) — the behaviour of releases before faucet-common-kafka 1.1.1, which a pipeline feeding text into a `bytes` field relied on. A JSON array of byte numbers (`[202, 254]`) is accepted under either setting.
 
 ```yaml
     value_format:

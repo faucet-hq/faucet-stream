@@ -1,11 +1,10 @@
-//! GCS sink executor: the shared file writer (#777) over a GCS backend.
+//! GCS sink executor: the shared [`FileSink`] over a [`GcsBackend`]
+//! (RFC 0013, #886).
 
 use crate::config::GcsSinkConfig;
-use crate::object::GcsObjects;
-use faucet_common_file::write::{FileWriter, RemoteBackend, SinkIdentity, WriterSink};
-use faucet_common_gcs::{build_storage, build_storage_control};
+use faucet_common_file::write::{FileSink, SinkIdentity};
+use faucet_common_gcs::{GcsBackend, build_storage, build_storage_control};
 use faucet_core::{FaucetError, FileFormat};
-use google_cloud_storage::client::StorageControl;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -20,7 +19,7 @@ use std::sync::Arc;
 /// encoded; `flush` waits for all of them, so a bookmark never advances past
 /// an object that is not in the bucket.
 pub struct GcsSink {
-    inner: WriterSink,
+    inner: FileSink<GcsBackend>,
 }
 
 impl GcsSink {
@@ -32,36 +31,16 @@ impl GcsSink {
         let write = config.write_config();
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
-        let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
-        let calls = Arc::new(faucet_core::CallSlot::new(
-            faucet_core::CallContext::new()
-                .without_timeout()
-                .with_roundtrip_metering(false),
-        ));
-        let objects = Arc::new(GcsObjects {
-            storage,
-            control: control.clone(),
-            bucket: config.bucket.clone(),
-            roundtrips: roundtrips.clone(),
-            calls: calls.clone(),
-        });
-        let backend = RemoteBackend::new(
-            objects,
-            base,
-            &template,
-            config.scratch_dir.as_deref().map(std::path::Path::new),
-        )?
-        .with_upload_concurrency(config.concurrency);
-        let writer = FileWriter::new(settings, template, Arc::new(backend))?;
+        let backend = GcsBackend::builder(storage, control, config.bucket.clone())
+            .concurrency(config.concurrency)
+            .scratch_dir(config.scratch_dir.as_deref().map(std::path::Path::new))
+            .build(base, &template)?;
         let identity = GcsIdentity {
-            control,
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
-            roundtrips,
-            calls,
         };
         Ok(Self {
-            inner: WriterSink::new(writer, identity),
+            inner: FileSink::build(settings, template, Arc::new(backend), identity)?,
         })
     }
 
@@ -73,16 +52,13 @@ impl GcsSink {
 
 faucet_common_file::delegate_sink!(GcsSink, inner);
 
-/// What the GCS sink supplies to the shared sink.
+/// What the GCS sink supplies to the shared sink; requests, metering and the
+/// preflight probe are the backend's.
 struct GcsIdentity {
-    control: StorageControl,
     bucket: String,
     prefix: String,
-    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
-    calls: Arc<faucet_core::CallSlot>,
 }
 
-#[faucet_core::async_trait]
 impl SinkIdentity for GcsIdentity {
     fn connector_name(&self) -> &'static str {
         "gcs"
@@ -95,41 +71,25 @@ impl SinkIdentity for GcsIdentity {
     fn dataset_uri(&self) -> String {
         format!("gs://{}/{}", self.bucket, self.prefix)
     }
+}
 
-    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.roundtrips.install(recorder.clone());
-        self.calls.install_recorder(recorder);
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faucet_core::Sink as _;
 
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    /// Preflight probe: a non-mutating `list_objects` call capped at one
-    /// result confirms the bucket is reachable and the credentials work.
-    async fn check(
-        &self,
-        ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::{CheckReport, Probe};
-        let started = std::time::Instant::now();
-        let request = self
-            .control
-            .list_objects()
-            .set_parent(format!("projects/_/buckets/{}", self.bucket))
-            .set_page_size(1_i32);
-        let sent = faucet_core::CallExt::within(request.send(), &self.calls, "list");
-        let probe = match tokio::time::timeout(ctx.timeout, sent).await {
-            Ok(Err(e)) => Probe::fail("auth", started.elapsed(), e.to_string()),
-            Ok(Ok(Ok(_))) => Probe::pass("auth", started.elapsed()),
-            Ok(Ok(Err(e))) => Probe::fail_hint(
-                "auth",
-                started.elapsed(),
-                e.to_string(),
-                "check bucket name, credentials, and network",
-            ),
-            Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
-        };
-        Ok(CheckReport::single(probe))
+    #[tokio::test]
+    async fn the_sink_is_a_file_sink_over_gcs() {
+        let config: GcsSinkConfig = serde_json::from_value(serde_json::json!({
+            "bucket": "b", "prefix": "p/", "storage_host": "http://127.0.0.1:9",
+            "auth": {"type": "anonymous"}
+        }))
+        .unwrap();
+        let sink = GcsSink::new(config).await.unwrap();
+        assert_eq!(sink.connector_name(), "gcs");
+        assert_eq!(sink.dataset_uri(), "gs://b/p/");
+        assert_eq!(sink.format(), FileFormat::JsonLines);
+        assert_eq!(sink.inner.backend().bucket(), "b");
+        assert!(sink.config_schema().is_object());
     }
 }

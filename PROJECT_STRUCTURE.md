@@ -4,9 +4,9 @@ Where everything lives in the faucet-stream repository. For how the pieces fit
 together at run time, see the [architecture guide](docs/architecture/README.md);
 to start contributing, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The workspace has <!--COUNT:crates-->111<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
+The workspace has <!--COUNT:crates-->113<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
 source connectors, <!--COUNT:sinks-->35<!--/COUNT--> sink connectors and
-<!--COUNT:common-->23<!--/COUNT--> shared connector libraries, plus the core, auth, state,
+<!--COUNT:common-->25<!--/COUNT--> shared connector libraries, plus the core, auth, state,
 lineage, transform and test crates below.
 
 ```
@@ -16,7 +16,7 @@ crates/
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
   source/                     — source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, …)
   sink/                       — sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
-  common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, file)
+  common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, s3, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, file, sql — the shared SQL dialects and sink engine)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
   transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform

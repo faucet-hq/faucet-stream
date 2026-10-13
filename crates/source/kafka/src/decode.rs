@@ -21,7 +21,7 @@ pub async fn decode(
         return Ok(Value::Null);
     };
     match format {
-        KafkaValueFormat::Json => serde_json::from_slice(bytes)
+        KafkaValueFormat::Json => faucet_core::fidelity::from_slice(bytes)
             .map_err(|e| FaucetError::Source(format!("kafka json decode: {e}"))),
         KafkaValueFormat::RawString => {
             let s = std::str::from_utf8(bytes)
@@ -65,6 +65,28 @@ pub async fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record, serialized the way a
+    /// producer sends it, decodes back unchanged.
+    #[tokio::test]
+    async fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes = serde_json::to_vec(record).unwrap();
+            landed.push(
+                decode(
+                    Some(&bytes),
+                    &KafkaValueFormat::Json,
+                    #[cfg(feature = "schema-registry")]
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
 
     #[tokio::test]
     async fn decode_json_object() {

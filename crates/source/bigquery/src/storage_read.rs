@@ -130,20 +130,7 @@ async fn call<F: std::future::Future>(
     fut: F,
     what: &str,
 ) -> Result<F::Output, FaucetError> {
-    let mut once = Some(within(fut, what));
-    calls
-        .call(op, || {
-            let attempt = once.take();
-            async move {
-                match attempt {
-                    Some(f) => f.await,
-                    None => Err(FaucetError::Source(format!(
-                        "BigQuery Storage Read {what}: a streaming call cannot be retried"
-                    ))),
-                }
-            }
-        })
-        .await
+    calls.call_once(op, within(fut, what)).await
 }
 
 async fn within_for<F: std::future::Future>(

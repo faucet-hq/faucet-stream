@@ -12,6 +12,8 @@ use crate::config::PostgresColumnMapping;
 use crate::sink::{
     PostgresSink, bootstrap_lock_key, pg_bind_text, qualified_table_ref, run_bootstrap_ddl,
 };
+use faucet_common_sql::SqlDialect;
+use faucet_common_sql::dialects::Postgres;
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
@@ -23,21 +25,10 @@ use sqlx::Row;
 
 const MAX_PG_PARAMS: usize = 65535;
 
-fn pg_placeholder(n: usize) -> String {
-    format!("${n}")
-}
-
 fn journal_sql() -> JournalSql {
-    JournalSql {
-        quote: quote_ident,
-        placeholder: pg_placeholder,
-        before_type: "JSONB",
-        insert_prefix: "INSERT",
-        insert_suffix: " ON CONFLICT DO NOTHING",
-        now: "now()",
-        key_column: faucet_core::rollback::KEY_COLUMN_TEXT,
-        primary_key: faucet_core::rollback::PRIMARY_KEY_TEXT,
-    }
+    Postgres
+        .journal_sql()
+        .expect("the postgres dialect journals")
 }
 
 fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -608,21 +599,16 @@ impl PostgresSink {
         token: Option<&str>,
     ) -> Result<(), FaucetError> {
         self.ensure_commit_table().await?;
-        let t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE);
-        let s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL);
-        let k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL);
         match token {
             Some(token) => {
-                sqlx::query(&format!(
-                    "INSERT INTO {t} ({s}, {k}) VALUES ($1, $2) ON CONFLICT ({s}) DO UPDATE SET {k} = EXCLUDED.{k}, updated_at = now()"
-                ))
-                .bind(scope)
-                .bind(token)
-                .execute(&self.pool)
-                .await
+                sqlx::query(&Postgres.commit_token_upsert_sql())
+                    .bind(scope)
+                    .bind(token)
+                    .execute(&self.pool)
+                    .await
             }
             None => {
-                sqlx::query(&format!("DELETE FROM {t} WHERE {s} = $1"))
+                sqlx::query(&Postgres.commit_token_delete_sql())
                     .bind(scope)
                     .execute(&self.pool)
                     .await

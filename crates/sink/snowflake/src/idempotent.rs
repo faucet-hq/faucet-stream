@@ -76,7 +76,7 @@ pub fn build_create_commit_table(database: &str, schema: &str) -> String {
 /// interpreted, so any text — including JSON with `\\u0000` escapes — round
 /// trips byte for byte.
 pub fn sql_string_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+    faucet_common_sql::SqlDialect::quote_literal(&faucet_common_sql::dialects::Snowflake, s)
 }
 
 /// The watermark `MERGE` with `scope` and `token` given as SQL expressions.

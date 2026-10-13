@@ -3,9 +3,11 @@
 //! Shared GCS credential and client construction for faucet source and
 //! sink connectors.
 
+mod backend;
 mod checksum;
 mod json_control;
 
+pub use backend::{GcsBackend, GcsBackendBuilder, MAX_REWRITE_CALLS};
 pub use checksum::{crc32c_of_bytes, open_with_crc32c};
 
 use faucet_core::FaucetError;

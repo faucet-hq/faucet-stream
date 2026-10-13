@@ -9,13 +9,12 @@
 //! keys, `doctor_first`, queue limits, cluster dispatch, metrics, and the audit
 //! log all behave identically.
 
-use crate::params::SuppliedParams;
 use crate::serve::error::ServeError;
 use crate::serve::history::templates::{
     TemplateRecord, TemplateState, TemplateSummary, VersionChannel, VersionSelector,
 };
 use crate::serve::rbac::AuthContext;
-use crate::serve::runner::{self, ConfigFormatWire, SubmitRequest, SubmitResponse};
+use crate::serve::runner::{self, ConfigFormatWire, SubmitResponse};
 use crate::serve::state::ServerState;
 use crate::templates::{RegisterRequest, TemplateStore};
 use axum::Json;
@@ -28,7 +27,7 @@ use std::collections::BTreeMap;
 /// Map a `CliError` from the templates layer onto an HTTP status. A missing
 /// template is a 404; anything the caller could have sent differently is a 422;
 /// a registry failure is a 500.
-fn map_err(e: crate::error::CliError) -> ServeError {
+pub(crate) fn map_err(e: crate::error::CliError) -> ServeError {
     use crate::error::CliError;
     match e {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
@@ -1211,7 +1210,7 @@ pub enum OverlayRef {
 }
 
 impl TriggerBody {
-    fn overlay_choice(&self) -> Option<crate::templates::OverlayChoice> {
+    pub(crate) fn overlay_choice(&self) -> Option<crate::templates::OverlayChoice> {
         self.overlay.as_ref().map(|o| match o {
             OverlayRef::Id(id) => crate::templates::OverlayChoice::Registered {
                 id: id.clone(),
@@ -1263,16 +1262,16 @@ pub struct TriggerResponse {
 
 /// Label keys stamped on a template-triggered run, so `GET /v1/runs` can filter
 /// by provenance.
-const LABEL_TEMPLATE: &str = "template";
-const LABEL_TEMPLATE_VERSION: &str = "template_version";
+pub(crate) const LABEL_TEMPLATE: &str = "template";
+pub(crate) const LABEL_TEMPLATE_VERSION: &str = "template_version";
 /// Run label marking a run of a non-`passing` version (#856).
 pub const LABEL_ALLOW_UNTESTED: &str = "allow_untested";
-const LABEL_SINK_TEMPLATE: &str = "sink_template";
-const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
-const LABEL_OVERLAY: &str = "overlay";
-const LABEL_OVERLAY_VERSION: &str = "overlay_version";
+pub(crate) const LABEL_SINK_TEMPLATE: &str = "sink_template";
+pub(crate) const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
+pub(crate) const LABEL_OVERLAY: &str = "overlay";
+pub(crate) const LABEL_OVERLAY_VERSION: &str = "overlay_version";
 /// Labels only the server stamps on a template-triggered run.
-const RESERVED_LABELS: &[&str] = &[
+pub(crate) const RESERVED_LABELS: &[&str] = &[
     LABEL_TEMPLATE,
     LABEL_TEMPLATE_VERSION,
     LABEL_ALLOW_UNTESTED,
@@ -1305,240 +1304,24 @@ pub async fn trigger_template(
     }
 }
 
-/// What a trigger produced: a run, or (under `--require-approval run` / an
-/// explicit `require_approval`) a pending change request (#703).
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum TriggerOutcome {
-    Run(TriggerResponse),
-    PendingApproval(Box<crate::serve::changes::ChangeRequest>),
-}
+/// What a trigger produced (see [`crate::runtime::server::trigger_template`]).
+pub use crate::runtime::server::TriggerOutcome;
 
-/// The trigger logic behind `POST /v1/templates/{id}/runs`.
+/// The trigger logic behind `POST /v1/templates/{id}/runs`: the runtime's
+/// `trigger_template` as `actor`.
 pub async fn trigger_template_outcome(
     state: ServerState,
     actor: AuthContext,
     id: String,
-    mut body: TriggerBody,
+    body: TriggerBody,
 ) -> Result<TriggerOutcome, ServeError> {
-    if actor.tenant.is_some() && !body.env.is_empty() {
-        return Err(ServeError::Forbidden(
-            "a tenant-scoped principal may not override a template's environment (`env`)".into(),
-        ));
-    }
-    // A run for a tenant never runs a version whose tests are not passing
-    // (#856): `allow_untested` is an operator's escape hatch, not a tenant's.
-    if actor.tenant.is_some() && body.allow_untested {
-        crate::serve::audit::write_target_detail(
-            &state,
-            &actor,
-            "template.run",
-            format!("template:{id}"),
-            "allow_untested refused for a tenant".into(),
-            "denied",
-        )
-        .await;
-        return Err(ServeError::Forbidden(
-            "`allow_untested` is never allowed for a tenant-scoped principal or a run made for a \
-             tenant — run a version that holds a label"
-                .into(),
-        ));
-    }
-    let overlay = body.overlay_choice();
-    let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
-    // Resolve through the registry: a channel needs a lookup, and an unpinned
-    // request means `stable` — the *launched* version, never "the newest build".
-    let s = store(&state);
-    let want = crate::templates::resolve_version(&s, &id, body.version.unwrap_or_default())
-        .await
-        .map_err(map_err)?;
-
-    // A deprecated template still runs — retiring must not hard-break callers —
-    // but every trigger says so, loudly enough to show up in the operator's logs.
-    let tstate = crate::templates::template_state(&s, &id)
-        .await
-        .map_err(map_err)?;
-    let deprecated = crate::templates::deprecation_warning(&tstate, want);
-    if let Some(reason) = &deprecated {
-        tracing::warn!(
-            template = %id,
-            version = want,
-            reason = %reason,
-            "triggering a DEPRECATED pipeline template"
-        );
-    }
-    // A clustered submit persists the materialized config so any instance can
-    // re-run it, so nothing secret may be baked into that body. In cluster mode we
-    // therefore materialize in `Persisted` mode: `${env:}` / `${file:}` /
-    // `${secret:}` stay as tokens and are resolved by the executing instance
-    // (#456 C5). What cannot be deferred is a value the *caller* supplied, so
-    // those are refused below.
-    let clustered = state.cluster().enabled();
-    let gated = body.require_approval
-        || (!body.standing_approval
-            && state.requires_approval(crate::serve::changes::ChangeKind::Run));
-    let mode = if clustered || gated {
-        crate::templates::Materialize::Persisted
-    } else {
-        crate::templates::Materialize::Local
-    };
-    let sink = crate::templates::SinkChoice {
-        id: body.sink.clone(),
-        version: body.sink_version.unwrap_or_default(),
-        overlay,
-        allow_untested: body.allow_untested,
-    };
-    if let Some(sink_id) = &sink.id {
-        let sink_state = crate::templates::template_state(&s, sink_id)
-            .await
-            .map_err(map_err)?;
-        if sink_state.status == crate::serve::history::templates::TemplateStatus::Deprecated {
-            tracing::warn!(sink_template = %sink_id, "composing a DEPRECATED sink template");
-        }
-    }
-    let materialized = crate::templates::materialize_for_run_selected(
-        &s,
-        &id,
-        want,
-        &sink,
-        &supplied,
-        &body.env,
-        mode,
-        body.selection.as_ref(),
+    crate::runtime::server::trigger_template(
+        state,
+        crate::runtime::Principal::new(actor, crate::runtime::Origin::Trusted),
+        id,
+        body,
     )
     .await
-    .map_err(map_err)?;
-
-    // Caller-supplied values that would land in the persisted body: a
-    // `secret: true` param, or an `env:` override (which substitutes into the
-    // config exactly like a param and is equally likely to be a credential —
-    // #456 M4). Both are refused rather than written to a shared database that is
-    // deliberately not a secret store.
-    if (clustered || gated) && (materialized.used_secret_params || !body.env.is_empty()) {
-        let what = if materialized.used_secret_params {
-            "declares `secret: true` param(s)"
-        } else {
-            "was triggered with `env` overrides"
-        };
-        let why = if gated {
-            "this trigger needs an approved change request, which stores the materialized \
-             config for the approvers to review — and would store the value with it"
-        } else {
-            "a clustered server persists the materialized config so a peer can execute it — \
-             which would store the value in the shared run-history database"
-        };
-        let alternative = if gated {
-            "trigger it on a server that does not require approval for runs"
-        } else {
-            "trigger it on a non-clustered server"
-        };
-        return Err(ServeError::Unprocessable {
-            message: format!(
-                "this template {what}, and {why}. Reference the secret from the template body \
-                 instead (`${{env:VAR}}`, `${{vault:…}}`, `${{aws-sm:…}}`, … — all resolved on \
-                 the executing instance, never persisted), or {alternative}"
-            ),
-            details: None,
-        });
-    }
-
-    let mut labels = body.labels;
-    // Provenance labels are the server's to set: a caller's value never stands
-    // in for one this run did not earn.
-    labels.retain(|k, _| !RESERVED_LABELS.contains(&k.as_str()));
-    labels.insert(LABEL_TEMPLATE.into(), materialized.template_id.clone());
-    if let Some(status) = materialized.untested {
-        labels.insert(LABEL_ALLOW_UNTESTED.into(), "true".into());
-        crate::serve::audit::write_target_detail(
-            &state,
-            &actor,
-            "template.run",
-            format!(
-                "template:{}@{}",
-                materialized.template_id, materialized.version
-            ),
-            format!("allow_untested: v{} is {status}", materialized.version),
-            "ok",
-        )
-        .await;
-    }
-    labels.insert(
-        LABEL_TEMPLATE_VERSION.into(),
-        materialized.version.to_string(),
-    );
-    if let (Some(sid), Some(sv)) = (&materialized.sink_id, materialized.sink_version) {
-        labels.insert(LABEL_SINK_TEMPLATE.into(), sid.clone());
-        labels.insert(LABEL_SINK_TEMPLATE_VERSION.into(), sv.to_string());
-    }
-    if let Some(oid) = &materialized.overlay_id {
-        labels.insert(LABEL_OVERLAY.into(), oid.clone());
-        if let Some(ov) = materialized.overlay_version {
-            labels.insert(LABEL_OVERLAY_VERSION.into(), ov.to_string());
-        }
-    }
-    // The caller's selection names the run, not the stream list it resolved
-    // to (#741).
-    if let Some(sel) = &body.selection {
-        labels.insert(crate::select::LABEL_SELECTION.into(), sel.canonical());
-    }
-
-    let req = SubmitRequest {
-        config: materialized.body.clone(),
-        config_format: ConfigFormatWire::Json,
-        name: body.name.or_else(|| materialized.name.clone()),
-        labels,
-        timeout_secs: body.timeout_secs,
-        doctor_first: body.doctor_first,
-        idempotency_key: body.idempotency_key,
-        clock: body.clock,
-        concurrency: body.concurrency,
-        callback: body.callback,
-        require_approval: body.require_approval,
-        reason: body.reason,
-        budget: body.budget,
-        approved_change: None,
-        selection: materialized.selection.clone(),
-        trusted_config: true,
-        server_file: false,
-    };
-    let run = if !gated {
-        runner::submit(state.clone(), req, actor.clone()).await?
-    } else {
-        match runner::submit_gated(state.clone(), req, actor.clone()).await? {
-            runner::SubmitOutcome::Accepted(run) => run,
-            // Approval first (#703): the trigger became a change request.
-            runner::SubmitOutcome::PendingApproval(change) => {
-                return Ok(TriggerOutcome::PendingApproval(change));
-            }
-        }
-    };
-    // `submit` already recorded `run.submit`; this second entry attributes the
-    // *trigger* specifically, and its `run_id` links to the run record whose
-    // `template` / `template_version` labels name the version used.
-    crate::serve::audit::write(
-        &state,
-        &actor,
-        "template.run",
-        Some(run.run_id.clone()),
-        None,
-        "ok",
-    )
-    .await;
-    Ok(TriggerOutcome::Run(TriggerResponse {
-        run,
-        template_id: materialized.template_id,
-        template_version: materialized.version,
-        sink_template: materialized.sink_id,
-        sink_template_version: materialized.sink_version,
-        streams: materialized.streams,
-        overlay: materialized.overlay_id,
-        overlay_version: materialized.overlay_version,
-        overlay_contributes: materialized.overlay_contributes,
-        warnings: materialized.warnings,
-        params: materialized.params_redacted,
-        deprecated,
-        selection: body.selection,
-    }))
 }
 
 #[cfg(test)]

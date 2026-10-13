@@ -129,3 +129,17 @@ Every statement (`INSERT`, `COPY`, DDL, the catalog lookups) and every S3
 staging request runs through the pipeline's `CallContext` (#880): each is sent
 once, any caller deadline ends it, and each is metered as a round trip
 (`execute`, `query`, `stage`). The pool's connect timeout still applies.
+
+## Shared SQL layer
+
+This sink takes its quoting, literal escaping, `$n` placeholders and 32767-parameter chunking, column types and the create-table, add-column and `INSERT` text from the `Redshift` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Row handling stays here: an append skips (with a warning) a record that shares no column rather than failing it, field names fold with Unicode lower-casing as Redshift does, and pages are buffered into `COPY`-from-S3 commit groups — semantics the engine's mapping does not have.
+
+## Value fidelity
+
+A column with an exact-decimal type (`NUMERIC(p,s)` / `DECIMAL`) is bound as
+text cast to that type (`$n::numeric(38,9)`), so an exact decimal string from a
+source (`"12345678901234567890.123456789"`) and a non-integer JSON number both
+land with every digit — the server parses them, never a double. See
+[value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).

@@ -966,6 +966,41 @@ async fn columnar_taken_only_in_read_api_mode() {
     let _pages = read_src.stream_pages(&ctx, 0);
 }
 
+/// The Storage Read session is opened through the run's call context: a
+/// deadline that has already passed ends it before any connection is made.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn storage_read_connect_honours_the_call_deadline() {
+    use faucet_core::Source as _;
+    let server = MockServer::start().await;
+    let (src, _sa) = build_source(
+        &server,
+        BigQuerySourceConfig::new(
+            PROJECT_ID,
+            BigQueryCredentials::ServiceAccountKey {
+                json: dummy_service_account_json(&server.uri()).to_string(),
+            },
+            "",
+        )
+        .with_read_api("my_dataset.my_table"),
+    )
+    .await;
+    src.set_call_context(
+        faucet_core::CallContext::new().with_deadline(tokio::time::Instant::now()),
+    );
+    let ctx = HashMap::new();
+    let first = src
+        .stream_batches(&ctx, 0)
+        .next()
+        .await
+        .expect("the stream yields its failure");
+    assert!(
+        matches!(first, Err(faucet_core::FaucetError::Timeout { .. })),
+        "the connect is cut off: {:?}",
+        first.err()
+    );
+}
+
 /// A result whose schema names a type the REST client cannot decode (`RANGE`)
 /// is still read: the raw fallback re-sends the query with the same
 /// `requestId` (so BigQuery returns the same job instead of running it twice)

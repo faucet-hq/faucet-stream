@@ -206,14 +206,15 @@ async fn doctor_check_fails_when_parent_directory_missing() {
 }
 
 #[tokio::test]
-async fn doctor_check_skips_s3_destination() {
-    // For an S3 destination the doctor probe is skipped — object-store targets
-    // are not probed.
+async fn doctor_check_probes_an_s3_destination_with_head_bucket() {
+    // An S3 destination writes through the S3 backend (#886), whose probe is a
+    // non-mutating `HeadBucket` — against an endpoint nothing listens on, it
+    // fails.
     let cfg = ParquetSinkConfig::new(ParquetDestination::S3(ParquetS3Destination {
         bucket: "b".to_string(),
         prefix: "p/".to_string(),
         region: Some("us-east-1".to_string()),
-        endpoint_url: Some("http://localhost:4566".to_string()),
+        endpoint_url: Some("http://127.0.0.1:9".to_string()),
         allow_http: true,
     }));
     // SAFETY: constants; concurrent writes converge to the same value (mirrors
@@ -227,8 +228,8 @@ async fn doctor_check_skips_s3_destination() {
     let report = sink.check(&CheckContext::default()).await.unwrap();
     assert_eq!(report.probes.len(), 1);
     assert!(
-        matches!(report.probes[0].status, ProbeStatus::Skip { .. }),
-        "S3 target must be skipped, got {:?}",
+        matches!(report.probes[0].status, ProbeStatus::Fail { .. }),
+        "an unreachable S3 target fails its probe, got {:?}",
         report.probes[0].status
     );
 

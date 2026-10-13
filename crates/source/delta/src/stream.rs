@@ -539,11 +539,10 @@ fn coerce_partition_value(raw: &str, dt: &DataType) -> Value {
             .parse::<i64>()
             .map(|n| Value::Number(n.into()))
             .unwrap_or_else(|_| Value::String(raw.to_string())),
-        DataType::Float32 | DataType::Float64 => {
-            serde_json::Number::from_f64(raw.parse::<f64>().unwrap_or(f64::NAN))
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::String(raw.to_string()))
-        }
+        DataType::Float32 | DataType::Float64 => raw
+            .parse::<f64>()
+            .map(faucet_core::fidelity::float64)
+            .unwrap_or_else(|_| Value::String(raw.to_string())),
         // Dates/timestamps/strings/decimals: keep the logical string form.
         _ => Value::String(raw.to_string()),
     }

@@ -9114,9 +9114,9 @@
           "type": "object",
           "properties": {
             "bytes_encoding": {
-              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `hex` (default — the shape the Kafka source decodes those\nfields to, so records round-trip) or `utf8` (the string's UTF-8\nbytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte\nnumbers is accepted either way. Ignored by the source.",
+              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `base64` (default — the shape the Kafka source decodes those\nfields to, so records round-trip), `hex` (the source's rendering\nbefore #885) or `utf8` (the string's UTF-8 bytes, the reading before\nfaucet-common-kafka 1.1.1). A JSON array of byte numbers is accepted\neither way. Ignored by the source.",
               "$ref": "#/$defs/source_kafka__BytesText",
-              "default": "hex"
+              "default": "base64"
             },
             "schema_registry": {
               "$ref": "#/$defs/source_kafka__SchemaRegistryConfig"
@@ -9166,7 +9166,12 @@
       "description": "How a JSON string is read for an Avro `bytes` / `fixed` value on encode.",
       "oneOf": [
         {
-          "description": "The string is lowercase hex, the shape [`datum_to_json`] produces.",
+          "description": "The string is standard base64, the shape [`datum_to_json`] produces.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "The string is lowercase hex (the rendering before #885).",
           "type": "string",
           "const": "hex"
         },
@@ -12796,9 +12801,9 @@
           "type": "object",
           "properties": {
             "bytes_encoding": {
-              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `hex` (default — the shape the Kafka source decodes those\nfields to, so records round-trip) or `utf8` (the string's UTF-8\nbytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte\nnumbers is accepted either way. Ignored by the source.",
+              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `base64` (default — the shape the Kafka source decodes those\nfields to, so records round-trip), `hex` (the source's rendering\nbefore #885) or `utf8` (the string's UTF-8 bytes, the reading before\nfaucet-common-kafka 1.1.1). A JSON array of byte numbers is accepted\neither way. Ignored by the source.",
               "$ref": "#/$defs/sink_kafka__BytesText",
-              "default": "hex"
+              "default": "base64"
             },
             "schema_registry": {
               "$ref": "#/$defs/sink_kafka__SchemaRegistryConfig"
@@ -12848,7 +12853,12 @@
       "description": "How a JSON string is read for an Avro `bytes` / `fixed` value on encode.",
       "oneOf": [
         {
-          "description": "The string is lowercase hex, the shape [`datum_to_json`] produces.",
+          "description": "The string is standard base64, the shape [`datum_to_json`] produces.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "The string is lowercase hex (the rendering before #885).",
           "type": "string",
           "const": "hex"
         },
@@ -13588,7 +13598,7 @@
           }
         },
         {
-          "description": "S3 bucket. Each written object is `<prefix><uuid>.parquet`.",
+          "description": "S3 bucket. Each written object is `<prefix><run id>-<part>.parquet`.",
           "type": "object",
           "properties": {
             "bucket": {
@@ -13618,7 +13628,7 @@
               "x-faucet-resource": "url"
             },
             "allow_http": {
-              "description": "Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`\nURL (e.g. for LocalStack).",
+              "description": "Accepted for compatibility: the S3 client takes an `http://`\n`endpoint_url` (e.g. for LocalStack) without it.",
               "type": [
                 "boolean",
                 "string"

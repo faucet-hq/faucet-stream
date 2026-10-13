@@ -144,26 +144,6 @@ impl ServerState {
         self.inner.references.clone()
     }
 
-    /// Load a config body under this server's default base, data-flow policy
-    /// and reference policy.
-    pub async fn load_submission(
-        &self,
-        body: &str,
-        format: crate::serve::load::ConfigFormat,
-        origin: crate::serve::load::BodyOrigin,
-    ) -> Result<crate::serve::load::LoadedSubmission, crate::serve::error::ServeError> {
-        crate::serve::load::load_submission_with(
-            body,
-            format,
-            self.default_base().as_ref(),
-            crate::serve::runner::server_policy(self).as_deref(),
-            origin,
-            None,
-            &self.references(),
-        )
-        .await
-    }
-
     /// The origin of a body: [`Self::caller_origin`] unless the server's
     /// operator wrote it.
     pub fn origin(&self, trusted: bool) -> crate::serve::load::BodyOrigin {

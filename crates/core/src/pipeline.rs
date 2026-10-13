@@ -1148,9 +1148,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 }
             }
             run_result
-        }
-        .instrument(span)
-        .await;
+        };
+        let non_finite = crate::fidelity::NonFiniteCounter::new();
+        let result = non_finite.scope(result.instrument(span)).await;
+        settle_non_finite(&non_finite, self.row_accounts.as_deref(), &name, &row);
         // #753: finalize only a fully successful, uncancelled run, whichever
         // transfer path it took — a failed or cancelled run keeps the previous
         // output intact.
@@ -1187,6 +1188,35 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
 
         result
     }
+}
+
+/// Fold the run's non-finite count (values with no JSON rendering written as
+/// `null`, #885) into the row accounts and the metric, and say so once.
+fn settle_non_finite(
+    counter: &crate::fidelity::NonFiniteCounter,
+    accounts: Option<&crate::accounting::RowAccounts>,
+    pipeline: &str,
+    row: &str,
+) {
+    let n = counter.count();
+    if n == 0 {
+        return;
+    }
+    if let Some(a) = accounts {
+        a.add_non_finite(n);
+    }
+    metrics::counter!(
+        "faucet_fidelity_non_finite_total",
+        "pipeline" => pipeline.to_string(),
+        "row" => row.to_string()
+    )
+    .increment(n);
+    tracing::warn!(
+        pipeline = %pipeline,
+        row = %row,
+        non_finite = n,
+        "{n} NaN or infinite value(s) have no JSON representation and were written as null"
+    );
 }
 
 /// Columnar (Arrow) fast path, driven by [`Pipeline::run`] when both the source

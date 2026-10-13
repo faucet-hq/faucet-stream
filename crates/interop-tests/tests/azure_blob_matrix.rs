@@ -12,7 +12,7 @@ mod remote_matrix;
 
 use std::sync::Arc;
 
-use faucet_core::{FaucetError, Sink};
+use faucet_core::{FaucetError, Sink, Source};
 use futures::StreamExt;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjPath;
@@ -48,6 +48,17 @@ impl Remote for AzureRemote {
         Box::pin(async move {
             let cfg = serde_json::from_value(cfg).map_err(FaucetError::Json)?;
             Ok(Box::new(faucet_sink_azure_blob::AzureBlobSink::new(cfg).await?) as Box<dyn Sink>)
+        })
+    }
+
+    fn source(&self, prefix: &str) -> BoxFut<'_, Result<Box<dyn Source>, FaucetError>> {
+        let cfg = self.config(prefix, json!({}));
+        Box::pin(async move {
+            let cfg = serde_json::from_value(cfg).map_err(FaucetError::Json)?;
+            Ok(
+                Box::new(faucet_source_azure_blob::AzureBlobSource::new(cfg).await?)
+                    as Box<dyn Source>,
+            )
         })
     }
 
@@ -123,13 +134,11 @@ async fn every_writable_format_takes_every_option_on_azure_blob() {
             .build()
             .expect("verifying store"),
     );
-    run_matrix(
-        AzureRemote {
-            endpoint,
-            store,
-            _c: container,
-        },
-        true,
-    )
-    .await;
+    let remote = AzureRemote {
+        endpoint,
+        store,
+        _c: container,
+    };
+    remote_matrix::assert_corpus_written(&remote).await;
+    run_matrix(remote, true).await;
 }

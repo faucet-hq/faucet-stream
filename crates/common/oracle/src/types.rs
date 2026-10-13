@@ -76,83 +76,21 @@ pub fn cell_to_json(cell: Cell) -> Value {
     }
 }
 
-/// A non-finite `BINARY_DOUBLE` (`Inf`, `NaN`) has no JSON number form; emit
-/// its text instead of silently turning it into `null`.
 fn float_to_json(f: f64) -> Value {
-    serde_json::Number::from_f64(f)
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::String(f.to_string()))
+    faucet_core::fidelity::float64(f)
 }
 
 /// A `BINARY_FLOAT` through its shortest decimal form, so `0.1` stays `0.1`
-/// instead of widening to `0.10000000149011612`; non-finite values as text.
+/// instead of widening to `0.10000000149011612`; non-finite values as a counted
+/// `null` (#885).
 pub(crate) fn float32_to_json(f: f32) -> Value {
-    if !f.is_finite() {
-        return Value::String(f.to_string());
-    }
-    f.to_string()
-        .parse::<f64>()
-        .map_or_else(|_| Value::String(f.to_string()), float_to_json)
+    faucet_core::fidelity::float32(f)
 }
 
 /// Convert an Oracle decimal string to JSON without losing precision.
 pub fn number_text_to_json(text: &str) -> Value {
-    let t = text.trim();
-    let is_integer = !t.contains(['.', 'e', 'E']);
-    if is_integer {
-        if let Ok(i) = t.parse::<i64>() {
-            return json!(i);
-        }
-        if let Ok(u) = t.parse::<u64>() {
-            return json!(u);
-        }
-        return Value::String(t.to_string());
-    }
-    if let Ok(f) = t.parse::<f64>()
-        && f.is_finite()
-        && canonical_decimal(t).is_some()
-        && canonical_decimal(t) == canonical_decimal(&f.to_string())
-    {
-        return float_to_json(f);
-    }
-    Value::String(t.to_string())
-}
-
-/// Canonical `(negative, significant digits, exponent)` of a decimal string —
-/// two strings denote the same number iff their canonical forms are equal.
-fn canonical_decimal(s: &str) -> Option<(bool, String, i64)> {
-    let s = s.trim();
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (mantissa, exp) = match body.find(['e', 'E']) {
-        Some(i) => (&body[..i], body[i + 1..].parse::<i64>().ok()?),
-        None => (body, 0),
-    };
-    let (int_part, frac_part) = match mantissa.find('.') {
-        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
-        None => (mantissa, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part
-        .chars()
-        .chain(frac_part.chars())
-        .all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    let digits = format!("{int_part}{frac_part}");
-    let exponent = exp - frac_part.len() as i64;
-    let significant = digits.trim_start_matches('0');
-    if significant.is_empty() {
-        return Some((false, "0".into(), 0));
-    }
-    let trimmed = significant.trim_end_matches('0');
-    let trailing = significant.len() - trimmed.len();
-    Some((neg, trimmed.to_string(), exponent + trailing as i64))
+    faucet_core::fidelity::number_text(text)
+        .unwrap_or_else(|_| Value::String(text.trim().to_string()))
 }
 
 /// ISO-8601 duration for an `INTERVAL DAY TO SECOND`.
@@ -283,8 +221,8 @@ impl TypeFamily {
             // are emitted as their exact text.
             TypeFamily::Integer => json!({ "type": ["integer", "string"] }),
             TypeFamily::Decimal => json!({ "type": ["number", "string"] }),
-            // Non-finite values (`Inf`, `NaN`) are emitted as text.
-            TypeFamily::BinaryFloat => json!({ "type": ["number", "string"] }),
+            // Non-finite values (`Inf`, `NaN`) are a counted `null` (#885).
+            TypeFamily::BinaryFloat => json!({ "type": ["number", "null"] }),
             TypeFamily::Boolean => json!({ "type": "boolean" }),
             TypeFamily::Json => json!({ "type": "object" }),
             TypeFamily::Raw | TypeFamily::Blob => {
@@ -306,11 +244,9 @@ impl TypeFamily {
 /// as `YYYY-MM-DD HH24:MI:SS[.FF] [TZH:TZM]` (see [`crate::NLS_SESSION_SQL`]).
 pub fn typed_text_to_json(text: &str, family: TypeFamily) -> Value {
     match family {
-        TypeFamily::Integer | TypeFamily::Decimal => number_text_to_json(text),
-        TypeFamily::BinaryFloat => match text.trim().parse::<f64>() {
-            Ok(f) => float_to_json(f),
-            Err(_) => Value::String(text.to_string()),
-        },
+        TypeFamily::Integer | TypeFamily::Decimal | TypeFamily::BinaryFloat => {
+            number_text_to_json(text)
+        }
         TypeFamily::Date | TypeFamily::Timestamp | TypeFamily::TimestampTz => {
             Value::String(normalize_datetime_text(text))
         }
@@ -329,9 +265,8 @@ pub fn typed_text_to_json(text: &str, family: TypeFamily) -> Value {
             "0" | "FALSE" => Value::Bool(false),
             _ => Value::String(text.to_string()),
         },
-        TypeFamily::Json => {
-            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.into()))
-        }
+        TypeFamily::Json => faucet_core::fidelity::parse_json(text.as_bytes())
+            .unwrap_or_else(|_| Value::String(text.into())),
         _ => Value::String(text.to_string()),
     }
 }
@@ -523,17 +458,11 @@ mod tests {
             json!("0.12345678901234567890123")
         );
         assert_eq!(number_text_to_json("abc.d"), json!("abc.d"));
-        assert_eq!(number_text_to_json("1e999"), json!("1e999"));
-    }
-
-    #[test]
-    fn canonical_decimal_forms() {
-        assert_eq!(canonical_decimal("1.50"), canonical_decimal("1.5"));
-        assert_eq!(canonical_decimal("0.000"), Some((false, "0".into(), 0)));
-        assert_eq!(canonical_decimal("+2"), canonical_decimal("2"));
-        assert_eq!(canonical_decimal("100"), Some((false, "1".into(), 2)));
-        assert_eq!(canonical_decimal("."), None);
-        assert_eq!(canonical_decimal("1ex"), None);
+        assert_eq!(
+            number_text_to_json("1e999"),
+            json!(format!("1{}", "0".repeat(999)))
+        );
+        assert_eq!(number_text_to_json("NaN"), Value::Null);
     }
 
     #[test]
@@ -546,7 +475,7 @@ mod tests {
         assert_eq!(cell_to_json(Cell::Text("x".into())), json!("x"));
         assert_eq!(cell_to_json(Cell::Number("3".into())), json!(3));
         assert_eq!(cell_to_json(Cell::Float(2.5)), json!(2.5));
-        assert_eq!(cell_to_json(Cell::Float(f64::INFINITY)), json!("inf"));
+        assert_eq!(cell_to_json(Cell::Float(f64::INFINITY)), Value::Null);
         assert_eq!(cell_to_json(Cell::Bytes(vec![1, 2, 3])), json!("AQID"));
         assert_eq!(cell_to_json(Cell::Date(d)), json!("2024-01-02T03:04:05"));
         let t = d + chrono::Duration::milliseconds(500);
@@ -633,13 +562,10 @@ mod tests {
         // Values past i64/u64 or f64 exactness are emitted as text.
         assert_eq!(Integer.json_schema()["type"], json!(["integer", "string"]));
         assert_eq!(Decimal.json_schema()["type"], json!(["number", "string"]));
-        assert_eq!(
-            BinaryFloat.json_schema()["type"],
-            json!(["number", "string"])
-        );
+        assert_eq!(BinaryFloat.json_schema()["type"], json!(["number", "null"]));
         assert_eq!(super::float32_to_json(0.1), json!(0.1));
-        assert_eq!(super::float32_to_json(f32::INFINITY), json!("inf"));
-        assert_eq!(super::float32_to_json(f32::NAN), json!("NaN"));
+        assert_eq!(super::float32_to_json(f32::INFINITY), Value::Null);
+        assert_eq!(super::float32_to_json(f32::NAN), Value::Null);
         assert_eq!(Boolean.json_schema()["type"], "boolean");
         assert_eq!(Json.json_schema()["type"], "object");
         assert_eq!(Blob.json_schema()["contentEncoding"], "base64");

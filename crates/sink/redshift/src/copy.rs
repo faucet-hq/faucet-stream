@@ -6,9 +6,20 @@
 //! a database.
 
 use crate::config::RedshiftCopyFormat;
+use faucet_common_sql::dialects::Redshift;
+use faucet_common_sql::{SqlDialect, TableTarget};
 use faucet_core::FaucetError;
-use faucet_core::util::quote_ident;
 use serde_json::Value;
+
+/// Quote one identifier (PostgreSQL-style double quotes).
+fn quote_ident(name: &str) -> String {
+    Redshift.quote_ident(name)
+}
+
+/// The engine target of an already-quoted table reference.
+fn target(table_ref: &str) -> TableTarget {
+    TableTarget::new(table_ref, table_ref)
+}
 
 /// Build a schema-qualified, quoted table reference (`"schema"."table"` or
 /// `"table"`).
@@ -16,28 +27,6 @@ pub(crate) fn qualified_table_ref(schema: Option<&str>, table: &str) -> String {
     match schema {
         Some(s) => format!("{}.{}", quote_ident(s), quote_ident(table)),
         None => quote_ident(table),
-    }
-}
-
-/// Map a [`faucet_core::SqlBaseType`] to the Redshift column type used when
-/// auto-creating a table (#580).
-///
-/// Redshift has no JSON column type, so nested values land in `VARCHAR(MAX)`
-/// — the same text the writer already serialises them to. Integers widen to
-/// `BIGINT` and floats to `DOUBLE PRECISION` so a later, wider value never
-/// overflows a narrower column.
-pub(crate) fn redshift_type(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "BIGINT",
-        Double => "DOUBLE PRECISION",
-        Boolean => "BOOLEAN",
-        // `VARCHAR(65535)` rather than Redshift's `VARCHAR(MAX)` alias: they
-        // mean the same thing on Redshift, and the explicit width is also
-        // valid standard SQL — which is what lets the integration suite
-        // exercise this DDL against a Postgres stand-in rather than skipping
-        // it (there is no Redshift container).
-        Text | Json => "VARCHAR(65535)",
     }
 }
 
@@ -50,14 +39,15 @@ pub(crate) fn build_create_table_sql(
     table_ref: &str,
     columns: &[faucet_core::PlannedColumn],
 ) -> String {
-    let cols = faucet_core::render_columns(columns, quote_ident, redshift_type);
-    format!("CREATE TABLE IF NOT EXISTS {table_ref} ({cols})")
+    Redshift
+        .create_table_sql(&target(table_ref), columns, &[])
+        .expect("redshift CREATE TABLE")
 }
 
 /// Render a value as a single-quoted SQL string literal, doubling interior
 /// single quotes so it is injection-safe.
 pub(crate) fn sql_string_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    Redshift.quote_literal(s)
 }
 
 /// The `s3://bucket/key` URI for a staged object.
@@ -113,26 +103,15 @@ pub(crate) fn copy_statement(
 
 /// Build a multi-row `INSERT INTO table (cols) VALUES ($1,$2),($3,$4)…`.
 /// Placeholders are numbered `$1..=$(num_rows*columns.len())`.
-pub(crate) fn insert_statement(table_ref: &str, columns: &[String], num_rows: usize) -> String {
-    let col_list = columns
-        .iter()
-        .map(|c| quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let num_cols = columns.len();
-    let mut tuples = Vec::with_capacity(num_rows);
-    for row in 0..num_rows {
-        let start = row * num_cols + 1;
-        let placeholders = (0..num_cols)
-            .map(|c| format!("${}", start + c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tuples.push(format!("({placeholders})"));
-    }
-    format!(
-        "INSERT INTO {table_ref} ({col_list}) VALUES {}",
-        tuples.join(", ")
-    )
+pub(crate) fn insert_statement(
+    table_ref: &str,
+    columns: &[String],
+    casts: &[Option<&str>],
+    num_rows: usize,
+) -> String {
+    Redshift
+        .insert_sql(table_ref, columns, casts, num_rows)
+        .expect("redshift INSERT")
 }
 
 /// The value of `record`'s field for destination column `column`: the exact key
@@ -174,8 +153,9 @@ pub(crate) fn missing_fields(
 /// `ALTER TABLE … ADD COLUMN` for a field first seen after the table existed,
 /// typed like an auto-created column.
 pub(crate) fn add_column_sql(table_ref: &str, column: &faucet_core::PlannedColumn) -> String {
-    let def = faucet_core::render_columns(std::slice::from_ref(column), quote_ident, redshift_type);
-    format!("ALTER TABLE {table_ref} ADD COLUMN {def}")
+    Redshift
+        .add_column_sql(&target(table_ref), &column.name, column.base_type)
+        .expect("redshift ADD COLUMN")
 }
 
 /// The set of destination columns present in at least one record, preserving
@@ -385,7 +365,7 @@ mod tests {
 
     #[test]
     fn insert_statement_numbers_placeholders_per_row() {
-        let sql = insert_statement("\"t\"", &["a".into(), "b".into()], 2);
+        let sql = insert_statement("\"t\"", &["a".into(), "b".into()], &[], 2);
         assert_eq!(
             sql,
             "INSERT INTO \"t\" (\"a\", \"b\") VALUES ($1, $2), ($3, $4)"
@@ -394,8 +374,8 @@ mod tests {
 
     #[test]
     fn insert_statement_single_row() {
-        let sql = insert_statement("\"t\"", &["a".into()], 1);
-        assert_eq!(sql, "INSERT INTO \"t\" (\"a\") VALUES ($1)");
+        let sql = insert_statement("\"t\"", &["a".into()], &[Some("numeric(10,2)")], 1);
+        assert_eq!(sql, "INSERT INTO \"t\" (\"a\") VALUES ($1::numeric(10,2))");
     }
 
     #[test]

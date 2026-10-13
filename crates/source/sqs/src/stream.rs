@@ -39,7 +39,7 @@ pub struct SqsSource {
 /// Decode one SQS message body: the parsed JSON value if the body is valid
 /// JSON, otherwise the raw body wrapped as a JSON string. Pure.
 pub(crate) fn decode_body(body: &str) -> Value {
-    serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()))
+    faucet_core::fidelity::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
 
 /// Pause after an empty short-poll receive.
@@ -487,6 +487,19 @@ impl faucet_core::Source for SqsSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record, serialized the way a
+    /// producer sends it, decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes = serde_json::to_vec(record).unwrap();
+            landed.push(decode_body(std::str::from_utf8(&bytes).unwrap()));
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
 
     #[test]
     fn metadata_wraps_the_body_with_id_and_attributes() {

@@ -154,7 +154,28 @@ impl DeltaSink {
             state.schema = Some(schema);
         }
         let schema = state.schema.clone().expect("schema set above");
-        self.ensure_table_writer(state, &schema).await
+        let creating = state.table.is_none();
+        self.ensure_table_writer(state, &schema).await?;
+        if creating {
+            // The created table names list elements as Delta does (`element`),
+            // not as the inferred schema did (`item`); encode against it.
+            let table = state.table.as_ref().expect("table set above");
+            let created = table
+                .snapshot()
+                .map_err(|e| FaucetError::Sink(format!("delta: table has no snapshot: {e}")))?
+                .snapshot()
+                .arrow_schema();
+            state.integral = Some(
+                faucet_common_delta::arrow_bridge::schema_from_delta(&created).map_err(
+                    |e| match e {
+                        FaucetError::Source(m) => FaucetError::Sink(m),
+                        other => other,
+                    },
+                )?,
+            );
+            state.schema = Some(created);
+        }
+        Ok(())
     }
 
     /// Establish the table + record-batch writer for an already-locked `schema`.

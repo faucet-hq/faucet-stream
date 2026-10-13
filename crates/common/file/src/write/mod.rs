@@ -4,9 +4,11 @@
 //!
 //! A sink maps its config onto a [`WriteConfig`], which gives it the
 //! [`WriteSettings`] and the output's [`NameTemplate`]; it builds a backend
-//! for its storage, wraps a [`FileWriter`] in a [`WriterSink`], and forwards
+//! for its storage, builds the one generic [`FileSink`] over it, and forwards
 //! its `Sink` impl with [`delegate_sink!`](crate::delegate_sink). The local
-//! `file` sink is exactly that over [`LocalBackend`].
+//! `file` sink is a `FileSink<LocalBackend>`; the S3, GCS, Azure Blob and
+//! SFTP sinks are `FileSink`s over the backends their stores' common crates
+//! implement (RFC 0013, #886).
 //!
 //! Every [`FileWriter`] method is `async`. Encoding runs on the calling task
 //! (moved off the async worker with `block_in_place` on a multi-thread
@@ -50,5 +52,5 @@ pub use remote::{
     BoxFuture, MultipartClient, MultipartUpload, ObjectClient, RemoteBackend, content_type,
     object_layout,
 };
-pub use sink::{SinkIdentity, WriterSink};
+pub use sink::{FileSink, SinkIdentity, WriterSink};
 pub use writer::{COMMIT_MARKER, FileWriter, SWAP_MARKER, WriteSettings};

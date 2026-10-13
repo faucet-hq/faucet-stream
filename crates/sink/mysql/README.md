@@ -441,6 +441,18 @@ Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (e
 
 Every sink operation runs through the pipeline's `CallContext` (#880) as one backend call named after the operation (`write_batch`, `write_batch_partial`, `write_batch_idempotent`, `last_committed_token`, the overwrite, schema, cleanup and rollback steps): the run's deadline ends it promptly and its transaction rolls back, `write_timeout_secs` still bounds it, and it counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The sink never retries a write itself; a `resilience:` policy retries a page only when the write is replay-safe (a keyed upsert).
 
+## Shared SQL layer
+
+This sink runs on [`faucet-common-sql`](../../common/sql/README.md)'s
+`SqlSinkEngine` with the `Mysql` dialect (RFC 0013, #884): column mapping
+(exact first, else ignoring ASCII case), the union column set of an append, one upsert per set of carried
+columns, page-ordered keyed groups with the rollback journal written first,
+statements chunked under the parameter limit, create-table and evolution DDL,
+the scoped-cleanup sequence, the commit-token write and the row report all come
+from the engine, so they behave the same here as in every other SQL sink. The
+sink supplies the connection (an executor over its driver) and keeps its own
+transactions, the unique-index check and the `RENAME TABLE` overwrite swap.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
@@ -494,3 +506,10 @@ unwrapped base64 (any length), `BIT` as its integer and `DECIMAL` as exact text,
 columns out, so a restore writes back exactly what was there. Rolling back an
 overwrite of a table with foreign keys or triggers puts the previous rows back
 in place rather than renaming.
+
+## Value fidelity
+
+A non-integer JSON number is bound as its shortest decimal text (`0.1`), which
+MySQL parses exactly into a `DECIMAL` (or a `DOUBLE`); a bound double would be
+converted from binary. Exact decimals from a source arrive as strings and are
+bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).

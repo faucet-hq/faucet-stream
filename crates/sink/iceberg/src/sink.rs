@@ -529,83 +529,42 @@ impl IcebergSink {
             action = action.set_snapshot_properties(props);
         }
 
-        let tx = match carried {
-            Some((scope, token)) => match tx
+        // Building the transaction fails locally, so its data files were
+        // uploaded but definitively never committed.
+        let prepared = match carried {
+            Some((scope, token)) => tx
                 .update_table_properties()
                 .set(token_property(&scope), token)
                 .apply(tx)
-            {
-                Ok(tx) => tx,
-                Err(e) => {
-                    maybe_cleanup_orphans(
-                        &self.calls,
-                        table.file_io(),
-                        &self.config.table,
-                        self.config.cleanup_orphans_on_failure,
-                        true,
-                        &file_paths,
-                    )
-                    .await;
-                    return Err(FaucetError::Sink(format!(
-                        "iceberg: recording the commit token as a table property failed: {e}"
-                    )));
-                }
-            },
-            None => tx,
+                .map_err(|e| format!("recording the commit token as a table property failed: {e}")),
+            None => Ok(tx),
+        }
+        .and_then(|tx| {
+            action
+                .apply(tx)
+                .map_err(|e| format!("fast_append apply failed: {e}"))
+        });
+        let outcome = match prepared {
+            Ok(tx) => commit_outcome(
+                tx.commit(self.catalog.as_ref())
+                    .within(&self.calls, "commit")
+                    .await,
+            ),
+            Err(e) => Err((FaucetError::Sink(format!("iceberg: {e}")), true)),
         };
-        let tx = match action.apply(tx) {
-            Ok(tx) => tx,
-            Err(e) => {
-                // Building the append failed locally — the data files were
-                // uploaded but definitively never committed.
+        let updated_table = match outcome {
+            Ok(updated_table) => updated_table,
+            Err((err, definite_loss)) => {
                 maybe_cleanup_orphans(
                     &self.calls,
                     table.file_io(),
                     &self.config.table,
                     self.config.cleanup_orphans_on_failure,
-                    true,
+                    definite_loss,
                     &file_paths,
                 )
                 .await;
-                return Err(FaucetError::Sink(format!(
-                    "iceberg: fast_append apply failed: {e}"
-                )));
-            }
-        };
-
-        let committed = tx
-            .commit(self.catalog.as_ref())
-            .within(&self.calls, "commit")
-            .await;
-        let updated_table = match committed {
-            Ok(Ok(updated_table)) => updated_table,
-            Err(spent) => {
-                // The commit may have landed: never clean up after it.
-                maybe_cleanup_orphans(
-                    &self.calls,
-                    table.file_io(),
-                    &self.config.table,
-                    self.config.cleanup_orphans_on_failure,
-                    false,
-                    &file_paths,
-                )
-                .await;
-                return Err(spent);
-            }
-            Ok(Err(e)) => {
-                maybe_cleanup_orphans(
-                    &self.calls,
-                    table.file_io(),
-                    &self.config.table,
-                    self.config.cleanup_orphans_on_failure,
-                    commit_failure_is_definite_loss(e.kind()),
-                    &file_paths,
-                )
-                .await;
-                return Err(FaucetError::Sink(format!(
-                    "iceberg: transaction commit failed ({}): {e}",
-                    e.kind()
-                )));
+                return Err(err);
             }
         };
 
@@ -613,6 +572,25 @@ impl IcebergSink {
         // metadata (snapshot ID, manifest list, etc.).
         state.table = Some(updated_table);
         Ok(())
+    }
+}
+
+/// A commit attempt's result, or the error to return with whether its data
+/// files are definitely orphaned. A spent call context is never a definite
+/// loss: the commit may have landed.
+fn commit_outcome<T>(
+    committed: Result<Result<T, iceberg::Error>, FaucetError>,
+) -> Result<T, (FaucetError, bool)> {
+    match committed {
+        Ok(Ok(table)) => Ok(table),
+        Err(spent) => Err((spent, false)),
+        Ok(Err(e)) => Err((
+            FaucetError::Sink(format!(
+                "iceberg: transaction commit failed ({}): {e}",
+                e.kind()
+            )),
+            commit_failure_is_definite_loss(e.kind()),
+        )),
     }
 }
 
@@ -1304,6 +1282,28 @@ mod tests {
         assert!(!commit_failure_is_definite_loss(
             ErrorKind::FeatureUnsupported
         ));
+    }
+
+    #[test]
+    fn commit_outcome_classifies_each_result() {
+        assert_eq!(commit_outcome::<u8>(Ok(Ok(7))).ok(), Some(7));
+        let (err, definite) = commit_outcome::<u8>(Err(FaucetError::Timeout {
+            operation: "commit call (deadline)".into(),
+            after: std::time::Duration::from_secs(1),
+        }))
+        .unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err:?}");
+        assert!(!definite, "a spent context may have landed the commit");
+        let (err, definite) = commit_outcome::<u8>(Ok(Err(iceberg::Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            "lost the race",
+        ))))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("transaction commit failed"),
+            "{err}"
+        );
+        assert!(definite);
     }
 
     /// Write `n` files via `io` under `dir`, returning their `file://` paths.

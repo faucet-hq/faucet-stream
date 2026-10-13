@@ -119,6 +119,16 @@ async fn oracle_logminer_cdc_end_to_end() {
     )
     .await;
     let source = OracleCdcSource::new(cfg(&conn)).await.expect("source");
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "oracle-cdc",
+        ),
+    ));
+    let caps = source.capabilities();
+    assert!(caps.reports_lag() && caps.table_routing());
     assert!(source.supports_exactly_once());
     assert_eq!(
         source.state_key().unwrap(),

@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-sql.workspace = true
 faucet-common-redshift.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -32,6 +33,7 @@ faucet-conformance = { workspace = true, features = ["containers"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

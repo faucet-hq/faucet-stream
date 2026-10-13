@@ -15,9 +15,11 @@ pub(crate) const SETTINGS: &[(&str, &str)] = &[
     ("default_format", "JSONCompactEachRowWithNamesAndTypes"),
     ("output_format_json_quote_64bit_integers", "1"),
     ("output_format_json_quote_decimals", "1"),
+    // A decimal at its declared scale (`1.50`, not `1.5`).
+    ("output_format_decimal_trailing_zeros", "1"),
     // RFC 3339 in UTC; the default `simple` format drops the zone offset.
     ("date_time_output_format", "iso"),
-    // NaN / ±Inf as `"nan"` / `"inf"` / `"-inf"` instead of `null`.
+    // NaN / ±Inf as `"nan"` / `"inf"` / `"-inf"`, read as a counted `null`.
     ("output_format_json_quote_denormals", "1"),
 ];
 
@@ -26,6 +28,9 @@ pub(crate) const SETTINGS: &[(&str, &str)] = &[
 enum Kind {
     /// `Int8`…`Int64` / `UInt8`…`UInt64`: an exact JSON number.
     Integer,
+    /// `Float32` / `Float64`: a number, or a non-finite word as a counted
+    /// `null` (#885).
+    Float,
     /// Everything else: the cell as ClickHouse rendered it.
     AsIs,
 }
@@ -45,6 +50,7 @@ fn kind_of(type_name: &str) -> Kind {
         "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" => {
             Kind::Integer
         }
+        "Float32" | "Float64" | "BFloat16" => Kind::Float,
         _ => Kind::AsIs,
     }
 }
@@ -56,6 +62,9 @@ fn cell(kind: Kind, v: Value) -> Value {
             .map(Value::from)
             .or_else(|_| s.parse::<u64>().map(Value::from))
             .unwrap_or(Value::String(s)),
+        (Kind::Float, Value::String(s)) => {
+            faucet_core::fidelity::number_text(&s).unwrap_or(Value::String(s))
+        }
         (_, v) => v,
     }
 }
@@ -108,7 +117,7 @@ impl CompactDecoder {
         if text.is_empty() {
             return Ok(None);
         }
-        let value: Value = serde_json::from_str(text).map_err(|e| {
+        let value: Value = faucet_core::fidelity::from_str(text).map_err(|e| {
             FaucetError::Source(format!("ClickHouse: failed to parse response line: {e}"))
         })?;
         match std::mem::replace(&mut self.state, State::Names) {
@@ -167,6 +176,21 @@ impl CompactDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_finite_floats_are_counted_nulls() {
+        assert_eq!(kind_of("Nullable(Float64)"), Kind::Float);
+        assert_eq!(cell(Kind::Float, Value::String("nan".into())), Value::Null);
+        assert_eq!(cell(Kind::Float, Value::String("-inf".into())), Value::Null);
+        assert_eq!(
+            cell(Kind::Float, serde_json::json!(1.5)),
+            serde_json::json!(1.5)
+        );
+        assert_eq!(
+            cell(Kind::Float, Value::String("x".into())),
+            serde_json::json!("x")
+        );
+    }
     use serde_json::json;
 
     fn decode(lines: &[&str]) -> Result<Vec<Value>, FaucetError> {

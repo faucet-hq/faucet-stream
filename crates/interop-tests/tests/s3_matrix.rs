@@ -13,9 +13,9 @@ mod remote_matrix;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::{Client, Config as S3Config};
-use faucet_core::{FaucetError, Sink};
+use faucet_core::{FaucetError, Sink, Source};
 use remote_matrix::{BoxFut, Remote, run_matrix};
-use serde_json::Value;
+use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
@@ -40,6 +40,14 @@ impl Remote for S3Remote {
         Box::pin(async move {
             let cfg = serde_json::from_value(cfg).map_err(FaucetError::Json)?;
             Ok(Box::new(faucet_sink_s3::S3Sink::new(cfg).await?) as Box<dyn Sink>)
+        })
+    }
+
+    fn source(&self, prefix: &str) -> BoxFut<'_, Result<Box<dyn Source>, FaucetError>> {
+        let cfg = self.config(prefix, json!({}));
+        Box::pin(async move {
+            let cfg = serde_json::from_value(cfg).map_err(FaucetError::Json)?;
+            Ok(Box::new(faucet_source_s3::S3Source::new(cfg).await?) as Box<dyn Source>)
         })
     }
 
@@ -115,13 +123,11 @@ async fn every_writable_format_takes_every_option_on_s3() {
         .send()
         .await
         .expect("bucket");
-    run_matrix(
-        S3Remote {
-            endpoint,
-            client,
-            _c: container,
-        },
-        true,
-    )
-    .await;
+    let remote = S3Remote {
+        endpoint,
+        client,
+        _c: container,
+    };
+    remote_matrix::assert_corpus_written(&remote).await;
+    run_matrix(remote, true).await;
 }

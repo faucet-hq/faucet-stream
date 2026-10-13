@@ -19,6 +19,8 @@ arrow = ["faucet-core/arrow"]
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-file = { workspace = true, features = ["file-format-parquet"] }
+faucet-common-s3.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,7 +31,7 @@ futures.workspace = true
 arrow.workspace = true
 arrow-json.workspace = true
 parquet = { workspace = true }
-object_store = { workspace = true, features = ["aws"] }
+object_store = { workspace = true }
 uuid.workspace = true
 url.workspace = true
 bytes.workspace = true
@@ -40,6 +42,9 @@ serde_json.workspace = true
 faucet-conformance.workspace = true
 schemars.workspace = true
 tempfile = "3"
+wiremock = "0.6"
+bytes.workspace = true
+faucet-core = { workspace = true, features = ["file-format-parquet"] }
 
 [package.metadata.docs.rs]
 all-features = true

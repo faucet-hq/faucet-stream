@@ -1,12 +1,16 @@
 //! `POST /v1/doctor` — validate + probe a submitted config WITHOUT running it.
 //! Reuses the same preflight as `doctor_first`: 200 with the report when all
-//! probes pass, 422 with the report as `details` when any fail.
+//! probes pass, 422 with the report as `details` when any fail. An adapter
+//! over [`crate::runtime::server::doctor`].
 
+use crate::runtime::Principal;
+use crate::runtime::server::Submission;
 use crate::serve::error::ServeError;
-use crate::serve::runner::{ConfigFormatWire, run_doctor_first};
+use crate::serve::rbac::AuthContext;
+use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -20,11 +24,15 @@ pub struct DoctorRequest {
 /// `POST /v1/doctor` → 200 report (all pass) / 422 report (any fail) / 400 (bad config).
 pub async fn doctor(
     State(state): State<ServerState>,
+    actor: Option<Extension<AuthContext>>,
     Json(req): Json<DoctorRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = state
-        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
-        .await?;
-    let report = run_doctor_first(&state, &loaded).await?;
-    Ok(Json(report))
+    let actor = actor
+        .map(|Extension(a)| a)
+        .unwrap_or_else(|| AuthContext::system("doctor"));
+    let principal = Principal::caller(&state, actor);
+    let sub = Submission::new(&req.config, req.config_format.into());
+    crate::runtime::server::doctor(&state, &principal, sub)
+        .await
+        .map(Json)
 }

@@ -1996,7 +1996,7 @@ impl RestStream {
         let (bytes, _headers) = self
             .job_request_bytes(op, method, url, headers, query, json)
             .await?;
-        serde_json::from_slice(&bytes)
+        faucet_core::fidelity::from_slice(&bytes)
             .map_err(|e| FaucetError::Source(format!("async_job: {url} returned non-JSON: {e}")))
     }
 
@@ -2280,7 +2280,7 @@ impl RestStream {
         }
         match self.config.response_format {
             crate::config::ResponseFormat::Json => {
-                let v: Value = serde_json::from_slice(bytes).map_err(|e| {
+                let v: Value = faucet_core::fidelity::from_slice(bytes).map_err(|e| {
                     FaucetError::Source(format!("async_job: result is not JSON: {e}"))
                 })?;
                 let records = match job.fetch.records_path.as_deref() {
@@ -2903,7 +2903,7 @@ impl RestStream {
         // extraction passes it straight through. `validate()` guarantees
         // pagination is `none`, so a single response is fetched.
         let body: Value = match self.config.response_format {
-            crate::config::ResponseFormat::Json => serde_json::from_slice(&bytes)?,
+            crate::config::ResponseFormat::Json => faucet_core::fidelity::from_slice(&bytes)?,
             crate::config::ResponseFormat::Csv => Value::Array(
                 crate::format::parse_csv_with_nulls(
                     &bytes,

@@ -551,6 +551,14 @@ impl Client {
         let bytes = self.bytes(resp).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
+
+    /// A JSON response body as a `Value` with exact numbers: a literal the
+    /// value would not spell again stays a string of its digits
+    /// ([`crate::fidelity::from_slice`]).
+    pub async fn json_value(&self, resp: Response) -> Result<serde_json::Value, FaucetError> {
+        let bytes = self.bytes(resp).await?;
+        Ok(crate::fidelity::from_slice(&bytes)?)
+    }
 }
 
 /// The request for the next redirect hop, or `None` when the hop is not

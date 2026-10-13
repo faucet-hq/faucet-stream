@@ -677,6 +677,49 @@ pub fn to_envelope(event: &Event, txn: &Committed, meta: &TableMeta) -> Value {
 mod tests {
     use super::*;
 
+    /// The value-fidelity corpus (#885): the wide row as the literals LogMiner
+    /// renders for each column family decodes back unchanged. An Oracle
+    /// `NUMBER` carries no scale in its value, so `1.50` reads as `1.5`; a
+    /// zero-length string is `NULL`; there is no negative zero.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let back = match v {
+                Value::Null => Value::Null,
+                Value::Bool(b) => {
+                    typed_text_to_json(if *b { "1" } else { "0" }, TypeFamily::Boolean)
+                }
+                Value::Number(n) if n.is_f64() => {
+                    typed_text_to_json(&n.to_string(), TypeFamily::BinaryFloat)
+                }
+                Value::Number(n) => typed_text_to_json(&n.to_string(), TypeFamily::Integer),
+                Value::String(s) if name.starts_with("canonical_decimal") => {
+                    typed_text_to_json(s, TypeFamily::Decimal)
+                }
+                Value::String(s) if name == "canonical_big_integer" => {
+                    typed_text_to_json(s, TypeFamily::Integer)
+                }
+                Value::String(s) => typed_text_to_json(s, TypeFamily::Text),
+                other => typed_text_to_json(&other.to_string(), TypeFamily::Json),
+            };
+            landed.insert(name.clone(), back);
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[Value::Object(landed)],
+            fidelity::Tolerance::exact()
+                .skipping("canonical_decimal_scale")
+                .skipping("floats_negative_zero"),
+        );
+        assert_eq!(
+            typed_text_to_json("1.50", TypeFamily::Decimal),
+            serde_json::json!(1.5)
+        );
+    }
+
     fn row(scn: u64, op: i64, xid: &str, redo: &str) -> LogRow {
         LogRow {
             scn,

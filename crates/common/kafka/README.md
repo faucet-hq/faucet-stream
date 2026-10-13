@@ -87,7 +87,7 @@ require the `schema-registry` feature.
 | `json` (default) | — | Parse bytes as a JSON document |
 | `raw_string` | — | UTF-8 string → `value` field |
 | `bytes` | — | Raw bytes passed through as a base64 string |
-| `confluent_avro` | `schema-registry` | Confluent wire envelope; writer schema fetched by id and cached; logical types map like the Avro file format (`decimal` → exact string, `bytes`/`fixed` → hex, temporals → ISO 8601) |
+| `confluent_avro` | `schema-registry` | Confluent wire envelope; writer schema fetched by id and cached; logical types map like the Avro file format (`decimal` → exact string, `bytes`/`fixed` → base64, temporals → ISO 8601) |
 | `confluent_protobuf` | `schema-registry` | Confluent wire envelope + single-message `.proto` compiled in-process; every field is emitted (proto3 defaults included) under its `.proto` name |
 | `confluent_json_schema` | `schema-registry` | Confluent wire envelope; optional `validate: true` checks decoded JSON against the schema |
 

@@ -1705,6 +1705,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn position_and_lag_name_a_failed_connect() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let config: MysqlCdcSourceConfig = serde_json::from_value(json!({
+            "connection_url": format!("mysql://repl:pass@127.0.0.1:{port}/db"),
+            "server_id": 1003
+        }))
+        .unwrap();
+        let source = MysqlCdcSource {
+            opts: build_opts(&config).unwrap(),
+            config,
+            state_key_value: "k".into(),
+            pending_bookmark: Mutex::new(None),
+            emitted: std::sync::Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+        };
+        source.set_call_context(faucet_core::CallContext::new());
+        source.set_roundtrip_recorder(std::sync::Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "mysql-cdc",
+            ),
+        ));
+        let caps = source.capabilities();
+        assert!(caps.reports_lag() && caps.table_routing());
+        let err = source
+            .capture_resume_position()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capture_position connect"), "{err}");
+        assert!(source.lag().await.unwrap().is_none());
+        source
+            .apply_start_bookmark(json!({"file": "binlog.000001", "pos": 4}))
+            .await
+            .unwrap();
+        let err = source.lag().await.unwrap_err().to_string();
+        assert!(err.contains("lag connect"), "{err}");
+    }
+
     // ── build_opts TLS ────────────────────────────────────────────────────────
 
     #[test]

@@ -54,7 +54,15 @@ pub async fn submit_run(
         return Err(ServeError::Forbidden(TENANT_RAW_CONFIG.to_string()));
     }
     runner::refuse_reserved_idempotency_key(req.idempotency_key.as_deref())?;
-    match runner::submit_gated(state, req, actor).await? {
+    let principal = crate::runtime::Principal::caller(&state, actor);
+    match crate::runtime::server::submit(
+        &state,
+        &principal,
+        req,
+        crate::runtime::server::Approval::Required,
+    )
+    .await?
+    {
         SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         // The server (or the caller) wants approval first (#703): the body
         // is the pending change request, not a run.
@@ -146,78 +154,19 @@ pub struct RunDetail {
 
 /// `POST /v1/runs/{id}/cancel` → 202 (cancel requested) / 200 (terminal no-op) / 404.
 /// In cluster mode, cancel is best-effort: the run may complete on its owning
-/// instance before that instance processes the flag.
+/// instance before that instance processes the flag. The runtime's `cancel`.
 pub async fn cancel_run(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ServeError> {
-    ensure_visible(&state, &actor, &id).await?;
-    // 1. A live local token (this instance is running/queued it) → cancel now.
-    if state.registry().cancel(&id) {
-        crate::serve::audit::write(&state, &actor, "run.cancel", Some(id.clone()), None, "ok")
-            .await;
-        return Ok(StatusCode::ACCEPTED);
-    }
-
-    // 2. Look up the record.
-    let rec = match state
-        .history()
-        .get(&id)
-        .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
-    {
-        Some(r) => r,
-        None => return Err(ServeError::NotFound),
-    };
-
-    if rec.status.is_terminal() {
-        return Ok(StatusCode::OK); // already done — no-op.
-    }
-
-    // 3. Cluster mode: the run is owned by another instance (or unclaimed).
-    if state.cluster().enabled() {
-        // Unclaimed (Pending) → cancel it directly.
-        if state
-            .history()
-            .cancel_pending(&id)
-            .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?
-        {
-            crate::serve::audit::write(&state, &actor, "run.cancel", Some(id.clone()), None, "ok")
-                .await;
-            // Terminal transition that bypasses `runner::finalize` entirely, so
-            // it must fire the completion callback itself (#481).
-            match state.history().get(&id).await {
-                Ok(Some(rec)) => crate::serve::callback::fire(&rec).await,
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %id,
-                    error = %e,
-                    "could not read cancelled run for its completion callback"
-                ),
-            }
-            return Ok(StatusCode::ACCEPTED);
-        }
-        // Otherwise it is running on a peer → flag it; the peer cancels on its
-        // next claim-loop tick.
-        state
-            .history()
-            .request_cancel(&id)
-            .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?;
-        if rec.status == crate::serve::history::RunStatus::Sharded {
-            crate::serve::runner::maybe_finalize_parent(&state, &id).await;
-        }
-        crate::serve::audit::write(&state, &actor, "run.cancel", Some(id.clone()), None, "ok")
-            .await;
-        return Ok(StatusCode::ACCEPTED);
-    }
-
-    // Single-instance, non-terminal, no local token: a transient race (the token
-    // was removed between the registry check and the history read as the run
-    // completes). Treat as a no-op — the run is finishing or just finished.
-    Ok(StatusCode::OK)
+    let principal = crate::runtime::Principal::caller(&state, actor);
+    Ok(
+        match crate::runtime::server::cancel(&state, &principal, &id).await? {
+            crate::runtime::server::CancelOutcome::Requested => StatusCode::ACCEPTED,
+            crate::runtime::server::CancelOutcome::Finished => StatusCode::OK,
+        },
+    )
 }
 
 /// `DELETE /v1/runs/{id}` → 204 / 404 / 409 (still running).
@@ -344,23 +293,6 @@ pub async fn list_runs(
     }))
 }
 
-/// The state-key prefix a serve run's markers live under: the config's
-/// `name` (else `serve`, as the runner names it), behind the tenant
-/// namespace for a tenant run.
-fn rollback_pipeline_name(loaded: &crate::serve::load::LoadedSubmission) -> String {
-    let base = loaded
-        .cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| "serve".to_string());
-    loaded
-        .tenant
-        .as_ref()
-        .map(|t| t.state_scope())
-        .unwrap_or_default()
-        .prefix(&base)
-}
-
 /// `POST /v1/runs/{id}/rollback` request body (#706).
 #[derive(Debug, Deserialize, Default)]
 pub struct RollbackRequest {
@@ -386,7 +318,8 @@ pub struct RollbackRequest {
 /// `POST /v1/runs/{id}/rollback` → 200 with the
 /// [`RollbackReport`](crate::rollback::RollbackReport) (`applied: false` +
 /// `conflicts > 0` means the rollback was refused because a later run changed
-/// the keys — pass `force`). Admin-only; audited as `run.rollback`.
+/// the keys — pass `force`). Admin-only; audited as `run.rollback`. The
+/// runtime's `rollback`.
 pub async fn rollback_run(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
@@ -394,126 +327,10 @@ pub async fn rollback_run(
     body: Option<Json<RollbackRequest>>,
 ) -> Result<Json<crate::rollback::RollbackReport>, ServeError> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    let rec = state
-        .history()
-        .get(&id)
+    let principal = crate::runtime::Principal::caller(&state, actor);
+    crate::runtime::server::rollback(&state, &principal, &id, req)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
-        .ok_or(ServeError::NotFound)?;
-    if !rec.status.is_terminal() {
-        return Err(ServeError::Conflict(format!(
-            "run {id} is {} — a run can only be rolled back once it has finished",
-            rec.status.as_str()
-        )));
-    }
-    // Which invocation: the caller's pick, else the only one.
-    let known: Vec<String> = rec
-        .invocations
-        .iter()
-        .filter_map(|i| i.run_id.clone())
-        .collect();
-    let invocation_id = match req.invocation_id {
-        Some(inv) => {
-            if !known.is_empty() && !known.contains(&inv) {
-                return Err(ServeError::BadConfig(format!(
-                    "invocation_id {inv} is not one of run {id}'s invocations ({})",
-                    known.join(", ")
-                )));
-            }
-            inv
-        }
-        None if known.len() == 1 => known[0].clone(),
-        None if known.is_empty() => {
-            return Err(ServeError::Unprocessable {
-                message: format!(
-                    "run {id} recorded no invocation ids (it predates rollback support, or \
-                     no pipeline ran); pass `invocation_id` explicitly"
-                ),
-                details: None,
-            });
-        }
-        None => {
-            return Err(ServeError::BadConfig(format!(
-                "run {id} has {} invocations — pass `invocation_id` (one of: {})",
-                known.len(),
-                known.join(", ")
-            )));
-        }
-    };
-    // Which config: the caller's, else the stored one (cluster mode).
-    let (config, format, origin) = match (req.config, rec.config_body.as_deref()) {
-        (Some(c), _) => (c, req.config_format.into(), state.caller_origin()),
-        (None, Some(stored)) => (
-            stored.to_string(),
-            rec.config_format.unwrap_or_default(),
-            crate::serve::runner::stored_origin(&rec),
-        ),
-        (None, None) => {
-            return Err(ServeError::Unprocessable {
-                message: format!(
-                    "run {id}'s config is not stored on this server; pass `config` (the \
-                     pipeline config the run was made with) in the request body"
-                ),
-                details: None,
-            });
-        }
-    };
-    // Load as the run was executed: under its tenant (connections, state
-    // namespace) when it had one (#789 SERVE-27).
-    let loaded =
-        crate::serve::runner::load_for(&state, &config, format, rec.tenant.as_deref(), origin)
-            .await?;
-    loaded.require_matrix()?;
-    if !req.dry_run {
-        crate::serve::runner::refuse_unapproved_write(&state, "run rollback")?;
-        crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;
-    }
-    let _permit = crate::serve::runner::inline_permit(&state)?;
-    let auth = loaded
-        .auth_catalog()
-        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
-    let pipeline_name = rollback_pipeline_name(&loaded);
-    let (node, store, marker) = crate::rollback::locate(
-        &loaded.nodes,
-        &pipeline_name,
-        &invocation_id,
-        req.row.as_deref(),
-    )
-    .await
-    .map_err(cli_to_serve)?;
-    let report = crate::rollback::rollback_node(
-        &node,
-        store,
-        marker,
-        &crate::rollback::RollbackInputs {
-            run_id: invocation_id,
-            row: req.row,
-            dry_run: req.dry_run,
-            force: req.force,
-            pipeline_name,
-            auth,
-        },
-    )
-    .await
-    .map_err(cli_to_serve)?;
-    let result = if req.dry_run {
-        "dry_run"
-    } else if report.outcome.applied {
-        "ok"
-    } else {
-        "blocked"
-    };
-    crate::serve::audit::write(&state, &actor, "run.rollback", Some(id), None, result).await;
-    Ok(Json(report))
-}
-
-/// Map a CLI-layer error to an HTTP-facing one: a bad config / missing run is
-/// a client error (400); anything else is internal (500).
-fn cli_to_serve(e: crate::error::CliError) -> ServeError {
-    match e {
-        crate::error::CliError::Config(m) => ServeError::BadConfig(m),
-        other => ServeError::Internal(other.to_string()),
-    }
+        .map(Json)
 }
 
 #[cfg(test)]

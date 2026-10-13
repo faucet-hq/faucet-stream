@@ -17,14 +17,6 @@ faucet-common-gcs.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-async-trait.workspace = true
-tracing.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
-google-cloud-storage.workspace = true
-google-cloud-gax.workspace = true
-futures.workspace = true
-bytes.workspace = true
-uuid.workspace = true
 # Arrow columnar path (opt-in `arrow` feature, RFC 0002 / #375): encode Arrow
 # `RecordBatch`es to Parquet objects for the row + columnar lanes. Optional so
 # default builds pull neither `parquet` nor `arrow`.

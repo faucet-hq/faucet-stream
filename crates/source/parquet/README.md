@@ -126,7 +126,7 @@ Each row becomes a `serde_json::Value::Object`. Field encoding is delegated to `
 
 | Arrow type | JSON shape |
 |---|---|
-| `Int32`/`Int64`/`Float32`/`Float64` | number (NaN / ±Infinity as the strings `"NaN"` / `"Infinity"` / `"-Infinity"`) |
+| `Int32`/`Int64`/`Float32`/`Float64` | number (NaN / ±Infinity as a `null` counted in the run summary (`non_finite`)) |
 | `Utf8`/`LargeUtf8` | string |
 | `Boolean` | `true`/`false` |
 | `Date32`/`Date64` | ISO-8601 date string |

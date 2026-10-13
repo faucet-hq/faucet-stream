@@ -221,7 +221,7 @@ impl faucet_core::Source for ElasticsearchSource {
                     let req = self.client.post(&url).json(&json!({"query": query}));
                     let resp = self.client.send(Self::apply_auth_value(req, &auth)).await?;
                     let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                    self.client.json(resp).await
+                    self.client.json_value(resp).await
                 })
                 .await?;
 
@@ -256,7 +256,7 @@ impl faucet_core::Source for ElasticsearchSource {
                             }));
                             let resp = self.client.send(Self::apply_auth_value(req, &auth)).await?;
                             let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                            self.client.json(resp).await
+                            self.client.json_value(resp).await
                         })
                         .await?;
 

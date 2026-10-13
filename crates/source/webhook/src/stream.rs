@@ -315,7 +315,7 @@ async fn webhook_handler(
         }
     }
 
-    let value = match serde_json::from_slice::<Value>(&body) {
+    let value = match faucet_core::fidelity::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
             // If the body is not valid JSON, wrap it as a string.

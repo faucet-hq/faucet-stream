@@ -84,18 +84,19 @@ pub fn decode_value(
             Ok(Value::Number(n.into()))
         }
         (TypeCode::Float64 | TypeCode::Float32, Kind::NumberValue(f)) => {
-            Ok(serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number))
+            Ok(faucet_core::fidelity::float64(*f))
         }
         // FLOAT64 NaN / Infinity / -Infinity arrive as strings; JSON has no
-        // representation for them, so keep the string form.
+        // representation for them, so they become a counted `null` (#885).
         (TypeCode::Float64 | TypeCode::Float32, Kind::StringValue(s)) => {
-            Ok(Value::String(s.clone()))
+            Ok(faucet_core::fidelity::number_text(s).unwrap_or_else(|_| Value::String(s.clone())))
         }
         (TypeCode::Bool, Kind::BoolValue(b)) => Ok(Value::Bool(*b)),
         // JSON columns carry their RFC 7159 text in a string value.
-        (TypeCode::Json, Kind::StringValue(s)) => serde_json::from_str(s).map_err(|e| {
-            RowError::CustomParseError(format!("{field_name}: invalid JSON column value: {e}"))
-        }),
+        (TypeCode::Json, Kind::StringValue(s)) => faucet_core::fidelity::parse_json(s.as_bytes())
+            .map_err(|e| {
+                RowError::CustomParseError(format!("{field_name}: invalid JSON column value: {e}"))
+            }),
         // Strings and every string-encoded scalar (timestamps, dates,
         // NUMERIC, base64 bytes, UUID, INTERVAL, PROTO) pass through.
         (_, Kind::StringValue(s)) => Ok(Value::String(s.clone())),
@@ -138,7 +139,7 @@ fn kind_to_json(kind: &Kind) -> Value {
     match kind {
         Kind::NullValue(_) => Value::Null,
         Kind::BoolValue(b) => Value::Bool(*b),
-        Kind::NumberValue(f) => serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number),
+        Kind::NumberValue(f) => faucet_core::fidelity::float64(*f),
         Kind::StringValue(s) => Value::String(s.clone()),
         Kind::ListValue(list) => Value::Array(
             list.values
@@ -242,7 +243,7 @@ mod tests {
                 "f"
             )
             .unwrap(),
-            json!("NaN")
+            Value::Null
         );
         assert_eq!(
             decode_value(&pv(Kind::BoolValue(true)), Some(&ty(TypeCode::Bool)), "b").unwrap(),

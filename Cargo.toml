@@ -12,6 +12,7 @@ members = [
     "crates/common/kafka",
     "crates/common/snowflake",
     "crates/common/mssql",
+    "crates/common/sql",
     "crates/common/kinesis",
     "crates/common/spanner",
     "crates/common/delta",
@@ -19,6 +20,7 @@ members = [
     "crates/common/pubsub",
     "crates/common/clickhouse",
     "crates/common/azure",
+    "crates/common/s3",
     "crates/source/rest",
     "crates/source/singer",
     "crates/common/singer",
@@ -151,6 +153,7 @@ faucet-common-kinesis = { path = "crates/common/kinesis", version = "1" }
 faucet-common-snowflake = { path = "crates/common/snowflake", version = "1" }
 faucet-common-spanner = { path = "crates/common/spanner", version = "1" }
 faucet-common-mssql = { path = "crates/common/mssql", version = "1" }
+faucet-common-sql = { path = "crates/common/sql", version = "1" }
 faucet-common-delta = { path = "crates/common/delta", version = "1" }
 faucet-source-rest = { path = "crates/source/rest", version = "1" }
 faucet-source-singer = { path = "crates/source/singer", version = "1" }
@@ -227,6 +230,7 @@ faucet-common-clickhouse = { path = "crates/common/clickhouse", version = "1" }
 faucet-source-clickhouse = { path = "crates/source/clickhouse", version = "1" }
 faucet-sink-clickhouse = { path = "crates/sink/clickhouse", version = "1" }
 faucet-common-azure = { path = "crates/common/azure", version = "1" }
+faucet-common-s3 = { path = "crates/common/s3", version = "1" }
 faucet-source-azure-blob = { path = "crates/source/azure-blob", version = "1" }
 faucet-sink-azure-blob = { path = "crates/sink/azure-blob", version = "1" }
 faucet-source-duckdb = { path = "crates/source/duckdb", version = "1" }

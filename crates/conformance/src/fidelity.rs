@@ -145,6 +145,16 @@ pub fn corpus() -> Vec<Value> {
             "null_val": Value::Null,
         }),
         json!({
+            ROW_KEY: "canonical",
+            // The canonical renderings of `faucet_core::fidelity`: an exact
+            // decimal and a big integer are strings, binary is base64. A
+            // connector that parses them back through a float corrupts them.
+            "decimal": "12345678901234567890.123456789",
+            "decimal_scale": "1.50",
+            "big_integer": "123456789012345678901234567890",
+            "binary": "AAEC/f7/",
+        }),
+        json!({
             ROW_KEY: "nested",
             "object": { "a": 1, "b": { "c": [1, 2, 3] } },
             "array": [1, "two", null, true],
@@ -173,6 +183,39 @@ pub fn flat_corpus() -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// Read every record `source` produces and assert it is the corpus — the
+/// one-sided source form, after the test seeded the backend with [`corpus`]
+/// (or, for a destination with one wide row, [`flat_corpus`]).
+pub async fn assert_corpus_read(source: &dyn faucet_core::Source, sent: &[Value], tol: Tolerance) {
+    let landed = source
+        .fetch_all()
+        .await
+        .unwrap_or_else(|e| panic!("reading the corpus back failed: {e}"));
+    assert_round_trip(sent, &landed, tol);
+}
+
+/// Write `sent` through `sink` (one page, then flush), read the destination
+/// back with `read_back`, and assert the corpus survived — the one-sided sink
+/// form.
+pub async fn assert_corpus_written<F, Fut>(
+    sink: &dyn faucet_core::Sink,
+    sent: &[Value],
+    read_back: F,
+    tol: Tolerance,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<Value>>,
+{
+    sink.write_batch(sent)
+        .await
+        .unwrap_or_else(|e| panic!("writing the corpus failed: {e}"));
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("flushing the corpus failed: {e}"));
+    let landed = read_back().await;
+    assert_round_trip(sent, &landed, tol);
 }
 
 /// One field that did not survive the trip.
@@ -464,6 +507,63 @@ mod tests {
             .map(|r| r.as_object().expect("object").len() - 1)
             .sum();
         assert_eq!(obj.len(), expected + 1, "plus the row key");
+    }
+
+    struct VecSource(Vec<Value>);
+
+    #[async_trait::async_trait]
+    impl faucet_core::Source for VecSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, faucet_core::FaucetError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct VecSink(std::sync::Mutex<Vec<Value>>);
+
+    #[async_trait::async_trait]
+    impl faucet_core::Sink for VecSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+            self.0.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn one_sided_helpers_compare_against_the_corpus() {
+        assert_corpus_read(&VecSource(corpus()), &corpus(), Tolerance::exact()).await;
+        let sink = VecSink::default();
+        assert_corpus_written(
+            &sink,
+            &corpus(),
+            || async { sink.0.lock().unwrap().clone() },
+            Tolerance::exact(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "round-trip fidelity lost")]
+    async fn a_lossy_source_fails_the_read_helper() {
+        let mut lossy = corpus();
+        lossy[0]["beyond_f64_exact"] = json!(9_007_199_254_740_992i64);
+        assert_corpus_read(&VecSource(lossy), &corpus(), Tolerance::exact()).await;
+    }
+
+    #[test]
+    fn the_corpus_carries_the_canonical_renderings() {
+        let canonical = corpus()
+            .into_iter()
+            .find(|r| r[ROW_KEY] == "canonical")
+            .expect("canonical row");
+        assert_eq!(
+            canonical["decimal"],
+            json!("12345678901234567890.123456789")
+        );
+        assert_eq!(canonical["binary"], json!("AAEC/f7/"));
     }
 
     #[test]

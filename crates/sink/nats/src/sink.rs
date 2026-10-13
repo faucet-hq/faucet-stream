@@ -102,7 +102,7 @@ impl NatsSink {
                             continue;
                         }
                     };
-                    let payload = Bytes::from(serde_json::to_vec(record)?);
+                    let payload = message_payload(record)?;
                     match &js {
                         Some(js) => match js.publish(subject, payload).await {
                             Ok(ack) => acks.push((base + i, ack)),
@@ -257,9 +257,27 @@ impl Sink for NatsSink {
     }
 }
 
+/// The message body for `record`: its JSON text.
+fn message_payload(record: &Value) -> Result<Bytes, serde_json::Error> {
+    serde_json::to_vec(record).map(Bytes::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record this sink encodes reads
+    /// back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes: Vec<u8> = message_payload(record).unwrap().to_vec();
+            landed.push(faucet_core::fidelity::from_slice(&bytes).unwrap());
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
 
     #[tokio::test]
     async fn an_operation_past_its_bound_is_a_typed_timeout() {

@@ -194,7 +194,7 @@ fn decode_bytes(
     for step in steps {
         match step {
             DecodeStep::Extract { extract } => {
-                let v: Value = serde_json::from_slice(&buf).map_err(|e| {
+                let v: Value = faucet_core::fidelity::from_slice(&buf).map_err(|e| {
                     FaucetError::Source(format!("decode `extract`: body is not JSON: {e}"))
                 })?;
                 let s = jsonpath_first_string(&v, extract).ok_or_else(|| {
@@ -342,7 +342,7 @@ async fn parse_records(
 ) -> Result<Vec<Value>, FaucetError> {
     match spec.format {
         ParseFormat::Json => {
-            let v: Value = serde_json::from_slice(bytes)
+            let v: Value = faucet_core::fidelity::from_slice(bytes)
                 .map_err(|e| FaucetError::Source(format!("decode `parse` json: {e}")))?;
             records_from_value(v, spec.records_path.as_deref())
         }

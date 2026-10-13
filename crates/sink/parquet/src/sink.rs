@@ -7,9 +7,11 @@ use crate::upload::AbortableUpload;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use faucet_common_file::write::{FileSink, SinkIdentity, WriteConfig};
+use faucet_common_s3::S3Backend;
 use faucet_core::FaucetError;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem};
+use object_store::{ObjectStore, local::LocalFileSystem};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::file::properties::WriterProperties;
 use serde_json::Value;
@@ -50,7 +52,12 @@ use crate::schema::infer_schema;
 )]
 pub struct ParquetSink {
     config: ParquetSinkConfig,
-    store: Arc<dyn ObjectStore>,
+    /// The local file system a `LocalPath` destination writes through, or
+    /// `None` for S3.
+    store: Option<Arc<dyn ObjectStore>>,
+    /// An S3 destination: the shared file sink over the S3 backend (RFC 0013,
+    /// #886), which every `Sink` method hands off to.
+    remote: Option<FileSink<S3Backend>>,
     /// The directory portion of a `LocalPath` destination (created on `new`),
     /// or `None` for S3.
     local_root: Option<PathBuf>,
@@ -139,12 +146,19 @@ impl ParquetSink {
             );
         }
 
-        let (store, local_root) = build_store(&config.destination).await?;
+        let (store, remote, local_root) = match &config.destination {
+            ParquetDestination::S3(s3) => (None, Some(build_remote(&config, s3).await?), None),
+            ParquetDestination::LocalPath { path } => {
+                let (store, root) = build_local_store(path).await?;
+                (Some(store), None, Some(root))
+            }
+        };
         let single_file = compute_single_file_mode(&config);
 
         Ok(Self {
             config,
             store,
+            remote,
             local_root,
             single_file,
             state: Mutex::new(WriterState::new()),
@@ -195,14 +209,15 @@ impl ParquetSink {
                 })?;
                 Ok((obj, Some(absolute)))
             }
-            ParquetDestination::S3(s3) => {
-                let key = format!("{}{}.parquet", s3.prefix, Uuid::new_v4());
-                let obj = ObjPath::parse(&key).map_err(|e| {
-                    FaucetError::Sink(format!("invalid s3 prefix/key '{key}': {e}"))
-                })?;
-                Ok((obj, None))
-            }
+            ParquetDestination::S3(_) => Err(s3_writes_through_the_backend()),
         }
+    }
+
+    /// The local file system of a `LocalPath` destination.
+    fn local_store(&self) -> Result<&Arc<dyn ObjectStore>, FaucetError> {
+        self.store
+            .as_ref()
+            .ok_or_else(s3_writes_through_the_backend)
     }
 
     fn writer_properties(&self) -> WriterProperties {
@@ -228,7 +243,7 @@ impl ParquetSink {
         {
             self.outputs.record_open_probing_with(local.clone(), true);
         }
-        let writer = AbortableUpload::new(self.store.clone(), obj_path);
+        let writer = AbortableUpload::new(self.local_store()?.clone(), obj_path);
         self.opened
             .store(true, std::sync::atomic::Ordering::Relaxed);
         AsyncArrowWriter::try_new(writer, schema, Some(self.writer_properties()))
@@ -506,16 +521,30 @@ fn sync_file_and_dir(path: &FsPath) -> Result<(), FaucetError> {
 #[async_trait]
 impl faucet_core::Sink for ParquetSink {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
+        match &self.remote {
+            Some(remote) => remote.batch_atomicity(),
+            None => self.config.batch_atomicity(),
+        }
     }
 
-    /// Derived, plus [`SchemaReport::DropsUnknownFields`](faucet_core::SchemaReport):
-    /// fields outside a file's schema are dropped with a warning.
+    /// Derived, plus [`SchemaReport::DropsUnknownFields`](faucet_core::SchemaReport)
+    /// for a local destination: fields outside a file's schema are dropped
+    /// with a warning. An S3 destination widens the schema instead.
     fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::of_sink(self)
-            .to_builder()
-            .schema_report(faucet_core::SchemaReport::DropsUnknownFields)
-            .build()
+        crate::descriptor::DESCRIPTOR
+            .capabilities(&serde_json::to_value(&self.config).unwrap_or(Value::Null))
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        if let Some(remote) = &self.remote {
+            remote.set_roundtrip_recorder(recorder);
+        }
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        if let Some(remote) = &self.remote {
+            remote.set_call_context(ctx);
+        }
     }
 
     fn connector_name(&self) -> &'static str {
@@ -540,6 +569,9 @@ impl faucet_core::Sink for ParquetSink {
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        if let Some(remote) = &self.remote {
+            return remote.write_batch(records).await;
+        }
         if records.is_empty() {
             return Ok(0);
         }
@@ -570,7 +602,7 @@ impl faucet_core::Sink for ParquetSink {
     /// `serde_json::Value` rows.
     #[cfg(feature = "arrow")]
     fn supports_columnar(&self) -> bool {
-        true
+        self.remote.as_ref().is_none_or(|r| r.supports_columnar())
     }
 
     /// Write an Arrow `RecordBatch` directly, bypassing the
@@ -584,6 +616,9 @@ impl faucet_core::Sink for ParquetSink {
         &self,
         batch: &arrow::record_batch::RecordBatch,
     ) -> Result<usize, FaucetError> {
+        if let Some(remote) = &self.remote {
+            return remote.write_batch_columnar(batch).await;
+        }
         if batch.num_rows() == 0 {
             return Ok(0);
         }
@@ -601,6 +636,9 @@ impl faucet_core::Sink for ParquetSink {
     /// opens a fresh file. Rows written after the last `flush()` are not
     /// persisted.
     async fn flush(&self) -> Result<(), FaucetError> {
+        if let Some(remote) = &self.remote {
+            return remote.flush().await;
+        }
         let mut state = self.state.lock().await;
         if self.single_file {
             self.publish(&mut state).await?;
@@ -619,11 +657,14 @@ impl faucet_core::Sink for ParquetSink {
     /// have nothing stale at a fixed name. Only reached after a successful,
     /// uncancelled run.
     async fn complete_run(&self) -> Result<(), FaucetError> {
+        if let Some(remote) = &self.remote {
+            return remote.complete_run().await;
+        }
         if !self.single_file || self.opened.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
         let (obj_path, _) = self.next_object_path()?;
-        match object_store::ObjectStoreExt::delete(&self.store, &obj_path).await {
+        match object_store::ObjectStoreExt::delete(self.local_store()?, &obj_path).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(FaucetError::Sink(format!(
                 "could not remove the previous run's parquet file: {e}"
@@ -636,22 +677,17 @@ impl faucet_core::Sink for ParquetSink {
     /// For a local destination, verifies the target's parent directory exists
     /// and is writable by creating and immediately removing a uniquely-named
     /// temp file there — never touching the user's actual output. For an S3
-    /// destination the probe is skipped: object-store targets are not probed by
-    /// the doctor.
+    /// destination it is the S3 backend's non-mutating `HeadBucket`.
     async fn check(
         &self,
-        _ctx: &faucet_core::check::CheckContext,
+        ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
-        let path = match &self.config.destination {
-            ParquetDestination::S3(_) => {
-                return Ok(CheckReport::single(Probe::skip(
-                    "io",
-                    "object-store target not probed by doctor",
-                )));
-            }
-            ParquetDestination::LocalPath { path } => path.clone(),
+        let path = match (&self.config.destination, &self.remote) {
+            (_, Some(remote)) => return remote.check(ctx).await,
+            (ParquetDestination::LocalPath { path }, None) => path.clone(),
+            (ParquetDestination::S3(_), None) => return Err(s3_writes_through_the_backend()),
         };
 
         // Guard against object-store URLs that slipped into a LocalPath
@@ -877,45 +913,102 @@ fn compute_single_file_mode(config: &ParquetSinkConfig) -> bool {
     }
 }
 
-async fn build_store(
-    destination: &ParquetDestination,
-) -> Result<(Arc<dyn ObjectStore>, Option<PathBuf>), FaucetError> {
-    match destination {
-        ParquetDestination::LocalPath { path } => {
-            let target = FsPath::new(path);
-            let parent = if target.extension().and_then(|e| e.to_str()) == Some("parquet") {
-                target.parent().map(|p| p.to_path_buf())
-            } else {
-                Some(target.to_path_buf())
-            }
-            .unwrap_or_else(|| PathBuf::from("."));
+async fn build_local_store(path: &str) -> Result<(Arc<dyn ObjectStore>, PathBuf), FaucetError> {
+    let target = FsPath::new(path);
+    let parent = if target.extension().and_then(|e| e.to_str()) == Some("parquet") {
+        target.parent().map(|p| p.to_path_buf())
+    } else {
+        Some(target.to_path_buf())
+    }
+    .unwrap_or_else(|| PathBuf::from("."));
 
-            tokio::fs::create_dir_all(&parent).await.map_err(|e| {
-                FaucetError::Sink(format!(
-                    "could not create directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
+    tokio::fs::create_dir_all(&parent).await.map_err(|e| {
+        FaucetError::Sink(format!(
+            "could not create directory {}: {e}",
+            parent.display()
+        ))
+    })?;
 
-            let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
-            Ok((store, Some(parent)))
-        }
-        ParquetDestination::S3(s3) => {
-            let mut builder = AmazonS3Builder::from_env().with_bucket_name(&s3.bucket);
-            if let Some(region) = &s3.region {
-                builder = builder.with_region(region);
-            }
-            if let Some(endpoint) = &s3.endpoint_url {
-                builder = builder.with_endpoint(endpoint);
-            }
-            if s3.allow_http {
-                builder = builder.with_allow_http(true);
-            }
-            let store = builder
-                .build()
-                .map_err(|e| FaucetError::Config(format!("could not build S3 client: {e}")))?;
-            Ok((Arc::new(store), None))
-        }
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    Ok((store, parent))
+}
+
+fn s3_writes_through_the_backend() -> FaucetError {
+    FaucetError::Sink("parquet sink: an S3 destination writes through the S3 backend".into())
+}
+
+/// The shared write settings of an S3 destination: uniquely named Parquet
+/// objects under `prefix`, one per `flush` or per rollover cap.
+pub(crate) fn s3_write_config(
+    config: &ParquetSinkConfig,
+    s3: &crate::config::ParquetS3Destination,
+) -> WriteConfig {
+    WriteConfig {
+        connector: "parquet sink",
+        path_field: "destination.path",
+        prefix: s3.prefix.clone(),
+        path: None,
+        file_extension: ".parquet".into(),
+        format: Some(faucet_core::FileFormat::Parquet),
+        parquet: faucet_common_file::write::ParquetOptions {
+            compression: Some(config.compression.as_codec()),
+            row_group_size: config.row_group_size,
+            schema: None,
+        },
+        max_records_per_file: config.max_rows_per_file,
+        max_bytes_per_file: config.max_bytes_per_file,
+        object_per_flush: true,
+        ..WriteConfig::default()
+    }
+}
+
+/// An S3 destination: a [`FileSink`] over an [`S3Backend`] (RFC 0013, #886).
+async fn build_remote(
+    config: &ParquetSinkConfig,
+    s3: &crate::config::ParquetS3Destination,
+) -> Result<FileSink<S3Backend>, FaucetError> {
+    if matches!(config.schema, Some(SchemaSource::Explicit {})) {
+        return Err(FaucetError::Config(
+            "explicit parquet schemas are not supported yet; use inferred".to_string(),
+        ));
+    }
+    let write = s3_write_config(config, s3);
+    let mut settings = write.settings()?;
+    settings.object_per_write = false;
+    let (base, template) = write.object_layout(&settings)?;
+    let client =
+        faucet_common_s3::build_client(s3.region.as_deref(), s3.endpoint_url.as_deref()).await;
+    let backend = S3Backend::builder(client, s3.bucket.clone())
+        .concurrency(S3_CONCURRENCY)
+        .build(base, &template)?;
+    let identity = ParquetS3Identity {
+        bucket: s3.bucket.clone(),
+        prefix: s3.prefix.clone(),
+    };
+    FileSink::build(settings, template, Arc::new(backend), identity)
+}
+
+/// Objects (and parts) an S3 destination uploads at once.
+const S3_CONCURRENCY: usize = 4;
+
+/// What an S3 destination supplies to the shared file sink.
+struct ParquetS3Identity {
+    bucket: String,
+    prefix: String,
+}
+
+impl SinkIdentity for ParquetS3Identity {
+    fn connector_name(&self) -> &'static str {
+        "parquet"
+    }
+
+    fn config_schema(&self) -> Value {
+        serde_json::to_value(faucet_core::schema_for!(ParquetSinkConfig))
+            .expect("schema serialization")
+    }
+
+    fn dataset_uri(&self) -> String {
+        format!("s3://{}/{}", self.bucket, self.prefix)
     }
 }
 

@@ -99,6 +99,49 @@ async fn append_replay_of_committed_rows_converges() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn writes_are_metered_on_the_installed_recorder() {
+    let (sink, _conn) = sink_for("em-metered", append_spec()).await;
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "spanner",
+        )
+        .with_meter(meter.clone()),
+    ));
+    sink.write_batch(&[json!({"id": 1, "v": "a"})])
+        .await
+        .expect("write");
+    let trips = meter.snapshot().sink_roundtrips;
+    assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
+}
+
+/// The check probe's query runs through the call context: a spent deadline
+/// fails the auth probe instead of reaching the database.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_fails_the_auth_probe_once_the_call_deadline_is_spent() {
+    let (sink, _conn) = sink_for("em-checkdl", append_spec()).await;
+    sink.set_call_context(
+        faucet_core::CallContext::new().with_deadline(tokio::time::Instant::now()),
+    );
+    let report = sink
+        .check(&faucet_core::check::CheckContext::default())
+        .await
+        .expect("check runs");
+    let auth = report
+        .probes
+        .iter()
+        .find(|p| p.name == "auth")
+        .expect("auth probe");
+    assert!(
+        matches!(auth.status, faucet_core::check::ProbeStatus::Fail { .. }),
+        "{report:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auto_created_table_takes_numbers_without_drift() {
     // Auto-created columns are STRING(MAX); numbers and booleans encode into
     // them, so the drift diff must not call them incompatible (SQL-112).

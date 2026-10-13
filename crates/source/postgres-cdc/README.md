@@ -18,7 +18,7 @@ Reach for it when you want to stream live mutations out of an operational Postgr
 - **Snapshot → CDC handoff** — implements `capture_resume_position()` so `faucet replicate` can bulk-snapshot a table and hand off to CDC with no gap and no duplicate.
 - **Crash-safe WAL feedback** — the advertised `confirmed_flush_lsn` advances *only* from a durably-persisted bookmark, so Postgres never recycles WAL for changes the consumer hasn't committed.
 - **TLS-capable** — `prefer` / `require` / `verify_ca` / `verify_full` modes for the replication connection (the default `from_url` honours the connection URL's `sslmode`).
-- **Type-aware decoding** — booleans, integers, floats (incl. `NaN`/`Infinity`), `numeric` (exact precision), `bytea` (base64), `json`/`jsonb`, and 1-D scalar arrays decode to native JSON; everything else is preserved as raw Postgres text.
+- **Type-aware decoding** — booleans, integers, floats (`NaN`/`Infinity` as a counted `null`), `numeric` and `money` (exact precision), `bytea` (base64), `json`/`jsonb`, and 1-D scalar arrays decode to native JSON; everything else is preserved as raw Postgres text.
 - **OOM and WAL safety valves** — `max_staged_records` bounds a single in-progress transaction; `idle_timeout`, `max_messages` and `max_cycle_duration` (default 5 minutes, so a cycle ends even under steady writes) bound a fetch cycle.
 
 ## Installation
@@ -188,8 +188,10 @@ Values arrive in Postgres text form and are decoded by column type OID:
 | `bool` | `true` / `false` |
 | `int2` / `int4` / `int8` | number |
 | `float4` / `float8` (finite) | number |
-| `float4` / `float8` `NaN` / `±Infinity` | `"NaN"` / `"Infinity"` / `"-Infinity"` (string, to stay distinct from a SQL `NULL` → `null`) |
-| `numeric` | string (exact precision) |
+| `float4` / `float8` `NaN` / `±Infinity` | a `null` counted in the run summary (`non_finite`) |
+| `numeric` | string (exact precision; `NaN` / `±Infinity` a counted `null`) |
+| `money` | string, the exact amount (`"1234.50"`), whatever the server's `lc_monetary` locale |
+| `json` / `jsonb` | the document, a number a JSON value cannot hold exactly kept as a string of its digits |
 | `bytea` | base64 string |
 | `json` / `jsonb` | parsed JSON value |
 | 1-D arrays of the above scalar types (`int4[]`, `text[]`, `uuid[]`, …) | JSON array, decoded element-by-element (`NULL` elements → `null`) |

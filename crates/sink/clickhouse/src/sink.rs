@@ -3,6 +3,8 @@
 
 use async_trait::async_trait;
 use faucet_common_clickhouse::{apply_auth, build_json_each_row, query_params};
+use faucet_common_sql::dialects::ClickHouse;
+use faucet_common_sql::{SqlDialect, TableTarget};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use faucet_core::{FaucetError, Sink};
@@ -39,51 +41,29 @@ pub struct ClickHouseSink {
 }
 
 /// Quote a (possibly schema-qualified) table name. Each `.`-separated segment
-/// is quoted with [`faucet_common_clickhouse::quote_ident`] so `db.table`
-/// becomes `"db"."table"` — safe against identifier injection while preserving
-/// the database/table split.
+/// is quoted with the dialect's backslash-escaping identifier quoting, so
+/// `db.table` becomes `"db"."table"` — safe against identifier injection while
+/// preserving the database/table split.
 fn quote_table(table: &str) -> String {
-    table
-        .split('.')
-        .map(faucet_common_clickhouse::quote_ident)
-        .collect::<Vec<_>>()
-        .join(".")
+    faucet_common_sql::dialects::clickhouse::quote_table(table)
 }
 
-/// Map a [`faucet_core::SqlBaseType`] to the ClickHouse column type used when
-/// auto-creating a table (#580).
-///
-/// Every column is `Nullable(…)`: ClickHouse rejects a null into a
-/// non-nullable column, so a type inferred from page 1 that happened to have
-/// no nulls would fail page 2 the first time a field is absent. `String` is
-/// the landing type for nested values, matching the `JSONEachRow` body the
-/// writer sends.
-fn clickhouse_type(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "Nullable(Int64)",
-        Double => "Nullable(Float64)",
-        Boolean => "Nullable(Bool)",
-        Text | Json => "Nullable(String)",
-    }
+/// The engine target of `table`.
+fn target(table: &str) -> TableTarget {
+    TableTarget::new(table, quote_table(table))
 }
 
 /// `CREATE TABLE IF NOT EXISTS … ENGINE = MergeTree ORDER BY tuple()` (#580).
 ///
-/// `ORDER BY tuple()` is the neutral sort key — faucet has no basis to pick
-/// one, and guessing wrong bakes a bad primary index into the table. An
-/// operator who cares about the sort key defines the table and sets
+/// Every column is `Nullable(…)` (ClickHouse rejects a null into a
+/// non-nullable column); `ORDER BY tuple()` is the neutral sort key — faucet
+/// has no basis to pick one, and guessing wrong bakes a bad primary index into
+/// the table. An operator who cares defines the table and sets
 /// `create_table: false`.
 fn build_create_table_sql(table: &str, columns: &[faucet_core::PlannedColumn]) -> String {
-    let cols = faucet_core::render_columns(
-        columns,
-        faucet_common_clickhouse::quote_ident,
-        clickhouse_type,
-    );
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} ({cols}) ENGINE = MergeTree ORDER BY tuple()",
-        quote_table(table)
-    )
+    ClickHouse
+        .create_table_sql(&target(table), columns, &[])
+        .expect("clickhouse CREATE TABLE")
 }
 
 /// Build the `INSERT … FORMAT JSONEachRow` statement (carried in the `query`
@@ -180,15 +160,9 @@ fn missing_fields(records: &[Value], known: &std::collections::HashSet<String>) 
 /// `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for a field first seen after the
 /// table existed, typed like an auto-created column.
 fn add_column_sql(table: &str, column: &faucet_core::PlannedColumn) -> String {
-    let def = faucet_core::render_columns(
-        std::slice::from_ref(column),
-        faucet_common_clickhouse::quote_ident,
-        clickhouse_type,
-    );
-    format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {def}",
-        quote_table(table)
-    )
+    ClickHouse
+        .add_column_sql(&target(table), &column.name, column.base_type)
+        .expect("clickhouse ADD COLUMN")
 }
 
 impl ClickHouseSink {

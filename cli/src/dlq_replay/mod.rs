@@ -16,7 +16,7 @@ pub mod reader;
 use crate::auth_catalog::AuthCatalog;
 use crate::config::{ExecutionSpec, PipelineConfig};
 use crate::error::{CliError, CliResult};
-use crate::executor::{ExecuteOptions, run_expanded};
+use crate::executor::ExecuteOptions;
 use chrono::{DateTime, FixedOffset};
 use faucet_core::UnwrappedEnvelope;
 use plan::{build_replay_node, default_failed_dlq_path, validate_reason};
@@ -221,7 +221,7 @@ pub async fn replay(
         Some(spec) => Some(spec.to_policy()?),
         None => None,
     };
-    let summary = run_expanded(
+    let summary = crate::runtime::run_local(
         vec![node],
         ExecuteOptions {
             legacy_state_writes: false,

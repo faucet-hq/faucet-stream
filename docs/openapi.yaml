@@ -2846,7 +2846,8 @@ components:
         DLQ) or `dropped` (a poison-pill `drop` action). `unaccounted` rows were
         lost by a sink without saying so; any non-zero value failed the run.
         `transform_in` / `transform_out` count the transform chain's input and
-        output.
+        output. `non_finite` counts values (not rows) with no JSON rendering —
+        `NaN`, `±Infinity` — the source wrote as `null` (#885).
       properties:
         transform_in: { type: integer }
         transform_out: { type: integer }
@@ -2858,6 +2859,7 @@ components:
         quarantined: { type: integer }
         dropped: { type: integer }
         unaccounted: { type: integer }
+        non_finite: { type: integer }
     InvocationRecord:
       type: object
       properties:

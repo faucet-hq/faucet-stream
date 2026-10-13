@@ -497,7 +497,8 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
                 .into(),
         ));
     }
-    let report = plan_node(
+    let report = crate::runtime::local::plan(
+        &crate::runtime::Principal::local(),
         &cfg,
         node,
         &auth,

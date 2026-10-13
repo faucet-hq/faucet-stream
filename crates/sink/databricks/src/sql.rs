@@ -8,6 +8,9 @@
 
 use std::ops::Range;
 
+use faucet_common_sql::SqlDialect;
+use faucet_common_sql::dialects::Databricks;
+
 use faucet_core::drift::{SchemaEvolution, SqlBaseType, adds_null, base_widened};
 use faucet_core::idempotency::{
     COMMIT_TOKEN_SCOPE_COL, COMMIT_TOKEN_TABLE, COMMIT_TOKEN_TOKEN_COL,
@@ -105,24 +108,14 @@ impl TableRef {
 
 /// Backtick-quote an identifier (a backtick inside is doubled).
 pub fn quote_ident(s: &str) -> String {
-    format!("`{}`", s.replace('`', "``"))
+    Databricks.quote_ident(s)
 }
 
 /// A Databricks SQL string literal. Databricks processes backslash escapes
 /// inside literals (and treats `''` as two adjacent literals, not an escaped
 /// quote), so both `\` and `'` are backslash-escaped.
 pub fn string_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
+    Databricks.quote_literal(s)
 }
 
 /// The string cell a JSON value travels as (`None` = SQL NULL). Nested values
@@ -175,12 +168,7 @@ pub fn cast_expr(expr: &str, full_type: &str) -> String {
 
 /// Databricks type keyword for a planned / evolved column.
 pub fn base_type_sql(t: SqlBaseType) -> &'static str {
-    match t {
-        SqlBaseType::Integer => "BIGINT",
-        SqlBaseType::Double => "DOUBLE",
-        SqlBaseType::Boolean => "BOOLEAN",
-        SqlBaseType::Text | SqlBaseType::Json => "STRING",
-    }
+    Databricks.type_name(t)
 }
 
 /// `CREATE TABLE IF NOT EXISTS … USING DELTA` from planned columns, plus the
@@ -1122,6 +1110,35 @@ pub fn plan_evolution(
 mod tests {
     use super::*;
     use faucet_core::drift::ColumnChange;
+
+    /// The value-fidelity corpus (#885): every cell this sink sends, read back
+    /// by the column type it was sent for, is the value it came from.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let ty = match v {
+                serde_json::Value::String(_) => "STRING",
+                serde_json::Value::Bool(_) => "BOOLEAN",
+                serde_json::Value::Number(n) if n.is_f64() => "DOUBLE",
+                serde_json::Value::Number(_) => "BIGINT",
+                _ => "VARIANT",
+            };
+            let back = match (cell_text_for(v, ty), ty) {
+                (None, _) => serde_json::Value::Null,
+                (Some(text), "STRING") => serde_json::Value::String(text),
+                (Some(text), _) => faucet_core::fidelity::from_str(&text).unwrap(),
+            };
+            landed.insert(name.clone(), back);
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[serde_json::Value::Object(landed)],
+            fidelity::Tolerance::exact(),
+        );
+    }
 
     fn t() -> TableRef {
         TableRef::new(Some("main"), "sales", "orders")

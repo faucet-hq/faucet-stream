@@ -1,19 +1,21 @@
 //! Pure helpers for turning JSON records into MSSQL `INSERT` statements and
 //! bound parameters. No I/O — all unit-testable.
 
-use faucet_common_mssql::{PARAM_LIMIT, quote_ident_mssql};
+#[cfg(test)]
+use faucet_common_mssql::PARAM_LIMIT;
+use faucet_common_sql::dialects::Mssql;
+use faucet_common_sql::mapping::fold_record;
+use faucet_common_sql::{SqlDialect, TableTarget};
 use faucet_core::FaucetError;
 use serde_json::Value;
 use tiberius::ToSql;
 
-use crate::coltype::placeholder;
 use crate::config::OnUnknownField;
 
 /// An owned bind parameter, so the `&dyn ToSql` slice handed to `tiberius`
 /// borrows from a value that outlives the call.
 pub(crate) enum BoundParam {
     I64(i64),
-    F64(f64),
     Bool(bool),
     Str(String),
     /// A NULL bound as `nvarchar`, which converts to every non-binary type
@@ -35,7 +37,9 @@ impl BoundParam {
                 // the value.
                 Err(_) => BoundParam::Str(n.as_u64().unwrap().to_string()),
             },
-            Value::Number(n) => BoundParam::F64(n.as_f64().unwrap_or(0.0)),
+            // Its shortest text: SQL Server parses that exactly into a DECIMAL
+            // or a float, where a bound float converts from binary (#885).
+            Value::Number(n) => BoundParam::Str(n.to_string()),
             Value::Bool(b) => BoundParam::Bool(*b),
             Value::Null => BoundParam::Null(None),
             // Arrays/objects are serialized; for a json_column this is the whole
@@ -55,7 +59,6 @@ impl BoundParam {
     pub(crate) fn as_tosql(&self) -> &dyn ToSql {
         match self {
             BoundParam::I64(v) => v,
-            BoundParam::F64(v) => v,
             BoundParam::Bool(v) => v,
             BoundParam::Str(v) => v,
             BoundParam::Null(v) => v,
@@ -63,38 +66,17 @@ impl BoundParam {
         }
     }
 }
-
 /// `tiberius` routes parameterized statements through `sp_executesql`, which
-/// consumes two of the 2100 parameters itself (the statement text and the
-/// parameter-declaration string). So the usable budget for bind values is
-/// `PARAM_LIMIT - 2` — sending a full 2100 bind values overflows by two.
-const SP_EXECUTESQL_RESERVED: usize = 2;
-
-/// MSSQL's table value constructor (the `VALUES (…), (…), …` clause) allows at
-/// most 1000 row expressions per statement — a separate limit from the 2100
-/// parameters. For narrow tables (1–2 columns) this binds before the parameter
-/// budget does.
-const MAX_VALUES_ROWS: usize = 1000;
+/// consumes two of the 2100 parameters itself; and a `VALUES` constructor
+/// allows at most 1000 row expressions.
+#[cfg(test)]
+use faucet_common_sql::dialects::mssql::{MAX_VALUES_ROWS, SP_EXECUTESQL_RESERVED};
 
 /// Maximum rows per `INSERT` so the request stays within **both** of MSSQL's
 /// limits: the 2100-parameter cap (minus the `sp_executesql` overhead) and the
 /// 1000-row-values cap on a `VALUES` clause. Always at least 1.
 pub(crate) fn max_rows_per_insert(num_cols: usize) -> usize {
-    if num_cols == 0 {
-        return 1;
-    }
-    let by_params = (PARAM_LIMIT.saturating_sub(SP_EXECUTESQL_RESERVED) / num_cols).max(1);
-    by_params.min(MAX_VALUES_ROWS)
-}
-
-/// One `VALUES` row group of `width` placeholders starting at `@P{start}`, each
-/// wrapped in its column's `CAST` target when `casts` names one. `casts` is
-/// either empty (no casts) or one entry per column.
-fn row_group(start: usize, width: usize, casts: &[Option<String>]) -> String {
-    let phs: Vec<String> = (0..width)
-        .map(|i| placeholder(start + i, casts.get(i).and_then(|c| c.as_deref())))
-        .collect();
-    format!("({})", phs.join(", "))
+    Mssql.rows_per_statement(num_cols)
 }
 
 /// Build a multi-row `INSERT` with `@P`-numbered placeholders:
@@ -111,15 +93,11 @@ pub(crate) fn build_insert_sql_cast(
     casts: &[Option<String>],
     num_rows: usize,
 ) -> String {
-    let num_cols = cols_quoted.len();
-    let tuples: Vec<String> = (0..num_rows)
-        .map(|row| row_group(row * num_cols + 1, num_cols, casts))
-        .collect();
     format!(
         "INSERT INTO {} ({}) VALUES {}",
         table_quoted,
         cols_quoted.join(", "),
-        tuples.join(", ")
+        Mssql.values_sql(cols_quoted.len(), &cast_refs(casts), num_rows, 0)
     )
 }
 
@@ -130,28 +108,12 @@ pub(crate) fn build_insert_sql_cast(
 pub(crate) fn fold_to_columns(insertable: &[String], records: &[Value]) -> Vec<Value> {
     records
         .iter()
-        .map(|r| {
-            let Some(obj) = r.as_object() else {
-                return r.clone();
-            };
-            let mut out = serde_json::Map::with_capacity(obj.len());
-            for (key, value) in obj {
-                let column = if insertable.iter().any(|c| c == key) {
-                    key.clone()
-                } else {
-                    let mut folded = insertable.iter().filter(|c| c.eq_ignore_ascii_case(key));
-                    match (folded.next(), folded.next()) {
-                        (Some(c), None) if !obj.contains_key(c.as_str()) => c.clone(),
-                        _ => key.clone(),
-                    }
-                };
-                out.insert(column, value.clone());
-            }
-            Value::Object(out)
+        .map(|r| match r.as_object() {
+            Some(obj) => Value::Object(fold_record(insertable, obj)),
+            None => r.clone(),
         })
         .collect()
 }
-
 /// Indices of the object records in `records` with no field naming a writable
 /// column: writing one would insert an all-`NULL` row, or nothing at all.
 pub(crate) fn unmatched_rows(insertable: &[String], records: &[Value]) -> Vec<usize> {
@@ -232,20 +194,21 @@ pub(crate) fn resolve_insert_columns(
     Ok(columns)
 }
 
-/// Build a parameterized `MERGE` upsert. `table` must already be quoted; the
-/// `key` / `cols` entries are bare identifiers that this function quotes via
-/// [`quote_ident_mssql`].
+/// The `CAST` targets as the dialect takes them.
+fn cast_refs(casts: &[Option<String>]) -> Vec<Option<&str>> {
+    casts.iter().map(|c| c.as_deref()).collect()
+}
+
+/// Build a parameterized `MERGE` upsert (the dialect's keyed upsert). `table`
+/// must already be quoted; the `key` / `cols` entries are bare identifiers.
 ///
 /// Emits `n_rows` `VALUES` groups of `cols.len()` `@PN` params each, numbered
 /// row-major so the binding order matches `n_rows` calls of
 /// [`auto_row_params_typed(record, cols, …)`](auto_row_params_typed) concatenated in record
-/// order. Joins on every `key` column, `UPDATE`s the non-key columns, and
-/// `INSERT`s all columns. When every column is a key there is nothing to
-/// update, so the `WHEN MATCHED` clause is omitted entirely. T-SQL requires a
-/// terminating `;` on `MERGE`, so one is always appended.
-///
-/// Each placeholder is cast to its column's type (SQL-38, SQL-39); `casts` is
-/// empty or one entry per `cols` entry.
+/// order. Joins on every `key` column, `UPDATE`s the non-key columns (no
+/// `WHEN MATCHED` when every column is a key), `INSERT`s all columns, and ends
+/// with the `;` T-SQL requires. Each placeholder is cast to its column's type
+/// (SQL-38, SQL-39); `casts` is empty or one entry per `cols` entry.
 pub(crate) fn build_merge_cast(
     table: &str,
     key: &[String],
@@ -253,228 +216,68 @@ pub(crate) fn build_merge_cast(
     casts: &[Option<String>],
     n_rows: usize,
 ) -> Result<String, FaucetError> {
-    let q = |s: &str| quote_ident_mssql(s);
-    let quoted_cols: Vec<String> = cols.iter().map(|c| q(c)).collect::<Result<_, _>>()?;
-    let quoted_keys: Vec<String> = key.iter().map(|k| q(k)).collect::<Result<_, _>>()?;
-    let col_list = quoted_cols.join(", ");
-
-    let groups: Vec<String> = (0..n_rows)
-        .map(|row| row_group(row * cols.len() + 1, cols.len(), casts))
-        .collect();
-
-    let on = quoted_keys
-        .iter()
-        .map(|qk| format!("tgt.{qk} = src.{qk}"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-
-    // Non-key columns get UPDATE assignments; compare on the *bare* names so a
-    // column equal to a key column (after quoting) is correctly excluded.
-    let update_set = cols
-        .iter()
-        .zip(&quoted_cols)
-        .filter(|(c, _)| !key.iter().any(|k| k == *c))
-        .map(|(_, qc)| format!("tgt.{qc} = src.{qc}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let insert_vals = quoted_cols
-        .iter()
-        .map(|qc| format!("src.{qc}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let matched = if update_set.is_empty() {
-        String::new()
-    } else {
-        format!(" WHEN MATCHED THEN UPDATE SET {update_set}")
-    };
-
-    Ok(format!(
-        "MERGE {table} AS tgt USING (VALUES {}) AS src ({col_list}) ON {on}{matched} \
-         WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({insert_vals});",
-        groups.join(", ")
-    ))
+    Mssql.upsert_sql(table, key, cols, &cast_refs(casts), n_rows)
 }
 
 /// Build a parameterized `MERGE … WHEN MATCHED THEN DELETE` for composite-key
-/// deletes. `table` must already be quoted; `key` entries are bare identifiers
-/// quoted here.
-///
-/// T-SQL has no row-constructor `IN ((a,b), …)`, so a composite-key delete is
-/// expressed as a `MERGE` whose source is the `VALUES` list of key tuples.
-/// Params are numbered row-major over the key columns, matching how the caller
-/// binds each [`KeyTuple`](faucet_core::KeyTuple)'s values in `key` order.
-///
-/// Each key placeholder is cast to its column's type when `casts` names one.
+/// deletes (T-SQL has no row-constructor `IN ((a,b), …)`). Params are numbered
+/// row-major over the key columns, matching how the caller binds each
+/// [`KeyTuple`](faucet_core::KeyTuple)'s values in `key` order.
 pub(crate) fn build_merge_delete_cast(
     table: &str,
     key: &[String],
     casts: &[Option<String>],
     n_rows: usize,
 ) -> Result<String, FaucetError> {
-    let quoted_keys: Vec<String> = key
-        .iter()
-        .map(|k| quote_ident_mssql(k))
-        .collect::<Result<_, _>>()?;
-    let key_list = quoted_keys.join(", ");
-
-    let groups: Vec<String> = (0..n_rows)
-        .map(|row| row_group(row * key.len() + 1, key.len(), casts))
-        .collect();
-
-    let on = quoted_keys
-        .iter()
-        .map(|qk| format!("tgt.{qk} = src.{qk}"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-
-    Ok(format!(
-        "MERGE {table} AS tgt USING (VALUES {}) AS src ({key_list}) ON {on} \
-         WHEN MATCHED THEN DELETE;",
-        groups.join(", ")
-    ))
+    Mssql.delete_keys_sql(table, key, &cast_refs(casts), n_rows)
 }
 
-/// Session-scoped temp table holding the key tuples one invocation wrote, used
-/// by scoped cleanup (#478).
-///
-/// The `#` prefix scopes it to the connection's session, so two pipelines
-/// cleaning up concurrently on different pooled connections cannot collide on
-/// the name. It is a fixed constant — no user input reaches it — so it is
-/// interpolated bare rather than through [`quote_ident_mssql`].
-pub(crate) const CLEANUP_TEMP_TABLE: &str = "#faucet_cleanup_keys";
+/// The engine target for an already-quoted table.
+fn quoted_target(table_quoted: &str) -> TableTarget {
+    TableTarget::new(table_quoted, table_quoted)
+}
 
-/// Drop a leftover [`CLEANUP_TEMP_TABLE`] if one exists.
-///
-/// A pooled connection outlives a single cleanup and a `#temp` table lives for
-/// the whole session, so a previous cleanup on the same connection can still own
-/// the name. `DROP TABLE IF EXISTS` is SQL Server 2016+, so the older
-/// `OBJECT_ID(N'tempdb..#…')` guard is used instead for wider server support.
+/// Drop a leftover the session-scoped `#faucet_cleanup_keys` table if one exists (the `OBJECT_ID`
+/// guard works on servers older than 2016).
 pub(crate) fn build_cleanup_temp_drop_sql() -> String {
-    format!(
-        "IF OBJECT_ID(N'tempdb..{CLEANUP_TEMP_TABLE}') IS NOT NULL DROP TABLE {CLEANUP_TEMP_TABLE}"
-    )
+    Mssql
+        .cleanup_drop_sql()
+        .expect("the mssql dialect drops its cleanup table")
 }
 
-/// Create [`CLEANUP_TEMP_TABLE`] with the *exact* column types of the target
-/// table's `key` columns.
-///
-/// `SELECT … INTO` copies each column's full declared type (length, precision,
-/// scale, collation), which reconstructing a `CREATE TABLE` from `sys.columns`
-/// would have to re-derive — and getting e.g. `nvarchar` length wrong would
-/// silently truncate a key and delete the wrong rows. `WHERE 1 = 0` means no row
-/// is ever read.
-///
-/// The `UNION ALL` derived table is load-bearing, not decoration: a plain
-/// `SELECT … INTO` **inherits the IDENTITY property** of a source column, and
-/// inserting into an identity column then fails without `IDENTITY_INSERT`. A
-/// column produced by a `UNION` never inherits it.
-///
-/// `table_quoted` must already be quoted; `key` entries are bare identifiers
-/// quoted here.
+/// Create the session-scoped `#faucet_cleanup_keys` table with the *exact* column types of the target
+/// table's `key` columns (`SELECT … INTO`; the `UNION ALL` keeps an
+/// `IDENTITY` property from being inherited).
 pub(crate) fn build_cleanup_temp_create_sql(
     table_quoted: &str,
     key: &[String],
 ) -> Result<String, FaucetError> {
-    if key.is_empty() {
-        return Err(FaucetError::Sink(
-            "cleanup: requires a non-empty `key` to build the written-key set".into(),
-        ));
-    }
-    let quoted_keys: Vec<String> = key
-        .iter()
-        .map(|k| quote_ident_mssql(k))
-        .collect::<Result<_, _>>()?;
-    let key_list = quoted_keys.join(", ");
-    Ok(format!(
-        "SELECT {key_list} INTO {CLEANUP_TEMP_TABLE} FROM \
-         (SELECT {key_list} FROM {table_quoted} WHERE 1 = 0 \
-         UNION ALL SELECT {key_list} FROM {table_quoted} WHERE 1 = 0) AS s"
-    ))
+    Mssql.cleanup_create_sql(&quoted_target(table_quoted), key, &[])
 }
 
 /// Build the multi-row `INSERT` that loads written key tuples into
-/// [`CLEANUP_TEMP_TABLE`]. Params are numbered row-major over the key columns,
-/// matching how the caller binds each [`KeyTuple`](faucet_core::KeyTuple)'s
-/// values in `key` order.
-///
-/// The caller must chunk `n_rows` by
-/// [`max_rows_per_insert(key.len())`](max_rows_per_insert): the written-key set
-/// routinely runs to tens of thousands of rows, far past MSSQL's 2100-parameter
-/// and 1000-row-values ceilings.
+/// the session-scoped `#faucet_cleanup_keys` table. The caller chunks `n_rows` by
+/// [`max_rows_per_insert(key.len())`](max_rows_per_insert).
 pub(crate) fn build_cleanup_key_insert_sql(
     key: &[String],
     casts: &[Option<String>],
     n_rows: usize,
 ) -> Result<String, FaucetError> {
-    let quoted_keys: Vec<String> = key
-        .iter()
-        .map(|k| quote_ident_mssql(k))
-        .collect::<Result<_, _>>()?;
-    Ok(build_insert_sql_cast(
-        CLEANUP_TEMP_TABLE,
-        &quoted_keys,
-        casts,
-        n_rows,
-    ))
+    Mssql.cleanup_insert_sql(key, &cast_refs(casts), n_rows)
 }
 
 /// Build the scoped-cleanup `DELETE`: every row matching `scope` whose key is
-/// **not** in [`CLEANUP_TEMP_TABLE`].
-///
-/// `NOT EXISTS` against the temp table rather than `key NOT IN (@P1, …)` because
-/// the written-key set can reach the cleanup ceiling (100k rows by default),
-/// hundreds of times MSSQL's 2100-parameter limit.
-///
-/// Scope predicates are bound `@P1..@Pn` in the order `scope_cols` is given, so
-/// the caller must bind its values in that same order. `table_quoted` must
-/// already be quoted; `scope_cols` / `key` entries are bare identifiers quoted
-/// here.
+/// **not** in the session-scoped `#faucet_cleanup_keys` table. Scope predicates bind `@P1..@Pn` in
+/// `scope_cols` order. An empty scope or key is refused — an empty predicate
+/// would match every row.
 pub(crate) fn build_cleanup_delete_sql(
     table_quoted: &str,
     scope_cols: &[&str],
     key: &[String],
 ) -> Result<String, FaucetError> {
-    if scope_cols.is_empty() {
-        // Refusing here is the difference between "delete this parent's stale
-        // rows" and "truncate the table" — an empty predicate matches everything.
-        return Err(FaucetError::Sink(
-            "cleanup: the completeness claim is empty — an empty scope would match every \
-             row in the destination"
-                .into(),
-        ));
-    }
-    if key.is_empty() {
-        return Err(FaucetError::Sink(
-            "cleanup: requires a non-empty `key` so a written row can be told apart from a \
-             stale one"
-                .into(),
-        ));
-    }
-
-    let scope_pred = scope_cols
-        .iter()
-        .enumerate()
-        .map(|(i, c)| Ok(format!("t.{} = @P{}", quote_ident_mssql(c)?, i + 1)))
-        .collect::<Result<Vec<_>, FaucetError>>()?
-        .join(" AND ");
-
-    let join_pred = key
-        .iter()
-        .map(|k| {
-            let q = quote_ident_mssql(k)?;
-            Ok(format!("c.{q} = t.{q}"))
-        })
-        .collect::<Result<Vec<_>, FaucetError>>()?
-        .join(" AND ");
-
-    Ok(format!(
-        "DELETE t FROM {table_quoted} AS t WHERE {scope_pred} \
-         AND NOT EXISTS (SELECT 1 FROM {CLEANUP_TEMP_TABLE} c WHERE {join_pred})"
-    ))
+    let scope: Vec<String> = scope_cols.iter().map(|c| c.to_string()).collect();
+    Mssql.cleanup_delete_sql(&quoted_target(table_quoted), &scope, &[], key)
 }
-
 /// Bind one record's values in `columns` order (SQL NULL for missing keys),
 /// with NULLs typed `varbinary` for the columns flagged in `binary`.
 /// Upsert rows grouped by the subset of `columns` each carries (a key present
@@ -524,6 +327,31 @@ pub(crate) fn auto_row_params_typed(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The value-fidelity corpus (#885): every parameter this sink binds
+    /// carries exactly the value it came from (a non-integer number as its
+    /// shortest text, which SQL Server parses exactly).
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let back = match BoundParam::from_value(v) {
+                BoundParam::I64(i) => json!(i),
+                BoundParam::Bool(b) => json!(b),
+                BoundParam::Null(_) | BoundParam::NullBinary(_) => Value::Null,
+                BoundParam::Str(s) if v.is_string() => json!(s),
+                BoundParam::Str(s) => faucet_core::fidelity::from_str(&s).unwrap(),
+            };
+            landed.insert(name.clone(), back);
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[Value::Object(landed)],
+            fidelity::Tolerance::exact(),
+        );
+    }
 
     #[test]
     fn fields_fold_to_columns_and_unmatched_rows_are_named() {
@@ -672,8 +500,8 @@ mod tests {
             BoundParam::I64(7)
         ));
         assert!(matches!(
-            BoundParam::from_value(&json!(1.5)),
-            BoundParam::F64(_)
+            BoundParam::from_value(&json!(0.1)),
+            BoundParam::Str(s) if s == "0.1"
         ));
         assert!(matches!(
             BoundParam::from_value(&json!(true)),

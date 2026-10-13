@@ -238,6 +238,44 @@ async fn a_failed_external_link_is_an_error() {
     assert!(err.to_string().contains("external link HTTP 403"), "{err}");
 }
 
+/// A presigned link that cannot be reached is an error, and the statement
+/// and chunk round trips are metered on the installed recorder.
+#[tokio::test]
+async fn an_unreachable_external_link_is_an_error() {
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}/presigned/x", dead.local_addr().unwrap());
+    drop(dead);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s11",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT")]),
+            "result": { "external_links": [{ "external_link": dead_url }] }
+        })))
+        .mount(&server)
+        .await;
+    let src = source(&server.uri(), "SELECT id FROM t").await;
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    src.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "databricks",
+        )
+        .with_meter(meter.clone()),
+    ));
+    let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("external-link request failed"),
+        "{err}"
+    );
+    let trips = meter.snapshot().source_roundtrips;
+    assert!(trips.contains_key("chunk"), "{trips:?}");
+}
+
 /// A presigned chunk that is not a JSON array of rows is an error.
 #[tokio::test]
 async fn an_unparseable_external_chunk_is_an_error() {

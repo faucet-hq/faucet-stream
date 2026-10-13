@@ -171,8 +171,9 @@ The name `batch` is reserved for the page relation. Using it as a relation name 
   that fits a 64-bit integer becomes a JSON integer; any wider value is an
   exact decimal string such as `"1234567890123456789012345678.0123456789"`,
   never an `f64` rounding.
-- **Non-finite floats** (`NaN`, `±Infinity`) become the strings `"NaN"`,
-  `"Infinity"` and `"-Infinity"` rather than `null`.
+- **Non-finite floats** (`NaN`, `±Infinity`) have no JSON number: they become
+  a `null` counted in the run summary (`non_finite`) and
+  `faucet_fidelity_non_finite_total`; binary columns are base64.
 - **A field that is `{}` in every record of a page** is passed to DuckDB as the
   string `'{}'` (DuckDB has no zero-field struct) and comes back as `{}`.
 - **Keys that differ only by letter case** (`a` and `A`) fail the page: SQL

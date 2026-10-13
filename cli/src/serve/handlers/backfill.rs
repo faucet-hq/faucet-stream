@@ -25,7 +25,7 @@ use crate::backfill::plan::{parse_boundary, parse_window, range_hash, substitute
 use crate::backfill::spec::{has_scoping_tokens, parse_timezone};
 use crate::serve::error::ServeError;
 use crate::serve::rbac::AuthContext;
-use crate::serve::runner::{self, ConfigFormatWire, SubmitRequest};
+use crate::serve::runner::{ConfigFormatWire, SubmitRequest};
 use crate::serve::state::ServerState;
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -169,9 +169,12 @@ pub async fn submit_backfill(
     // Validate the config loads/expands and gate the window scoping exactly
     // like the CLI: every root's source must reference a `${backfill.*}` /
     // `${now.*}` token or each unit would replay identical data.
-    let loaded = state
-        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
-        .await?;
+    let loaded = crate::runtime::server::load(
+        &state,
+        &crate::runtime::Principal::caller(&state, actor.clone()),
+        crate::runtime::server::Submission::new(&req.config, req.config_format.into()),
+    )
+    .await?;
     loaded.require_matrix()?;
     let unscoped: Vec<&str> = loaded
         .nodes
@@ -290,7 +293,15 @@ pub async fn submit_backfill(
             trusted_config: false,
             server_file: false,
         };
-        match runner::submit(state.clone(), submit, actor.clone()).await {
+        let outcome = crate::runtime::server::submit(
+            &state,
+            &crate::runtime::Principal::caller(&state, actor.clone()),
+            submit,
+            crate::runtime::server::Approval::Standing,
+        )
+        .await
+        .and_then(|o| o.accepted());
+        match outcome {
             Ok(resp) => {
                 submitted += 1;
                 reports.push(BackfillUnitRun {

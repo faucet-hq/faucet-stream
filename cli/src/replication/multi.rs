@@ -6,7 +6,7 @@
 
 use crate::config::{ConnectorSpec, PipelineConfig};
 use crate::error::{CliError, CliResult};
-use crate::executor::{RunSummary, build_state_key, run_expanded};
+use crate::executor::{RunSummary, build_state_key};
 use crate::expand::{ExpandedNode, expand};
 use crate::registry::build_source;
 use crate::replication::compiled::{CompiledReplication, CompiledTables};
@@ -362,7 +362,7 @@ async fn snapshot_table(
         && !shared.destination_exists(&plan).await?;
     let strategy = snapshot_strategy(shared.snapshot_replaces(), missing, shards.len());
     if strategy.clear_first {
-        let summary = run_expanded(
+        let summary = crate::runtime::run_local(
             vec![snapshot_as_overwrite(&snap, true)],
             make_opts(&shared.opts, Some(cancel.clone())),
         )
@@ -389,7 +389,7 @@ async fn snapshot_table(
             node.source.config = spec.0;
             opts.shard = Some(spec.1);
         }
-        runs.spawn(async move { run_expanded(vec![node], opts).await });
+        runs.spawn(async move { crate::runtime::run_local(vec![node], opts).await });
         if first_alone {
             first_alone = false;
             if let Some(joined) = runs.join_next().await {
@@ -635,7 +635,7 @@ async fn run_group(
         let opts = make_opts(&shared.opts, None);
         let name = table.clone();
         runs.spawn(async move {
-            let (result, held) = match run_expanded(vec![node], opts).await {
+            let (result, held) = match crate::runtime::run_local(vec![node], opts).await {
                 Ok(summary) => (
                     summary_error(&summary).map_or(Ok(()), Err),
                     summary.lease_refusal().map(|e| e.to_string()),

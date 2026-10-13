@@ -309,19 +309,11 @@ mod tests {
     async fn call_statement_reports_which_side_cut_it_short() {
         let ctx = statement_call_context(0);
         assert!(ctx.timeout().is_none());
-        let ok = call_statement(&ctx, "query", None, async { Ok(1) }, || {
-            FaucetError::Source("late".into())
-        })
-        .await;
+        let late = || FaucetError::Source("late".into());
+        let ok = call_statement(&ctx, "query", None, async { Ok(1) }, late).await;
         assert_eq!((ok.0.unwrap(), ok.1), (1, false));
-        let failed = call_statement(
-            &ctx,
-            "query",
-            None,
-            async { Err::<u8, _>(FaucetError::Source("boom".into())) },
-            || FaucetError::Source("late".into()),
-        )
-        .await;
+        let boom = async { Err::<u8, _>(FaucetError::Source("boom".into())) };
+        let failed = call_statement(&ctx, "query", None, boom, late).await;
         assert!(!failed.1 && failed.0.unwrap_err().to_string().contains("boom"));
 
         let bound = Duration::from_millis(10);
@@ -344,7 +336,7 @@ mod tests {
             "query",
             Some(Duration::from_secs(300)),
             std::future::pending::<Result<u8, FaucetError>>(),
-            || FaucetError::Source("unused".into()),
+            late,
         )
         .await;
         assert!(late.1 && matches!(late.0, Err(FaucetError::Timeout { .. })));

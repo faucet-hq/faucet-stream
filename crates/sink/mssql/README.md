@@ -415,6 +415,12 @@ Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (e
 
 Every statement runs through the pipeline's `CallContext` (#880) as one backend call (`insert`, `merge`, `begin`, `commit`, `rollback`, `query`, `statement`, `copy`): the run's deadline ends it promptly, `statement_timeout_secs` still bounds each data statement (DDL and the overwrite swap are bounded only by the deadline), and a statement cut short leaves its connection mid-response, so the connection is replaced and the server rolls its transaction back. Each counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. A chunk the server itself rolled back (deadlock victim, lock timeout) is re-run after a backoff that also ends at the deadline; nothing else is retried.
 
+## Shared SQL layer
+
+This sink takes its SQL text (the keyed `MERGE` upsert and delete, `CAST`-typed `@Pn` placeholders, the 2100-parameter / 1000-row limits, create-table, add-column and cleanup statements, the commit-token SQL) and its field folding (a field folds to the one column equal ignoring case) from the `Mssql` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Statement execution stays here: each chunk runs over `tiberius` with typed failure classification (rolled back / infrastructure / row rejected), transient re-runs and per-row isolation for the DLQ, which the engine's executor model does not express.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
@@ -436,3 +442,11 @@ exist.
 
 
 **Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+
+## Value fidelity
+
+A non-integer JSON number is bound as its shortest decimal text (`0.1`), which
+SQL Server parses exactly into a `DECIMAL` / `NUMERIC` / `MONEY` (or a float
+column); a bound `float` would be converted from binary and land as
+`0.10000000000000001`. Exact decimals from a source arrive as strings and are
+bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).

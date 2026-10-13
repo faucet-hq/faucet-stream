@@ -840,13 +840,19 @@ fn build_create_table_sql(
     table: &str,
     columns: &[faucet_core::PlannedColumn],
 ) -> String {
-    let cols = faucet_core::render_columns(columns, quote_ident, |_| "STRING");
-    format!(
-        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({cols})",
+    let reference = format!(
+        "{}.{}.{}",
         quote_ident(database),
         quote_ident(schema),
         quote_ident(table)
+    );
+    faucet_common_sql::SqlDialect::create_table_sql(
+        &faucet_common_sql::dialects::Snowflake,
+        &faucet_common_sql::TableTarget::new(table, reference),
+        columns,
+        &[],
     )
+    .expect("snowflake CREATE TABLE")
 }
 
 #[async_trait]
@@ -1154,19 +1160,8 @@ impl faucet_core::Sink for SnowflakeSink {
             .get_or_try_init(|| async { crate::bulk::resolve_store(stage) })
             .await?;
         let file = format!("faucet-{}.parquet", uuid::Uuid::new_v4());
-        let mut upload = Some(crate::bulk::upload(store, &file, bytes));
         self.calls
-            .call("stage", || {
-                let attempt = upload.take();
-                async move {
-                    match attempt {
-                        Some(f) => f.await,
-                        None => Err(FaucetError::Sink(
-                            "snowflake stage upload is sent once".into(),
-                        )),
-                    }
-                }
-            })
+            .call_once("stage", crate::bulk::upload(store, &file, bytes))
             .await?;
 
         // Load the staged Parquet file into the target table.
@@ -1197,6 +1192,30 @@ mod tests {
     use super::*;
     use crate::config::SnowflakeAuth;
     use faucet_core::Sink as _;
+
+    /// The value-fidelity corpus (#885): the JSON payload bound to
+    /// `PARSE_JSON(?)` reads back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sink = SnowflakeSink::new(SnowflakeSinkConfig::new(
+            "acct",
+            "wh",
+            "db",
+            "schema",
+            "T",
+            SnowflakeAuth::OAuth { token: "t".into() },
+        ))
+        .unwrap();
+        let sent = fidelity::corpus();
+        let (_, payload) = sink.build_insert(&sent).unwrap();
+        let landed = faucet_core::fidelity::from_str(&payload).unwrap();
+        fidelity::assert_round_trip(
+            &sent,
+            landed.as_array().unwrap(),
+            fidelity::Tolerance::exact(),
+        );
+    }
 
     #[test]
     fn dataset_uri_includes_account_db_schema_table() {

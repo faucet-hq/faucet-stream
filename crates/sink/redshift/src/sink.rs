@@ -22,10 +22,6 @@ use crate::copy::{
     s3_uri, serialize_csv, serialize_jsonl,
 };
 
-/// Redshift caps bind parameters per statement; keep multi-row `INSERT`s under
-/// this by sub-chunking.
-const MAX_REDSHIFT_PARAMS: usize = 32_767;
-
 /// A sink that loads JSON records into an Amazon Redshift table.
 pub struct RedshiftSink {
     /// Whether the target has been confirmed present for this sink instance
@@ -297,10 +293,22 @@ impl RedshiftSink {
     /// by the `insert` path and the CSV `copy` path (both need the column
     /// set/order).
     async fn discover_columns(&self) -> Result<Vec<String>, FaucetError> {
+        Ok(self
+            .discover_typed_columns()
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// The table's `(column, declared type)` pairs in declared order.
+    async fn discover_typed_columns(&self) -> Result<Vec<(String, String)>, FaucetError> {
         let rows = self
             .call("query", async {
                 sqlx::query(&format!(
-                    "SELECT a.attname::text AS column_name FROM pg_catalog.pg_attribute a \
+                    "SELECT a.attname::text AS column_name, \
+                     format_type(a.atttypid, a.atttypmod)::text AS data_type \
+                     FROM pg_catalog.pg_attribute a \
                      JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                      WHERE {TARGET_RELATION} AND a.attnum > 0 AND NOT a.attisdropped \
@@ -314,9 +322,14 @@ impl RedshiftSink {
             })
             .await?;
 
-        let cols: Vec<String> = rows
+        let cols: Vec<(String, String)> = rows
             .iter()
-            .map(|r| r.get::<String, _>("column_name"))
+            .map(|r| {
+                (
+                    r.get::<String, _>("column_name"),
+                    r.get::<String, _>("data_type"),
+                )
+            })
             .collect();
         if cols.is_empty() {
             return Err(FaucetError::Sink(format!(
@@ -431,11 +444,25 @@ impl RedshiftSink {
         if records.is_empty() {
             return Ok(0);
         }
-        let table_columns = self.discover_columns().await?;
+        let typed = self.discover_typed_columns().await?;
+        let table_columns: Vec<String> = typed.iter().map(|(n, _)| n.clone()).collect();
         let present: Vec<String> = columns_present(records, &table_columns)
             .into_iter()
             .cloned()
             .collect();
+        // An exact-decimal column binds text cast to its type, so the server
+        // parses the digits the record holds (#885).
+        let decimal_types: Vec<Option<String>> = present
+            .iter()
+            .map(|c| {
+                typed
+                    .iter()
+                    .find(|(n, _)| n == c)
+                    .map(|(_, t)| t.clone())
+                    .filter(|t| faucet_core::fidelity::is_exact_decimal_type(t))
+            })
+            .collect();
+        let casts: Vec<Option<&str>> = decimal_types.iter().map(|t| t.as_deref()).collect();
         if present.is_empty() {
             // Reporting the chunk as written would advance the bookmark past
             // rows that never landed (SQL-19).
@@ -470,18 +497,27 @@ impl RedshiftSink {
         }
 
         let num_cols = present.len();
-        let max_rows = (MAX_REDSHIFT_PARAMS / num_cols).max(1);
+        // Redshift caps bind parameters per statement; the dialect sizes each
+        // multi-row INSERT under it.
+        let max_rows = faucet_common_sql::SqlDialect::rows_per_statement(
+            &faucet_common_sql::dialects::Redshift,
+            num_cols,
+        );
         let mut total = 0usize;
 
         for sub in insertable.chunks(max_rows) {
-            let sql = insert_statement(&self.table_ref(), &present, sub.len());
+            let sql = insert_statement(&self.table_ref(), &present, &casts, sub.len());
             let mut q = sqlx::query(&sql);
             for record in sub {
                 let obj = record.as_object().ok_or_else(|| {
                     FaucetError::Sink("redshift: insert requires JSON object records".into())
                 })?;
-                for col in &present {
-                    q = bind_json(q, crate::copy::field(obj, col), col)?;
+                for (col, cast) in present.iter().zip(&casts) {
+                    let value = crate::copy::field(obj, col);
+                    q = match (cast, value) {
+                        (Some(_), Some(Value::Number(n))) => q.bind(n.to_string()),
+                        _ => bind_json(q, value, col)?,
+                    };
                 }
             }
             self.call("execute", async {

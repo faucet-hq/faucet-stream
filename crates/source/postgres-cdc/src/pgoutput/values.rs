@@ -17,6 +17,7 @@ const OID_INT8: u32 = 20;
 const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 const OID_NUMERIC: u32 = 1700;
+const OID_MONEY: u32 = 790;
 const OID_JSON: u32 = 114;
 const OID_JSONB: u32 = 3802;
 const OID_DATE: u32 = 1082;
@@ -39,6 +40,7 @@ fn array_element_oid(array_oid: u32) -> Option<u32> {
         1021 => OID_FLOAT4,  // _float4
         1022 => OID_FLOAT8,  // _float8
         1231 => OID_NUMERIC, // _numeric
+        791 => OID_MONEY,    // _money
         199 => OID_JSON,     // _json
         3807 => OID_JSONB,   // _jsonb
         1009 => 25,          // _text → text
@@ -79,23 +81,16 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
             })?;
             Value::from(n)
         }
-        OID_FLOAT4 | OID_FLOAT8 => match text {
-            // JSON has no NaN/Inf. Preserve them as strings so the
-            // non-finite value is distinguishable from a SQL NULL, which
-            // also maps to `Value::Null` (#78/#45).
-            "NaN" => Value::String("NaN".into()),
-            "Infinity" => Value::String("Infinity".into()),
-            "-Infinity" => Value::String("-Infinity".into()),
-            other => {
-                let n: f64 = other.parse().map_err(|e| {
-                    FaucetError::Source(format!("pgoutput: float parse {text:?}: {e}"))
-                })?;
-                serde_json::Number::from_f64(n)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            }
-        },
-        OID_NUMERIC => Value::String(text.into()),
+        // JSON has no NaN/Inf: they become a counted `null` (#885).
+        OID_FLOAT4 | OID_FLOAT8 => {
+            let n: f64 = text
+                .parse()
+                .map_err(|e| FaucetError::Source(format!("pgoutput: float parse {text:?}: {e}")))?;
+            faucet_core::fidelity::float64(n)
+        }
+        OID_NUMERIC => faucet_core::fidelity::decimal_text(text)
+            .map_err(|e| FaucetError::Source(format!("pgoutput: numeric {e}")))?,
+        OID_MONEY => money_json(text)?,
         OID_BYTEA => {
             let stripped = text.strip_prefix("\\x").ok_or_else(|| {
                 FaucetError::Source(format!(
@@ -106,9 +101,11 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
             Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
         OID_DATE | OID_TIME | OID_TIMESTAMP | OID_TIMESTAMPTZ => temporal_json(type_oid, text)?,
-        OID_JSON | OID_JSONB => serde_json::from_str(text).map_err(|e| {
-            FaucetError::Source(format!("pgoutput: json/jsonb parse {text:?}: {e}"))
-        })?,
+        OID_JSON | OID_JSONB => {
+            faucet_core::fidelity::parse_json(text.as_bytes()).map_err(|e| {
+                FaucetError::Source(format!("pgoutput: json/jsonb parse {text:?}: {e}"))
+            })?
+        }
         other => {
             // One-dimensional arrays of a known scalar element type decode
             // into a JSON array; everything else (incl. multi-dimensional
@@ -130,6 +127,33 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
             }
         }
     })
+}
+
+/// A `money` value, which the server prints in its `lc_monetary` locale
+/// (`$1,234.50`, `-$5.00`, `1.234,50 €`, `($5.00)`), as the exact decimal the
+/// query source reads through `money::numeric`. The decimal separator is the
+/// last `.` or `,` unless exactly three digits follow it (a locale with no
+/// fractional digits prints `￥1,235`).
+fn money_json(text: &str) -> Result<Value, FaucetError> {
+    let negative = text.contains('-') || (text.contains('(') && text.contains(')'));
+    let kept: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+        .collect();
+    let decimal_at = kept.rfind(['.', ',']).filter(|&i| kept.len() - i - 1 != 3);
+    let mut digits = String::with_capacity(kept.len() + 1);
+    if negative {
+        digits.push('-');
+    }
+    for (i, c) in kept.char_indices() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if Some(i) == decimal_at {
+            digits.push('.');
+        }
+    }
+    faucet_core::fidelity::decimal_text(&digits)
+        .map_err(|e| FaucetError::Source(format!("pgoutput: money {text:?}: {e}")))
 }
 
 /// Re-render a temporal value the way the `postgres` query source does —
@@ -326,15 +350,35 @@ mod tests {
     #[test]
     fn floats() {
         assert_eq!(text_to_json(OID_FLOAT8, "3.5").unwrap(), json!(3.5));
-        // NaN/Inf are preserved as strings (distinct from a NULL → Value::Null).
-        assert_eq!(text_to_json(OID_FLOAT8, "NaN").unwrap(), json!("NaN"));
+        // NaN/Inf are a counted null (#885).
+        assert_eq!(text_to_json(OID_FLOAT8, "NaN").unwrap(), Value::Null);
+        assert_eq!(text_to_json(OID_FLOAT4, "Infinity").unwrap(), Value::Null);
+        assert_eq!(text_to_json(OID_FLOAT8, "-Infinity").unwrap(), Value::Null);
+        assert_eq!(text_to_json(OID_NUMERIC, "NaN").unwrap(), Value::Null);
+        assert!(text_to_json(OID_NUMERIC, "x").is_err());
+        for (text, exact) in [
+            ("$1,234.50", "1234.50"),
+            ("-$5.00", "-5.00"),
+            ("($5.00)", "-5.00"),
+            ("1.234,50 €", "1234.50"),
+            ("￥1,235", "1235"),
+            ("$0.07", "0.07"),
+        ] {
+            assert_eq!(
+                text_to_json(OID_MONEY, text).unwrap(),
+                json!(exact),
+                "{text}"
+            );
+        }
+        assert!(text_to_json(OID_MONEY, "n/a").is_err());
         assert_eq!(
-            text_to_json(OID_FLOAT4, "Infinity").unwrap(),
-            json!("Infinity")
+            text_to_json(791, "{\"$1.00\",\"$2.50\"}").unwrap(),
+            json!(["1.00", "2.50"])
         );
+        assert!(text_to_json(OID_FLOAT8, "x").is_err());
         assert_eq!(
-            text_to_json(OID_FLOAT8, "-Infinity").unwrap(),
-            json!("-Infinity")
+            text_to_json(OID_JSONB, r#"{"n": 12345678901234567890.5}"#).unwrap(),
+            json!({"n": "12345678901234567890.5"})
         );
     }
 

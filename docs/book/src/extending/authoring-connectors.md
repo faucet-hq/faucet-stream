@@ -509,6 +509,80 @@ until you call `hang()`, so a client that connects in `new()` can be built
 first and then stalled. A connector with no backend round trip (a local file)
 is listed with its reason in `crates/conformance/call-deadline-exempt.txt`.
 
+## SQL sinks: the shared dialect and engine
+
+A sink that writes rows into a SQL database does not plan its own SQL. The
+`faucet-common-sql` crate holds the planning every SQL sink used to copy:
+
+- **`SqlDialect`** answers "how is this spelled here": identifier quoting
+  (`check_ident` refuses what cannot be quoted), literal escaping,
+  placeholders (`$3::int4`, `?`, `@P3`, `:3`) and the parameter limit, created,
+  key and widened type names, the keyed upsert (`ON CONFLICT`,
+  `ON DUPLICATE KEY`, `MERGE`) and delete statements, the scoped-cleanup
+  statements, the commit-token watermark table and the rollback-journal SQL.
+  Every statement builder is a provided method, so a dialect overrides only
+  where its SQL differs. Built-in dialects live in
+  `faucet_common_sql::dialects`.
+- **`SqlSinkEngine<D>`** owns the decisions: which record field lands in which
+  column (`ColumnMatching`: exact, case-insensitive, fold-to-unique, upper-fold),
+  a record matching no column (an error, never a silent skip), the union column
+  set of an append (a missing column binds NULL), one upsert per set of carried
+  columns (an absent column keeps its stored value), page-ordered keyed groups
+  (`plan_writes_ordered`, the journal written first on the same connection),
+  statements chunked under the parameter limit, create-table and evolution DDL,
+  the cleanup sequence, the commit-token write and the row report
+  (`WriteReport`: a keyed page accepts one row per planned upsert or delete and
+  coalesces the rest).
+
+A backend crate supplies a dialect and a `SqlExecutor` over its driver
+connection or open transaction: it returns the target's live columns (with
+types when its placeholders cast) and binds each planned `Param` as its column
+needs. It keeps what is genuinely its own — transactions, bulk-load paths,
+overwrite swaps, catalog queries — and runs the engine inside its own backend
+call, so the deadline and metering of [`CallContext`](#backend-calls-callcontext-httpclient-batching)
+still cover every statement:
+
+```rust
+use faucet_common_sql::dialects::Postgres;
+use faucet_common_sql::{SqlExecutor, SqlSinkEngine, Statement, TableColumn, TableTarget};
+use faucet_core::{async_trait, FaucetError};
+
+struct Exec<'c> {
+    conn: &'c mut sqlx::PgConnection,
+}
+
+#[async_trait]
+impl SqlExecutor for Exec<'_> {
+    async fn columns(&mut self, t: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        // read the catalog for `t.reference` on `self.conn`
+        # Ok(vec![])
+    }
+    async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+        // bind each `stmt.params` value as its column needs, run `stmt.sql`
+        # Ok(0)
+    }
+}
+
+// In the sink: plan the page, then apply it inside one transaction.
+// let plans = engine.plan_keyed(records)?;
+// engine.apply_plans(&mut Exec { conn: &mut tx }, &target, &plans).await?;
+```
+
+The shared planning matrix (`crates/common/sql/tests/dialect_matrix.rs`) runs
+the same cases — mapping, dedup, upsert/delete ordering, chunking, widening,
+create-table, cleanup, journal and token SQL — against every dialect, so a rule
+fixed for one backend is checked for all of them. A new SQL sink adds its
+dialect there.
+
+Which built-in sinks use how much of it:
+
+| Sink | Uses |
+|---|---|
+| postgres, mysql, sqlite | the engine end to end, over an executor |
+| mssql | the dialect (MERGE, `CAST` placeholders, limits) and the shared mapping; its own retry-classified chunk execution |
+| duckdb | the engine's row planning, executed on the blocking driver |
+| redshift, clickhouse, oracle, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; their own row handling (`COPY`/`JSONEachRow` bodies, array DML, JSON-payload statement APIs) |
+
 ## Make it fast
 
 Performance is the project's first principle, and none of this may trade away
@@ -528,6 +602,42 @@ the ordering rules above:
   on `tokio::task::spawn_blocking`; buffer file and socket writers.
 - Don't log or meter per record. The pipeline already records metrics and spans
   for every call; never use record ids, URLs or cursors as labels.
+
+## Values: the fidelity model
+
+Render every typed value through `faucet_core::fidelity`, not by hand, so a
+value reads the same whichever connector produced it
+([value fidelity](../reference/value-fidelity.md)):
+
+- an exact decimal is a string at its declared scale (`decimal_text`,
+  `decimal_from_i128`) — never `to_f64()` or `parse::<f64>()`;
+- an integer a `Value` cannot hold is a string (`integer_i128`,
+  `integer_text`);
+- a float goes through `float64` / `float32`, which turn `NaN` / `±Infinity`
+  into a `null` the run counts;
+- bytes are base64 (`binary`), instants RFC 3339 with an offset (`timestamp`);
+- a JSON body or payload parses with `fidelity::from_slice`, a JSON column
+  with `fidelity::parse_json`;
+- a sink binds a non-integer number into a SQL column as its shortest text
+  (`non_integer_text`), so the server parses the decimal exactly.
+
+Then run the shared corpus. A source/sink pair does it in
+`crates/interop-tests/tests/`; a connector alone can do it against its
+backend in its own `tests/`, or through its value converter in a `#[cfg(test)]`
+module:
+
+```rust,ignore
+use faucet_conformance::fidelity::{self, Tolerance};
+
+// A sink: write the corpus, read the destination back.
+fidelity::assert_corpus_written(&sink, &fidelity::corpus(), || read_back(), Tolerance::exact()).await;
+// A source over a backend seeded with the corpus.
+fidelity::assert_corpus_read(&source, &fidelity::corpus(), Tolerance::exact()).await;
+```
+
+`scripts/fidelity-coverage.py` fails CI for a built-in connector that runs
+none of these, and `scripts/decimal-f64.py` for a decimal converted through a
+float.
 
 ## Config and schema
 

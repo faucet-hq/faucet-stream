@@ -1,4 +1,4 @@
-//! The S3 [`ObjectClient`] behind the shared file writer (#777).
+//! The S3 [`ObjectClient`] behind [`S3Backend`](crate::S3Backend) (#777, #886).
 //!
 //! A file up to [`PART_BYTES`] is one `PutObject`; a larger one is a
 //! multipart upload of `PART_BYTES` parts (up to `concurrency` in flight per
@@ -22,6 +22,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use faucet_common_file::write::{ObjectClient, content_type};
 use faucet_core::FaucetError;
+use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::observability::RoundtripRecorder;
 use futures::stream::{StreamExt, TryStreamExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +41,7 @@ pub const MAX_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const COPY_PART_BYTES: u64 = 512 * 1024 * 1024;
 
 /// S3's limit on the parts of one multipart upload.
-pub(crate) const MAX_PARTS: u64 = 10_000;
+pub const MAX_PARTS: u64 = 10_000;
 
 /// S3's limit on the keys of one `DeleteObjects` request.
 const MAX_DELETE_KEYS: usize = 1_000;
@@ -341,6 +343,35 @@ impl ObjectClient for S3Objects {
                 .map_err(|e| self.sdk_err("copy object", to, e))?;
         }
         self.delete(from).await
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    /// A non-mutating `HeadBucket`: the bucket is reachable and the
+    /// credentials work. Uploads nothing.
+    async fn check(&self, ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+        let started = std::time::Instant::now();
+        let request = self.client.head_bucket().bucket(&self.bucket);
+        let sent = request.send().within(&self.calls, "head");
+        let probe = match tokio::time::timeout(ctx.timeout, sent).await {
+            Ok(Err(e)) => Probe::fail("auth", started.elapsed(), e.to_string()),
+            Ok(Ok(Ok(_))) => Probe::pass("auth", started.elapsed()),
+            Ok(Ok(Err(e))) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check bucket name, credentials, and network",
+            ),
+            Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
+        };
+        Ok(Some(CheckReport::single(probe)))
     }
 }
 

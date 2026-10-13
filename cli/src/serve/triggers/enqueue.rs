@@ -5,7 +5,7 @@
 use super::compiled::CompiledTrigger;
 use super::context::{self, TriggerEvent};
 use super::{metrics, spec::PipelineRef};
-use crate::serve::runner::{self, ConfigFormatWire, SubmitRequest};
+use crate::serve::runner::{ConfigFormatWire, SubmitRequest};
 use crate::serve::state::ServerState;
 
 #[derive(Debug)]
@@ -277,9 +277,24 @@ async fn fire_one(
             };
             let mut req = build_submit_request(compiled, event, text, fired_at);
             req.idempotency_key = req.idempotency_key.map(idem);
-            runner::submit(state.clone(), req, actor)
-                .await
-                .map(|r| r.run_id)
+            // A trigger declared in the server's triggers file is a standing
+            // approval; its config file is the server's own.
+            crate::runtime::server::submit(
+                state,
+                &crate::runtime::Principal::new(
+                    actor,
+                    crate::runtime::Origin::from(if req.server_file {
+                        crate::serve::load::BodyOrigin::ServerFile
+                    } else {
+                        state.origin(req.trusted_config)
+                    }),
+                ),
+                req,
+                crate::runtime::server::Approval::Standing,
+            )
+            .await
+            .and_then(|o| o.accepted())
+            .map(|r| r.run_id)
         }
         (None, Some(tpl)) => {
             submit_template(state, compiled, tpl, event, fired_at, actor, idem).await
@@ -399,11 +414,12 @@ async fn submit_template(
     actor: crate::serve::rbac::AuthContext,
     idem: impl Fn(String) -> String,
 ) -> Result<String, crate::serve::error::ServeError> {
-    use crate::serve::handlers::templates::{TriggerOutcome, trigger_template_outcome};
+    use crate::runtime::server::{TriggerOutcome, trigger_template};
     let mut body = template_body(compiled, tpl, event, fired_at)
         .map_err(crate::serve::error::ServeError::BadConfig)?;
     body.idempotency_key = body.idempotency_key.map(idem);
-    match trigger_template_outcome(state.clone(), actor, tpl.id.clone(), body).await? {
+    let principal = crate::runtime::Principal::new(actor, crate::runtime::Origin::Trusted);
+    match trigger_template(state.clone(), principal, tpl.id.clone(), body).await? {
         TriggerOutcome::Run(r) => Ok(r.run.run_id),
         TriggerOutcome::PendingApproval(c) => Ok(format!("change:{}", c.id)),
     }

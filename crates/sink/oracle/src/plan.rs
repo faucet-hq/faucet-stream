@@ -4,12 +4,11 @@
 use base64::Engine;
 use faucet_common_oracle::oracle::sql_type::OracleType;
 use faucet_common_oracle::{
-    TypeFamily, bytes_to_hex, hex_to_bytes, iso_to_oracle_interval, quote_ident_oracle,
-    split_table, string_literal,
+    TypeFamily, bytes_to_hex, hex_to_bytes, iso_to_oracle_interval, quote_ident_oracle, split_table,
 };
-use faucet_core::idempotency::{
-    COMMIT_TOKEN_SCOPE_COL, COMMIT_TOKEN_TABLE, COMMIT_TOKEN_TOKEN_COL,
-};
+use faucet_common_sql::dialects::{Oracle, oracle};
+use faucet_common_sql::{SqlDialect, TableTarget};
+use faucet_core::idempotency::COMMIT_TOKEN_TABLE;
 use faucet_core::{FaucetError, PlannedColumn, SqlBaseType};
 use serde_json::{Value, json};
 
@@ -19,12 +18,10 @@ use crate::config::{OnUnknownField, OracleColumnMapping};
 pub(crate) const ORA_TABLE_MISSING: i32 = 942;
 /// ORA-00955: name is already used by an existing object.
 pub(crate) const ORA_NAME_IN_USE: i32 = 955;
-/// ORA-01430: column being added already exists.
-pub(crate) const ORA_COLUMN_EXISTS: i32 = 1430;
 /// ORA-01451: column to be modified to NULL cannot be modified to NULL.
-pub(crate) const ORA_ALREADY_NULL: i32 = 1451;
+pub(crate) const ORA_ALREADY_NULL: i32 = oracle::ORA_ALREADY_NULL;
 /// Width of the watermark table's `scope` key column.
-pub(crate) const SCOPE_COL_WIDTH: usize = 1000;
+pub(crate) const SCOPE_COL_WIDTH: usize = oracle::SCOPE_COL_WIDTH;
 
 /// One destination column, from `ALL_TAB_COLS`.
 #[derive(Debug, Clone, PartialEq)]
@@ -293,24 +290,14 @@ pub(crate) fn resolve_insert_columns(
         .collect())
 }
 
-fn quote_all(cols: &[String]) -> Result<Vec<String>, FaucetError> {
-    cols.iter().map(|c| quote_ident_oracle(c)).collect()
-}
-
-fn placeholders(n: usize) -> String {
-    (1..=n)
-        .map(|i| format!(":{i}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The engine target of an already-quoted table reference.
+fn target(table: &str) -> TableTarget {
+    TableTarget::new(table, table)
 }
 
 /// `INSERT INTO t ("A", "B") VALUES (:1, :2)` — executed as array DML.
 pub(crate) fn insert_sql(table: &str, cols: &[String]) -> Result<String, FaucetError> {
-    Ok(format!(
-        "INSERT INTO {table} ({}) VALUES ({})",
-        quote_all(cols)?.join(", "),
-        placeholders(cols.len())
-    ))
+    Oracle.insert_sql(table, cols, &[], 1)
 }
 
 /// Keyed `MERGE` upsert over one bound row (executed as array DML).
@@ -319,97 +306,25 @@ pub(crate) fn merge_sql(
     key: &[String],
     cols: &[String],
 ) -> Result<String, FaucetError> {
-    for k in key {
-        if !cols.contains(k) {
-            return Err(FaucetError::Sink(format!(
-                "oracle upsert: key column {k:?} is not a writable column of the table"
-            )));
-        }
-    }
-    let quoted = quote_all(cols)?;
-    let select = quoted
-        .iter()
-        .enumerate()
-        .map(|(i, q)| format!(":{} AS {q}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let on = quote_all(key)?
-        .iter()
-        .map(|q| format!("t.{q} = s.{q}"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let updates: Vec<String> = cols
-        .iter()
-        .zip(&quoted)
-        .filter(|(c, _)| !key.contains(c))
-        .map(|(_, q)| format!("t.{q} = s.{q}"))
-        .collect();
-    let matched = if updates.is_empty() {
-        String::new()
-    } else {
-        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
-    };
-    Ok(format!(
-        "MERGE INTO {table} t USING (SELECT {select} FROM DUAL) s ON ({on}){matched} \
-         WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
-        quoted.join(", "),
-        quoted
-            .iter()
-            .map(|q| format!("s.{q}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    Oracle.upsert_sql(table, key, cols, &[], 1)
 }
 
 /// `DELETE FROM t WHERE "K1" = :1 AND "K2" = :2` (executed as array DML).
 pub(crate) fn delete_sql(table: &str, key: &[String]) -> Result<String, FaucetError> {
-    let pred = quote_all(key)?
-        .iter()
-        .enumerate()
-        .map(|(i, q)| format!("{q} = :{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    Ok(format!("DELETE FROM {table} WHERE {pred}"))
+    Oracle.delete_keys_sql(table, key, &[], 1)
 }
 
 /// Run `ddl` via `EXECUTE IMMEDIATE`, swallowing the listed `ORA-` codes so
 /// idempotent DDL (create-if-missing, drop-if-present) needs no pre-check.
 pub(crate) fn ignoring(ddl: &str, codes: &[i32]) -> String {
-    let list = codes
-        .iter()
-        .map(|c| format!("-{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "BEGIN EXECUTE IMMEDIATE {}; EXCEPTION WHEN OTHERS THEN IF SQLCODE NOT IN ({list}) \
-         THEN RAISE; END IF; END;",
-        string_literal(ddl)
-    )
-}
-
-/// Oracle type for a planned column. A column whose first-page values are all
-/// whole numbers is an unconstrained `NUMBER`: `NUMBER(19)` has scale 0, so a
-/// later `99.95` was silently rounded to `100` (SQL-16); only a key column, which
-/// must stay integral, is `NUMBER(38)`. Doubles are IEEE `BINARY_DOUBLE` (a
-/// `NUMBER` cannot hold 1e300 or 1e-300); key text is bounded (`CLOB` cannot be
-/// indexed); other text is `CLOB` so no value is ever truncated.
-pub(crate) fn column_type(t: SqlBaseType, is_key: bool) -> &'static str {
-    match t {
-        SqlBaseType::Integer if is_key => "NUMBER(38)",
-        SqlBaseType::Integer => "NUMBER",
-        SqlBaseType::Double => "BINARY_DOUBLE",
-        SqlBaseType::Boolean => "NUMBER(1)",
-        SqlBaseType::Text | SqlBaseType::Json if is_key => "VARCHAR2(1000 CHAR)",
-        SqlBaseType::Text | SqlBaseType::Json => "CLOB",
-    }
+    oracle::ignoring(ddl, codes)
 }
 
 /// Character width of each text key column when `n` of them share a primary
-/// key: an index key must fit about 6,400 bytes at an 8 KB block, and an
-/// AL32UTF8 character takes up to 4 bytes, so the key's text columns share
-/// 1,500 characters (at most 1,000 each).
+/// key (see [`oracle::key_text_width`]).
+#[cfg(test)]
 pub(crate) fn key_text_width(n: usize) -> usize {
-    (1500 / n.max(1)).min(1000)
+    oracle::key_text_width(n)
 }
 
 /// `CREATE TABLE` for `auto_columns`, from the first page's planned columns.
@@ -418,36 +333,12 @@ pub(crate) fn create_table_sql(
     columns: &[PlannedColumn],
     key: &[String],
 ) -> Result<String, FaucetError> {
-    let text_keys = columns
-        .iter()
-        .filter(|c| {
-            key.contains(&c.name) && matches!(c.base_type, SqlBaseType::Text | SqlBaseType::Json)
-        })
-        .count();
-    let mut defs = Vec::with_capacity(columns.len() + 1);
-    for c in columns {
-        let is_key = key.contains(&c.name);
-        let ty = match c.base_type {
-            SqlBaseType::Text | SqlBaseType::Json if is_key => {
-                format!("VARCHAR2({} CHAR)", key_text_width(text_keys))
-            }
-            t => column_type(t, is_key).to_string(),
-        };
-        defs.push(format!("{} {ty}", quote_ident_oracle(&c.name)?));
-    }
-    if !key.is_empty() {
-        defs.push(format!("PRIMARY KEY ({})", quote_all(key)?.join(", ")));
-    }
-    Ok(format!("CREATE TABLE {table} ({})", defs.join(", ")))
+    Oracle.create_table_sql(&target(table), columns, key)
 }
 
 /// `CREATE TABLE` for `json_column` mode.
 pub(crate) fn create_json_table_sql(table: &str, column: &str) -> Result<String, FaucetError> {
-    let id = if column == "ID" { "FAUCET_ID" } else { "ID" };
-    Ok(format!(
-        "CREATE TABLE {table} (\"{id}\" NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, {} CLOB)",
-        quote_ident_oracle(column)?
-    ))
+    Oracle.create_json_table_sql(&target(table), column)
 }
 
 /// Owner-qualify a helper object so it lives beside the target table.
@@ -467,35 +358,22 @@ pub(crate) fn token_table(table: &str) -> Result<String, FaucetError> {
 
 /// `CREATE TABLE` for the exactly-once watermark (wrap with [`ignoring`]).
 pub(crate) fn token_table_ddl(token_table: &str) -> String {
-    format!(
-        "CREATE TABLE {token_table} (\"{COMMIT_TOKEN_SCOPE_COL}\" VARCHAR2({SCOPE_COL_WIDTH} CHAR) \
-         PRIMARY KEY, \"{COMMIT_TOKEN_TOKEN_COL}\" CLOB NOT NULL, \
-         \"updated_at\" TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL)"
-    )
+    oracle::token_table_ddl(token_table)
 }
 
 /// Upsert of a scope's token (`:1` scope, `:2` token).
 pub(crate) fn token_merge_sql(token_table: &str) -> String {
-    let (s, t) = (COMMIT_TOKEN_SCOPE_COL, COMMIT_TOKEN_TOKEN_COL);
-    format!(
-        "MERGE INTO {token_table} w USING (SELECT :1 AS \"{s}\", :2 AS \"{t}\" FROM DUAL) n \
-         ON (w.\"{s}\" = n.\"{s}\") \
-         WHEN MATCHED THEN UPDATE SET w.\"{t}\" = n.\"{t}\", w.\"updated_at\" = SYSTIMESTAMP \
-         WHEN NOT MATCHED THEN INSERT (\"{s}\", \"{t}\", \"updated_at\") \
-         VALUES (n.\"{s}\", n.\"{t}\", SYSTIMESTAMP)"
-    )
+    oracle::token_merge_sql(token_table)
 }
 
 /// Remove a scope's token row (`:1` scope).
 pub(crate) fn token_delete_sql(token_table: &str) -> String {
-    format!("DELETE FROM {token_table} WHERE \"{COMMIT_TOKEN_SCOPE_COL}\" = :1")
+    oracle::token_delete_sql(token_table)
 }
 
 /// Read a scope's token (`:1` scope).
 pub(crate) fn token_select_sql(token_table: &str) -> String {
-    format!(
-        "SELECT \"{COMMIT_TOKEN_TOKEN_COL}\" FROM {token_table} WHERE \"{COMMIT_TOKEN_SCOPE_COL}\" = :1"
-    )
+    oracle::token_select_sql(token_table)
 }
 
 /// Bind values `(owner, table)` for the dictionary lookups below.
@@ -600,14 +478,7 @@ pub(crate) fn add_column_sql(
     col: &str,
     t: SqlBaseType,
 ) -> Result<String, FaucetError> {
-    Ok(ignoring(
-        &format!(
-            "ALTER TABLE {table} ADD ({} {})",
-            quote_ident_oracle(col)?,
-            column_type(t, false)
-        ),
-        &[ORA_COLUMN_EXISTS],
-    ))
+    Oracle.add_column_sql(&target(table), col, t)
 }
 
 /// Widen a column to `t`. Oracle can only widen a numeric column in place.
@@ -617,10 +488,9 @@ pub(crate) fn widen_column_sql(
     t: SqlBaseType,
 ) -> Result<String, FaucetError> {
     match t {
-        SqlBaseType::Double => Ok(format!(
-            "ALTER TABLE {table} MODIFY ({} NUMBER)",
-            quote_ident_oracle(col)?
-        )),
+        SqlBaseType::Double => Oracle
+            .alter_column_type_sql(&target(table), col, Oracle.widened_type_name(None, t))?
+            .ok_or_else(|| FaucetError::Sink(format!("oracle cannot widen column {col:?}"))),
         other => Err(FaucetError::Sink(format!(
             "oracle cannot widen column {col:?} to {other:?} in place"
         ))),
@@ -629,13 +499,9 @@ pub(crate) fn widen_column_sql(
 
 /// Relax `NOT NULL`, idempotent.
 pub(crate) fn relax_null_sql(table: &str, col: &str) -> Result<String, FaucetError> {
-    Ok(ignoring(
-        &format!(
-            "ALTER TABLE {table} MODIFY ({} NULL)",
-            quote_ident_oracle(col)?
-        ),
-        &[ORA_ALREADY_NULL],
-    ))
+    Oracle
+        .drop_not_null_sql(&target(table), col)?
+        .ok_or_else(|| FaucetError::Sink(format!("oracle cannot relax column {col:?}")))
 }
 
 /// Overwrite staging: a structural clone of the target.
@@ -691,7 +557,7 @@ pub(crate) fn swap_sql(
     staging: &str,
     cols: &[String],
 ) -> Result<[String; 2], FaucetError> {
-    let list = quote_all(cols)?.join(", ");
+    let list = Oracle.column_list(cols)?;
     Ok([
         format!("DELETE FROM {target}"),
         format!("INSERT INTO {target} ({list}) SELECT {list} FROM {staging}"),
@@ -752,14 +618,7 @@ pub(crate) fn case_records(records: &[Value], upper: bool) -> std::borrow::Cow<'
 /// stores names upper-cased, and lower-case keys from most sources would
 /// otherwise match nothing under `identifier_case: preserve` (SQL-17).
 pub(crate) fn column_for<'a>(key: &str, columns: &'a [String]) -> Option<&'a str> {
-    if let Some(c) = columns.iter().find(|c| c.as_str() == key) {
-        return Some(c);
-    }
-    let upper = key.to_uppercase();
-    columns
-        .iter()
-        .find(|c| c.as_str() == upper && c.as_str() == c.to_uppercase())
-        .map(String::as_str)
+    faucet_common_sql::mapping::column_for_field(key, columns, Oracle.column_matching())
 }
 
 /// Rename every record key that addresses a column only through

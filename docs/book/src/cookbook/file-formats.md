@@ -265,7 +265,7 @@ fallback:
 | `local-timestamp-*` | naive ISO 8601 | `Timestamp(unit)` without a zone |
 | `uuid` | canonical string | `Utf8` |
 | `duration` | `{months, days, millis}` | `Struct` |
-| `bytes` / `fixed` | lowercase hex, the same as the Arrow JSON writer | `Binary` / `FixedSizeBinary` |
+| `bytes` / `fixed` | standard base64, the same as an Arrow binary column | `Binary` / `FixedSizeBinary` |
 | `enum` | the symbol | `Utf8` |
 
 A union of `null` and one type is that type, nullable. A union of several
@@ -273,8 +273,11 @@ non-null types reads as whichever branch the value holds. On the columnar path,
 where a column has one type, it becomes a `Utf8` column holding the value's
 JSON. A recursive record is a nested object on the record path and JSON text
 on the columnar path, because Arrow has no recursive types. `NaN` and the
-infinities, which JSON cannot hold, read as the strings `"NaN"`, `"Infinity"`
-and `"-Infinity"`.
+infinities, which JSON cannot hold, read as a `null` counted in the run
+summary; on the columnar path they stay floats. These are the canonical
+renderings of [value fidelity](../reference/value-fidelity.md). A sink reads a
+`bytes` / `fixed` string as base64; `bytes_encoding: hex` (Kafka) reads the
+lowercase hex earlier releases wrote.
 
 **Writing.** A sink encodes each object against `avro.schema`, or against a
 schema inferred from that object's records:
@@ -446,7 +449,15 @@ for every field and the mapping from the old sinks' fields.
 
 The same writer (`faucet_common_file::write`) sits under the `s3`, `gcs`,
 `azure-blob` and `sftp` sinks, with a remote storage backend — so they take
-every format and option above with the same field names. The object's name
+every format and option above with the same field names. They are, in fact,
+one sink: the local `file` sink and the four remote sinks are each the shared
+`FileSink` over a storage backend (`LocalBackend`, `S3Backend`, `GcsBackend`,
+`AzureBackend`, `SftpBackend`), and so is the deprecated `parquet` sink's S3
+destination. A backend only stores finished files; every format, codec,
+encryption, rollover, `if_exists` and overwrite rule lives once, above it.
+Each backend's requests run through the run's call deadline and are metered
+as round trips, and `faucet doctor` probes the store (`HeadBucket` on S3, a
+one-object listing on GCS and Azure, opening the SSH session on SFTP). The object's name
 template is `path` (`file_name` on SFTP, whose `path` is the remote
 directory), placed after the existing `prefix`:
 

@@ -36,11 +36,31 @@ published, and Parquet schema inference, widening or an explicit schema.
 A sink maps its config onto `WriteConfig` — the one mapping every file sink
 shares (record and byte caps, `batch_size`, the path rules, the per-sink
 Parquet codec default) — which gives it the `WriteSettings` and the
-`NameTemplate`. It builds a `StorageBackend`, wraps a `FileWriter` in
-`WriterSink` (the one `Sink` implementation: batch writes, flush, the
-overwrite lifecycle, the end-of-run prune, the columnar path) and forwards its
-own `Sink` impl with `delegate_sink!`, supplying only its name, schema,
-dataset URI and `check()` through `SinkIdentity`.
+`NameTemplate`. It builds its store's `StorageBackend` and the one generic
+`FileSink<B>` over it (`FileSink::build(settings, template, backend,
+identity)`; the one `Sink` implementation: batch writes, flush, the overwrite
+lifecycle, the end-of-run prune, the columnar path), and forwards its own
+`Sink` impl with `delegate_sink!`, which forwards every hook through
+`faucet_core::forward_sink!`. The connector supplies only its name, config
+schema, dataset URI and readback source through `SinkIdentity`.
+
+Every file sink is a `FileSink` (RFC 0013, #886):
+
+| Sink | Is | Backend from |
+|---|---|---|
+| `file` | `FileSink<LocalBackend>` | this crate |
+| `s3` (and the deprecated `parquet` sink's S3 destination) | `FileSink<S3Backend>` | `faucet-common-s3` |
+| `gcs` | `FileSink<GcsBackend>` | `faucet-common-gcs` |
+| `azure-blob` | `FileSink<AzureBackend>` | `faucet-common-azure` |
+| `sftp` | `FileSink<SftpBackend>` | `faucet-common-sftp` |
+
+So every one of them writes every format, compression, encryption, rollover,
+`if_exists` and `write_mode: overwrite` behaviour the same way. A backend's
+requests run through the run's call context and report to its round-trip
+recorder (`StorageBackend::set_call_context` / `set_roundtrip_recorder`), and
+its `check` is the sink's preflight probe; the identity's `check` answers
+only when the backend has none (the local `file` sink). `WriterSink` is the
+same sink with the backend type left unnamed, built from a `FileWriter`.
 
 Every writer method is `async`: encoding runs on the calling task, storage I/O
 is awaited, so a cancelled run stops waiting on a hung upload. A failure that
@@ -58,6 +78,7 @@ flush fails.
 | `prepare(area)` | create the directory, remove this output's crash leftovers |
 | `part_size()` / `open_stream(area, name)` | upload a line format in parts while it is written |
 | `describe`, `local_path` | messages, local-output previews |
+| `set_call_context` / `set_roundtrip_recorder` / `check` | the run's call context and recorder for every request; a preflight probe (`None`: the sink's own) |
 
 `LocalBackend` is the local-filesystem backend the `file` sink uses: scratch
 files beside the destination, `fsync`, and a rename into place, each call on
@@ -65,7 +86,9 @@ Tokio's blocking pool. `RemoteBackend` turns an `ObjectClient` (list, exists,
 download, upload, delete, rename) into a backend with a private scratch
 directory and up to `concurrency` background uploads; a `MultipartClient`
 lets JSON Lines and raw text go up in parts as they are written, so neither
-memory nor scratch disk grows with the object.
+memory nor scratch disk grows with the object. A store's common crate wraps a
+`RemoteBackend` over its `ObjectClient` in its own named backend type and
+forwards the trait with `delegate_storage_backend!`.
 
 The overwrite swap writes a `.faucet-swap` marker when it starts and a
 `.faucet-commit` marker listing the files before the first one moves, so a move

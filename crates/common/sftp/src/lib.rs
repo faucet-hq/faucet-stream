@@ -28,6 +28,10 @@
 //! password or key passphrase, so a `Debug`-formatted
 //! [`SftpConnectionConfig`] is safe to log.
 
+mod backend;
+
+pub use backend::{SftpBackend, SftpBackendBuilder};
+
 use std::sync::Arc;
 
 use faucet_core::FaucetError;

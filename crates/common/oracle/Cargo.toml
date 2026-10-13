@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-sql.workspace = true
 oracle = { workspace = true, features = ["chrono"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

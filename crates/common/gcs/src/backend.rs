@@ -1,4 +1,5 @@
-//! The GCS [`ObjectClient`] behind the shared file writer (#777).
+//! [`GcsBackend`]: the shared file writer's storage on a GCS bucket (#777,
+//! #886), over the GCS [`ObjectClient`].
 //!
 //! Uploads stream the finished local file; past the client's resumable
 //! threshold that is a resumable upload, which GCS finalises only once every
@@ -10,21 +11,23 @@
 //! it (#783).
 
 use async_trait::async_trait;
-use faucet_common_file::write::{ObjectClient, content_type};
+use faucet_common_file::write::{NameTemplate, ObjectClient, RemoteBackend, content_type};
 use faucet_core::CallExt as _;
 use faucet_core::FaucetError;
+use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::observability::RoundtripRecorder;
 use google_cloud_gax::paginator::ItemPaginator as _;
 use google_cloud_storage::client::{Storage, StorageControl};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) struct GcsObjects {
-    pub storage: Storage,
-    pub control: StorageControl,
-    pub bucket: String,
-    pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+struct GcsObjects {
+    storage: Storage,
+    control: StorageControl,
+    bucket: String,
+    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
     /// The run's call context (#880) every request runs through, once.
-    pub calls: Arc<faucet_core::CallSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -33,7 +36,7 @@ fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
 
 /// A rename's rewrite is resumed at most this many times before it fails:
 /// a server that never reports `done` would otherwise loop forever.
-pub(crate) const MAX_REWRITE_CALLS: usize = 1000;
+pub const MAX_REWRITE_CALLS: usize = 1000;
 
 /// The HTTP status a client error stands for: its own, or the equivalent of
 /// a retryable gRPC code.
@@ -50,7 +53,7 @@ fn status_of(e: &google_cloud_storage::Error) -> Option<u16> {
 }
 
 /// Whether a client error means "no such object".
-pub(crate) fn is_not_found(e: &google_cloud_storage::Error) -> bool {
+fn is_not_found(e: &google_cloud_storage::Error) -> bool {
     e.http_status_code() == Some(404)
         || e.status()
             .is_some_and(|s| s.code == google_cloud_gax::error::rpc::Code::NotFound)
@@ -136,7 +139,7 @@ impl ObjectClient for GcsObjects {
     }
 
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
-        let (file, crc) = faucet_common_gcs::open_with_crc32c(from)
+        let (file, crc) = crate::open_with_crc32c(from)
             .await
             .map_err(|e| err("open local file", key, e))?;
         self.roundtrips.record("put");
@@ -201,6 +204,154 @@ impl ObjectClient for GcsObjects {
         }
         self.delete(from).await
     }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    /// A non-mutating `list_objects` capped at one result: the bucket is
+    /// reachable and the credentials work.
+    async fn check(&self, ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+        let started = std::time::Instant::now();
+        let request = self
+            .control
+            .list_objects()
+            .set_parent(self.bucket_path())
+            .set_page_size(1_i32);
+        let sent = request.send().within(&self.calls, "list");
+        let probe = match tokio::time::timeout(ctx.timeout, sent).await {
+            Ok(Err(e)) => Probe::fail("auth", started.elapsed(), e.to_string()),
+            Ok(Ok(Ok(_))) => Probe::pass("auth", started.elapsed()),
+            Ok(Ok(Err(e))) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check bucket name, credentials, and network",
+            ),
+            Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
+        };
+        Ok(Some(CheckReport::single(probe)))
+    }
+}
+
+/// A [`StorageBackend`](faucet_common_file::write::StorageBackend) on a GCS
+/// bucket.
+///
+/// Each file is built in a local scratch file and published with one
+/// upload — resumable past the client's threshold, finalised only once
+/// every byte arrived — carrying its CRC32C so the store verifies it. A move
+/// into place is a `rewrite` (resumed until done, at most
+/// [`MAX_REWRITE_CALLS`] calls) and a delete.
+///
+/// Every request runs through the run's call context (#880) and reports to
+/// its round-trip recorder; the preflight probe lists one object.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+pub struct GcsBackend {
+    remote: RemoteBackend,
+    objects: Arc<GcsObjects>,
+}
+
+faucet_common_file::delegate_storage_backend!(GcsBackend, remote);
+
+impl GcsBackend {
+    /// Start building a backend on `bucket` through the two clients
+    /// ([`build_storage`](crate::build_storage) and
+    /// [`build_storage_control`](crate::build_storage_control)).
+    pub fn builder(
+        storage: Storage,
+        control: StorageControl,
+        bucket: impl Into<String>,
+    ) -> GcsBackendBuilder {
+        GcsBackendBuilder {
+            storage,
+            control,
+            bucket: bucket.into(),
+            concurrency: 1,
+            scratch_dir: None,
+        }
+    }
+
+    /// The control-plane client.
+    pub fn control(&self) -> &StorageControl {
+        &self.objects.control
+    }
+
+    /// The bucket.
+    pub fn bucket(&self) -> &str {
+        &self.objects.bucket
+    }
+
+    /// The generic remote backend this one is built on.
+    pub fn remote(&self) -> &RemoteBackend {
+        &self.remote
+    }
+}
+
+impl std::fmt::Debug for GcsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsBackend")
+            .field("bucket", &self.objects.bucket)
+            .field("base", &self.remote.base())
+            .finish()
+    }
+}
+
+/// Builds a [`GcsBackend`].
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+#[must_use]
+pub struct GcsBackendBuilder {
+    storage: Storage,
+    control: StorageControl,
+    bucket: String,
+    concurrency: usize,
+    scratch_dir: Option<PathBuf>,
+}
+
+impl GcsBackendBuilder {
+    /// Objects uploaded at once. Default 1.
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
+
+    /// Where files are built before they are uploaded. Default: the system
+    /// temporary directory.
+    pub fn scratch_dir(mut self, dir: Option<&Path>) -> Self {
+        self.scratch_dir = dir.map(Path::to_path_buf);
+        self
+    }
+
+    /// The backend for keys `base` + a name `template` produces.
+    pub fn build(
+        self,
+        base: impl Into<String>,
+        template: &NameTemplate,
+    ) -> Result<GcsBackend, FaucetError> {
+        let objects = Arc::new(GcsObjects {
+            storage: self.storage,
+            control: self.control,
+            bucket: self.bucket,
+            roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .with_roundtrip_metering(false),
+            )),
+        });
+        let remote =
+            RemoteBackend::new(objects.clone(), base, template, self.scratch_dir.as_deref())?
+                .with_upload_concurrency(self.concurrency);
+        Ok(GcsBackend { remote, objects })
+    }
 }
 
 #[cfg(test)]
@@ -208,12 +359,10 @@ mod tests {
     use super::*;
 
     async fn objects(host: &str) -> GcsObjects {
-        let creds = faucet_common_gcs::GcsCredentials::Anonymous;
+        let creds = crate::GcsCredentials::Anonymous;
         GcsObjects {
-            storage: faucet_common_gcs::build_storage(&creds, Some(host))
-                .await
-                .unwrap(),
-            control: faucet_common_gcs::build_storage_control(&creds, Some(host))
+            storage: crate::build_storage(&creds, Some(host)).await.unwrap(),
+            control: crate::build_storage_control(&creds, Some(host))
                 .await
                 .unwrap(),
             bucket: "b".into(),
@@ -292,7 +441,7 @@ mod tests {
         let server = MockServer::start().await;
         let body = b"{\"a\":1}\n";
         let encoded = base64::engine::general_purpose::STANDARD
-            .encode(faucet_common_gcs::crc32c_of_bytes(body).to_be_bytes());
+            .encode(crate::crc32c_of_bytes(body).to_be_bytes());
         Mock::given(method("POST"))
             .and(path("/upload/storage/v1/b/b/o"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -319,6 +468,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_backend_names_keys_and_probes_with_one_listing() {
+        use faucet_common_file::write::{Area, StorageBackend};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/storage/v1/b/b/o"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let creds = crate::GcsCredentials::Anonymous;
+        let host = Some(server.uri());
+        let template = NameTemplate::from_path(
+            "x.jsonl",
+            faucet_core::FileFormat::JsonLines,
+            faucet_core::Compression::None,
+            false,
+        )
+        .unwrap()
+        .1;
+        let backend = GcsBackend::builder(
+            crate::build_storage(&creds, host.as_deref()).await.unwrap(),
+            crate::build_storage_control(&creds, host.as_deref())
+                .await
+                .unwrap(),
+            "b",
+        )
+        .concurrency(2)
+        .scratch_dir(None)
+        .build("pre/", &template)
+        .unwrap();
+        assert_eq!(backend.bucket(), "b");
+        assert_eq!(
+            backend.describe(Area::Destination, "x.jsonl"),
+            "gs://b/pre/x.jsonl"
+        );
+        assert_eq!(backend.remote().upload_concurrency(), 2);
+        assert!(format!("{backend:?}").contains("GcsBackend"));
+        let _ = backend.control();
+        backend.set_call_context(faucet_core::CallContext::new());
+        backend.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Sink,
+                "p",
+                "r",
+                "gcs",
+            ),
+        ));
+        let report = backend
+            .check(&CheckContext::default())
+            .await
+            .unwrap()
+            .expect("a probe");
+        assert_eq!(report.failed_count(), 0, "{report:?}");
+    }
+
     #[test]
     fn grpc_codes_map_to_their_http_status() {
         use google_cloud_gax::error::rpc::{Code, Status};
@@ -331,15 +538,11 @@ mod tests {
 
     #[tokio::test]
     async fn uploading_a_missing_local_file_names_the_step_and_the_key() {
-        let creds = faucet_common_gcs::GcsCredentials::Anonymous;
+        let creds = crate::GcsCredentials::Anonymous;
         let host = Some("http://127.0.0.1:9");
         let o = GcsObjects {
-            storage: faucet_common_gcs::build_storage(&creds, host)
-                .await
-                .unwrap(),
-            control: faucet_common_gcs::build_storage_control(&creds, host)
-                .await
-                .unwrap(),
+            storage: crate::build_storage(&creds, host).await.unwrap(),
+            control: crate::build_storage_control(&creds, host).await.unwrap(),
             bucket: "b".into(),
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
             calls: Arc::new(faucet_core::CallSlot::default()),

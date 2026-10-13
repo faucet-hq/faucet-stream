@@ -387,6 +387,11 @@ ORC is read-only, so there is no `orc` format here. Enable with
 
 ## Shared file writer (#777)
 
+The sink is the shared `FileSink<GcsBackend>` (RFC 0013, #886): the one `Sink`
+implementation every file sink is — the local `file` sink over the local
+file system, this one over the `GcsBackend` in
+[`faucet-common-gcs`](https://crates.io/crates/faucet-common-gcs). Its preflight probe is the backend's one-object listing.
+
 This sink writes through the same file-writing layer as the local
 [`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
 format and option the file sink does, with the same field names:

@@ -160,6 +160,20 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record this sink encodes reads
+    /// back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes: Vec<u8> = encode_payload(record, ValueFormat::Json).unwrap();
+            landed.push(faucet_core::fidelity::from_slice(&bytes).unwrap());
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     use serde_json::json;
 
     #[test]

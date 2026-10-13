@@ -90,3 +90,14 @@ Append only. `faucet list --json` prints the declaration.
 ## Timeouts, cancellation and retries
 
 Every page write runs through the pipeline's `CallContext` (#880): the run's deadline ends it promptly, and a write cut short is interrupted inside DuckDB so its transaction rolls back. Each write counts as one `write` round trip in `faucet_sink_roundtrips_total`. The sink never retries a write itself.
+
+## Shared SQL layer
+
+This sink takes its row planning — the engine's column mapping (exact first, else ignoring ASCII case), union column set and `INSERT` statements — and its quoting, types and DDL from the `Duckdb` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. The driver is blocking, so the planned statements run on `spawn_blocking` here rather than through the async executor; adding columns for new fields stays sink-specific.
+
+## Value fidelity
+
+A non-integer JSON number is bound as its shortest decimal text, which DuckDB
+casts exactly into a `DECIMAL` or `DOUBLE` column. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).

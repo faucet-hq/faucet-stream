@@ -12,6 +12,8 @@ use serde_json::Value;
 use tiberius::ToSql;
 
 use faucet_common_mssql::{MssqlPool, MssqlPooledConnection, build_pool, quote_ident_mssql};
+use faucet_common_sql::dialects::Mssql;
+use faucet_common_sql::{SqlDialect, TableTarget};
 
 /// Width of the watermark table's `scope` PRIMARY KEY column. SQL Server's index
 /// key budget is 900 bytes = 450 UTF-16 chars, so the column cannot be
@@ -173,14 +175,10 @@ impl MssqlSink {
         let MssqlColumnMapping::JsonColumn { column } = &self.config.column_mapping else {
             return Ok(());
         };
-        let col = quote_ident_mssql(column)?;
-        let sql = tolerate_concurrent_create(&format!(
-            "IF OBJECT_ID(N'{}', N'U') IS NULL \
-             CREATE TABLE {} (id BIGINT IDENTITY(1,1) PRIMARY KEY, {} NVARCHAR(MAX))",
-            self.config.table.replace('\'', "''"),
-            self.table_quoted,
-            col
-        ));
+        let sql = tolerate_concurrent_create(&Mssql.create_json_table_sql(
+            &TableTarget::new(&self.config.table, &self.table_quoted),
+            column,
+        )?);
         self.run_ddl(&sql, "create_table").await
     }
 
@@ -477,22 +475,10 @@ impl MssqlSink {
         &self,
         conn: &mut MssqlPooledConnection<'_>,
     ) -> Result<(), FaucetError> {
-        // NVARCHAR(450) is the maximum SQL Server index key byte budget (900 B /
-        // 2 bytes-per-char = 450 chars) — fine for the PRIMARY KEY `scope`. The
-        // `token` column is `NVARCHAR(MAX)` because a `#291` commit token embeds
-        // the page's resume bookmark (`{20-digit seq}#{bookmark-json}`) and
-        // exceeds the old `NVARCHAR(32)`, which raised "String or binary data
-        // would be truncated" and broke exactly-once delivery (audit #321 C4).
-        // The table / column names are the fixed constants — no user-controlled
-        // input in this string.
-        let sql = tolerate_concurrent_create(&format!(
-            "IF OBJECT_ID(N'{tbl}', N'U') IS NULL \
-             CREATE TABLE [{tbl}] ([scope] NVARCHAR({w}) PRIMARY KEY, \
-             [token] NVARCHAR(MAX) NOT NULL, \
-             [updated_at] DATETIME2 DEFAULT SYSUTCDATETIME())",
-            tbl = faucet_core::idempotency::COMMIT_TOKEN_TABLE,
-            w = SCOPE_COL_WIDTH,
-        ));
+        // `scope` is NVARCHAR(SCOPE_COL_WIDTH), the 900-byte index key budget;
+        // `token` is NVARCHAR(MAX) because a `#291` commit token embeds the
+        // page's resume bookmark (audit #321 C4).
+        let sql = tolerate_concurrent_create(&Mssql.commit_token_table_sql());
         self.control(conn, &sql).await
     }
 
@@ -905,10 +891,6 @@ fn control_op(stmt: &str) -> &'static str {
     }
 }
 
-/// Map a [`SqlBaseType`](faucet_core::SqlBaseType) to the MSSQL type keyword used when adding/widening a
-/// column during schema evolution (issue #194). Integers widen to `BIGINT` and
-/// floats to `FLOAT` so a later, wider value never overflows a narrower column;
-/// text/json land in `NVARCHAR(MAX)`.
 /// `IF OBJECT_ID(...) IS NULL CREATE TABLE` for an `auto_columns` target
 /// (#580). NVARCHAR(MAX) cannot be indexed, so key columns get a bounded type,
 /// and a keyed write gets a PRIMARY KEY so MERGE has a target on a first run
@@ -919,27 +901,7 @@ fn build_create_table_sql(
     columns: &[faucet_core::PlannedColumn],
     key: &[String],
 ) -> Result<String, FaucetError> {
-    let mut rendered: Vec<String> = Vec::with_capacity(columns.len() + 1);
-    for c in columns {
-        let ty = if key.contains(&c.name) {
-            mssql_key_keyword(c.base_type)
-        } else {
-            mssql_keyword(c.base_type)
-        };
-        rendered.push(format!("{} {ty}", quote_ident_mssql(&c.name)?));
-    }
-    if !key.is_empty() {
-        let cols = key
-            .iter()
-            .map(|k| quote_ident_mssql(k))
-            .collect::<Result<Vec<_>, _>>()?;
-        rendered.push(format!("PRIMARY KEY ({})", cols.join(", ")));
-    }
-    Ok(format!(
-        "IF OBJECT_ID(N'{}', N'U') IS NULL CREATE TABLE {table_quoted} ({})",
-        table_literal.replace('\'', "''"),
-        rendered.join(", ")
-    ))
+    Mssql.create_table_sql(&TableTarget::new(table_literal, table_quoted), columns, key)
 }
 
 /// Wrap an `IF OBJECT_ID(...) IS NULL CREATE TABLE` so a concurrent creator
@@ -962,51 +924,16 @@ fn sp_rename_sql(from_literal: &str, to_table: &str) -> String {
     )
 }
 
-/// The type for a primary-key column of a created table (#676): SQL Server
-/// cannot index `NVARCHAR(MAX)`, and 450 characters is its 900-byte key limit.
-fn mssql_key_keyword(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Text | Json => "NVARCHAR(450)",
-        other => mssql_keyword(other),
-    }
-}
-
-fn mssql_keyword(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "BIGINT",
-        Double => "FLOAT",
-        Boolean => "BIT",
-        Text => "NVARCHAR(MAX)",
-        Json => "NVARCHAR(MAX)",
-    }
-}
-
-/// Build an idempotent `ADD COLUMN`. T-SQL has no `ADD COLUMN IF NOT EXISTS`, so
-/// guard with `IF NOT EXISTS (SELECT 1 FROM sys.columns …)`.
-///
-/// `table_quoted` is the already-bracket-quoted relation (`[dbo].[events]`).
-/// `table_literal` is the bare (un-quoted) table name used inside the
-/// `OBJECT_ID(N'…')` lookup — the caller passes `self.config.table` so it
-/// resolves the same relation the DDL targets. Both `table_literal` and `col`
-/// are single-quote-escaped for their `N'…'` string literals; `col` is also
-/// bracket-quoted for the `ADD` clause via [`quote_ident_mssql`].
+/// Build an idempotent `ADD COLUMN` (guarded by `sys.columns`; T-SQL has no
+/// `ADD COLUMN IF NOT EXISTS`). `table_quoted` is the bracket-quoted relation,
+/// `table_literal` the bare name its `OBJECT_ID(N'…')` lookup resolves.
 fn build_add_column_sql(
     table_quoted: &str,
     table_literal: &str,
     col: &str,
     t: faucet_core::SqlBaseType,
 ) -> Result<String, FaucetError> {
-    let qcol = quote_ident_mssql(col)?;
-    Ok(format!(
-        "IF NOT EXISTS (SELECT 1 FROM sys.columns \
-         WHERE object_id = OBJECT_ID(N'{}') AND name = N'{}') \
-         ALTER TABLE {table_quoted} ADD {qcol} {}",
-        table_literal.replace('\'', "''"),
-        col.replace('\'', "''"),
-        mssql_keyword(t),
-    ))
+    Mssql.add_column_sql(&TableTarget::new(table_literal, table_quoted), col, t)
 }
 
 /// The type an evolving column widens to. An integer column that starts
@@ -1017,11 +944,19 @@ fn widened_keyword(
     from: Option<faucet_core::SqlBaseType>,
     to: faucet_core::SqlBaseType,
 ) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match (from, to) {
-        (Some(Integer), Double) => "DECIMAL(38,10)",
-        (_, other) => mssql_keyword(other),
-    }
+    Mssql.widened_type_name(from, to)
+}
+
+/// The bounded type of a created primary-key column (`NVARCHAR(MAX)` cannot
+/// be indexed).
+#[cfg(test)]
+fn mssql_key_keyword(t: faucet_core::SqlBaseType) -> &'static str {
+    Mssql.key_type_name(t)
+}
+
+#[cfg(test)]
+fn mssql_keyword(t: faucet_core::SqlBaseType) -> &'static str {
+    Mssql.type_name(t)
 }
 
 /// The nullability a widened column keeps: a widening that gains `null`
@@ -1658,6 +1593,12 @@ impl Sink for MssqlSink {
         &self,
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
+        // Read before checking out the DDL connection (a one-connection pool).
+        let current = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
+            Vec::new()
+        } else {
+            self.discover_column_types().await?
+        };
         let mut conn = self.checkout().await?;
 
         for c in &evolution.additions {
@@ -1668,11 +1609,6 @@ impl Sink for MssqlSink {
                 FaucetError::Sink(format!("MSSQL ADD COLUMN {} failed: {e}", c.name))
             })?;
         }
-        let current = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
-            Vec::new()
-        } else {
-            self.discover_column_types().await?
-        };
         for c in &evolution.widenings {
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
@@ -1727,10 +1663,7 @@ impl Sink for MssqlSink {
         let mut conn = self.checkout().await?;
         self.ensure_commit_table(&mut conn).await?;
         for scope_owned in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
-            let sql = format!(
-                "SELECT [token] FROM [{}] WHERE [scope] = @P1",
-                faucet_core::idempotency::COMMIT_TOKEN_TABLE
-            );
+            let sql = Mssql.commit_token_select_sql();
             let rows = self
                 .on_conn(&mut conn, "query", true, async |c| {
                     c.query(&sql, &[&scope_owned])
@@ -1825,14 +1758,7 @@ impl Sink for MssqlSink {
         };
 
         // UPSERT the commit token atomically with the data rows.
-        let merge = format!(
-            "MERGE [{tbl}] AS t \
-             USING (SELECT @P1 AS [scope], @P2 AS [token]) AS s \
-             ON t.[scope] = s.[scope] \
-             WHEN MATCHED THEN UPDATE SET t.[token] = s.[token], t.[updated_at] = SYSUTCDATETIME() \
-             WHEN NOT MATCHED THEN INSERT ([scope], [token]) VALUES (s.[scope], s.[token]);",
-            tbl = faucet_core::idempotency::COMMIT_TOKEN_TABLE,
-        );
+        let merge = Mssql.commit_token_upsert_sql();
         let (scope_owned, token_owned) = (scope_key(scope), token.to_string());
         let refs: Vec<&dyn ToSql> = vec![&scope_owned, &token_owned];
         let merged = self

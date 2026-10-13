@@ -405,6 +405,12 @@ any caller deadline ends it (an abandoned statement is cancelled on the
 warehouse), and each is metered as a round trip (`submit`, `poll`, `stage`).
 The HTTP client's connect / idle-read timeouts and `poll_timeout` are unchanged.
 
+## Shared SQL layer
+
+This sink takes its literal escaping and create-table text from the `Snowflake` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Rows travel as one JSON payload per statement through the SQL API (`PARSE_JSON` + `FLATTEN`) or a staged `COPY INTO`, so there is no per-cell statement for the engine to plan.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

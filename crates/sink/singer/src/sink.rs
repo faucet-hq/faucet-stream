@@ -442,6 +442,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The value-fidelity corpus (#885): the `RECORD` lines this sink writes for the corpus
+    /// parse back to the records unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let mut line = Vec::new();
+            faucet_common_singer::message::write_record(&mut line, "s", record, None);
+            match faucet_common_singer::parse_line(std::str::from_utf8(&line).unwrap()).unwrap() {
+                faucet_common_singer::SingerMessage::Record { record, .. } => landed.push(record),
+                other => panic!("expected a RECORD, got {other:?}"),
+            }
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     fn sink(v: Value) -> SingerSink {
         SingerSink::new(serde_json::from_value(v).unwrap()).unwrap()
     }

@@ -1,4 +1,5 @@
-//! The SFTP [`ObjectClient`] behind the shared file writer (#777).
+//! [`SftpBackend`]: the shared file writer's storage on an SFTP server (#777,
+//! #886), over the SFTP [`ObjectClient`].
 //!
 //! A file is uploaded to a hidden temporary name beside its destination and
 //! renamed into place, so a reader never sees a partial file. A server with
@@ -11,15 +12,17 @@
 //! the sink. Only the server's typed "no such file" status means "missing";
 //! every other stat or remove failure is an error (#783).
 
-use async_trait::async_trait;
-use faucet_common_file::write::ObjectClient;
-use faucet_common_sftp::{
+use crate::{
     SftpConnection, SftpConnectionConfig, SftpError, connect_with_extensions, is_no_such_file,
 };
+use async_trait::async_trait;
+use faucet_common_file::write::{NameTemplate, ObjectClient, RemoteBackend};
 use faucet_core::FaucetError;
+use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::observability::RoundtripRecorder;
 use russh_sftp::protocol::OpenFlags;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -29,8 +32,8 @@ use tokio::sync::Mutex;
 /// carries a full packet instead of an 8 KiB slice.
 const COPY_BUF: usize = 1024 * 1024;
 
-pub(crate) struct SftpObjects {
-    pub connection: SftpConnectionConfig,
+struct SftpObjects {
+    connection: SftpConnectionConfig,
     session: Mutex<Option<Arc<SftpConnection>>>,
     /// Directories known to exist, so an upload does not stat its parents
     /// again.
@@ -39,7 +42,7 @@ pub(crate) struct SftpObjects {
     /// cover the plain-`RENAME` fallback against a server that has it).
     posix_rename: bool,
     /// The run's call context (#880): every operation runs through it, once.
-    pub calls: Arc<faucet_core::CallSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 fn err(what: &str, path: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -56,7 +59,7 @@ fn missing(what: &str, path: &str, e: SftpError) -> Result<bool, FaucetError> {
 }
 
 /// The directory and file-name prefix of a key prefix.
-pub(crate) fn split_prefix(prefix: &str) -> (String, &str) {
+fn split_prefix(prefix: &str) -> (String, &str) {
     match prefix.rfind('/') {
         Some(0) => ("/".to_string(), &prefix[1..]),
         Some(i) => (prefix[..i].to_string(), &prefix[i + 1..]),
@@ -91,7 +94,7 @@ fn ancestors(dir: &str) -> Vec<String> {
 }
 
 impl SftpObjects {
-    pub(crate) fn new(connection: SftpConnectionConfig) -> Self {
+    fn new(connection: SftpConnectionConfig) -> Self {
         Self {
             connection,
             session: Mutex::new(None),
@@ -214,6 +217,37 @@ impl ObjectClient for SftpObjects {
             .call_once("copy", self.rename_now(from, to))
             .await
     }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    /// Open (or reuse) the SSH session: the server is reachable, its host
+    /// key is trusted and the credentials work. Writes nothing.
+    async fn check(&self, ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+        let started = std::time::Instant::now();
+        let connected = tokio::time::timeout(
+            ctx.timeout,
+            self.calls
+                .call_once("head", async { self.connection().await.map(|_| ()) }),
+        )
+        .await;
+        let probe = match connected {
+            Ok(Ok(())) => Probe::pass("auth", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check host, port, credentials, host-key policy, and network",
+            ),
+            Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
+        };
+        Ok(Some(CheckReport::single(probe)))
+    }
 }
 
 /// The operations behind [`ObjectClient`], each run as one call.
@@ -315,9 +349,143 @@ impl SftpObjects {
     }
 }
 
+/// A [`StorageBackend`](faucet_common_file::write::StorageBackend) on a
+/// directory of an SFTP server.
+///
+/// Each file is built in a local scratch file and uploaded to a hidden
+/// temporary name beside its destination, then renamed into place
+/// (`posix-rename` when the server has it), so a reader never sees a partial
+/// file. Missing directories are created. The SSH session is opened on first
+/// use and reused for the backend's life.
+///
+/// Every operation runs through the run's call context (#880) and reports
+/// to its round-trip recorder; the preflight probe opens the session.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+pub struct SftpBackend {
+    remote: RemoteBackend,
+    objects: Arc<SftpObjects>,
+}
+
+faucet_common_file::delegate_storage_backend!(SftpBackend, remote);
+
+impl SftpBackend {
+    /// Start building a backend on the server `connection` names. Opens no
+    /// connection.
+    pub fn builder(connection: SftpConnectionConfig) -> SftpBackendBuilder {
+        SftpBackendBuilder {
+            connection,
+            concurrency: 1,
+            scratch_dir: None,
+        }
+    }
+
+    /// The connection config.
+    pub fn connection(&self) -> &SftpConnectionConfig {
+        &self.objects.connection
+    }
+
+    /// The generic remote backend this one is built on.
+    pub fn remote(&self) -> &RemoteBackend {
+        &self.remote
+    }
+}
+
+impl std::fmt::Debug for SftpBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SftpBackend")
+            .field("host", &self.objects.connection.host)
+            .field("port", &self.objects.connection.port)
+            .field("base", &self.remote.base())
+            .finish()
+    }
+}
+
+/// Builds an [`SftpBackend`].
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+#[must_use]
+pub struct SftpBackendBuilder {
+    connection: SftpConnectionConfig,
+    concurrency: usize,
+    scratch_dir: Option<PathBuf>,
+}
+
+impl SftpBackendBuilder {
+    /// Files uploaded at once over the one session. Default 1.
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
+
+    /// Where files are built before they are uploaded. Default: the system
+    /// temporary directory.
+    pub fn scratch_dir(mut self, dir: Option<&Path>) -> Self {
+        self.scratch_dir = dir.map(Path::to_path_buf);
+        self
+    }
+
+    /// The backend for remote paths `base` + a name `template` produces.
+    pub fn build(
+        self,
+        base: impl Into<String>,
+        template: &NameTemplate,
+    ) -> Result<SftpBackend, FaucetError> {
+        let objects = Arc::new(SftpObjects::new(self.connection));
+        let remote =
+            RemoteBackend::new(objects.clone(), base, template, self.scratch_dir.as_deref())?
+                .with_upload_concurrency(self.concurrency);
+        Ok(SftpBackend { remote, objects })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_backend_is_lazy_and_probes_by_connecting() {
+        use faucet_common_file::write::{Area, StorageBackend};
+        let template = NameTemplate::from_path(
+            "x.jsonl",
+            faucet_core::FileFormat::JsonLines,
+            faucet_core::Compression::None,
+            false,
+        )
+        .unwrap()
+        .1;
+        let mut conn = SftpConnectionConfig::with_password("127.0.0.1", "u", "p");
+        conn.port = 1;
+        let backend = SftpBackend::builder(conn)
+            .concurrency(2)
+            .scratch_dir(None)
+            .build("/out/", &template)
+            .unwrap();
+        assert_eq!(
+            backend.describe(Area::Destination, "x.jsonl"),
+            "sftp://127.0.0.1:1/out/x.jsonl"
+        );
+        assert_eq!(backend.connection().port, 1);
+        assert_eq!(backend.remote().upload_concurrency(), 2);
+        assert!(format!("{backend:?}").contains("SftpBackend"));
+        backend.set_call_context(faucet_core::CallContext::new());
+        backend.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "sftp",
+        )));
+        let report = backend
+            .check(&CheckContext {
+                timeout: std::time::Duration::from_secs(3),
+            })
+            .await
+            .unwrap()
+            .expect("a probe");
+        assert_eq!(report.failed_count(), 1, "{report:?}");
+    }
 
     #[test]
     fn prefixes_split_into_directory_and_name_start() {
@@ -334,7 +502,7 @@ mod tests {
         assert_eq!(o.describe("/out/a.jsonl"), "sftp://h:22/out/a.jsonl");
     }
 
-    fn status(code: faucet_common_sftp::StatusCode) -> SftpError {
+    fn status(code: crate::StatusCode) -> SftpError {
         SftpError::Status(russh_sftp::protocol::Status {
             id: 1,
             status_code: code,
@@ -345,7 +513,7 @@ mod tests {
 
     #[test]
     fn only_no_such_file_means_missing() {
-        use faucet_common_sftp::StatusCode;
+        use crate::StatusCode;
         assert!(!missing("stat", "/p", status(StatusCode::NoSuchFile)).unwrap());
         let e = missing("stat", "/p", status(StatusCode::PermissionDenied))
             .unwrap_err()

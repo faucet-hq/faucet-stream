@@ -145,7 +145,13 @@ async fn a_flat_wide_row_survives_the_auto_mapped_round_trip() {
                 None => Value::Null,
                 // Every column is declared TEXT, so a value arrives as the
                 // sink's rendering of it. Parse it back to compare by value.
-                Some(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
+                // A decimal written at a scale (`1.50`) keeps its text: parsed
+                // as a number its trailing zeros would be lost.
+                Some(t) => match faucet_core::fidelity::from_str(&t) {
+                    Ok(v) if v.is_number() && is_scaled_decimal(&t) => Value::String(t),
+                    Ok(v) => v,
+                    Err(_) => Value::String(t),
+                },
             },
         );
     }
@@ -224,4 +230,12 @@ async fn a_deliberately_corrupted_read_back_is_caught() {
     let mismatches = fidelity::diff_round_trip(&sent, &landed, &Tolerance::exact());
     assert_eq!(mismatches.len(), 1, "{mismatches:?}");
     assert_eq!(mismatches[0].field, "i64_max");
+}
+
+/// A plain decimal literal with trailing fraction zeros (`1.50`), which a
+/// number cannot carry.
+fn is_scaled_decimal(t: &str) -> bool {
+    !t.contains(['e', 'E'])
+        && t.split_once('.')
+            .is_some_and(|(_, frac)| frac.len() > 1 && frac.ends_with('0'))
 }

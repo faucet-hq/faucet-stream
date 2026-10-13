@@ -133,10 +133,10 @@ its bookmark does not cover.
 destination:
   type: s3
   bucket: my-bucket
-  prefix: events/                       # each object is <prefix><uuid>.parquet
+  prefix: events/                       # each object is <prefix><run id>-<part>.parquet
   region: us-east-1                     # optional; defaults to the AWS chain
   endpoint_url: http://localhost:4566   # optional; MinIO / LocalStack
-  allow_http: true                      # required for http:// endpoints
+  allow_http: true                      # accepted; http:// endpoints work without it
 ```
 
 | `ParquetS3Destination` field | Type | Default | Description |
@@ -145,9 +145,21 @@ destination:
 | `prefix` | string | `""` | Key prefix for written objects. Empty writes to the bucket root. |
 | `region` | string | *(SDK default)* | AWS region. |
 | `endpoint_url` | string | *(none)* | Custom endpoint for S3-compatible services. |
-| `allow_http` | bool | `false` | Allow non-HTTPS endpoints. Required when `endpoint_url` is `http://`. |
+| `allow_http` | bool | `false` | Accepted for compatibility; an `http://` `endpoint_url` works without it. |
 
-S3 credentials follow the standard `aws_config` / `object_store` AWS chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, profile, instance metadata).
+S3 credentials follow the standard AWS SDK chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, profile, instance metadata).
+
+An S3 destination writes through the shared file writer: it is a
+`FileSink<S3Backend>` (RFC 0013, #886) — the same sink as
+[`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3) with
+`format: parquet` — so each object is built locally and published with one
+upload (a multipart upload past 8 MiB, aborted on failure) at `flush` or at
+`max_rows_per_file` / `max_bytes_per_file` (encoded bytes). The schema is
+inferred from each object's first page and **widened** by later pages, so no
+field is dropped. `schema: { type: explicit }` is refused, as on a local
+destination, and `faucet doctor` probes the bucket with a non-mutating
+`HeadBucket`. The local-destination notes below (sampling, dropped fields,
+`object_store` multipart) apply to `local_path` only.
 
 ## Examples
 

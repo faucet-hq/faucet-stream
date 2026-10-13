@@ -357,3 +357,32 @@ async fn stream_max_len_caps_the_stream() {
         "approximate trimming bounds the stream, got {len}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipeline_the_server_rejects_names_the_failure() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let _: () = conn.set("taken", "a string").await.unwrap();
+    let sink = RedisSink::new(RedisSinkConfig::new(
+        &url,
+        RedisSinkType::List {
+            key: "taken".into(),
+        },
+    ))
+    .await
+    .expect("sink build");
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "redis",
+        ),
+    ));
+    let err = sink
+        .write_batch(&[json!({"a": 1})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Redis pipeline execution failed"), "{err}");
+}

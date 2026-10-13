@@ -304,3 +304,14 @@ async fn dataset_uri_is_host_database_collection() {
     .unwrap();
     assert_eq!(sink.dataset_uri(), format!("{uri}/testdb/docs"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn committing_without_staging_names_the_failed_swap() {
+    let (_container, uri) = start_mongo().await;
+    let sink = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    let err = sink.commit_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("mongodb overwrite swap (renameCollection) failed"),
+        "{err}"
+    );
+}
