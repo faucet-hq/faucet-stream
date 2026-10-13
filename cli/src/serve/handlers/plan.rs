@@ -7,9 +7,6 @@
 //! endpoint is `Plan` (viewer+) — see [`crate::serve::rbac::required_permission`].
 //! Audited as `plan`.
 
-use crate::auth_catalog::build_auth_catalog;
-use crate::commands::plan::{PlanOptions, plan_node, select_root};
-use crate::error::CliError;
 use crate::serve::error::ServeError;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
@@ -18,13 +15,6 @@ use axum::Json;
 use axum::extract::{Extension, State};
 use serde::Deserialize;
 use serde_json::Value;
-
-fn cli_to_serve(e: CliError) -> ServeError {
-    match e {
-        CliError::Config(m) => ServeError::BadConfig(m),
-        other => ServeError::Internal(other.to_string()),
-    }
-}
 
 /// `POST /v1/plan` request body.
 #[derive(Debug, Deserialize)]
@@ -49,58 +39,15 @@ pub struct PlanRequest {
     pub depth: Option<u32>,
 }
 
-/// `POST /v1/plan` → 200 with the plan report.
+/// `POST /v1/plan` → 200 with the plan report: the runtime's `plan` for a
+/// config the request carried.
 pub async fn plan(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<PlanRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = state
-        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
-        .await?;
-    loaded.require_matrix()?;
-    let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;
-    let node = select_root(&loaded.nodes, req.row.as_deref()).map_err(cli_to_serve)?;
-    let sample = req.sample.map(|records| {
-        let label = format!("request ({} record(s))", records.len());
-        (records, label)
-    });
-    #[cfg(feature = "catalog")]
-    let history = state.history();
-    #[cfg(feature = "catalog")]
-    let impact = req.impact.then(|| crate::commands::plan::ImpactOptions {
-        store: history.as_ref(),
-        // The same name the executor records catalog edges under for a serve
-        // run, so the row's own edge is found.
-        pipeline: loaded
-            .cfg
-            .name
-            .clone()
-            .unwrap_or_else(|| "serve".to_string()),
-        depth: req.depth.unwrap_or(crate::impact::DEFAULT_DEPTH),
-    });
-    #[cfg(not(feature = "catalog"))]
-    if req.impact {
-        return Err(ServeError::Unprocessable {
-            message: "impact analysis requires a server built with the `catalog` feature".into(),
-            details: None,
-        });
-    }
-    let report = plan_node(
-        &loaded.cfg,
-        node,
-        &auth,
-        PlanOptions {
-            sample,
-            #[cfg(feature = "catalog")]
-            impact,
-            #[cfg(not(feature = "catalog"))]
-            _marker: std::marker::PhantomData,
-        },
-    )
-    .await
-    .map_err(cli_to_serve)?;
-    let value = serde_json::to_value(&report).map_err(|e| ServeError::Internal(e.to_string()))?;
-    crate::serve::audit::write(&state, &actor, "plan", None, None, "ok").await;
-    Ok(Json(value))
+    let principal = crate::runtime::Principal::caller(&state, actor);
+    crate::runtime::server::plan(&state, &principal, req)
+        .await
+        .map(Json)
 }

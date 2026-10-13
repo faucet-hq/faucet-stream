@@ -81,19 +81,24 @@ async fn resolve(
             ));
         }
         (Some(body), None) => {
-            state
-                .load_submission(body, src.config_format.into(), state.caller_origin())
-                .await?
+            crate::runtime::server::load(
+                state,
+                &crate::runtime::Principal::caller(state, actor.clone()),
+                crate::runtime::server::Submission::new(body, src.config_format.into()),
+            )
+            .await?
         }
         (None, Some(id)) => {
             let body = template_body(state, id, src).await?;
-            state
-                .load_submission(
+            crate::runtime::server::load(
+                state,
+                &crate::runtime::Principal::new(actor.clone(), crate::runtime::Origin::Trusted),
+                crate::runtime::server::Submission::new(
                     &body,
                     crate::serve::load::ConfigFormat::Json,
-                    crate::serve::load::BodyOrigin::Trusted,
-                )
-                .await?
+                ),
+            )
+            .await?
         }
         (None, None) => {
             return Err(ServeError::BadConfig(

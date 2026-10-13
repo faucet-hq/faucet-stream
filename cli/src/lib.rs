@@ -71,6 +71,7 @@ pub mod registry_index;
 pub mod replication;
 pub mod requires;
 pub mod rollback;
+pub mod runtime;
 pub mod scaffold;
 #[cfg(feature = "schedule")]
 pub mod schedule;
@@ -477,7 +478,7 @@ pub async fn run_from_yaml_str_selected(
         Some(sel) => sel.apply_resolved(&cfg, nodes, &auth).await?,
         None => nodes,
     };
-    executor::run_expanded(
+    crate::runtime::run_local(
         nodes,
         executor::ExecuteOptions {
             legacy_state_writes: false,

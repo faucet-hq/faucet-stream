@@ -117,7 +117,8 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
     });
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
 
-    let outcome = dlq_replay::replay(
+    let outcome = crate::runtime::local::replay_dlq(
+        &crate::runtime::Principal::local(),
         &cfg,
         &args.from,
         ReplayInputs {

@@ -821,10 +821,15 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         }
         let req: crate::serve::runner::SubmitRequest =
             serde_json::from_value(req).map_err(|e| format!("invalid arguments: {e}"))?;
-        let outcome =
-            crate::serve::runner::submit_gated(server.state.clone(), req, server.actor.clone())
-                .await
-                .map_err(|e| e.api_error().error.message)?;
+        let principal = crate::runtime::Principal::caller(&server.state, server.actor.clone());
+        let outcome = crate::runtime::server::submit(
+            &server.state,
+            &principal,
+            req,
+            crate::runtime::server::Approval::Required,
+        )
+        .await
+        .map_err(|e| e.api_error().error.message)?;
         return Ok(pretty(&match outcome {
             crate::serve::runner::SubmitOutcome::Accepted(r) => json!(r),
             crate::serve::runner::SubmitOutcome::PendingApproval(c) => {
@@ -1300,9 +1305,8 @@ async fn run_template_on_server(
     sink: crate::templates::SinkChoice,
     selection: Option<crate::select::SelectionRequest>,
 ) -> Result<String, String> {
-    use crate::serve::handlers::templates::{
-        OverlayRef, TriggerBody, TriggerOutcome, trigger_template_outcome,
-    };
+    use crate::runtime::server::{TriggerOutcome, trigger_template};
+    use crate::serve::handlers::templates::{OverlayRef, TriggerBody};
     use crate::serve::history::templates::VersionSelector;
     let (overlay, overlay_version) = match sink.overlay {
         Some(crate::templates::OverlayChoice::Registered { id, version }) => {
@@ -1323,9 +1327,9 @@ async fn run_template_on_server(
         allow_untested: sink.allow_untested,
         ..Default::default()
     };
-    let outcome = trigger_template_outcome(
+    let outcome = trigger_template(
         server.state.clone(),
-        server.actor.clone(),
+        crate::runtime::Principal::new(server.actor.clone(), crate::runtime::Origin::Trusted),
         id.to_string(),
         body,
     )

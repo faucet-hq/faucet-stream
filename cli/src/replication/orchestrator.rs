@@ -6,7 +6,7 @@
 use crate::auth_catalog::AuthCatalog;
 use crate::config::{ExecutionSpec, PipelineConfig};
 use crate::error::{CliError, CliResult};
-use crate::executor::{ExecuteOptions, run_expanded};
+use crate::executor::ExecuteOptions;
 use crate::expand::{ExpandedNode, expand};
 use crate::registry::build_source;
 use crate::replication::compiled::CompiledReplication;
@@ -233,7 +233,7 @@ pub async fn run_replication(
     // ── Snapshot phase (idempotent redo on resume) ───────────────────────────
     if !marker.snapshot_done {
         tracing::info!(pipeline = %opts.pipeline_name, "mirror: running snapshot phase (Ctrl-C / SIGTERM to stop)");
-        let summary = run_expanded(
+        let summary = crate::runtime::run_local(
             vec![snapshot_node.clone()],
             make_opts(&opts, Some(cancel.clone())),
         )
@@ -287,7 +287,7 @@ pub async fn run_replication(
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
     loop {
         let cycle: CliResult<()> = async {
-            let summary = run_expanded(
+            let summary = crate::runtime::run_local(
                 vec![cdc_node.clone()],
                 make_opts(&opts, Some(cancel.clone())),
             )

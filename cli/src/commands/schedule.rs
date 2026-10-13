@@ -7,7 +7,7 @@ use crate::auth_catalog::{AuthCatalog, build_auth_catalog};
 use crate::cli::ScheduleArgs;
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
-use crate::executor::{ExecuteOptions, InvocationErrorKind, RunSummary, run_expanded};
+use crate::executor::{ExecuteOptions, InvocationErrorKind, RunSummary};
 use crate::expand::{ExpandedNode, expand};
 use crate::schedule::compiled::CompiledSchedule;
 use crate::schedule::metrics as m;
@@ -140,9 +140,9 @@ async fn run_rows(rows: Rows, opts: ExecuteOptions) -> CliResult<RunSummary> {
             Some(cfg) => {
                 let mut cfg = (*cfg).clone();
                 crate::partition::resolve_runtime_with(&mut cfg, &opts.auth).await?;
-                run_expanded(expand(&cfg)?, opts).await
+                crate::runtime::run_local(expand(&cfg)?, opts).await
             }
-            None => run_expanded(rows.nodes, opts).await,
+            None => crate::runtime::run_local(rows.nodes, opts).await,
         },
     }
 }

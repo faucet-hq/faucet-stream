@@ -4,7 +4,7 @@
 use crate::cli::{RunArgs, RunOutput};
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
-use crate::executor::{ExecuteOptions, RunSummary, run_expanded};
+use crate::executor::{ExecuteOptions, RunSummary};
 use crate::expand::expand;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -387,7 +387,7 @@ pub(crate) async fn execute(
     #[cfg(feature = "cli-tui")]
     let tui_cancel = tui_active.then(|| stop.token());
     let started_at = Utc::now();
-    let run_fut = run_expanded(
+    let run_fut = crate::runtime::run_local(
         nodes,
         ExecuteOptions {
             legacy_state_writes: false,
