@@ -36,6 +36,7 @@ faucet-source-azure-blob = { workspace = true, features = ["arrow", "compression
 faucet-source-delta = { workspace = true, features = ["arrow"] }
 faucet-source-duckdb.workspace = true
 faucet-source-graphql.workspace = true
+faucet-source-elasticsearch.workspace = true
 faucet-source-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
 faucet-source-gcs = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-iceberg = { workspace = true, features = ["arrow", "catalog-sql"] }
@@ -59,6 +60,7 @@ faucet-sink-csv = { workspace = true, features = ["compression"] }
 faucet-sink-delta = { workspace = true, features = ["arrow"] }
 faucet-sink-duckdb.workspace = true
 faucet-sink-http.workspace = true
+faucet-sink-elasticsearch.workspace = true
 faucet-sink-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
 faucet-sink-gcs = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-iceberg = { workspace = true, features = ["catalog-sql"] }

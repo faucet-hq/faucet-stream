@@ -148,3 +148,103 @@ async fn webhook_source_keeps_each_posted_payload() {
     let landed: Vec<Value> = run.await.unwrap().expect("webhook run");
     fidelity::assert_round_trip(&sent, &landed, Tolerance::exact());
 }
+
+/// Serves one page of `_source` documents (their exact bytes), then the empty
+/// end-of-scroll page.
+struct ScrollOnce {
+    first: Vec<u8>,
+    served: std::sync::atomic::AtomicBool,
+}
+
+impl wiremock::Respond for ScrollOnce {
+    fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+        let body = if self.served.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            br#"{"_scroll_id":"s","hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}"#.to_vec()
+        } else {
+            self.first.clone()
+        };
+        ResponseTemplate::new(200).set_body_raw(body, "application/json")
+    }
+}
+
+#[tokio::test]
+async fn elasticsearch_sink_and_source_keep_the_corpus() {
+    let server = MockServer::start().await;
+    let sent = fidelity::corpus();
+    let items: Vec<String> = (0..sent.len())
+        .map(|_| r#"{"index":{"status":201}}"#.to_string())
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(r#"{{"errors":false,"items":[{}]}}"#, items.join(",")),
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let sink = faucet_sink_elasticsearch::ElasticsearchSink::new(
+        faucet_sink_elasticsearch::ElasticsearchSinkConfig::new(server.uri(), "test"),
+    )
+    .expect("sink");
+    sink.write_batch(&sent).await.expect("bulk");
+    sink.flush().await.expect("flush");
+    let bulk = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/_bulk")
+        .expect("a _bulk request");
+    let docs: Vec<&[u8]> = bulk
+        .body
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .skip(1)
+        .step_by(2)
+        .collect();
+    assert_eq!(docs.len(), sent.len());
+    let mut page =
+        br#"{"_scroll_id":"s","hits":{"total":{"value":1,"relation":"eq"},"hits":["#.to_vec();
+    for (i, doc) in docs.iter().enumerate() {
+        if i > 0 {
+            page.push(b',');
+        }
+        page.extend_from_slice(format!(r#"{{"_index":"test","_id":"{i}","_source":"#).as_bytes());
+        page.extend_from_slice(doc);
+        page.push(b'}');
+    }
+    page.extend_from_slice(b"]}}");
+
+    let search = MockServer::start().await;
+    let responder = std::sync::Arc::new(ScrollOnce {
+        first: page,
+        served: std::sync::atomic::AtomicBool::new(false),
+    });
+    for (m, route) in [("POST", "/test/_search"), ("POST", "/_search/scroll")] {
+        Mock::given(method(m))
+            .and(path(route))
+            .respond_with(SharedResponder(responder.clone()))
+            .mount(&search)
+            .await;
+    }
+    Mock::given(method("DELETE"))
+        .and(path("/_search/scroll"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(r#"{"succeeded":true}"#, "application/json"),
+        )
+        .mount(&search)
+        .await;
+    let source = faucet_source_elasticsearch::ElasticsearchSource::new(
+        faucet_source_elasticsearch::ElasticsearchSourceConfig::new(search.uri(), "test"),
+    )
+    .expect("source");
+    fidelity::assert_corpus_read(&source, &sent, Tolerance::exact()).await;
+}
+
+struct SharedResponder(std::sync::Arc<ScrollOnce>);
+
+impl wiremock::Respond for SharedResponder {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        self.0.respond(req)
+    }
+}
