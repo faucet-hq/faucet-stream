@@ -32,6 +32,10 @@ A pair the table does not list is supported.
 | `resilience:` | falls back | falls back | ✓ | ✓ | ✓ |
 | `complete_for: { on_missing: delete }` | falls back | falls back | ✓ | ✓ | refused |
 | `policy:` rule with `on_runtime: quarantine` | falls back | falls back | ✓ | refused | ✓ |
+| `policy:` | falls back | ✓ | ✓ | ✓ | ✓ |
+| `budget:` | falls back | ✓ | ✓ | ✓ | ✓ |
+| `profiling:` | falls back | ✓ | ✓ | ✓ | ✓ |
+| `metadata_columns:` | falls back | falls back | ✓ | ✓ | ✓ |
 
 The exactly-once watermark and overwrite staging columns apply only when the run uses them (`delivery: exactly_once` against an idempotent sink, `write_mode: overwrite`).
 
