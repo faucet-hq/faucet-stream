@@ -542,6 +542,19 @@ fn with_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record, serialized the way a
+    /// producer sends it, decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes = serde_json::to_vec(record).unwrap();
+            landed.push(payload_to_value(&bytes, NatsValueFormat::Json, "s").unwrap());
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
 
     #[test]
     fn skip_drops_an_undecodable_payload_and_fail_keeps_the_error() {

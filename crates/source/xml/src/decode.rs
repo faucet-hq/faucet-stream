@@ -372,7 +372,7 @@ fn unzip_member(bytes: &[u8], member: Option<&str>) -> Result<Vec<u8>, FaucetErr
 fn parse_records_sync(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, FaucetError> {
     match spec.format {
         ParseFormat::Json => {
-            let v: Value = serde_json::from_slice(bytes)
+            let v: Value = faucet_core::fidelity::from_slice(bytes)
                 .map_err(|e| FaucetError::Source(format!("decode `parse` json: {e}")))?;
             records_from_value(v, spec.records_path.as_deref())
         }

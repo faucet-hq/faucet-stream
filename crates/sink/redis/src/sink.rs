@@ -413,6 +413,23 @@ fn flatten_record_to_fields(record: &Value) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    /// The value-fidelity corpus (#885): every record this sink encodes reads
+    /// back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes: Vec<u8> =
+                record_command_args(&RedisSinkType::List { key: "k".into() }, record).unwrap()[2]
+                    .clone()
+                    .into_bytes();
+            landed.push(faucet_core::fidelity::from_slice(&bytes).unwrap());
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     #[test]
     fn keeps_its_auto_traits() {
         fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}

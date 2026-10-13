@@ -435,6 +435,23 @@ fn fail_cut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record this sink encodes reads
+    /// back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes: Vec<u8> = faucet_common_rabbitmq::encode_payload(
+                record,
+                faucet_common_rabbitmq::RabbitMqValueFormat::Json,
+            )
+            .unwrap();
+            landed.push(faucet_core::fidelity::from_slice(&bytes).unwrap());
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
 
     #[test]
     fn a_cut_group_fails_only_rows_not_yet_decided() {

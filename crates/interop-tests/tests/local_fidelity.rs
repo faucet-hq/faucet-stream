@@ -59,10 +59,9 @@ async fn arrow_destinations_refuse_what_they_cannot_hold() {
     .enumerate()
     {
         let path = p(dir.path(), &format!("refused{i}.parquet"));
-        let sink = faucet_sink_file::FileSink::new(
-            serde_json::from_value(json!({"path": path})).unwrap(),
-        )
-        .unwrap();
+        let sink =
+            faucet_sink_file::FileSink::new(serde_json::from_value(json!({"path": path})).unwrap())
+                .unwrap();
         let err = async {
             sink.write_batch(&[json!({ field: value })]).await?;
             sink.flush().await
@@ -81,10 +80,9 @@ async fn file_sink_and_file_source_keep_json_documents_exactly() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["corpus.jsonl", "corpus.json"] {
         let path = p(dir.path(), name);
-        let sink = faucet_sink_file::FileSink::new(
-            serde_json::from_value(json!({"path": path})).unwrap(),
-        )
-        .unwrap();
+        let sink =
+            faucet_sink_file::FileSink::new(serde_json::from_value(json!({"path": path})).unwrap())
+                .unwrap();
         write(&sink, &fidelity::corpus()).await;
         let source = faucet_source_file::FileSource::new(
             serde_json::from_value(json!({"path": path})).unwrap(),
@@ -99,10 +97,9 @@ async fn file_sink_and_file_source_keep_typed_formats() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["corpus.parquet", "corpus.avro"] {
         let path = p(dir.path(), name);
-        let sink = faucet_sink_file::FileSink::new(
-            serde_json::from_value(json!({"path": path})).unwrap(),
-        )
-        .unwrap();
+        let sink =
+            faucet_sink_file::FileSink::new(serde_json::from_value(json!({"path": path})).unwrap())
+                .unwrap();
         let sent = wide_arrow();
         write(&sink, &sent).await;
         let source = faucet_source_file::FileSource::new(
@@ -141,15 +138,17 @@ async fn csv_sink_and_csv_source_keep_every_rendering() {
 async fn parquet_sink_and_parquet_source_keep_the_wide_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = p(dir.path(), "corpus.parquet");
-    let sink = faucet_sink_parquet::ParquetSink::new(faucet_sink_parquet::ParquetSinkConfig::local(&path))
-        .await
-        .unwrap();
-    let sent = wide_arrow();
-    write(&sink, &sent).await;
-    let source =
-        faucet_source_parquet::ParquetSource::new(faucet_source_parquet::ParquetSourceConfig::local(&path))
+    let sink =
+        faucet_sink_parquet::ParquetSink::new(faucet_sink_parquet::ParquetSinkConfig::local(&path))
             .await
             .unwrap();
+    let sent = wide_arrow();
+    write(&sink, &sent).await;
+    let source = faucet_source_parquet::ParquetSource::new(
+        faucet_source_parquet::ParquetSourceConfig::local(&path),
+    )
+    .await
+    .unwrap();
     fidelity::assert_corpus_read(&source, &sent, typed(Tolerance::exact())).await;
 }
 
@@ -162,9 +161,10 @@ async fn delta_sink_and_delta_source_keep_the_wide_row() {
         .unwrap();
     let sent = wide_arrow();
     write(&sink, &sent).await;
-    let source = faucet_source_delta::DeltaSource::new(faucet_source_delta::DeltaSourceConfig::new(&uri))
-        .await
-        .unwrap();
+    let source =
+        faucet_source_delta::DeltaSource::new(faucet_source_delta::DeltaSourceConfig::new(&uri))
+            .await
+            .unwrap();
     fidelity::assert_corpus_read(&source, &sent, typed(Tolerance::exact())).await;
 }
 
@@ -205,7 +205,9 @@ async fn sqlite_sink_and_sqlite_source_keep_the_corpus() {
         "query": "SELECT * FROM corpus",
     }))
     .unwrap();
-    let source = faucet_source_sqlite::SqliteSource::new(source).await.unwrap();
+    let source = faucet_source_sqlite::SqliteSource::new(source)
+        .await
+        .unwrap();
     // SQLite has no boolean (`true` is stored as 1) and no negative zero.
     fidelity::assert_corpus_read(
         &source,
@@ -234,10 +236,9 @@ async fn duckdb_sink_and_duckdb_source_keep_the_corpus() {
     let sent = vec![fidelity::flat_corpus()];
     write(&sink, &sent).await;
     drop(sink);
-    let source = faucet_source_duckdb::DuckdbSource::new(faucet_source_duckdb::DuckdbSourceConfig::new(
-        &db,
-        "SELECT * FROM corpus",
-    ))
+    let source = faucet_source_duckdb::DuckdbSource::new(
+        faucet_source_duckdb::DuckdbSourceConfig::new(&db, "SELECT * FROM corpus"),
+    )
     .await
     .unwrap();
     fidelity::assert_corpus_read(&source, &sent, typed(Tolerance::exact())).await;

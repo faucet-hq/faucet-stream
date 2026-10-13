@@ -153,7 +153,8 @@ fn json_number_to_n(n: &Number) -> String {
     } else if let Some(u) = n.as_u64() {
         u.to_string()
     } else {
-        format!("{}", n.as_f64().unwrap_or_default())
+        // The shortest text that names the double (`1e300`, not 301 digits).
+        n.to_string()
     }
 }
 

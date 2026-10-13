@@ -710,6 +710,27 @@ fn stream_ignores_consumer_group(group: Option<&str>, consumer: Option<&str>) ->
 
 #[cfg(test)]
 mod tests {
+    /// The value-fidelity corpus (#885): every record, serialized the way a
+    /// producer sends it, decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes = serde_json::to_vec(record).unwrap();
+            landed.push(
+                Decoding {
+                    parse_json: RedisJsonParsing::All,
+                    binary: RedisBinary::Base64,
+                }
+                .value(&bytes, "k")
+                .unwrap(),
+            );
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     #[test]
     fn keeps_its_auto_traits() {
         fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}

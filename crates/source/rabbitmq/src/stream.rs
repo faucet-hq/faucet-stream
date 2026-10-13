@@ -509,6 +509,26 @@ fn idle_expired(deadline: Option<Instant>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record, serialized the way a
+    /// producer sends it, decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes = serde_json::to_vec(record).unwrap();
+            landed.push(
+                faucet_common_rabbitmq::decode_payload(
+                    &bytes,
+                    faucet_common_rabbitmq::RabbitMqValueFormat::Json,
+                )
+                .unwrap(),
+            );
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     use lapin::BasicProperties;
     use lapin::types::AMQPValue;
 

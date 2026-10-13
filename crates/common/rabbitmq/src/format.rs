@@ -40,7 +40,7 @@ impl RabbitMqValueFormat {
 /// are errors under `json`/`string` and base64 under `bytes`.
 pub fn decode_payload(body: &[u8], format: RabbitMqValueFormat) -> Result<Value, FaucetError> {
     match format {
-        RabbitMqValueFormat::Json => serde_json::from_slice(body).map_err(|e| {
+        RabbitMqValueFormat::Json => faucet_core::fidelity::from_slice(body).map_err(|e| {
             FaucetError::Source(format!("rabbitmq: message body is not valid JSON: {e}"))
         }),
         RabbitMqValueFormat::String => std::str::from_utf8(body)

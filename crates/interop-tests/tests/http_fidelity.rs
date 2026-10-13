@@ -88,8 +88,7 @@ async fn xml_source_keeps_every_rendering() {
     let element = format!("{}.{}", opts.xml.root_element, opts.xml.record_element);
     let server = serve("GET", "/feed.xml", body, "application/xml").await;
     let source = XmlStream::new(
-        XmlStreamConfig::new(server.uri(), "/feed.xml")
-            .records_element_path(element),
+        XmlStreamConfig::new(server.uri(), "/feed.xml").records_element_path(element),
     );
     // XML carries text only: a number lands as the string that renders it,
     // an empty element (an empty string or a null) reads as an empty
@@ -106,10 +105,9 @@ async fn xml_source_keeps_every_rendering() {
         "strings_padded",
     ]
     .iter()
-    .fold(
-        Tolerance::exact().lenient_scalar_kind(),
-        |t, f| t.skipping(f),
-    );
+    .fold(Tolerance::exact().lenient_scalar_kind(), |t, f| {
+        t.skipping(f)
+    });
     fidelity::assert_corpus_read(&source, &sent, tol).await;
 }
 
