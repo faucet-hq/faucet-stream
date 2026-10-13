@@ -10,6 +10,7 @@ use crate::auth_catalog::build_auth_catalog;
 use crate::dlq_replay::{self, ReplayInputs, reader::DlqDecryptor};
 use crate::error::CliError;
 use crate::serve::error::ServeError;
+use crate::serve::history::{RunRecord, RunStatus};
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
@@ -126,9 +127,12 @@ pub async fn replay(
     };
     // A tenant's replay loads under its scope and is admitted against its
     // limits, whose per-run ceilings join the config's budget (#871).
-    let caller_budget = match tenant.as_deref() {
-        Some(t) => admit_replay(&state, t).await?,
-        None => None,
+    let (admission, caller_budget) = match tenant.as_deref() {
+        Some(t) => {
+            let (a, b) = admit_replay(&state, t).await?;
+            (Some(a), b)
+        }
+        None => (None, None),
     };
     let loaded = crate::serve::runner::load_for(
         &state,
@@ -167,6 +171,17 @@ pub async fn replay(
         state: &state,
         id: id.clone(),
     };
+    let decryptor = DlqDecryptor::from_keys(&req.encryption_keys)
+        .map_err(CliError::from)
+        .map_err(cli_to_serve)?;
+    // A replay that writes is a run (#871): recorded while it runs, so it
+    // holds one of its tenant's `max_concurrent_runs` slots on every instance.
+    let started = if req.dry_run {
+        drop(admission);
+        None
+    } else {
+        Some(start_replay_record(&state, &id, &req.from, tenant.as_deref(), admission).await?)
+    };
 
     let outcome = dlq_replay::replay(
         &loaded.cfg,
@@ -180,15 +195,16 @@ pub async fn replay(
             execution: loaded.cfg.execution.clone(),
             auth,
             clock: Utc::now().fixed_offset(),
-            decryptor: DlqDecryptor::from_keys(&req.encryption_keys)
-                .map_err(CliError::from)
-                .map_err(cli_to_serve)?,
+            decryptor,
             budget: caller_budget,
-            cancel: Some(cancel),
+            cancel: Some(cancel.clone()),
         },
     )
     .await;
 
+    if let Some(rec) = started {
+        rec.finish(&outcome, cancel.is_cancelled()).await;
+    }
     let result_label = if outcome.is_ok() { "ok" } else { "error" };
     crate::serve::audit::write(&state, &actor, "dlq.replay", None, None, result_label).await;
 
@@ -203,26 +219,142 @@ pub async fn replay(
     Ok(Json(body))
 }
 
+/// A tenant's admission guard; nothing without the `tenants` feature.
+#[cfg(feature = "tenants")]
+type ReplayAdmission = crate::serve::tenants::Admission;
+#[cfg(not(feature = "tenants"))]
+type ReplayAdmission = ();
+
 /// Admit a replay for `tenant`: it exists, is not suspended and is under its
 /// concurrency limit; its per-run ceilings are returned as the replay's budget.
+/// The guard serializes the tenant's admissions until the replay is recorded.
 #[cfg(feature = "tenants")]
 async fn admit_replay(
     state: &ServerState,
     tenant: &str,
-) -> Result<Option<faucet_core::BudgetSpec>, ServeError> {
-    crate::serve::tenants::admit_inline(state, tenant)
-        .await
-        .map(|(_admission, budget)| budget)
+) -> Result<(ReplayAdmission, Option<faucet_core::BudgetSpec>), ServeError> {
+    crate::serve::tenants::admit_inline(state, tenant).await
 }
 
 #[cfg(not(feature = "tenants"))]
 async fn admit_replay(
     _state: &ServerState,
     tenant: &str,
-) -> Result<Option<faucet_core::BudgetSpec>, ServeError> {
+) -> Result<(ReplayAdmission, Option<faucet_core::BudgetSpec>), ServeError> {
     Err(ServeError::BadConfig(format!(
         "replay for tenant '{tenant}' refused: this server was built without the `tenants` feature"
     )))
+}
+
+/// Label on the run record of a DLQ replay.
+pub const LABEL_DLQ_REPLAY: &str = "dlq_replay";
+
+/// Record a replay as a running run under its id, owned by `tenant`, then
+/// release the admission guard. In cluster mode the tenant's concurrency is
+/// re-counted across instances and an over-limit replay is refused (429).
+async fn start_replay_record(
+    state: &ServerState,
+    id: &str,
+    from: &str,
+    tenant: Option<&str>,
+    admission: Option<ReplayAdmission>,
+) -> Result<ReplayRecord, ServeError> {
+    let history = state.history();
+    if history
+        .get(id)
+        .await
+        .map_err(|e| ServeError::from_history("run history", e))?
+        .is_some()
+    {
+        return Err(ServeError::Conflict(format!(
+            "a run with id '{id}' already exists"
+        )));
+    }
+    let now = Utc::now();
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(LABEL_DLQ_REPLAY.to_string(), "true".to_string());
+    let mut rec = RunRecord::queued(id.to_string(), None, labels, None, now);
+    rec.status = RunStatus::Running;
+    rec.started_at = Some(now);
+    rec.replay_of = Some(from.to_string());
+    rec.tenant = tenant.map(str::to_string);
+    history
+        .upsert(&rec)
+        .await
+        .map_err(|e| ServeError::from_history("run history", e))?;
+    let guard = ReplayRecord {
+        state: state.clone(),
+        rec: Some(rec),
+    };
+    if let Some(t) = tenant {
+        history
+            .tenant_run_link(id, t)
+            .await
+            .map_err(|e| ServeError::Internal(format!("recording the replay's tenant: {e}")))?;
+    }
+    drop(admission);
+    #[cfg(feature = "tenants")]
+    if state.cluster().enabled()
+        && let Some(t) = tenant
+        && let Some(msg) = crate::serve::tenants::over_limit(state, t).await?
+    {
+        return Err(ServeError::TooManyRequests(msg));
+    }
+    Ok(guard)
+}
+
+/// A replay's run record while it runs. Finished explicitly; dropped
+/// unfinished (a refused or abandoned request), it is closed as cancelled so
+/// it never holds a tenant slot.
+struct ReplayRecord {
+    state: ServerState,
+    rec: Option<RunRecord>,
+}
+
+impl ReplayRecord {
+    /// Write the replay's terminal state. A failed write is logged: the
+    /// replay itself already finished.
+    async fn finish(mut self, outcome: &Result<dlq_replay::ReplayOutcome, CliError>, cancelled: bool) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        rec.status = match (outcome, cancelled) {
+            (_, true) => RunStatus::Cancelled,
+            (Ok(_), false) => RunStatus::Completed,
+            (Err(_), false) => RunStatus::Failed,
+        };
+        match outcome {
+            Ok(o) => rec.records_written = o.records_written as u64,
+            Err(e) => rec.error = Some(crate::secrets::registry::redact_message(&e.to_string())),
+        }
+        close(&self.state, rec).await;
+    }
+}
+
+impl Drop for ReplayRecord {
+    fn drop(&mut self) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        rec.status = RunStatus::Cancelled;
+        rec.error = Some("the replay request ended before the replay finished".into());
+        let state = self.state.clone();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { close(&state, rec).await });
+        }
+    }
+}
+
+/// Stamp `rec`'s finish time and store it.
+async fn close(state: &ServerState, mut rec: RunRecord) {
+    let now = Utc::now();
+    rec.finished_at = Some(now);
+    rec.elapsed_secs = rec
+        .started_at
+        .map(|s| (now - s).num_milliseconds().max(0) as f64 / 1000.0);
+    if let Err(e) = state.history().upsert(&rec).await {
+        tracing::warn!(run_id = %rec.run_id, error = %e, "could not record a replay's outcome");
+    }
 }
 
 /// `POST /v1/dlq/discard` request body.
@@ -443,5 +575,159 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "tenants")]
+    async fn tenant_state(max_concurrent_runs: Option<u32>) -> ServerState {
+        use crate::serve::history::tenants::TenantRecord;
+        let state = crate::serve::test_support::test_state();
+        state.set_tenants(crate::serve::tenants::TenantsRuntime::new(
+            Some(
+                crate::serve::tenants::vault::Vault::new("0123456789abcdef0123456789abcdef", &[])
+                    .unwrap(),
+            ),
+            Default::default(),
+        ));
+        let now = chrono::Utc::now();
+        let mut t = TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: Default::default(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            notifications_sealed: None,
+            suspended: false,
+            created_at: now,
+            updated_at: now,
+            created_by: "t".into(),
+        };
+        t.limits.max_concurrent_runs = max_concurrent_runs;
+        state.history().tenant_upsert(&t).await.unwrap();
+        state
+    }
+
+    /// #871: a running replay holds one of its tenant's `max_concurrent_runs`
+    /// slots — a run submitted meanwhile is refused with 429 — and gives it
+    /// back when it finishes.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_running_tenant_replay_holds_a_concurrency_slot() {
+        let state = tenant_state(Some(1)).await;
+        let (admission, _) = admit_replay(&state, "acme").await.unwrap();
+        let running = start_replay_record(&state, "rp-1", "/dlq", Some("acme"), Some(admission))
+            .await
+            .unwrap();
+        let rec = state.history().get("rp-1").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Running);
+        assert_eq!(rec.replay_of.as_deref(), Some("/dlq"));
+        assert_eq!(rec.tenant.as_deref(), Some("acme"));
+        assert_eq!(rec.labels.get(LABEL_DLQ_REPLAY).map(String::as_str), Some("true"));
+
+        let req: crate::serve::runner::SubmitRequest =
+            serde_json::from_value(serde_json::json!({"config": "x"})).unwrap();
+        let err = crate::serve::runner::submit(state.clone(), req, actor(Some("acme")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::TooManyRequests(_)), "{err:?}");
+        assert!(matches!(
+            admit_replay(&state, "acme").await,
+            Err(ServeError::TooManyRequests(_))
+        ));
+
+        let outcome = Ok(dlq_replay::ReplayOutcome {
+            candidates: 2,
+            records_written: 2,
+            dry_run: false,
+            failed_dlq: "/dlq.failed".into(),
+        });
+        running.finish(&outcome, false).await;
+        let rec = state.history().get("rp-1").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Completed);
+        assert_eq!(rec.records_written, 2);
+        assert!(rec.finished_at.is_some());
+        drop(admit_replay(&state, "acme").await.unwrap());
+    }
+
+    /// #871: an end-to-end tenant replay leaves a completed run record.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_tenant_replay_is_recorded_as_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 2, "");
+        let state = tenant_state(Some(1)).await;
+        let mut req = request(cfg, from.clone());
+        req.id = Some("rp-2".into());
+        let out = replay(State(state.clone()), Extension(actor(Some("acme"))), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(out.0["tenant"], "acme");
+        let rec = state.history().get("rp-2").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Completed);
+        assert_eq!(rec.records_written, 2);
+        assert_eq!(rec.replay_of.as_deref(), Some(from.as_str()));
+        drop(admit_replay(&state, "acme").await.unwrap());
+
+        // An id already in history is refused rather than overwritten.
+        let (cfg, from) = fixture(dir.path(), 1, "");
+        let mut req = request(cfg, from);
+        req.id = Some("rp-2".into());
+        let err = replay(State(state), Extension(actor(Some("acme"))), Json(req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+    }
+
+    /// #871: a replay that fails, is cancelled, or whose request is abandoned
+    /// closes its record, so it never keeps holding a slot.
+    #[tokio::test]
+    async fn an_unfinished_replay_record_is_closed() {
+        let state = crate::serve::test_support::test_state();
+        let failed = start_replay_record(&state, "rp-f", "/d", None, None)
+            .await
+            .unwrap();
+        failed
+            .finish(&Err(CliError::Config("bad".into())), false)
+            .await;
+        let rec = state.history().get("rp-f").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Failed);
+        assert!(rec.error.unwrap().contains("bad"));
+
+        let cancelled = start_replay_record(&state, "rp-c", "/d", None, None)
+            .await
+            .unwrap();
+        cancelled
+            .finish(&Err(CliError::Config("stopped".into())), true)
+            .await;
+        let rec = state.history().get("rp-c").await.unwrap().unwrap();
+        assert_eq!(rec.status, RunStatus::Cancelled);
+
+        let abandoned = start_replay_record(&state, "rp-a", "/d", None, None)
+            .await
+            .unwrap();
+        drop(abandoned);
+        let mut status = RunStatus::Running;
+        for _ in 0..200 {
+            status = state.history().get("rp-a").await.unwrap().unwrap().status;
+            if status != RunStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(status, RunStatus::Cancelled);
+    }
+
+    /// A dry-run replay writes nothing, so it is not recorded as a run.
+    #[tokio::test]
+    async fn a_dry_run_replay_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, from) = fixture(dir.path(), 1, "");
+        let state = crate::serve::test_support::test_state();
+        let mut req = request(cfg, from);
+        req.dry_run = true;
+        req.id = Some("rp-d".into());
+        let _ = replay(State(state.clone()), Extension(actor(None)), Json(req))
+            .await
+            .unwrap();
+        assert!(state.history().get("rp-d").await.unwrap().is_none());
     }
 }
