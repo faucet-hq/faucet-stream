@@ -369,6 +369,62 @@ mod tests {
         drop(closed);
     }
 
+    /// A client that hangs up is passed on: the proxy closes its side to the
+    /// target, and a target that cannot be reached closes the client.
+    #[tokio::test]
+    async fn the_proxy_passes_a_hang_up_on() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap().to_string();
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut buf = [0u8; 8];
+            let n = s.read(&mut buf).await.unwrap();
+            let _ = eof_tx.send(n);
+        });
+        let proxy = HangingProxy::start(&target).await.unwrap();
+        drop(TcpStream::connect(proxy.addr()).await.unwrap());
+        let n = tokio::time::timeout(Duration::from_secs(5), eof_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "the target sees the hang-up");
+
+        let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unreachable = gone.local_addr().unwrap().to_string();
+        drop(gone);
+        let proxy = HangingProxy::start(&unreachable).await.unwrap();
+        let mut conn = TcpStream::connect(proxy.addr()).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(n, 0, "no target, so the client is closed");
+    }
+
+    /// A client that hangs up before finishing its request ends the
+    /// connection; the server keeps answering others.
+    #[tokio::test]
+    async fn the_stalling_server_survives_a_half_request() {
+        let server = StallingBodyServer::start(|_, _| Reply::full("text/plain", "ok"))
+            .await
+            .unwrap();
+        let mut half = TcpStream::connect(server.addr()).await.unwrap();
+        half.write_all(b"GET /half").await.unwrap();
+        drop(half);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut conn = TcpStream::connect(server.addr()).await.unwrap();
+        conn.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut got = Vec::new();
+        while !got.ends_with(b"ok") {
+            let mut buf = [0u8; 64];
+            let n = conn.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed early");
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+
     #[tokio::test]
     async fn accepts_and_never_answers() {
         let hung = SilentListener::start().await.unwrap();
