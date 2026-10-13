@@ -120,6 +120,7 @@ mod tests {
             usage: None,
             batches: None,
             source_lag: None,
+            rows: None,
             skipped: false,
         }
     }

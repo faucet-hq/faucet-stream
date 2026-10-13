@@ -275,6 +275,12 @@ default and `open()` allows everything but metadata hosts. `faucet serve` uses
 it to confine configs a caller submits, so an annotated third-party connector
 is confined without serve changes.
 
+A connector whose own input can reach host files or the network — a SQL
+engine that can `ATTACH` or `read_csv` — exposes a boolean switch that confines
+it and marks it `#[schemars(extend("x-faucet-sandbox" = true))]`;
+`resolve::sandbox_fields(schema)` reads the marked fields back, and a host
+loading a config it does not trust forces each one on.
+
 ## Error types
 
 `FaucetError` covers every failure mode:

@@ -9,12 +9,17 @@ pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("dynamodb",
 fn capabilities(config: &Value) -> Capabilities {
     let builder = Capabilities::builder().discover(true);
     if config.is_null() {
-        return builder.shardable(true).reports_lag(true).build();
+        return builder
+            .shardable(true)
+            .reports_lag(true)
+            .table_routing(true)
+            .build();
     }
     let mode = str_field(config, "mode").unwrap_or("scan");
     builder
         .shardable(!matches!(mode, "query" | "streams"))
         .reports_lag(mode == "streams")
+        .table_routing(mode == "streams")
         .build()
 }
 
@@ -38,6 +43,8 @@ mod tests {
         assert!(q.discover() && !q.shardable() && !q.reports_lag());
         let st = caps(json!({"mode": "streams"}));
         assert!(st.discover() && !st.shardable() && st.reports_lag());
+        assert!(st.table_routing() && !q.table_routing());
+        assert!(caps(Value::Null).table_routing());
         let kind = caps(Value::Null);
         assert!(kind.discover() && kind.shardable() && kind.reports_lag());
         assert!(!kind.exactly_once() && !kind.columnar() && !kind.native());

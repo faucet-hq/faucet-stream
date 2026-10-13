@@ -68,10 +68,10 @@ fn compile_tables(
         }
         return Ok(None);
     };
-    if !crate::replication::tables::MULTI_TABLE_CDC_KINDS.contains(&cdc.kind.as_str()) {
+    if !crate::registry::source_capabilities(&cdc.kind, &cdc.config).table_routing() {
         return Err(CliError::Config(format!(
             "a multi-table mirror needs a CDC source that routes records to tables ({}); got '{}'",
-            crate::replication::tables::MULTI_TABLE_CDC_KINDS.join(" / "),
+            crate::registry::source_kinds_where(|c| c.table_routing()).join(" / "),
             cdc.kind
         )));
     }

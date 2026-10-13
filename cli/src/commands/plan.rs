@@ -158,25 +158,13 @@ async fn load_sample(
     Ok(None)
 }
 
-/// Source kinds whose read has a side effect `plan --live` must not cause: a
-/// CDC source creates or advances a replication slot / capture position, a
-/// Kafka source joins (and rebalances) the consumer group, and a webhook or
-/// websocket source opens a listener or a live session (#789 MSG-01).
-pub const PLAN_LIVE_REFUSED_KINDS: &[&str] = &[
-    "postgres-cdc",
-    "mysql-cdc",
-    "mongodb-cdc",
-    "mssql-cdc",
-    "oracle-cdc",
-    "kafka",
-    "webhook",
-    "websocket",
-];
-
 /// Refuse a `plan --live` sample from a source kind whose read has side
-/// effects. Pure.
+/// effects — its connector declares `read_side_effects`: a CDC source creates
+/// or advances a replication slot / capture position, a Kafka source joins
+/// (and rebalances) the consumer group, and a webhook or websocket source
+/// opens a listener or a live session (#789 MSG-01). Pure.
 pub fn refuse_side_effecting_live_read(kind: &str) -> CliResult<()> {
-    if PLAN_LIVE_REFUSED_KINDS.contains(&kind) {
+    if crate::registry::source_kind_capabilities(kind).read_side_effects() {
         return Err(CliError::Config(format!(
             "plan --live cannot sample a `{kind}` source: reading it has side effects (a \
              replication slot, a consumer-group rebalance, a listener) that a read-only plan \
@@ -947,7 +935,10 @@ mod tests {
 
     #[test]
     fn plan_live_refuses_sources_whose_read_has_side_effects() {
-        for kind in PLAN_LIVE_REFUSED_KINDS {
+        let refused = crate::registry::source_kinds_where(|c| c.read_side_effects());
+        #[cfg(feature = "source-kafka")]
+        assert!(refused.contains(&"kafka"), "{refused:?}");
+        for kind in &refused {
             let err = refuse_side_effecting_live_read(kind)
                 .unwrap_err()
                 .to_string();

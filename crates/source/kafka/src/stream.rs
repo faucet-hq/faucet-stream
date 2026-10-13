@@ -1024,6 +1024,7 @@ impl Source for KafkaSource {
         faucet_core::Capabilities::of_source(self)
             .to_builder()
             .reports_lag(true)
+            .read_side_effects(true)
             .build()
     }
 

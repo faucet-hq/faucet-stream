@@ -95,6 +95,8 @@ pub struct Capabilities {
     reports_lag: bool,
     columnar: bool,
     native: bool,
+    table_routing: bool,
+    read_side_effects: bool,
 }
 
 const MODE_ORDER: [WriteMode; 4] = [
@@ -190,6 +192,8 @@ impl Capabilities {
             .range_read(inner.range_read)
             .range_digest(inner.range_digest)
             .reports_lag(inner.reports_lag)
+            .table_routing(inner.table_routing)
+            .read_side_effects(inner.read_side_effects)
             .build()
     }
 
@@ -311,6 +315,19 @@ impl Capabilities {
         self.native
     }
 
+    /// Names the table each record belongs to (`Source::record_table`), so
+    /// one change stream can drive a multi-table mirror.
+    pub fn table_routing(&self) -> bool {
+        self.table_routing
+    }
+
+    /// Reading changes state outside the pipeline — creates or advances a
+    /// replication slot or capture position, joins a consumer group, opens a
+    /// listener or a live session — so a read-only preview must not read it.
+    pub fn read_side_effects(&self) -> bool {
+        self.read_side_effects
+    }
+
     /// The source's typed replay guarantee.
     pub fn replay_guarantee(&self) -> ReplayGuarantee {
         if self.exactly_once {
@@ -389,6 +406,8 @@ impl CapabilitiesBuilder {
         reports_lag,
         columnar,
         native,
+        table_routing,
+        read_side_effects,
     );
 
     /// Finish.
@@ -626,6 +645,8 @@ mod tests {
             .range_read(true)
             .range_digest(true)
             .reports_lag(true)
+            .table_routing(true)
+            .read_side_effects(true)
             .schema_report(SchemaReport::DropsUnknownFields)
             .scoped_overwrite(true)
             .direct_overwrite(true)
@@ -633,6 +654,7 @@ mod tests {
             .build();
         let src = Capabilities::decorated_source(&Plain, &inner);
         assert!(src.range_read() && src.range_digest() && src.reports_lag());
+        assert!(src.table_routing() && src.read_side_effects());
         assert!(!src.discover(), "derived from the outer connector");
         let sink = Capabilities::decorated_sink(&Plain, &inner);
         assert_eq!(sink.schema_report(), SchemaReport::DropsUnknownFields);
@@ -661,6 +683,13 @@ mod tests {
         assert_eq!(c.to_builder().build(), c);
         let off = c.to_builder().columnar(false).build();
         assert!(!off.columnar());
+        assert!(!c.table_routing() && !c.read_side_effects());
+        let cdc = c
+            .to_builder()
+            .table_routing(true)
+            .read_side_effects(true)
+            .build();
+        assert!(cdc.table_routing() && cdc.read_side_effects());
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["schema_report"], "drops_unknown_fields");
         assert_eq!(v["write_modes"], json!(["append", "delete"]));

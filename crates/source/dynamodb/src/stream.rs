@@ -547,6 +547,7 @@ impl faucet_core::Source for DynamoDbSource {
         faucet_core::Capabilities::of_source(self)
             .to_builder()
             .reports_lag(self.config.mode == ReadMode::Streams)
+            .table_routing(self.config.mode == ReadMode::Streams)
             .build()
     }
 

@@ -508,3 +508,48 @@ async fn cancel_of_queued_run_transitions_to_cancelled() {
         "a queued run must cancel promptly without waiting for a permit (#146 R E6)"
     );
 }
+
+/// A finished run's detail carries each invocation's row account (#879).
+#[tokio::test(flavor = "multi_thread")]
+async fn run_detail_carries_the_row_account() {
+    let port = free_port();
+    spawn_server(port, None).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "name\nalice\nbob\ncarol\n").unwrap();
+    let output = dir.path().join("out.jsonl");
+    let submit: serde_json::Value = client
+        .post(format!("{base}/v1/runs"))
+        .json(&serde_json::json!({ "config": csv_to_jsonl_yaml(&input, &output) }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = submit["run_id"].as_str().unwrap().to_string();
+
+    let mut rec = serde_json::Value::Null;
+    for _ in 0..800 {
+        rec = client
+            .get(format!("{base}/v1/runs/{run_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if rec["status"] == "completed" || rec["status"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rec["status"], "completed", "{rec:#}");
+    let rows = &rec["invocations"][0]["rows"];
+    assert_eq!(rows["offered"], 3, "{rec:#}");
+    assert_eq!(rows["accepted"], 3, "{rec:#}");
+    assert_eq!(rows["unaccounted"], 0, "{rec:#}");
+}

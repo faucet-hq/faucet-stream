@@ -2835,6 +2835,29 @@ components:
         bytes: { type: integer, description: Unread change log (Postgres WAL, MySQL binlog) }
         events: { type: integer, description: Unconsumed messages or change transactions }
         seconds: { type: number, description: Age of the oldest unread change }
+    RowAccounts:
+      type: object
+      description: >
+        Where every row of an invocation went (#879). `offered` rows reached the
+        governance passes and the sink; each ends `accepted`, `coalesced` (merged
+        into another row of the same page by a keyed write), `skipped` (declined
+        by the sink and reported), `failed` (per-row failure routed to the DLQ),
+        `quarantined` (a quality / contract / drift / policy pass sent it to the
+        DLQ) or `dropped` (a poison-pill `drop` action). `unaccounted` rows were
+        lost by a sink without saying so; any non-zero value failed the run.
+        `transform_in` / `transform_out` count the transform chain's input and
+        output.
+      properties:
+        transform_in: { type: integer }
+        transform_out: { type: integer }
+        offered: { type: integer }
+        accepted: { type: integer }
+        coalesced: { type: integer }
+        skipped: { type: integer }
+        failed: { type: integer }
+        quarantined: { type: integer }
+        dropped: { type: integer }
+        unaccounted: { type: integer }
     InvocationRecord:
       type: object
       properties:
@@ -2846,6 +2869,7 @@ components:
         error: { type: string, nullable: true }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }
         source_lag: { $ref: "#/components/schemas/SourceLag" }
+        rows: { $ref: "#/components/schemas/RowAccounts" }
         skipped: { type: boolean, description: "The invocation never ran because its parent or a `depends_on` row failed or was skipped; `error` names it. Absent when false." }
       example:
         row_id: orders_to_warehouse

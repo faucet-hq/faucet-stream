@@ -16724,7 +16724,8 @@
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": false,
+                      "x-faucet-sandbox": true
                     }
                   }
                 },
@@ -16837,7 +16838,8 @@
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": false,
+                      "x-faucet-sandbox": true
                     }
                   }
                 },
@@ -25217,7 +25219,8 @@
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": false,
+                      "x-faucet-sandbox": true
                     }
                   }
                 },

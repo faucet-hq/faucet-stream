@@ -211,8 +211,11 @@ take a value from records (`${parent.*}` and other runtime tokens other than
 ### SQL connectors run sandboxed
 
 A query can read files by itself — DuckDB's `read_text('/etc/passwd')` or
-`ATTACH`, SQLite's `ATTACH` — so every `duckdb` source and sink and every
-`sqlite` source in a config the server loads runs with `sandbox: true`: DuckDB
+`ATTACH`, SQLite's `ATTACH` — so every connector whose schema marks a confining
+switch with `x-faucet-sandbox` runs with that switch on in a config the server
+loads. Among the built-ins that is every `duckdb` source and sink and every
+`sqlite` source (`sandbox: true`); a plugin connector that marks its own
+switch is confined the same way. DuckDB
 gets `enable_external_access = false` with extension autoload off and the
 configuration locked (a query cannot `SET` it back), and each SQLite
 connection allows no attached database (which also stops `VACUUM INTO`;
@@ -229,7 +232,9 @@ template a trigger runs is sandboxed like any other.
 
 ### Subprocess connectors
 
-The `singer` source and sink run a program named in their config. A config
+A connector whose schema marks a field `x-faucet-resource: command` runs a
+program named in its config — among the built-ins, the `singer` source and
+sink; a plugin connector is recognised the same way. A config
 **the request carries** (`POST /v1/runs`, `/v1/doctor`, `/v1/plan`,
 `/v1/status`, `/v1/backfill`, `/v1/verify`, `/v1/dlq/replay`, a rollback with
 a `config`, MCP `validate_config` / `preview` / `run_pipeline`) may use them
@@ -449,6 +454,9 @@ is the last `run_id` from the previous page.
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "batches": {"attempted": 5, "committed": 5, "dlq_partial": 0, "dlq_all": 0, "failed": 0},
+     "rows": {"transform_in": 4100, "transform_out": 4098, "offered": 4098, "accepted": 4096,
+              "coalesced": 0, "skipped": 0, "failed": 2, "quarantined": 0, "dropped": 0,
+              "unaccounted": 0},
      "source_lag": {"bytes": 4096}}
   ],
   "error": null,
@@ -463,8 +471,20 @@ comes back with every header value as `***` and URL credentials stripped, and
 the stored `config_body` (cluster runs) is returned to admins only — it can
 hold inline credentials. Each invocation carries
 `batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
-`failed`, #737) — and, for a source with a head, `source_lag` at the end of the
+`failed`, #737), `rows` — where every row went (#879): of the `offered` rows,
+how many the sink `accepted`, merged into another row of the same page by a
+keyed write (`coalesced`), declined by design (`skipped`), failed per row to the
+DLQ (`failed`), a quality / contract / drift / policy pass `quarantined`, or a
+poison-pill `drop` action `dropped`; `unaccounted` rows were lost by a sink
+without saying so and fail the run; `transform_in` / `transform_out` count the
+transform chain's input and output, the same view `faucet run --output json`
+prints — and, for a source with a head, `source_lag` at the end of the
 invocation (`bytes` / `events` / `seconds`, #733).
+
+A DLQ replay that writes (`POST /v1/dlq/replay` without `dry_run`) is recorded
+as a run under its `id` while it runs, with the label `dlq_replay: "true"` and
+`replay_of` naming the DLQ location it read, so it appears in `GET /v1/runs`
+and holds one of its tenant's `max_concurrent_runs` slots until it ends.
 
 > **Bookmarks:** run records carry record counts + per-row outcomes, not
 > replication bookmarks. Bookmark state is per-row/per-state-key and lives in the

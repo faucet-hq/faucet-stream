@@ -20,4 +20,11 @@ pub use stream::WebsocketSource;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("websocket", faucet_core::capabilities::plain_source);
+    faucet_core::ConnectorDescriptor::new("websocket", capabilities);
+
+/// Reading opens a live session: a side effect a read-only preview must not cause.
+fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+    faucet_core::Capabilities::builder()
+        .read_side_effects(true)
+        .build()
+}

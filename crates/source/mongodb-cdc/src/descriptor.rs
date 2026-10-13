@@ -9,6 +9,8 @@ fn capabilities(_config: &Value) -> Capabilities {
     Capabilities::builder()
         .exactly_once(true)
         .reports_lag(true)
+        .table_routing(true)
+        .read_side_effects(true)
         .build()
 }
 
@@ -25,6 +27,8 @@ mod tests {
                 Capabilities::builder()
                     .exactly_once(true)
                     .reports_lag(true)
+                    .table_routing(true)
+                    .read_side_effects(true)
                     .build()
             );
         }

@@ -36,6 +36,7 @@ pub struct DuckdbSourceConfig {
     /// `SET` it back. Defaults to `false`. `faucet serve` forces it on for
     /// every config it did not load from its own triggers file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("x-faucet-sandbox" = true))]
     pub sandbox: bool,
 }
 

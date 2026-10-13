@@ -252,6 +252,12 @@ A replay runs under the config's [`budget:`](./usage.md#run-budgets) and
 `POST /v1/runs/{id}/cancel` stops it at its next page boundary while it runs.
 A replay `tenant` (`tenants` feature) loads the config under that tenant's scope
 and is admitted against its limits, whose per-run ceilings bound the replay.
+A replay that writes is recorded as a run under its `id` (label
+`dlq_replay: "true"`, `replay_of` = the DLQ location) for as long as it runs,
+so it shows in the run list and counts toward its tenant's
+`max_concurrent_runs`: with the limit at `1`, a run submitted for the tenant
+while its replay runs is refused with `429`. A `--dry-run` replay writes
+nothing and is not recorded.
 
 Rows that fail **again** on replay are quarantined to a *fresh* DLQ — a
 `replay-failed.jsonl` sibling of the source by default (override with

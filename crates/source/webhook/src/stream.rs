@@ -382,6 +382,13 @@ impl faucet_core::Source for WebhookSource {
             .expect("schema serialization")
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .read_side_effects(true)
+            .build()
+    }
+
     fn connector_name(&self) -> &'static str {
         "webhook"
     }

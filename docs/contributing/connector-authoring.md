@@ -93,6 +93,19 @@ configured bucket, a URL path appended to a checked `base_url`) goes in
 looks like a resource, and on an allow-list entry that no longer matches one.
 After adding an annotation, regenerate `schemas/faucet.schema.json`.
 
+A connector whose own input can reach past its declared resources — a SQL
+engine whose query can `ATTACH` a file or `read_csv` a path — needs a boolean
+switch that confines it, marked so the server can find it:
+
+```rust
+#[schemars(extend("x-faucet-sandbox" = true))]
+pub sandbox: bool,
+```
+
+`faucet serve` forces every field marked this way to `true` in a config it did
+not load from its own triggers file, wherever the connector appears (template,
+row override, topology node, fan-out source, DLQ sink, …).
+
 ### Resumability
 
 If your source can resume, implement two methods:
