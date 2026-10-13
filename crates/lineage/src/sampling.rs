@@ -231,9 +231,17 @@ impl SamplingSink {
 
 #[async_trait]
 impl Sink for SamplingSink {
-    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
+    // Every hook not sampled below reaches the wrapped sink. Without the
+    // columnar build the fast path stays at the trait default (off).
+    faucet_core::forward_sink!(inner; except
+        write_batch, write_batch_partial, write_batch_idempotent, load_native, write_batch_columnar,
+        supports_columnar);
+
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
     }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let n = self.inner.write_batch(records).await?;
         self.state.observe(records);
@@ -254,40 +262,6 @@ impl Sink for SamplingSink {
         }
         Ok(outcomes)
     }
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-    // Capability + exactly-once passthroughs. Without these the wrapper's
-    // trait defaults would mask the inner sink's capabilities whenever lineage
-    // (or catalog) sampling is active — e.g. an exactly-once run would be
-    // rejected as "sink is not idempotent" purely because sampling was on.
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::decorated_sink(self, &self.inner.capabilities())
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        self.inner.supported_write_modes()
-    }
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -300,102 +274,6 @@ impl Sink for SamplingSink {
             .await?;
         self.state.observe(records);
         Ok(n)
-    }
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
-        &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    fn supports_staged_load(&self) -> bool {
-        self.inner.supports_staged_load()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &faucet_core::rollback::RollbackOptions,
-    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-    async fn check(
-        &self,
-        ctx: &faucet_core::CheckContext,
-    ) -> Result<faucet_core::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
-    }
-    // Native byte-passthrough passthrough (#639). Without forwarding these, the
-    // wrapper's trait defaults would report "no native load capability", forcing
-    // the pipeline onto the `Value` path whenever sampling is active — the exact
-    // regression this fix closes (memory ~35× higher). We tap the payload for the
-    // sink-side schema sample while the inner sink drains it, so the fast path and
-    // the catalog schema both survive.
-    fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
-        self.inner.native_load_capabilities()
     }
     async fn load_native(
         &self,
@@ -423,14 +301,6 @@ impl Sink for SamplingSink {
             bookmark,
         };
         self.inner.load_native(tapped, scope, ctx).await
-    }
-    // Columnar (Arrow) fast-path passthrough (#639, #375). Same rationale as the
-    // native methods: without forwarding, the wrapper masks the inner sink's
-    // columnar capability and forces the `Value` path. We sample a bounded row
-    // prefix of the batch for the schema, then forward the batch unchanged.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
     }
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(
@@ -476,14 +346,16 @@ impl SamplingSource {
 
 #[async_trait]
 impl Source for SamplingSource {
-    async fn fetch_with_context(
-        &self,
-        ctx: &HashMap<String, Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        // Required method; sampling happens in `stream_pages` (the path the
-        // pipeline actually drives). Delegate so the trait is complete.
-        self.inner.fetch_with_context(ctx).await
+    // Every hook not sampled below reaches the wrapped source. Without the
+    // columnar build the fast path stays at the trait default (off).
+    faucet_core::forward_source!(inner; except
+        stream_pages, stream_native, stream_batches, supports_columnar);
+
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
     }
+
     /// Override `stream_pages` (NOT `fetch_*`) so native-streaming sources keep
     /// their bounded-memory page stream — we tap the pages as they flow rather
     /// than forcing the buffering default path.
@@ -503,40 +375,7 @@ impl Source for SamplingSource {
             }
         })
     }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    fn state_key(&self) -> Option<String> {
-        self.inner.state_key()
-    }
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
 
-    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
-        self.inner.set_run_clock(now);
-    }
-
-    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-        self.inner.set_cancel(cancel)
-    }
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        self.inner.apply_start_bookmark(bookmark).await
-    }
-    // Native byte-passthrough passthrough (#639) — mirror of the sink side. We
-    // forward the format advertisement and wrap each native batch's payload in a
-    // tap that samples a bounded prefix + counts records by newline while passing
-    // every byte through unchanged, so the fast path stays memory-flat and the
-    // input-side schema sample is still captured.
-    fn native_output_formats(&self) -> &'static [faucet_core::NativeFormat] {
-        self.inner.native_output_formats()
-    }
     fn stream_native<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
@@ -560,11 +399,6 @@ impl Source for SamplingSource {
             }
         })
     }
-    // Columnar (Arrow) fast-path passthrough (#639, #375) — mirror of the sink.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
-    }
     #[cfg(feature = "arrow")]
     fn stream_batches<'a>(
         &'a self,
@@ -585,59 +419,6 @@ impl Source for SamplingSource {
                 yield page;
             }
         })
-    }
-    // Bookmark + capability passthroughs. `fetch_with_context_incremental`
-    // matters even though the pipeline drives `stream_pages`: an *outer*
-    // wrapper's default `stream_pages` builds on it, and the trait default
-    // would silently drop the inner source's bookmark (breaking incremental
-    // resume whenever sampling is active).
-    async fn fetch_with_context_incremental(
-        &self,
-        ctx: &HashMap<String, Value>,
-    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        self.inner.fetch_with_context_incremental(ctx).await
-    }
-    fn supports_exactly_once(&self) -> bool {
-        self.inner.supports_exactly_once()
-    }
-    fn consumes_destructively(&self) -> bool {
-        self.inner.consumes_destructively()
-    }
-    fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
-        self.inner.replay_guarantee()
-    }
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::decorated_source(self, &self.inner.capabilities())
-    }
-    async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.capture_resume_position().await
-    }
-    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
-        self.inner.lag().await
-    }
-
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
     }
 }
 
@@ -688,6 +469,52 @@ mod tests {
         ) -> Option<bool> {
             Some(record.get("p")?.as_u64()? < position.as_u64()?)
         }
+    }
+
+    /// The columnar hooks are sampled only in the `arrow` build; without it
+    /// they stay at the trait default.
+    const UNSAMPLED_COLUMNAR: &[&str] = if cfg!(feature = "arrow") {
+        &[]
+    } else {
+        &[
+            "supports_columnar",
+            "stream_batches",
+            "write_batch_columnar",
+        ]
+    };
+
+    fn skips(kind: &[&str]) -> Vec<&'static str> {
+        UNSAMPLED_COLUMNAR
+            .iter()
+            .copied()
+            .filter(|h| kind.contains(h))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sampling_sink_forwards_every_hook() {
+        use faucet_conformance::forwarding::{
+            HookSink, SINK_HOOKS, assert_sink_forwards_every_hook,
+        };
+        let probe = HookSink::default();
+        let sink = SamplingSink::new(
+            Box::new(probe.clone()),
+            std::sync::Arc::new(SampleState::new(5)),
+        );
+        assert_sink_forwards_every_hook(&sink, &probe, &skips(SINK_HOOKS)).await;
+    }
+
+    #[tokio::test]
+    async fn sampling_source_forwards_every_hook() {
+        use faucet_conformance::forwarding::{
+            HookSource, SOURCE_HOOKS, assert_source_forwards_every_hook,
+        };
+        let probe = HookSource::default();
+        let source = SamplingSource::new(
+            Box::new(probe.clone()),
+            std::sync::Arc::new(SampleState::new(5)),
+        );
+        assert_source_forwards_every_hook(&source, &probe, &skips(SOURCE_HOOKS)).await;
     }
 
     fn assert_forwards_multi_table_hooks(s: &dyn faucet_core::Source) {

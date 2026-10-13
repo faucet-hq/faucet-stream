@@ -837,10 +837,9 @@ pub async fn read_state(
         .clone()
         .unwrap_or_else(|| fallback_name.to_string());
     // A tenant's runs key their state `{tenant}::{pipeline}::…`.
-    let name = match tenant {
-        Some(t) => format!("{}::{name}", t.id),
-        None => name,
-    };
+    let name = faucet_core::StateKey::pipeline(name)
+        .with_tenant(tenant.map(|t| t.id.as_str()))
+        .namespace();
     let target = crate::pipeline_state::PipelineTarget::resolve(&cfg, &name)
         .map_err(|e| format!("state omitted: {e}"))?;
     let stores = crate::pipeline_state::ops::Stores::build(&target, None)

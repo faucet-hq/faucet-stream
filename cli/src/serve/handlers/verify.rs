@@ -9,7 +9,6 @@
 use crate::auth_catalog::build_auth_catalog;
 use crate::error::CliError;
 use crate::serve::error::ServeError;
-use crate::serve::load::load_submission;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
@@ -58,14 +57,9 @@ pub async fn verify(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = load_submission(
-        &req.config,
-        req.config_format.into(),
-        state.default_base().as_ref(),
-        crate::serve::runner::server_policy(&state).as_deref(),
-        state.caller_origin(),
-    )
-    .await?;
+    let loaded = state
+        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
+        .await?;
     if req.repair && !req.dry_run {
         crate::serve::runner::refuse_unapproved_write(&state, "verify repair")?;
         crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;

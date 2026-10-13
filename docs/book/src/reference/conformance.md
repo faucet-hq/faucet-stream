@@ -112,6 +112,13 @@ One more check pins what the CLI checks a config against:
 See [Authoring connectors](../extending/authoring-connectors.md#self-certify-with-the-conformance-battery)
 for how to wire the battery into a new connector.
 
+A connector that **wraps** another one (a decorator holding an inner source or
+sink) also uses the forwarding harness,
+`faucet_conformance::forwarding::assert_source_forwards_every_hook` /
+`assert_sink_forwards_every_hook`. It proves every defaulted hook reaches the
+wrapped connector. See
+[Wrapping another connector](../extending/authoring-connectors.md#wrapping-another-connector).
+
 ## Related
 
 - [`faucet conformance`](./cli.md#conformance) — the command

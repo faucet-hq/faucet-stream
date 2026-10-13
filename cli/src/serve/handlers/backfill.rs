@@ -24,7 +24,6 @@
 use crate::backfill::plan::{parse_boundary, parse_window, range_hash, substitute_unit_tokens};
 use crate::backfill::spec::{has_scoping_tokens, parse_timezone};
 use crate::serve::error::ServeError;
-use crate::serve::load::load_submission;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::{self, ConfigFormatWire, SubmitRequest};
 use crate::serve::state::ServerState;
@@ -93,7 +92,9 @@ struct SubmittedRange {
 }
 
 fn submitted_range_key(base_name: &str, hash: &str) -> String {
-    format!("{base_name}::__serve_backfill__::{hash}")
+    faucet_core::StateKey::pipeline(base_name)
+        .with_suffix(faucet_core::KeySuffix::ServeBackfill(hash.to_owned()))
+        .render()
 }
 
 fn unit_idempotency_key(hash: &str, generation: u32, unit: &str) -> String {
@@ -168,14 +169,9 @@ pub async fn submit_backfill(
     // Validate the config loads/expands and gate the window scoping exactly
     // like the CLI: every root's source must reference a `${backfill.*}` /
     // `${now.*}` token or each unit would replay identical data.
-    let loaded = load_submission(
-        &req.config,
-        req.config_format.into(),
-        state.default_base().as_ref(),
-        crate::serve::runner::server_policy(&state).as_deref(),
-        state.caller_origin(),
-    )
-    .await?;
+    let loaded = state
+        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
+        .await?;
     loaded.require_matrix()?;
     let unscoped: Vec<&str> = loaded
         .nodes

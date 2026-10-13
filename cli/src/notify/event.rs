@@ -12,7 +12,7 @@ use std::time::Instant;
 
 /// Scrub every resolved secret from text bound for an external channel.
 fn redact(s: String) -> String {
-    crate::secrets::registry::redact(&s).into_owned()
+    crate::secrets::registry::redact_message(&s)
 }
 
 /// Run identity + timing for the invocation an event belongs to (#480).

@@ -14,6 +14,7 @@ pub type ElasticsearchSinkAuth = ElasticsearchAuth;
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ElasticsearchSinkConfig {
     /// Base URL of the Elasticsearch cluster (e.g. `"http://localhost:9200"`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub base_url: String,
     /// Target index name.
     pub index: String,

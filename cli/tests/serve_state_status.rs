@@ -84,6 +84,7 @@ async fn spawn_server(port: u16, dir: &Path) {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

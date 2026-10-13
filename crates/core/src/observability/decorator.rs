@@ -52,6 +52,42 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
+type BoxedStream<'b, T> = Pin<Box<dyn Stream<Item = Result<T, FaucetError>> + Send + 'b>>;
+
+/// Run a source's fast-path stream behind `catch_unwind` (#872): a panic while
+/// opening the stream or polling an item becomes one `Panic`-kind error that
+/// ends the stream, exactly like the row path in `stream_pages`.
+fn panic_isolated<'b, T: Send + 'b>(
+    open: impl FnOnce() -> BoxedStream<'b, T>,
+    labels: Vec<Label>,
+) -> BoxedStream<'b, T> {
+    use futures::StreamExt;
+    let fail = move |panic: Box<dyn std::any::Any + Send>| {
+        let mut l = labels.clone();
+        l.push(Label::new("kind", SharedString::const_str("Panic")));
+        counter!("faucet_source_errors_total", l).increment(1);
+        FaucetError::Custom(format!("panic in source: {}", panic_message(&*panic)).into())
+    };
+    let inner = match std::panic::catch_unwind(AssertUnwindSafe(open)) {
+        Ok(stream) => stream,
+        Err(panic) => {
+            let err = fail(panic);
+            return Box::pin(futures::stream::once(async move { Err(err) }));
+        }
+    };
+    Box::pin(futures::stream::unfold(Some(inner), move |state| {
+        let fail = fail.clone();
+        async move {
+            let mut stream = state?;
+            match AssertUnwindSafe(stream.next()).catch_unwind().await {
+                Ok(Some(item)) => Some((item, Some(stream))),
+                Ok(None) => None,
+                Err(panic) => Some((Err(fail(panic)), None)),
+            }
+        }
+    }))
+}
+
 /// Guard an inner connector's `connector_name()` so an empty string maps to
 /// the `"unknown"` fallback. Used both for the `connector` metric label and the
 /// `connector_name()` passthrough so the two never disagree.
@@ -134,99 +170,10 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         guarded_connector_name(self.inner.connector_name())
     }
 
-    /// Forward the round-trip recorder to the wrapped connector (#638) — the
-    /// decorator sits between the pipeline and the connector, so without this
-    /// the hook would never reach the code that performs the I/O.
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-
-    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
-        self.inner.set_run_clock(now);
-    }
-
-    fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
-        self.inner.set_cancel(cancel)
-    }
-
-    fn state_key(&self) -> Option<String> {
-        self.inner.state_key()
-    }
-
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        self.inner.apply_start_bookmark(bookmark).await
-    }
-
-    fn supports_exactly_once(&self) -> bool {
-        self.inner.supports_exactly_once()
-    }
-    fn consumes_destructively(&self) -> bool {
-        self.inner.consumes_destructively()
-    }
-
-    fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
-        self.inner.replay_guarantee()
-    }
-    fn capabilities(&self) -> crate::Capabilities {
-        crate::Capabilities::decorated_source(self, &self.inner.capabilities())
-    }
-
-    async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.capture_resume_position().await
-    }
-    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
-        self.inner.lag().await
-    }
-
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
-    }
-
-    async fn fetch_with_context(
-        &self,
-        context: &HashMap<String, Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        // Library-call path; the pipeline drives through stream_pages.
-        self.inner.fetch_with_context(context).await
-    }
-
-    async fn fetch_with_context_incremental(
-        &self,
-        context: &HashMap<String, Value>,
-    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        self.inner.fetch_with_context_incremental(context).await
-    }
-
-    // Columnar fast path (feature `arrow`): forward transparently to the inner
-    // source. The columnar streaming loop in `pipeline.rs` emits the source
-    // metrics itself, so no instrumentation is layered here (RFC 0002 / #375).
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
-    }
+    // Every other hook reaches the wrapped connector unchanged; the columnar
+    // and native streams add only byte metering and panic isolation (#872) —
+    // the fast-path loops in `pipeline.rs` emit the source metrics.
+    crate::forward_source!(inner; except connector_name, stream_batches, stream_native, stream_pages);
 
     #[cfg(feature = "arrow")]
     fn stream_batches<'b>(
@@ -236,7 +183,10 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
     ) -> Pin<Box<dyn Stream<Item = Result<crate::columnar::ColumnarPage, FaucetError>> + Send + 'b>>
     {
         use futures::StreamExt;
-        let inner = self.inner.stream_batches(context, batch_size);
+        let inner = panic_isolated(
+            || self.inner.stream_batches(context, batch_size),
+            self.metric_labels(),
+        );
         let Some(meter) = self.meter.clone() else {
             return inner;
         };
@@ -250,12 +200,6 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         }))
     }
 
-    // Native byte-passthrough capability (#633) forwards to the inner source; the
-    // native streaming loop in `pipeline.rs` emits the source metrics itself.
-    fn native_output_formats(&self) -> &'static [crate::native::NativeFormat] {
-        self.inner.native_output_formats()
-    }
-
     fn stream_native<'b>(
         &'b self,
         context: &'b HashMap<String, Value>,
@@ -264,7 +208,10 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
     ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'b>>
     {
         use futures::StreamExt;
-        let inner = self.inner.stream_native(context, format, batch_size);
+        let inner = panic_isolated(
+            || self.inner.stream_native(context, format, batch_size),
+            self.metric_labels(),
+        );
         let Some(meter) = self.meter.clone() else {
             return inner;
         };
@@ -457,6 +404,12 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
         l
     }
 
+    /// Count a panic from the wrapped sink and turn it into a typed error.
+    fn panicked(&self, what: &str, panic: Box<dyn std::any::Any + Send>) -> FaucetError {
+        counter!("faucet_sink_errors_total", self.error_labels("Panic")).increment(1);
+        FaucetError::Custom(format!("panic in {what}: {}", panic_message(&*panic)).into())
+    }
+
     /// Count `accepted` records of `records` as written; when the sink
     /// accepted a prefix, only that prefix's estimated size is attributed.
     fn meter_written(&self, records: &[Value], accepted: usize) {
@@ -475,9 +428,12 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
 
 #[async_trait]
 impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
-    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
-    }
+    // Every hook not instrumented below reaches the wrapped connector
+    // unchanged: identity, capabilities, lifecycle and provenance must look
+    // through the decorator, or the feature behind each one goes inert.
+    crate::forward_sink!(inner; except connector_name, write_batch_columnar,
+        load_native, write_batch, write_batch_partial, flush, write_batch_idempotent);
+
     fn connector_name(&self) -> &'static str {
         // Return the guarded name so an inner connector that returns "" maps to
         // the "unknown" fallback — keeping this passthrough consistent with the
@@ -485,43 +441,15 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         guarded_connector_name(self.inner.connector_name())
     }
 
-    /// Forward the round-trip recorder to the wrapped connector (#638) — the
-    /// decorator sits between the pipeline and the connector, so without this
-    /// the hook would never reach the code that performs the I/O.
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-
-    // Identity + provenance passthroughs. Instrumentation must be invisible to
-    // anything asking the sink *what* it is or *what it wrote* — a decorator that
-    // falls back to the trait defaults reports `"<name>://unknown"` and an empty
-    // output list, which for `local_outputs` means the retention GC (#587) never
-    // learns about files this sink created and can never reclaim them. Silent, and
-    // only observable as disk filling up.
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-
-    async fn local_outputs(&self) -> Vec<crate::local_outputs::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-
-    // Columnar fast path (feature `arrow`): forward transparently to the inner
-    // sink; the columnar loop in `pipeline.rs` emits the sink metrics (RFC 0002).
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
-    }
-
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(
         &self,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
-        let n = self.inner.write_batch_columnar(batch).await?;
+        let n = AssertUnwindSafe(async { self.inner.write_batch_columnar(batch).await })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| Err(self.panicked("sink", panic)))?;
         if let Some(m) = &self.meter {
             let rows = batch.num_rows().max(1);
             let bytes = crate::columnar::batch_slice_bytes(batch)
@@ -533,12 +461,6 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         Ok(n)
     }
 
-    // Native byte-passthrough load (#633): forward to the inner sink; the native
-    // loop in `pipeline.rs` emits the sink metrics.
-    fn native_load_capabilities(&self) -> Vec<crate::native::NativeLoadCapability> {
-        self.inner.native_load_capabilities()
-    }
-
     async fn load_native(
         &self,
         batch: crate::native::NativeBatch,
@@ -546,7 +468,10 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         ctx: crate::native::NativeLoadContext,
     ) -> Result<usize, FaucetError> {
         let Some(meter) = self.meter.clone() else {
-            return self.inner.load_native(batch, scope, ctx).await;
+            return AssertUnwindSafe(async { self.inner.load_native(batch, scope, ctx).await })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| Err(self.panicked("sink", panic)));
         };
         let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut batch = batch;
@@ -561,7 +486,10 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
                 }
             },
         );
-        let n = self.inner.load_native(batch, scope, ctx).await?;
+        let n = AssertUnwindSafe(async { self.inner.load_native(batch, scope, ctx).await })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| Err(self.panicked("sink", panic)))?;
         meter.add_written(n as u64, bytes.load(Ordering::Relaxed));
         Ok(n)
     }
@@ -733,62 +661,6 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         }
     }
 
-    // ── Non-instrumented passthroughs ────────────────────────────────────────
-    // These carry no per-call metric/span of their own, but they MUST delegate
-    // to the inner sink — the `Sink` trait gives each a default that disables
-    // the corresponding feature (schema-drift, upsert, exactly-once). Because
-    // the pipeline drives the *wrapped* sink, failing to forward them silently
-    // makes those features inert through the entire CLI/observability path.
-
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-
-    async fn evolve_schema(
-        &self,
-        evolution: &crate::drift::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-
-    fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &crate::cleanup::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-
-    fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    fn capabilities(&self) -> crate::Capabilities {
-        crate::Capabilities::decorated_sink(self, &self.inner.capabilities())
-    }
-
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -841,80 +713,6 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
                 ))
             }
         }
-    }
-
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
-
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-
-    fn supports_staged_load(&self) -> bool {
-        self.inner.supports_staged_load()
-    }
-
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &crate::rollback::RollbackOptions,
-    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-
-    async fn check(
-        &self,
-        ctx: &crate::check::CheckContext,
-    ) -> Result<crate::check::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
     }
 }
 
@@ -1836,9 +1634,9 @@ mod sink_tests {
 
     #[tokio::test]
     async fn instrumented_sink_forwards_every_hook() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let wrapped = InstrumentedSink::new(&probe, labels());
-        crate::sink_forwarding::assert_forwards_every_hook(&wrapped, &probe, &[]).await;
+        crate::forwarding::assert_sink_forwards_every_hook(&wrapped, &probe, &[]).await;
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -1846,7 +1644,7 @@ mod sink_tests {
     async fn idempotent_write_is_counted_metered_and_panic_guarded() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _snap = snapshotter();
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let meter = Arc::new(UsageMeter::new());
         let wrapped = InstrumentedSink::new(&probe, Labels::new("p", "eo-row", "rid"))
             .with_meter(Arc::clone(&meter));
@@ -1909,7 +1707,7 @@ mod sink_tests {
     #[tokio::test]
     async fn native_loads_are_metered_for_buffered_and_streamed_payloads() {
         use crate::native::{NativeBatch, NativeFormat, NativeLoadContext, NativePayload};
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let meter = Arc::new(UsageMeter::new());
         let wrapped = InstrumentedSink::new(&probe, labels()).with_meter(Arc::clone(&meter));
         let ctx = || NativeLoadContext {
@@ -2050,12 +1848,262 @@ mod sink_tests {
         let unmetered = InstrumentedSource::new(&Cols, labels());
         assert_eq!(unmetered.stream_batches(&ctx, 10).count().await, 1);
 
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let sink = InstrumentedSink::new(&probe, labels()).with_meter(Arc::clone(&meter));
         assert_eq!(sink.write_batch_columnar(&batch()).await.unwrap(), 3);
         let snap = meter.snapshot();
         assert_eq!((snap.records_read, snap.records_written), (3, 3));
         assert!(snap.bytes_read > 0);
         assert_eq!(snap.bytes_read, snap.bytes_written);
+    }
+
+    // ── panic isolation on the columnar and native fast paths (#872) ─────────
+
+    fn panic_errors_for(row: &str, metric: &str) -> u64 {
+        snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _u, _d, v)| {
+                let k = key.key();
+                let hit = k.name() == metric
+                    && k.labels().any(|l| l.key() == "row" && l.value() == row)
+                    && k.labels()
+                        .any(|l| l.key() == "kind" && l.value() == "Panic");
+                match (hit, v) {
+                    (true, DebugValue::Counter(c)) => Some(c),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    fn assert_panic_error(result: Result<usize, FaucetError>, what: &str, msg: &str) {
+        match result {
+            Err(FaucetError::Custom(b)) => {
+                assert_eq!(b.to_string(), format!("panic in {what}: {msg}"))
+            }
+            other => panic!("expected a panic error, got {other:?}"),
+        }
+    }
+
+    struct PanicsOnFastPaths;
+    #[async_trait]
+    impl Sink for PanicsOnFastPaths {
+        async fn write_batch(&self, _: &[Value]) -> Result<usize, FaucetError> {
+            Ok(0)
+        }
+        #[cfg(feature = "arrow")]
+        async fn write_batch_columnar(
+            &self,
+            _batch: &arrow::array::RecordBatch,
+        ) -> Result<usize, FaucetError> {
+            panic!("columnar kaboom")
+        }
+        async fn load_native(
+            &self,
+            _batch: crate::native::NativeBatch,
+            _scope: &str,
+            _ctx: crate::native::NativeLoadContext,
+        ) -> Result<usize, FaucetError> {
+            panic!("native kaboom")
+        }
+    }
+
+    fn native_batch() -> crate::native::NativeBatch {
+        crate::native::NativeBatch {
+            format: crate::native::NativeFormat::NdJson,
+            payload: crate::native::NativePayload::Bytes(b"{}\n".to_vec()),
+            csv: crate::native::CsvDialect::default(),
+            records: Some(1),
+            bookmark: None,
+        }
+    }
+
+    fn load_ctx() -> crate::native::NativeLoadContext {
+        crate::native::NativeLoadContext {
+            write_mode: crate::write_mode::WriteMode::Append,
+            first_batch: true,
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn native_load_panic_is_a_typed_error_metered_or_not() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap = snapshotter();
+        let plain =
+            InstrumentedSink::new(&PanicsOnFastPaths, Labels::new("p", "native-panic", "rid"));
+        let r = plain.load_native(native_batch(), "s", load_ctx()).await;
+        assert_panic_error(r, "sink", "native kaboom");
+        let metered =
+            InstrumentedSink::new(&PanicsOnFastPaths, Labels::new("p", "native-panic", "rid"))
+                .with_meter(Arc::new(UsageMeter::new()));
+        let r = metered.load_native(native_batch(), "s", load_ctx()).await;
+        assert_panic_error(r, "sink", "native kaboom");
+        assert_eq!(
+            panic_errors_for("native-panic", "faucet_sink_errors_total"),
+            2
+        );
+    }
+
+    #[cfg(feature = "arrow")]
+    fn one_row() -> arrow::array::RecordBatch {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        arrow::array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "arrow")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn columnar_write_panic_is_a_typed_error() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap = snapshotter();
+        let wrapped =
+            InstrumentedSink::new(&PanicsOnFastPaths, Labels::new("p", "col-panic", "rid"))
+                .with_meter(Arc::new(UsageMeter::new()));
+        let r = wrapped.write_batch_columnar(&one_row()).await;
+        assert_panic_error(r, "sink", "columnar kaboom");
+        assert_eq!(panic_errors_for("col-panic", "faucet_sink_errors_total"), 1);
+    }
+
+    /// Panics opening its native stream; its columnar stream yields one page
+    /// and then panics on the next poll.
+    struct PanickyStreams;
+    #[async_trait]
+    impl Source for PanickyStreams {
+        async fn fetch_with_context(
+            &self,
+            _: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        #[cfg(feature = "arrow")]
+        fn stream_batches<'a>(
+            &'a self,
+            _context: &'a HashMap<String, Value>,
+            _batch_size: usize,
+        ) -> Pin<
+            Box<dyn Stream<Item = Result<crate::columnar::ColumnarPage, FaucetError>> + Send + 'a>,
+        > {
+            let mut polled = 0;
+            Box::pin(futures::stream::poll_fn(move |_| {
+                polled += 1;
+                if polled == 1 {
+                    std::task::Poll::Ready(Some(Ok(crate::columnar::ColumnarPage {
+                        batch: one_row(),
+                        bookmark: None,
+                    })))
+                } else {
+                    panic!("batches kaboom")
+                }
+            }))
+        }
+        fn stream_native<'a>(
+            &'a self,
+            _context: &'a HashMap<String, Value>,
+            _format: crate::native::NativeFormat,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'a>>
+        {
+            panic!("open kaboom")
+        }
+    }
+
+    /// Yields one native batch, then panics on the next poll.
+    struct PanicsMidNative;
+    #[async_trait]
+    impl Source for PanicsMidNative {
+        async fn fetch_with_context(
+            &self,
+            _: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn stream_native<'a>(
+            &'a self,
+            _context: &'a HashMap<String, Value>,
+            _format: crate::native::NativeFormat,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'a>>
+        {
+            let mut polled = 0;
+            Box::pin(futures::stream::poll_fn(move |_| {
+                polled += 1;
+                if polled == 1 {
+                    std::task::Poll::Ready(Some(Ok(native_batch())))
+                } else {
+                    panic!("mid kaboom")
+                }
+            }))
+        }
+    }
+
+    fn panic_text(item: Option<Result<impl std::fmt::Debug, FaucetError>>) -> String {
+        match item {
+            Some(Err(FaucetError::Custom(b))) => b.to_string(),
+            other => panic!("expected a panic error item, got {other:?}"),
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn native_stream_panics_become_one_error_item_that_ends_the_stream() {
+        use futures::StreamExt;
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap = snapshotter();
+        let ctx = HashMap::new();
+        let fmt = crate::native::NativeFormat::NdJson;
+
+        let opening =
+            InstrumentedSource::new(&PanickyStreams, Labels::new("p", "src-panic", "rid"));
+        let mut s = opening.stream_native(&ctx, fmt, 10);
+        assert_eq!(panic_text(s.next().await), "panic in source: open kaboom");
+        assert!(s.next().await.is_none(), "the stream ends after the panic");
+
+        let mid = InstrumentedSource::new(&PanicsMidNative, Labels::new("p", "src-panic", "rid"))
+            .with_meter(Arc::new(UsageMeter::new()));
+        let mut s = mid.stream_native(&ctx, fmt, 10);
+        assert!(matches!(s.next().await, Some(Ok(_))));
+        assert_eq!(panic_text(s.next().await), "panic in source: mid kaboom");
+        assert!(s.next().await.is_none());
+        assert_eq!(
+            panic_errors_for("src-panic", "faucet_source_errors_total"),
+            2
+        );
+    }
+
+    #[cfg(feature = "arrow")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn columnar_stream_panic_becomes_one_error_item() {
+        use futures::StreamExt;
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap = snapshotter();
+        let ctx = HashMap::new();
+        for meter in [None, Some(Arc::new(UsageMeter::new()))] {
+            let mut wrapped =
+                InstrumentedSource::new(&PanickyStreams, Labels::new("p", "batches-panic", "rid"));
+            if let Some(m) = meter {
+                wrapped = wrapped.with_meter(m);
+            }
+            let mut s = wrapped.stream_batches(&ctx, 10);
+            assert!(matches!(s.next().await, Some(Ok(_))));
+            assert_eq!(
+                panic_text(s.next().await),
+                "panic in source: batches kaboom"
+            );
+            assert!(s.next().await.is_none());
+        }
+        assert_eq!(
+            panic_errors_for("batches-panic", "faucet_source_errors_total"),
+            2
+        );
     }
 }

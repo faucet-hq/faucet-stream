@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 /// credentials.
 pub(crate) fn redact_record(rec: &mut RunRecord, actor: &AuthContext) {
     if let Some(e) = &rec.error {
-        rec.error = Some(crate::secrets::registry::redact(e).into_owned());
+        rec.error = Some(crate::secrets::registry::redact_message(e));
     }
     for inv in &mut rec.invocations {
         if let Some(e) = &inv.error {
-            inv.error = Some(crate::secrets::registry::redact(e).into_owned());
+            inv.error = Some(crate::secrets::registry::redact_message(e));
         }
     }
     if let Some(cb) = &mut rec.callback {

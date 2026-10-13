@@ -99,6 +99,21 @@ A config submitted over HTTP or MCP may not use the `singer` source or sink —
 they run a program on the host — unless the server is started with
 `--allow-subprocess-connectors`. Registered templates may.
 
+Every other reference a submitted config makes goes through the same
+allow-list: local paths stay under the working and temp directories, `${env:}`
+and secret-manager references are refused, and cloud-metadata hosts are
+unreachable, until the operator widens it:
+
+```bash
+faucet serve --auth-config auth.yaml \
+  --allow-path-root /data/pipelines \
+  --allow-url-host '*.example.com' \
+  --allow-env 'PIPELINE_*' --allow-secret-scheme vault
+```
+
+See [Reference policy](../reference/http-api.md#reference-policy) for the full
+table.
+
 **Every mutating action** (`run.submit` / `run.cancel` / `run.delete`) **and every
 denied attempt** is written to a tamper-evident audit log — principal, role,
 action, run id, config fingerprint, source IP, timestamp, result. Admins read it:

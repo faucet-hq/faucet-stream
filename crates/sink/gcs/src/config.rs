@@ -220,6 +220,7 @@ pub struct GcsSinkConfig {
     /// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
     /// minor release; any change is called out in the changelog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub scratch_dir: Option<String>,
 }
 

@@ -1196,7 +1196,7 @@ async fn execute(
             format!("the plan changed since approval: {}", diff.join("; "))
         };
         change.status = ChangeStatus::Invalidated;
-        change.error = Some(why);
+        change.error = Some(crate::secrets::registry::redact_message(&why));
         change.plan = Some(fresh);
         change.touch();
         save(state, &change).await?;
@@ -1414,7 +1414,7 @@ async fn finish_failed(
     error: String,
 ) -> Result<ChangeRequest, ServeError> {
     change.status = ChangeStatus::Failed;
-    change.error = Some(crate::secrets::registry::redact(&error).into_owned());
+    change.error = Some(crate::secrets::registry::redact_message(&error));
     change.touch();
     save(state, &change).await?;
     record_metric(change.kind, "failed");

@@ -65,10 +65,9 @@ pub fn build_snapshot(
 ) -> ConfigSnapshot {
     let mut rows = BTreeMap::new();
     for node in nodes {
-        let state_key = node
-            .state
-            .as_ref()
-            .map(|_| format!("{pipeline}::{}", node.id));
+        let state_key = node.state.as_ref().map(|_| {
+            faucet_core::StateKey::invocation(pipeline.as_str(), node.id.as_str()).render()
+        });
         rows.insert(
             node.id.clone(),
             RowSnapshot {

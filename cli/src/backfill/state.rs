@@ -81,7 +81,9 @@ impl BackfillState {
 
 /// State key holding a range's progress marker.
 pub fn marker_key(pipeline_name: &str, range_hash: &str) -> String {
-    format!("{pipeline_name}::__backfill__::{range_hash}")
+    faucet_core::StateKey::pipeline(pipeline_name)
+        .with_suffix(faucet_core::KeySuffix::Backfill(range_hash.to_owned()))
+        .render()
 }
 
 /// State key a unit's pipeline invocation reads/advances — the executor's key
@@ -94,7 +96,7 @@ pub fn unit_state_key(pipeline_name: &str, range_hash: &str, unit_id: &str) -> S
 
 /// The synthesized row id for a unit's node.
 pub fn unit_row_id(range_hash: &str, unit_id: &str) -> String {
-    format!("backfill::{range_hash}::{unit_id}")
+    faucet_core::state_key::backfill_unit_row(range_hash, unit_id)
 }
 
 /// Split the plan into (to-run, already-done) against a loaded marker: done

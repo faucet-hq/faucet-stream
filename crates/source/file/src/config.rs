@@ -68,6 +68,7 @@ pub struct FileSourceConfig {
     /// A file, a directory, a glob (`data/**/*.jsonl`), or one `http://` /
     /// `https://` URL. A directory lists its regular files (descending into
     /// subdirectories with `recursive: true`); every listing is sorted by path.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub path: String,
     /// File format, `auto` (by extension, per file) by default. Under `auto`
     /// a file with no recognised extension is skipped with a warning, or

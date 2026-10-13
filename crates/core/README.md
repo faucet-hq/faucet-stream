@@ -222,6 +222,20 @@ let stages = vec![TransformStage::Map(
 let wrapped = TransformingSource::new(source, stages);
 ```
 
+## Resource annotations and reference policies
+
+Mark a config field that names a local path, a URL or a program with
+`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`).
+`faucet_core::resolve` reads the annotation back from a config schema
+(`annotated_resources(schema, config)`, `declares(schema, kind)`) and checks
+each value with a `ReferencePolicy`: an allow-list of path roots (compared
+after symlinks resolve), URL schemes and hosts (link-local and cloud-metadata
+hosts refused unless listed), environment variable names, secret-manager
+schemes and whether a program may run. `ReferencePolicy::deny_all()` is the
+default and `open()` allows everything but metadata hosts. `faucet serve` uses
+it to confine configs a caller submits, so an annotated third-party connector
+is confined without serve changes.
+
 ## Error types
 
 `FaucetError` covers every failure mode:
@@ -270,6 +284,25 @@ let result = Pipeline::new(&source, &sink)
 ```
 
 State keys are validated via `state::validate_state_key`.
+
+Runtimes that drive many pipelines build their keys with `StateKey` (#882): a
+typed key from its components (tenant, pipeline, row, parent key, shard, a
+`KeySuffix` marker) with one rendering,
+`[{tenant}::]{pipeline}::{row}[::{sub}][::{shard}][::{suffix}]`. The rendering
+is versioned by `KEY_SCHEME_VERSION`; `StateKey::legacy_renderings()` lists the
+keys earlier schemes rendered, and `migrate_state_key(store, key, candidates)`
+moves a value left under one of them to the current key (only while the current
+key is empty), so a rendering change never turns a resumable pipeline into a
+first run.
+
+```rust
+use faucet_core::{KeySuffix, StateKey};
+
+let key = StateKey::invocation("orders", "lines").with_parent_key("42");
+assert_eq!(key.render(), "orders::lines::42");
+let sla = key.with_suffix(KeySuffix::Sla);
+assert_eq!(sla.render(), "orders::lines::42::__sla__");
+```
 
 The pipeline stores each bookmark in a **versioned envelope** (#736,
 `state_version`): `{ "faucet_state": 1, "owner": <connector_name>, "schema":
@@ -522,6 +555,29 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 
 > **Keep `faucet-core` the only required dependency.** If your connector needs a new common dependency, propose re-exporting it from `faucet-core` rather than requiring every connector author to add it. Keep the `Source` / `Sink` traits object-safe (no connector-specific types or generics on methods) and `FaucetError::Custom` intact for third-party error wrapping.
 
+## Wrapping a source or sink
+
+A wrapper that holds another connector must forward every defaulted hook, or the
+feature behind it turns off for everything it wraps. `forward_source!` /
+`forward_sink!` generate the forwarding body of every hook inside the wrapper's
+`impl` block; the wrapper writes only the hooks it changes and lists them (plus
+any it deliberately leaves at the trait default) after `except`:
+
+```rust,ignore
+#[async_trait]
+impl Sink for Stamped {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.inner.write_batch(&self.stamp(records)).await
+    }
+    forward_sink!(inner; except write_batch, write_batch_partial, write_batch_idempotent,
+        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+}
+```
+
+An unknown name in `except` does not compile, so the list stays exact. Prove the
+wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
+`assert_source_forwards_every_hook`.
+
 ## Modules
 
 | Module | Contents |
@@ -534,6 +590,7 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 | `config` | `load_json`, `load_env`, `load_env_file`, duration serde helpers |
 | `transform` | `RecordTransform`, `CompiledTransform`, support enums (`CastType`, `CastOnError`, `KeyCaseMode`, `ValueCaseMode`) |
 | `transforming_source` | `TransformingSource` — attach stages to any source |
+| `forward` | `forward_source!` / `forward_sink!` — generate a wrapper's pass-through hooks (see below) |
 | `stage` | `TransformStage`, `FilterSpec`, `ExplodeSpec`, `CdcUnwrapSpec`, `compile_stage` |
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |

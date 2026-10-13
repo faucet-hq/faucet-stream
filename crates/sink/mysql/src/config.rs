@@ -28,6 +28,7 @@ impl Default for MysqlColumnMapping {
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MysqlSinkConfig {
     /// MySQL connection URL (e.g. `mysql://user:pass@host/db`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
     /// Target table name.
     pub table_name: String,

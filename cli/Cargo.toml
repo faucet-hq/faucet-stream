@@ -743,6 +743,8 @@ metrics-util.workspace = true
 serde_yaml = "0.9"
 async-stream.workspace = true
 futures-core.workspace = true
+# Columnar panic-isolation test (#872) builds Arrow batches.
+arrow.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 # faucet replicate snapshot→CDC integration tests (#189): real Postgres via

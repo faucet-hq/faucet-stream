@@ -58,6 +58,7 @@ pub struct OracleTls {
     /// Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with
     /// the trusted CA and, for mutual TLS, the client certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub wallet_location: Option<String>,
     /// Verify that the server certificate's DN matches the host. Defaults to `true`.
     #[serde(default = "default_true")]

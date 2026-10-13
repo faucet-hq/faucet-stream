@@ -68,7 +68,9 @@ cardinality and never a Prometheus label.
   `faucet_transform_duration_seconds`.
 - **State:** `faucet_state_{get,put,delete}_total` (get carries
   `outcome=hit|miss`), `faucet_state_errors_total{op,kind}`, plus duration
-  histograms.
+  histograms; `faucet_state_key_migrations_total{outcome=moved|raced}` counts
+  bookmarks moved from a key an earlier release rendered (see
+  [State keys](../cookbook/state.md#key-migration)).
 - **Pipeline:** `faucet_pipeline_runs_total{status=ok|err,kind}`,
   `faucet_pipeline_run_duration_seconds`, `faucet_pipeline_in_flight`,
   `faucet_pipeline_seconds_since_last_bookmark`,
@@ -128,7 +130,9 @@ metrics for `faucet schedule` and `faucet serve`.
 
 - **Drop-guard timers** sample durations even when a task is cancelled.
 - **Panic isolation** — a panicking connector surfaces as a `Panic` error kind
-  rather than crashing the process.
+  rather than crashing the process, on the row path and on the columnar and
+  native fast paths alike: a panic while writing an Arrow batch, loading native
+  bytes, or opening or polling a fast-path stream fails that run only.
 - **Idempotent install** — installing the recorder/subscriber twice warns rather
   than panics.
 

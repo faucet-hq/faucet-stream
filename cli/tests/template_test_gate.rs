@@ -624,6 +624,7 @@ async fn serve_with_history(
             vault_previous_key: Vec::new(),
             connect_providers: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

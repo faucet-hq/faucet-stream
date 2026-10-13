@@ -341,7 +341,7 @@ impl LogExport {
                 metrics::export_error();
                 summary.failed = true;
                 tracing::warn!(run_id = %row.run_id, error = %e.detail, "shipping run logs failed");
-                let stored = crate::secrets::registry::redact(&e.message).into_owned();
+                let stored = crate::secrets::registry::redact_message(&e.message);
                 history.log_ship_fail(&row.run_id, &stored).await?;
                 break;
             }

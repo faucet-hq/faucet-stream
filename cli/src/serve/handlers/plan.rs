@@ -11,7 +11,6 @@ use crate::auth_catalog::build_auth_catalog;
 use crate::commands::plan::{PlanOptions, plan_node, select_root};
 use crate::error::CliError;
 use crate::serve::error::ServeError;
-use crate::serve::load::load_submission;
 use crate::serve::rbac::AuthContext;
 use crate::serve::runner::ConfigFormatWire;
 use crate::serve::state::ServerState;
@@ -56,14 +55,9 @@ pub async fn plan(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<PlanRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    let loaded = load_submission(
-        &req.config,
-        req.config_format.into(),
-        state.default_base().as_ref(),
-        crate::serve::runner::server_policy(&state).as_deref(),
-        state.caller_origin(),
-    )
-    .await?;
+    let loaded = state
+        .load_submission(&req.config, req.config_format.into(), state.caller_origin())
+        .await?;
     loaded.require_matrix()?;
     let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let node = select_root(&loaded.nodes, req.row.as_deref()).map_err(cli_to_serve)?;

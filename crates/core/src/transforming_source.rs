@@ -237,107 +237,13 @@ impl Source for TransformingSource {
         })
     }
 
-    fn state_key(&self) -> Option<String> {
-        self.inner.state_key()
-    }
-
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        self.inner.apply_start_bookmark(bookmark).await
-    }
-
-    fn supports_exactly_once(&self) -> bool {
-        self.inner.supports_exactly_once()
-    }
-    fn consumes_destructively(&self) -> bool {
-        self.inner.consumes_destructively()
-    }
-
-    fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
-        self.inner.replay_guarantee()
-    }
-    fn capabilities(&self) -> crate::Capabilities {
-        crate::Capabilities::decorated_source(self, &self.inner.capabilities())
-    }
-
-    async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.capture_resume_position().await
-    }
-    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
-        self.inner.lag().await
-    }
-
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-
-    fn is_shardable(&self) -> bool {
-        self.inner.is_shardable()
-    }
-
-    async fn enumerate_shards(
-        &self,
-        target: usize,
-    ) -> Result<Vec<crate::shard::ShardSpec>, FaucetError> {
-        self.inner.enumerate_shards(target).await
-    }
-
-    async fn apply_shard(&self, shard: &crate::shard::ShardSpec) -> Result<(), FaucetError> {
-        self.inner.apply_shard(shard).await
-    }
-
-    fn supports_discover(&self) -> bool {
-        self.inner.supports_discover()
-    }
-
-    async fn discover(&self) -> Result<Vec<crate::discover::DatasetDescriptor>, FaucetError> {
-        self.inner.discover().await
-    }
-
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
-    }
-
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-
-    fn dataset_uri(&self) -> String {
-        // Forward the wrapped connector's identity — without this, lineage and
-        // the Data Movement Catalog would see the default
-        // `<connector>://unknown` whenever transforms are attached.
-        self.inner.dataset_uri()
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-
-    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
-        self.inner.set_run_clock(now);
-    }
-
-    fn set_cancel(&self, cancel: tokio_util::sync::CancellationToken) -> bool {
-        self.inner.set_cancel(cancel)
-    }
+    // Everything else reaches the wrapped connector. The convenience fetches
+    // take the trait default so they run through the transforms above; the
+    // native byte path and server-side range digests stay at the default
+    // (off) because both would bypass the transforms.
+    crate::forward_source!(inner; except fetch_with_context, fetch_with_context_incremental,
+        stream_pages, supports_columnar, stream_batches, fetch_all, fetch_all_incremental,
+        native_output_formats, stream_native, range_digest);
 }
 
 #[cfg(test)]
@@ -487,6 +393,27 @@ mod tests {
             TransformingSource::new(Box::new(RoutedSource), vec![], Labels::for_named("test"))
                 .unwrap();
         assert_forwards_multi_table_hooks(&wrapped);
+    }
+
+    #[tokio::test]
+    async fn forwards_every_hook_the_transforms_do_not_change() {
+        let probe = crate::forwarding::HookSource::default();
+        let wrapped =
+            TransformingSource::new(Box::new(probe.clone()), vec![], Labels::for_named("test"))
+                .unwrap();
+        crate::forwarding::assert_source_forwards_every_hook(
+            &wrapped,
+            &probe,
+            &[
+                "fetch_all",
+                "fetch_all_incremental",
+                "native_output_formats",
+                "stream_native",
+                "range_digest",
+            ],
+        )
+        .await;
+        assert!(wrapped.native_output_formats().is_empty());
     }
 
     #[derive(Default)]

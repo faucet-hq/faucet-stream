@@ -143,6 +143,7 @@ pub struct RedshiftConnection {
     /// PEM file of the CA that signed the server certificate (the Redshift CA
     /// bundle), for `tls_mode: verify_ca | verify_full`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub ssl_root_cert: Option<String>,
 }
 

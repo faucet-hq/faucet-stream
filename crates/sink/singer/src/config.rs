@@ -37,6 +37,7 @@ pub enum FlushOn {
 pub struct SingerSinkConfig {
     /// The target executable to run (looked up on `PATH`, or an absolute
     /// path), e.g. `target-jsonl` or `/opt/targets/target-postgres`.
+    #[schemars(extend("x-faucet-resource" = "command"))]
     pub target_command: String,
 
     /// Extra arguments appended after faucet's own `--config <file>` flag.

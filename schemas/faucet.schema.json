@@ -4529,7 +4529,8 @@
               "type": "object",
               "properties": {
                 "token_url": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 },
                 "client_id": {
                   "type": "string"
@@ -4569,7 +4570,8 @@
               "properties": {
                 "url": {
                   "description": "URL of the token endpoint.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 },
                 "method": {
                   "description": "HTTP method for the token request (e.g. GET, POST).",
@@ -5534,7 +5536,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         },
         "url_from": {
           "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
@@ -5612,7 +5615,8 @@
         },
         "url": {
           "description": "Status URL — absolute or `base_url`-relative; `${job_id}` substituted.",
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         },
         "headers": {
           "description": "Extra headers.",
@@ -5700,7 +5704,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         },
         "url_from": {
           "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
@@ -6845,7 +6850,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             },
             "mode": {
               "type": "string",
@@ -6861,7 +6867,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             },
             "mode": {
               "type": "string",
@@ -6916,7 +6923,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       }
     },
@@ -7192,7 +7200,8 @@
               "properties": {
                 "path": {
                   "description": "Path to the `.creds` file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -7265,21 +7274,24 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "client_cert_path": {
           "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "client_key_path": {
           "description": "PEM PKCS#8 private key for `client_cert_path`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       },
       "additionalProperties": true
@@ -7399,7 +7411,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "path"
             },
             "mode": {
               "type": "string",
@@ -7958,7 +7971,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             },
             "mode": {
               "type": "string",
@@ -7974,7 +7988,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             },
             "mode": {
               "type": "string",
@@ -7998,7 +8013,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       }
     },
@@ -8220,7 +8236,8 @@
               "properties": {
                 "path": {
                   "description": "Filesystem path to the service-account key JSON.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -8972,15 +8989,18 @@
               "properties": {
                 "ca_path": {
                   "description": "Path to the CA certificate file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 },
                 "cert_path": {
                   "description": "Path to the client certificate file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 },
                 "key_path": {
                   "description": "Path to the client private key file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 },
                 "key_password": {
                   "description": "Optional passphrase for the private key.",
@@ -9032,7 +9052,8 @@
                   "type": [
                     "string",
                     "null"
-                  ]
+                  ],
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -9161,7 +9182,8 @@
       "type": "object",
       "properties": {
         "url": {
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         },
         "auth": {
           "anyOf": [
@@ -9441,7 +9463,8 @@
               "properties": {
                 "path": {
                   "description": "Filesystem path to the service-account key JSON.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -9528,7 +9551,8 @@
           "type": "object",
           "properties": {
             "path": {
-              "type": "string"
+              "type": "string",
+              "x-faucet-resource": "path"
             },
             "type": {
               "type": "string",
@@ -9587,7 +9611,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "url"
             },
             "type": {
               "type": "string",
@@ -9691,7 +9716,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         },
         "allow_http": {
           "description": "`AWS_ALLOW_HTTP` — permit plaintext HTTP to the endpoint (MinIO in dev).",
@@ -9739,7 +9765,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "service_account_key": {
           "description": "`GOOGLE_SERVICE_ACCOUNT_KEY` — inline service-account JSON key.",
@@ -9886,7 +9913,8 @@
               "type": "object",
               "properties": {
                 "path": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -10105,7 +10133,8 @@
               "properties": {
                 "path": {
                   "description": "Filesystem path to the service-account JSON key.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -10228,7 +10257,8 @@
               "properties": {
                 "path": {
                   "description": "Filesystem path to the service-account JSON key.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -10414,7 +10444,8 @@
               "type": "object",
               "properties": {
                 "path": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -10473,7 +10504,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
@@ -10481,7 +10513,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "path"
             },
             "credential": {
               "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
@@ -10516,7 +10549,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
@@ -10524,7 +10558,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "path"
             },
             "credential": {
               "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
@@ -10559,7 +10594,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
@@ -10567,7 +10603,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "path"
             },
             "credential": {
               "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
@@ -10602,7 +10639,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
@@ -10610,7 +10648,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "path"
             },
             "credential": {
               "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
@@ -10960,7 +10999,8 @@
         },
         "url": {
           "description": "Object-store URL of the stage's backing location, e.g.\n`s3://bucket/prefix/`, `gs://bucket/prefix/`, or\n`azure://container/prefix/`. Uploaded Parquet files land here and are\nthen loaded via `@stage/<file>`.",
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         },
         "storage_options": {
           "description": "Extra `object_store` config keys for the upload client (credentials,\nregion, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,\n`aws_secret_access_key`, `aws_region`, `google_service_account_key`.\nPrefer `${secret:…}` / `${env:…}` interpolation for secret values.",
@@ -11097,7 +11137,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       }
     },
@@ -11257,7 +11298,8 @@
       "properties": {
         "location": {
           "description": "Object-store location to stage files under, e.g.\n`s3://my-bucket/faucet-stage/`. Scheme selects the backend\n(`s3://` / `gs://` / `az://`).",
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         },
         "format": {
           "description": "File format written to the stage. Default `parquet`.",
@@ -11293,7 +11335,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         },
         "sas_token": {
           "description": "Shared Access Signature token SQL Server uses to **read** the staged\nobjects. Omit to rely on the server's managed identity / configured access.",
@@ -11719,7 +11762,8 @@
               "properties": {
                 "path": {
                   "description": "Path to the `.creds` file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -11792,21 +11836,24 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "client_cert_path": {
           "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "client_key_path": {
           "description": "PEM PKCS#8 private key for `client_cert_path`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       },
       "additionalProperties": true
@@ -11869,7 +11916,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "path"
             },
             "mode": {
               "type": "string",
@@ -12623,15 +12671,18 @@
               "properties": {
                 "ca_path": {
                   "description": "Path to the CA certificate file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 },
                 "cert_path": {
                   "description": "Path to the client certificate file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 },
                 "key_path": {
                   "description": "Path to the client private key file.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 },
                 "key_password": {
                   "description": "Optional passphrase for the private key.",
@@ -12683,7 +12734,8 @@
                   "type": [
                     "string",
                     "null"
-                  ]
+                  ],
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -12812,7 +12864,8 @@
       "type": "object",
       "properties": {
         "url": {
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         },
         "auth": {
           "anyOf": [
@@ -13238,7 +13291,8 @@
               "properties": {
                 "path": {
                   "description": "Filesystem path to the service-account key JSON.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -13524,7 +13578,8 @@
           "type": "object",
           "properties": {
             "path": {
-              "type": "string"
+              "type": "string",
+              "x-faucet-resource": "path"
             },
             "type": {
               "type": "string",
@@ -13559,7 +13614,8 @@
                 "string",
                 "null"
               ],
-              "default": null
+              "default": null,
+              "x-faucet-resource": "url"
             },
             "allow_http": {
               "description": "Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`\nURL (e.g. for LocalStack).",
@@ -13717,7 +13773,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         },
         "allow_http": {
           "description": "`AWS_ALLOW_HTTP` — permit plaintext HTTP to the endpoint (MinIO in dev).",
@@ -13765,7 +13822,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "service_account_key": {
           "description": "`GOOGLE_SERVICE_ACCOUNT_KEY` — inline service-account JSON key.",
@@ -13841,7 +13899,8 @@
               "type": "object",
               "properties": {
                 "path": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -14159,7 +14218,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         }
       },
       "additionalProperties": true
@@ -14205,7 +14265,8 @@
               "properties": {
                 "path": {
                   "description": "Filesystem path to the service-account key JSON.",
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               }
             }
@@ -14311,7 +14372,8 @@
       "properties": {
         "location": {
           "description": "Object-store location to stage files under, e.g.\n`s3://my-bucket/faucet-stage/`. Scheme selects the backend\n(`s3://` / `gs://` / `az://`).",
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         },
         "format": {
           "description": "File format written to the stage. Default `parquet`.",
@@ -14347,7 +14409,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         },
         "access_key": {
           "description": "Access key the ClickHouse server uses to **read** the staged objects\n(the `s3()`/`gcs()` credentials). Omit to rely on the server's own IAM /\nconfigured access.",
@@ -14726,7 +14789,8 @@
                   "properties": {
                     "base_url": {
                       "description": "Base URL of the API, e.g. `https://api.example.com/v2`. Required. Joined\nwith [`path`](Self::path); any trailing slash is handled either way.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "path": {
                       "description": "URL path, relative to `base_url`. May contain `{key}` placeholders that\nare substituted per-partition (e.g. `\"/orgs/{org_id}/users\"`).",
@@ -15227,7 +15291,8 @@
                   "properties": {
                     "endpoint": {
                       "description": "GraphQL endpoint URL.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "query": {
                       "description": "The GraphQL query string.",
@@ -15443,7 +15508,8 @@
                   "properties": {
                     "base_url": {
                       "description": "Base URL of the API.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "path": {
                       "description": "Request path (appended to base_url).",
@@ -15643,7 +15709,8 @@
                   "properties": {
                     "endpoint": {
                       "description": "gRPC endpoint URL (e.g. `\"http://localhost:50051\"`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "service_name": {
                       "description": "Fully qualified service name (e.g. `\"mypackage.MyService\"`).",
@@ -15658,7 +15725,8 @@
                     },
                     "descriptor_set_path": {
                       "description": "Path to the compiled `FileDescriptorSet` file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
@@ -15678,7 +15746,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     },
                     "domain_name": {
                       "default": null,
@@ -15906,7 +15975,8 @@
                   "properties": {
                     "connection_url": {
                       "description": "PostgreSQL connection URL (e.g. `postgres://user:pass@host/db`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "query": {
                       "description": "SQL query to execute.",
@@ -16058,7 +16128,8 @@
                   "properties": {
                     "connection_url": {
                       "description": "Connection URL pointing at the database whose WAL we want to read.\nThe crate internally upgrades the connection to `replication=database`\n— callers do **not** need to add it themselves.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "slot_name": {
                       "description": "Logical replication slot name. Must match the Postgres naming rules:\n1–63 chars, lowercase letters / digits / underscores only.",
@@ -16288,7 +16359,8 @@
                   "properties": {
                     "connection_url": {
                       "description": "MySQL connection URL (e.g. `mysql://user:pass@host/db`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "query": {
                       "description": "SQL query to execute.",
@@ -16443,7 +16515,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "connection_string": {
                       "description": "ADO.NET-style connection string handed straight to `tiberius`, e.g.\n`Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually\nexclusive with [`connection_url`](Self::connection_url).",
@@ -16607,7 +16680,8 @@
                   "properties": {
                     "database_url": {
                       "description": "SQLite database URL (file path or `sqlite::memory:`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "query": {
                       "description": "SQL query to execute.",
@@ -16732,7 +16806,8 @@
                   "properties": {
                     "database": {
                       "description": "Path to the DuckDB database file, or `:memory:` for an in-memory\ndatabase. A `duckdb://` / `duckdb:` scheme prefix is accepted and\nstripped.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "query": {
                       "description": "SQL query to execute.",
@@ -16844,7 +16919,8 @@
                   "properties": {
                     "queue_url": {
                       "description": "SQS queue URL (e.g. `https://sqs.us-east-1.amazonaws.com/1234/my-q`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "region": {
                       "description": "AWS region. `None` uses the SDK default chain (env, profile, IMDS).",
@@ -16858,7 +16934,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "AWS credentials. Defaults to the SDK default provider chain.",
@@ -17195,7 +17272,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "host": {
                       "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
@@ -17481,7 +17559,8 @@
                           "properties": {
                             "path": {
                               "description": "Path to the private-key file.",
-                              "type": "string"
+                              "type": "string",
+                              "x-faucet-resource": "path"
                             },
                             "passphrase": {
                               "description": "Optional passphrase used to decrypt an encrypted private key.",
@@ -17725,7 +17804,8 @@
                         "string",
                         "null"
                       ],
-                      "default": null
+                      "default": null,
+                      "x-faucet-resource": "url"
                     },
                     "file_format": {
                       "description": "Format of the files to read. Defaults to `json_lines`.",
@@ -17927,7 +18007,8 @@
                   "properties": {
                     "connection_uri": {
                       "description": "MongoDB connection URI (e.g. `mongodb://localhost:27017`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "database": {
                       "description": "Database name.",
@@ -18055,7 +18136,8 @@
                   "properties": {
                     "connection_uri": {
                       "description": "MongoDB connection URI. Must point at a replica set or sharded cluster.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "scope": {
                       "description": "Which change stream to open.",
@@ -18216,7 +18298,8 @@
                   "properties": {
                     "connection_url": {
                       "description": "Connection URL, e.g. `mysql://repl:pass@host:3306/db`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "server_id": {
                       "description": "Replica server id. **Required** and must be unique across all replicas.",
@@ -18383,7 +18466,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "connection_string": {
                       "description": "ADO.NET-style connection string handed straight to `tiberius`, e.g.\n`Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually\nexclusive with [`connection_url`](Self::connection_url).",
@@ -18658,7 +18742,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     }
                   },
                   "title": "RedshiftSourceConfig",
@@ -18753,7 +18838,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "emulator_host": {
                       "description": "Point the client at a Pub/Sub emulator (`host:port`). When set, auth is\nskipped and the endpoint is taken from this value — mirrors the\n`PUBSUB_EMULATOR_HOST` environment variable the SDK honours.",
@@ -18916,7 +19002,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "host": {
                       "description": "Hostname of the ClickHouse server. Mutually exclusive with\n[`url`](Self::url); combined with [`http_port`](Self::http_port) and\n[`tls`](Self::tls) to build the base URL.",
@@ -19091,7 +19178,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "allow_http": {
                       "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
@@ -19365,7 +19453,8 @@
                   "properties": {
                     "url": {
                       "description": "Redis connection URL (e.g. `\"redis://127.0.0.1:6379\"`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "source_type": {
                       "description": "The type of Redis data structure to read from.",
@@ -19632,7 +19721,8 @@
                   "properties": {
                     "url": {
                       "description": "WebSocket endpoint, `ws://` or `wss://`. Supports `{placeholder}`\nparent-matrix context substitution.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "auth": {
                       "description": "Authentication applied to the HTTP upgrade request. Either inline\n(`{ type, config }`) or a `{ ref: <name> }` pointer to a shared\nprovider in the CLI's top-level `auth:` catalog.",
@@ -19837,7 +19927,8 @@
                   "properties": {
                     "path": {
                       "description": "Path to the CSV file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "has_headers": {
                       "description": "Whether the file has a header row. Defaults to `true`.",
@@ -19980,7 +20071,8 @@
                   "properties": {
                     "executable": {
                       "description": "The tap executable to run (looked up on `PATH`, or an absolute path),\ne.g. `tap-github` or `/opt/taps/tap-csv`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "command"
                     },
                     "args": {
                       "description": "Extra positional/flag arguments appended after faucet's own\n`--config` / `--catalog` / `--state` flags.",
@@ -20145,7 +20237,8 @@
                     },
                     "base_url": {
                       "description": "Base URL of the Elasticsearch cluster (e.g. `\"http://localhost:9200\"`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "batch_size": {
                       "default": 1000,
@@ -20489,7 +20582,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "AWS credentials. Defaults to the SDK default provider chain.",
@@ -20949,7 +21043,8 @@
                   "properties": {
                     "table_uri": {
                       "description": "Delta table location URI: `file:///abs/path`, `s3://bucket/key`,\n`abfss://…`, `gs://bucket/key`. A bare local path is accepted and\ntreated as `file://`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "credentials": {
                       "description": "Object-store credentials. Defaults to the ambient provider chain.",
@@ -21084,7 +21179,8 @@
                   "properties": {
                     "workspace_url": {
                       "description": "Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "warehouse_id": {
                       "description": "Target SQL Warehouse id.",
@@ -21873,7 +21969,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "expression_attribute_names": {
                       "additionalProperties": {
@@ -22745,7 +22842,8 @@
                   "properties": {
                     "path": {
                       "description": "A file, a directory, a glob (`data/**/*.jsonl`), or one `http://` /\n`https://` URL. A directory lists its regular files (descending into\nsubdirectories with `recursive: true`); every listing is sorted by path.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "format": {
                       "description": "File format, `auto` (by extension, per file) by default. Under `auto`\na file with no recognised extension is skipped with a warning, or\nrefused when `strict: true`. JSON Lines, Avro, ORC and Parquet stream;\nJSON arrays, CSV, XML and Excel are read whole per file.",
@@ -23024,7 +23122,8 @@
                         "string",
                         "null"
                       ],
-                      "default": null
+                      "default": null,
+                      "x-faucet-resource": "url"
                     },
                     "file_format": {
                       "description": "Format of the files to read. Defaults to `json_lines`.",
@@ -23243,7 +23342,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "allow_http": {
                       "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
@@ -24076,7 +24176,8 @@
                   "properties": {
                     "connection_url": {
                       "description": "PostgreSQL connection URL (e.g. `postgres://user:pass@host/db`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "table_name": {
                       "description": "Target table name.",
@@ -24261,7 +24362,8 @@
                   "properties": {
                     "path": {
                       "description": "Path to the output file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "append": {
                       "description": "Whether to append to an existing file (default: false, truncates).",
@@ -24317,7 +24419,8 @@
                   "properties": {
                     "path": {
                       "description": "Path to the output file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "append": {
                       "description": "Whether to append to an existing file (default: false, truncates).",
@@ -24571,7 +24674,8 @@
                   "properties": {
                     "connection_url": {
                       "description": "MySQL connection URL (e.g. `mysql://user:pass@host/db`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "table_name": {
                       "description": "Target table name.",
@@ -24730,7 +24834,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "connection_string": {
                       "description": "ADO.NET-style connection string handed straight to `tiberius`, e.g.\n`Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually\nexclusive with [`connection_url`](Self::connection_url).",
@@ -24921,7 +25026,8 @@
                   "properties": {
                     "database_url": {
                       "description": "SQLite database URL (file path or `:memory:`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "table_name": {
                       "description": "Target table name.",
@@ -25071,7 +25177,8 @@
                   "properties": {
                     "database": {
                       "description": "Path to the DuckDB database file, or `:memory:`. A `duckdb://` /\n`duckdb:` scheme prefix is accepted and stripped.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "table_name": {
                       "description": "Target table name.",
@@ -25176,7 +25283,8 @@
                   "properties": {
                     "queue_url": {
                       "description": "SQS queue URL (e.g. `https://sqs.us-east-1.amazonaws.com/1234/my-q`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "region": {
                       "description": "AWS region. `None` uses the SDK default chain.",
@@ -25190,7 +25298,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "AWS credentials. Defaults to the SDK default provider chain.",
@@ -25469,7 +25578,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "host": {
                       "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
@@ -25727,7 +25837,8 @@
                           "properties": {
                             "path": {
                               "description": "Path to the private-key file.",
-                              "type": "string"
+                              "type": "string",
+                              "x-faucet-resource": "path"
                             },
                             "passphrase": {
                               "description": "Optional passphrase used to decrypt an encrypted private key.",
@@ -25910,7 +26021,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     },
                     "connect_timeout_secs": {
                       "default": 30,
@@ -26094,7 +26206,8 @@
                     },
                     "target_command": {
                       "description": "The target executable to run (looked up on `PATH`, or an absolute\npath), e.g. `target-jsonl` or `/opt/targets/target-postgres`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "command"
                     },
                     "target_config": {
                       "default": {},
@@ -26208,7 +26321,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "file_extension": {
                       "description": "File extension for written objects (default: `.jsonl`). Not used when\n`path` is set.",
@@ -26327,7 +26441,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     }
                   },
                   "x-faucet-aliases": [
@@ -26392,7 +26507,8 @@
                   "properties": {
                     "connection_uri": {
                       "description": "MongoDB connection URI (e.g. `mongodb://localhost:27017`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "database": {
                       "description": "Database name.",
@@ -26522,7 +26638,8 @@
                   "properties": {
                     "url": {
                       "description": "Redis connection URL (e.g. `\"redis://127.0.0.1:6379\"`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "sink_type": {
                       "description": "The type of Redis data structure to write to.",
@@ -26623,7 +26740,8 @@
                   "properties": {
                     "path": {
                       "description": "Path to the output CSV file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "delimiter": {
                       "description": "Field delimiter byte. Defaults to `b','`.",
@@ -26732,7 +26850,8 @@
                   "properties": {
                     "base_url": {
                       "description": "Base URL of the Elasticsearch cluster (e.g. `\"http://localhost:9200\"`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "index": {
                       "description": "Target index name.",
@@ -27161,7 +27280,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "AWS credentials. Defaults to the SDK default provider chain.",
@@ -27498,7 +27618,8 @@
                   "properties": {
                     "url": {
                       "description": "Target endpoint URL.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "method": {
                       "description": "HTTP method (default: POST).",
@@ -27865,7 +27986,8 @@
                   "properties": {
                     "path": {
                       "description": "The file to write, as a template. `{part}` is replaced by the rollover\npart number (`00001`, `00002`, …); with a rollover cap and no `{part}`,\n`-{part}` is inserted before the extension. A path ending in `/` is a\ndirectory: files are named `part-{part}` plus the format's extension,\nso `format` must be set. `${now.*}` tokens are resolved by the CLI\nbefore the sink sees the path.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "format": {
                       "description": "File format: `auto` (default) resolves from the path's extension,\nlooking through a compression suffix (`.csv.gz` is CSV). ORC is\nread-only and refused.",
@@ -28049,7 +28171,8 @@
                   "properties": {
                     "table_uri": {
                       "description": "Delta table location URI: `file:///abs/path`, `s3://bucket/key`,\n`abfss://…`, `gs://bucket/key`. A bare local path is accepted and\ntreated as `file://`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "path"
                     },
                     "credentials": {
                       "description": "Object-store credentials. Defaults to the ambient provider chain.",
@@ -28331,7 +28454,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     }
                   },
                   "x-faucet-aliases": [
@@ -28520,7 +28644,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "batch_size": {
                       "description": "Rows per load unit. For `insert`, the per-statement multi-row chunk size;\nfor `copy`, the number of rows per staged S3 object. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` = one unit for the whole page.",
@@ -28558,7 +28683,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     }
                   },
                   "title": "RedshiftSinkConfig",
@@ -28637,7 +28763,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "emulator_host": {
                       "description": "Point the client at a Pub/Sub emulator (`host:port`). When set, auth is\nskipped and the endpoint is taken from this value — mirrors the\n`PUBSUB_EMULATOR_HOST` environment variable the SDK honours.",
@@ -28758,7 +28885,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "host": {
                       "description": "Hostname of the ClickHouse server. Mutually exclusive with\n[`url`](Self::url); combined with [`http_port`](Self::http_port) and\n[`tls`](Self::tls) to build the base URL.",
@@ -28958,7 +29086,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "allow_http": {
                       "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
@@ -29155,7 +29284,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "path"
                     }
                   },
                   "title": "AzureBlobSinkConfig",
@@ -29380,7 +29510,8 @@
                     },
                     "workspace_url": {
                       "description": "Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "write_mode": {
                       "$ref": "#/$defs/sink_databricks__WriteMode",
@@ -29498,7 +29629,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "expression_attribute_names": {
                       "additionalProperties": {
@@ -30500,7 +30632,8 @@
         },
         "location": {
           "description": "Staging root. Either a Unity Catalog volume path\n(`/Volumes/<catalog>/<schema>/<volume>[/prefix]`, uploaded through the\nFiles API with the sink's own credentials) or a cloud location the\nwarehouse can read through an external location: `s3://bucket/prefix`,\n`gs://bucket/prefix`, or\n`abfss://container@account.dfs.core.windows.net/prefix`. Cloud locations\nneed the crate's `staging` feature and ambient cloud credentials for the\nupload.",
-          "type": "string"
+          "type": "string",
+          "x-faucet-resource": "url"
         }
       },
       "type": "object"
@@ -30878,7 +31011,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "default": null,
@@ -30886,7 +31020,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             }
           },
           "type": "object"
@@ -30921,7 +31056,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "default": null,
@@ -30929,7 +31065,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             }
           },
           "type": "object"
@@ -30964,7 +31101,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "default": null,
@@ -30972,7 +31110,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             }
           },
           "type": "object"
@@ -31007,7 +31146,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "url"
             },
             "warehouse": {
               "default": null,
@@ -31015,7 +31155,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "x-faucet-resource": "path"
             }
           },
           "type": "object"
@@ -31130,7 +31271,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       },
       "type": "object"
@@ -31262,7 +31404,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       },
       "type": "object"
@@ -31369,7 +31512,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         }
       },
       "type": "object"

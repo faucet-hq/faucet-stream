@@ -30,6 +30,7 @@ use std::fmt;
 #[serde(deny_unknown_fields)]
 pub struct MongoSourceConfig {
     /// MongoDB connection URI (e.g. `mongodb://localhost:27017`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_uri: String,
     /// Database name.
     pub database: String,

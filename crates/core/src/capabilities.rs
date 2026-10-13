@@ -5,8 +5,8 @@
 //! roll back, evolve a schema, report lag, digest a key range, and so on. Two
 //! places carry the declaration:
 //!
-//! - [`Source::capabilities`](crate::Source::capabilities) /
-//!   [`Sink::capabilities`](crate::Sink::capabilities) on a built connector.
+//! - [`Source::capabilities`] /
+//!   [`Sink::capabilities`] on a built connector.
 //!   The default derives every field from the older per-capability trait
 //!   methods, so a connector that overrides only those keeps working.
 //! - A static [`ConnectorDescriptor`] registered with the connector's factory.
@@ -44,7 +44,7 @@ pub enum SchemaReport {
     /// The sink has not declared it.
     #[default]
     Undeclared,
-    /// [`Sink::current_schema`](crate::Sink::current_schema) reports the live
+    /// [`Sink::current_schema`] reports the live
     /// destination schema, so the drift pass sees every column change.
     Reported,
     /// The sink reports no schema and writes every field it is given.
@@ -133,7 +133,7 @@ impl Capabilities {
     }
 
     /// Derive a source's capabilities from its per-capability trait methods.
-    /// The default [`Source::capabilities`](crate::Source::capabilities); an
+    /// The default [`Source::capabilities`]; an
     /// override that adds a capability no trait method expresses starts here
     /// (`Capabilities::of_source(self).to_builder().range_digest(true).build()`).
     pub fn of_source<S: Source + ?Sized>(source: &S) -> Self {
@@ -151,7 +151,7 @@ impl Capabilities {
     }
 
     /// Derive a sink's capabilities from its per-capability trait methods.
-    /// The default [`Sink::capabilities`](crate::Sink::capabilities).
+    /// The default [`Sink::capabilities`].
     pub fn of_sink<S: Sink + ?Sized>(sink: &S) -> Self {
         #[cfg(feature = "arrow")]
         let columnar = sink.supports_columnar();

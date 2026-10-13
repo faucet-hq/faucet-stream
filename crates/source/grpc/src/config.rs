@@ -69,6 +69,7 @@ pub enum RpcKind {
 #[serde(deny_unknown_fields)]
 pub struct GrpcStreamConfig {
     /// gRPC endpoint URL (e.g. `"http://localhost:50051"`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: String,
     /// Fully qualified service name (e.g. `"mypackage.MyService"`).
     pub service_name: String,
@@ -78,6 +79,7 @@ pub struct GrpcStreamConfig {
     /// using the `FileDescriptorSet`.
     pub request: Value,
     /// Path to the compiled `FileDescriptorSet` file.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub descriptor_set_path: PathBuf,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
@@ -89,6 +91,7 @@ pub struct GrpcStreamConfig {
     /// PEM file with an extra CA certificate to trust — for a server whose
     /// certificate is signed by a private CA.
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub ca_cert: Option<PathBuf>,
     /// Host name to verify the server certificate against, when it differs
     /// from the endpoint's host (connecting by IP or through a tunnel).

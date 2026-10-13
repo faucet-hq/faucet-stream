@@ -1,0 +1,25 @@
+{
+  "scheme": 2,
+  "keys": [
+    { "name": "row", "pipeline": "orders", "row": "customers", "key": "orders::customers" },
+    { "name": "tenant row", "tenant": "acme", "pipeline": "orders", "row": "customers", "key": "acme::orders::customers" },
+    { "name": "child with a plain parent key", "pipeline": "orders", "row": "lines", "parent_key": "42", "key": "orders::lines::42" },
+    { "name": "child with a separator in its parent key", "pipeline": "orders", "row": "lines", "parent_key": "eu:7/a", "key": "orders::lines::eu:7/a" },
+    { "name": "child with an encoded parent key", "pipeline": "orders", "row": "lines", "parent_key": "a b", "key": "orders::lines::ab.he63f991904833892" },
+    { "name": "child whose parent key holds the separator", "pipeline": "orders", "row": "lines", "parent_key": "x::y", "key": "orders::lines::xy.h1f99055382621cda" },
+    { "name": "product tuple", "pipeline": "orders", "row": "stats", "sub": "region:eu/day:2026-01-01", "key": "orders::stats::region:eu/day:2026-01-01" },
+    { "name": "shard", "pipeline": "orders", "row": "customers", "shard": "shard-3", "key": "orders::customers::shard-3" },
+    { "name": "partition chunk row", "pipeline": "orders", "row": "events::partition::03", "key": "orders::events::partition::03" },
+    { "name": "backfill unit", "pipeline": "orders", "row": "backfill::0123456789abcdef::2026-01-01", "key": "orders::backfill::0123456789abcdef::2026-01-01" },
+    { "name": "mirror cdc", "pipeline": "orders", "row": "cdc", "key": "orders::cdc" },
+    { "name": "sla", "pipeline": "orders", "row": "customers", "suffix": "sla", "key": "orders::customers::__sla__" },
+    { "name": "profiling", "pipeline": "orders", "row": "customers", "suffix": "profiling", "key": "orders::customers::__profiling__" },
+    { "name": "rollback index", "pipeline": "orders", "row": "customers", "suffix": "rollback_index", "key": "orders::customers::__rollback__" },
+    { "name": "rollback run", "pipeline": "orders", "row": "customers", "suffix": "rollback_run", "arg": "run-1", "key": "orders::customers::__rollback__::run-1" },
+    { "name": "status", "pipeline": "orders", "row": "lines", "parent_key": "42", "suffix": "status", "key": "orders::lines::42::__status__" },
+    { "name": "lease", "tenant": "acme", "pipeline": "orders", "row": "customers", "suffix": "lease", "key": "acme::orders::customers::__lease__" },
+    { "name": "replication", "pipeline": "orders", "suffix": "replication", "key": "orders::__replication__" },
+    { "name": "backfill marker", "pipeline": "orders", "suffix": "backfill", "arg": "0123456789abcdef", "key": "orders::__backfill__::0123456789abcdef" },
+    { "name": "served backfill", "pipeline": "orders", "suffix": "serve_backfill", "arg": "0123456789abcdef", "key": "orders::__serve_backfill__::0123456789abcdef" }
+  ]
+}

@@ -123,7 +123,10 @@ impl From<&InvocationOutcome> for InvocationRecord {
             run_id: o.run_id.clone(),
             records_written: o.records_written,
             duration_ms: o.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
-            error: o.error.clone(),
+            error: o
+                .error
+                .as_deref()
+                .map(crate::secrets::registry::redact_message),
             usage: o.usage.clone(),
             batches: o.metrics.as_ref().and_then(|m| m.batches),
             source_lag: o.metrics.as_ref().and_then(|m| m.source_lag),

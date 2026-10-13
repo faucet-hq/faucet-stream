@@ -41,6 +41,7 @@ pub enum RedisSourceType {
 #[serde(deny_unknown_fields)]
 pub struct RedisSourceConfig {
     /// Redis connection URL (e.g. `"redis://127.0.0.1:6379"`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: String,
     /// The type of Redis data structure to read from.
     pub source_type: RedisSourceType,

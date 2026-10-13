@@ -27,8 +27,8 @@ test checks and which stays green through a real regression.
 
 | Tier | What it covers | Docker? | Runs |
 |---|---|---|---|
-| **Engine guarantees** | Bookmark ordering, exactly-once (both mechanisms), overwrite atomicity, cleanup safety, cancel-still-flushes | No | Every PR, **required** |
-| **State compatibility** | Bookmarks / exactly-once envelopes / versioned state envelopes / commit tokens written by a release still load; an older bookmark shape migrates; a newer one is refused | No | Every PR, **required** |
+| **Engine guarantees** | Bookmark ordering, exactly-once (both mechanisms), overwrite atomicity, cleanup safety, cancel-still-flushes, panic isolation on every transfer path | No | Every PR, **required** |
+| **State compatibility** | Bookmarks / exactly-once envelopes / versioned state envelopes / commit tokens written by a release still load; an older bookmark shape migrates; a newer one is refused; every state **key** a release wrote still renders, or is migrated from | No | Every PR, **required** |
 | **Connector conformance** | Per-connector battery (capabilities truthful, bounded memory, idempotent replay, …) | Per connector | Every PR |
 | **Drift policy matrix** | All five `on_drift` policies against a live evolving destination | No | Every PR, **required** |
 | **Containerized integration** | Real databases, Kafka, object stores; CDC replication | Yes | Every PR, reported |
@@ -57,6 +57,8 @@ cargo test -p faucet-conformance --test reliability_cleanup_safety
 cargo test -p faucet-conformance --test reliability_fault_injection
 cargo test -p faucet-conformance --test compat_state_format
 cargo test -p faucet-conformance --test reliability_state_migration
+cargo test -p faucet-conformance --test reliability_panic_isolation
+cargo test -p faucet-conformance --test forwarding
 
 # Each resumable source's frozen bookmark shapes (#736).
 cargo test -p faucet-source-postgres-cdc --test state_compat
@@ -157,6 +159,19 @@ source (`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, `kafka`,
 `kinesis`) keeps its own released bookmark shapes under
 `crates/source/<kind>/tests/fixtures/state/`, read by its `state_compat.rs`.
 
+State **keys** are frozen the same way (#882). A bookmark is found by its key,
+and a key rendered differently from the one a release wrote under looks exactly
+like a first run — a full re-sync, or a skipped incremental range — with a green
+run. `key-renderings-v<scheme>.json` lists, per key scheme
+(`faucet_core::KEY_SCHEME_VERSION`), each key's components and the key that
+scheme rendered: the current scheme's keys must render byte-for-byte, and every
+key an earlier scheme rendered must be one of `StateKey::legacy_renderings()` —
+the keys the executor's run-start migration moves a bookmark from. Changing a
+rendering without bumping the scheme and keeping the old rendering reachable
+fails these tests. `cli/tests/state_key_construction.rs` complements them: it
+fails when a state key in the CLI or core is assembled with `format!` instead of
+`StateKey`.
+
 ### State migration (`reliability_state_migration`)
 
 Two guarantees about state crossing a boundary, both asserted through a real
@@ -240,6 +255,36 @@ nothing), and `.best_effort()` declares the other case.
 — `Boundary::Write` is whole-batch, and deliberately stays an **outer** error
 even on the `write_batch_partial` path, because that is exactly what
 `on_batch_error` keys off.
+
+### Panic isolation (`reliability_panic_isolation`)
+
+A connector that panics must fail its run with a typed error, never unwind
+through the pipeline. Under `on_error: continue` an unwinding panic kills
+the task, not just the row, and the other matrix rows go down with it. The
+observability decorators turn a panic into an error of kind `Panic` (counted in
+`faucet_source_errors_total` / `faucet_sink_errors_total`) on every path.
+
+Asserts, by driving `Pipeline::run` down each fast path with a connector that
+panics at one point, that the run returns an error naming the panic: a panic
+in the sink's columnar write (`write_batch_columnar`) or native load
+(`load_native`), and a panic in the source's columnar or native stream, both
+while opening it and while polling an item. The row path has the same guard
+and its own unit tests in `faucet-core`. The CLI test
+`cli/tests/fast_path_panic_isolation.rs` checks the matrix case: a row that
+panics on the columnar path fails, and the next row still runs.
+
+### Wrapper forwarding (`forwarding`)
+
+Every wrapper the engine puts between the pipeline and a connector (the
+observability decorators, transforms, metadata columns, budgets, policies,
+profiling, cleanup, lineage sampling, and the CLI's state-key, bind-context,
+limit, capture and mirror wrappers) must forward every defaulted hook. A missed
+hook falls back to its trait default and quietly turns the feature behind it
+off. This suite checks the canonical hook lists against the `Source` and `Sink`
+trait definitions, so a hook added to a trait without being added to the
+harness fails CI. It also checks that `forward_source!` / `forward_sink!`
+forward every listed hook, and that the harness names any hook a wrapper drops.
+Each wrapper has its own harness test next to it.
 
 ### File-format fidelity (`format_fidelity`)
 

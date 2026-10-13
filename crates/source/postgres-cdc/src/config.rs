@@ -45,6 +45,7 @@ pub struct PostgresCdcSourceConfig {
     /// Connection URL pointing at the database whose WAL we want to read.
     /// The crate internally upgrades the connection to `replication=database`
     /// — callers do **not** need to add it themselves.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
 
     /// Logical replication slot name. Must match the Postgres naming rules:
@@ -242,11 +243,13 @@ pub enum CdcTls {
     /// system roots when `None`).
     VerifyCa {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("x-faucet-resource" = "path"))]
         ca_path: Option<String>,
     },
     /// Require TLS and verify both the certificate chain and the hostname.
     VerifyFull {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("x-faucet-resource" = "path"))]
         ca_path: Option<String>,
     },
     /// Follow the `sslmode` / `sslrootcert` of `connection_url` (default);

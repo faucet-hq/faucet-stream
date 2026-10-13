@@ -132,6 +132,7 @@ pub struct S3SinkConfig {
     /// AWS region. `None` uses the SDK default.
     pub region: Option<String>,
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// File extension for written objects (default: `.jsonl`). Not used when
     /// `path` is set.
@@ -240,6 +241,7 @@ pub struct S3SinkConfig {
     /// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
     /// minor release; any change is called out in the changelog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub scratch_dir: Option<String>,
 }
 

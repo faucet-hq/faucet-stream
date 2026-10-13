@@ -396,7 +396,7 @@ async fn live_leases(
     target: &PipelineTarget,
     now: DateTime<Utc>,
 ) -> CliResult<Vec<(String, RunLease)>> {
-    let suffix = super::keys::lease_key("");
+    let suffix = faucet_core::KeySuffix::Lease.tail();
     let bases: Vec<String> = if store.supports_list() {
         store
             .list(&namespace_prefix(&target.pipeline))
@@ -406,8 +406,8 @@ async fn live_leases(
             .collect()
     } else {
         let mut b: Vec<String> = target.rows.iter().map(|r| target.base_key(&r.id)).collect();
-        b.push(format!("{}::cdc", target.pipeline));
-        b.push(format!("{}::snapshot", target.pipeline));
+        b.push(target.base_key("cdc"));
+        b.push(target.base_key("snapshot"));
         let marker = crate::replication::state::marker_key(&target.pipeline);
         if let Some(v) = store.get(&marker).await?
             && let Ok(m) = crate::replication::multi_state::MirrorState::from_value(v)
@@ -433,7 +433,9 @@ async fn live_leases(
 
 /// Whether a live lease on `held` blocks a change to `bases`.
 fn lease_blocks(target: &PipelineTarget, bases: &[String], held: &str, scope: LeaseScope) -> bool {
-    let under = |b: &str| held == b || held.starts_with(&format!("{b}::"));
+    let under = |b: &str| {
+        held == b || held.starts_with(&faucet_core::StateKey::from_rendered(b).children_prefix())
+    };
     scope == LeaseScope::Namespace
         || bases.iter().any(|b| under(b))
         || !target.rows.iter().any(|r| under(&target.base_key(&r.id)))

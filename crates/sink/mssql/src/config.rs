@@ -132,6 +132,7 @@ pub struct MssqlStagingConfig {
     /// Explicit blob endpoint base (`host[/account]`, path-style) — for Azurite
     /// / sovereign clouds. Overrides `storage_account`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: Option<String>,
     /// Shared Access Signature token SQL Server uses to **read** the staged
     /// objects. Omit to rely on the server's managed identity / configured access.

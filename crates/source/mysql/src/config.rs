@@ -10,6 +10,7 @@ use serde_json::Value;
 #[serde(deny_unknown_fields)]
 pub struct MysqlSourceConfig {
     /// MySQL connection URL (e.g. `mysql://user:pass@host/db`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
     /// SQL query to execute.
     pub query: String,

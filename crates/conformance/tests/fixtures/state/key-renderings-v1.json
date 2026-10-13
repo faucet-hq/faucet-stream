@@ -1,0 +1,9 @@
+{
+  "scheme": 1,
+  "keys": [
+    { "name": "child with a plain parent key", "pipeline": "orders", "row": "lines", "parent_key": "42", "key": "orders::lines::42" },
+    { "name": "child whose parent key holds the separator", "pipeline": "orders", "row": "lines", "parent_key": "x::y", "key": "orders::lines::x::y" },
+    { "name": "child with an over-long parent key", "pipeline": "orders", "row": "lines", "parent_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "key": "orders::lines::aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "name": "row", "pipeline": "orders", "row": "customers", "key": "orders::customers" }
+  ]
+}

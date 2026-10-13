@@ -63,6 +63,16 @@ pub fn channel(table: &str, inner: Arc<dyn Source>) -> (TableFeed, ChannelSource
 
 #[async_trait::async_trait]
 impl Source for ChannelSource {
+    // Only the stream's identity reaches the shared CDC source: the records come
+    // from the demux channel, and reads, probes, cancellation and run hooks on the
+    // real stream belong to the demux, not to one table's pipeline.
+    faucet_core::forward_source!(inner; except
+        fetch_with_context, stream_pages, apply_start_bookmark, state_key, fetch_all,
+        fetch_with_context_incremental, fetch_all_incremental, supports_columnar, stream_batches,
+        native_output_formats, stream_native, capture_resume_position, lag, is_shardable,
+        enumerate_shards, apply_shard, range_digest, supports_discover, discover,
+        set_roundtrip_recorder, set_run_clock, set_cancel, check);
+
     async fn fetch_with_context(
         &self,
         ctx: &HashMap<String, Value>,
@@ -102,56 +112,12 @@ impl Source for ChannelSource {
         Ok(())
     }
 
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-
     fn state_key(&self) -> Option<String> {
         Some(
             self.inner
                 .state_key()
                 .unwrap_or_else(|| "mirror".to_string()),
         )
-    }
-
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
-    }
-
-    fn supports_exactly_once(&self) -> bool {
-        self.inner.supports_exactly_once()
-    }
-
-    fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
-        self.inner.replay_guarantee()
-    }
-
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
     }
 }
 
@@ -404,6 +370,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn channel_source_forwards_only_the_stream_identity() {
+        use faucet_conformance::forwarding::{HookSource, assert_source_forwards_every_hook};
+        let probe = HookSource::default();
+        let (feed, source) = channel("t", Arc::new(probe.clone()));
+        drop(feed);
+        assert_eq!(source.state_key().as_deref(), Some("hook"));
+        assert_source_forwards_every_hook(
+            &source,
+            &probe,
+            &[
+                "fetch_with_context",
+                "fetch_all",
+                "fetch_with_context_incremental",
+                "fetch_all_incremental",
+                "stream_pages",
+                "supports_columnar",
+                "stream_batches",
+                "native_output_formats",
+                "stream_native",
+                "apply_start_bookmark",
+                "capture_resume_position",
+                "lag",
+                "is_shardable",
+                "enumerate_shards",
+                "apply_shard",
+                "range_digest",
+                "supports_discover",
+                "discover",
+                "set_roundtrip_recorder",
+                "set_run_clock",
+                "set_cancel",
+                "check",
+            ],
+        )
+        .await;
+    }
 
     /// A scripted shared stream: pages of `{table, v}` records whose bookmark is
     /// a plain integer, ordered numerically.

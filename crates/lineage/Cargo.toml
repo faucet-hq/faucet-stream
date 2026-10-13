@@ -32,6 +32,7 @@ rdkafka = { workspace = true, optional = true, features = ["sasl"] }
 
 [dev-dependencies]
 wiremock = "0.6"
+faucet-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 

@@ -51,6 +51,7 @@ pub enum PostgresWriteMethod {
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PostgresSinkConfig {
     /// PostgreSQL connection URL (e.g. `postgres://user:pass@host/db`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
     /// Target table name.
     pub table_name: String,

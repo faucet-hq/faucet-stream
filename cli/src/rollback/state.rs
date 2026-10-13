@@ -15,12 +15,16 @@ pub const MARKER_SUFFIX: &str = "__rollback__";
 
 /// `{state_key}::__rollback__` — the retained-run index.
 pub fn index_key(state_key: &str) -> String {
-    format!("{state_key}::{MARKER_SUFFIX}")
+    faucet_core::StateKey::from_rendered(state_key)
+        .with_suffix(faucet_core::KeySuffix::RollbackIndex)
+        .render()
 }
 
 /// `{state_key}::__rollback__::{run_id}` — one run's marker.
 pub fn marker_key(state_key: &str, run_id: &str) -> String {
-    format!("{state_key}::{MARKER_SUFFIX}::{run_id}")
+    faucet_core::StateKey::from_rendered(state_key)
+        .with_suffix(faucet_core::KeySuffix::RollbackRun(run_id.to_owned()))
+        .render()
 }
 
 /// What a run looked like before it wrote, and how it wrote.

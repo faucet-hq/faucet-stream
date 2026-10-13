@@ -12,7 +12,9 @@ pub const SLA_STATE_SUFFIX: &str = "__sla__";
 
 /// The SLA-history key for one invocation: `{base}::__sla__`.
 pub fn sla_state_key(base: &str) -> String {
-    format!("{base}::{SLA_STATE_SUFFIX}")
+    faucet_core::StateKey::from_rendered(base)
+        .with_suffix(faucet_core::KeySuffix::Sla)
+        .render()
 }
 
 /// Rolling SLA history for one root invocation.

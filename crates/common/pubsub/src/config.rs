@@ -21,6 +21,7 @@ pub enum PubsubCredentials {
     /// Path to a service-account JSON key file on disk.
     ServiceAccountJsonFile {
         /// Filesystem path to the service-account key JSON.
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
     },
     /// Service-account JSON key as an inline string. Pair with
@@ -67,6 +68,7 @@ pub struct PubsubConnection {
     /// Override the Pub/Sub API endpoint (host:port or URL). Rarely needed —
     /// prefer `emulator_host` for the emulator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: Option<String>,
     /// Point the client at a Pub/Sub emulator (`host:port`). When set, auth is
     /// skipped and the endpoint is taken from this value — mirrors the

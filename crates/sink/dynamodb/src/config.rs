@@ -35,6 +35,7 @@ pub struct DynamoDbSinkConfig {
     pub region: Option<String>,
     /// Custom endpoint URL (DynamoDB Local, LocalStack, VPC endpoints).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
     /// AWS credentials. Defaults to the SDK default provider chain.
     #[serde(default)]

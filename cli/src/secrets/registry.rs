@@ -183,6 +183,42 @@ pub fn redact(input: &str) -> Cow<'_, str> {
     redact_with(input, |_| "***".to_owned())
 }
 
+/// Characters that end a URL embedded in a message.
+fn url_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']')
+}
+
+/// Redact a message that leaves the process (#874): every registered secret,
+/// and the credentials of every URL in it (`scheme://user:pass@host`,
+/// credential query parameters), so text persisted to a shared store is clean
+/// whichever instance later reads it.
+pub fn redact_message(input: &str) -> String {
+    let secrets = redact(input);
+    let text = secrets.as_ref();
+    let plain = faucet_core::util::redact_uri_credentials;
+    if !text.contains("://") {
+        return plain(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let start = rest[..at]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| url_boundary(c) || c == '=' || c == ',')
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = rest[at..]
+            .char_indices()
+            .find(|&(_, c)| url_boundary(c))
+            .map_or(rest.len(), |(i, _)| at + i);
+        out.push_str(&plain(&rest[..start]));
+        out.push_str(&plain(&rest[start..end]));
+        rest = &rest[end..];
+    }
+    out.push_str(&plain(rest));
+    out
+}
+
 /// Replace every registered secret value in `input` with a caller-supplied
 /// token. `token(secret)` receives the raw secret and returns its replacement;
 /// it is called only for secrets actually present in `input`. Used by the
@@ -487,5 +523,24 @@ mod tests {
             w.flush().unwrap();
         }
         assert_eq!(String::from_utf8(buf).unwrap(), "token=*** done");
+    }
+
+    #[test]
+    #[serial]
+    fn redact_message_masks_secrets_and_url_credentials() {
+        register("s3cr3t-874-value");
+        let msg = "open 'postgres://app:pw@db:5432/x' failed (s3cr3t-874-value); \
+                   retry https://h/api?api_key=k1&x=1 and mysql://u:p2@m/y";
+        let out = redact_message(msg);
+        assert!(!out.contains("s3cr3t-874-value"), "{out}");
+        assert!(!out.contains("app:pw"), "{out}");
+        assert!(!out.contains("k1"), "{out}");
+        assert!(!out.contains("u:p2"), "{out}");
+        assert!(out.contains("postgres://db:5432/x"), "{out}");
+        assert!(out.contains("mysql://m/y"), "{out}");
+        assert!(!redact_message("Password=hunter;Server=x").contains("hunter"));
+        assert_eq!(redact_message("plain"), "plain");
+        assert_eq!(redact_message("at end url=s3://b/k"), "at end url=s3://b/k");
+        unregister("s3cr3t-874-value");
     }
 }

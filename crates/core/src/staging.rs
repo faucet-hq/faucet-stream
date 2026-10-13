@@ -139,6 +139,7 @@ pub struct StagingSpec {
     /// Object-store location to stage files under, e.g.
     /// `s3://my-bucket/faucet-stage/`. Scheme selects the backend
     /// (`s3://` / `gs://` / `az://`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub location: String,
     /// File format written to the stage. Default `parquet`.
     #[serde(default = "default_format")]

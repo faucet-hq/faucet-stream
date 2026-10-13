@@ -33,6 +33,8 @@ pub enum KeyKind {
     BackfillMarker(String),
     /// `{name}::backfill::{range_hash}::{unit}` — one backfill unit's bookmark.
     BackfillUnit(String),
+    /// `{name}::__serve_backfill__::{hash}` — a served backfill range's record.
+    ServeBackfillMarker(String),
 }
 
 impl KeyKind {
@@ -54,6 +56,7 @@ impl KeyKind {
             Self::Replication => "replication",
             Self::BackfillMarker(_) => "backfill-marker",
             Self::BackfillUnit(_) => "backfill-unit",
+            Self::ServeBackfillMarker(_) => "serve-backfill-marker",
         }
     }
 }
@@ -78,83 +81,74 @@ impl ClassifiedKey {
     /// The invocation key a marker hangs off (`{name}::{row}[::{sub}]`).
     pub fn base(&self, pipeline: &str) -> Option<String> {
         let row = self.row.as_ref()?;
+        let key = faucet_core::StateKey::invocation(pipeline, row.as_str());
         Some(match &self.sub {
-            Some(sub) => format!("{pipeline}::{row}::{sub}"),
-            None => format!("{pipeline}::{row}"),
+            Some(sub) => key.with_sub(sub.as_str()).render(),
+            None => key.render(),
         })
     }
 }
 
 /// Decode `key` relative to `pipeline`; `None` when it is outside the namespace.
 pub fn classify(pipeline: &str, key: &str) -> Option<ClassifiedKey> {
-    let rest = key.strip_prefix(pipeline)?.strip_prefix("::")?;
-    if rest.is_empty() {
-        return None;
-    }
-    let segs: Vec<&str> = rest.split("::").collect();
-    let join = |s: &[&str]| s.join("::");
+    use faucet_core::KeySuffix;
+    let parsed = faucet_core::StateKey::parse(None, pipeline, key)?;
     let pipeline_level = |kind| ClassifiedKey {
         key: key.to_string(),
         row: None,
         sub: None,
         kind,
     };
-    match segs[0] {
-        "__replication__" => return Some(pipeline_level(KeyKind::Replication)),
-        "__backfill__" if segs.len() > 1 => {
-            return Some(pipeline_level(KeyKind::BackfillMarker(join(&segs[1..]))));
+    let kind = match parsed.suffix() {
+        None => KeyKind::Bookmark,
+        Some(KeySuffix::Replication) => return Some(pipeline_level(KeyKind::Replication)),
+        Some(KeySuffix::Backfill(h)) => {
+            return Some(pipeline_level(KeyKind::BackfillMarker(h.clone())));
         }
-        "backfill" if segs.len() > 1 => {
-            // A unit's own run markers hang off `{name}::backfill::{range_hash}::{unit}`.
-            let (unit_end, kind) = match segs.last() {
-                Some(&STATUS_SUFFIX) if segs.len() > 2 => (segs.len() - 1, Some(KeyKind::Status)),
-                Some(&LEASE_SUFFIX) if segs.len() > 2 => (segs.len() - 1, Some(KeyKind::Lease)),
-                _ => (segs.len(), None),
-            };
-            let unit = join(&segs[1..unit_end]);
-            return Some(match kind {
-                Some(kind) => ClassifiedKey {
-                    key: key.to_string(),
-                    row: None,
-                    sub: Some(unit),
-                    kind,
-                },
-                None => pipeline_level(KeyKind::BackfillUnit(unit)),
-            });
+        Some(KeySuffix::ServeBackfill(h)) => {
+            return Some(pipeline_level(KeyKind::ServeBackfillMarker(h.clone())));
         }
-        _ => {}
+        Some(KeySuffix::Sla) => KeyKind::Sla,
+        Some(KeySuffix::Profiling) => KeyKind::Profiling,
+        Some(KeySuffix::RollbackIndex) => KeyKind::RollbackIndex,
+        Some(KeySuffix::RollbackRun(r)) => KeyKind::RollbackRun(r.clone()),
+        Some(KeySuffix::Status) => KeyKind::Status,
+        Some(KeySuffix::Lease) => KeyKind::Lease,
+        Some(_) => KeyKind::Bookmark,
+    };
+    let row = parsed.row()?.to_string();
+    // A backfill unit's row id is `backfill::{range_hash}::{unit}`.
+    if let Some(unit) = row.strip_prefix("backfill::") {
+        return Some(match kind {
+            KeyKind::Bookmark => pipeline_level(KeyKind::BackfillUnit(unit.to_string())),
+            kind => ClassifiedKey {
+                key: key.to_string(),
+                row: None,
+                sub: Some(unit.to_string()),
+                kind,
+            },
+        });
     }
-    let row = segs[0].to_string();
-    let reserved = segs.iter().enumerate().skip(1).find_map(|(i, s)| {
-        let kind = match *s {
-            "__sla__" => KeyKind::Sla,
-            "__profiling__" => KeyKind::Profiling,
-            STATUS_SUFFIX => KeyKind::Status,
-            LEASE_SUFFIX => KeyKind::Lease,
-            "__rollback__" if i + 1 < segs.len() => KeyKind::RollbackRun(join(&segs[i + 1..])),
-            "__rollback__" => KeyKind::RollbackIndex,
-            _ => return None,
-        };
-        Some((i, kind))
-    });
-    let (end, kind) = reserved.unwrap_or((segs.len(), KeyKind::Bookmark));
-    let sub = (end > 1).then(|| join(&segs[1..end]));
     Some(ClassifiedKey {
         key: key.to_string(),
         row: Some(row),
-        sub,
+        sub: parsed.sub(),
         kind,
     })
 }
 
 /// `{base}::__status__`.
 pub fn status_key(base: &str) -> String {
-    format!("{base}::{STATUS_SUFFIX}")
+    faucet_core::StateKey::from_rendered(base)
+        .with_suffix(faucet_core::KeySuffix::Status)
+        .render()
 }
 
 /// `{base}::__lease__`.
 pub fn lease_key(base: &str) -> String {
-    format!("{base}::{LEASE_SUFFIX}")
+    faucet_core::StateKey::from_rendered(base)
+        .with_suffix(faucet_core::KeySuffix::Lease)
+        .render()
 }
 
 #[cfg(test)]
@@ -210,6 +204,9 @@ mod tests {
         assert_eq!(k.kind, KeyKind::Lease);
         // A row literally named `backfill` with no unit is still a row.
         assert_eq!(c("orders::backfill").kind, KeyKind::Bookmark);
+        let k = c("orders::__serve_backfill__::h1");
+        assert_eq!((k.row, k.kind.label()), (None, "serve-backfill-marker"));
+        assert!(k.kind.is_marker());
     }
 
     #[test]

@@ -13,7 +13,9 @@ pub const PROFILING_STATE_SUFFIX: &str = "__profiling__";
 
 /// The profiling-history key for one invocation: `{base}::__profiling__`.
 pub fn profiling_state_key(base: &str) -> String {
-    format!("{base}::{PROFILING_STATE_SUFFIX}")
+    faucet_core::StateKey::from_rendered(base)
+        .with_suffix(faucet_core::KeySuffix::Profiling)
+        .render()
 }
 
 /// One run's profile as stored in the baseline, with the drift it raised
