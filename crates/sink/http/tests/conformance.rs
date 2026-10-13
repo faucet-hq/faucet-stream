@@ -61,3 +61,20 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+#[test]
+fn conformance_descriptor_matches_built_sink() {
+    for v in [
+        serde_json::json!({"url": "http://127.0.0.1:1/ingest"}),
+        serde_json::json!({"url": "http://127.0.0.1:1/ingest", "batch_size": 0}),
+    ] {
+        let cfg: faucet_sink_http::HttpSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_sink_http::HttpSink::new(cfg);
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_http::DESCRIPTOR,
+            "http",
+            &v,
+            &built,
+        );
+    }
+}

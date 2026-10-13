@@ -222,3 +222,7 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Observability
 
 Metrics emitted by this source are labelled `connector="parquet"`.
+
+## Capabilities
+
+Shardable (hash of file path); columnar with the `arrow` feature. Not exactly-once, no discovery. `faucet list --json` prints the declaration.

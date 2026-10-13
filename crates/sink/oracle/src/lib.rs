@@ -26,9 +26,11 @@
 //! ```
 
 mod config;
+mod descriptor;
 mod plan;
 mod sink;
 
 pub use config::{IdentifierCase, OnUnknownField, OracleColumnMapping, OracleSinkConfig};
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_oracle::{OracleConnectionConfig, OracleTls};
 pub use sink::OracleSink;

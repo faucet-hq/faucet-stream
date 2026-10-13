@@ -4,6 +4,9 @@
 //!
 //! See the crate-level README for usage and config-field reference.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 mod config;
 #[cfg(feature = "arrow")]
 mod parquet_range;

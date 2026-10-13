@@ -330,3 +330,7 @@ already landed a second time). See
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
+
+## Capabilities
+
+Append only; nothing else (no exactly-once, upsert or schema evolution). `faucet list --json` prints the declaration.

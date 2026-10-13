@@ -519,3 +519,7 @@ as a source round trip. Reads and heads are priced as S3 read requests
 (`usage.pricing.object_storage.read_per_1k_requests`), a listing page like a
 PUT (`write_per_1k_requests`); see the
 [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
+## Capabilities
+
+Shardable (hash of object key) and discoverable; columnar (with `arrow`) for `file_format: parquet`, and for `avro` / `orc` with their format features. Not exactly-once. `faucet list --json` prints the declaration.

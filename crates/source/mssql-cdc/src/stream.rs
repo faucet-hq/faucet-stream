@@ -230,6 +230,13 @@ impl Source for MssqlCdcSource {
         Ok(Some(marks.to_value()?))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(true)
+            .build()
+    }
+
     fn supports_exactly_once(&self) -> bool {
         true
     }

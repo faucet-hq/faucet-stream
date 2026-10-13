@@ -27,6 +27,7 @@
 
 mod config;
 mod convert;
+mod descriptor;
 mod money;
 mod stream;
 
@@ -35,4 +36,5 @@ pub use stream::MssqlSource;
 
 // Re-export the shared connection/TLS types so users configure the source
 // without depending on `faucet-common-mssql` directly.
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_mssql::{MssqlConnectionConfig, MssqlTls, MssqlTlsMode};

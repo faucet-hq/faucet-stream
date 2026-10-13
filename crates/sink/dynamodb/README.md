@@ -84,6 +84,10 @@ skipped by default, which makes re-delivery idempotent with conditions like
 `check()` runs `DescribeTable` and, for keyed modes, verifies `key` matches the
 table key schema. Nothing is written.
 
+## Capabilities
+
+Declares `write_mode: append | upsert | delete` and keyed upsert; it dedups by key only when the config sets `write_mode: upsert|delete` with a `key`. No idempotent writes, cleanup or schema evolution. `faucet list --json` prints the declaration.
+
 ## License
 
 MIT OR Apache-2.0

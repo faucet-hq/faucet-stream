@@ -489,6 +489,10 @@ In the CLI / umbrella, enable the connector with `source-kafka`, and the registr
 and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
 logged once and reported as no lag — it never fails a run.
 
+## Capabilities
+
+Declares exactly-once replay (deterministic from its per-partition offsets bookmark), sharding (consumer-group membership slots) and lag reporting, for every config. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

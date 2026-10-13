@@ -26,3 +26,32 @@ fn conformance_connector_name_nonempty() {
     assert_connector_name_nonempty_value(sink.connector_name(), sink.connector_name());
     assert_eq!(sink.connector_name(), "snowflake");
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+#[test]
+fn conformance_descriptor_matches_built_sink() {
+    let base = serde_json::json!({
+        "account": "xy12345",
+        "warehouse": "WH",
+        "database": "DB",
+        "schema": "PUBLIC",
+        "table": "t",
+        "auth": {"type": "oauth", "config": {"token": "t"}},
+    });
+    let mut configs = vec![base.clone()];
+    if cfg!(feature = "arrow") {
+        let mut bulk = base;
+        bulk["bulk_load"] = serde_json::json!({"stage": "s", "url": "s3://bucket/prefix"});
+        configs.push(bulk);
+    }
+    for v in configs {
+        let cfg: SnowflakeSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SnowflakeSink::new(cfg).expect("sink builds lazily");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_snowflake::DESCRIPTOR,
+            "snowflake",
+            &v,
+            &built,
+        );
+    }
+}

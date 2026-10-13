@@ -443,6 +443,10 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent writes (exactly-once), keyed upsert, scoped cleanup, schema evolution (`schema_report: reported`), staged load, scoped (`overwrite.scope`) and staging-free overwrite. Under `write_mode: upsert|delete` with a `key` it dedups by key; the columnar (with the `arrow` feature) and native byte-load paths are declared only for `append` / `overwrite`. `faucet list --json` prints these declared capabilities.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -382,6 +382,15 @@ impl faucet_core::Sink for DeltaSink {
         &[WriteMode::Append]
     }
 
+    /// Fields the table schema lacks are warned about and dropped, and no
+    /// `current_schema` is reported, so a drift policy cannot see them.
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_sink(self)
+            .to_builder()
+            .schema_report(faucet_core::SchemaReport::DropsUnknownFields)
+            .build()
+    }
+
     async fn check(
         &self,
         ctx: &faucet_core::check::CheckContext,

@@ -477,6 +477,10 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Declares `write_mode: append` and idempotent (exactly-once) writes. Under `value_format: confluent_avro` (the `schema-registry` feature) it declares that it drops record fields the Avro schema lacks, so `on_drift: fail` is refused at load time. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -110,3 +110,21 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+#[tokio::test]
+async fn descriptor_matches_built_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = serde_json::to_value(ParquetSinkConfig::local(
+        dir.path().to_string_lossy().to_string(),
+    ))
+    .unwrap();
+    let cfg: ParquetSinkConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = ParquetSink::new(cfg).await.unwrap();
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_parquet::DESCRIPTOR,
+        "parquet",
+        &v,
+        &built,
+    );
+}

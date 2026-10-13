@@ -6,6 +6,9 @@
 //! filesystem) as `jsonl`, `json_array`, or `raw_text`. See the crate-level
 //! README for usage and the config-field reference.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 mod config;
 mod stream;
 

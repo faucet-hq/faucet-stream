@@ -19,6 +19,7 @@
 //! all-column logging for full update images).
 
 mod config;
+mod descriptor;
 mod lag;
 mod logs;
 mod miner;
@@ -28,6 +29,7 @@ mod state;
 mod stream;
 
 pub use config::{OnUnsupported, OracleCdcSourceConfig, StartPosition};
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_oracle::{OracleConnectionConfig, OracleTls};
 pub use state::Position;
 pub use stream::OracleCdcSource;

@@ -78,3 +78,28 @@ async fn conformance_keyed_battery() {
     let sink = keyed_sink(&endpoint, "replay").await;
     assert_idempotent_replay(&sink, || count(&client, "replay")).await;
 }
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"table_name": "t", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"table_name": "t", "write_mode": "upsert", "key": ["pk"], "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"table_name": "t", "write_mode": "delete", "key": ["pk"], "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_dynamodb::DynamoDbSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_dynamodb::DynamoDbSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_dynamodb::DESCRIPTOR,
+            "dynamodb",
+            &v,
+            &built,
+        );
+    }
+}

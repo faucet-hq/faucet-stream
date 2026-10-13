@@ -90,3 +90,21 @@ async fn conformance_preflight_check_wellformed() {
     )
     .await;
 }
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    for v in [
+        serde_json::json!({"executable": fake_tap(), "stream": "s"}),
+        serde_json::json!({"executable": fake_tap(), "stream": "s", "flush_on_state": false}),
+    ] {
+        let cfg: faucet_source_singer::SingerSourceConfig =
+            serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_singer::SingerSource::new(cfg);
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_singer::DESCRIPTOR,
+            "singer",
+            &v,
+            &built,
+        );
+    }
+}

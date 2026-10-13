@@ -24,7 +24,10 @@
 //! reading the relevant fields of the raw config value. Descriptors read field
 //! by field and fall back to the connector's defaults for anything missing or
 //! not yet interpolated, so a config that has not been resolved yet still gets
-//! an answer; they never fail.
+//! an answer; they never fail. Called with `Value::Null` instead of a config
+//! object, a descriptor answers the kind-level view
+//! ([`ConnectorDescriptor::kind_capabilities`]): every capability some valid
+//! config enables (config-only facts such as `keyed_dedup` stay off).
 
 use crate::idempotency::{ReplayGuarantee, SinkGuarantee};
 use crate::traits::{Sink, Source};
@@ -416,9 +419,16 @@ impl ConnectorDescriptor {
         self.kind
     }
 
-    /// The capabilities the connector has under `config`.
+    /// The capabilities the connector has under `config` (a config object).
     pub fn capabilities(&self, config: &Value) -> Capabilities {
         (self.capabilities)(config)
+    }
+
+    /// The kind-level view: every capability some config of this connector
+    /// enables — what listings and "supported: …" messages show. The
+    /// descriptor function answers it when called with `Value::Null`.
+    pub fn kind_capabilities(&self) -> Capabilities {
+        (self.capabilities)(&Value::Null)
     }
 }
 
@@ -680,6 +690,7 @@ mod tests {
     fn descriptor_answers_from_config() {
         const D: ConnectorDescriptor = ConnectorDescriptor::new("rich", rich);
         assert_eq!(D.kind(), "rich");
+        assert_eq!(D.kind_capabilities(), Capabilities::append_only_sink());
         assert!(
             D.capabilities(&json!({"write_mode": "upsert", "key": ["id"]}))
                 .keyed_dedup()

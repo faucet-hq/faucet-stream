@@ -395,6 +395,10 @@ where its previous owner left off.
 Outside the cluster coordinator the `shard` config has **no effect** — a plain
 `faucet run` streams the whole query.
 
+## Capabilities
+
+Declares `discover`, `range_read` and `range_digest` (`faucet verify` reads and digests one integer-key range server-side), and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

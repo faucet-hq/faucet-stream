@@ -18,3 +18,6 @@ pub use faucet_core::{FaucetError, Source};
 
 pub use config::{SnowflakeAuth, SnowflakeSourceConfig};
 pub use stream::SnowflakeSource;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

@@ -118,3 +118,7 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
+## Capabilities
+
+Append only, with a staged load (`write_strategy: copy` bulk-loads through S3). `faucet list --json` prints the declaration.

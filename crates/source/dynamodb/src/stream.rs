@@ -521,6 +521,13 @@ impl faucet_core::Source for DynamoDbSource {
         Ok(Some(capture_bookmark(&arn, &described).to_value()))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(self.config.mode == ReadMode::Streams)
+            .build()
+    }
+
     /// Streams mode: now minus the creation time of the newest record read
     /// from each open shard, the largest across shards; before this run has
     /// read, the age of each open shard's oldest unconsumed record at the

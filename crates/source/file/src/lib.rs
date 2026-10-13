@@ -12,6 +12,9 @@
 //! **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
 //! minor release; any change is called out in the changelog.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 #[cfg(feature = "encryption")]
 mod decrypt;

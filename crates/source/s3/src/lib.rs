@@ -7,6 +7,9 @@
 //! Lists and reads objects from an S3 bucket/prefix, parsing them as JSON Lines,
 //! JSON arrays, or raw text.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 #[cfg(feature = "arrow")]
 mod parquet_range;

@@ -1667,6 +1667,13 @@ impl faucet_core::Sink for PostgresSink {
             .expect("schema serialization")
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_sink(self)
+            .to_builder()
+            .scoped_overwrite(true)
+            .build()
+    }
+
     fn supports_cleanup(&self) -> bool {
         // Column-mapping mode only: the scope + key predicates address real
         // columns, which a single JSONB payload column does not have.

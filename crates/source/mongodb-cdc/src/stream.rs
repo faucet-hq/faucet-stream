@@ -284,6 +284,13 @@ impl Source for MongoCdcSource {
         Ok(Some(Bookmark::from_token(&token)?.to_value()?))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(true)
+            .build()
+    }
+
     /// Seconds between the cluster's current time and the oldest change this
     /// source has not delivered (#733).
     async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {

@@ -185,3 +185,7 @@ pipeline:
 ## License
 
 MIT
+
+## Capabilities
+
+Columnar (with `arrow`) for `file_format: parquet`, and for `avro` / `orc` with their format features. Not shardable, discoverable or exactly-once. `faucet list --json` prints the declaration.

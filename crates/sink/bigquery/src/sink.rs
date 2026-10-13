@@ -2297,6 +2297,16 @@ impl faucet_core::Sink for BigQuerySink {
         true
     }
 
+    /// Adds what no trait method expresses: a windowed `overwrite.scope`
+    /// (#518) and a staging-free overwrite driven by `_overwrite_staging`.
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_sink(self)
+            .to_builder()
+            .scoped_overwrite(true)
+            .direct_overwrite(true)
+            .build()
+    }
+
     fn config_schema(&self) -> serde_json::Value {
         serde_json::to_value(faucet_core::schema_for!(BigQuerySinkConfig))
             .expect("schema serialization")

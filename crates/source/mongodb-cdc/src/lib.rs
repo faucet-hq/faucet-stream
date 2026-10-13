@@ -12,3 +12,6 @@ mod stream;
 pub use config::{FullDocument, FullDocumentBeforeChange, MongoCdcSourceConfig, Scope, StartFrom};
 pub use state::{Bookmark, STATE_SCHEMA, migrate_state, state_key};
 pub use stream::MongoCdcSource;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

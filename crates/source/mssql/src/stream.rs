@@ -461,6 +461,13 @@ impl Source for MssqlSource {
         Ok(CheckReport::single(probe))
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .range_read(true)
+            .build()
+    }
+
     fn supports_discover(&self) -> bool {
         true
     }

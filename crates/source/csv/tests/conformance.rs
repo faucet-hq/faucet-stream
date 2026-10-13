@@ -93,3 +93,18 @@ async fn conformance_errors_not_panics() {
     ));
     faucet_conformance::assert_errors_not_panics(&source).await;
 }
+
+// ── Descriptor (RFC 0013): agrees with the built source ─────────────────────
+
+#[test]
+fn descriptor_matches_built_source() {
+    let v = serde_json::json!({"path": "/tmp/does-not-matter.csv"});
+    let cfg: CsvSourceConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = CsvSource::new(cfg);
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_csv::DESCRIPTOR,
+        "csv",
+        &v,
+        &built,
+    );
+}

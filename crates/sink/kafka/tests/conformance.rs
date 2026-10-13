@@ -166,3 +166,29 @@ mod idempotent {
         .await;
     }
 }
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let mut configs =
+        vec![r#"{"brokers": "127.0.0.1:1", "topic": {"type": "fixed", "name": "t"}}"#];
+    #[cfg(feature = "schema-registry")]
+    configs.push(
+        r#"{"brokers": "127.0.0.1:1", "topic": {"type": "fixed", "name": "t"}, "value_format": {"type": "confluent_avro", "schema_registry": {"url": "http://127.0.0.1:1"}}, "value_schema": "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"}]}"}"#,
+    );
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_kafka::KafkaSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_kafka::KafkaSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_kafka::DESCRIPTOR,
+            "kafka",
+            &v,
+            &built,
+        );
+    }
+}

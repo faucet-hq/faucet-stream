@@ -10,6 +10,7 @@ use faucet_core::{FaucetError, FileFormat};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod capabilities;
 #[cfg(feature = "encryption")]
 pub mod sealed_lines;
 pub mod write;
@@ -19,7 +20,9 @@ pub mod __private {
     pub use faucet_core::async_trait;
     pub use faucet_core::check::{CheckContext, CheckReport};
     pub use faucet_core::observability::RoundtripRecorder;
-    pub use faucet_core::{BatchAtomicity, FaucetError, LocalOutput, Sink, WriteMode};
+    pub use faucet_core::{
+        BatchAtomicity, Capabilities, FaucetError, LocalOutput, Sink, WriteMode,
+    };
     pub use serde_json::Value;
 }
 

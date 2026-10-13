@@ -155,3 +155,42 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+
+fn descriptor_config(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut v = base;
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+#[tokio::test]
+async fn descriptor_matches_built_sink() {
+    let base = serde_json::json!({"bucket": "b", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1"});
+    let mut cases = vec![
+        serde_json::json!({}),
+        serde_json::json!({"format": "raw_text"}),
+        serde_json::json!({"format": "auto", "path": "x.json"}),
+        serde_json::json!({"format": "auto", "file_extension": ".txt"}),
+    ];
+    #[cfg(feature = "file-format-csv")]
+    cases.extend([
+        serde_json::json!({"format": "csv", "csv": {"on_unknown_field": "warn"}}),
+        serde_json::json!({"format": "csv", "csv": {"on_unknown_field": "error"}}),
+    ]);
+    #[cfg(feature = "arrow")]
+    cases.push(serde_json::json!({"format": "auto", "path": "x-{part}.parquet"}));
+    for extra in cases {
+        let v = descriptor_config(base.clone(), extra);
+        let cfg: S3SinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = S3Sink::new(cfg).await.expect("sink builds offline");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_s3::DESCRIPTOR,
+            "s3",
+            &v,
+            &built,
+        );
+    }
+}

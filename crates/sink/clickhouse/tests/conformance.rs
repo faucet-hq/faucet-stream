@@ -110,3 +110,24 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+#[test]
+fn descriptor_matches_the_built_sink() {
+    for v in [
+        serde_json::json!({"url": "http://localhost:8123", "table": "t"}),
+        serde_json::json!({
+            "url": "http://localhost:8123",
+            "table": "t",
+            "staging": {"location": "s3://bucket/stage", "format": "jsonl", "region": "us-east-1"}
+        }),
+    ] {
+        let cfg: ClickHouseSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = ClickHouseSink::new(cfg).expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_clickhouse::DESCRIPTOR,
+            "clickhouse",
+            &v,
+            &built,
+        );
+    }
+}

@@ -204,3 +204,26 @@ async fn conformance_preflight_check_wellformed() {
     let sink = ElasticsearchSink::new(ElasticsearchSinkConfig::new(server.uri(), "idx")).unwrap();
     assert_sink_preflight_check_wellformed(&sink, &CheckContext::default()).await;
 }
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i"}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "write_mode": "upsert", "key": ["id"]}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "write_mode": "delete", "key": ["id"]}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_elasticsearch::ElasticsearchSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_elasticsearch::ElasticsearchSink::new(cfg).expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_elasticsearch::DESCRIPTOR,
+            "elasticsearch",
+            &v,
+            &built,
+        );
+    }
+}

@@ -369,3 +369,26 @@ async fn a_single_group_fifo_queue_drains_in_order() {
     assert_eq!(order, (0..15).collect::<Vec<i64>>());
     assert!(got.iter().all(|r| r["message_id"].is_string()));
 }
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"queue_url": "http://127.0.0.1:1/1/q", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_sqs::SqsSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_sqs::SqsSource::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_sqs::DESCRIPTOR,
+            "sqs",
+            &v,
+            &built,
+        );
+    }
+}

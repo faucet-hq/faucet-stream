@@ -8,10 +8,12 @@
 mod batch;
 mod config;
 mod convert;
+mod descriptor;
 mod query;
 mod state;
 mod stream;
 
 pub use config::{CdcTls, MysqlCdcSourceConfig, StartPosition};
+pub use descriptor::DESCRIPTOR;
 pub use state::{Bookmark, state_key};
 pub use stream::MysqlCdcSource;

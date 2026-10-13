@@ -18,3 +18,7 @@ pub use faucet_core::{FaucetError, Source, TlsClientConfig};
 pub use config::{SoapConfig, SoapVersion, XmlAuth, XmlPagination, XmlStreamConfig};
 pub use decode::{DecodeStep, ParseFormat, ParseSpec, run_decode};
 pub use stream::XmlStream;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("xml", faucet_core::capabilities::plain_source);

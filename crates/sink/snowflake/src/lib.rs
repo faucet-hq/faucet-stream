@@ -19,3 +19,6 @@ pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{SnowflakeAuth, SnowflakeSinkConfig, SnowflakeStageConfig};
 pub use sink::SnowflakeSink;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

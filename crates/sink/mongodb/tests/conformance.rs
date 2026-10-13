@@ -141,3 +141,28 @@ mod idempotent {
         .await;
     }
 }
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c"}"#,
+        r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c", "write_mode": "upsert", "key": ["id"]}"#,
+        r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c", "write_mode": "overwrite"}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_mongodb::MongoSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_mongodb::MongoSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_mongodb::DESCRIPTOR,
+            "mongodb",
+            &v,
+            &built,
+        );
+    }
+}

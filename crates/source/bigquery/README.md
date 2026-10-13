@@ -247,6 +247,10 @@ it and reads the job's **destination table** through the same gRPC Arrow path
 REST JSON — exactly where a large result most needs the fast path. Only a
 config with *neither* a table nor SQL is rejected.
 
+## Capabilities
+
+Declares `discover`. Columnar (Arrow) output is declared only when the crate is built with the `arrow` feature and the config sets `read_api: true`. `faucet list --json` prints these declared capabilities.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -154,6 +154,10 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Append only; a staged load when a `staging:` block is set and the `staging` feature is compiled in. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

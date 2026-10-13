@@ -85,6 +85,10 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Declares `write_mode: append` only; no idempotent writes. `faucet list --json` prints the declaration.
+
 ## License
 
 MIT OR Apache-2.0

@@ -393,6 +393,10 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Declares `append`, idempotent writes (exactly-once) and staged load. Columnar (Arrow) loading is declared only when built with the `arrow` feature and `bulk_load` is set. `faucet list --json` prints these declared capabilities.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

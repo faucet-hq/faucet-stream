@@ -92,3 +92,7 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
+## Capabilities
+
+Declares `write_mode: append` only; no idempotent writes. `faucet list --json` prints the declaration.

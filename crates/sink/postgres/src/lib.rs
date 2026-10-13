@@ -11,10 +11,12 @@
 
 pub mod config;
 mod copy;
+mod descriptor;
 mod rollback;
 pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{BinaryEncoding, PostgresColumnMapping, PostgresSinkConfig, PostgresWriteMethod};
+pub use descriptor::DESCRIPTOR;
 pub use sink::PostgresSink;

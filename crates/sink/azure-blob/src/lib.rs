@@ -7,6 +7,9 @@
 //! Excel, Avro, Parquet and raw text — through the shared file writer (#777).
 //! See the crate-level README for the config-field reference.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 mod config;
 mod object;
 mod sink;

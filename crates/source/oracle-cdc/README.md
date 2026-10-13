@@ -118,6 +118,10 @@ once and reported as no lag — it never fails a run.
 
 Pair with `cdc_unwrap` and an upsert-capable sink (`write_mode: upsert`, `delete_marker: { field: __op, values: [d] }`). For an initial load, `faucet mirror` captures `capture_resume_position()` before bulk-copying with the `oracle` query source, then streams changes from that SCN.
 
+## Capabilities
+
+Declares `exactly_once` (deterministic replay from the SCN bookmark) and `reports_lag` (seconds behind the current SCN). `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

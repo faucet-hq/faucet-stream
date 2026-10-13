@@ -212,3 +212,7 @@ JSON Lines, JSON arrays and raw text need nothing. `file-format-csv`,
 `file-format-xml`, `file-format-excel`, `file-format-avro`,
 `file-format-parquet` add the rest (`file-formats` is all of them); `arrow`
 enables the columnar write path; `encryption` enables the `encryption` block.
+
+## Capabilities
+
+Write modes `append` and `overwrite`; no exactly-once or keyed upsert. Columnar for Parquet and Avro output (with the `arrow` feature). For CSV output under `csv.on_unknown_field: warn` it declares that it drops fields outside the frozen header (`schema_report: drops_unknown_fields`), so `schema.on_drift: fail` is refused at load time. The format comes from `format` or the path's extension. `faucet list --json` prints the declaration.

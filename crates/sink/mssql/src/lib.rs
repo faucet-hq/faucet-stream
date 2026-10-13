@@ -28,6 +28,7 @@
 
 mod coltype;
 mod config;
+mod descriptor;
 mod encode;
 mod sink;
 #[cfg(feature = "staging")]
@@ -41,4 +42,5 @@ pub use sink::MssqlSink;
 
 // Re-export the shared connection/TLS types so users configure the sink without
 // depending on `faucet-common-mssql` directly.
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_mssql::{MssqlConnectionConfig, MssqlTls, MssqlTlsMode};

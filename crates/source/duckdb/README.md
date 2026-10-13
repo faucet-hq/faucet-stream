@@ -80,3 +80,7 @@ name, so one of them would be lost. Alias the columns.
 This crate wires the reusable [`faucet-conformance`](https://docs.rs/faucet-conformance)
 battery in `tests/conformance.rs` — config-schema validity, bounded-memory
 streaming (seeded temp database), and errors-not-panics.
+
+## Capabilities
+
+A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.

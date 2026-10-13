@@ -22,6 +22,7 @@
 //! Singer-class rather than faucet-class.
 
 pub mod config;
+mod descriptor;
 pub mod process;
 pub mod schema;
 pub mod sink;
@@ -29,5 +30,6 @@ pub mod sink;
 pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{FlushOn, InheritEnv, SingerSinkConfig};
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_singer::{Redactor, SingerMessage, parse_line, secret_like_values};
 pub use sink::SingerSink;

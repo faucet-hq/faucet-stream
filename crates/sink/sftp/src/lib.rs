@@ -12,6 +12,9 @@
 //! host-key verification come from
 //! [`faucet-common-sftp`](https://docs.rs/faucet-common-sftp).
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 mod object;
 pub mod sink;

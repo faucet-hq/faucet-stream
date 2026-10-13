@@ -156,3 +156,6 @@ parquet:
   columns: [id, amount]
 ```
 
+## Capabilities
+
+Columnar (with `arrow`) for `format: parquet`, and for `avro` / `orc` with their format features. Not shardable, discoverable or exactly-once. `faucet list --json` prints the declaration.

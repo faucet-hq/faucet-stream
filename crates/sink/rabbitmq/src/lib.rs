@@ -34,3 +34,7 @@ pub use faucet_common_rabbitmq::{
     RabbitMqAuth, RabbitMqConnectionConfig, RabbitMqExchangeKind, RabbitMqTls, RabbitMqValueFormat,
 };
 pub use faucet_core::{FaucetError, Sink};
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("rabbitmq", faucet_core::capabilities::append_only_sink);

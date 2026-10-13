@@ -100,3 +100,7 @@ cargo test -p faucet-source-pubsub
 ```
 
 License: MIT OR Apache-2.0.
+
+## Capabilities
+
+Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.

@@ -18,3 +18,7 @@ pub use faucet_core::{FaucetError, Source};
 
 pub use config::DuckdbSourceConfig;
 pub use stream::DuckdbSource;
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("duckdb", faucet_core::capabilities::plain_source);

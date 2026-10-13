@@ -319,3 +319,40 @@ async fn conformance_errors_not_panics() {
 
     assert_errors_not_panics(&source).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    const UNREACHABLE: &str = "http://127.0.0.1:1";
+    let sa_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        sa_file.path(),
+        serde_json::to_string_pretty(&dummy_service_account_json(UNREACHABLE)).unwrap(),
+    )
+    .unwrap();
+    let base = json!({
+        "project_id": PROJECT_ID,
+        "auth": {"type": "application_default"},
+        "query": "SELECT 1",
+    });
+    let mut read_api = base.clone();
+    read_api["read_api"] = json!(true);
+    read_api["read_table"] = json!("d.t");
+    for v in [base, read_api] {
+        let cfg: BigQuerySourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let client = ClientBuilder::new()
+            .with_auth_base_url(format!("{UNREACHABLE}{AUTH_SCOPE_BASE}"))
+            .with_v2_base_url(UNREACHABLE.to_string())
+            .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+            .await
+            .expect("offline client");
+        let built = BigQuerySource::from_parts(cfg, client);
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_bigquery::DESCRIPTOR,
+            "bigquery",
+            &v,
+            &built,
+        );
+    }
+}

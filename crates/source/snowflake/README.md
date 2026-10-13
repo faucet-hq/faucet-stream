@@ -316,6 +316,10 @@ reordered by a throughput knob — and a failure is still attributed to the
 partition that caused it. The look-ahead holds up to this many partitions'
 decoded rows, so raise it for throughput and lower it for memory.
 
+## Capabilities
+
+Declares `discover`. No exactly-once replay, sharding or columnar path. `faucet list --json` prints these declared capabilities.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

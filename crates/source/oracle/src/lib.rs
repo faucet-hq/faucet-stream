@@ -25,9 +25,11 @@
 //! ```
 
 mod config;
+mod descriptor;
 mod query;
 mod stream;
 
 pub use config::{OracleReplication, OracleSourceConfig, ShardConfig};
+pub use descriptor::DESCRIPTOR;
 pub use faucet_common_oracle::{OracleConnectionConfig, OracleTls};
 pub use stream::OracleSource;

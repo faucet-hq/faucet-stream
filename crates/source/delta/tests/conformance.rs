@@ -142,3 +142,21 @@ async fn conformance_preflight_check_wellformed() {
         .expect("source");
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ──────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "descriptor");
+    seed(&uri, 1).await;
+    let v = serde_json::json!({ "table_uri": uri });
+    let cfg: DeltaSourceConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = DeltaSource::new(cfg).await.expect("source");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_delta::DESCRIPTOR,
+        "delta",
+        &v,
+        &built,
+    );
+}

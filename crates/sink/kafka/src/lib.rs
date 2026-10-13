@@ -22,3 +22,6 @@ pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{Acks, KafkaSinkConfig, KafkaSinkTopic};
 pub use sink::KafkaSink;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

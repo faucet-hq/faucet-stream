@@ -169,6 +169,10 @@ Pipeline::new(source, &sink).run().await?;
 to a private temp file. It does not run the target — Singer targets have no
 side-effect-free probe mode.
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013): write modes `append`, `upsert` and `overwrite`. `upsert` hands `key` to the external target as `key_properties`, which faucet cannot vouch for, so the sink does **not** claim the keyed-upsert guarantee (`delivery: exactly_once` cannot rely on it) and never reports key deduplication. `faucet list --json` prints the declaration.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

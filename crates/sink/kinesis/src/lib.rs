@@ -24,3 +24,7 @@ pub use sink::KinesisSink;
 
 // Shared connection types, re-exported so users need only this crate.
 pub use faucet_common_kinesis::{KinesisCredentials, build_client};
+
+/// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
+pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
+    faucet_core::ConnectorDescriptor::new("kinesis", faucet_core::capabilities::append_only_sink);

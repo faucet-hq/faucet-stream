@@ -62,3 +62,7 @@ pipeline:
 ```
 
 License: MIT OR Apache-2.0.
+
+## Capabilities
+
+Declares columnar (Arrow) output when built with the `arrow` feature. No discovery, sharding or exactly-once replay. `faucet list --json` prints these declared capabilities.

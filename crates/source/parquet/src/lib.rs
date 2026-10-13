@@ -9,6 +9,9 @@
 //!
 //! See the crate-level README for configuration examples.
 
+mod descriptor;
+pub use descriptor::DESCRIPTOR;
+
 pub mod config;
 pub mod convert;
 pub mod stream;

@@ -8,10 +8,12 @@
 //! column or dynamic column mapping.
 
 pub mod config;
+mod descriptor;
 mod rollback;
 pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{SqliteColumnMapping, SqliteSinkConfig};
+pub use descriptor::DESCRIPTOR;
 pub use sink::SqliteSink;

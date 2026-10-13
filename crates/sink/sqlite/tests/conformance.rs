@@ -138,3 +138,27 @@ async fn conformance_capabilities_truthful() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_sink() {
+    let dir = TempDir::new().expect("tempdir");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("d.db").display());
+    for v in [
+        serde_json::json!({"database_url": url, "table_name": "t"}),
+        serde_json::json!({"database_url": url, "table_name": "t", "column_mapping": "auto_map"}),
+        serde_json::json!({
+            "database_url": url, "table_name": "t", "column_mapping": "auto_map",
+            "write_mode": "upsert", "key": ["id"]
+        }),
+        serde_json::json!({"database_url": url, "table_name": "t", "write_mode": "overwrite"}),
+    ] {
+        let cfg: SqliteSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SqliteSink::new(cfg).await.expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_sqlite::DESCRIPTOR,
+            "sqlite",
+            &v,
+            &built,
+        );
+    }
+}

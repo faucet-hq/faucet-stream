@@ -31,3 +31,6 @@ pub use config::{
     STATEMENT_TEXT_LIMIT,
 };
 pub use sink::DatabricksSink;
+
+mod descriptor;
+pub use descriptor::DESCRIPTOR;

@@ -83,6 +83,10 @@ config:
   credentials: { type: access_key, config: { access_key_id: test, secret_access_key: test } }
 ```
 
+## Capabilities
+
+Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
+
 ## License
 
 MIT OR Apache-2.0

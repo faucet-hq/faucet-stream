@@ -193,3 +193,26 @@ async fn large_records_and_fifo_order() {
     }
     assert_eq!(seen, (0..25).collect::<Vec<i64>>());
 }
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"queue_url": "http://127.0.0.1:1/1/q", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_sqs::SqsSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_sqs::SqsSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_sqs::DESCRIPTOR,
+            "sqs",
+            &v,
+            &built,
+        );
+    }
+}

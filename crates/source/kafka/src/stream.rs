@@ -960,6 +960,13 @@ impl Source for KafkaSource {
         true
     }
 
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .reports_lag(true)
+            .build()
+    }
+
     fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
         crate::state::position_le(a, b)
     }

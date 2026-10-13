@@ -62,3 +62,21 @@ async fn conformance_preflight_check_wellformed() {
     let source = WebhookSource::new(WebhookSourceConfig::new().listen_addr("127.0.0.1:0"));
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 }
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    for v in [
+        serde_json::json!({}),
+        serde_json::json!({"listen_addr": "127.0.0.1:0"}),
+    ] {
+        let cfg: faucet_source_webhook::WebhookSourceConfig =
+            serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_webhook::WebhookSource::new(cfg);
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_webhook::DESCRIPTOR,
+            "webhook",
+            &v,
+            &built,
+        );
+    }
+}

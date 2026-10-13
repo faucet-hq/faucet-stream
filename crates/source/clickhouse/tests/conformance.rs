@@ -90,3 +90,20 @@ async fn conformance_bounded_memory() {
     .expect("source");
     assert_bounded_memory(&source, 50, 250).await;
 }
+
+#[test]
+fn descriptor_matches_the_built_source() {
+    for v in [
+        serde_json::json!({"url": "http://localhost:8123", "query": "SELECT 1"}),
+        serde_json::json!({"host": "localhost", "query": "SELECT 1", "batch_size": 0}),
+    ] {
+        let cfg: ClickHouseSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = ClickHouseSource::new(cfg).expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_clickhouse::DESCRIPTOR,
+            "clickhouse",
+            &v,
+            &built,
+        );
+    }
+}
