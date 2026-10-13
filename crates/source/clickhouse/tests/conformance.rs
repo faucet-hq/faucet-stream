@@ -108,3 +108,17 @@ fn descriptor_matches_the_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let uri = hung.http_url();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        ClickHouseSource::new(ClickHouseSourceConfig::new(&uri, "SELECT 1")).unwrap()
+    })
+    .await;
+}

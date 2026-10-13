@@ -170,6 +170,16 @@ pub fn build_client(_conn: &ClickHouseConnection) -> Result<reqwest::Client, Fau
         .build_reqwest()
 }
 
+/// [`build_client`] as a [`faucet_core::http::Client`], which runs requests
+/// through a [`CallContext`](faucet_core::io::CallContext) (#880) and drops
+/// credentials on a redirect to another origin.
+pub fn http_client(_conn: &ClickHouseConnection) -> Result<faucet_core::http::Client, FaucetError> {
+    faucet_core::http::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .build()
+}
+
 /// Build the ordered `(key, value)` query parameters for a ClickHouse HTTP
 /// request: the `database` parameter followed by any extra `settings`
 /// (e.g. `("default_format", "JSONEachRow")`, `("async_insert", "1")`).

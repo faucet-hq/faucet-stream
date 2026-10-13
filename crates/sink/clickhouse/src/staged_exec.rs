@@ -23,12 +23,12 @@ impl ClickHouseSink {
     /// and a URL lands in proxy and access logs.
     pub(crate) async fn send_query(&self, statement: &str) -> Result<(), FaucetError> {
         let req = crate::sink::staged_request(
-            &self.client,
+            self.client.inner(),
             &self.base_url,
             &self.config.connection,
             statement,
         );
-        let resp = req.send().await?;
+        let resp = self.client.call(&self.calls.get(), "insert", req).await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
     }
