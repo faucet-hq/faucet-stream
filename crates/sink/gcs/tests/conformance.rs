@@ -205,4 +205,18 @@ async fn declared_capabilities() {
         visible_records(host_ref, bucket, "ovw/").await
     })
     .await;
+
+    let recorded = GcsSink::new(
+        GcsSinkConfig::new(bucket)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host)
+            .prefix("rt/"),
+    )
+    .await
+    .expect("sink");
+    faucet_conformance::calls::assert_sink_records_roundtrips(
+        &recorded,
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
 }
