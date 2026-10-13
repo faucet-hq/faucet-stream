@@ -93,20 +93,23 @@ async fn assert_forwards(decorated: &dyn Sink, decorator: &str) {
 
 #[tokio::test]
 async fn metadata_sink_forwards() {
-    use faucet_core::{CompiledMetadata, MetadataColumnsSpec, MetadataContext, MetadataSink};
+    use faucet_core::{CompiledMetadata, Governance, MetadataColumnsSpec, MetadataContext};
 
     let spec = MetadataColumnsSpec::default();
     let meta = CompiledMetadata::compile(&spec)
         .expect("compile")
         .expect("metadata columns enabled by default when the block is present");
-    let sink = MetadataSink::new(
-        Box::new(FileSink::new()),
-        meta,
-        MetadataContext {
-            run_id: "run-1".into(),
-            source: "csv".into(),
-        },
-    );
+    // Built the way every entry point builds it (#875).
+    let sink = Governance::new()
+        .with_metadata(
+            meta,
+            MetadataContext {
+                run_id: "run-1".into(),
+                source: "csv".into(),
+            },
+        )
+        .sink_builder()
+        .build(Box::new(FileSink::new()));
     assert_forwards(&sink, "MetadataSink").await;
 }
 

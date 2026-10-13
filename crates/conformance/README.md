@@ -83,6 +83,15 @@ async fn streams_with_bounded_memory() {
 Sinks use the value form of check 1:
 `conf::assert_config_schema_valid_value(&sink.config_schema(), sink.connector_name())`.
 
+## Reliability suites
+
+`tests/reliability_*.rs` run the real `Pipeline::run` against scripted doubles
+to pin the engine's guarantees — bookmark ordering, exactly-once, lifecycle,
+cleanup safety, the DLQ boundary, panic isolation, state migration and
+(`reliability_governance`) the governed DLQ, row accounting and per-row policy
+quarantine on every write path (RFC 0013). See the
+[reliability testing guide](../../docs/book/src/operations/reliability-testing.md).
+
 ## Forwarding harnesses (for wrappers)
 
 A wrapper (a source or sink that holds another one) must forward every

@@ -45,6 +45,11 @@ pub const RESERVED_IDS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ExpandedNode {
     pub id: String,
+    /// Governance passes this node's caller turned off on purpose, with the
+    /// reason (#875) — a DLQ replay does not re-mask, a repair does not
+    /// profile. Applied by [`crate::governance::governance_for`]; empty for
+    /// every row a config expands to.
+    pub opt_outs: Vec<faucet_core::OptOut>,
     pub row_index: usize,
     /// Relative dispatch cost for `execution.schedule: lpt` (#644); `None`
     /// means unranked, which sorts after every weighted row.
@@ -772,6 +777,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 &format!("row '{row_id}'"),
             )?;
             out.push(ExpandedNode {
+                opt_outs: Vec::new(),
                 id: ids[i].clone(),
                 row_index: i,
                 // A discovery row enumerates a value set rather than moving
@@ -1237,6 +1243,23 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         };
         let delivery_guarantee = faucet_core::derive_delivery_guarantee(&guarantee_inputs);
 
+        // A policy quarantine sends single rows to the DLQ; the atomic
+        // watermark commits whole pages and forbids a DLQ, so the combination
+        // is refused by name before the generic gates below (#873). Keyed
+        // upsert keeps the row path, where per-row quarantine works.
+        #[cfg(feature = "policy")]
+        if delivery == faucet_core::DeliveryMode::ExactlyOnce
+            && !keyed_upsert_configured
+            && cfg.policy.as_ref().is_some_and(crate::policy::quarantines)
+        {
+            return Err(CliError::Config(format!(
+                "row '{}': {}; use `on_runtime: fail`, or `write_mode: upsert` + `key` for \
+                 keyed-upsert effectively-once",
+                ids[i],
+                faucet_core::compat::EO_WITH_POLICY_QUARANTINE
+            )));
+        }
+
         // Exactly-once delivery gate: `delivery: exactly_once` means "require
         // ≥ effectively-once". Enforced at config-load time so `faucet
         // validate` catches an unsupported topology before any run starts,
@@ -1544,6 +1567,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
 
         let base = ExpandedNode {
+            opt_outs: Vec::new(),
             id: ids[i].clone(),
             row_index: i,
             weight: row.weight,

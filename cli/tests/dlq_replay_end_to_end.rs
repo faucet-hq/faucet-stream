@@ -51,6 +51,8 @@ async fn inputs(pipeline: &str, dry_run: bool) -> ReplayInputs<'static> {
         execution: None,
         auth: build_auth_catalog(None).unwrap(),
         clock: chrono::Utc::now().fixed_offset(),
+        budget: None,
+        cancel: None,
     }
 }
 

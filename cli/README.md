@@ -1147,6 +1147,14 @@ Sibling of `source`, `sink`, `transforms`, `state` under `pipeline:`.
 Matrix rows can override the inherited `dlq:` wholesale, or disable
 inherited DLQ for that row with `dlq: null`.
 
+The DLQ is a governed destination (#870): rows quarantined by any pass are
+checked against `policy:` with the DLQ sink's own `attributes`, masked by
+masking rules whose `applies_to` names `dlq`, counted against `budget:`,
+metered into the usage record and retried under `resilience:` when the DLQ
+sink's write is replay-safe. `faucet dlq replay` runs under the config's
+`budget:` and `resilience:`; `faucet run` prints each row's account of where
+every offered row went (#879).
+
 Example:
 
 ```yaml

@@ -373,6 +373,23 @@ pub async fn admit(
     tenant: &str,
     req: &mut crate::serve::runner::SubmitRequest,
 ) -> Result<Admission, ServeError> {
+    let (admission, budget) = admit_inline(state, tenant).await?;
+    if let Some(b) = budget {
+        req.budget = Some(match req.budget.take() {
+            Some(own) => own.merge(&b),
+            None => b,
+        });
+    }
+    Ok(admission)
+}
+
+/// [`admit`] for work that is not a submitted run (a DLQ replay, #871):
+/// the same existence, suspension and concurrency checks, returning the
+/// tenant's per-run ceilings for the caller to apply.
+pub async fn admit_inline(
+    state: &ServerState,
+    tenant: &str,
+) -> Result<(Admission, Option<faucet_core::BudgetSpec>), ServeError> {
     let rec = get_tenant(state, tenant).await?;
     if rec.suspended {
         metrics::record_limit_rejection(tenant, "suspended");
@@ -397,13 +414,7 @@ pub async fn admit(
             )));
         }
     }
-    if let Some(b) = rec.limits.budget() {
-        req.budget = Some(match req.budget.take() {
-            Some(own) => own.merge(&b),
-            None => b,
-        });
-    }
-    Ok(Admission { _guard: guard })
+    Ok((Admission { _guard: guard }, rec.limits.budget()))
 }
 
 /// Whether `tenant` is past its `max_concurrent_runs` now that a new run is

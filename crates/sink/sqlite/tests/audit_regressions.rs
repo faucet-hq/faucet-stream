@@ -263,23 +263,24 @@ async fn an_auto_created_column_keeps_integers_above_i64_exact() {
 
 #[tokio::test]
 async fn enabling_metadata_columns_on_an_existing_table_adds_them() {
-    use faucet_core::metadata::{
-        CompiledMetadata, MetadataColumnsSpec, MetadataContext, MetadataSink,
-    };
+    use faucet_core::Governance;
+    use faucet_core::metadata::{CompiledMetadata, MetadataColumnsSpec, MetadataContext};
     let (_dir, url) = fresh_db(&["CREATE TABLE existing (id INTEGER)"]).await;
     let inner = SqliteSink::new(config(&url, "existing", WriteMode::Append, &[]))
         .await
         .unwrap();
     let spec: MetadataColumnsSpec =
         serde_json::from_value(json!({"enabled": true, "columns": ["run_id"]})).unwrap();
-    let sink = MetadataSink::new(
-        Box::new(inner),
-        CompiledMetadata::compile(&spec).unwrap().unwrap(),
-        MetadataContext {
-            run_id: "run-7".into(),
-            source: "test".into(),
-        },
-    );
+    let sink = Governance::new()
+        .with_metadata(
+            CompiledMetadata::compile(&spec).unwrap().unwrap(),
+            MetadataContext {
+                run_id: "run-7".into(),
+                source: "test".into(),
+            },
+        )
+        .sink_builder()
+        .build(Box::new(inner));
     sink.write_batch(&[json!({"id": 1})]).await.unwrap();
     let rows = query(&url, "SELECT id, _faucet_run_id FROM existing").await;
     assert_eq!(rows[0].get::<String, _>(1), "run-7");

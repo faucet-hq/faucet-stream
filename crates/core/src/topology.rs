@@ -240,6 +240,10 @@ pub struct TopologyGovernance {
     /// idempotent sinks, durable state, no DLQ) — `run_stream` re-checks the sink
     /// side and downgrades with a warning rather than pretending.
     pub delivery: crate::idempotency::DeliveryMode,
+    /// Each sink node's DLQ as a governed destination (#870), built by the
+    /// caller with [`Governance::dlq_config`](crate::governance::Governance::dlq_config).
+    /// A sink node with no entry writes to [`TopologyOptions::dlq`].
+    pub dlq_by_sink: HashMap<String, DlqConfig>,
 }
 
 impl TopologyGovernance {
@@ -1001,7 +1005,11 @@ impl Topology {
                             pipeline_name: pipeline,
                             run_id: opts.run_id.clone(),
                             state_store: opts.state_store.clone(),
-                            dlq: opts.dlq.clone(),
+                            dlq: governance
+                                .dlq_by_sink
+                                .get(&id)
+                                .cloned()
+                                .or_else(|| opts.dlq.clone()),
                             cancel: cancel.clone(),
                             // Masking is destination-scoped, so each sink node
                             // takes the policy compiled for it (if any); the rest

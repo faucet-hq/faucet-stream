@@ -62,7 +62,7 @@ All fields are optional; an empty `config: {}` writes JSON Lines to stdout with 
 | `destination` | `stdout` \| `stderr` | `stdout` | Which standard stream to write to. `stderr` is useful when stdout is reserved for the pipeline's own structured output. |
 | `format` | `json_lines` \| `pretty_json` \| `tsv` \| `csv` | `json_lines` | How each record is serialized — see [Formats](#formats). |
 | `flush_per_record` | bool | `false` | Flush the underlying writer after every record instead of at batch boundaries. Lower latency for live preview, slightly lower throughput. |
-| `max_records` | int | *(unset → unlimited)* | Stop after this many records. Once reached, subsequent `write_batch` calls become no-ops. Powers `faucet preview --limit N`. |
+| `max_records` | int | *(unset → unlimited)* | Stop after this many records. Once reached, subsequent `write_batch` calls become no-ops; the records past the cap (or after the consumer closed the pipe) are reported as *skipped* to the pipeline's row accounting. Powers `faucet preview --limit N`. |
 | `batch_size` | int | `1000` | Records per upstream `StreamPage`. **No behavioural impact at this sink** — present only for config parity across the workspace. See [Streaming & batching](#streaming--batching). |
 
 ### Formats

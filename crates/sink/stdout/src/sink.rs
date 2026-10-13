@@ -201,6 +201,16 @@ impl faucet_core::Sink for StdoutSink {
         Ok(written_this_call)
     }
 
+    /// Records past `max_records`, or after the consumer closed the pipe, are
+    /// dropped by design and reported as skipped (#879).
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let n = self.write_batch(records).await?;
+        Ok(faucet_core::WriteReport::accepted(n).with_skipped(records.len().saturating_sub(n)))
+    }
+
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut state = self.state.lock().await;
         state

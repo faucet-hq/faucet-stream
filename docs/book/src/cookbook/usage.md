@@ -20,6 +20,7 @@ listed as *compute not reported* — never as zero.
 | `bytes_read` / `bytes_written` | An estimate of the serialized JSON size of the same records — the same estimate for every connector, so pipelines compare; **not** wire bytes. |
 | `source_roundtrips` / `sink_roundtrips` | Calls a connector made to its backend, by op (`page`, `get`, `list`, `put`, `insert`, …) — the same counts as the `faucet_*_roundtrips_total` metrics. |
 | `throttled` / `throttle_wait_secs` / `source_retries` | Rate-limit responses the source received, the seconds it actually slept on them, and its retries by class — reported by `rest`, `graphql` and `xml` ([source-side throttling](./resilience.md#source-side-throttling)). Omitted when zero. |
+| `dlq_records_written` / `dlq_bytes_written` | Envelopes written to the [dead-letter queue](./dlq.md#the-dlq-is-a-governed-destination) and their estimated bytes. Omitted when zero. |
 | `signals` | Backend-reported figures: BigQuery `bytes_processed` / `bytes_billed` / `bytes_streamed` / `bytes_loaded`; S3 and GCS request counts. Each names the connector it came from. |
 
 Accounting is always on; there is nothing to enable. Recording into a store
@@ -147,6 +148,15 @@ budget:
   aborts cleanly), and the run fails with `budget_exceeded`.
 - **`allowed_sinks`** is checked before anything runs: a row writing to a sink
   the list does not name refuses the whole run.
+- **The DLQ counts too.** Envelopes written to the
+  [dead-letter queue](./dlq.md#the-dlq-is-a-governed-destination) count against
+  the same records and bytes ceilings as the main sink, so a run that fails
+  every row into the DLQ is stopped like one that writes them.
+- **Follow-up work stays inside it.** A [DLQ replay](./dlq.md#replaying) runs
+  under the config's budget (and a tenant's per-run limits under
+  `faucet serve`); a [`verify` repair](./verify.md) started by a run's post-run
+  verify is bounded by what is left of that run's budget, and stops on its
+  cancellation.
 
 `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink
 X` merges with the config's block — the stricter of each ceiling and the

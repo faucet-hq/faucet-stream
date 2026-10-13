@@ -56,7 +56,7 @@ use faucet_core::serde_json::{Value, json};
 use faucet_core::shard::ShardSpec;
 use faucet_core::traits::{RowOutcome, Sink, Source};
 use faucet_core::write_mode::WriteMode;
-use faucet_core::{CancellationToken, FaucetError, Stream};
+use faucet_core::{CancellationToken, FaucetError, Stream, WriteReport};
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -105,6 +105,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
 /// Every [`Sink`] hook a wrapper must forward, by trait-method name.
 pub const SINK_HOOKS: &[&str] = &[
     "write_batch",
+    "write_batch_reported",
     "flush",
     "write_batch_partial",
     "batch_atomicity",
@@ -209,6 +210,10 @@ impl Sink for HookSink {
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.hit("write_batch");
         Ok(records.len())
+    }
+    async fn write_batch_reported(&self, records: &[Value]) -> Result<WriteReport, FaucetError> {
+        self.hit("write_batch_reported");
+        Ok(WriteReport::accepted(records.len()))
     }
     async fn flush(&self) -> Result<(), FaucetError> {
         self.hit("flush");
@@ -415,6 +420,7 @@ impl Sink for HookSink {
 pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, skip: &[&str]) {
     let page = [json!({"id": 1})];
     let _ = sink.write_batch(&page).await;
+    let _ = sink.write_batch_reported(&page).await;
     let _ = sink.flush().await;
     let _ = sink.write_batch_partial(&page).await;
     let _ = sink.batch_atomicity();

@@ -119,6 +119,8 @@ async fn replay_picks_up_the_configs_dlq_encryption_block() {
             execution: None,
             auth: build_auth_catalog(None).unwrap(),
             clock: chrono::Utc::now().fixed_offset(),
+            budget: None,
+            cancel: None,
         },
     )
     .await
@@ -178,6 +180,8 @@ async fn replay_picks_up_a_file_dlqs_encryption_block() {
             execution: None,
             auth: build_auth_catalog(None).unwrap(),
             clock: chrono::Utc::now().fixed_offset(),
+            budget: None,
+            cancel: None,
         },
     )
     .await
@@ -283,6 +287,8 @@ async fn replay_seals_the_refailed_rows_like_the_source_dlq() {
                 execution: None,
                 auth: build_auth_catalog(None).unwrap(),
                 clock: chrono::Utc::now().fixed_offset(),
+                budget: None,
+                cancel: None,
             },
         )
         .await

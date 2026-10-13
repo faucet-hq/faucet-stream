@@ -274,6 +274,24 @@ impl BudgetSink {
         )
     }
 
+    /// Wrap `inner` counting against an existing `state` — the main sink and
+    /// the DLQ of one run share it (#870). No duration timer is started; the
+    /// caller owns one ([`BudgetTimer::start_for`]).
+    pub fn wrap_shared(
+        inner: Box<dyn Sink>,
+        spec: BudgetSpec,
+        state: Arc<BudgetState>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            spec,
+            state,
+            cancel,
+            prepaid: AtomicU64::new(0),
+        }
+    }
+
     /// Check a page against the records / bytes ceilings before it is
     /// written; on a crossing, record the verdict and refuse the page.
     fn admit(&self, records: &[Value]) -> Result<u64, FaucetError> {
@@ -339,6 +357,16 @@ impl BudgetSink {
 pub struct BudgetTimer(Option<tokio::task::JoinHandle<()>>);
 
 impl BudgetTimer {
+    /// Start the duration ceiling's timer for `state`: when it fires it records
+    /// the verdict and cancels `cancel`. A `None` ceiling starts nothing.
+    pub fn start_for(
+        max_duration_secs: Option<u64>,
+        state: Arc<BudgetState>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self::start(max_duration_secs, state, cancel)
+    }
+
     #[allow(clippy::disallowed_methods)] // the duration budget's own timer
     fn start(
         max_duration_secs: Option<u64>,
@@ -374,8 +402,8 @@ impl Sink for BudgetSink {
     // A native byte load cannot be counted before it lands, so it stays off;
     // everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        admit_page, write_batch, write_batch_partial, write_batch_idempotent, write_batch_columnar,
-        native_load_capabilities, load_native);
+        admit_page, write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_columnar, native_load_capabilities, load_native);
 
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
         if let Some(v) = self.state.verdict() {
@@ -391,6 +419,15 @@ impl Sink for BudgetSink {
         let n = self.inner.write_batch(records).await?;
         self.account(n as u64, bytes);
         Ok(n)
+    }
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let bytes = self.admit(records)?;
+        let r = self.inner.write_batch_reported(records).await?;
+        self.account(r.accepted as u64, bytes);
+        Ok(r)
     }
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         let bytes = self.admit(records)?;

@@ -175,6 +175,32 @@ pub fn dlq_facts(dlq: &crate::config::DlqSpec) -> SinkFacts {
     }
 }
 
+/// The columns as the DLQ receives them: masked by the main destination's
+/// rules (already in `columns`) and by the rules that name only the DLQ.
+#[cfg(feature = "masking")]
+fn dlq_columns(
+    columns: &[ColumnFacts],
+    masking: Option<&faucet_core::MaskingSpec>,
+    main: &[&str],
+    dlq: &crate::config::DlqSpec,
+) -> Vec<ColumnFacts> {
+    let only = masking
+        .and_then(|m| crate::governance::dlq_only_masking(m, main, dlq))
+        .and_then(|spec| faucet_core::CompiledMasking::compile(&spec).ok());
+    columns
+        .iter()
+        .cloned()
+        .map(|mut c| {
+            if c.masked.is_none()
+                && let Some(m) = &only
+            {
+                c.masked = m.name_action_for(&c.name).map(str::to_string);
+            }
+            c
+        })
+        .collect()
+}
+
 /// The static verdict for one row.
 pub fn evaluate_node(
     policy: &CompiledPolicy,
@@ -193,22 +219,23 @@ pub fn evaluate_node(
         attributes: node.sink.attributes.clone(),
     };
     let mut violations = faucet_core::policy::evaluate(policy, &facts, &columns);
+    // The DLQ is a destination of its own (#870): any configured DLQ can
+    // receive a row (a quality / contract / drift / policy quarantine, or a
+    // per-row sink failure), so every labelled column is evaluated against its
+    // attributes, with the masking that reaches it.
     if let Some(dlq) = &node.dlq {
-        let quarantined: Vec<_> = violations
-            .iter()
-            .filter(|v| {
-                policy.rules().iter().any(|r| {
-                    r.name == v.rule
-                        && r.on_runtime == faucet_core::policy::RuntimeAction::Quarantine
-                })
-            })
-            .cloned()
-            .collect();
-        violations.extend(faucet_core::policy::dlq_violations(
+        let main = [node.sink_ref.as_str(), node.sink.kind.as_str()];
+        #[cfg(feature = "masking")]
+        let at_dlq = dlq_columns(&columns, node.masking.as_ref(), &main, dlq);
+        #[cfg(not(feature = "masking"))]
+        let at_dlq = {
+            let _ = main;
+            columns.clone()
+        };
+        violations.extend(faucet_core::policy::evaluate(
             policy,
             &dlq_facts(dlq),
-            &columns,
-            &quarantined,
+            &at_dlq,
         ));
     }
     RowPolicyReport {
@@ -662,7 +689,20 @@ pub fn evaluate_topology(spec: &PolicySpec, cfg: &PipelineConfig) -> CliResult<P
             kind: sink_kind.clone(),
             attributes: attributes.clone(),
         };
-        let violations = faucet_core::policy::evaluate(&compiled, &facts, &columns);
+        #[allow(unused_mut)]
+        let mut violations = faucet_core::policy::evaluate(&compiled, &facts, &columns);
+        // Each sink node's DLQ is a destination of its own (#870).
+        if let Some(dlq) = &cfg.pipeline.dlq {
+            #[cfg(feature = "masking")]
+            let at_dlq = dlq_columns(&columns, cfg.pipeline.masking.as_ref(), &sink_ids, dlq);
+            #[cfg(not(feature = "masking"))]
+            let at_dlq = columns.clone();
+            violations.extend(faucet_core::policy::evaluate(
+                &compiled,
+                &dlq_facts(dlq),
+                &at_dlq,
+            ));
+        }
         total += violations.len();
         rows.push(RowPolicyReport {
             row: id.clone(),
@@ -866,6 +906,82 @@ pipeline:
             CliError::PolicyViolations { violations: 2 }
         ));
         assert!(quarantines(&policy()));
+    }
+
+    /// #873: `faucet validate` refuses a policy quarantine with the
+    /// atomic-watermark exactly-once, naming why.
+    #[test]
+    fn a_quarantine_with_exactly_once_is_refused_by_name() {
+        let mut c =
+            mk_cfg("  state: { type: file, config: { path: st } }\ndelivery: exactly_once\n");
+        c.policy = Some(
+            serde_json::from_value(json!({
+                "classifications": [{"label": "pii", "fields": ["email"]}],
+                "rules": [{"name": "r", "when": {"label": "pii"},
+                           "require": {"residency": ["eu"]}, "on_runtime": "quarantine"}]
+            }))
+            .unwrap(),
+        );
+        let err = expand(&c).unwrap_err().to_string();
+        assert!(
+            err.contains("on_runtime: quarantine is not compatible with delivery: exactly_once"),
+            "{err}"
+        );
+    }
+
+    /// #870: a DLQ is evaluated as a destination of its own whenever one is
+    /// configured — here a quality quarantine (no policy quarantine at all)
+    /// could send a labelled row there.
+    #[test]
+    fn a_dlq_is_evaluated_whatever_quarantines_into_it() {
+        let only_eu: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "fields": ["email"]}],
+            "rules": [{"name": "pii-eu", "when": {"label": "pii"}, "require": {"residency": ["eu"]}}]
+        }))
+        .unwrap();
+        let cfg = |dlq_residency: &str| {
+            mk_cfg(&format!(
+                "  contract:\n    version: \"1\"\n    fields:\n      - {{ name: email, type: string }}\n  quality:\n    record:\n      - {{ type: not_null, field: email, on_failure: quarantine }}\n  dlq:\n    sink: {{ type: jsonl, config: {{ path: dlq.jsonl }}, attributes: {{ residency: {dlq_residency} }} }}\n"
+            ))
+        };
+        let report = |c: &PipelineConfig| {
+            evaluate_nodes(&only_eu, &expand(c).unwrap(), &HashMap::new()).unwrap()
+        };
+        let r = report(&cfg("us"));
+        let at_dlq: Vec<_> = r.rows[0]
+            .violations
+            .iter()
+            .filter(|v| v.sink == "dlq")
+            .collect();
+        assert_eq!(at_dlq.len(), 1, "{r:?}");
+        assert_eq!(at_dlq[0].rule, "pii-eu");
+        let r = report(&cfg("eu"));
+        assert!(
+            r.rows[0].violations.iter().all(|v| v.sink != "dlq"),
+            "{r:?}"
+        );
+    }
+
+    /// #870: a masking rule that names the DLQ satisfies a `mask:` rule there.
+    #[test]
+    fn a_masking_rule_naming_the_dlq_satisfies_the_policy_there() {
+        let masked: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "fields": ["email"]}],
+            "rules": [{"name": "pii-eu", "when": {"label": "pii"}, "require": {"residency": ["eu"]}, "mask": ["hash"]}]
+        }))
+        .unwrap();
+        let c = mk_cfg(
+            "  contract:\n    version: \"1\"\n    fields:\n      - { name: email, type: string }\n  masking:\n    rules:\n      - { match: { fields: [email] }, action: { type: hash }, applies_to: [dlq] }\n  dlq:\n    sink: { type: jsonl, config: { path: dlq.jsonl }, attributes: { residency: us } }\n",
+        );
+        let r = evaluate_nodes(&masked, &expand(&c).unwrap(), &HashMap::new()).unwrap();
+        assert!(
+            r.rows[0].violations.iter().all(|v| v.sink != "dlq"),
+            "{r:?}"
+        );
+        assert!(
+            r.rows[0].violations.iter().any(|v| v.sink != "dlq"),
+            "the main sink is not masked by a DLQ-only rule: {r:?}"
+        );
     }
 
     #[test]

@@ -98,6 +98,17 @@ pub enum FaucetError {
         actual: u64,
     },
 
+    /// A sink accounted for fewer rows of a page than it was offered (#879):
+    /// its write returned `accepted` for a page of `offered` rows, without
+    /// per-row outcomes or a coalescing report
+    /// ([`Sink::write_batch_reported`](crate::Sink::write_batch_reported))
+    /// saying where the rest went. The page is not checkpointed, so a resumed
+    /// run reads it again.
+    #[error(
+        "Rows unaccounted: the sink accepted {accepted} of {offered} offered rows and reported          no per-row failure or coalescing for the rest"
+    )]
+    RowsUnaccounted { offered: u64, accepted: u64 },
+
     /// A run's learned column profile drifted from its baseline under a
     /// `profiling.on_drift: fail` policy (#708). Raised after the run's data
     /// is written: the failure marks the run, it does not undo it.

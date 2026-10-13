@@ -357,6 +357,41 @@ writes the bare value instead — for a mixed-version cluster.
 
 `Pipeline::with_dlq(DlqConfig)` attaches an optional DLQ sink. The streaming loop calls `Sink::write_batch_partial` per page; rows that come back `Err` are wrapped in a fixed-shape envelope (`build_envelope`) and routed to the DLQ before the page bookmark advances. `OnBatchError` controls the policy when a sink can't report per-row results: `propagate` aborts the run; `dlq_all` routes the whole failed page. Sinks override `write_batch_partial` to expose per-row results (BigQuery `insertAll`, Elasticsearch `_bulk`).
 
+## Governance (RFC 0013)
+
+`faucet_core::Governance` carries every guarantee a run is held to — masking,
+quality, contract, schema drift, the data-flow policy, budget, profiling,
+metadata columns, metering, resilience, cancellation and the DLQ — and
+assembles them in one canonical order. Wrap the destination with
+`sink_builder()` and attach the value with `Pipeline::with_governance`:
+
+```rust,ignore
+let governance = Governance::new()
+    .with_masking(masking)
+    .with_budget(BudgetSpec { max_records: Some(1_000_000), ..Default::default() })
+    .with_dlq(DlqGovernance::new(dlq).with_facts(dlq_facts))
+    .with_cancel(cancel)
+    .without(Pass::Profiling, "a backfill would skew the baseline");
+let sink = governance.sink_builder().build(Box::new(destination));
+Pipeline::new(&source, &sink).with_governance(governance).run().await?;
+```
+
+Around the sink the order is `policy → profiling → [outer tap] → metadata →
+[inner tap] → budget → destination` (`SINK_LAYERS`); per page it is masking →
+quality → contract → drift. The DLQ is governed as a destination of its own:
+masking rules naming it, the policy with its own attributes, the shared budget
+and metering. A pass that does not apply is turned off with
+`without(pass, reason)`, which is recorded (`opt_outs()`) and logged.
+
+## Row accounting
+
+Every row offered to a sink is accounted for: `offered = accepted + coalesced +
+skipped + failed + quarantined + dropped`. The pipeline writes through
+`Sink::write_batch_reported`, whose default wraps `write_batch`'s count
+(crediting a keyed sink's merged rows as coalesced); a shortfall fails the page
+with `FaucetError::RowsUnaccounted` before its bookmark advances.
+`Pipeline::with_row_accounts(Arc<RowAccounts>)` exposes the counts.
+
 ## Effectively-once delivery
 
 `DeliveryMode` (`AtLeastOnce` default, or `ExactlyOnce`) controls run semantics. Under `ExactlyOnce` the pipeline assigns a monotonic fixed-width commit token (`format_token(seq)`) to each bookmark-carrying page and calls `write_batch_idempotent(records, scope, token)`; the sink commits records **and** token atomically. On resume, `last_committed_token(scope)` is consulted to skip already-committed pages.
@@ -635,6 +670,8 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `stage` | `TransformStage`, `FilterSpec`, `ExplodeSpec`, `CdcUnwrapSpec`, `compile_stage` |
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
+| `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870) |
+| `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
 | `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
 | `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |

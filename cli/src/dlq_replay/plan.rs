@@ -198,11 +198,15 @@ pub fn build_replay_node(
     // The quality and contract passes are deliberately kept: they are pure
     // predicates over the record, so re-checking is idempotent — and a replay is
     // exactly when you want them re-enforced.
+    // Masking is opted out by name rather than cleared, so the policy
+    // backstop still knows which columns are masked (#875).
     node.transforms.clear();
-    #[cfg(feature = "masking")]
-    {
-        node.masking = None;
-    }
+    node.opt_outs.push(faucet_core::OptOut {
+        pass: faucet_core::Pass::Masking,
+        reason: "DLQ payloads were masked before they were dead-lettered, and masking is not \
+                 idempotent"
+            .into(),
+    });
 
     // A replay reads the whole DLQ location once — no bookmarking, and never
     // exactly-once (the reader is not a deterministic-replay source).
@@ -717,17 +721,40 @@ pipeline:
 
     /// …and the payload is already masked, so the masking pass is dropped too:
     /// masking's `hash`/`tokenize` would produce H(H(x)), breaking the
-    /// joinability masking exists to guarantee.
+    /// joinability masking exists to guarantee. It is opted out by name (#875),
+    /// so the policy backstop still knows which columns are masked.
     #[cfg(feature = "masking")]
-    #[test]
-    fn replay_drops_masking() {
+    #[tokio::test]
+    async fn replay_drops_masking() {
         let cfg = cfg(
             "  masking:\n    rules:\n      - name: h\n        match: { fields: [email] }\n        action: { type: hash }\n",
         );
         assert!(crate::expand::expand(&cfg).unwrap()[0].masking.is_some());
+        let node = replay_node(&cfg);
         assert!(
-            replay_node(&cfg).masking.is_none(),
+            node.opt_outs
+                .iter()
+                .any(|o| o.pass == faucet_core::Pass::Masking),
             "the payload in the envelope is already masked"
+        );
+        let opts = crate::executor::ExecuteOptions::for_tests("replay");
+        let built = crate::governance::governance_for(crate::governance::GovernanceRequest {
+            node: &node,
+            opts: &opts,
+            pipeline: "p",
+            row: &node.id,
+            run_id: "r",
+            cancel: &tokio_util::sync::CancellationToken::new(),
+            meter: None,
+        })
+        .await
+        .unwrap();
+        assert!(!built.governance.is_active(faucet_core::Pass::Masking));
+        assert!(
+            built
+                .governance
+                .opted_out(faucet_core::Pass::Masking)
+                .is_some_and(|r| r.contains("already masked") || r.contains("masked before"))
         );
     }
 

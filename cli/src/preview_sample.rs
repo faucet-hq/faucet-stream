@@ -36,13 +36,15 @@ pub fn destructive_read_refusal(kind: &str, command: &str) -> String {
 /// Apply every rule of a config's `masking:` policy to previewed records — a
 /// preview has no destination, so `applies_to` scoping does not narrow it,
 /// as in `faucet test`.
+/// The masking comes from [`crate::governance::preview_governance`], the
+/// preview entry point's governance (#875).
 #[cfg(feature = "masking")]
 pub fn mask(records: Vec<Value>, spec: Option<&faucet_core::MaskingSpec>) -> CliResult<Vec<Value>> {
-    let Some(spec) = spec else {
-        return Ok(records);
-    };
-    let compiled = faucet_core::CompiledMasking::compile(spec)?;
-    Ok(faucet_core::apply_masking(records, &compiled).records)
+    let governance = crate::governance::preview_governance(spec)?;
+    Ok(match governance.masking() {
+        Some(m) => faucet_core::apply_masking(records, m).records,
+        None => records,
+    })
 }
 
 /// Cap a source config's `batch_size` at the preview `limit` (an unset or `0`

@@ -80,6 +80,16 @@ fn destinations(cfg: &PipelineConfig) -> CliResult<Vec<Destination>> {
         }
     }
     out.sort();
+    // The DLQ is a destination too (#870): a rule naming `dlq` (or the DLQ's
+    // kind) masks the envelope payloads; unscoped rules ran on the page.
+    if let Some(dlq) = &cfg.pipeline.dlq {
+        let ids = crate::governance::dlq_ids(dlq);
+        out.push(Destination {
+            label: "dlq (dead-letter queue)".into(),
+            kind: dlq.sink.kind.clone(),
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+        });
+    }
     Ok(out)
 }
 
@@ -326,6 +336,33 @@ matrix:
             .map(|d| d.label)
             .collect();
         assert_eq!(labels, ["archive (rows a)", "warehouse (rows w)"]);
+    }
+
+    #[test]
+    fn the_dlq_is_listed_as_a_destination() {
+        use crate::config::PipelineConfig;
+        use std::path::Path;
+        let spec: MaskingSpec = serde_json::from_value(json!({
+            "rules": [{ "name": "d", "match": { "fields": ["x"] }, "action": { "type": "redact" },
+                        "applies_to": ["dlq"] }]
+        }))
+        .unwrap();
+        let cfg = PipelineConfig::from_text(
+            r#"version: 1
+pipeline:
+  source: { type: csv, config: { path: ./in.csv } }
+  sink: { type: stdout, config: {} }
+  dlq:
+    sink: { type: jsonl, config: { path: ./dlq.jsonl } }
+"#,
+            Path::new("test.yaml"),
+        )
+        .unwrap();
+        let out = render_summary(&spec, &destinations(&cfg).unwrap());
+        assert!(
+            out.contains("- dlq (dead-letter queue) [jsonl]: d"),
+            "{out}"
+        );
     }
 
     /// The report scopes rules by the kind a row actually writes (after its

@@ -13,6 +13,7 @@
 //! - [`ReplicationMethod`] — incremental replication support
 //! - [`schema::infer_schema`] — JSON Schema inference from record samples
 
+pub mod accounting;
 pub mod adaptive;
 pub mod anomaly;
 pub mod auth;
@@ -42,6 +43,7 @@ pub mod error;
 pub mod file_format;
 pub mod forward;
 pub mod http;
+pub mod governance;
 // The conformance crate's forwarding harness, compiled into core's own unit
 // tests under the `faucet_core::` paths it is written against.
 #[cfg(test)]
@@ -100,6 +102,7 @@ pub mod zip_columns;
 #[cfg(feature = "compression")]
 pub mod compression;
 
+pub use accounting::{RowAccounts, RowAccountsSnapshot, WriteReport};
 pub use adaptive::{
     AdaptiveBatchConfig, AdjustDirection, AdjustReason, Adjustment, AimdController, Observation,
 };
@@ -147,6 +150,12 @@ pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
     AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, CsvUnknownField, ExcelOptions,
     FileFormat, FileInput, FormatOptions, OrcOptions, XmlOptions,
+};
+#[cfg(feature = "policy")]
+pub use governance::PolicyGovernance;
+pub use governance::{
+    DlqGovernance, Governance, GovernedSink, GovernedSinkBuilder, OptOut, Pass, SINK_LAYERS,
+    SinkLayer,
 };
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,

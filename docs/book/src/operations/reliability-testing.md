@@ -58,6 +58,7 @@ cargo test -p faucet-conformance --test reliability_fault_injection
 cargo test -p faucet-conformance --test compat_state_format
 cargo test -p faucet-conformance --test reliability_state_migration
 cargo test -p faucet-conformance --test reliability_panic_isolation
+cargo test -p faucet-conformance --test reliability_governance
 cargo test -p faucet-conformance --test forwarding
 
 # Each resumable source's frozen bookmark shapes (#736).
@@ -255,6 +256,32 @@ nothing), and `.best_effort()` declares the other case.
 — `Boundary::Write` is whole-batch, and deliberately stays an **outer** error
 even on the `write_batch_partial` path, because that is exactly what
 `on_batch_error` keys off.
+
+### Governance and row accounting (`reliability_governance`)
+
+The guarantees RFC 0013 moved into core, run through `Pipeline::with_governance`
+and a destination built by `Governance::sink_builder` — the way every CLI
+entry point builds them:
+
+- **The DLQ is a governed destination (#870).** A row the *quality* pass
+  quarantines — and one a sink rejects per row — is checked against the
+  policy with the DLQ's own attributes: a US DLQ never receives an EU-only
+  label (the run fails, the DLQ stays empty), an EU DLQ does. DLQ envelopes
+  appear in the usage snapshot and count against the run budget; a budget the
+  DLQ alone crosses stops the run with nothing written to it; a transient DLQ
+  write failure is retried under `resilience:` when the DLQ's write is
+  replay-safe, and is not retried when it is not.
+- **Row accounting (#879).** A sink that reports one row fewer than it was
+  offered, with no per-row outcome, fails the run with `RowsUnaccounted` on
+  both the plain and the per-row (DLQ) path; a keyed sink that merges rows,
+  and one that declines a row by design and reports it as skipped, balance;
+  quarantined and DLQ'd rows are counted.
+- **Policy quarantine is per row on every path (#873).** A columnar-capable
+  source and sink give the same written rows and the same quarantined set as
+  the row path, and the columnar write is never called.
+
+The canonical sink-layer order (#875) is asserted by a unit test in
+`crates/core/src/governance.rs`.
 
 ### Panic isolation (`reliability_panic_isolation`)
 

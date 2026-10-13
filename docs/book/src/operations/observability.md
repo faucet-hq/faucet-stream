@@ -52,6 +52,13 @@ cardinality and never a Prometheus label.
   — one increment per sink write, `outcome` ∈ `committed` \| `dlq_partial` \|
   `dlq_all` \| `failed`; their sum is the writes attempted. See
   [batch atomicity](../cookbook/dlq.md#batch-atomicity-and-dlq_all).
+- **Row accounting** (#879): `faucet_rows_unaccounted_total{pipeline,row,connector}`
+  — rows a sink was offered but neither wrote, merged by key, declined by
+  design nor reported failed per row. Any increase means a run failed with
+  `RowsUnaccounted` before its bookmark advanced; `faucet run` prints each
+  row's account (offered / accepted / coalesced / skipped / failed to DLQ /
+  quarantined / dropped / filtered by transforms) and `--output json` carries
+  it as `rows`.
 - **Upstream round trips** (#638): `faucet_source_roundtrips_total{op}` and
   `faucet_sink_roundtrips_total{op}` — how many calls a connector actually made
   to its backend, with companion `*_roundtrip_duration_seconds{op}` histograms.

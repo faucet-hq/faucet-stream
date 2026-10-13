@@ -106,6 +106,18 @@ impl Registry {
             });
     }
 
+    /// Whether a token is registered under `id`.
+    pub fn is_registered(&self, id: &str) -> bool {
+        self.tokens.contains_key(id)
+    }
+
+    /// Drop the token registered under `id` without touching the queue /
+    /// in-flight counters — for inline work (a DLQ replay, #871) that never
+    /// took a queue slot.
+    pub fn deregister(&self, id: &str) {
+        self.tokens.remove(id);
+    }
+
     /// Cancel a live run. Returns `true` if a live token existed.
     pub fn cancel(&self, run_id: &str) -> bool {
         if let Some(t) = self.tokens.get(run_id) {

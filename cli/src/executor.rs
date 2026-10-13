@@ -389,6 +389,9 @@ pub struct InvocationMetrics {
     pub batches: Option<faucet_core::BatchOutcomes>,
     /// The source's lag at the end of the run (#733), when it reports one.
     pub source_lag: Option<faucet_core::SourceLag>,
+    /// Where every row went (#879): offered, accepted, coalesced, failed to the
+    /// DLQ, quarantined, dropped. `None` when nothing was offered.
+    pub rows: Option<faucet_core::RowAccountsSnapshot>,
 }
 
 /// Counters one invocation's pipeline fills in and the caller reads afterwards
@@ -398,6 +401,8 @@ pub(crate) struct RunObservers {
     pub(crate) meter: Arc<faucet_core::UsageMeter>,
     pub(crate) batches: Arc<faucet_core::BatchOutcomeCounters>,
     pub(crate) lag: Arc<faucet_core::LagObserver>,
+    /// Per-run row accounting (#879).
+    pub(crate) rows: Arc<faucet_core::RowAccounts>,
 }
 
 impl RunObservers {
@@ -1772,6 +1777,7 @@ async fn run_unit(
         duration_ms,
         batches: observers.batch_outcomes(),
         source_lag: observers.lag.last(),
+        rows: Some(observers.rows.snapshot()).filter(|r| r.offered > 0 || r.unaccounted > 0),
         ..Default::default()
     };
     match result {
@@ -2326,73 +2332,31 @@ async fn build_pipeline<'a>(
     cleanup_scope: Option<Value>,
     suppress_overwrite: bool,
     observers: RunObservers,
+    governance: faucet_core::Governance,
+    row_accounts: Arc<faucet_core::RowAccounts>,
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
         .with_row(row_id.to_owned())
         .with_run_id(run_id.to_owned())
         .with_usage_meter(observers.meter)
+        .with_row_accounts(row_accounts)
         .with_batch_outcomes(observers.batches)
         .with_lag_observer(observers.lag)
         .with_legacy_state_writes(opts.legacy_state_writes);
     if let Some(store) = state {
         pipeline = pipeline.with_state_store(store);
     }
-    if let Some(ref dlq_spec) = node.dlq {
-        let dlq_cfg = if opts.dry_run {
-            preview_dlq_config(dlq_spec)
-        } else {
-            build_dlq_config(dlq_spec).await?
-        };
-        pipeline = pipeline
-            .with_dlq(dlq_cfg)
-            .allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
+    if let Some(dlq_spec) = &node.dlq {
+        pipeline = pipeline.allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
     }
-    // Cooperative cancellation: a cancelled token makes the streaming loop stop
-    // at the next page boundary and flush the sink (#146 H16). The pipeline takes
-    // a clone so the caller's lineage terminal-event classification and SLA pass
-    // can still read `cancel.is_cancelled()` (cheap — the token is an `Arc`).
-    pipeline = pipeline.with_cancel(cancel.clone());
-    // Pipeline-level quality checks (v1: no matrix-row override). `expand` already
-    // validated this spec, but compile again here to obtain the runtime
-    // `CompiledQuality`; map any error to a config-level failure.
-    #[cfg(feature = "quality")]
-    if let Some(ref quality_spec) = node.quality {
-        let compiled = Arc::new(
-            faucet_core::CompiledQuality::compile(quality_spec)
-                .map_err(|e| CliError::Config(format!("quality: {e}")))?,
-        );
-        pipeline = pipeline.with_quality(compiled);
-    }
-    // Pipeline-level data contract (v1: no matrix-row override). `expand` already
-    // validated the spec; compile again here to obtain the runtime
-    // `CompiledContract`.
-    #[cfg(feature = "contract")]
-    if let Some(ref contract_spec) = node.contract {
-        let compiled = Arc::new(
-            faucet_core::CompiledContract::compile(contract_spec)
-                .map_err(|e| CliError::Config(format!("contract: {e}")))?,
-        );
-        pipeline = pipeline.with_contract(compiled);
-    }
-    // Pipeline-level PII masking (v1: no matrix-row override). Compile scoped to
-    // this node's destination sink — by template name (`sink_ref`) and by
-    // connector kind — so `applies_to` per-destination rules resolve. When no
-    // rule applies to this sink the compiled policy is empty and the pass is
-    // skipped entirely.
-    #[cfg(feature = "masking")]
-    if let Some(ref masking_spec) = node.masking {
-        let sink_ids = [node.sink_ref.as_str(), node.sink.kind.as_str()];
-        let compiled = faucet_core::CompiledMasking::compile_for_sink(masking_spec, &sink_ids)
-            .map_err(|e| CliError::Config(format!("masking: {e}")))?;
-        if !compiled.is_empty() {
-            pipeline = pipeline.with_masking(Arc::new(compiled));
-        }
-    }
-    // Schema-drift policy (pipeline-level in v1; same for every invocation).
-    if let Some(ref sd) = node.schema {
-        pipeline = pipeline.with_schema_drift(faucet_core::SchemaDriftPolicy::compile(sd));
-    }
+    // Every governance pass — masking, quality, contract, schema drift, the
+    // policy / profiling / metadata / budget sink layers, metering, resilience,
+    // cancellation and the governed DLQ — comes from `governance_for` (#875).
+    // The cancel token is a clone, so the caller can still read
+    // `cancel.is_cancelled()` for the lineage terminal event and the SLA pass.
+    let _ = cancel;
+    pipeline = pipeline.with_governance(governance);
     // ── Scoped cleanup (#478) ────────────────────────────────────────────────
     // Attaching the policy is what authorises a delete, so the coarse gating
     // lives here — `run_stream` only adds "the run finished uncancelled".
@@ -2446,11 +2410,6 @@ async fn build_pipeline<'a>(
             .map_err(|e| CliError::Config(format!("adaptive_batch_size: {e}")))?;
         pipeline = pipeline.with_adaptive(ab);
     }
-    // Resilience policy (retry/backoff/circuit-breaker/poison). Top-level in v1,
-    // so the same policy is attached to every invocation.
-    if let Some(policy) = opts.resilience.clone() {
-        pipeline = pipeline.with_resilience(policy);
-    }
     // Delivery guarantee (exactly-once resume/skip when the node opted in; the
     // expand gate already verified source/sink/state support). Preview modes
     // (`--dry-run`, `--limit`) swap in counting/truncating sinks that cannot
@@ -2500,6 +2459,7 @@ async fn run_one_invocation(
         Some(opts.run_id.clone().unwrap_or_else(|| run_id.clone())),
         Some(run_id.clone()),
     );
+    let invocation_clock = std::time::Instant::now();
     let pipeline_name = opts.pipeline_name.clone();
     let row_id = node.id.clone();
     #[cfg(feature = "lineage")]
@@ -2516,23 +2476,22 @@ async fn run_one_invocation(
         && !opts.dry_run
         && opts.limit.is_none()
         && opts.shard.is_none();
-    // Column profiling (#708): roots only, real runs only — the same scoping
-    // as SLA / catalog. The profiler is shared with the sink decorator below
-    // and read back after the run.
-    let profiling_active = node.profiling.is_some()
-        && matches!(node.role, NodeRole::Root)
-        && !opts.dry_run
-        && opts.limit.is_none()
-        && opts.shard.is_none();
-    let profiler: Option<Arc<std::sync::Mutex<faucet_core::Profiler>>> = node
-        .profiling
-        .as_ref()
-        .filter(|_| profiling_active)
-        .map(|spec| {
-            Arc::new(std::sync::Mutex::new(faucet_core::Profiler::new(
-                spec.clone(),
-            )))
-        });
+    // Every governance pass for this invocation, from one place (#875). The
+    // profiler (#708) is shared with the sink layer and read back after the run.
+    let crate::governance::GovernanceBuild {
+        governance,
+        profiler,
+    } = crate::governance::governance_for(crate::governance::GovernanceRequest {
+        node,
+        opts,
+        pipeline: &pipeline_name,
+        row: &row_id,
+        run_id: &run_id,
+        cancel: &cancel,
+        meter: Some(Arc::clone(&observers.meter)),
+    })
+    .await?;
+    let row_accounts = Arc::clone(&observers.rows);
     // 1) Resolve `${parent.path}` in the per-row source + sink configs.
     let mut source_cfg = node.source.config.clone();
     let mut sink_cfg = node.sink.config.clone();
@@ -2693,37 +2652,8 @@ async fn run_one_invocation(
         build_sink(&node.sink.kind, sink_cfg, &opts.auth).await?
     };
     let sink_dataset_uri = faucet_core::redact_uri_credentials(&raw_sink.dataset_uri());
-    // Run budget (#703): innermost, right around the destination, so the
-    // ceilings count exactly what the sink accepts (post-masking, post-policy
-    // quarantine). A page that would cross `max_records` / `max_bytes` is
-    // refused whole before it is written; `max_duration_secs` cancels the
-    // cooperative token from a timer. `_budget_timer` keeps that timer alive
-    // for the invocation. `allowed_sinks` was checked before anything ran.
-    let (raw_sink, budget_state, _budget_timer): (
-        Box<dyn Sink>,
-        Option<Arc<faucet_core::BudgetState>>,
-        Option<faucet_core::BudgetTimer>,
-    ) = match opts.budget.as_ref().filter(|b| !b.is_empty()) {
-        Some(spec) => {
-            let (s, state, timer) =
-                faucet_core::BudgetSink::wrap(raw_sink, spec.clone(), cancel.clone());
-            (Box::new(s), Some(state), Some(timer))
-        }
-        None => (raw_sink, None, None),
-    };
-    let raw_sink: Box<dyn Sink> = match opts.limit {
-        Some(n) => Box::new(LimitedSink::wrap(raw_sink, n)),
-        None => raw_sink,
-    };
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let sink: Box<dyn Sink> = match &capture {
-        Some(projection) => Box::new(CapturingSink::wrap(
-            raw_sink,
-            Arc::clone(&captured),
-            Arc::clone(projection),
-        )),
-        None => raw_sink,
-    };
+    let sink: Box<dyn Sink> = raw_sink;
 
     // ── Lineage: sampling wrappers (only for requested facets) ───────────────
     // `in_sample` taps the source's pre-transform records (input schema /
@@ -2799,12 +2729,15 @@ async fn run_one_invocation(
         if stages.is_empty() {
             source
         } else {
-            Box::new(faucet_core::TransformingSource::new_with_batches(
-                source,
-                stages,
-                batch_fns,
-                obs_labels.clone(),
-            )?)
+            Box::new(
+                faucet_core::TransformingSource::new_with_batches(
+                    source,
+                    stages,
+                    batch_fns,
+                    obs_labels.clone(),
+                )?
+                .with_row_accounts(Arc::clone(&row_accounts)),
+            )
         }
     };
     #[cfg(not(feature = "arrow"))]
@@ -2813,11 +2746,10 @@ async fn run_one_invocation(
         if stages.is_empty() {
             source
         } else {
-            Box::new(faucet_core::TransformingSource::new(
-                source,
-                stages,
-                obs_labels.clone(),
-            )?)
+            Box::new(
+                faucet_core::TransformingSource::new(source, stages, obs_labels.clone())?
+                    .with_row_accounts(Arc::clone(&row_accounts)),
+            )
         }
     };
 
@@ -2892,88 +2824,32 @@ async fn run_one_invocation(
         source
     };
 
-    // #510: stamp `_faucet_*` run/lineage metadata columns closest to the real
-    // sink (so `loaded_at` ≈ the actual write), and inside the lineage sampler
-    // below so samples reflect the source records, not the added columns.
-    let sink: Box<dyn Sink> = match &node.metadata_columns {
-        Some(spec) => match faucet_core::CompiledMetadata::compile(spec)
-            .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?
-        {
-            Some(meta) => Box::new(faucet_core::MetadataSink::new(
-                sink,
-                meta,
-                faucet_core::MetadataContext {
-                    run_id: run_id.clone(),
-                    source: node.source.kind.clone(),
-                },
-            )),
-            None => sink,
-        },
-        None => sink,
-    };
-
-    // Wrap the sink so it samples written records — outermost, immediately
-    // before the pipeline is constructed (after capture/limit wrappers).
-    #[cfg(feature = "lineage")]
-    let sink: Box<dyn Sink> = match &out_sample {
-        Some(state) => Box::new(faucet_lineage::SamplingSink::new(
-            sink,
-            std::sync::Arc::clone(state),
-        )),
-        None => sink,
-    };
-    // Column profiling (#708): outermost too, so the profile describes the
-    // post-transform, post-masking records without the `_faucet_*` columns.
-    let sink: Box<dyn Sink> = match &profiler {
-        Some(p) => Box::new(faucet_core::ProfilingSink::new(sink, Arc::clone(p))),
-        None => sink,
-    };
-    // Data-flow policy runtime backstop (#702): classify the real records
-    // (names + value detectors) with the same rules the static pass used and
-    // fail / quarantine per the violated rule. Post-masking, so a properly
-    // masked value no longer trips its detector.
-    #[cfg(feature = "policy")]
-    let sink: Box<dyn Sink> = match &node.policy {
-        Some(spec) => {
-            if crate::policy::quarantines(spec) && node.dlq.is_none() {
-                return Err(CliError::Config(format!(
-                    "row '{}': policy: a rule with `on_runtime: quarantine` needs a `dlq:` \
-                     block to route the quarantined records to",
-                    node.id
-                )));
-            }
-            let compiled =
-                faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
-                    .map_err(|e| CliError::Config(format!("policy: {e}")))?;
-            let mut policy_sink = faucet_core::PolicySink::new(
-                sink,
-                Arc::new(compiled),
-                faucet_core::SinkFacts {
-                    id: node.sink_ref.clone(),
-                    kind: node.sink.kind.clone(),
-                    attributes: node.sink.attributes.clone(),
-                },
-                faucet_core::PolicyScope {
-                    pipeline: pipeline_name.clone(),
-                    row: row_id.clone(),
-                },
-            );
-            if let Some(dlq) = &node.dlq {
-                policy_sink = policy_sink.with_dlq_destination(crate::policy::dlq_facts(dlq));
-            }
-            Box::new(match &node.masking {
-                Some(masking) => policy_sink.with_masking(Arc::new(
-                    faucet_core::CompiledMasking::compile_for_sink(
-                        masking,
-                        &[node.sink_ref.as_str(), node.sink.kind.as_str()],
-                    )
-                    .map_err(|e| CliError::Config(format!("masking: {e}")))?,
-                )),
-                None => policy_sink,
-            })
+    // The governed sink stack, in core's canonical order (#875): policy →
+    // profiling → [lineage sampler] → metadata → [--limit, fan-out capture] →
+    // budget → destination. The budget is innermost so its ceilings count what
+    // the destination accepts; a duration ceiling cancels the cooperative token.
+    let limit = opts.limit;
+    let capture_sink = capture
+        .as_ref()
+        .map(|p| (Arc::clone(&captured), Arc::clone(p)));
+    #[allow(unused_mut)]
+    let mut builder = governance.sink_builder().inner_tap(move |s| {
+        let s: Box<dyn Sink> = match limit {
+            Some(n) => Box::new(LimitedSink::wrap(s, n)),
+            None => s,
+        };
+        match capture_sink {
+            Some((buf, projection)) => Box::new(CapturingSink::wrap(s, buf, projection)),
+            None => s,
         }
-        None => sink,
-    };
+    });
+    #[cfg(feature = "lineage")]
+    if let Some(state) = out_sample.clone() {
+        builder = builder.outer_tap(move |s| Box::new(faucet_lineage::SamplingSink::new(s, state)));
+    }
+    let governed = builder.build(sink);
+    let budget_state = governed.budget_state().cloned();
+    let sink: Box<dyn Sink> = Box::new(governed);
 
     // 5) Assemble the runtime pipeline. The whole `with_*` builder chain (state,
     //    DLQ, cancellation, quality, contract, masking, schema-drift, adaptive
@@ -2995,6 +2871,8 @@ async fn run_one_invocation(
         cleanup_scope,
         suppress_overwrite,
         observers.clone(),
+        governance,
+        Arc::clone(&row_accounts),
     )
     .await?;
     // ── Lineage: START + heartbeat + terminal ────────────────────────────────
@@ -3117,7 +2995,20 @@ async fn run_one_invocation(
             // machine is large, and inlining it here overflowed the 2 MiB
             // test-thread stack under `--all-features` (see
             // `boxed_run_one_invocation`).
-            match crate::verify::verify_node_boxed(node, spec, &inputs).await {
+            // A repair is bounded by what is left of this run's budget, stops
+            // with it, and retries like it (#871).
+            let guards = crate::verify::RunGuards {
+                budget: opts.budget.as_ref().map(|spec| {
+                    crate::budget::remaining_budget(
+                        spec,
+                        budget_state.as_deref(),
+                        invocation_clock.elapsed(),
+                    )
+                }),
+                cancel: Some(cancel.clone()),
+                resilience: opts.resilience.clone(),
+            };
+            match crate::verify::verify_node_boxed(node, spec, &inputs, &guards).await {
                 Ok(outcome) if outcome.report.equal() => result,
                 // A repair that re-synced every reported difference healed the
                 // drift: the run is green, and the drift is logged.
@@ -3741,6 +3632,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::ProfileDrift { .. } => "profile_drift",
         FaucetError::PolicyViolation { .. } => "policy",
         FaucetError::BudgetExceeded { .. } => "budget_exceeded",
+        FaucetError::RowsUnaccounted { .. } => "rows_unaccounted",
         FaucetError::Timeout { .. } => "timeout",
         _ => "error",
     }
@@ -4052,8 +3944,24 @@ impl Sink for CapturingSink {
     // carry none) stay at the trait default (off); everything else reaches the
     // wrapped sink.
     faucet_core::forward_sink!(inner; except
-        write_batch, write_batch_partial, write_batch_idempotent, supports_columnar,
-        write_batch_columnar, native_load_capabilities, load_native);
+        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let report = self.inner.write_batch_reported(records).await?;
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+        Ok(report)
+    }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let written = self.inner.write_batch(records).await?;
@@ -4130,7 +4038,8 @@ impl Sink for LimitedSink {
     // and native paths stay at the trait default (the idempotent default calls
     // write_batch); everything else reaches the wrapped sink.
     faucet_core::forward_sink!(inner; except
-        write_batch_partial, commit_overwrite, write_batch, supports_idempotent_writes,
+        write_batch_partial, commit_overwrite, write_batch, write_batch_reported,
+        supports_idempotent_writes,
         write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
 
@@ -4162,6 +4071,23 @@ impl Sink for LimitedSink {
              and the destination is left unchanged"
         );
         self.inner.abort_overwrite().await
+    }
+    // Rows past the cap are dropped by design and reported as skipped, so row
+    // accounting (#879) does not take them for a silent loss.
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let take = remaining.min(records.len());
+        let report = if take == 0 {
+            faucet_core::WriteReport::default()
+        } else {
+            self.inner.write_batch_reported(&records[..take]).await?
+        };
+        self.remaining
+            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
+        Ok(report.with_skipped(report.skipped + (records.len() - take)))
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);
@@ -4211,6 +4137,45 @@ fn value_to_string_brief(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+impl ExecuteOptions {
+    /// Plain options for a unit test: no budget, cancel, resilience or
+    /// observers.
+    pub(crate) fn for_tests(name: &str) -> Self {
+        ExecuteOptions {
+            legacy_state_writes: false,
+            force_lease: false,
+            pipeline_name: name.into(),
+            run_id: None,
+            execution: None,
+            concurrency: None,
+            dry_run: false,
+            limit: None,
+            state_path_override: None,
+            state_scope: Default::default(),
+            shard: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+            cancel: None,
+            resilience: None,
+            sla: None,
+            reconcile: None,
+            verify: None,
+            rollback: None,
+            #[cfg(feature = "lineage")]
+            lineage: None,
+            #[cfg(feature = "lineage")]
+            lineage_cfg: None,
+            #[cfg(feature = "notify")]
+            notifier: None,
+            #[cfg(feature = "catalog")]
+            catalog: None,
+            usage: Default::default(),
+            budget: None,
+        }
     }
 }
 
@@ -4386,6 +4351,7 @@ mod tests {
 
         fn node(id: &str, weight: Option<f64>) -> ExpandedNode {
             ExpandedNode {
+                opt_outs: Vec::new(),
                 id: id.into(),
                 row_index: 0,
                 weight,
@@ -6239,6 +6205,7 @@ matrix:
 
         fn child(id: &str, parent: &str, parent_key: &str, refs: &[(&str, &str)]) -> ExpandedNode {
             ExpandedNode {
+                opt_outs: Vec::new(),
                 id: id.into(),
                 row_index: 0,
                 weight: None,
@@ -6330,6 +6297,7 @@ matrix:
         use crate::config::ConnectorSpec;
         use crate::expand::{DeferredRef, ExpandedNode, NodeRole};
         let c = ExpandedNode {
+            opt_outs: Vec::new(),
             id: "c".into(),
             row_index: 0,
             weight: None,
@@ -6746,6 +6714,7 @@ matrix:
     fn stub_node(state: Option<crate::config::StateStoreSpec>) -> ExpandedNode {
         use crate::config::ConnectorSpec;
         ExpandedNode {
+            opt_outs: Vec::new(),
             id: "n".into(),
             row_index: 0,
             weight: None,
@@ -7006,6 +6975,7 @@ matrix:
         // list exercises the executor's own deadlock guard (lines 227-233).
         use crate::config::ConnectorSpec;
         let orphan = ExpandedNode {
+            opt_outs: Vec::new(),
             id: "orphan".into(),
             row_index: 0,
             weight: None,
