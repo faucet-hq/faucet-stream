@@ -5904,6 +5904,7 @@ dependencies = [
  "bb8-tiberius",
  "chrono",
  "faucet-common-mssql",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "object_store",
@@ -5924,6 +5925,7 @@ version = "1.8.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",
  "schemars 1.2.1",

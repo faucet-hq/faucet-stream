@@ -18,25 +18,12 @@ use sqlx::{MySqlConnection, Row};
 
 const MAX_MYSQL_PARAMS: usize = 65535;
 
-fn placeholder(_n: usize) -> String {
-    "?".to_string()
-}
-
+/// The journal SQL of the MySQL dialect: InnoDB caps an index at 3072 bytes
+/// and utf8mb4 text is 4 bytes a character, so the key is a stored SHA-256 of
+/// the JSON rather than the JSON itself (which stays readable in `key_json`).
 fn journal_sql() -> JournalSql {
-    JournalSql {
-        quote: quote_ident_mysql,
-        placeholder,
-        before_type: "LONGTEXT",
-        insert_prefix: "INSERT IGNORE",
-        insert_suffix: "",
-        now: "CURRENT_TIMESTAMP",
-        // InnoDB caps an index at 3072 bytes, and utf8mb4 text is 4 bytes a
-        // character, so the key is a stored SHA-256 of the JSON rather than
-        // the JSON itself (which stays readable in `key_json`).
-        key_column: "key_json TEXT NOT NULL, key_hash CHAR(64) CHARACTER SET ascii \
-                     AS (SHA2(key_json, 256)) STORED",
-        primary_key: "PRIMARY KEY (run_id, table_name, key_hash)",
-    }
+    faucet_common_sql::SqlDialect::journal_sql(&faucet_common_sql::dialects::Mysql)
+        .expect("the mysql dialect journals")
 }
 
 fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
