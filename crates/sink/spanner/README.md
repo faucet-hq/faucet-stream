@@ -142,6 +142,14 @@ already landed a second time). See
 
 Declares write modes `append` / `upsert` / `delete`, idempotent writes (exactly-once), keyed upsert, scoped cleanup and schema evolution (`schema_report: reported`); a `write_mode: upsert|delete` config with a `key` dedups by key. `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+Every read, commit and DDL operation runs through the pipeline's
+`CallContext` (#880): each is made once (the client's own `ABORTED` retry inside a
+read-write transaction is unchanged), any caller deadline ends it, and each is
+metered as a round trip (`metadata`, `commit`, `ddl`, `query`).
+`ddl_timeout_secs` still bounds a schema change.
+
 ## License
 
 MIT OR Apache-2.0

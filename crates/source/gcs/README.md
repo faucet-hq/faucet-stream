@@ -472,6 +472,14 @@ cluster coordinator a run reads every object, unchanged.
 > *total* object set (matching single-worker semantics) rather than
 > multiplying by the shard count.
 
+## Timeouts, cancellation and retries
+
+Every object-store request — listings, object and metadata reads, each ranged
+Parquet read — runs through the pipeline's `CallContext` (#880): the run's
+cancel token stops an in-flight request, any caller deadline ends it, and round
+trips are still metered as `list` / `get` (see Usage signals). The client's own
+timeouts and retry are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

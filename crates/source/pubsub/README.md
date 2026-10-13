@@ -104,3 +104,13 @@ License: MIT OR Apache-2.0.
 ## Capabilities
 
 Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every pull runs through the pipeline's `CallContext` (#880): the run's cancel
+token stops an in-flight pull (its task is aborted, so nothing it leased is
+lost — unacked messages redeliver), any caller deadline ends it, and pulls,
+acks, nacks and lease renewals are metered as round trips (`pull`, `ack`,
+`nack`, `renew`). Acks, nacks and renewals never take the cancel token: they
+are how a page already made durable leaves the subscription. The client's own
+RPC deadlines are unchanged.

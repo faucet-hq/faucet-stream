@@ -79,3 +79,51 @@ fn dummy_service_account_json(oauth_server: &str) -> serde_json::Value {
         "client_x509_cert_url": format!("{oauth_server}/robot/v1/metadata/x509/dummy"),
     })
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "fake-token",
+            "token_type": "bearer",
+            "expires_in": 9_999_999,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let sa_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        sa_file.path(),
+        serde_json::to_string_pretty(&dummy_service_account_json(&server.uri())).unwrap(),
+    )
+    .unwrap();
+    let make = || {
+        let config = BigQuerySinkConfig::new(
+            "p",
+            "d",
+            "t",
+            faucet_sink_bigquery::BigQueryCredentials::ApplicationDefault,
+        )
+        .with_media_load(false);
+        let client = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                ClientBuilder::new()
+                    .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
+                    .with_v2_base_url(server.uri())
+                    .build_from_service_account_key_file(sa_file.path().to_str().unwrap()),
+            )
+        })
+        .expect("client against the mock");
+        BigQuerySink::from_parts(config, client)
+    };
+    faucet_conformance::calls::assert_sink_call_deadline(make, &[json!({"id": 1})]).await;
+}

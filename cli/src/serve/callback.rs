@@ -407,22 +407,22 @@ async fn checked_addrs(
 }
 
 /// One bounded, retried delivery attempt sequence.
-#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 async fn deliver(spec: &CallbackSpec, body: &Value, restricted: bool) -> Result<(), String> {
     let url =
         reqwest::Url::parse(&spec.url).map_err(|e| format!("callback.url is not valid: {e}"))?;
     let pinned = checked_addrs(&url, restricted).await?;
-    let mut builder = reqwest::Client::builder()
+    let mut builder = faucet_core::http::Client::builder()
         .timeout(ATTEMPT_TIMEOUT)
         // A redirect would leave the checked host.
-        .redirect(reqwest::redirect::Policy::none());
+        .max_redirects(0);
     if let Some(host) = url.host_str()
         && !pinned.is_empty()
     {
-        builder = builder.resolve_to_addrs(host, &pinned);
+        let host = host.to_string();
+        builder = builder.configure(|b| b.resolve_to_addrs(&host, &pinned));
     }
     let client = builder
-        .build()
+        .build_reqwest()
         .map_err(|e| format!("building callback client: {e}"))?;
     let method = reqwest::Method::from_bytes(spec.method.as_bytes())
         .map_err(|_| format!("invalid method `{}`", spec.method))?;
@@ -452,7 +452,10 @@ async fn deliver(spec: &CallbackSpec, body: &Value, restricted: bool) -> Result<
             Err(e) => last = format!("request failed: {e}"),
         }
         if attempt < MAX_ATTEMPTS {
-            tokio::time::sleep(RETRY_BASE * 2u32.pow(attempt - 1)).await;
+            // No cancel token or deadline: the wait always completes.
+            let _ = faucet_core::CallContext::new()
+                .wait(RETRY_BASE * 2u32.pow(attempt - 1))
+                .await;
         }
     }
     Err(last)

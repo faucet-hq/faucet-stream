@@ -42,12 +42,18 @@ impl AzureBlobSink {
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
         let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
+        let calls = Arc::new(faucet_core::CallSlot::new(
+            faucet_core::CallContext::new()
+                .without_timeout()
+                .with_roundtrip_metering(false),
+        ));
         let objects = Arc::new(AzureObjects {
             store: store.clone(),
             container: config.container().to_string(),
             part_bytes: PART_BYTES,
             concurrency: config.concurrency,
             roundtrips: roundtrips.clone(),
+            calls: calls.clone(),
         });
         let backend = RemoteBackend::new(
             objects,
@@ -60,6 +66,7 @@ impl AzureBlobSink {
             store: store.clone(),
             part_bytes: PART_BYTES,
             roundtrips: roundtrips.clone(),
+            calls: calls.clone(),
         }));
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
         let identity = AzureIdentity {
@@ -67,6 +74,7 @@ impl AzureBlobSink {
             container: config.container().to_string(),
             prefix: config.prefix.clone(),
             roundtrips,
+            calls,
         };
         Ok(Self {
             inner: WriterSink::new(writer, identity),
@@ -87,6 +95,7 @@ struct AzureIdentity {
     container: String,
     prefix: String,
     roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 #[faucet_core::async_trait]
@@ -105,7 +114,12 @@ impl SinkIdentity for AzureIdentity {
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
     }
 
     async fn check(
@@ -116,17 +130,20 @@ impl SinkIdentity for AzureIdentity {
         let started = std::time::Instant::now();
         let listed = tokio::time::timeout(ctx.timeout, async {
             let mut listing = self.store.list(None);
-            listing.next().await
+            faucet_core::CallExt::within(listing.next(), &self.calls, "list").await
         })
         .await;
         let probe = match listed {
-            Ok(None) | Ok(Some(Ok(_))) => Probe::pass("auth", started.elapsed()),
-            Ok(Some(Err(e))) => Probe::fail_hint(
-                "auth",
-                started.elapsed(),
-                e.to_string(),
-                "check account, container, credentials, and network",
-            ),
+            Ok(Err(e)) => Probe::fail("auth", started.elapsed(), e.to_string()),
+            Ok(Ok(listed)) => match listed {
+                None | Some(Ok(_)) => Probe::pass("auth", started.elapsed()),
+                Some(Err(e)) => Probe::fail_hint(
+                    "auth",
+                    started.elapsed(),
+                    e.to_string(),
+                    "check account, container, credentials, and network",
+                ),
+            },
             Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
         };
         Ok(CheckReport::single(probe))
@@ -138,6 +155,7 @@ struct AzureBlocks {
     store: Arc<dyn ObjectStore>,
     part_bytes: usize,
     roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 fn azure_err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -151,15 +169,18 @@ impl MultipartClient for AzureBlocks {
     }
 
     async fn start(&self, key: &str) -> Result<Box<dyn MultipartUpload>, FaucetError> {
-        let upload = self
-            .store
-            .put_multipart(&ObjectPath::from(key))
-            .await
-            .map_err(|e| azure_err("start multipart", key, e))?;
+        let upload = faucet_core::CallExt::within(
+            self.store.put_multipart(&ObjectPath::from(key)),
+            &self.calls,
+            "put",
+        )
+        .await?
+        .map_err(|e| azure_err("start multipart", key, e))?;
         Ok(Box::new(AzureUpload {
             key: key.to_string(),
             upload: Arc::new(Mutex::new(upload)),
             roundtrips: self.roundtrips.clone(),
+            calls: self.calls.clone(),
         }))
     }
 }
@@ -168,6 +189,7 @@ struct AzureUpload {
     key: String,
     upload: Arc<Mutex<Box<dyn object_store::MultipartUpload>>>,
     roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 impl MultipartUpload for AzureUpload {
@@ -179,7 +201,12 @@ impl MultipartUpload for AzureUpload {
             .unwrap_or_else(|p| p.into_inner())
             .put_part(bytes::Bytes::from(body).into());
         let key = self.key.clone();
-        Box::pin(async move { part.await.map_err(|e| azure_err("put part", &key, e)) })
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            faucet_core::CallExt::within(part, &calls, "put")
+                .await?
+                .map_err(|e| azure_err("put part", &key, e))
+        })
     }
 
     fn complete(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
@@ -189,9 +216,8 @@ impl MultipartUpload for AzureUpload {
                 .map_err(|_| azure_err("complete multipart", &self.key, "a part is still open"))?
                 .into_inner()
                 .unwrap_or_else(|p| p.into_inner());
-            upload
-                .complete()
-                .await
+            faucet_core::CallExt::within(upload.complete(), &self.calls, "put")
+                .await?
                 .map(|_| ())
                 .map_err(|e| azure_err("complete multipart", &self.key, e))
         })
@@ -203,9 +229,8 @@ impl MultipartUpload for AzureUpload {
                 return Ok(());
             };
             let mut upload = upload.into_inner().unwrap_or_else(|p| p.into_inner());
-            upload
-                .abort()
-                .await
+            faucet_core::CallExt::within(upload.abort(), &self.calls, "abort")
+                .await?
                 .map_err(|e| azure_err("abort multipart", &self.key, e))
         })
     }

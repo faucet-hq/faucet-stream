@@ -20,6 +20,7 @@
 //! - [`resolve_password`] — extracts the password (and is where an unsupported
 //!   credential variant surfaces its error).
 
+pub mod calls;
 mod config;
 mod pool;
 

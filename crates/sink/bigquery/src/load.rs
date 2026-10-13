@@ -10,6 +10,7 @@
 use crate::config::BigQuerySinkConfig;
 use arrow::array::RecordBatch;
 use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::model::job::Job;
 use gcp_bigquery_client::model::job_configuration::JobConfiguration;
@@ -30,6 +31,17 @@ use tokio::sync::OnceCell;
 /// `codecov.yml` `ignore` list excludes this file for that reason, mirroring
 /// the GCS connectors.
 pub async fn write_columnar(
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    gcs_store: &OnceCell<Storage>,
+    batch: &RecordBatch,
+) -> Result<usize, FaucetError> {
+    write_columnar_in(&CallContext::new(), client, config, gcs_store, batch).await
+}
+
+/// [`write_columnar`] with every backend call made through `calls` (#880).
+pub(crate) async fn write_columnar_in(
+    calls: &CallContext,
     client: &Client,
     config: &BigQuerySinkConfig,
     gcs_store: &OnceCell<Storage>,
@@ -63,17 +75,20 @@ pub async fn write_columnar(
     let key = format!("{prefix}faucet-{}.parquet", uuid::Uuid::now_v7());
     let bucket_path = format!("projects/_/buckets/{}", cfg.staging_bucket);
     let crc = faucet_common_gcs::crc32c_of_bytes(&bytes);
-    store
-        .write_object(bucket_path, key.clone(), bytes::Bytes::from(bytes))
-        .set_content_type("application/vnd.apache.parquet")
-        .with_known_crc32c(crc)
-        .send_unbuffered()
-        .await
-        .map_err(|e| {
-            FaucetError::Sink(format!(
-                "BigQuery load staging upload failed for {key}: {e}"
-            ))
-        })?;
+    crate::sink::call_once(calls, "load", async {
+        store
+            .write_object(bucket_path, key.clone(), bytes::Bytes::from(bytes))
+            .set_content_type("application/vnd.apache.parquet")
+            .with_known_crc32c(crc)
+            .send_unbuffered()
+            .await
+            .map_err(|e| {
+                FaucetError::Sink(format!(
+                    "BigQuery load staging upload failed for {key}: {e}"
+                ))
+            })
+    })
+    .await?;
 
     // Insert + poll the load job.
     let source_uri = format!("gs://{}/{key}", cfg.staging_bucket);
@@ -84,18 +99,21 @@ pub async fn write_columnar(
         &source_uri,
         &cfg.write_disposition,
     );
-    let inserted = client
-        .job()
-        .insert(&config.project_id, job)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.insert failed: {e}")))?;
+    let inserted = crate::sink::call_once(calls, "load", async {
+        client
+            .job()
+            .insert(&config.project_id, job)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.insert failed: {e}")))
+    })
+    .await?;
     let job_ref = inserted
         .job_reference
         .ok_or_else(|| FaucetError::Sink("BigQuery load job returned no jobReference".into()))?;
     let job_id = job_ref
         .job_id
         .ok_or_else(|| FaucetError::Sink("BigQuery load job returned no jobId".into()))?;
-    let loaded = await_load_job(client, config, &job_id, job_ref.location.as_deref()).await;
+    let loaded = await_load_job(calls, client, config, &job_id, job_ref.location.as_deref()).await;
     match &loaded {
         Err((_, false)) => {
             tracing::warn!(
@@ -104,7 +122,7 @@ pub async fn write_columnar(
                 "leaving the staged load object: the job may still run"
             );
         }
-        _ => delete_staged(cfg, &key).await,
+        _ => delete_staged(calls, cfg, &key).await,
     }
     loaded.map_err(|(e, _)| e)?;
 
@@ -119,7 +137,7 @@ pub async fn write_columnar(
 
 /// Best-effort removal of a staged Parquet object once its load job has
 /// finished (SQL-100); a failure only warns, the rows are already loaded.
-async fn delete_staged(cfg: &crate::config::BigQueryLoadConfig, key: &str) {
+async fn delete_staged(calls: &CallContext, cfg: &crate::config::BigQueryLoadConfig, key: &str) {
     let control =
         match faucet_common_gcs::build_storage_control(&cfg.gcs_auth, cfg.storage_host.as_deref())
             .await
@@ -130,12 +148,16 @@ async fn delete_staged(cfg: &crate::config::BigQueryLoadConfig, key: &str) {
                 return;
             }
         };
-    if let Err(e) = control
-        .delete_object()
-        .set_bucket(format!("projects/_/buckets/{}", cfg.staging_bucket))
-        .set_object(key.to_string())
-        .send()
-        .await
+    if let Err(e) = crate::sink::call_once(calls, "load", async {
+        control
+            .delete_object()
+            .set_bucket(format!("projects/_/buckets/{}", cfg.staging_bucket))
+            .set_object(key.to_string())
+            .send()
+            .await
+            .map_err(|e| FaucetError::Sink(e.to_string()))
+    })
+    .await
     {
         tracing::warn!(key, error = %e, "could not delete staged BigQuery load object");
     }
@@ -191,6 +213,34 @@ pub async fn write_columnar_media_with_schema(
     schema: Option<serde_json::Value>,
     batch: &RecordBatch,
 ) -> Result<usize, FaucetError> {
+    write_columnar_media_in(
+        &CallContext::new(),
+        client,
+        config,
+        upload_base,
+        token,
+        table_id,
+        write_disposition,
+        schema,
+        batch,
+    )
+    .await
+}
+
+/// [`write_columnar_media_with_schema`] with every backend call made through
+/// `calls` (#880).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_columnar_media_in(
+    calls: &CallContext,
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    upload_base: &str,
+    token: &str,
+    table_id: &str,
+    write_disposition: &str,
+    schema: Option<serde_json::Value>,
+    batch: &RecordBatch,
+) -> Result<usize, FaucetError> {
     if batch.num_rows() == 0 {
         return Ok(0);
     }
@@ -228,19 +278,23 @@ pub async fn write_columnar_media_with_schema(
         "{upload_base}/upload/bigquery/v2/projects/{}/jobs?uploadType=multipart",
         config.project_id
     );
-    let resp = crate::sink::upload_client()?
-        .post(&url)
-        .bearer_auth(token)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            format!("multipart/related; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| FaucetError::Sink(format!("BigQuery Parquet media upload failed: {e}")))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let http = crate::sink::upload_client()?;
+    let (status, text) = crate::sink::call_once(calls, "load", async {
+        let resp = http
+            .post(&url)
+            .bearer_auth(token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/related; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("BigQuery Parquet media upload failed: {e}")))?;
+        let status = resp.status();
+        Ok((status, resp.text().await.unwrap_or_default()))
+    })
+    .await?;
     if !status.is_success() {
         return Err(FaucetError::Sink(format!(
             "BigQuery Parquet media upload returned HTTP {status}: {text}"
@@ -254,7 +308,7 @@ pub async fn write_columnar_media_with_schema(
         FaucetError::Sink("BigQuery media load job returned no jobReference.jobId".into())
     })?;
     let location = job["jobReference"]["location"].as_str();
-    await_load_job(client, config, job_id, location)
+    await_load_job(calls, client, config, job_id, location)
         .await
         .map_err(|(e, _)| e)?;
 
@@ -273,8 +327,8 @@ pub async fn write_columnar_media_with_schema(
 /// error in the body — the trap `await_query_complete` also guards). The
 /// error's flag is `false` only when the job timed out and may still be
 /// running.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 async fn await_load_job(
+    calls: &CallContext,
     client: &Client,
     config: &BigQuerySinkConfig,
     job_id: &str,
@@ -286,20 +340,19 @@ async fn await_load_job(
             creds: &config.auth,
             host: config.upload_base_url.as_deref(),
         };
-        let job = faucet_common_bigquery::raw::tolerant_get_job(
-            client,
-            target,
-            &config.project_id,
-            job_id,
-            location,
-        )
-        .await
-        .map_err(|e| {
-            (
-                FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")),
-                true,
+        let job = crate::sink::call_once(calls, "job", async {
+            faucet_common_bigquery::raw::tolerant_get_job(
+                client,
+                target,
+                &config.project_id,
+                job_id,
+                location,
             )
-        })?;
+            .await
+            .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))
+        })
+        .await
+        .map_err(|e| (e, true))?;
         let status = job.status.ok_or_else(|| {
             (
                 FaucetError::Sink("BigQuery load job returned no status; cannot confirm".into()),
@@ -316,7 +369,8 @@ async fn await_load_job(
             return Ok(());
         }
         if crate::sink::job_timed_out(config.job_timeout, started) {
-            match crate::sink::cancel_timed_out_job(client, config, "load", job_id, location).await
+            match crate::sink::cancel_timed_out_job(calls, client, config, "load", job_id, location)
+                .await
             {
                 crate::sink::CancelOutcome::Succeeded => continue,
                 crate::sink::CancelOutcome::Failed { error, terminal } => {
@@ -324,7 +378,10 @@ async fn await_load_job(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        calls
+            .wait(Duration::from_millis(500))
+            .await
+            .map_err(|e| (e, false))?;
     }
 }
 

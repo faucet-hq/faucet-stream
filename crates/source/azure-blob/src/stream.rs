@@ -60,6 +60,7 @@ struct BlobRange {
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
     etag: Option<String>,
+    calls: faucet_core::CallContext,
 }
 
 #[cfg(feature = "arrow")]
@@ -94,12 +95,16 @@ impl faucet_core::file_format::parquet_io::RangeRead for BlobRange {
         use futures::FutureExt as _;
         async move {
             let opts = range_options(range, self.etag.clone());
-            let got = self
-                .store
-                .get_opts(&self.path, opts)
+            let (store, path) = (&self.store, &self.path);
+            self.calls
+                .call_once("get", async move {
+                    let got = store
+                        .get_opts(path, opts)
+                        .await
+                        .map_err(|e| range_error(path, e))?;
+                    got.bytes().await.map_err(|e| range_error(path, e))
+                })
                 .await
-                .map_err(|e| range_error(&self.path, e))?;
-            got.bytes().await.map_err(|e| range_error(&self.path, e))
         }
         .boxed()
     }
@@ -110,11 +115,15 @@ type ColumnarStream<'a> = Pin<
     Box<dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a>,
 >;
 
+use faucet_core::CallExt as _;
+
 /// An Azure Blob source that lists and reads objects from a container.
 pub struct AzureBlobSource {
     config: AzureBlobSourceConfig,
     store: Arc<dyn ObjectStore>,
     filter: faucet_common_file::ObjectFilter,
+    /// Backend-call context (#880) every request runs through.
+    calls: faucet_core::CallSlot,
 }
 
 impl AzureBlobSource {
@@ -129,6 +138,7 @@ impl AzureBlobSource {
             config,
             store,
             filter,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -148,7 +158,7 @@ impl AzureBlobSource {
             .unwrap_or_default();
         let mut listing = self.store.list(list_root(effective_prefix).as_ref());
         let mut names: Vec<String> = Vec::new();
-        while let Some(item) = listing.next().await {
+        while let Some(item) = listing.next().within(&self.calls, "list").await? {
             let meta = item.map_err(|e| {
                 FaucetError::Source(format!(
                     "azure list error for container '{}': {e}",
@@ -235,17 +245,23 @@ impl AzureBlobSource {
             return Ok((schema, stream::iter(batches.into_iter().map(Ok)).boxed()));
         }
         let path = object_path(key);
-        let meta = self.store.head(&path).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "azure head error for container '{}' key '{key}': {e}",
-                self.config.container()
-            ))
-        })?;
+        let meta = self
+            .store
+            .head(&path)
+            .within(&self.calls, "head")
+            .await?
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "azure head error for container '{}' key '{key}': {e}",
+                    self.config.container()
+                ))
+            })?;
         let reader = faucet_core::file_format::parquet_io::RangedParquetReader::new(
             BlobRange {
                 store: self.store.clone(),
                 path,
                 etag: meta.e_tag.clone(),
+                calls: self.calls.get(),
             },
             meta.size,
             key,
@@ -377,12 +393,17 @@ impl AzureBlobSource {
         key: &str,
     ) -> Result<Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>, FaucetError> {
         let path = object_path(key);
-        let result = self.store.get(&path).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "azure get error for container '{}' key '{key}': {e}",
-                self.config.container()
-            ))
-        })?;
+        let result = self
+            .store
+            .get(&path)
+            .within(&self.calls, "get")
+            .await?
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "azure get error for container '{}' key '{key}': {e}",
+                    self.config.container()
+                ))
+            })?;
 
         // Read the metadata BEFORE consuming the stream (which moves `result`),
         // so a cleanly-truncated transfer is rejected rather than silently
@@ -850,6 +871,17 @@ impl faucet_core::Source for AzureBlobSource {
         "azure-blob"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     /// Avro, ORC and Parquet blobs decode straight to Arrow, so they take the
     /// columnar path; every other format stays on the row path (#719, #777).
     #[cfg(feature = "arrow")]
@@ -939,7 +971,16 @@ impl faucet_core::Source for AzureBlobSource {
         let started = std::time::Instant::now();
         let probe = match tokio::time::timeout(ctx.timeout, async {
             let mut listing = self.store.list(None);
-            listing.next().await
+            listing
+                .next()
+                .within(&self.calls, "list")
+                .await
+                .unwrap_or_else(|e| {
+                    Some(Err(object_store::Error::Generic {
+                        store: "azure",
+                        source: Box::new(e),
+                    }))
+                })
         })
         .await
         {
@@ -978,6 +1019,7 @@ mod tests {
             store: store.clone(),
             path: path.clone(),
             etag,
+            calls: faucet_core::CallContext::new(),
         };
         assert_eq!(&pinned.read_range(2..5).await.unwrap()[..], b"234");
         store
@@ -990,6 +1032,7 @@ mod tests {
             store,
             path: ObjectPath::from("d/missing"),
             etag: None,
+            calls: faucet_core::CallContext::new(),
         };
         let err = missing.read_range(0..1).await.unwrap_err().to_string();
         assert!(err.contains("azure get range error"), "{err}");

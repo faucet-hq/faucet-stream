@@ -37,6 +37,7 @@ pub(crate) struct S3RangeReader {
     len: u64,
     pin: Pin,
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
+    calls: faucet_core::CallContext,
 }
 
 /// What every range read is tied to, so all of them see the object as the
@@ -72,16 +73,16 @@ impl S3RangeReader {
         bucket: &str,
         key: &str,
         recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
+        calls: faucet_core::CallContext,
     ) -> Result<Self, faucet_core::FaucetError> {
         if let Some(r) = &recorder {
             r.record("head");
         }
-        let head = client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
+        let head = calls
+            .call_once("head", async {
+                Ok(client.head_object().bucket(bucket).key(key).send().await)
+            })
+            .await?
             .map_err(|e| {
                 faucet_core::FaucetError::Source(format!(
                     "S3 head object error for key '{key}': {e}"
@@ -109,6 +110,7 @@ impl S3RangeReader {
             len,
             pin,
             recorder,
+            calls,
         })
     }
 
@@ -131,19 +133,23 @@ impl S3RangeReader {
             .bucket(&self.bucket)
             .key(&self.key)
             .range(&header);
-        let response = self.pin.apply(request).send().await.map_err(|e| {
-            if precondition_failed(&e) {
-                replaced(&self.key)
-            } else {
-                failed(&self.key, &header, "", e)
-            }
-        })?;
-        let data = response
-            .body
-            .collect()
+        let fetched = self
+            .calls
+            .call_once("get", async {
+                let response = match self.pin.apply(request).send().await {
+                    Ok(r) => r,
+                    Err(e) if precondition_failed(&e) => return Ok(Err(replaced(&self.key))),
+                    Err(e) => return Ok(Err(failed(&self.key, &header, "", e))),
+                };
+                Ok(response
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| failed(&self.key, &header, " mid-stream", e)))
+            })
             .await
-            .map_err(|e| failed(&self.key, &header, " mid-stream", e))?;
-        let bytes = data.into_bytes();
+            .map_err(|e| ParquetError::External(Box::new(e)))?;
+        let bytes = fetched?.into_bytes();
         if bytes.len() as u64 != wanted {
             return Err(short(&self.key, &header, bytes.len() as u64, wanted));
         }

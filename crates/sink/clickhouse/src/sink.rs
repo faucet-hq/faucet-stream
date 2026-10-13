@@ -2,7 +2,7 @@
 //! `INSERT … FORMAT JSONEachRow` writes.
 
 use async_trait::async_trait;
-use faucet_common_clickhouse::{apply_auth, build_client, build_json_each_row, query_params};
+use faucet_common_clickhouse::{apply_auth, build_json_each_row, query_params};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use faucet_core::{FaucetError, Sink};
@@ -25,9 +25,11 @@ pub struct ClickHouseSink {
     /// could not be described.
     known_columns: tokio::sync::Mutex<Option<Option<std::collections::HashSet<String>>>>,
     pub(crate) config: ClickHouseSinkConfig,
-    pub(crate) client: reqwest::Client,
+    pub(crate) client: faucet_core::http::Client,
     /// Resolved once in [`ClickHouseSink::new`] so the hot path never re-parses.
     pub(crate) base_url: String,
+    /// Backend-call context (#880): every request runs through it, once.
+    pub(crate) calls: faucet_core::CallSlot,
     /// Per-sink run id for staged-object keys (avoids cross-run collisions).
     #[cfg(feature = "staging")]
     stage_run_id: String,
@@ -300,7 +302,8 @@ impl ClickHouseSink {
             .post(&self.base_url)
             .query(&params)
             .body(sql.to_string());
-        let resp = apply_auth(req, &self.config.connection).send().await?;
+        let req = apply_auth(req, &self.config.connection);
+        let resp = self.client.call(&self.calls.get(), "query", req).await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         resp.text().await.map_err(FaucetError::Http)
     }
@@ -314,8 +317,13 @@ impl ClickHouseSink {
     pub fn new(config: ClickHouseSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let base_url = config.connection.base_url()?;
-        let client = build_client(&config.connection)?;
+        let client = faucet_common_clickhouse::http_client(&config.connection)?;
         Ok(Self {
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
             table_ready: std::sync::atomic::AtomicBool::new(false),
             known_columns: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
@@ -392,7 +400,7 @@ impl ClickHouseSink {
         );
         let req = self.client.post(&self.base_url).query(&params).body(body);
         let req = apply_auth(req, &self.config.connection);
-        let resp = req.send().await?;
+        let resp = self.client.call(&self.calls.get(), "insert", req).await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
     }
@@ -509,6 +517,17 @@ impl Sink for ClickHouseSink {
         "clickhouse"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     /// Staged bulk load is active only when a `staging:` block is configured
     /// and the `staging` feature is compiled in.
     fn supports_staged_load(&self) -> bool {
@@ -536,14 +555,16 @@ impl Sink for ClickHouseSink {
             .query(&params)
             .body("SELECT 1");
         let req = apply_auth(req, &self.config.connection);
-        let probe = match tokio::time::timeout(ctx.timeout, req.send()).await {
-            Ok(Ok(resp)) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
-                Ok(_) => Probe::pass("connect", started.elapsed()),
-                Err(e) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
-            },
-            Ok(Err(e)) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
-            Err(_) => Probe::fail_hint("connect", started.elapsed(), "timed out", hint),
-        };
+        let calls = self.calls.get();
+        let probe =
+            match tokio::time::timeout(ctx.timeout, self.client.call(&calls, "query", req)).await {
+                Ok(Ok(resp)) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
+                    Ok(_) => Probe::pass("connect", started.elapsed()),
+                    Err(e) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
+                },
+                Ok(Err(e)) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
+                Err(_) => Probe::fail_hint("connect", started.elapsed(), "timed out", hint),
+            };
         Ok(CheckReport::single(probe))
     }
 }

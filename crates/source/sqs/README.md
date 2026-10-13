@@ -87,6 +87,15 @@ config:
 
 Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every SQS request — `ReceiveMessage`, `DeleteMessageBatch`, the visibility
+renewals — runs through the pipeline's `CallContext` (#880): each is bounded by
+the default 300 s call timeout and any caller deadline, the run's cancel token
+stops an in-flight receive and the empty-poll pause, and each is metered as a
+round trip (`receive`, `delete`, `visibility`). The AWS SDK's own retry is
+unchanged.
+
 ## License
 
 MIT OR Apache-2.0

@@ -7,6 +7,7 @@ use crate::config::{KinesisSourceConfig, OnDecodeError, StartPosition, ValueForm
 use aws_sdk_kinesis::Client;
 use aws_sdk_kinesis::types::ShardIteratorType;
 use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -174,9 +175,10 @@ pub(crate) enum ShardEvent {
 /// exhausted. Each `GetRecords` call holds one `permits` permit, so a stream
 /// with more shards than permits still reads every shard in turn. Returns
 /// `true` when the shard was fully drained.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_shard(
     client: Client,
+    calls: CallContext,
     config: KinesisSourceConfig,
     shard_id: String,
     bookmarked_sequence: Option<String>,
@@ -193,13 +195,24 @@ pub(crate) async fn run_shard(
     let mut iterator = {
         let mut attempt = 0u32;
         loop {
-            match acquire_iterator(&client, &config, &shard_id, last_sequence.as_deref()).await {
+            match acquire_iterator(
+                &client,
+                &calls,
+                &config,
+                &shard_id,
+                last_sequence.as_deref(),
+            )
+            .await
+            {
                 Ok(it) => break it,
-                Err(error) if attempt + 1 < INITIAL_ITERATOR_ATTEMPTS => {
+                Err(error) if attempt + 1 < INITIAL_ITERATOR_ATTEMPTS && !spent(&error) => {
                     attempt += 1;
                     tracing::debug!(shard = %shard_id, error = %error, attempt,
                         "kinesis: GetShardIterator failed; retrying");
-                    tokio::time::sleep(backoff_delay(poll_interval, attempt)).await;
+                    if let Err(error) = calls.wait(backoff_delay(poll_interval, attempt)).await {
+                        let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
+                        return false;
+                    }
                 }
                 Err(error) => {
                     let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
@@ -220,13 +233,24 @@ pub(crate) async fn run_shard(
             .acquire()
             .await
             .expect("the shard permit semaphore is never closed");
-        let response = client
-            .get_records()
-            .shard_iterator(&current)
-            .limit(config.records_per_request as i32)
-            .send()
+        let response = calls
+            .call("get_records", || async {
+                Ok(client
+                    .get_records()
+                    .shard_iterator(&current)
+                    .limit(config.records_per_request as i32)
+                    .send()
+                    .await)
+            })
             .await;
         drop(permit);
+        let response = match response {
+            Ok(r) => r,
+            Err(error) => {
+                let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
+                return false;
+            }
+        };
         match response {
             Ok(out) => {
                 attempts = Attempts::default();
@@ -284,8 +308,11 @@ pub(crate) async fn run_shard(
                 if let Ok(mut m) = behind.lock() {
                     m.insert(shard_id.clone(), behind_ms);
                 }
-                if records.is_empty() || behind_ms == 0 {
-                    tokio::time::sleep(poll_interval).await;
+                if (records.is_empty() || behind_ms == 0)
+                    && let Err(error) = calls.wait(poll_interval).await
+                {
+                    let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
+                    return false;
                 }
             }
             Err(err) => {
@@ -296,13 +323,22 @@ pub(crate) async fn run_shard(
                     let delay = backoff_delay(poll_interval, attempts.throttled().min(4));
                     tracing::debug!(shard = %shard_id, delay_ms = delay.as_millis() as u64,
                         "kinesis: throughput exceeded; backing off");
-                    tokio::time::sleep(delay).await;
+                    if let Err(error) = calls.wait(delay).await {
+                        let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
+                        return false;
+                    }
                     continue;
                 }
                 if service.is_expired_iterator_exception() {
                     tracing::debug!(shard = %shard_id, "kinesis: iterator expired; re-acquiring");
-                    match acquire_iterator(&client, &config, &shard_id, last_sequence.as_deref())
-                        .await
+                    match acquire_iterator(
+                        &client,
+                        &calls,
+                        &config,
+                        &shard_id,
+                        last_sequence.as_deref(),
+                    )
+                    .await
                     {
                         Ok(it) => {
                             iterator = it;
@@ -331,10 +367,22 @@ pub(crate) async fn run_shard(
                 tracing::warn!(shard = %shard_id, error = %service,
                     attempt = error_attempts, delay_ms = delay.as_millis() as u64,
                     "kinesis: GetRecords failed; retrying");
-                tokio::time::sleep(delay).await;
+                if let Err(error) = calls.wait(delay).await {
+                    let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
+                    return false;
+                }
             }
         }
     }
+}
+
+/// Whether `error` is the call context running out (cancel / deadline), which
+/// no retry can recover from.
+fn spent(error: &FaucetError) -> bool {
+    matches!(
+        error,
+        FaucetError::Cancelled { .. } | FaucetError::Timeout { .. }
+    )
 }
 
 /// Consecutive `GetRecords` setbacks since the last success. Throttles only
@@ -367,20 +415,26 @@ pub(crate) type BehindLatest =
 /// closed, drained shard reports none.
 pub(crate) async fn probe_behind(
     client: &Client,
+    calls: &CallContext,
     config: &KinesisSourceConfig,
     shard_id: &str,
     bookmarked_sequence: Option<&str>,
 ) -> Result<Option<i64>, FaucetError> {
-    let Some(iterator) = acquire_iterator(client, config, shard_id, bookmarked_sequence).await?
+    let Some(iterator) =
+        acquire_iterator(client, calls, config, shard_id, bookmarked_sequence).await?
     else {
         return Ok(None);
     };
-    let out = client
-        .get_records()
-        .shard_iterator(iterator)
-        .limit(1)
-        .send()
-        .await
+    let out = calls
+        .call("get_records", || async {
+            Ok(client
+                .get_records()
+                .shard_iterator(&iterator)
+                .limit(1)
+                .send()
+                .await)
+        })
+        .await?
         .map_err(|e| {
             FaucetError::Source(format!(
                 "kinesis: GetRecords on {shard_id} failed: {}",
@@ -393,29 +447,35 @@ pub(crate) async fn probe_behind(
 /// Acquire a shard iterator at the bookmark (if any) or start position.
 async fn acquire_iterator(
     client: &Client,
+    calls: &CallContext,
     config: &KinesisSourceConfig,
     shard_id: &str,
     bookmarked_sequence: Option<&str>,
 ) -> Result<Option<String>, FaucetError> {
     let (iterator_type, sequence, timestamp_secs) =
         iterator_request(&config.start_position, bookmarked_sequence);
-    let mut req = client
-        .get_shard_iterator()
-        .stream_name(&config.stream_name)
-        .shard_id(shard_id)
-        .shard_iterator_type(iterator_type);
-    if let Some(seq) = sequence {
-        req = req.starting_sequence_number(seq);
-    }
-    if let Some(secs) = timestamp_secs {
-        req = req.timestamp(aws_sdk_kinesis::primitives::DateTime::from_secs(secs));
-    }
-    let out = req.send().await.map_err(|e| {
-        FaucetError::Source(format!(
-            "kinesis: GetShardIterator for {shard_id} failed: {}",
-            e.into_service_error()
-        ))
-    })?;
+    let out = calls
+        .call("get_shard_iterator", || async {
+            let mut req = client
+                .get_shard_iterator()
+                .stream_name(&config.stream_name)
+                .shard_id(shard_id)
+                .shard_iterator_type(iterator_type.clone());
+            if let Some(seq) = &sequence {
+                req = req.starting_sequence_number(seq);
+            }
+            if let Some(secs) = timestamp_secs {
+                req = req.timestamp(aws_sdk_kinesis::primitives::DateTime::from_secs(secs));
+            }
+            Ok(req.send().await)
+        })
+        .await?
+        .map_err(|e| {
+            FaucetError::Source(format!(
+                "kinesis: GetShardIterator for {shard_id} failed: {}",
+                e.into_service_error()
+            ))
+        })?;
     Ok(out.shard_iterator().map(str::to_string))
 }
 

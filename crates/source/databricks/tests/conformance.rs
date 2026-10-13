@@ -98,3 +98,34 @@ fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let uri = hung.http_url();
+    let make = || {
+        let config = DatabricksSourceConfig {
+            workspace_url: uri.clone(),
+            warehouse_id: "wh".into(),
+            sql: "SELECT id FROM t".into(),
+            auth: AuthSpec::Inline(DatabricksAuth::Pat { token: "t".into() }),
+            catalog: None,
+            schema: None,
+            parameters: Vec::new(),
+            wait_timeout_secs: 50,
+            poll_interval_secs: 1,
+            statement_timeout_secs: 3600,
+            batch_size: 100,
+            arrow_native: false,
+            result_disposition: Default::default(),
+            replication: DatabricksReplication::Full,
+            state_key: None,
+        };
+        DatabricksSource::new(config).unwrap()
+    };
+    faucet_conformance::calls::assert_source_call_deadline(make).await;
+}

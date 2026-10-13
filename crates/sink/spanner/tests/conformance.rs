@@ -156,3 +156,43 @@ async fn conformance_write_modes_truthful() {
     })
     .await;
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// The client opens its session pool while it is built, so the backend hangs
+/// only once the sink exists: a proxy forwards to the emulator during `new()`
+/// and then stops answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let conn = support::create_database(
+        "deadline",
+        vec!["CREATE TABLE t (id INT64 NOT NULL) PRIMARY KEY (id)".to_string()],
+    )
+    .await;
+    let emulator = conn.emulator_host.clone().expect("emulator host");
+    let proxy = faucet_conformance::hung::HangingProxy::start(&emulator)
+        .await
+        .expect("proxy");
+    let host = proxy.addr().to_string();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || {
+            proxy.resume();
+            let mut cfg = SpannerSinkConfig::new(
+                conn.project_id.clone(),
+                conn.instance.clone(),
+                conn.database.clone(),
+                "t",
+            );
+            cfg.connection.emulator_host = Some(host.clone());
+            let sink = block_on(SpannerSink::new(cfg)).expect("sink builds");
+            proxy.hang();
+            sink
+        },
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}

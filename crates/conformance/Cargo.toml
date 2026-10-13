@@ -20,7 +20,7 @@ futures-core.workspace = true
 # `scripted::ScriptedSink` can inject a latency into each write (the slow-sink /
 # backpressure arm of the reliability suites), which needs an async sleep in
 # non-test code. `time` only — this crate spawns no runtime of its own.
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "net", "rt", "io-util", "sync"] }
 testcontainers = { version = "0.27", optional = true }
 
 [features]
@@ -29,7 +29,7 @@ testcontainers = { version = "0.27", optional = true }
 containers = ["dep:testcontainers", "tokio/net", "tokio/io-util"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util", "io-util"] }
 # The shared file-format layer (#604) is the one "connector" every file source
 # and sink shares, so its typed fidelity is asserted here against the same
 # corpus each connector pair uses.

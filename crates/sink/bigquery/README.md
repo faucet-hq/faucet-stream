@@ -447,6 +447,19 @@ already landed a second time). See
 
 Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent writes (exactly-once), keyed upsert, scoped cleanup, schema evolution (`schema_report: reported`), staged load, scoped (`overwrite.scope`) and staging-free overwrite. Under `write_mode: upsert|delete` with a `key` it dedups by key; the columnar (with the `arrow` feature) and native byte-load paths are declared only for `append` / `overwrite`. `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+Every request — `insertAll`, `jobs.query` / `jobs.get` / `jobs.cancel`, the
+media and resumable uploads, the GCS staging upload — runs through the
+pipeline's `CallContext` (#880): each is sent once, bounded by the default 300 s
+call timeout and any caller deadline, and still metered as `insert` / `query` /
+`job` / `load`. The retries that were already here are unchanged — the
+transient control-plane retry (`tables.get`, DDL), the concurrent-transaction
+re-submit and the job polls — and their pauses wait through the same context,
+so a deadline ends them. `job_timeout` still cancels a job that runs too long.
+Upload clients are built by `faucet_core::http`, so a redirect to another
+origin never carries the bearer token.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

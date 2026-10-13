@@ -37,3 +37,26 @@ async fn descriptor_matches_the_built_source() {
         &built,
     );
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let v = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": hung.port(),
+        "database": "db",
+        "user": "u",
+        "credentials": {"type": "password", "config": {"password": "pw"}},
+        "tls_mode": "disable",
+        "query": "SELECT 1"
+    });
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        faucet_source_redshift::RedshiftSource::new(serde_json::from_value(v.clone()).unwrap())
+            .unwrap()
+    })
+    .await;
+}

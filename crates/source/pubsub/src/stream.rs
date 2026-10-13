@@ -11,6 +11,8 @@
 use crate::config::PubsubSourceConfig;
 use crate::convert::{MessageParts, record_with_policy, timestamp_millis};
 use crate::state::{PubsubBookmark, state_key};
+use faucet_core::CallExt as _;
+use faucet_core::io::CallContext;
 use faucet_core::lease::LeaseExtender;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use gcloud_pubsub::client::Client;
@@ -28,6 +30,8 @@ pub struct PubsubSource {
     /// Bookmark applied by the pipeline before streaming — informational only
     /// (Pub/Sub redelivers unacked messages; there is no client-side seek).
     start_bookmark: Mutex<Option<PubsubBookmark>>,
+    /// Backend-call context (#880): pulls and the idle pause run through it.
+    calls: faucet_core::CallSlot,
 }
 
 impl PubsubSource {
@@ -39,6 +43,7 @@ impl PubsubSource {
             config,
             client,
             start_bookmark: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(CallContext::new().without_timeout()),
         })
     }
 
@@ -68,11 +73,15 @@ fn pull_timed_out(code: i32) -> bool {
 
 /// Return messages to the subscription for immediate redelivery (a pull
 /// response the run will not process). Best-effort. Thin SDK shim.
-async fn nack_messages(messages: Vec<ReceivedMessage>) {
+async fn nack_messages(acks: &CallContext, messages: Vec<ReceivedMessage>) {
     use futures::StreamExt;
     futures::stream::iter(messages)
         .map(|m| async move {
-            if let Err(e) = m.nack().await {
+            let nacked = match m.nack().within_ctx(acks, "nack").await {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = nacked {
                 tracing::warn!(error = %e, "pubsub: nack failed; the message redelivers after its ack deadline");
             }
         })
@@ -103,27 +112,51 @@ const RENEW_CONCURRENCY: usize = 16;
 /// Ack a batch of messages with one `Acknowledge` RPC per [`ACK_BATCH`] ids
 /// (best-effort — a failed ack means redelivery, i.e. at-least-once, never data
 /// loss). Thin SDK shim.
-async fn ack_messages(subscription: &Subscription, messages: &[ReceivedMessage]) {
+async fn ack_messages(
+    acks: &CallContext,
+    subscription: &Subscription,
+    messages: &[ReceivedMessage],
+) {
     for chunk in messages.chunks(ACK_BATCH) {
         let ids = chunk.iter().map(|m| m.ack_id().to_string()).collect();
-        if let Err(e) = subscription.ack(ids).await {
+        let acked = match subscription.ack(ids).within_ctx(acks, "ack").await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = acked {
             tracing::warn!(error = %e, "pubsub: ack failed; messages will be redelivered");
         }
     }
 }
 
 /// Renew the ack deadline of every held message. Best-effort. Thin SDK shim.
-async fn renew_deadlines(messages: Vec<ReceivedMessage>, secs: i32) {
+async fn renew_deadlines(acks: CallContext, messages: Vec<ReceivedMessage>, secs: i32) {
     use futures::StreamExt;
+    let acks = &acks;
     futures::stream::iter(messages)
         .map(|m| async move {
-            if let Err(e) = m.modify_ack_deadline(secs).await {
+            let renewed = match m.modify_ack_deadline(secs).within_ctx(acks, "renew").await {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = renewed {
                 tracing::warn!(error = %e, "pubsub: ack deadline renewal failed");
             }
         })
         .buffer_unordered(RENEW_CONCURRENCY)
         .collect::<Vec<()>>()
         .await;
+}
+
+/// The context acks, nacks and lease renewals run in: the run's recorder and
+/// a bounded attempt, but never its cancel token — an ack is how a page the
+/// pipeline already made durable leaves the subscription.
+fn ack_context(calls: &CallContext) -> CallContext {
+    let ctx = CallContext::new().without_retry();
+    match calls.recorder() {
+        Some(r) => ctx.with_recorder(r.clone()),
+        None => ctx,
+    }
 }
 
 /// How often held messages are renewed: every 5 s, or every third of the
@@ -157,7 +190,6 @@ impl faucet_core::Source for PubsubSource {
         Ok(all)
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages<'a>(
         &'a self,
         _context: &'a std::collections::HashMap<String, Value>,
@@ -178,9 +210,12 @@ impl faucet_core::Source for PubsubSource {
 
         Box::pin(async_stream::try_stream! {
             let subscription = self.subscription();
+            let calls = self.calls.get();
+            let acks = ack_context(&calls);
             let lease = (extension > 0).then(|| {
+                let acks = acks.clone();
                 LeaseExtender::spawn(renew_every(extension), move |held: Vec<ReceivedMessage>| {
-                    renew_deadlines(held, extension as i32)
+                    renew_deadlines(acks.clone(), held, extension as i32)
                 })
             });
             let hold = |page: &[ReceivedMessage], yielded: &[ReceivedMessage]| {
@@ -208,7 +243,7 @@ impl faucet_core::Source for PubsubSource {
 
             'consume: loop {
                 if !pending.is_empty() {
-                    ack_messages(&subscription, &pending).await;
+                    ack_messages(&acks, &subscription, &pending).await;
                     pending.clear();
                     hold(&page_msgs, &pending);
                 }
@@ -221,9 +256,14 @@ impl faucet_core::Source for PubsubSource {
                 // bounded by the client's deadline (#789 MSG-60).
                 let pull_sub = self.subscription();
                 let mut pull = tokio::spawn(async move { pull_messages(&pull_sub, want).await });
-                let joined = match idle {
-                    Some(window) => match tokio::time::timeout(window, &mut pull).await {
-                        Ok(joined) => joined,
+                let waited = match idle {
+                    Some(window) => match tokio::time::timeout(
+                        window,
+                        (&mut pull).within_ctx(&calls, "pull"),
+                    )
+                    .await
+                    {
+                        Ok(waited) => waited,
                         Err(_) => {
                             tracing::info!(
                                 subscription = %self.config.subscription,
@@ -234,15 +274,18 @@ impl faucet_core::Source for PubsubSource {
                             // still parked server-side is cancelled, which
                             // leases nothing.
                             match tokio::time::timeout(LATE_PULL_GRACE, &mut pull).await {
-                                Ok(Ok(Ok(late))) if !late.is_empty() => nack_messages(late).await,
+                                Ok(Ok(Ok(late))) if !late.is_empty() => {
+                                    nack_messages(&acks, late).await
+                                }
                                 Ok(_) => {}
                                 Err(_) => pull.abort(),
                             }
                             break 'consume;
                         }
                     },
-                    None => pull.await,
+                    None => (&mut pull).within_ctx(&calls, "pull").await,
                 };
+                let joined = waited.inspect_err(|_| pull.abort())?;
                 let messages = joined
                     .map_err(|e| FaucetError::Source(format!("pubsub: pull task failed: {e}")))??;
 
@@ -259,7 +302,7 @@ impl faucet_core::Source for PubsubSource {
                     }
                     // No idle window (max-messages only) and no messages: yield
                     // to the scheduler briefly to avoid a hot spin.
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    calls.wait(Duration::from_millis(200)).await?;
                     continue;
                 }
                 last_activity = Instant::now();
@@ -310,7 +353,7 @@ impl faucet_core::Source for PubsubSource {
                         // Defensive: a server returning more than requested.
                         let rest: Vec<ReceivedMessage> = messages.collect();
                         if !rest.is_empty() {
-                            nack_messages(rest).await;
+                            nack_messages(&acks, rest).await;
                         }
                         break 'consume;
                     }
@@ -333,7 +376,7 @@ impl faucet_core::Source for PubsubSource {
             // Every remaining page has now resumed past its `yield`, so it is
             // durable — ack it before returning.
             if !pending.is_empty() {
-                ack_messages(&subscription, &pending).await;
+                ack_messages(&acks, &subscription, &pending).await;
             }
             drop(lease);
 
@@ -368,6 +411,17 @@ impl faucet_core::Source for PubsubSource {
         "pubsub"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "pubsub://{}/subscriptions/{}",
@@ -390,16 +444,19 @@ impl faucet_core::Source for PubsubSource {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
         let subscription = self.subscription();
-        let fut = subscription.exists(None);
+        let fut = subscription.exists(None).within(&self.calls, "exists");
         let probe = match tokio::time::timeout(ctx.timeout, fut).await {
             Err(_) => Probe::fail("subscription_exists", start.elapsed(), "timed out"),
-            Ok(Ok(true)) => Probe::pass("subscription_exists", start.elapsed()),
-            Ok(Ok(false)) => Probe::fail(
-                "subscription_exists",
-                start.elapsed(),
-                format!("subscription '{}' does not exist", self.config.subscription),
-            ),
             Ok(Err(e)) => Probe::fail("subscription_exists", start.elapsed(), e.to_string()),
+            Ok(Ok(r)) => match r {
+                Ok(true) => Probe::pass("subscription_exists", start.elapsed()),
+                Ok(false) => Probe::fail(
+                    "subscription_exists",
+                    start.elapsed(),
+                    format!("subscription '{}' does not exist", self.config.subscription),
+                ),
+                Err(e) => Probe::fail("subscription_exists", start.elapsed(), e.to_string()),
+            },
         };
         Ok(CheckReport::single(probe))
     }

@@ -320,6 +320,15 @@ decoded rows, so raise it for throughput and lower it for memory.
 
 Declares `discover`. No exactly-once replay, sharding or columnar path. `faucet list --json` prints these declared capabilities.
 
+## Timeouts, cancellation and retries
+
+Every SQL API request — submit, the `202` status polls, partition fetches —
+runs through the pipeline's `CallContext` (#880): the run's cancel token stops
+an in-flight request or the poll pause (the statement is then cancelled on the
+warehouse), any caller deadline ends it, and each is metered as a round trip
+(`submit`, `poll`, `partition`). The HTTP client's connect / idle-read timeouts
+and `poll_timeout` are unchanged; nothing is retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

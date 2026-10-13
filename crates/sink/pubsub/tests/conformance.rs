@@ -155,3 +155,26 @@ async fn assert_capabilities_truthful_count(
     })
     .await;
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let host = hung.addr().to_string();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || {
+            let mut cfg = PubsubSinkConfig::new("hung-t");
+            cfg.connection = conn(&host);
+            block_on(PubsubSink::new(cfg)).expect("sink builds offline")
+        },
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
+}

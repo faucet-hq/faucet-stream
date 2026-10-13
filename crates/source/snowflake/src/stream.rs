@@ -81,6 +81,8 @@ pub struct SnowflakeSource {
     /// auth; the provider yields a `Bearer` or `Token` credential mapped onto
     /// [`SnowflakeAuth::OAuth`]. Set via [`Self::with_auth_provider`].
     auth_provider: Option<SharedAuthProvider>,
+    /// Backend-call context (#880) every request runs through.
+    calls: faucet_core::CallSlot,
 }
 
 impl SnowflakeSource {
@@ -94,6 +96,7 @@ impl SnowflakeSource {
             client: http_client()?,
             endpoint_base: None,
             auth_provider: None,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -291,15 +294,20 @@ impl SnowflakeSource {
         let (auth, token_type) = self.auth_headers().await?;
 
         let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", &auth)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header("X-Snowflake-Authorization-Token-Type", token_type)
-            .json(&body)
-            .send()
-            .await
+            .calls
+            .call("submit", || async {
+                Ok(self
+                    .client
+                    .post(&url)
+                    .header("Authorization", &auth)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("X-Snowflake-Authorization-Token-Type", token_type)
+                    .json(&body)
+                    .send()
+                    .await)
+            })
+            .await?
             .map_err(|e| FaucetError::Source(format!("Snowflake request failed: {e}")))?;
 
         let status = resp.status();
@@ -332,7 +340,6 @@ impl SnowflakeSource {
 
     /// Poll the same handle as a partition-less GET until the response is
     /// 200 + `code: "090001"`. Used after a 202 from the initial POST.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn poll_until_ready(&self, handle: &str) -> Result<StatementResponse, FaucetError> {
         let url = format!("{}/api/v2/statements/{}", self.base_url(), handle);
         let poll_timeout = self.config.poll_timeout;
@@ -342,13 +349,18 @@ impl SnowflakeSource {
             let (auth, token_type) = self.auth_headers().await?;
             guard.set_auth(auth.clone(), token_type);
             let resp = self
-                .client
-                .get(&url)
-                .header("Authorization", &auth)
-                .header("Accept", "application/json")
-                .header("X-Snowflake-Authorization-Token-Type", token_type)
-                .send()
-                .await
+                .calls
+                .call("poll", || async {
+                    Ok(self
+                        .client
+                        .get(&url)
+                        .header("Authorization", &auth)
+                        .header("Accept", "application/json")
+                        .header("X-Snowflake-Authorization-Token-Type", token_type)
+                        .send()
+                        .await)
+                })
+                .await?
                 .map_err(|e| FaucetError::Source(format!("Snowflake poll request failed: {e}")))?;
 
             let status = resp.status();
@@ -362,7 +374,7 @@ impl SnowflakeSource {
                         poll_timeout.as_secs()
                     )));
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.calls.wait(Duration::from_millis(500)).await?;
                 continue;
             }
             if !status.is_success() {
@@ -389,13 +401,18 @@ impl SnowflakeSource {
         let url = self.partition_url(handle, partition);
         let (auth, token_type) = self.auth_headers().await?;
         let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", &auth)
-            .header("Accept", "application/json")
-            .header("X-Snowflake-Authorization-Token-Type", token_type)
-            .send()
-            .await
+            .calls
+            .call("partition", || async {
+                Ok(self
+                    .client
+                    .get(&url)
+                    .header("Authorization", &auth)
+                    .header("Accept", "application/json")
+                    .header("X-Snowflake-Authorization-Token-Type", token_type)
+                    .send()
+                    .await)
+            })
+            .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
                     "Snowflake partition fetch failed (partition {partition}): {e}"
@@ -563,6 +580,17 @@ impl faucet_core::Source for SnowflakeSource {
         "snowflake"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(SnowflakeSourceConfig))
             .expect("schema serialization")
@@ -655,14 +683,19 @@ impl faucet_core::Source for SnowflakeSource {
                 .map_err(|e| Probe::fail("auth", start.elapsed(), e.to_string()))?;
             let token_type = snowflake_token_type(&effective);
             let resp = self
-                .client
-                .post(&url)
-                .header("Authorization", &auth)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("X-Snowflake-Authorization-Token-Type", token_type)
-                .json(&body)
-                .send()
+                .calls
+                .call("submit", || async {
+                    self.client
+                        .post(&url)
+                        .header("Authorization", &auth)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json")
+                        .header("X-Snowflake-Authorization-Token-Type", token_type)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(FaucetError::from)
+                })
                 .await
                 .map_err(|e| {
                     Probe::fail_hint(

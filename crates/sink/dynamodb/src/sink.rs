@@ -9,6 +9,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use faucet_common_dynamodb::{
     ErrorClass, KeyAttribute, classify_error, json_to_attribute, key_schema, sdk_error_parts,
 };
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome, WriteMode};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -68,6 +69,14 @@ pub(crate) fn row_outcomes(
         .collect()
 }
 
+/// `outcomes` plus every op in `pending` failed with `error` (the call context
+/// ran out before they were confirmed).
+fn fail_all(mut outcomes: Vec<OpOutcome>, pending: Vec<Op>, error: &FaucetError) -> Vec<OpOutcome> {
+    let msg = error.to_string();
+    outcomes.extend(pending.into_iter().map(|op| (op.rows, Err(msg.clone()))));
+    outcomes
+}
+
 /// Amazon DynamoDB sink. See the crate README for semantics.
 pub struct DynamoDbSink {
     config: DynamoDbSinkConfig,
@@ -75,6 +84,7 @@ pub struct DynamoDbSink {
     keys: tokio::sync::OnceCell<(Vec<KeyAttribute>, Vec<String>)>,
     names: Option<HashMap<String, String>>,
     values: Option<HashMap<String, AttributeValue>>,
+    calls: CallSlot,
 }
 
 impl DynamoDbSink {
@@ -108,6 +118,7 @@ impl DynamoDbSink {
             keys: tokio::sync::OnceCell::new(),
             names,
             values,
+            calls: CallSlot::new(CallContext::new()),
         })
     }
 
@@ -116,16 +127,21 @@ impl DynamoDbSink {
         let out = self
             .config
             .retry
-            .run(&what, || async move {
-                self.client
-                    .describe_table()
-                    .table_name(&self.config.table_name)
-                    .send()
-                    .await
-                    .map_err(|e| sdk_error_parts(&e))
-            })
-            .await
-            .map_err(FaucetError::Sink)?;
+            .run_in(
+                &self.calls.get(),
+                "describe_table",
+                &what,
+                FaucetError::Sink,
+                || async move {
+                    self.client
+                        .describe_table()
+                        .table_name(&self.config.table_name)
+                        .send()
+                        .await
+                        .map_err(|e| sdk_error_parts(&e))
+                },
+            )
+            .await?;
         out.table().cloned().ok_or_else(|| {
             FaucetError::Sink(format!(
                 "dynamodb: DescribeTable '{}' returned no table",
@@ -139,7 +155,7 @@ impl DynamoDbSink {
         let (keys, names) = self
             .keys
             .get_or_try_init(|| async {
-                let desc = self.describe().await?;
+                let desc = Box::pin(self.describe()).await?;
                 let keys = key_schema(&desc)?;
                 let names: Vec<String> = keys.iter().map(|k| k.name.clone()).collect();
                 if matches!(
@@ -157,7 +173,7 @@ impl DynamoDbSink {
     /// [`Self::single_write`] with a request failure reported against the op's
     /// rows, so a page never loses the outcomes of rows that already landed.
     async fn single_write_outcome(&self, op: &Op) -> Result<(), String> {
-        match self.single_write(op).await {
+        match Box::pin(self.single_write(op)).await {
             Ok(result) => result,
             Err(e) => Err(e.to_string()),
         }
@@ -171,42 +187,46 @@ impl DynamoDbSink {
         let on_fail = self.config.on_condition_failure;
         self.config
             .retry
-            .run(&what, || async move {
-                let sent = match &op.kind {
-                    OpKind::Put(item) => self
-                        .client
-                        .put_item()
-                        .table_name(table)
-                        .set_item(Some(item.clone()))
-                        .set_condition_expression(self.config.condition_expression.clone())
-                        .set_expression_attribute_names(self.names.clone())
-                        .set_expression_attribute_values(self.values.clone())
-                        .send()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| sdk_error_parts(&e)),
-                    OpKind::Delete(key) => self
-                        .client
-                        .delete_item()
-                        .table_name(table)
-                        .set_key(Some(key.clone()))
-                        .set_condition_expression(self.config.condition_expression.clone())
-                        .set_expression_attribute_names(self.names.clone())
-                        .set_expression_attribute_values(self.values.clone())
-                        .send()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| sdk_error_parts(&e)),
-                };
-                classify_single(sent, on_fail)
-            })
+            .run_in(
+                &self.calls.get(),
+                "write",
+                &what,
+                FaucetError::Sink,
+                || async move {
+                    let sent = match &op.kind {
+                        OpKind::Put(item) => self
+                            .client
+                            .put_item()
+                            .table_name(table)
+                            .set_item(Some(item.clone()))
+                            .set_condition_expression(self.config.condition_expression.clone())
+                            .set_expression_attribute_names(self.names.clone())
+                            .set_expression_attribute_values(self.values.clone())
+                            .send()
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| sdk_error_parts(&e)),
+                        OpKind::Delete(key) => self
+                            .client
+                            .delete_item()
+                            .table_name(table)
+                            .set_key(Some(key.clone()))
+                            .set_condition_expression(self.config.condition_expression.clone())
+                            .set_expression_attribute_names(self.names.clone())
+                            .set_expression_attribute_values(self.values.clone())
+                            .send()
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| sdk_error_parts(&e)),
+                    };
+                    classify_single(sent, on_fail)
+                },
+            )
             .await
-            .map_err(FaucetError::Sink)
     }
 
     /// Send one chunk, retrying unprocessed items; a validation failure falls
     /// back to item-by-item writes so only the bad rows fail.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn batch_chunk(
         &self,
         ops: Vec<Op>,
@@ -217,14 +237,23 @@ impl DynamoDbSink {
         let mut pending = ops;
         let mut outcomes: Vec<OpOutcome> = Vec::new();
         let mut attempt = 0u32;
+        let calls = self.calls.get();
         loop {
-            let requests = pending.iter().map(Op::write_request).collect();
-            let sent = self
-                .client
-                .batch_write_item()
-                .request_items(table.clone(), requests)
-                .send()
+            let requests: Vec<_> = pending.iter().map(Op::write_request).collect();
+            let sent = calls
+                .call("batch_write", || async {
+                    Ok(self
+                        .client
+                        .batch_write_item()
+                        .request_items(table.clone(), requests.clone())
+                        .send()
+                        .await)
+                })
                 .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(spent) => return Ok(fail_all(outcomes, pending, &spent)),
+            };
             match sent {
                 Ok(out) => {
                     let unprocessed: HashSet<String> = out
@@ -248,7 +277,9 @@ impl DynamoDbSink {
                     }
                     tracing::debug!(table = %table, unprocessed = left.len(), attempt,
                         "dynamodb: retrying unprocessed items");
-                    tokio::time::sleep(retry.delay(attempt)).await;
+                    if let Err(spent) = calls.wait(retry.delay(attempt)).await {
+                        return Ok(fail_all(outcomes, left, &spent));
+                    }
                     attempt += 1;
                     pending = left;
                 }
@@ -258,7 +289,7 @@ impl DynamoDbSink {
                         tracing::debug!(table = %table, error = %message,
                             "dynamodb: batch rejected; isolating rows");
                         for op in pending {
-                            let result = self.single_write_outcome(&op).await;
+                            let result = Box::pin(self.single_write_outcome(&op)).await;
                             outcomes.push((op.rows, result));
                         }
                         return Ok(outcomes);
@@ -273,7 +304,9 @@ impl DynamoDbSink {
                         outcomes.extend(pending.into_iter().map(|op| (op.rows, Err(msg.clone()))));
                         return Ok(outcomes);
                     }
-                    tokio::time::sleep(retry.delay(attempt)).await;
+                    if let Err(spent) = calls.wait(retry.delay(attempt)).await {
+                        return Ok(fail_all(outcomes, pending, &spent));
+                    }
                     attempt += 1;
                 }
             }
@@ -296,9 +329,12 @@ impl DynamoDbSink {
             return Ok(outcomes);
         }
         let chunks = chunk_ops(ops, self.config.items_per_request());
-        let mut stream =
-            futures::stream::iter(chunks.into_iter().map(|c| self.batch_chunk(c, keys)))
-                .buffer_unordered(self.config.concurrency);
+        let mut stream = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Box::pin(self.batch_chunk(c, keys))),
+        )
+        .buffer_unordered(self.config.concurrency);
         while let Some(r) = stream.next().await {
             outcomes.extend(r?);
         }
@@ -395,6 +431,17 @@ impl faucet_core::Sink for DynamoDbSink {
 
     fn connector_name(&self) -> &'static str {
         "dynamodb"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -588,6 +635,7 @@ mod tests {
             keys,
             names: None,
             values: None,
+            calls: CallSlot::default(),
         }
     }
 

@@ -77,3 +77,12 @@ A fractional number bound for an integer column (`10.5` into a `long`) fails the
 ## Capabilities
 
 Declares `append` only and `schema_report: drops_unknown_fields` (fields the table lacks are warned about and dropped, so `on_drift: fail` is refused), plus columnar (Arrow) input when built with the `arrow` feature. `faucet list --json` prints these declared capabilities.
+
+## Timeouts, cancellation and retries
+
+The table open, every buffered write and the commit run through the
+pipeline's `CallContext` (#880): each is made once, any caller deadline ends it,
+and each is metered as a round trip (`open`, `write`, `commit`). A failed or
+cut-short commit poisons the sink for the rest of the run — the buffered rows
+are gone, so the run fails and the page is replayed rather than reported
+written.

@@ -392,6 +392,15 @@ This crate has no optional features of its own. Enable it in the CLI/umbrella vi
 
 The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Connects, unary calls, every streamed message and every reconnect backoff run
+through the pipeline's `CallContext` (#880): the run's cancel token stops a
+stalled call or read, any caller deadline ends it (a server stream is not
+reconnected after that), and unary calls and stream opens are metered as round
+trips (`call`, `open`). `timeout`, `connect_timeout`, `idle_timeout` and the
+reconnect policy are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -52,6 +52,10 @@ pub struct BigQuerySource {
     /// `query` (`jobs.query`), `poll` (`jobs.getQueryResults`), `job`
     /// (`jobs.get`). Cost signal: `bytes_processed` (bytes) per query.
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): every request runs through it for the
+    /// run's timeout, deadline and cancel. Round trips stay counted by
+    /// `roundtrips`, so the slot does not meter them a second time.
+    calls: faucet_core::CallSlot,
     /// The client's token provider, when the source built the client.
     tokens: Option<TokenProvider>,
     /// `jobs.getQueryResults` reader with integer-microsecond timestamps,
@@ -59,7 +63,35 @@ pub struct BigQuerySource {
     results: tokio::sync::OnceCell<QueryResultsReader>,
 }
 
+/// The source's call slot: the default attempt timeout, no retry, and no
+/// round-trip metering (the `roundtrips` slot counts them).
+fn call_slot() -> faucet_core::CallSlot {
+    faucet_core::CallSlot::new(faucet_core::CallContext::new().with_roundtrip_metering(false))
+}
+
 impl BigQuerySource {
+    /// The effective call context (#880), for the Storage Read path.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn call_context(&self) -> faucet_core::CallContext {
+        self.calls.get()
+    }
+
+    /// `jobs.query` for `req` as one backend call.
+    async fn run_query(&self, req: &QueryRequest) -> Result<QueryResponse, FaucetError> {
+        self.calls
+            .call("query", || async {
+                faucet_common_bigquery::raw::tolerant_query(
+                    &self.client,
+                    self.raw_target(),
+                    &self.config.project_id,
+                    req.clone(),
+                )
+                .await
+                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))
+            })
+            .await
+    }
+
     /// Where schema-tolerant fallback requests go (SQL-172).
     fn raw_target(&self) -> faucet_common_bigquery::raw::RawTarget<'_> {
         faucet_common_bigquery::raw::RawTarget {
@@ -95,6 +127,7 @@ impl BigQuerySource {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: call_slot(),
             tokens: Some(tokens),
             results: tokio::sync::OnceCell::new(),
         })
@@ -143,7 +176,6 @@ impl BigQuerySource {
     /// The query is run to completion first: the destination table only exists
     /// (and only has rows) once the job is DONE.
     #[cfg(feature = "arrow")]
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     pub(crate) async fn query_destination_table(
         &self,
         context: &HashMap<String, Value>,
@@ -151,14 +183,7 @@ impl BigQuerySource {
         let (query, bindings) = self.resolve_query(context);
         let req = self.build_query_request(query, &bindings);
         self.roundtrips.record("query");
-        let initial = faucet_common_bigquery::raw::tolerant_query(
-            &self.client,
-            self.raw_target(),
-            &self.config.project_id,
-            req,
-        )
-        .await
-        .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let initial = self.run_query(&req).await?;
         self.signal_bytes_processed(&initial);
         let job_ref = initial.job_reference.as_ref().ok_or_else(|| {
             FaucetError::Source("BigQuery jobs.query returned no jobReference".into())
@@ -169,15 +194,20 @@ impl BigQuerySource {
         let poll_started = std::time::Instant::now();
         let job = loop {
             self.roundtrips.record("job");
-            let job = faucet_common_bigquery::raw::tolerant_get_job(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                job_id,
-                job_ref.location.as_deref(),
-            )
-            .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
+            let job = self
+                .calls
+                .call("job", || async {
+                    faucet_common_bigquery::raw::tolerant_get_job(
+                        &self.client,
+                        self.raw_target(),
+                        &self.config.project_id,
+                        job_id,
+                        job_ref.location.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))
+                })
+                .await?;
             if job_finished(job.status.as_ref(), job_id)? {
                 break job;
             }
@@ -188,7 +218,7 @@ impl BigQuerySource {
                     poll_timeout.as_secs()
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.calls.wait(Duration::from_millis(200)).await?;
         };
         let dest = job
             .configuration
@@ -236,6 +266,7 @@ impl BigQuerySource {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: call_slot(),
             tokens: None,
             results: tokio::sync::OnceCell::new(),
         }
@@ -276,10 +307,16 @@ impl BigQuerySource {
                 QueryResultsReader::new(tokens, self.config.api_host.clone())
             })
             .await?;
-        reader
-            .get(&self.config.project_id, job_id, params)
+        self.calls
+            .call("poll", || async {
+                reader
+                    .get(&self.config.project_id, job_id, params.clone())
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
+                    })
+            })
             .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}")))
     }
 
     /// Resolve the final SQL statement and ordered bind values for a given
@@ -320,16 +357,21 @@ impl BigQuerySource {
         let mut dataset_ids: Vec<String> = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let mut opts = DatasetListOptions::default();
-            if let Some(t) = page_token.take() {
-                opts = opts.page_token(t);
-            }
+            let token = page_token.take();
             let resp = self
-                .client
-                .dataset()
-                .list(project, opts)
-                .await
-                .map_err(discovery_err)?;
+                .calls
+                .call("discover", || async {
+                    let mut opts = DatasetListOptions::default();
+                    if let Some(t) = token.clone() {
+                        opts = opts.page_token(t);
+                    }
+                    self.client
+                        .dataset()
+                        .list(project, opts)
+                        .await
+                        .map_err(discovery_err)
+                })
+                .await?;
             dataset_ids.extend(
                 resp.datasets
                     .iter()
@@ -347,16 +389,21 @@ impl BigQuerySource {
         'datasets: for dataset_id in &dataset_ids {
             let mut page_token: Option<String> = None;
             loop {
-                let mut opts = TableListOptions::default();
-                if let Some(t) = page_token.take() {
-                    opts = opts.page_token(t);
-                }
+                let token = page_token.take();
                 let resp = self
-                    .client
-                    .table()
-                    .list(project, dataset_id, opts)
-                    .await
-                    .map_err(discovery_err)?;
+                    .calls
+                    .call("discover", || async {
+                        let mut opts = TableListOptions::default();
+                        if let Some(t) = token.clone() {
+                            opts = opts.page_token(t);
+                        }
+                        self.client
+                            .table()
+                            .list(project, dataset_id, opts)
+                            .await
+                            .map_err(discovery_err)
+                    })
+                    .await?;
                 for table in resp.tables.unwrap_or_default() {
                     // Physical tables only — views / materialized views /
                     // external tables are not `SELECT *`-scannable datasets in
@@ -399,15 +446,20 @@ impl BigQuerySource {
         let mut out = Vec::with_capacity(refs.len());
         for (i, (dataset_id, table_id)) in refs.iter().enumerate() {
             if i < max_schema_fetches {
-                let table = faucet_common_bigquery::raw::tolerant_get_table(
-                    &self.client,
-                    self.raw_target(),
-                    project,
-                    dataset_id,
-                    table_id,
-                )
-                .await
-                .map_err(discovery_err)?;
+                let table = self
+                    .calls
+                    .call("discover", || async {
+                        faucet_common_bigquery::raw::tolerant_get_table(
+                            &self.client,
+                            self.raw_target(),
+                            project,
+                            dataset_id,
+                            table_id,
+                        )
+                        .await
+                        .map_err(discovery_err)
+                    })
+                    .await?;
                 let fields = table.schema.fields.unwrap_or_default();
                 out.push(table_descriptor(
                     project,
@@ -623,8 +675,14 @@ impl faucet_core::Source for BigQuerySource {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
     }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
     fn connector_name(&self) -> &'static str {
         "bigquery"
     }
@@ -674,14 +732,7 @@ impl faucet_core::Source for BigQuerySource {
 
         let probe = async {
             self.roundtrips.record("query");
-            match faucet_common_bigquery::raw::tolerant_query(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                req,
-            )
-            .await
-            {
+            match self.run_query(&req).await {
                 Ok(_) => Ok::<Probe, Probe>(Probe::pass("query", start.elapsed())),
                 Err(e) => Err(Probe::fail_hint(
                     "query",
@@ -703,7 +754,6 @@ impl faucet_core::Source for BigQuerySource {
         Ok(CheckReport::single(probe))
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -713,14 +763,7 @@ impl faucet_core::Source for BigQuerySource {
 
         self.roundtrips.record("query");
 
-        let initial = faucet_common_bigquery::raw::tolerant_query(
-            &self.client,
-            self.raw_target(),
-            &self.config.project_id,
-            req,
-        )
-        .await
-        .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let initial = self.run_query(&req).await?;
 
         self.signal_bytes_processed(&initial);
 
@@ -757,7 +800,7 @@ impl faucet_core::Source for BigQuerySource {
                         poll_timeout.as_secs()
                     )));
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.calls.wait(Duration::from_millis(200)).await?;
                 continue;
             }
 
@@ -818,7 +861,6 @@ impl faucet_core::Source for BigQuerySource {
         crate::storage_read::stream_batches_arrow_with(self, context)
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
@@ -839,9 +881,7 @@ impl faucet_core::Source for BigQuerySource {
 
             self.roundtrips.record("query");
 
-            let initial = faucet_common_bigquery::raw::tolerant_query(&self.client, self.raw_target(), &self.config.project_id, req)
-                .await
-                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+            let initial = self.run_query(&req).await?;
 
             self.signal_bytes_processed(&initial);
 
@@ -892,7 +932,7 @@ impl faucet_core::Source for BigQuerySource {
                             poll_timeout.as_secs()
                         )))?;
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    self.calls.wait(Duration::from_millis(200)).await?;
                     continue;
                 }
 

@@ -38,6 +38,8 @@ pub struct DatabricksSource {
     auth_provider: Option<SharedAuthProvider>,
     /// Bookmark applied via [`Source::apply_start_bookmark`].
     start_bookmark: Mutex<Option<Value>>,
+    /// Backend-call context (#880) every request runs through.
+    calls: faucet_core::CallSlot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +98,7 @@ impl DatabricksSource {
             endpoint_base: None,
             auth_provider: None,
             start_bookmark: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -147,6 +150,7 @@ impl DatabricksSource {
             },
             ErrorSide::Source,
         )
+        .with_call_context(self.calls.get())
     }
 
     /// The effective incremental start bookmark (persisted bookmark, else the
@@ -295,9 +299,14 @@ impl DatabricksSource {
     /// it is fetched **without** an `Authorization` header (adding one breaks
     /// the signature).
     async fn get_external(&self, url: &str) -> Result<reqwest::Response, FaucetError> {
-        let resp = self.client.get(url).send().await.map_err(|e| {
-            FaucetError::Source(format!("databricks: external-link request failed: {e}"))
-        })?;
+        let resp = self
+            .calls
+            .call("chunk", || async {
+                self.client.get(url).send().await.map_err(|e| {
+                    FaucetError::Source(format!("databricks: external-link request failed: {e}"))
+                })
+            })
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -376,6 +385,17 @@ impl Source for DatabricksSource {
 
     fn connector_name(&self) -> &'static str {
         "databricks"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -609,13 +629,17 @@ impl Source for DatabricksSource {
             "disposition": "INLINE",
             "format": "JSON_ARRAY",
         });
-        let fut = self
-            .client
-            .post(self.statements_url())
-            .header("Authorization", &auth)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send();
+        let calls = self.calls.get().with_timeout(ctx.timeout);
+        let fut = calls.call("submit", || async {
+            self.client
+                .post(self.statements_url())
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(FaucetError::from)
+        });
         let probe = match tokio::time::timeout(ctx.timeout, fut).await {
             Ok(Ok(r)) if r.status().is_success() => Probe::pass("warehouse", started.elapsed()),
             Ok(Ok(r)) => Probe::fail_hint(

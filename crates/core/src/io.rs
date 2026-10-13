@@ -548,12 +548,113 @@ impl CallSlot {
         self.get().call(op, f).await
     }
 
-    /// Run `fut` once through the effective context ([`CallContext::call_once`]).
+    /// Run `fut` once through the effective context
+    /// ([`CallContext::call_once`]).
     pub async fn call_once<T, Fut>(&self, op: &'static str, fut: Fut) -> Result<T, FaucetError>
     where
         Fut: Future<Output = Result<T, FaucetError>>,
     {
         self.get().call_once(op, fut).await
+    }
+}
+
+/// Run any future as a one-shot backend call: `client.send().within(&slot,
+/// "put").await?` is [`CallSlot::call_once`] for a future whose output is not
+/// a [`FaucetError`] result (an SDK response), handing that output back
+/// untouched. The outer `Result` is the call context running out — the
+/// deadline or the cancel token.
+pub trait CallExt: Future + Send + Sized {
+    /// `self` as the call `op` through `slot`'s effective context.
+    fn within<'a>(
+        self,
+        slot: &'a CallSlot,
+        op: &'static str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Self::Output, FaucetError>> + Send + 'a>>
+    where
+        Self: 'a,
+        Self::Output: Send,
+    {
+        Box::pin(slot.call_once(op, async move { Ok(self.await) }))
+    }
+
+    /// [`within`](Self::within) through a [`CallContext`].
+    fn within_ctx<'a>(
+        self,
+        ctx: &'a CallContext,
+        op: &'static str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Self::Output, FaucetError>> + Send + 'a>>
+    where
+        Self: 'a,
+        Self::Output: Send,
+    {
+        Box::pin(ctx.call_once(op, async move { Ok(self.await) }))
+    }
+}
+
+impl<F: Future + Send> CallExt for F {}
+
+/// A streamed response body read under a [`CallContext`]: every read fails
+/// once the context's cancel token fires or its deadline passes, so a body
+/// that stops arriving mid-stream ends like any other call. Built with
+/// [`CallContext::reader`].
+pub struct CallReader<R> {
+    inner: R,
+    cancel: Option<std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>>,
+    deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<R> fmt::Debug for CallReader<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallReader")
+            .field("cancel", &self.cancel.is_some())
+            .field("deadline", &self.deadline.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallContext {
+    /// `inner` read under this context ([`CallReader`]).
+    #[allow(clippy::disallowed_methods)] // the deadline timer of a read, not a wait
+    pub fn reader<R>(&self, inner: R) -> CallReader<R> {
+        CallReader {
+            inner,
+            cancel: self
+                .inner
+                .cancel
+                .clone()
+                .map(|c| Box::pin(c.cancelled_owned())),
+            deadline: self
+                .inner
+                .deadline
+                .map(|d| Box::pin(tokio::time::sleep_until(d))),
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CallReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        if let Some(c) = self.cancel.as_mut()
+            && c.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                cancelled_error("read"),
+            )));
+        }
+        if let Some(d) = self.deadline.as_mut()
+            && d.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                deadline_error("read"),
+            )));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -637,6 +738,73 @@ mod tests {
             Err(FaucetError::HttpStatus { status: 503, .. })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_once_bounds_a_one_shot_future_and_never_retries() {
+        let ctx = CallContext::new()
+            .with_timeout(Duration::from_secs(1))
+            .with_retry(fast(3));
+        let polls = AtomicU32::new(0);
+        let r: Result<(), _> = ctx
+            .call_once("read", async {
+                polls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            })
+            .await;
+        assert!(matches!(r, Err(FaucetError::Timeout { .. })), "{r:?}");
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "never retried");
+
+        let r = ctx
+            .call_once("read", async { Err::<(), _>(status(503)) })
+            .await;
+        assert!(matches!(
+            r,
+            Err(FaucetError::HttpStatus { status: 503, .. })
+        ));
+
+        let slot = CallSlot::new(CallContext::new());
+        let cancel = CancellationToken::new();
+        slot.install(CallContext::new().with_cancel(cancel.clone()));
+        assert_eq!(slot.call_once("read", async { Ok(5) }).await.unwrap(), 5);
+        cancel.cancel();
+        let r = slot.call_once("read", async { Ok(5) }).await;
+        assert!(matches!(r, Err(FaucetError::Cancelled { .. })), "{r:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn within_hands_back_the_output_or_the_spent_context() {
+        let slot = CallSlot::new(CallContext::new().with_timeout(Duration::from_secs(1)));
+        let out: Result<u8, &str> = async { Err("sdk") }.within(&slot, "put").await.unwrap();
+        assert_eq!(out, Err("sdk"));
+        let hung = std::future::pending::<u8>().within(&slot, "put").await;
+        assert!(matches!(hung, Err(FaucetError::Timeout { .. })), "{hung:?}");
+        let ctx = CallContext::new();
+        assert_eq!(async { 3 }.within_ctx(&ctx, "get").await.unwrap(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_fails_at_the_deadline_and_on_cancel() {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut plain = CallContext::new().reader(&b"abc"[..]);
+        plain.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"abc");
+        assert!(format!("{plain:?}").contains("CallReader"));
+
+        let (_tx, rx) = tokio::io::duplex(8);
+        let ctx = CallContext::new().with_deadline(Instant::now() + Duration::from_secs(1));
+        let mut stalled = ctx.reader(rx);
+        let err = stalled.read_to_end(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        let (_tx, rx) = tokio::io::duplex(8);
+        let cancel = CancellationToken::new();
+        let mut stalled = CallContext::new().with_cancel(cancel.clone()).reader(rx);
+        cancel.cancel();
+        let err = stalled.read_to_end(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 
     #[tokio::test]

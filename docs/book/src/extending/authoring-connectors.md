@@ -424,6 +424,19 @@ repair what it left behind: replace the connection, interrupt the query.
 A sink's context never carries the run's cancel token — a cancelled run still
 flushes its sinks — and neither side gets a retry policy from the pipeline.
 
+When a call cannot be rebuilt for a retry (a write, a request that consumes a
+body, an SDK future), use the one-shot forms. They apply the timeout, the
+deadline and the cancel token and count the round trip, but never retry:
+
+- `slot.call_once("put", fut)` / `ctx.call_once("put", fut)` for a future
+  returning `Result<T, FaucetError>`;
+- `fut.within(&slot, "put")` / `fut.within_ctx(&ctx, "put")`
+  (`faucet_core::CallExt`) for any other future — an SDK call whose error you
+  map afterwards;
+- `ctx.reader(inner)` wraps an `AsyncRead` (a streamed object body, a child
+  process pipe) so a read that stalls ends at the deadline (`TimedOut`) or on
+  cancel (`Interrupted`) instead of hanging.
+
 ### Retries and writes
 
 - **Reads and other idempotent calls** retry through your context's policy.
@@ -475,7 +488,12 @@ Prove it: call
 `faucet_conformance::calls::assert_source_call_deadline` (or
 `assert_sink_call_deadline`) from your `tests/conformance.rs` against a backend
 that never answers (a wiremock server with a long `set_delay`); it checks the
-call ends at the deadline and on cancel.
+call ends at the deadline and on cancel. For a non-HTTP protocol,
+`faucet_conformance::hung::SilentListener` accepts connections and never
+writes a byte, and `HangingProxy` forwards to a real backend (an emulator)
+until you call `hang()`, so a client that connects in `new()` can be built
+first and then stalled. A connector with no backend round trip (a local file)
+is listed with its reason in `crates/conformance/call-deadline-exempt.txt`.
 
 ## Make it fast
 

@@ -88,6 +88,14 @@ table key schema. Nothing is written.
 
 Declares `write_mode: append | upsert | delete` and keyed upsert; it dedups by key only when the config sets `write_mode: upsert|delete` with a `key`. No idempotent writes, cleanup or schema evolution. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every request runs through the pipeline's `CallContext` (#880): each attempt is
+bounded by the default 300 s call timeout and any caller deadline, and metered as
+a round trip (`batch_write`, `write`, `describe_table`). The unprocessed-item and
+throttle retry (the `retry:` block) is unchanged; its backoffs wait through the
+same context, so a deadline ends them and the rows not yet confirmed fail.
+
 ## License
 
 MIT OR Apache-2.0

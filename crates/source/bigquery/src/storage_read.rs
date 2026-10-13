@@ -122,6 +122,30 @@ async fn within<F: std::future::Future>(fut: F, what: &str) -> Result<F::Output,
     within_for(GRPC_IDLE_TIMEOUT, fut, what).await
 }
 
+/// `fut` as one `op` backend call through `calls` (#880) — ended by the run's
+/// cancel token and deadline — and bounded by [`GRPC_IDLE_TIMEOUT`].
+async fn call<F: std::future::Future>(
+    calls: &faucet_core::CallContext,
+    op: &'static str,
+    fut: F,
+    what: &str,
+) -> Result<F::Output, FaucetError> {
+    let mut once = Some(within(fut, what));
+    calls
+        .call(op, || {
+            let attempt = once.take();
+            async move {
+                match attempt {
+                    Some(f) => f.await,
+                    None => Err(FaucetError::Source(format!(
+                        "BigQuery Storage Read {what}: a streaming call cannot be retried"
+                    ))),
+                }
+            }
+        })
+        .await
+}
+
 async fn within_for<F: std::future::Future>(
     limit: std::time::Duration,
     fut: F,
@@ -141,16 +165,22 @@ fn read_batches<'a>(
     context: &'a HashMap<String, Value>,
 ) -> impl Stream<Item = Result<RecordBatch, FaucetError>> + Send + 'a {
     let cfg = src.config();
+    let calls = src.call_context().without_retry();
     async_stream::try_stream! {
         let env = build_environment(&cfg.auth).await?;
-        let cm = ConnectionManager::new(
-            1,
-            STORAGE_DOMAIN,
-            STORAGE_AUDIENCE,
-            &env,
-            &ConnectionOptions::default(),
+        let cm = call(
+            &calls,
+            "connect",
+            ConnectionManager::new(
+                1,
+                STORAGE_DOMAIN,
+                STORAGE_AUDIENCE,
+                &env,
+                &ConnectionOptions::default(),
+            ),
+            "connect",
         )
-        .await
+        .await?
         .map_err(|e| FaucetError::Source(format!("BigQuery Storage Read connect: {e}")))?;
         let mut client = BigQueryReadClient::new(cm.conn()).max_decoding_message_size(MAX_DECODE_BYTES);
 
@@ -179,7 +209,7 @@ fn read_batches<'a>(
             max_stream_count: cfg.max_streams.max(1),
             ..Default::default()
         };
-        let created = within(client.create_read_session(request), "CreateReadSession")
+        let created = call(&calls, "read_session", client.create_read_session(request), "CreateReadSession")
             .await?
             .map_err(|e| FaucetError::Source(format!("BigQuery CreateReadSession failed: {e}")))?
             .into_inner();
@@ -199,9 +229,10 @@ fn read_batches<'a>(
         for stream in &created.streams {
             let mut client = client.clone();
             let name = stream.name.clone();
+            let calls = calls.clone();
             readers.push(Box::pin(async_stream::try_stream! {
                 let rr = ReadRowsRequest { read_stream: name, offset: 0 };
-                let mut responses = within(client.read_rows(rr), "ReadRows")
+                let mut responses = call(&calls, "read_rows", client.read_rows(rr), "ReadRows")
                     .await?
                     .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows failed: {e}")))?
                     .into_inner();
@@ -209,7 +240,7 @@ fn read_batches<'a>(
                 // own schema, and a batch decoded against a neighbour's schema
                 // would be silently wrong rather than an error.
                 let mut schema_bytes: Option<Vec<u8>> = None;
-                while let Some(msg) = within(responses.message(), "ReadRows message")
+                while let Some(msg) = call(&calls, "read_rows", responses.message(), "ReadRows message")
                     .await?
                     .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows stream error: {e}")))?
                 {

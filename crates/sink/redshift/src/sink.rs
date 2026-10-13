@@ -43,9 +43,21 @@ pub struct RedshiftSink {
     pool: PgPool,
     /// S3 client, built only for the `copy` strategy.
     s3: Option<S3Client>,
+    /// Backend-call context (#880): every statement and staging request runs
+    /// through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 impl RedshiftSink {
+    /// Run `fut` as the single backend call `op` (#880).
+    async fn call<T>(
+        &self,
+        op: &'static str,
+        fut: impl std::future::Future<Output = Result<T, FaucetError>>,
+    ) -> Result<T, FaucetError> {
+        faucet_common_redshift::calls::once(&self.calls.get(), op, fut).await
+    }
+
     /// Load one accumulated group, still re-chunked to `batch_size` so a
     /// single staged object / `INSERT` statement stays a reasonable size
     /// (#617).
@@ -107,16 +119,20 @@ impl RedshiftSink {
             return Ok(());
         }
         if !self.config.create_table {
-            let exists: Option<i32> = sqlx::query_scalar(&format!(
-                "SELECT 1 FROM pg_catalog.pg_class c \
-                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE {TARGET_RELATION} LIMIT 1"
-            ))
-            .bind(&self.config.table_name)
-            .bind(self.config.schema.as_deref())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("redshift table probe failed: {e}")))?;
+            let exists: Option<i32> = self
+                .call("query", async {
+                    sqlx::query_scalar(&format!(
+                        "SELECT 1 FROM pg_catalog.pg_class c \
+                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE {TARGET_RELATION} LIMIT 1"
+                    ))
+                    .bind(&self.config.table_name)
+                    .bind(self.config.schema.as_deref())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("redshift table probe failed: {e}")))
+                })
+                .await?;
             if exists.is_none() {
                 return Err(faucet_core::missing_target_error(
                     "redshift sink",
@@ -132,19 +148,26 @@ impl RedshiftSink {
             return Ok(());
         };
         if let Some(schema) = self.config.schema.as_deref() {
-            sqlx::query(&format!(
+            let sql = format!(
                 "CREATE SCHEMA IF NOT EXISTS {}",
                 faucet_core::util::quote_ident(schema)
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("redshift CREATE SCHEMA failed: {e}")))?;
+            );
+            self.call("execute", async {
+                sqlx::query(&sql)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("redshift CREATE SCHEMA failed: {e}")))
+            })
+            .await?;
         }
         let sql = build_create_table_sql(&self.table_ref(), &columns);
-        sqlx::query(&sql)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("redshift CREATE TABLE failed: {e}")))?;
+        self.call("execute", async {
+            sqlx::query(&sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("redshift CREATE TABLE failed: {e}")))
+        })
+        .await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -180,16 +203,27 @@ impl RedshiftSink {
                 continue;
             };
             let sql = crate::copy::add_column_sql(&self.table_ref(), col);
-            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+            let added = self
+                .call("execute", async {
+                    sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
+                        FaucetError::Sink(format!("redshift: ALTER TABLE ADD COLUMN failed: {e}"))
+                    })
+                })
+                .await;
+            if let Err(e) = added {
+                if matches!(
+                    e,
+                    FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
+                ) {
+                    return Err(e);
+                }
                 // A concurrent writer may have added it first.
                 if !self
                     .lowercased_columns()
                     .await?
                     .contains(&name.to_lowercase())
                 {
-                    return Err(FaucetError::Sink(format!(
-                        "redshift: ALTER TABLE ADD COLUMN failed: {e}"
-                    )));
+                    return Err(e);
                 }
             }
             cols.insert(name.to_lowercase());
@@ -227,6 +261,11 @@ impl RedshiftSink {
             config,
             pool,
             s3,
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -258,18 +297,22 @@ impl RedshiftSink {
     /// by the `insert` path and the CSV `copy` path (both need the column
     /// set/order).
     async fn discover_columns(&self) -> Result<Vec<String>, FaucetError> {
-        let rows = sqlx::query(&format!(
-            "SELECT a.attname::text AS column_name FROM pg_catalog.pg_attribute a \
-             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE {TARGET_RELATION} AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum"
-        ))
-        .bind(&self.config.table_name)
-        .bind(self.config.schema.as_deref())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("redshift: column discovery failed: {e}")))?;
+        let rows = self
+            .call("query", async {
+                sqlx::query(&format!(
+                    "SELECT a.attname::text AS column_name FROM pg_catalog.pg_attribute a \
+                     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE {TARGET_RELATION} AND a.attnum > 0 AND NOT a.attisdropped \
+                     ORDER BY a.attnum"
+                ))
+                .bind(&self.config.table_name)
+                .bind(self.config.schema.as_deref())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("redshift: column discovery failed: {e}")))
+            })
+            .await?;
 
         let cols: Vec<String> = rows
             .iter()
@@ -331,15 +374,18 @@ impl RedshiftSink {
         let key = self.staging_key(ext);
 
         // 1. Upload the staged object.
-        s3.put_object()
-            .bucket(bucket)
-            .key(&key)
-            .body(body.into())
-            .send()
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!("redshift: S3 upload failed for key '{key}': {e}"))
-            })?;
+        self.call("stage", async {
+            s3.put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(body.into())
+                .send()
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("redshift: S3 upload failed for key '{key}': {e}"))
+                })
+        })
+        .await?;
 
         // 2. COPY it into the table.
         let sql = copy_statement(
@@ -350,15 +396,32 @@ impl RedshiftSink {
             copy_cfg.region.as_deref(),
             copy_cfg.format,
         );
-        let copy_result = sqlx::query(&sql).execute(&self.pool).await;
+        let copy_result = self
+            .call("execute", async {
+                sqlx::query(&sql)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("redshift: COPY failed: {e}")))
+            })
+            .await;
 
         // 3. Best-effort cleanup of the staged object (regardless of COPY
         //    outcome — a failed COPY still leaves the object behind).
-        if let Err(e) = s3.delete_object().bucket(bucket).key(&key).send().await {
+        let deleted = self
+            .call("stage", async {
+                s3.delete_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| FaucetError::Sink(e.to_string()))
+            })
+            .await;
+        if let Err(e) = deleted {
             tracing::warn!(key = %key, error = %e, "redshift: failed to delete staged S3 object (best-effort)");
         }
 
-        copy_result.map_err(|e| FaucetError::Sink(format!("redshift: COPY failed: {e}")))?;
+        copy_result?;
         Ok(records.len())
     }
 
@@ -421,9 +484,12 @@ impl RedshiftSink {
                     q = bind_json(q, crate::copy::field(obj, col), col)?;
                 }
             }
-            q.execute(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("redshift: INSERT failed: {e}")))?;
+            self.call("execute", async {
+                q.execute(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("redshift: INSERT failed: {e}")))
+            })
+            .await?;
             total += sub.len();
         }
         Ok(total)
@@ -508,6 +574,17 @@ impl faucet_core::Sink for RedshiftSink {
 
     fn connector_name(&self) -> &'static str {
         "redshift"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     /// Redshift bulk-loads via `COPY … FROM 's3://…'` under `write_strategy: copy`
@@ -621,24 +698,27 @@ impl faucet_core::Sink for RedshiftSink {
         use faucet_core::check::{CheckReport, Probe};
 
         let started = std::time::Instant::now();
-        let probe =
-            match tokio::time::timeout(ctx.timeout, sqlx::query("SELECT 1").execute(&self.pool))
+        let ping = self.call("query", async {
+            sqlx::query("SELECT 1")
+                .execute(&self.pool)
                 .await
-            {
-                Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
-                Ok(Err(e)) => Probe::fail_hint(
-                    "auth",
-                    started.elapsed(),
-                    e.to_string(),
-                    "check host/port/database/user/credentials and that the cluster is reachable",
-                ),
-                Err(_) => Probe::fail_hint(
-                    "auth",
-                    started.elapsed(),
-                    "timed out",
-                    "check host/port/database/user/credentials and that the cluster is reachable",
-                ),
-            };
+                .map_err(|e| FaucetError::Sink(e.to_string()))
+        });
+        let probe = match tokio::time::timeout(ctx.timeout, ping).await {
+            Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check host/port/database/user/credentials and that the cluster is reachable",
+            ),
+            Err(_) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                "timed out",
+                "check host/port/database/user/credentials and that the cluster is reachable",
+            ),
+        };
         Ok(CheckReport::single(probe))
     }
 }

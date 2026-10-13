@@ -88,6 +88,7 @@ pub mod containers;
 pub mod doubles;
 pub mod fidelity;
 pub mod forwarding;
+pub mod hung;
 pub mod scripted;
 
 use std::collections::HashMap;

@@ -126,3 +126,12 @@ License: MIT OR Apache-2.0.
 ## Capabilities
 
 Declares columnar (Arrow) output only when the crate is built with the `arrow` feature and the config sets `arrow_native: true`; otherwise it declares nothing. `faucet list --json` prints these declared capabilities.
+
+## Timeouts, cancellation and retries
+
+Every request — statement submit and polls, result chunks, presigned
+external links — runs through the pipeline's `CallContext` (#880): the run's
+cancel token stops an in-flight request or poll (an abandoned statement is
+cancelled on the warehouse), any caller deadline ends it, and each is metered as
+a round trip (`submit`, `poll`, `chunk`). The HTTP client's connect / idle-read
+timeouts, `statement_timeout_secs` and the `429` / `503` retry are unchanged.

@@ -46,10 +46,32 @@ pub fn spawn_retrying<T>(
 /// Spawn `command`, retrying a transient `ETXTBSY` (see the module docs).
 ///
 /// The wait between attempts blocks the calling thread; it only happens on the
-/// `ETXTBSY` path and totals at most 150 ms.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
+/// `ETXTBSY` path and totals at most 150 ms. Async callers use
+/// [`spawn_command_in`].
+#[allow(clippy::disallowed_methods)] // a synchronous API: at most 150 ms, only on ETXTBSY
 pub fn spawn_command(command: &mut tokio::process::Command) -> io::Result<tokio::process::Child> {
     spawn_retrying(|| command.spawn(), std::thread::sleep)
+}
+
+/// [`spawn_command`] without blocking the thread: the `ETXTBSY` backoff waits
+/// through `calls` (#880), so the run's cancel token or deadline ends it.
+pub async fn spawn_command_in(
+    command: &mut tokio::process::Command,
+    calls: &faucet_core::CallContext,
+) -> io::Result<tokio::process::Child> {
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(e) if is_text_file_busy(&e) && attempt < SPAWN_ATTEMPTS => {
+                calls
+                    .wait(spawn_backoff(attempt))
+                    .await
+                    .map_err(io::Error::other)?;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -76,6 +98,17 @@ mod tests {
     #[test]
     fn raw_etxtbsy_maps_to_text_file_busy() {
         assert!(is_text_file_busy(&io::Error::from_raw_os_error(26)));
+    }
+
+    #[tokio::test]
+    async fn the_async_spawn_reports_a_missing_executable_and_a_spent_context() {
+        let ctx = faucet_core::CallContext::new();
+        let mut missing = tokio::process::Command::new("/nonexistent/faucet-singer-tap");
+        let err = spawn_command_in(&mut missing, &ctx).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let mut ok = tokio::process::Command::new("true");
+        let mut child = spawn_command_in(&mut ok, &ctx).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
     }
 
     #[test]

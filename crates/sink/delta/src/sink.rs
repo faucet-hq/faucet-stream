@@ -26,6 +26,7 @@ use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
 use faucet_common_delta::convert::infer_delta_schema;
+use faucet_core::CallExt as _;
 use faucet_core::{FaucetError, WriteMode};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -36,6 +37,9 @@ use crate::config::DeltaSinkConfig;
 pub struct DeltaSink {
     config: DeltaSinkConfig,
     state: Mutex<SinkState>,
+    /// Backend-call context (#880): the table open, buffered writes and the
+    /// commit run through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 /// Mutable per-run state, guarded by a `Mutex` so `write_batch(&self, …)` can
@@ -108,6 +112,11 @@ impl DeltaSink {
         Ok(Self {
             config,
             state: Mutex::new(SinkState::new()),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -121,7 +130,10 @@ impl DeltaSink {
     ) -> Result<(), FaucetError> {
         if state.schema.is_none() {
             if state.table.is_none() {
-                state.table = self.config.connection.open_optional().await?;
+                state.table = self
+                    .calls
+                    .call_once("open", self.config.connection.open_optional())
+                    .await?;
             }
             let schema = match &state.table {
                 Some(table) => table
@@ -156,7 +168,10 @@ impl DeltaSink {
         schema: &SchemaRef,
     ) -> Result<(), FaucetError> {
         if state.table.is_none() {
-            let table = self.open_or_create(schema).await?;
+            let table = self
+                .calls
+                .call_once("open", self.open_or_create(schema))
+                .await?;
             state.table = Some(table);
         }
         if state.writer.is_none() {
@@ -280,8 +295,12 @@ impl DeltaSink {
         let schema = state.schema.clone().expect("schema set");
         self.ensure_table_writer(state, &schema).await?;
         let writer = state.writer.as_mut().expect("writer set");
-        if let Err(e) = writer.write(batch).await {
-            let e = FaucetError::Sink(format!("delta: write failed: {e}"));
+        let written = match writer.write(batch).within(&self.calls, "write").await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(FaucetError::Sink(format!("delta: write failed: {e}"))),
+            Err(spent) => Err(spent),
+        };
+        if let Err(e) = written {
             state.poison(&e);
             return Err(e);
         }
@@ -310,10 +329,18 @@ impl DeltaSink {
             .table
             .take()
             .ok_or_else(|| FaucetError::Sink("delta: flush without an open table".to_string()))?;
-        let version = writer
+        let committed = match writer
             .flush_and_commit(&mut table)
+            .within(&self.calls, "commit")
             .await
-            .map_err(|e| FaucetError::Sink(format!("delta: commit failed: {e}")))?;
+        {
+            Ok(Ok(version)) => Ok(version),
+            Ok(Err(e)) => Err(FaucetError::Sink(format!("delta: commit failed: {e}"))),
+            Err(spent) => Err(spent),
+        };
+        // The writer is gone either way: a failed commit loses the buffered
+        // rows, so refuse to carry on as if they had landed.
+        let version = committed.inspect_err(|e| state.poison(e))?;
         tracing::debug!(version, uri = %self.config.connection.redacted_uri(), "delta commit");
         state.table = Some(table);
         state.pending = false;
@@ -372,6 +399,17 @@ impl faucet_core::Sink for DeltaSink {
         "delta"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         self.config.connection.redacted_uri()
     }
@@ -400,22 +438,24 @@ impl faucet_core::Sink for DeltaSink {
         // Metadata-only open (no data scan). A reachable store passes whether
         // or not the table exists yet — `create_if_not_missing` handles an
         // absent table at write time.
-        let probe =
-            match tokio::time::timeout(ctx.timeout, self.config.connection.open_optional()).await {
-                Ok(Ok(_)) => Probe::pass("table", started.elapsed()),
-                Ok(Err(e)) => Probe::fail_hint(
-                    "table",
-                    started.elapsed(),
-                    format!("delta sink probe failed: {e}"),
-                    "Verify table_uri, credentials, and object-store reachability.",
-                ),
-                Err(_) => Probe::fail_hint(
-                    "table",
-                    started.elapsed(),
-                    format!("delta sink probe timed out after {:?}", ctx.timeout),
-                    "Check object-store network reachability.",
-                ),
-            };
+        let open = self
+            .calls
+            .call_once("open", self.config.connection.open_optional());
+        let probe = match tokio::time::timeout(ctx.timeout, open).await {
+            Ok(Ok(_)) => Probe::pass("table", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint(
+                "table",
+                started.elapsed(),
+                format!("delta sink probe failed: {e}"),
+                "Verify table_uri, credentials, and object-store reachability.",
+            ),
+            Err(_) => Probe::fail_hint(
+                "table",
+                started.elapsed(),
+                format!("delta sink probe timed out after {:?}", ctx.timeout),
+                "Check object-store network reachability.",
+            ),
+        };
         Ok(CheckReport::single(probe))
     }
 
@@ -459,8 +499,14 @@ impl faucet_core::Sink for DeltaSink {
         self.ensure_table_writer(&mut state, &schema).await?;
         let rows = batch.num_rows();
         let writer = state.writer.as_mut().expect("writer set");
-        if let Err(e) = writer.write(batch).await {
-            let e = FaucetError::Sink(format!("delta: columnar write failed: {e}"));
+        let written = match writer.write(batch).within(&self.calls, "write").await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(FaucetError::Sink(format!(
+                "delta: columnar write failed: {e}"
+            ))),
+            Err(spent) => Err(spent),
+        };
+        if let Err(e) = written {
             state.poison(&e);
             return Err(e);
         }

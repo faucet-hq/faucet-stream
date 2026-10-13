@@ -192,3 +192,24 @@ fn descriptor_matches_built_sink() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn hung_connection(port: u16) -> SftpConnectionConfig {
+    SftpConnectionConfig::with_password("127.0.0.1", "u", "p")
+        .port(port)
+        .known_hosts(HostKeyPolicy::Insecure)
+}
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let port = hung.port();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || SftpSink::new(SftpSinkConfig::new(hung_connection(port), "/data")).unwrap(),
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}

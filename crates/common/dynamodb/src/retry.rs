@@ -7,6 +7,8 @@
 //! backoff; anything else (validation, missing table, access denied) fails
 //! immediately.
 
+use faucet_core::FaucetError;
+use faucet_core::io::CallContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -110,28 +112,78 @@ impl RetryPolicy {
     /// Run `op` until it succeeds, a fatal error occurs, or the retry budget is
     /// spent. `op` returns the error's `(code, message)`; `what` names the call
     /// in the final error message (the caller picks the `FaucetError` variant).
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
-    pub async fn run<T, F, Fut>(&self, what: &str, mut op: F) -> Result<T, String>
+    pub async fn run<T, F, Fut>(&self, what: &str, op: F) -> Result<T, String>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, (Option<String>, String)>>,
+    {
+        let ctx = CallContext::new().without_timeout();
+        self.attempts(&ctx, "request", what, op)
+            .await
+            .map_err(|e| match e {
+                Ok(message) => message,
+                Err(spent) => format!("dynamodb: {what} failed: {spent}"),
+            })
+    }
+
+    /// [`run`](Self::run) with every attempt made through `ctx` as one backend
+    /// call named `call` (#880): bounded by its timeout and deadline, stopped
+    /// by its cancel token, metered on its recorder; backoffs wait through it
+    /// too. A spent budget or a fatal error becomes `fail(message)`; the
+    /// context running out comes back as its own error.
+    pub async fn run_in<T, F, Fut>(
+        &self,
+        ctx: &CallContext,
+        call: &'static str,
+        what: &str,
+        fail: fn(String) -> FaucetError,
+        op: F,
+    ) -> Result<T, FaucetError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, (Option<String>, String)>>,
+    {
+        self.attempts(ctx, call, what, op)
+            .await
+            .map_err(|e| e.map_or_else(|spent| spent, fail))
+    }
+
+    /// The retry loop. `Err(Ok(message))` is a fatal error or a spent budget;
+    /// `Err(Err(e))` is `ctx` running out.
+    async fn attempts<T, F, Fut>(
+        &self,
+        ctx: &CallContext,
+        call: &'static str,
+        what: &str,
+        mut op: F,
+    ) -> Result<T, Result<String, FaucetError>>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, (Option<String>, String)>>,
     {
         let mut attempt = 0u32;
         loop {
-            match op().await {
-                Ok(v) => return Ok(v),
-                Err((code, message)) => {
+            match ctx
+                .call(call, || {
+                    let attempt = op();
+                    async move { Ok(attempt.await) }
+                })
+                .await
+            {
+                Err(spent) => return Err(Err(spent)),
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err((code, message))) => {
                     let class = classify_error(code.as_deref());
                     if class == ErrorClass::Fatal || attempt >= self.max_retries {
-                        return Err(format!(
+                        return Err(Ok(format!(
                             "dynamodb: {what} failed after {} attempt(s): {message}",
                             attempt + 1
-                        ));
+                        )));
                     }
                     let delay = self.delay(attempt);
                     tracing::debug!(what, ?class, attempt, delay_ms = delay.as_millis() as u64,
                         error = %message, "dynamodb: retrying");
-                    tokio::time::sleep(delay).await;
+                    ctx.wait(delay).await.map_err(Err)?;
                     attempt += 1;
                 }
             }
@@ -242,6 +294,80 @@ mod tests {
             .unwrap_err();
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(err.to_string().contains("conn refused"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_in_makes_each_attempt_a_call_and_stops_at_the_deadline() {
+        let calls = AtomicU32::new(0);
+        let out = fast(3)
+            .run_in(
+                &CallContext::new(),
+                "scan",
+                "scan",
+                FaucetError::Source,
+                || async {
+                    if calls.fetch_add(1, Ordering::SeqCst) < 1 {
+                        Err((Some("ThrottlingException".to_string()), "slow".to_string()))
+                    } else {
+                        Ok(3)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, 3);
+
+        let err = fast(0)
+            .run_in::<(), _, _>(
+                &CallContext::new(),
+                "scan",
+                "scan",
+                FaucetError::Sink,
+                || async { Err((Some("ValidationException".to_string()), "bad".to_string())) },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Sink(m) if m.contains("bad")));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let ctx = CallContext::new().with_deadline(deadline);
+        let err = fast(1)
+            .run_in::<(), _, _>(&ctx, "scan", "scan", FaucetError::Source, || {
+                std::future::pending()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err:?}");
+
+        let err = RetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 10_000,
+            max_backoff_ms: 10_000,
+        }
+        .run_in::<(), _, _>(&ctx, "scan", "scan", FaucetError::Source, || async {
+            Err((None, "down".to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err:?}");
+
+        let cancel = faucet_core::CancellationToken::new();
+        cancel.cancel();
+        let err = fast(0)
+            .run("scan", || async { Ok::<_, (Option<String>, String)>(1) })
+            .await;
+        assert_eq!(err.unwrap(), 1);
+        let err = fast(0)
+            .run_in::<(), _, _>(
+                &CallContext::new().with_cancel(cancel),
+                "scan",
+                "scan",
+                FaucetError::Source,
+                || async { Ok(()) },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Cancelled { .. }), "{err:?}");
     }
 
     #[test]

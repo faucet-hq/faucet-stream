@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use faucet_common_clickhouse::{apply_auth, build_client, query_params, sql_literal};
+use faucet_common_clickhouse::{apply_auth, query_params, sql_literal};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
 use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
@@ -19,7 +19,9 @@ use crate::config::{ClickHouseReplication, ClickHouseSourceConfig};
 /// ClickHouse query source (HTTP interface, typed compact JSON rows).
 pub struct ClickHouseSource {
     config: ClickHouseSourceConfig,
-    client: reqwest::Client,
+    client: faucet_core::http::Client,
+    /// Backend-call context (#880) every request runs through.
+    calls: faucet_core::CallSlot,
     /// Resolved once in [`ClickHouseSource::new`] so the hot path never re-parses.
     base_url: String,
     /// Bookmark loaded via [`Source::apply_start_bookmark`]; overrides the
@@ -39,10 +41,11 @@ impl ClickHouseSource {
     pub fn new(config: ClickHouseSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let base_url = config.connection.base_url()?;
-        let client = build_client(&config.connection)?;
+        let client = faucet_common_clickhouse::http_client(&config.connection)?;
         Ok(Self {
             config,
             client,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
             base_url,
             start_bookmark: Mutex::new(None),
         })
@@ -71,7 +74,10 @@ impl ClickHouseSource {
         let start = self.current_start();
         let (query, incr) = build_effective_query(&self.config, context, start.as_ref());
 
-        let resp = self.request(query).send().await?;
+        let resp = self
+            .client
+            .call(&self.calls.get(), "query", self.request(query))
+            .await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         let body = resp.text().await.map_err(|e| {
             FaucetError::Source(format!("ClickHouse: reading response failed: {e}"))
@@ -83,6 +89,31 @@ impl ClickHouseSource {
         let bookmark = if incr.is_some() { running_max } else { None };
         Ok((records, bookmark))
     }
+}
+
+/// The next chunk of a streamed response body, read through `calls` so the
+/// run's cancel token and deadline end a stalled read.
+async fn next_chunk<S>(
+    calls: &faucet_core::CallContext,
+    body: &mut S,
+) -> Result<Option<S::Item>, FaucetError>
+where
+    S: futures::Stream + Unpin,
+{
+    let mut read = Some(body.next());
+    calls
+        .call("read", || {
+            let attempt = read.take();
+            async move {
+                match attempt {
+                    Some(f) => Ok(f.await),
+                    None => Err(FaucetError::Source(
+                        "ClickHouse: a body read is not retried".into(),
+                    )),
+                }
+            }
+        })
+        .await
 }
 
 /// The user-facing incremental-cursor token, normalised into a `{key}`
@@ -291,9 +322,11 @@ impl Source for ClickHouseSource {
         let (query, incr) = build_effective_query(&self.config, context, start.as_ref());
 
         Box::pin(async_stream::try_stream! {
-            let resp = self.request(query).send().await?;
+            let calls = self.calls.get();
+            let resp = self.client.call(&calls, "query", self.request(query)).await?;
             let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
             let mut body = resp.bytes_stream();
+            let reads = calls.with_roundtrip_metering(false);
 
             let mut buf: Vec<u8> = Vec::new();
             let mut decoder = crate::decode::CompactDecoder::default();
@@ -301,7 +334,7 @@ impl Source for ClickHouseSource {
             let mut running_max: Option<Value> = None;
             let mut total = 0usize;
 
-            while let Some(chunk_result) = body.next().await {
+            while let Some(chunk_result) = next_chunk(&reads, &mut body).await? {
                 let bytes = chunk_result.map_err(FaucetError::Http)?;
                 buf.extend_from_slice(&bytes);
                 for line in split_complete_lines(&mut buf) {
@@ -345,6 +378,17 @@ impl Source for ClickHouseSource {
         "clickhouse"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "{}?query={}",
@@ -379,14 +423,16 @@ impl Source for ClickHouseSource {
         let started = std::time::Instant::now();
         let hint = "check url / host / database / credentials / that the server is reachable";
         let req = self.request("SELECT 1".to_string());
-        let probe = match tokio::time::timeout(ctx.timeout, req.send()).await {
-            Ok(Ok(resp)) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
-                Ok(_) => Probe::pass("connect", started.elapsed()),
-                Err(e) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
-            },
-            Ok(Err(e)) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
-            Err(_) => Probe::fail_hint("connect", started.elapsed(), "timed out", hint),
-        };
+        let calls = self.calls.get();
+        let probe =
+            match tokio::time::timeout(ctx.timeout, self.client.call(&calls, "query", req)).await {
+                Ok(Ok(resp)) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
+                    Ok(_) => Probe::pass("connect", started.elapsed()),
+                    Err(e) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
+                },
+                Ok(Err(e)) => Probe::fail_hint("connect", started.elapsed(), e.to_string(), hint),
+                Err(_) => Probe::fail_hint("connect", started.elapsed(), "timed out", hint),
+            };
         Ok(CheckReport::single(probe))
     }
 }

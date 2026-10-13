@@ -474,11 +474,13 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
 }
 
 /// The authorization-code grant (RFC 6749 §4.1.3) with the PKCE verifier.
-#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 async fn exchange(provider: &ConnectProvider, code: &str, verifier: &str) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
+    // The request body carries the client secret: never replayed to another
+    // origin on a redirect.
+    let client = faucet_core::http::Client::builder()
         .timeout(EXCHANGE_TIMEOUT)
-        .build()
+        .max_redirects(0)
+        .build_reqwest()
         .map_err(|e| e.to_string())?;
     let callback = provider.callback_uri();
     let resp = client

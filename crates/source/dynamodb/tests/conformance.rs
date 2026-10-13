@@ -114,3 +114,21 @@ async fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let make = || {
+        let cfg = config(&endpoint, "hung");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(DynamoDbSource::new(cfg))
+        })
+        .expect("source builds offline")
+    };
+    faucet_conformance::calls::assert_source_call_deadline(make).await;
+}

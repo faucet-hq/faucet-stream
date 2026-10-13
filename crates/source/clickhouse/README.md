@@ -98,6 +98,15 @@ Not supported in v1.
 
 A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+The query request and every read of its streamed response run through the
+pipeline's `CallContext` (#880): the run's cancel token stops an in-flight
+request or a stalled read, any caller deadline ends it, and the query is metered
+as a `query` round trip. Requests go through `faucet_core::http::Client`, so a
+redirect to another origin drops the credentials. The HTTP client's connect /
+idle-read timeouts are unchanged; nothing is retried.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

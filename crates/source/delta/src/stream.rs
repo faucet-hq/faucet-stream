@@ -23,9 +23,14 @@ use serde_json::Value;
 
 use crate::config::DeltaSourceConfig;
 
+use faucet_core::CallExt as _;
+
 /// A source that reads an Apache Delta Lake table into JSON records.
 pub struct DeltaSource {
     config: DeltaSourceConfig,
+    /// Backend-call context (#880): the table open, the file listing and every
+    /// data-file read run through it.
+    calls: faucet_core::CallSlot,
 }
 
 /// One active data file plus its partition values from the log.
@@ -44,16 +49,22 @@ impl DeltaSource {
             .validate()
             .map_err(|e| FaucetError::Config(format!("invalid delta source config: {e}")))?;
         config.connection.register_handlers();
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+        })
     }
 
     /// Open the table at the configured version / timestamp / latest.
     async fn open(&self) -> Result<deltalake::DeltaTable, FaucetError> {
-        match (self.config.version, &self.config.timestamp) {
-            (Some(v), _) => self.config.connection.open_at_version(v).await,
-            (None, Some(ts)) => self.config.connection.open_at_timestamp(ts).await,
-            (None, None) => self.config.connection.open().await,
-        }
+        let open = async {
+            match (self.config.version, &self.config.timestamp) {
+                (Some(v), _) => self.config.connection.open_at_version(v).await,
+                (None, Some(ts)) => self.config.connection.open_at_timestamp(ts).await,
+                (None, None) => self.config.connection.open().await,
+            }
+        };
+        self.calls.call_once("open", open).await
     }
 
     /// Resolve the active files + their partition values, and the table's Arrow
@@ -203,6 +214,17 @@ impl faucet_core::Source for DeltaSource {
         "delta"
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn dataset_uri(&self) -> String {
         self.config.connection.redacted_uri()
     }
@@ -215,31 +237,33 @@ impl faucet_core::Source for DeltaSource {
         let started = std::time::Instant::now();
         // Metadata-only open (no data scan). The source needs the table to
         // exist, so an absent table fails the probe.
-        let probe =
-            match tokio::time::timeout(ctx.timeout, self.config.connection.open_optional()).await {
-                Ok(Ok(Some(_))) => Probe::pass("table", started.elapsed()),
-                Ok(Ok(None)) => Probe::fail_hint(
-                    "table",
-                    started.elapsed(),
-                    format!(
-                        "delta source: no Delta table at '{}'",
-                        self.config.connection.redacted_uri()
-                    ),
-                    "Verify table_uri points at an existing Delta table.",
+        let open = self
+            .calls
+            .call_once("open", self.config.connection.open_optional());
+        let probe = match tokio::time::timeout(ctx.timeout, open).await {
+            Ok(Ok(Some(_))) => Probe::pass("table", started.elapsed()),
+            Ok(Ok(None)) => Probe::fail_hint(
+                "table",
+                started.elapsed(),
+                format!(
+                    "delta source: no Delta table at '{}'",
+                    self.config.connection.redacted_uri()
                 ),
-                Ok(Err(e)) => Probe::fail_hint(
-                    "table",
-                    started.elapsed(),
-                    format!("delta source probe failed: {e}"),
-                    "Verify table_uri, credentials, and object-store reachability.",
-                ),
-                Err(_) => Probe::fail_hint(
-                    "table",
-                    started.elapsed(),
-                    format!("delta source probe timed out after {:?}", ctx.timeout),
-                    "Check object-store network reachability.",
-                ),
-            };
+                "Verify table_uri points at an existing Delta table.",
+            ),
+            Ok(Err(e)) => Probe::fail_hint(
+                "table",
+                started.elapsed(),
+                format!("delta source probe failed: {e}"),
+                "Verify table_uri, credentials, and object-store reachability.",
+            ),
+            Err(_) => Probe::fail_hint(
+                "table",
+                started.elapsed(),
+                format!("delta source probe timed out after {:?}", ctx.timeout),
+                "Check object-store network reachability.",
+            ),
+        };
         Ok(CheckReport::single(probe))
     }
 
@@ -262,7 +286,9 @@ impl faucet_core::Source for DeltaSource {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         Box::pin(async_stream::try_stream! {
             let table = self.open().await?;
-            let (files, _schema, partition_cols) = self.resolve(&table).await?;
+            let (files, _schema, partition_cols) =
+                self.calls.call_once("plan", self.resolve(&table)).await?;
+            let reads = self.calls.get().with_roundtrip_metering(false);
             let store = table.object_store();
             let data_projection = self.data_projection(&partition_cols);
             let requested: Option<&[String]> =
@@ -277,12 +303,15 @@ impl faucet_core::Source for DeltaSource {
             let mut whole_file: Vec<Value> = Vec::new();
             for file in &files {
                 let reader = ParquetObjectReader::new(store.clone(), file.path.clone());
-                let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
-                    FaucetError::Source(format!(
-                        "delta: could not open data file '{}': {e}",
-                        file.path
-                    ))
-                })?;
+                let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+                    .within(&self.calls, "get")
+                    .await?
+                    .map_err(|e| {
+                        FaucetError::Source(format!(
+                            "delta: could not open data file '{}': {e}",
+                            file.path
+                        ))
+                    })?;
 
                 let file_rows = builder.metadata().file_metadata().num_rows();
                 builder = builder.with_batch_size(read_batch_size(self.config.batch_size, file_rows));
@@ -298,7 +327,7 @@ impl faucet_core::Source for DeltaSource {
                     ))
                 })?;
 
-                while let Some(batch) = batches.next().await {
+                while let Some(batch) = batches.next().within_ctx(&reads, "read").await? {
                     let batch = batch.map_err(|e| {
                         FaucetError::Source(format!("delta: read error in '{}': {e}", file.path))
                     })?;
@@ -341,7 +370,9 @@ impl faucet_core::Source for DeltaSource {
     {
         Box::pin(async_stream::try_stream! {
             let table = self.open().await?;
-            let (files, schema, partition_cols) = self.resolve(&table).await?;
+            let (files, schema, partition_cols) =
+                self.calls.call_once("plan", self.resolve(&table)).await?;
+            let reads = self.calls.get().with_roundtrip_metering(false);
             let store = table.object_store();
             let data_projection = self.data_projection(&partition_cols);
             let requested: Option<&[String]> =
@@ -350,9 +381,15 @@ impl faucet_core::Source for DeltaSource {
             let mut file_batches: Vec<arrow::array::RecordBatch> = Vec::new();
             for file in &files {
                 let reader = ParquetObjectReader::new(store.clone(), file.path.clone());
-                let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
-                    FaucetError::Source(format!("delta: could not open data file '{}': {e}", file.path))
-                })?;
+                let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+                    .within(&self.calls, "get")
+                    .await?
+                    .map_err(|e| {
+                        FaucetError::Source(format!(
+                            "delta: could not open data file '{}': {e}",
+                            file.path
+                        ))
+                    })?;
                 let file_rows = builder.metadata().file_metadata().num_rows();
                 builder = builder.with_batch_size(read_batch_size(self.config.batch_size, file_rows));
                 if let Some(cols) = &data_projection {
@@ -362,7 +399,7 @@ impl faucet_core::Source for DeltaSource {
                 let mut batches = builder.build().map_err(|e| {
                     FaucetError::Source(format!("delta: could not build reader for '{}': {e}", file.path))
                 })?;
-                while let Some(batch) = batches.next().await {
+                while let Some(batch) = batches.next().within_ctx(&reads, "read").await? {
                     let batch = batch.map_err(|e| {
                         FaucetError::Source(format!("delta: read error in '{}': {e}", file.path))
                     })?;

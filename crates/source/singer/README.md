@@ -117,6 +117,14 @@ pipeline:
 
 The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every read of the tap's output waits through the pipeline's `CallContext`
+(#880): the run's cancel token or any caller deadline ends the wait and stops
+the tap (SIGTERM, then SIGKILL). `idle_timeout_secs` still bounds a tap that
+goes quiet. Discovery (`faucet init --discover`) spawns the tap without
+blocking the runtime.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

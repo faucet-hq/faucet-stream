@@ -17,9 +17,11 @@ pub fn build_emitter(
     }
 }
 
+/// How long the lineage endpoint reachability probe may take.
+const LINEAGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Best-effort transport reachability check (used by validate + doctor).
 /// Never fails a run — returns a human-readable Ok/Err string.
-#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 pub async fn check_transport(cfg: &LineageConfig) -> Result<String, String> {
     match &cfg.transport {
         faucet_lineage::Transport::File { path } => {
@@ -31,7 +33,13 @@ pub async fn check_transport(cfg: &LineageConfig) -> Result<String, String> {
             }
         }
         faucet_lineage::Transport::Http { url, .. } => {
-            match reqwest::Client::new().head(url).send().await {
+            let client = faucet_core::http::Client::new()
+                .map_err(|e| format!("http endpoint unreachable: {e}"))?;
+            let probe = faucet_core::CallContext::new()
+                .with_timeout(LINEAGE_PROBE_TIMEOUT)
+                .call_once("probe", client.send(client.head(url)))
+                .await;
+            match probe {
                 Ok(_) => Ok(format!("http endpoint reachable: {url}")),
                 Err(e) => Err(format!("http endpoint unreachable: {e}")),
             }

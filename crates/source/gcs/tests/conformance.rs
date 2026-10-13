@@ -269,3 +269,24 @@ async fn descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let host = hung.http_url();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let config = GcsSourceConfig::new("hung")
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host);
+        block_on(GcsSource::new(config)).expect("source builds offline")
+    })
+    .await;
+}

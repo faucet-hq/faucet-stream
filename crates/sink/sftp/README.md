@@ -218,3 +218,11 @@ already landed a second time). See
 ## Capabilities
 
 Write modes `append` and `overwrite`; no exactly-once or keyed upsert. Columnar for Parquet and Avro output (with the `arrow` feature). For CSV output under `csv.on_unknown_field: warn` it declares that it drops fields outside the frozen header (`schema_report: drops_unknown_fields`), so `schema.on_drift: fail` is refused at load time. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every remote operation — upload, rename into place, listing, stat, delete,
+download — runs through the pipeline's `CallContext` (#880): each is made once,
+any caller deadline ends it, and each is metered as a round trip (`put`,
+`copy`, `list`, `head`, `delete`, `get`). The connection's own connect timeout
+is unchanged.

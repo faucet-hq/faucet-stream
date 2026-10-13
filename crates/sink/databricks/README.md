@@ -213,3 +213,12 @@ the target (`Skip` when it is missing and will be created).
 ## Capabilities
 
 Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent writes (exactly-once), keyed upsert, staged load and schema evolution (`schema_report: reported`); a `write_mode: upsert|delete` config with a `key` dedups by key. `faucet list --json` prints these declared capabilities.
+
+## Timeouts, cancellation and retries
+
+Every request — statement submit and polls, Files API uploads, cloud staging
+uploads — runs through the pipeline's `CallContext` (#880): any caller deadline
+ends it, and each is metered as a round trip (`submit`, `poll`, `files`). The
+HTTP client's connect / idle-read timeouts, `statement_timeout_secs`, the
+`429` / `503` retry and the concurrent-commit re-submit (`max_retries`,
+`retry_backoff_ms`) are unchanged; their pauses wait through the same context.

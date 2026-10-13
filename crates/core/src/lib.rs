@@ -162,7 +162,7 @@ pub use idempotency::{
     SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,
     parse_token, parse_token_parts, unwrap_state, wrap_state,
 };
-pub use io::{CallContext, CallSlot, DEFAULT_CALL_TIMEOUT};
+pub use io::{CallContext, CallExt, CallReader, CallSlot, DEFAULT_CALL_TIMEOUT};
 pub use join::{
     HashJoin, JoinConfig, JoinMode, JoinStats, KeyNormalize, OnCollision, OnDuplicate, Projection,
 };

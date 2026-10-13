@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use faucet_common_file::write::{ObjectClient, content_type};
+use faucet_core::CallExt as _;
 use faucet_core::FaucetError;
 use google_cloud_gax::paginator::ItemPaginator as _;
 use google_cloud_storage::client::{Storage, StorageControl};
@@ -22,6 +23,8 @@ pub(crate) struct GcsObjects {
     pub control: StorageControl,
     pub bucket: String,
     pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    /// The run's call context (#880) every request runs through, once.
+    pub calls: Arc<faucet_core::CallSlot>,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -84,7 +87,7 @@ impl ObjectClient for GcsObjects {
             .set_page_size(1000_i32)
             .by_item();
         let mut names = Vec::new();
-        while let Some(item) = items.next().await {
+        while let Some(item) = items.next().within(&self.calls, "list").await? {
             let object = item.map_err(|e| self.gcs_err("list", prefix, e))?;
             if !object.name.is_empty() {
                 names.push(object.name);
@@ -101,7 +104,8 @@ impl ObjectClient for GcsObjects {
             .set_bucket(self.bucket_path())
             .set_object(key.to_string())
             .send()
-            .await
+            .within(&self.calls, "head")
+            .await?
         {
             Ok(_) => Ok(true),
             Err(e) if is_not_found(&e) => Ok(false),
@@ -116,12 +120,13 @@ impl ObjectClient for GcsObjects {
             .storage
             .read_object(self.bucket_path(), key.to_string())
             .send()
-            .await
+            .within(&self.calls, "get")
+            .await?
             .map_err(|e| self.gcs_err("get", key, e))?;
         let mut file = tokio::fs::File::create(to)
             .await
             .map_err(|e| err("create local copy", key, e))?;
-        while let Some(chunk) = resp.next().await {
+        while let Some(chunk) = resp.next().within(&self.calls, "get").await? {
             let chunk = chunk.map_err(|e| self.gcs_err("download", key, e))?;
             file.write_all(&chunk)
                 .await
@@ -140,7 +145,8 @@ impl ObjectClient for GcsObjects {
             .set_content_type(content_type(key))
             .with_known_crc32c(crc)
             .send_unbuffered()
-            .await
+            .within(&self.calls, "put")
+            .await?
             .map_err(|e| self.gcs_err("put object", key, e))?;
         tracing::debug!(key = %key, "Uploaded GCS object");
         Ok(())
@@ -154,7 +160,8 @@ impl ObjectClient for GcsObjects {
             .set_bucket(self.bucket_path())
             .set_object(key.to_string())
             .send()
-            .await
+            .within(&self.calls, "delete")
+            .await?
         {
             Ok(_) => Ok(()),
             Err(e) if is_not_found(&e) => Ok(()),
@@ -184,7 +191,8 @@ impl ObjectClient for GcsObjects {
                 .set_destination_name(to.to_string())
                 .set_rewrite_token(token.clone())
                 .send()
-                .await
+                .within(&self.calls, "copy")
+                .await?
                 .map_err(|e| self.gcs_err("copy", to, e))?;
             if resp.done {
                 break;
@@ -210,6 +218,7 @@ mod tests {
                 .unwrap(),
             bucket: "b".into(),
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::default()),
         }
     }
 
@@ -333,6 +342,7 @@ mod tests {
                 .unwrap(),
             bucket: "b".into(),
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::default()),
         };
         let dir = tempfile::tempdir().unwrap();
         let e = o

@@ -15,6 +15,7 @@
 
 use std::time::{Duration, Instant};
 
+use faucet_core::io::CallContext;
 use faucet_core::{AuthSpec, Credential, FaucetError, SharedAuthProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -306,6 +307,9 @@ impl Default for StatementOptions {
     }
 }
 
+/// How long the best-effort cancel of an abandoned statement may take.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Upper bound on a single backoff sleep.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -369,6 +373,7 @@ pub struct StatementClient {
     provider: Option<SharedAuthProvider>,
     options: StatementOptions,
     side: ErrorSide,
+    calls: CallContext,
 }
 
 impl std::fmt::Debug for StatementClient {
@@ -401,7 +406,22 @@ impl StatementClient {
             provider,
             options,
             side,
+            calls: CallContext::new().without_timeout(),
         }
+    }
+
+    /// Run every request through `calls` (#880): each attempt bounded by its
+    /// timeout and deadline, stopped by its cancel token, metered on its
+    /// recorder; backoffs and polls wait through it. The default bounds
+    /// nothing beyond the HTTP client's own connect / idle-read timeouts.
+    pub fn with_call_context(mut self, calls: CallContext) -> Self {
+        self.calls = calls;
+        self
+    }
+
+    /// The call context requests run through.
+    pub fn call_context(&self) -> &CallContext {
+        &self.calls
     }
 
     /// The base URL (no trailing slash).
@@ -436,7 +456,6 @@ impl StatementClient {
     }
 
     /// Submit a pre-built request body and wait until it is terminal.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     pub async fn execute_body(&self, body: &Value) -> Result<StatementResponse, FaucetError> {
         let mut auth = self.authorization().await?;
         let started = Instant::now();
@@ -472,7 +491,10 @@ impl StatementClient {
                             limit.as_secs()
                         )));
                     }
-                    tokio::time::sleep(self.options.poll_interval).await;
+                    if let Err(spent) = self.calls.wait(self.options.poll_interval).await {
+                        self.cancel(&id, &auth).await;
+                        return Err(spent);
+                    }
                     let poll_url = format!("{url}/{id}");
                     let resp = self.send(Verb::Get, &poll_url, None, &mut auth).await?;
                     current = self.parse(resp).await?;
@@ -498,16 +520,31 @@ impl StatementClient {
     /// Best-effort cancel; a failure is logged, never raised.
     async fn cancel(&self, id: &str, auth: &str) {
         let url = format!("{}/{id}/cancel", self.statements_url());
-        match self
-            .http
-            .post(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
+        // The run's cancel token and deadline may be what ended the statement,
+        // so the cancel request gets its own short bound instead.
+        let mut ctx = CallContext::new()
+            .with_timeout(CANCEL_TIMEOUT)
+            .without_retry();
+        if let Some(r) = self.calls.recorder() {
+            ctx = ctx.with_recorder(r.clone());
+        }
+        let sent = ctx
+            .call("cancel", || async {
+                Ok(self
+                    .http
+                    .post(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await)
+            })
+            .await;
+        match sent {
+            Ok(Ok(r)) if r.status().is_success() => {}
+            Ok(Ok(r)) => {
                 tracing::warn!(statement_id = id, status = %r.status(), "databricks: cancel failed")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(statement_id = id, error = %e, "databricks: cancel failed")
             }
             Err(e) => tracing::warn!(statement_id = id, error = %e, "databricks: cancel failed"),
         }
@@ -523,7 +560,6 @@ impl StatementClient {
         })
     }
 
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn send(
         &self,
         verb: Verb,
@@ -533,21 +569,30 @@ impl StatementClient {
     ) -> Result<reqwest::Response, FaucetError> {
         let mut attempt: u32 = 0;
         let mut refreshed = false;
+        let op = if verb == Verb::Get { "poll" } else { "submit" };
         loop {
-            let mut req = match verb {
-                Verb::Get => self.http.get(url),
-                Verb::Post => self.http.post(url),
-            }
-            .header("Authorization", auth.as_str());
-            if let Some(b) = body {
-                req = req.json(b);
-            }
-            let resp = match req.send().await {
+            let header = auth.clone();
+            let sent = self
+                .calls
+                .call(op, || {
+                    let mut req = match verb {
+                        Verb::Get => self.http.get(url),
+                        Verb::Post => self.http.post(url),
+                    }
+                    .header("Authorization", header.as_str());
+                    if let Some(b) = body {
+                        req = req.json(b);
+                    }
+                    async move { Ok(req.send().await) }
+                })
+                .await?;
+            let resp = match sent {
                 Ok(r) => r,
                 Err(e) => {
                     if verb == Verb::Get && attempt < self.options.max_retries {
-                        tokio::time::sleep(backoff_delay(self.options.retry_backoff, attempt))
-                            .await;
+                        self.calls
+                            .wait(backoff_delay(self.options.retry_backoff, attempt))
+                            .await?;
                         attempt += 1;
                         continue;
                     }
@@ -579,7 +624,7 @@ impl StatementClient {
                 let wait = retry_after(&resp)
                     .unwrap_or_else(|| backoff_delay(self.options.retry_backoff, attempt));
                 tracing::debug!(status = code, attempt, "databricks: retrying request");
-                tokio::time::sleep(wait).await;
+                self.calls.wait(wait).await?;
                 attempt += 1;
                 continue;
             }

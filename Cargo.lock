@@ -5266,6 +5266,7 @@ name = "faucet-common-redshift"
 version = "1.1.1"
 dependencies = [
  "faucet-core",
+ "futures",
  "schemars 1.2.1",
  "serde",
  "serde_json",
