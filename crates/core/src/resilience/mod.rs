@@ -10,6 +10,7 @@ pub mod response_matcher;
 
 pub use breaker::CircuitBreaker;
 pub use classify::{RetryClass, RetryClassSet, classify};
+pub(crate) use execute::run_call;
 pub use execute::{
     RetryMetrics, execute_with_policy, execute_with_policy_metered, execute_with_policy_recorded,
 };

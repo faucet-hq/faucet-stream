@@ -94,6 +94,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
     "position_min",
     "connector_name",
     "set_roundtrip_recorder",
+    "set_call_context",
     "set_run_clock",
     "set_cancel",
     "dataset_uri",
@@ -138,6 +139,7 @@ pub const SINK_HOOKS: &[&str] = &[
     "config_schema",
     "connector_name",
     "set_roundtrip_recorder",
+    "set_call_context",
     "dataset_uri",
     "local_outputs",
     "check",
@@ -382,6 +384,9 @@ impl Sink for HookSink {
     fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {
         self.hit("set_roundtrip_recorder");
     }
+    fn set_call_context(&self, _ctx: faucet_core::io::CallContext) {
+        self.hit("set_call_context");
+    }
     fn dataset_uri(&self) -> String {
         self.hit("dataset_uri");
         "hook://dataset".into()
@@ -465,6 +470,7 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
     let _ = sink.config_schema();
     let _ = sink.connector_name();
     sink.set_roundtrip_recorder(recorder(RoundtripSide::Sink));
+    sink.set_call_context(faucet_core::io::CallContext::new());
     let _ = sink.dataset_uri();
     let _ = sink.local_outputs().await;
     let _ = sink.check(&CheckContext::default()).await;
@@ -671,6 +677,9 @@ impl Source for HookSource {
     fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {
         self.hit("set_roundtrip_recorder");
     }
+    fn set_call_context(&self, _ctx: faucet_core::io::CallContext) {
+        self.hit("set_call_context");
+    }
     fn set_run_clock(
         &self,
         _now: faucet_core::forward::__forward::chrono::DateTime<
@@ -750,6 +759,7 @@ pub async fn assert_source_forwards_every_hook(
     let _ = source.position_min(&[json!(2), json!(1)]);
     let _ = source.connector_name();
     source.set_roundtrip_recorder(recorder(RoundtripSide::Source));
+    source.set_call_context(faucet_core::io::CallContext::new());
     source.set_run_clock(faucet_core::forward::__forward::chrono::Utc::now());
     let _ = source.set_cancel(CancellationToken::new());
     let _ = source.dataset_uri();

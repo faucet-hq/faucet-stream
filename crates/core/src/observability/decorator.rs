@@ -353,6 +353,7 @@ pub(crate) fn error_kind(e: &FaucetError) -> &'static str {
         FaucetError::StateIncompatible { .. } => "StateIncompatible",
         FaucetError::CircuitOpen { .. } => "CircuitOpen",
         FaucetError::Timeout { .. } => "Timeout",
+        FaucetError::Cancelled { .. } => "Cancelled",
         FaucetError::Custom(_) => "Custom",
     }
 }

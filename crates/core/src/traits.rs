@@ -492,6 +492,16 @@ pub trait Source: Send + Sync {
     /// by storing the instant behind interior mutability.
     fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {}
 
+    /// Receive the run's [`CallContext`](crate::io::CallContext) (#880): the
+    /// cancel token, the round-trip recorder and any deadline every backend
+    /// call should honour. Called once before streaming.
+    ///
+    /// A connector stores it in a [`CallSlot`](crate::io::CallSlot) and runs
+    /// its backend calls through [`CallSlot::call`](crate::io::CallSlot::call),
+    /// which layers the connector's own timeout and retry settings over it.
+    /// Defaulted to a no-op; a wrapping source forwards it.
+    fn set_call_context(&self, _ctx: crate::io::CallContext) {}
+
     /// Receive the run's cancellation token ([`Pipeline::with_cancel`](crate::Pipeline::with_cancel)),
     /// installed once before streaming.
     ///
@@ -1026,6 +1036,13 @@ pub trait Sink: Send + Sync {
         _recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
     ) {
     }
+
+    /// Receive the run's [`CallContext`](crate::io::CallContext) (#880). See
+    /// [`Source::set_call_context`]. A sink's context never carries the run's
+    /// cancel token — a cancelled run still flushes its sinks — nor a retry
+    /// policy: writes are retried page by page under ADR 0007. Defaulted to a
+    /// no-op; a wrapping sink forwards it.
+    fn set_call_context(&self, _ctx: crate::io::CallContext) {}
 
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).

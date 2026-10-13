@@ -154,6 +154,15 @@ pub enum FaucetError {
         after: Duration,
     },
 
+    /// A backend call was abandoned because the run was cancelled
+    /// ([`CallContext::call`](crate::io::CallContext::call)). Not retriable:
+    /// the caller is stopping.
+    #[error("{operation} cancelled")]
+    Cancelled {
+        /// What was being waited on, e.g. `"page call"`.
+        operation: String,
+    },
+
     /// A custom error from a third-party connector.
     ///
     /// Use this to wrap your own error types without losing the error chain:

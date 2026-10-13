@@ -470,6 +470,14 @@ macro_rules! forward_source {
                 self.$inner.set_roundtrip_recorder(recorder)
             }
         });
+        $crate::__faucet_forward_filter!(set_call_context [$($skip)*] {
+            fn set_call_context(&self, ctx: $crate::io::CallContext) -> ()
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.set_call_context(ctx)
+            }
+        });
         $crate::__faucet_forward_filter!(set_run_clock [$($skip)*] {
             fn set_run_clock(
                 &self,
@@ -998,6 +1006,14 @@ macro_rules! forward_sink {
                 self.$inner.set_roundtrip_recorder(recorder)
             }
         });
+        $crate::__faucet_forward_filter!(set_call_context [$($skip)*] {
+            fn set_call_context(&self, ctx: $crate::io::CallContext) -> ()
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.set_call_context(ctx)
+            }
+        });
         $crate::__faucet_forward_filter!(dataset_uri [$($skip)*] {
             fn dataset_uri(&self) -> ::std::string::String
             {
@@ -1071,6 +1087,7 @@ macro_rules! __faucet_forward_filter {
     (position_min [position_min $($rest:ident)*] $item:tt) => {};
     (connector_name [connector_name $($rest:ident)*] $item:tt) => {};
     (set_roundtrip_recorder [set_roundtrip_recorder $($rest:ident)*] $item:tt) => {};
+    (set_call_context [set_call_context $($rest:ident)*] $item:tt) => {};
     (set_run_clock [set_run_clock $($rest:ident)*] $item:tt) => {};
     (set_cancel [set_cancel $($rest:ident)*] $item:tt) => {};
     (dataset_uri [dataset_uri $($rest:ident)*] $item:tt) => {};
@@ -1148,6 +1165,7 @@ macro_rules! __faucet_forward_known {
     (@source [position_min $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [connector_name $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [set_roundtrip_recorder $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
+    (@source [set_call_context $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [set_run_clock $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [set_cancel $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [dataset_uri $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
@@ -1188,6 +1206,7 @@ macro_rules! __faucet_forward_known {
     (@sink [config_schema $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [connector_name $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [set_roundtrip_recorder $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
+    (@sink [set_call_context $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [dataset_uri $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [local_outputs $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [check $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };

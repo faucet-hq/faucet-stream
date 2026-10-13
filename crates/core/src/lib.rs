@@ -16,6 +16,7 @@
 pub mod adaptive;
 pub mod anomaly;
 pub mod auth;
+pub mod batching;
 pub mod budget;
 pub mod check;
 pub mod cleanup;
@@ -38,6 +39,7 @@ pub mod encryption;
 pub mod error;
 pub mod file_format;
 pub mod forward;
+pub mod http;
 // The conformance crate's forwarding harness, compiled into core's own unit
 // tests under the `faucet_core::` paths it is written against.
 #[cfg(test)]
@@ -47,6 +49,7 @@ extern crate self as faucet_core;
 #[allow(dead_code)]
 mod forwarding;
 pub mod idempotency;
+pub mod io;
 pub mod join;
 pub mod json_numbers;
 pub mod lag;
@@ -137,6 +140,7 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
 pub use error::FaucetError;
+pub use io::{CallContext, CallSlot, DEFAULT_CALL_TIMEOUT};
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
     AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, CsvUnknownField, ExcelOptions,
