@@ -52,6 +52,10 @@ pub struct MysqlCdcSource {
     /// Last binlog position handed to the pipeline on a page bookmark this
     /// run — where [`Source::lag`] measures from (#733).
     emitted: std::sync::Mutex<Option<(String, u64)>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder for the connect and query calls and the binlog
+    /// stream.
+    calls: faucet_core::CallSlot,
 }
 
 impl MysqlCdcSource {
@@ -88,6 +92,7 @@ impl MysqlCdcSource {
             state_key_value: key,
             pending_bookmark: Mutex::new(None),
             emitted: std::sync::Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 }
@@ -98,6 +103,17 @@ impl MysqlCdcSource {
 
 #[async_trait]
 impl Source for MysqlCdcSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     /// Drain the stream using the per-source `batch_size = 0` sentinel so
     /// all transactions are accumulated into a single trailing page —
     /// matching the historical convenience API contract.
@@ -142,14 +158,18 @@ impl Source for MysqlCdcSource {
     }
 
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        let mut conn = Conn::new(self.opts.clone()).await.map_err(|e| {
-            FaucetError::Source(format!("mysql-cdc: capture_position connect: {e}"))
-        })?;
-        if let Some(xids) = prepared_xa(&mut conn).await {
-            refuse_prepared_xa(&xids)?;
-        }
-        let (file, pos) = current_binlog_position(&mut conn).await?;
-        drop(conn);
+        let (file, pos) = self
+            .calls
+            .call_once("query", async {
+                let mut conn = Conn::new(self.opts.clone()).await.map_err(|e| {
+                    FaucetError::Source(format!("mysql-cdc: capture_position connect: {e}"))
+                })?;
+                if let Some(xids) = prepared_xa(&mut conn).await {
+                    refuse_prepared_xa(&xids)?;
+                }
+                current_binlog_position(&mut conn).await
+            })
+            .await?;
         Ok(Some(Bookmark::FilePos { file, pos }.to_value()?))
     }
 
@@ -165,15 +185,19 @@ impl Source for MysqlCdcSource {
         let Some((file, pos)) = from else {
             return Ok(None);
         };
-        let mut conn = Conn::new(self.opts.clone())
-            .await
-            .map_err(|e| FaucetError::Source(format!("mysql-cdc: lag connect: {e}")))?;
-        let head = current_binlog_position(&mut conn).await?;
-        let logs: Vec<Row> = conn
-            .query("SHOW BINARY LOGS")
-            .await
-            .map_err(|e| FaucetError::Source(format!("mysql-cdc: SHOW BINARY LOGS: {e}")))?;
-        drop(conn);
+        let (head, logs) = self
+            .calls
+            .call_once("query", async {
+                let mut conn = Conn::new(self.opts.clone())
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("mysql-cdc: lag connect: {e}")))?;
+                let head = current_binlog_position(&mut conn).await?;
+                let logs: Vec<Row> = conn.query("SHOW BINARY LOGS").await.map_err(|e| {
+                    FaucetError::Source(format!("mysql-cdc: SHOW BINARY LOGS: {e}"))
+                })?;
+                Ok((head, logs))
+            })
+            .await?;
         let logs: Vec<(String, u64)> = logs
             .into_iter()
             .filter_map(|r| Some((r.get::<String, _>(0)?, r.get::<u64, _>(1)?)))
@@ -296,21 +320,31 @@ impl MysqlCdcSource {
             let anchor_start = pending.is_none() && matches!(resolved, ResolvedStart::Current { .. });
 
             // 2. Open a connection and build the binlog stream request.
-            let mut conn = Conn::new(self.opts.clone())
-                .await
-                .map_err(|e| FaucetError::Source(format!("mysql-cdc: connect failed: {e}")))?;
+            let calls = self.calls.get();
+            let mut conn = calls
+                .call_once("connect", async {
+                    Conn::new(self.opts.clone())
+                        .await
+                        .map_err(|e| FaucetError::Source(format!("mysql-cdc: connect failed: {e}")))
+                })
+                .await?;
 
             // Resolve Current → FilePos by querying the server's current binlog
             // position (fills in the actual file/pos before we build the request
             // that borrows from `resolved`).
-            let resolved = resolve_current(resolved, &mut conn).await?;
+            let resolved = calls
+                .call_once("query", resolve_current(resolved, &mut conn))
+                .await?;
             let req = build_request(self.config.server_id, &resolved)?;
 
             // 3. Start the binlog stream.
-            let binlog_stream = conn
-                .get_binlog_stream(req)
-                .await
-                .map_err(|e| FaucetError::Source(format!("mysql-cdc: get_binlog_stream: {e}")))?;
+            let binlog_stream = calls
+                .call_once("start", async {
+                    conn.get_binlog_stream(req).await.map_err(|e| {
+                        FaucetError::Source(format!("mysql-cdc: get_binlog_stream: {e}"))
+                    })
+                })
+                .await?;
             let mut stream = std::pin::pin!(binlog_stream);
 
             // A start with no persisted bookmark persists where it opened
@@ -369,7 +403,30 @@ impl MysqlCdcSource {
                 let now = std::time::Instant::now();
                 let idle_left = idle_timeout.saturating_sub(now.duration_since(last_event));
                 let wait = pages.time_left(now).map_or(idle_left, |t| t.min(idle_left));
-                match tokio::time::timeout(wait, stream.next()).await {
+                // The run's deadline and cancel token end the stream with an
+                // error (#880); the pipeline has already stopped reading.
+                if calls.deadline().is_some_and(|d| tokio::time::Instant::now() >= d) {
+                    Err(FaucetError::Timeout {
+                        operation: "mysql-cdc binlog stream (deadline)".into(),
+                        after: std::time::Duration::ZERO,
+                    })?;
+                }
+                let mut fatal: Option<FaucetError> = None;
+                let next = tokio::select! {
+                    biased;
+                    ev = stream.next() => Ok(ev),
+                    waited = calls.wait(wait) => {
+                        match waited {
+                            Ok(()) => {}
+                            Err(e) => fatal = Some(e),
+                        }
+                        Err(())
+                    }
+                };
+                if let Some(e) = fatal {
+                    Err(e)?;
+                }
+                match next {
                     Ok(Some(Ok(event))) => {
                         last_event = std::time::Instant::now();
                         let header = event.header();
@@ -600,13 +657,13 @@ impl MysqlCdcSource {
                     Ok(Some(Err(e))) => {
                         Err(FaucetError::Source(format!("mysql-cdc: stream error: {e}")))?;
                     }
-                    Err(_) if pages.due(std::time::Instant::now()) => {
+                    Err(()) if pages.due(std::time::Instant::now()) => {
                         emit!(pages.take());
                     }
                     // Idle timeout or stream closed. A transaction still open
                     // (or an XA one still undecided) is dropped: the server
                     // redelivers it from the last persisted bookmark next run.
-                    Ok(None) | Err(_) => {
+                    Ok(None) | Err(()) => {
                         emit!(pages.take());
                         if let Some((xid, age)) = pages.undecided(std::time::Instant::now()) {
                             tracing::warn!(

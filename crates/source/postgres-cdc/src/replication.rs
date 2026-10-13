@@ -1059,15 +1059,31 @@ fn slot_acquire_backoff(attempt: u32) -> Duration {
 /// it fails because the replication slot is still active (#146 M12). Any other
 /// error — and the final attempt's error after exhausting retries — is returned
 /// immediately. `max_retries = 0` preserves the previous fail-fast behaviour.
-#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub async fn retry_on_slot_active<F, Fut, T>(max_retries: u32, op: F) -> Result<T, FaucetError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, FaucetError>>,
+{
+    let ctx = faucet_core::CallContext::new().without_timeout();
+    retry_on_slot_active_in(&ctx, "slot", max_retries, op).await
+}
+
+/// [`retry_on_slot_active`] through a call context (#880): each attempt is a
+/// backend call named `op_name`, and the backoff between attempts ends early
+/// on cancel and at the deadline.
+pub async fn retry_on_slot_active_in<F, Fut, T>(
+    ctx: &faucet_core::CallContext,
+    op_name: &'static str,
+    max_retries: u32,
+    op: F,
+) -> Result<T, FaucetError>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, FaucetError>>,
 {
     let mut attempt = 0u32;
     loop {
-        match op().await {
+        match ctx.call_once(op_name, op()).await {
             Ok(value) => return Ok(value),
             Err(e) if attempt < max_retries && is_slot_active_error(&e) => {
                 let backoff = slot_acquire_backoff(attempt);
@@ -1078,7 +1094,7 @@ where
                     error = %e,
                     "postgres-cdc: replication slot still active; retrying after backoff"
                 );
-                tokio::time::sleep(backoff).await;
+                ctx.wait(backoff).await?;
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -1477,6 +1493,29 @@ mod tests {
             3,
             "initial attempt + 2 retries"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_on_slot_active_in_stops_waiting_on_cancel() {
+        let token = faucet_core::CancellationToken::new();
+        let ctx = faucet_core::CallContext::new()
+            .without_timeout()
+            .with_cancel(token.clone());
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        };
+        let started = std::time::Instant::now();
+        let (result, ()) = futures::future::join(
+            retry_on_slot_active_in(&ctx, "slot", 10, || async { Err::<(), _>(slot_in_use()) }),
+            cancel,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(FaucetError::Cancelled { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

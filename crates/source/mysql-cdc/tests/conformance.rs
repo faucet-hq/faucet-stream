@@ -227,3 +227,21 @@ async fn conformance_errors_not_panics() {
         .expect("new + preflight succeed against a live server");
     assert_errors_not_panics(&source).await;
 }
+
+/// A binlog stream with nothing to deliver stands in for a hung backend
+/// (#880): the read waits on the server until the deadline or the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_call_deadline() {
+    let (_container, url) = start_mysql_cdc().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            MysqlCdcSource::new(build_config(&url))
+                .await
+                .expect("source new"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}
