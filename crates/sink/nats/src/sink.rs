@@ -22,6 +22,8 @@ use tokio::sync::OnceCell;
 pub struct NatsSink {
     config: NatsSinkConfig,
     client: OnceCell<async_nats::Client>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 impl NatsSink {
@@ -32,27 +34,38 @@ impl NatsSink {
         Ok(Self {
             config,
             client: OnceCell::new(),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
     /// Lazily build (once) and return the shared NATS client.
     async fn client(&self) -> Result<async_nats::Client, FaucetError> {
         self.client
-            .get_or_try_init(|| faucet_common_nats::connect(&self.config.connection))
+            .get_or_try_init(|| {
+                self.calls.call_once(
+                    "connect",
+                    faucet_common_nats::connect(&self.config.connection),
+                )
+            })
             .await
             .cloned()
     }
 
-    /// Bound `fut` by `publish_timeout_secs` (#789 MSG-59).
+    /// Bound `fut` by `publish_timeout_secs` (#789 MSG-59), run as one backend
+    /// call named `what` under the run's call context (#880).
     async fn bounded<F: std::future::Future>(
         &self,
         fut: F,
-        what: &str,
+        what: &'static str,
     ) -> Result<F::Output, FaucetError> {
         let after = Duration::from_secs(self.config.publish_timeout_secs);
-        tokio::time::timeout(after, fut)
+        self.calls
+            .call_once(what, async {
+                tokio::time::timeout(after, fut)
+                    .await
+                    .map_err(|_| timeout_error(what, after))
+            })
             .await
-            .map_err(|_| timeout_error(what, after))
     }
 
     /// Publish every record in `batch_size` groups and return one outcome
@@ -122,9 +135,13 @@ impl NatsSink {
             };
             match self.bounded(work, "publish").await {
                 Ok(done) => done?,
-                Err(_) => {
+                Err(FaucetError::Timeout { .. }) => {
                     let after = Duration::from_secs(self.config.publish_timeout_secs);
                     fail_unconfirmed(&mut outcomes[base..], "publish", after);
+                    return Ok(outcomes);
+                }
+                Err(e) => {
+                    fail_cut(&mut outcomes[base..], &e);
                     return Ok(outcomes);
                 }
             }
@@ -170,8 +187,32 @@ fn fail_unconfirmed(outcomes: &mut [faucet_core::RowOutcome], what: &str, after:
     }
 }
 
+/// Like [`fail_unconfirmed`], for a publish group the run's call context
+/// cancelled: every row not yet decided fails with that error.
+fn fail_cut(outcomes: &mut [faucet_core::RowOutcome], cause: &FaucetError) {
+    for outcome in outcomes.iter_mut().filter(|o| o.is_ok()) {
+        *outcome = Err(match cause {
+            FaucetError::Cancelled { operation } => FaucetError::Cancelled {
+                operation: operation.clone(),
+            },
+            other => FaucetError::Sink(format!("nats publish: {other}")),
+        });
+    }
+}
+
 #[async_trait]
 impl Sink for NatsSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -235,6 +276,25 @@ mod tests {
             "{err:?}"
         );
         assert!(err.is_retriable());
+    }
+
+    #[test]
+    fn a_cancelled_group_fails_only_rows_not_yet_decided() {
+        let mut outcomes: Vec<faucet_core::RowOutcome> =
+            vec![Err(FaucetError::Sink("own".into())), Ok(()), Ok(())];
+        fail_cut(
+            &mut outcomes,
+            &FaucetError::Cancelled {
+                operation: "publish call".into(),
+            },
+        );
+        assert!(matches!(&outcomes[0], Err(FaucetError::Sink(m)) if m == "own"));
+        assert!(matches!(&outcomes[1], Err(FaucetError::Cancelled { .. })));
+        fail_cut(&mut outcomes[2..], &FaucetError::Source("x".into()));
+        assert!(matches!(&outcomes[2], Err(FaucetError::Cancelled { .. })));
+        let mut fresh: Vec<faucet_core::RowOutcome> = vec![Ok(())];
+        fail_cut(&mut fresh, &FaucetError::Source("x".into()));
+        assert!(matches!(&fresh[0], Err(FaucetError::Sink(m)) if m.contains("x")));
     }
 
     #[test]

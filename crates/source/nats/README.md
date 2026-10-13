@@ -86,6 +86,10 @@ pipeline:
 
 Declares no optional capabilities (no exactly-once, discovery, sharding or lag). `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+The connect, the JetStream stream/consumer lookups and pulls, the core subscription and its polls, and the page acks run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or an idle wait promptly with an error (the pipeline has already stopped reading and flushed what it took). Each call counts as one round trip (`connect`, `query`, `pull`, `subscribe`, `ack`) in `faucet_source_roundtrips_total`. Nothing is retried; an unacked message is redelivered by the server.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

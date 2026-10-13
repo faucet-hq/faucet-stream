@@ -31,6 +31,9 @@ use tokio::sync::OnceCell;
 pub struct NatsSource {
     config: NatsSourceConfig,
     client: OnceCell<async_nats::Client>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 impl NatsSource {
@@ -41,13 +44,19 @@ impl NatsSource {
         Ok(Self {
             config,
             client: OnceCell::new(),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
     /// Lazily build (once) and return the shared NATS client.
     async fn client(&self) -> Result<async_nats::Client, FaucetError> {
         self.client
-            .get_or_try_init(|| faucet_common_nats::connect(&self.config.connection))
+            .get_or_try_init(|| {
+                self.calls.call_once(
+                    "connect",
+                    faucet_common_nats::connect(&self.config.connection),
+                )
+            })
             .await
             .cloned()
     }
@@ -122,6 +131,17 @@ enum Polled {
 
 #[async_trait]
 impl Source for NatsSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -163,6 +183,9 @@ impl Source for NatsSource {
 
         Box::pin(async_stream::try_stream! {
             let client = self.client().await?;
+            let calls = self.calls.get();
+            // A read of an already-requested batch is not a round trip of its own.
+            let steps = calls.clone().with_roundtrip_metering(false);
 
             if self.config.is_jetstream() {
                 // ── JetStream pull-consumer mode ────────────────────────────
@@ -178,14 +201,22 @@ impl Source for NatsSource {
                     .expect("validated: jetstream_consumer is Some in JetStream mode");
 
                 let js = async_nats::jetstream::new(client.clone());
-                let js_stream = js
-                    .get_stream(stream_name)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("nats jetstream get_stream '{stream_name}': {e}")))?;
-                let consumer: async_nats::jetstream::consumer::PullConsumer = js_stream
-                    .get_consumer(consumer_name)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("nats jetstream get_consumer '{consumer_name}': {e}")))?;
+                let js_stream = calls
+                    .call_once("query", async {
+                        js.get_stream(stream_name).await.map_err(|e| {
+                            FaucetError::Source(format!("nats jetstream get_stream '{stream_name}': {e}"))
+                        })
+                    })
+                    .await?;
+                let consumer: async_nats::jetstream::consumer::PullConsumer = calls
+                    .call_once("query", async {
+                        js_stream.get_consumer(consumer_name).await.map_err(|e| {
+                            FaucetError::Source(format!(
+                                "nats jetstream get_consumer '{consumer_name}': {e}"
+                            ))
+                        })
+                    })
+                    .await?;
                 // Acks happen only after a page is written, so a page larger
                 // than the consumer's `max_ack_pending` would stall: the server
                 // stops delivering and later redelivers (#789 MSG-47).
@@ -210,7 +241,7 @@ impl Source for NatsSource {
 
                 loop {
                     if !to_ack.is_empty() {
-                        ack_all(&client, std::mem::take(&mut to_ack)).await;
+                        ack_page(&calls, &client, std::mem::take(&mut to_ack)).await;
                         hold(&page_msgs, &to_ack);
                     }
 
@@ -220,16 +251,20 @@ impl Source for NatsSource {
                     let want = pull_size(page_cap, buffer.len(), max_messages, total);
                     let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
                     let mut batch = Box::pin(
-                        consumer
-                            .batch()
-                            .max_messages(want)
-                            .expires(budget.max(Duration::from_millis(100)))
-                            .messages()
-                            .await
-                            .map_err(|e| FaucetError::Source(format!("nats jetstream pull: {e}")))?,
+                        calls
+                            .call_once("pull", async {
+                                consumer
+                                    .batch()
+                                    .max_messages(want)
+                                    .expires(budget.max(Duration::from_millis(100)))
+                                    .messages()
+                                    .await
+                                    .map_err(|e| FaucetError::Source(format!("nats jetstream pull: {e}")))
+                            })
+                            .await?,
                     );
                     let mut got = 0usize;
-                    while let Some(item) = batch.next().await {
+                    while let Some(item) = steps.call_once("pull", async { Ok(batch.next().await) }).await? {
                         let msg = item.map_err(|e| FaucetError::Source(format!("nats jetstream recv: {e}")))?;
                         let Some(mut record) = decode_payload(&msg.payload, format, &msg.subject, on_decode_error)? else {
                             if let Err(e) = msg.ack_with(async_nats::jetstream::AckKind::Term).await {
@@ -270,28 +305,33 @@ impl Source for NatsSource {
 
                 // Flush any acks pending from the last full page, then the
                 // trailing partial page (and its acks).
-                ack_all(&client, std::mem::take(&mut to_ack)).await;
+                ack_page(&calls, &client, std::mem::take(&mut to_ack)).await;
                 if !buffer.is_empty() {
                     yield StreamPage {
                         records: buffer,
                         bookmark: Some(page_bookmark(stream_name, consumer_name, total)),
                     };
-                    ack_all(&client, std::mem::take(&mut page_msgs)).await;
+                    ack_page(&calls, &client, std::mem::take(&mut page_msgs)).await;
                 }
                 drop(lease);
                 tracing::info!(messages = total, "nats source: jetstream stream complete");
             } else {
                 // ── Core NATS subscription mode ─────────────────────────────
-                let mut sub: Pin<Box<async_nats::Subscriber>> = Box::pin(match &self.config.queue_group {
-                    Some(group) => client
-                        .queue_subscribe(self.config.subject.clone(), group.clone())
-                        .await
-                        .map_err(|e| FaucetError::Source(format!("nats queue_subscribe '{}': {e}", self.config.subject)))?,
-                    None => client
-                        .subscribe(self.config.subject.clone())
-                        .await
-                        .map_err(|e| FaucetError::Source(format!("nats subscribe '{}': {e}", self.config.subject)))?,
-                });
+                let subscribed = calls
+                    .call_once("subscribe", async {
+                        match &self.config.queue_group {
+                            Some(group) => client
+                                .queue_subscribe(self.config.subject.clone(), group.clone())
+                                .await
+                                .map_err(|e| FaucetError::Source(format!("nats queue_subscribe '{}': {e}", self.config.subject))),
+                            None => client
+                                .subscribe(self.config.subject.clone())
+                                .await
+                                .map_err(|e| FaucetError::Source(format!("nats subscribe '{}': {e}", self.config.subject))),
+                        }
+                    })
+                    .await?;
+                let mut sub: Pin<Box<async_nats::Subscriber>> = Box::pin(subscribed);
 
                 let mut buffer: Vec<Value> = Vec::with_capacity(cap);
                 let mut total = 0usize;
@@ -301,7 +341,12 @@ impl Source for NatsSource {
                 // signal handler a library must not install (#789 MSG-89).
                 loop {
                     let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
-                    let polled = match tokio::time::timeout(budget, sub.next()).await {
+                    // The run's deadline and cancel token end the wait with an
+                    // error (#880); the pipeline has already stopped reading.
+                    let next = steps
+                        .call_once("poll", async { Ok(tokio::time::timeout(budget, sub.next()).await) })
+                        .await?;
+                    let polled = match next {
                         Ok(Some(msg)) => {
                             last_at = Instant::now();
                             match decode_payload(&msg.payload, format, &msg.subject, on_decode_error)? {
@@ -411,6 +456,27 @@ async fn mark_in_progress(messages: Vec<async_nats::jetstream::Message>) {
         if let Err(e) = msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
             tracing::warn!(error = %e, "nats source: in-progress ack failed");
         }
+    }
+}
+
+/// [`ack_all`] as one backend call (`ack`) under the run's call context; a call
+/// cut short is logged like a failed ack (the messages may be redelivered).
+async fn ack_page(
+    calls: &faucet_core::CallContext,
+    client: &async_nats::Client,
+    messages: Vec<async_nats::jetstream::Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let acked = calls
+        .call_once("ack", async {
+            ack_all(client, messages).await;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = acked {
+        tracing::warn!(error = %e, "nats source: acking a page was cut short (messages may be redelivered)");
     }
 }
 
