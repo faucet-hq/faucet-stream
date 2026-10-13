@@ -156,7 +156,8 @@ where
         {
             r.throttled();
         }
-        if let (Some(budget), Err(FaucetError::RateLimited(wait))) = (rate_limit_retries, &outcome) {
+        if let (Some(budget), Err(FaucetError::RateLimited(wait))) = (rate_limit_retries, &outcome)
+        {
             if rate_limited >= budget {
                 tracing::error!("rate limited {rate_limited} consecutive times; giving up");
                 return outcome;
@@ -234,6 +235,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::resilience::policy::BackoffKind;

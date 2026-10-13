@@ -16,9 +16,9 @@ use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, Shared
 
 /// faucet-auth's `FLOW_SESSION_KEY`: the captured key naming a flow session.
 const FLOW_SESSION_KEY: &str = "__session__";
-use futures_core::Stream;
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
+use futures_core::Stream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
@@ -559,7 +559,8 @@ impl RestStream {
             _ => {}
         }
         let new_builder = || -> Result<faucet_core::http::ClientBuilder, FaucetError> {
-            let mut builder = Client::builder().configure(|b| b.gzip(true).brotli(true).deflate(true));
+            let mut builder =
+                Client::builder().configure(|b| b.gzip(true).brotli(true).deflate(true));
             for name in &sensitive {
                 if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok() {
                     builder = builder.sensitive_header(name);
@@ -3799,24 +3800,19 @@ impl RestStream {
                 ("$select", key),
                 ("$format", "json"),
             ]);
-            let resp = self
-                .client
-                .send(request)
-                .await
-                .map_err(|e| {
-                    FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
-                })?;
+            let resp = self.client.send(request).await.map_err(|e| {
+                FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+            })?;
             if !resp.status().is_success() {
                 return Err(FaucetError::Source(format!(
                     "rest: OData key-bounds returned HTTP {}",
                     resp.status().as_u16()
                 )));
             }
-            let body: serde_json::Value = self
-                .client
-                .json(resp)
-                .await
-                .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))?;
+            let body: serde_json::Value =
+                self.client.json(resp).await.map_err(|e| {
+                    FaucetError::Source(format!("rest: OData key-bounds body: {e}"))
+                })?;
             let Some(row) = body
                 .get("value")
                 .and_then(|v| v.as_array())

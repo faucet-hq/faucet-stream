@@ -373,6 +373,7 @@ async fn try_acquire_every(
 /// Whether a live lease's holder is gone, so the lease may be taken over
 /// without `--force`. Waits briefly for a run in this process that is being
 /// torn down.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn holder_gone(key: &str, held: &RunLease) -> bool {
     let deadline = tokio::time::Instant::now() + LOCAL_TEARDOWN_WAIT;
     loop {
@@ -394,6 +395,7 @@ async fn holder_gone(key: &str, held: &RunLease) -> bool {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 fn spawn_guard(
     store: Arc<dyn StateStore>,
     key: String,
@@ -557,6 +559,7 @@ impl Drop for LeaseGuard {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use faucet_core::{FaucetError, MemoryStateStore};

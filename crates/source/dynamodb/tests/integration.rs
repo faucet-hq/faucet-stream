@@ -1,5 +1,6 @@
 //! Integration tests for `DynamoDbSource` against DynamoDB Local (Docker).
 //! Each test boots its own container; skipped when Docker is unavailable.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 

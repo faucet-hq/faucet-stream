@@ -3,6 +3,7 @@
 //! asserting the handler bodies run, RBAC is enforced (viewer may inspect but
 //! not replay/discard), and the returned summaries match.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::time::Duration;

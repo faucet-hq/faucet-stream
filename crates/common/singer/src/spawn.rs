@@ -47,6 +47,7 @@ pub fn spawn_retrying<T>(
 ///
 /// The wait between attempts blocks the calling thread; it only happens on the
 /// `ETXTBSY` path and totals at most 150 ms.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub fn spawn_command(command: &mut tokio::process::Command) -> io::Result<tokio::process::Child> {
     spawn_retrying(|| command.spawn(), std::thread::sleep)
 }

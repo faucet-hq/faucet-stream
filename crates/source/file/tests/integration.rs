@@ -3,6 +3,7 @@
 //! End-to-end reads through `FileSource` against real files on disk and a
 //! wiremock HTTP server (#720, #719).
 #![cfg(feature = "file-formats")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::check::CheckContext;
 use faucet_core::file_format::{FileFormat, FormatOptions, encode};

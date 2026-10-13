@@ -175,6 +175,7 @@ pub(crate) enum ShardEvent {
 /// Read one bounded slice of a shard: up to [`MAX_BATCHES_PER_SLICE`]
 /// batches, ending early when the shard is caught up (requeued after the poll
 /// interval), throttled (requeued after a backoff) or closed.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) async fn read_slice(
     client: StreamsClient,
     config: DynamoDbSourceConfig,
@@ -355,6 +356,7 @@ pub(crate) async fn read_slice(
 /// Peek one record at `start` without consuming anything: the creation time
 /// (ms) of the oldest unread record, or `None` when the shard has nothing
 /// to read. Throttled / transient failures retry per `config.retry`.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) async fn peek_oldest(
     client: &StreamsClient,
     config: &DynamoDbSourceConfig,

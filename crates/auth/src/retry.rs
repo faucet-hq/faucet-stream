@@ -96,7 +96,8 @@ pub(crate) async fn send_token_request(
                 attempt = n,
                 "token endpoint transient failure; retrying after backoff"
             );
-            let delay = wait.unwrap_or_else(|| faucet_core::retry::backoff_with_jitter(RETRY_BASE, n));
+            let delay =
+                wait.unwrap_or_else(|| faucet_core::retry::backoff_with_jitter(RETRY_BASE, n));
             *last_transient.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(TokenReply { status, body });
             Err(FaucetError::RateLimited(delay))
@@ -165,13 +166,17 @@ mod tests {
             .await;
         let client = Client::new().unwrap();
         let url = format!("{}/t", server.uri());
-        let reply = send_token_request(&client, || Ok(client.post(&url))).await.unwrap();
+        let reply = send_token_request(&client, || Ok(client.post(&url)))
+            .await
+            .unwrap();
         assert!(reply.is_success());
         assert_eq!(reply.text(), "ok");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         let url = format!("{}/p", server.uri());
-        let reply = send_token_request(&client, || Ok(client.post(&url))).await.unwrap();
+        let reply = send_token_request(&client, || Ok(client.post(&url)))
+            .await
+            .unwrap();
         assert_eq!(reply.status, 401);
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
@@ -185,7 +190,9 @@ mod tests {
             .await;
         let client = Client::new().unwrap();
         let url = format!("{}/t", server.uri());
-        let reply = send_token_request(&client, || Ok(client.post(&url))).await.unwrap();
+        let reply = send_token_request(&client, || Ok(client.post(&url)))
+            .await
+            .unwrap();
         assert_eq!(reply.status, 429);
         assert_eq!(
             server.received_requests().await.unwrap().len(),

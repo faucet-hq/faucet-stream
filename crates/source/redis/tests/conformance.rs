@@ -5,6 +5,7 @@
 //! requires Docker — it runs in CI alongside the other integration tests. It
 //! drives the stream mode (`XRANGE`-paged), matching the existing streaming
 //! integration test's container boot + seeding path verbatim.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Source;

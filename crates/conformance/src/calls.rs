@@ -74,9 +74,7 @@ where
     F: Fn() -> S,
 {
     let source = make();
-    source.set_call_context(
-        CallContext::new().with_deadline(Instant::now() + CALL_DEADLINE),
-    );
+    source.set_call_context(CallContext::new().with_deadline(Instant::now() + CALL_DEADLINE));
     let err = ends_within("source read with a deadline", drain(&source)).await;
     assert_timeout_like(&err, "source read with a deadline");
 
@@ -103,9 +101,7 @@ where
         sink.flush().await
     };
     let sink = make();
-    sink.set_call_context(
-        CallContext::new().with_deadline(Instant::now() + CALL_DEADLINE),
-    );
+    sink.set_call_context(CallContext::new().with_deadline(Instant::now() + CALL_DEADLINE));
     let err = ends_within("sink write with a deadline", write(sink)).await;
     assert_timeout_like(&err, "sink write with a deadline");
 

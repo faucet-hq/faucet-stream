@@ -6,6 +6,8 @@ use crate::config::{
 };
 use async_trait::async_trait;
 use base64::Engine as _;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::{
     filter_incremental_path_inclusive, max_replication_value_path, max_value,
 };
@@ -15,8 +17,6 @@ use faucet_core::{
     Stream, StreamPage,
 };
 use jsonpath_rust::JsonPath;
-use faucet_core::http::Client;
-use faucet_core::io::{CallContext, CallSlot};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;

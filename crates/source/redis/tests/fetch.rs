@@ -7,6 +7,7 @@
 //!
 //! These tests require Docker. Each test boots its own container and seeds its
 //! own keyspace so they are fully isolated and safe to run in parallel.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Source;
 use faucet_source_redis::{RedisSource, RedisSourceConfig, RedisSourceType};

@@ -200,6 +200,7 @@ pub(crate) fn offsets_stable(committed_high: &[i64], log_end: &[i64]) -> bool {
 /// reading at that point returns an older token for this scope and the resume
 /// rewrites a committed page (#789 MSG-73). Transactions opened after the
 /// snapshot do not extend the wait.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 fn wait_for_stable_offsets(
     cfg: &ClientConfig,
     committed: &BaseConsumer,
@@ -455,6 +456,7 @@ pub(crate) fn fold_token_for_scope(
 /// full queue is expected on a slow cluster: the producer keeps delivering in
 /// the background, and we wait for room for up to `budget` (the configured
 /// `message_timeout`) rather than `max_retries × backoff` (#789 MSG-56).
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub(crate) async fn enqueue_in_txn(
     producer: &FutureProducer,
     topic: &str,

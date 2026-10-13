@@ -1,5 +1,6 @@
 //! GraphQL bulk export jobs through the REST `async_job` (#768):
 //! GraphQL submit → POST poll → JSONL download → row routing by GID type.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::collections::HashMap;
 use std::sync::Arc;

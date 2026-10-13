@@ -19,6 +19,7 @@ pub fn build_emitter(
 
 /// Best-effort transport reachability check (used by validate + doctor).
 /// Never fails a run — returns a human-readable Ok/Err string.
+#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 pub async fn check_transport(cfg: &LineageConfig) -> Result<String, String> {
     match &cfg.transport {
         faucet_lineage::Transport::File { path } => {

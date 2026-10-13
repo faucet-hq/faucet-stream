@@ -214,6 +214,7 @@ impl GrpcStream {
     /// Drive a server-streaming RPC, yielding a page each time `page_chunk`
     /// records accumulate. Transient failures reconnect with backoff; others
     /// end the stream with an error.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn server_stream_resolved<'a>(
         &'a self,
         endpoint: String,

@@ -1,7 +1,7 @@
 //! A mock OTLP logs collector for the log-shipping tests (#806): gRPC (tonic)
 //! and HTTP/protobuf (wiremock). Records every acknowledged request; `down`
 //! makes it refuse exports (gRPC `UNAVAILABLE`, HTTP 503) to simulate an outage.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![allow(dead_code)]
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{

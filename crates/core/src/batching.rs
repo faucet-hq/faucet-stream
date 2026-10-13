@@ -59,11 +59,7 @@ pub fn into_chunks<T>(items: Vec<T>, batch_size: usize) -> Vec<Vec<T>> {
 /// Run `f` on every item with at most `limit` in flight (`0` is treated as
 /// `1`). Stops at, and returns, the first error; work already in flight is
 /// dropped.
-pub async fn for_each_concurrent<I, F, Fut>(
-    items: I,
-    limit: usize,
-    f: F,
-) -> Result<(), FaucetError>
+pub async fn for_each_concurrent<I, F, Fut>(items: I, limit: usize, f: F) -> Result<(), FaucetError>
 where
     I: IntoIterator,
     F: FnMut(I::Item) -> Fut,
@@ -154,7 +150,10 @@ mod tests {
 
     #[test]
     fn into_chunks_moves_items() {
-        assert_eq!(into_chunks(vec![1, 2, 3, 4, 5], 2), vec![vec![1, 2], vec![3, 4], vec![5]]);
+        assert_eq!(
+            into_chunks(vec![1, 2, 3, 4, 5], 2),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
         assert_eq!(into_chunks(vec![1, 2, 3], 0), vec![vec![1, 2, 3]]);
         assert_eq!(into_chunks(vec![1, 2], 2), vec![vec![1, 2]]);
         assert!(into_chunks(Vec::<u8>::new(), 2).is_empty());

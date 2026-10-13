@@ -2,6 +2,7 @@
 //! `LogHub` persistence writer (batching, per-run cap, retention). SQLite is
 //! embedded, so the SQL tests exercise the shared machinery used by Postgres too.
 #![cfg(feature = "serve-history-sqlite")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::serve::history::sqlite::SqliteHistory;
 use faucet_cli::serve::history::{RUN_LOG_TRUNCATED_SEQ, RunHistory, RunLogLine};

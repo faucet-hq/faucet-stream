@@ -73,6 +73,7 @@ impl<T> Drop for LeaseExtender<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

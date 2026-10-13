@@ -563,7 +563,10 @@ mod tests {
                 async { Err(status(503)) }
             })
             .await;
-        assert!(matches!(r, Err(FaucetError::HttpStatus { status: 503, .. })));
+        assert!(matches!(
+            r,
+            Err(FaucetError::HttpStatus { status: 503, .. })
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -629,7 +632,10 @@ mod tests {
         assert!(matches!(r, Err(FaucetError::Timeout { .. })), "{r:?}");
         assert!(Instant::now() - start <= Duration::from_secs(5));
         let r: Result<(), _> = ctx.call("op", || async { Ok(()) }).await;
-        assert!(matches!(r, Err(FaucetError::Timeout { .. })), "past deadline");
+        assert!(
+            matches!(r, Err(FaucetError::Timeout { .. })),
+            "past deadline"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -828,7 +834,11 @@ mod tests {
         assert!(kept.url().is_some(), "an unchanged URL is kept");
         let dropped = redact_reqwest_url(kept, |_| "not a url".into());
         assert!(dropped.url().is_none());
-        assert!(redact_reqwest_url(dropped, |_| String::new()).url().is_none());
+        assert!(
+            redact_reqwest_url(dropped, |_| String::new())
+                .url()
+                .is_none()
+        );
     }
 
     #[test]

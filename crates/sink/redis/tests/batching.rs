@@ -5,6 +5,7 @@
 //! batching" sentinel path.
 //!
 //! These tests require Docker.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Sink;
 use faucet_sink_redis::{RedisSink, RedisSinkConfig, RedisSinkType};

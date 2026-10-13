@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOptions};
 use lapin::types::FieldTable;

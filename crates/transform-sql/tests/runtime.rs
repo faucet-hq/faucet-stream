@@ -1,5 +1,6 @@
 //! Integration tests for the compiled `SqlTransform`: per-page execution,
 //! reference relations, schema drift, validation, and connection reuse.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::stage::{CompiledStage, apply_stages_to_page, compile_stage};
 use faucet_transform_sql::{RelationSource, RelationSpec, SqlTransform, SqlTransformConfig};

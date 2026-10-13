@@ -5,8 +5,8 @@
 //! The token is cached and refreshed single-flight, like the other providers.
 
 use async_trait::async_trait;
-use faucet_core::{AuthProvider, Credential, FaucetError};
 use faucet_core::http::Client;
+use faucet_core::{AuthProvider, Credential, FaucetError};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;

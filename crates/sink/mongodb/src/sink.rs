@@ -454,6 +454,7 @@ impl MongoSink {
     /// outer `Err` is returned only while nothing has been inserted, so a
     /// failed call never leaves rows that a DLQ replay would duplicate; after
     /// that, the documents still pending fail per row.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn insert_partial(
         &self,
         records: &[Value],

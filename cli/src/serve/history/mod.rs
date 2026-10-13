@@ -1997,6 +1997,7 @@ const CONNECT_ATTEMPTS: usize = 8;
 /// unclassified one costs at most the (bounded) attempt budget before
 /// degrading with the same message it would have degraded with immediately.
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn connect_with_retry<H, F, Fut>(label: &str, mut make: F) -> Result<H, HistoryError>
 where
     F: FnMut() -> Fut,

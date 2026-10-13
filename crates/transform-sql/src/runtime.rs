@@ -253,6 +253,7 @@ fn settled(
     age >= RELOAD_SETTLE || recheck() == Some(first)
 }
 
+#[allow(clippy::disallowed_methods)] // reload polling on a blocking thread
 fn reload_relations(st: &mut State) -> Result<(), FaucetError> {
     for r in st.reloadables.iter_mut() {
         let stamp = file_stamp(&r.path);

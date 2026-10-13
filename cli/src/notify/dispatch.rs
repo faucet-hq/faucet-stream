@@ -47,6 +47,7 @@ impl Notifier {
     /// Build a notifier from the config `notifications:` list. Returns `Ok(None)`
     /// when the list is empty (no overhead / no client). Validates the rules
     /// fail-fast (duplicate names, empty channel fields).
+    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     pub fn from_specs(specs: &[NotificationSpec]) -> CliResult<Option<Arc<Notifier>>> {
         if specs.is_empty() {
             return Ok(None);
@@ -197,6 +198,7 @@ impl Notifier {
     }
 
     /// Bounded-retry, per-attempt-timeout delivery of one message.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
     async fn send_with_retry(
         &self,
         rule: &NotificationSpec,

@@ -5,6 +5,7 @@
 //! pointed at the emulator through the config-level `emulator_host` override
 //! — no process-global `SPANNER_EMULATOR_HOST` env var, so parallel tests
 //! never race.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_common_spanner::SpannerConnection;
 use gcloud_googleapis::spanner::admin::database::v1::CreateDatabaseRequest;

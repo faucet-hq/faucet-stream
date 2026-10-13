@@ -2,9 +2,9 @@
 //! endpoint and extract it from the JSON response via JSONPath.
 
 use async_trait::async_trait;
+use faucet_core::http::Client;
 use faucet_core::{AuthProvider, Credential, FaucetError};
 use jsonpath_rust::JsonPath;
-use faucet_core::http::Client;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::Instant;

@@ -339,6 +339,7 @@ impl BudgetSink {
 pub struct BudgetTimer(Option<tokio::task::JoinHandle<()>>);
 
 impl BudgetTimer {
+    #[allow(clippy::disallowed_methods)] // the duration budget's own timer
     fn start(
         max_duration_secs: Option<u64>,
         state: Arc<BudgetState>,

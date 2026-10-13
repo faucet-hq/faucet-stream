@@ -2,6 +2,7 @@
 //!
 //! Each test boots its own LocalStack container and creates its own stream,
 //! so they are isolated and safe to run in parallel.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Source;
 use faucet_source_kinesis::{KinesisCredentials, KinesisSource, KinesisSourceConfig};

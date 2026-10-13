@@ -1,5 +1,6 @@
 //! A second run of a row is refused while another run holds its live lease
 //! (#789 MSG-42), unless forced.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::config::PipelineConfig;
 use faucet_cli::executor::{ExecuteOptions, run_expanded};

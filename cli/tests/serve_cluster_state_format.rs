@@ -1,6 +1,7 @@
 //! #736: cluster members advertise the newest state format they read, so a
 //! mixed-version cluster keeps writing bookmarks an older member can read.
 #![cfg(feature = "serve-history-sqlite")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use chrono::Utc;
 use faucet_cli::serve::history::sqlite::SqliteHistory;

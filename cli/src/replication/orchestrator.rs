@@ -145,6 +145,7 @@ pub(crate) fn spawn_cancel_on_signal(token: CancellationToken) {
 /// Run the two-phase replication. Validates, bootstraps (captures + seeds the
 /// CDC position), snapshots (if not already done), then streams CDC (looping
 /// until SIGTERM when `continuous`).
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run_replication(
     cfg: &PipelineConfig,
     compiled: &CompiledReplication,

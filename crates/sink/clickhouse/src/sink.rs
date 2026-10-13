@@ -611,6 +611,7 @@ mod staging_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use serde_json::json;

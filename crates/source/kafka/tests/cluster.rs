@@ -13,6 +13,7 @@
 //!   (no re-read of work another member already completed), while a bookmark
 //!   *ahead* of the committed offset still wins (the durable-write-before-
 //!   commit crash window).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::shard::ShardSpec;
 use faucet_core::{Source, StreamPage};

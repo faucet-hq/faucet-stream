@@ -439,6 +439,7 @@ impl LogShipSession {
 
     /// Close `run_id` and ship its lines for at most `flush_timeout_secs`.
     /// Returns the run's export status.
+    #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
     pub async fn finish_run(&self, run_id: &str) -> LogExportView {
         self.end_run(run_id);
         let timeout = self.spec.flush_timeout();
@@ -491,6 +492,7 @@ impl Drop for LogShipSession {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn background(shipper: Shipper, stop: faucet_core::CancellationToken) {
     let mut wait = SHIP_EVERY;
     loop {
@@ -537,6 +539,7 @@ pub async fn ship_spool(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

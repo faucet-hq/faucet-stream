@@ -175,6 +175,7 @@ macro_rules! primary {
         loop {
             match $pcall.await {
                 Err(e) if e.is_unreachable() && attempt < PRIMARY_ATTEMPTS => {
+                    #[allow(clippy::disallowed_methods)] // history-store reconnect backoff
                     tokio::time::sleep(RETRY_BASE * 4u32.pow(attempt - 1)).await;
                     attempt += 1;
                 }

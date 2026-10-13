@@ -11,6 +11,7 @@
     feature = "source-rest",
     feature = "sink-jsonl"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::{FileStateStore, StateStore};
 use serde_json::{Value, json};

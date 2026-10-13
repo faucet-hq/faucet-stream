@@ -3113,6 +3113,7 @@ fn quarantine_drift_rows(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -8966,8 +8967,15 @@ mod call_context_tests {
                 .unwrap();
             let src = source.seen.0.lock().unwrap().clone().unwrap();
             let snk = sink.0.0.lock().unwrap().clone().unwrap();
-            assert_eq!(src.cancel().is_some(), !drains, "draining sources keep their own cancel");
-            assert!(snk.cancel().is_none(), "a sink is never cancelled mid-flush");
+            assert_eq!(
+                src.cancel().is_some(),
+                !drains,
+                "draining sources keep their own cancel"
+            );
+            assert!(
+                snk.cancel().is_none(),
+                "a sink is never cancelled mid-flush"
+            );
             assert!(src.recorder().is_some() && snk.recorder().is_some());
             assert_eq!(src.timeout(), Some(std::time::Duration::from_secs(7)));
             assert_eq!(snk.timeout(), Some(std::time::Duration::from_secs(7)));

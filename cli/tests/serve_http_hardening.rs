@@ -2,6 +2,7 @@
 //! `--cors-origin`, `--body-limit-bytes` above axum's 2 MiB default, and the
 //! `concurrency: 0` refusal text.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::serve::{ServeConfig, run_server};
 use std::time::Duration;

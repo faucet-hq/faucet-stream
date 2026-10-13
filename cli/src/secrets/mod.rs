@@ -40,6 +40,7 @@ pub trait SecretResolver: Send + Sync {
 /// HTTP client for the secret-manager backends: a hung endpoint fails the
 /// load instead of hanging it.
 #[cfg(any(feature = "secrets-vault", feature = "secrets-gcp-sm"))]
+#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 pub(crate) fn secret_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))

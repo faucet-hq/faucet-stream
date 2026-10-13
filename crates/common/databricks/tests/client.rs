@@ -1,4 +1,5 @@
 //! Wiremock tests for the shared Statement Execution API client.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

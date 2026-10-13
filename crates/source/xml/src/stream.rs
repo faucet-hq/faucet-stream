@@ -3,11 +3,11 @@
 use crate::config::{XmlAuth, XmlPagination, XmlStreamConfig};
 use crate::convert;
 use async_trait::async_trait;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
 use faucet_core::{Stream, StreamPage};
-use faucet_core::http::Client;
-use faucet_core::io::{CallContext, CallSlot};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
@@ -713,12 +713,11 @@ impl XmlStream {
                                 ))
                             },
                         )?;
-                        let mut v =
-                            reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                                FaucetError::Auth(format!(
-                                    "invalid custom header value for {name:?}: {e}"
-                                ))
-                            })?;
+                        let mut v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                            FaucetError::Auth(format!(
+                                "invalid custom header value for {name:?}: {e}"
+                            ))
+                        })?;
                         v.set_sensitive(true);
                         hm.insert(n, v);
                     }

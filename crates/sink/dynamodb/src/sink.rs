@@ -206,6 +206,7 @@ impl DynamoDbSink {
 
     /// Send one chunk, retrying unprocessed items; a validation failure falls
     /// back to item-by-item writes so only the bad rows fail.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn batch_chunk(
         &self,
         ops: Vec<Op>,

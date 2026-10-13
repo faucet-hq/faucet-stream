@@ -772,6 +772,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 /// Does not touch the parent run record — the caller finalizes the shard and
 /// the parent. The flag is `true` when a server shutdown interrupted it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn execute_shard(
     state: &ServerState,
     loaded: LoadedSubmission,
@@ -1853,6 +1854,7 @@ fn spawn_run(
 /// `from_queue` is `true` when the run consumed a local queue slot (submit path)
 /// and `false` for a cluster claim-path run that never reserved one (#228).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn execute_run(
     state: ServerState,
     loaded: LoadedSubmission,
@@ -2310,6 +2312,7 @@ async fn finalize_queued_cancel(
 
 /// Spawn a detached timer that drops a finished run's log buffer after the drain
 /// window, freeing its ring once late `/logs` fetchers have had a chance to read.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 fn schedule_log_drop(state: ServerState, run_id: String) {
     tokio::spawn(async move {
         tokio::time::sleep(crate::serve::logs::LOG_DRAIN).await;
@@ -2337,6 +2340,7 @@ fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

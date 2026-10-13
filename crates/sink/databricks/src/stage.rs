@@ -253,6 +253,7 @@ impl FilesApiStager {
         Ok(url)
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn send(
         &self,
         method: reqwest::Method,
@@ -395,6 +396,7 @@ pub fn build_object_store(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

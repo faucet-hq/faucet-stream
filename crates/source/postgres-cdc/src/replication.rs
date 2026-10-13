@@ -1059,6 +1059,7 @@ fn slot_acquire_backoff(attempt: u32) -> Duration {
 /// it fails because the replication slot is still active (#146 M12). Any other
 /// error — and the final attempt's error after exhausting retries — is returned
 /// immediately. `max_retries = 0` preserves the previous fail-fast behaviour.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 pub async fn retry_on_slot_active<F, Fut, T>(max_retries: u32, op: F) -> Result<T, FaucetError>
 where
     F: Fn() -> Fut,
@@ -1086,6 +1087,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

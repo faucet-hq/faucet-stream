@@ -3,6 +3,7 @@
 //! by the Postgres backend too — against a real database file, no server needed.
 //! Requires the `serve-history-sqlite` feature.
 #![cfg(feature = "serve-history-sqlite")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use chrono::{Duration as ChronoDuration, Utc};
 use faucet_cli::serve::history::InstanceHeartbeat;

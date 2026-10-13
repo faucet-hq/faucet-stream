@@ -70,6 +70,7 @@ pub(crate) fn plan_segment_shards(total: u32) -> Vec<ShardSpec> {
 }
 
 /// Sleep until `at`, or forever when there is nothing to wait for.
+#[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
 async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(t) => tokio::time::sleep_until(t.into()).await,
@@ -756,6 +757,7 @@ fn stream_record_table(mode: crate::config::ReadMode, record: &Value) -> Option<
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
 
     #[test]

@@ -1,6 +1,7 @@
 #![cfg(all(feature = "otel", feature = "observability-install"))]
 //! A host that renders `/metrics` from its own Prometheus recorder (`faucet
 //! serve`) still exports OTLP metrics: the fanout feeds both.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use axum::{Router, body::Bytes, extract::State, routing::post};
 use faucet_core::observability::install_prometheus_with_otel_metrics;

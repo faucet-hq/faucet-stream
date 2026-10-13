@@ -518,6 +518,7 @@ impl SnowflakeSink {
     /// executing (HTTP 200 + code `090001`), bounded by `poll_timeout`.
     /// Returns the final parsed response (which carries the result `data`
     /// for a completed query).
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn poll_until_complete(&self, handle: &str) -> Result<SnowflakeResponse, FaucetError> {
         let url = format!("{}/{}", self.api_url(), handle);
         let poll_timeout = self.config.poll_timeout;

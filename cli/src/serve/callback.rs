@@ -407,6 +407,7 @@ async fn checked_addrs(
 }
 
 /// One bounded, retried delivery attempt sequence.
+#[allow(clippy::disallowed_methods)] // TODO(#880): build with faucet_core::http::Client
 async fn deliver(spec: &CallbackSpec, body: &Value, restricted: bool) -> Result<(), String> {
     let url =
         reqwest::Url::parse(&spec.url).map_err(|e| format!("callback.url is not valid: {e}"))?;

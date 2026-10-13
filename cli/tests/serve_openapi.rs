@@ -11,6 +11,7 @@
 //! list nor the spec would slip through — so a reviewer must update both when
 //! adding an endpoint. Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

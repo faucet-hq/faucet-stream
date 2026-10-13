@@ -10,6 +10,7 @@
 //! shard has been fully drained, so `stream_pages` completes after emitting
 //! exactly the seeded records — letting the bounded-memory check assert
 //! `seen == total`.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::{
     assert_bookmark_roundtrip, assert_config_schema_valid_value, assert_errors_not_panics,

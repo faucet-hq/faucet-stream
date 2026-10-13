@@ -271,6 +271,7 @@ async fn watch_loop(args: DevArgs, sample: Vec<Value>, prev: &mut Vec<Value>) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use serde_json::json;

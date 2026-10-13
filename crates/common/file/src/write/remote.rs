@@ -717,6 +717,7 @@ pub fn object_layout(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;

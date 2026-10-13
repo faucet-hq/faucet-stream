@@ -1,4 +1,5 @@
 //! Integration tests against an in-process tokio-tungstenite server.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::{
     AuthProvider, AuthReference, AuthSpec, Credential, FaucetError, SharedAuthProvider, Source,

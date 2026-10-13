@@ -2,6 +2,7 @@
 //! run per unit with backfill labels, deterministic idempotency (re-POST is
 //! replay-safe), the scoping gate, and range validation.
 #![cfg(all(feature = "serve", feature = "source-sqlite", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::serve::{ServeConfig, run_server};
 use serde_json::{Value, json};

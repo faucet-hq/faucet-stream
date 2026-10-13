@@ -125,6 +125,7 @@ impl StateStore for PrivateFileStore {
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Hold an exclusive OS lock on `path` until the returned file is dropped.
+#[allow(clippy::disallowed_methods)] // lock-file polling, not a backend call
 async fn lock_exclusive(path: PathBuf) -> Result<std::fs::File, FaucetError> {
     let mut opts = tokio::fs::OpenOptions::new();
     opts.create(true).truncate(false).write(true);

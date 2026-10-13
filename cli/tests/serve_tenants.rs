@@ -10,6 +10,7 @@
     feature = "sink-jsonl",
     feature = "serve-history-sqlite"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::time::Duration;

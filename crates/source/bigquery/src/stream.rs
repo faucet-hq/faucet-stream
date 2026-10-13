@@ -143,6 +143,7 @@ impl BigQuerySource {
     /// The query is run to completion first: the destination table only exists
     /// (and only has rows) once the job is DONE.
     #[cfg(feature = "arrow")]
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     pub(crate) async fn query_destination_table(
         &self,
         context: &HashMap<String, Value>,
@@ -702,6 +703,7 @@ impl faucet_core::Source for BigQuerySource {
         Ok(CheckReport::single(probe))
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -816,6 +818,7 @@ impl faucet_core::Source for BigQuerySource {
         crate::storage_read::stream_batches_arrow_with(self, context)
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn stream_pages<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,

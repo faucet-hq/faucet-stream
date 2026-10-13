@@ -8,6 +8,7 @@
 //!
 //! Idempotency checks (3/4) do not apply — the NATS sink is append-only and
 //! advertises no idempotency/keyed-upsert mechanism.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_sink_nats::NatsSinkConfig;

@@ -2,6 +2,7 @@
 //! A host that installs its own global subscriber before any config is loaded
 //! (the CLI) still exports OTLP traces: `install_observability` hands its trace
 //! layer to the reload slot the host registered.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use axum::{Router, body::Bytes, extract::State, routing::post};
 use faucet_core::observability::otel::{

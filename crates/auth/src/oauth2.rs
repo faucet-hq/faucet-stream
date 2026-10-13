@@ -8,8 +8,8 @@
 //! racing.
 
 use async_trait::async_trait;
-use faucet_core::{AuthProvider, Credential, FaucetError, StateStore};
 use faucet_core::http::Client;
+use faucet_core::{AuthProvider, Credential, FaucetError, StateStore};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -368,9 +368,10 @@ impl OAuth2RefreshProvider {
         if let Some(scope) = &self.scope {
             form.push(("scope", scope));
         }
-        let reply =
-            crate::retry::send_token_request(&self.http, || Ok(self.http.post(&self.token_url).form(&form)))
-                .await?;
+        let reply = crate::retry::send_token_request(&self.http, || {
+            Ok(self.http.post(&self.token_url).form(&form))
+        })
+        .await?;
         let body = parse_token_response(reply)?;
         state.access_token = Some(body.access_token.clone());
         state.expires_at = expiry_instant(body.expires_in, self.expiry_ratio);

@@ -4,6 +4,7 @@
 //! compiled in `build.rs`. The same server handles unary and server-streaming
 //! RPCs and includes a `fail_after` knob to exercise the source's reconnect
 //! path.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

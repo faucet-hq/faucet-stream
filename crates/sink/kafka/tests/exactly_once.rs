@@ -8,6 +8,7 @@
 //!
 //! Requires Docker. A single-broker container must enable transactions, so we
 //! force the transaction-state-log replication/ISR + offsets replication to 1.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_common_kafka::{CompressionType, KafkaAuth, KafkaValueFormat, OnKeyError};
 use faucet_core::idempotency::format_token;

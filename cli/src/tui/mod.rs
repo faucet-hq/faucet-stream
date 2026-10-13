@@ -244,6 +244,7 @@ pub fn flush_logs_to_stderr(max_lines: usize) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use std::io::Write;

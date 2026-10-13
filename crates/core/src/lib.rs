@@ -140,7 +140,6 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
 pub use error::FaucetError;
-pub use io::{CallContext, CallSlot, DEFAULT_CALL_TIMEOUT};
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
     AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, CsvUnknownField, ExcelOptions,
@@ -151,6 +150,7 @@ pub use idempotency::{
     SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,
     parse_token, parse_token_parts, unwrap_state, wrap_state,
 };
+pub use io::{CallContext, CallSlot, DEFAULT_CALL_TIMEOUT};
 pub use join::{
     HashJoin, JoinConfig, JoinMode, JoinStats, KeyNormalize, OnCollision, OnDuplicate, Projection,
 };

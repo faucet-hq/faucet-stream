@@ -1146,6 +1146,7 @@ async fn wait_for_signal() {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::serve::history::memory::MemoryHistory;

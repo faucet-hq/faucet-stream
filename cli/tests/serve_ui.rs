@@ -1,5 +1,6 @@
 //! Embedded web-console serving + auth-boundary tests (serve-ui feature).
 #![cfg(feature = "serve-ui")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

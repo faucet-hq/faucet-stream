@@ -274,6 +274,7 @@ impl Shared {
 
     /// One fetch cycle: mine windows until idle, emitting a page per committed
     /// transaction. Returns early when the consumer goes away.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn capture(
         &self,
         start: Option<Position>,

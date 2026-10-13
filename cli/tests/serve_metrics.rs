@@ -2,6 +2,7 @@
 //! binary because the Prometheus recorder is a process-global singleton (only the
 //! first server in a process gets a render handle). Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;

@@ -2,6 +2,7 @@
 //! records reported as written are never lost silently, an interrupted
 //! overwrite is finished by the next run, and storage I/O never blocks a
 //! caller's timeout.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Sink;
 use faucet_sink_file::FileSink;

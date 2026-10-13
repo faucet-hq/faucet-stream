@@ -1,4 +1,5 @@
 //! Integration tests against a real `rabbitmq:3-management` broker (Docker).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 

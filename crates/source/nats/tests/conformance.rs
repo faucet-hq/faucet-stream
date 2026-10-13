@@ -10,6 +10,7 @@
 //!
 //! Bookmark/idempotency checks (3/4/5) do not apply: core NATS is
 //! fire-and-forget (no bookmark) and 4/5 are sink-only.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};
 use faucet_core::Source as _;

@@ -13,6 +13,7 @@
 //! emitted CDC envelopes. It then resumes from the captured bookmark and
 //! asserts that a subsequent write — and only that write — is delivered (no
 //! replay).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Source;
 use faucet_core::check::{CheckContext, ProbeStatus};

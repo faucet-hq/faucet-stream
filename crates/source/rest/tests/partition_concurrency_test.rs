@@ -10,6 +10,7 @@
 //! Overlap is measured by counting **simultaneously open requests** rather
 //! than wall-clock, because a wall-clock ratio is a race on a loaded CI box
 //! (that is exactly how the #619 test first failed).
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::collections::HashMap;
 use std::sync::Arc;

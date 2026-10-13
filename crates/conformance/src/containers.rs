@@ -221,6 +221,7 @@ fn parse_status_line(head: &[u8]) -> Option<u16> {
 
 /// Poll `probe` against `ep` until it succeeds or `timeout` passes. Each call
 /// is bounded by [`PROBE_CALL_TIMEOUT`]; the last failure is returned.
+#[allow(clippy::disallowed_methods)] // test-harness timing
 pub async fn wait_ready(
     probe: &ReadyProbe,
     ep: &Endpoint,
@@ -438,6 +439,7 @@ pub fn backoff_before(attempt: u32, first: Duration) -> Duration {
 
 /// Run `op` up to `attempts` times, retrying only [`AttemptFailure::Retry`],
 /// sleeping [`backoff_before`] between attempts and logging each failure.
+#[allow(clippy::disallowed_methods)] // test-harness timing
 pub async fn retry_start<T, F, Fut>(
     label: &str,
     attempts: u32,

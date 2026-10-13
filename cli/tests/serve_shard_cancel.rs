@@ -1,6 +1,7 @@
 //! SERVE-14: `POST /v1/runs/{id}/cancel` on a source-sharded run in cluster mode
 //! cancels the shards that have not started and ends the run `cancelled`.
 #![cfg(all(feature = "serve", feature = "serve-history-sqlite"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::serve::history::sqlite::SqliteHistory;
 use faucet_cli::serve::history::{RunHistory, RunRecord, RunStatus, ShardInsert, ShardOutcome};
