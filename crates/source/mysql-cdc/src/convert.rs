@@ -391,6 +391,39 @@ pub fn binlog_row_to_json_hinted(
 mod tests {
     use super::*;
 
+    /// The value-fidelity corpus (#885): the wide row as the binlog row values
+    /// MySQL writes for it decodes back unchanged. MySQL's `BOOL` is a
+    /// `TINYINT` (it reads back as `1` / `0`), and a JSON column is decoded
+    /// from its binary form (covered by the `jsonb_*` tests), so nested values
+    /// travel as text here.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let mut sent = fidelity::flat_corpus();
+        let mut landed = Map::new();
+        for (name, v) in sent.as_object_mut().unwrap().iter_mut() {
+            if v.is_object() || v.is_array() {
+                *v = Json::String(v.to_string());
+            }
+            let value = match &*v {
+                Json::Null => Value::NULL,
+                Json::Bool(b) => Value::Int(i64::from(*b)),
+                Json::Number(n) if n.is_f64() => Value::Double(n.as_f64().unwrap()),
+                Json::Number(n) => Value::Int(n.as_i64().unwrap()),
+                Json::String(s) => Value::Bytes(s.as_bytes().to_vec()),
+                _ => unreachable!("nested values were turned into text"),
+            };
+            landed.insert(name.clone(), value_to_json(&value));
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[Json::Object(landed)],
+            fidelity::Tolerance::exact()
+                .skipping("booleans_and_null_true_val")
+                .skipping("booleans_and_null_false_val"),
+        );
+    }
+
     #[test]
     fn binary_columns_follow_the_character_column_charsets() {
         use mysql_async::consts::ColumnType as T;
