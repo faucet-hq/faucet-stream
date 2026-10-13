@@ -6,6 +6,8 @@
 //! transaction that makes a page's rows and its commit token land atomically.
 //! See `docs/superpowers/specs/2026-06-10-bigquery-exactly-once-design.md`.
 
+use faucet_common_sql::SqlDialect;
+use faucet_common_sql::dialects::BigQuery;
 use faucet_core::idempotency::{
     COMMIT_TOKEN_SCOPE_COL, COMMIT_TOKEN_TABLE, COMMIT_TOKEN_TOKEN_COL,
 };
@@ -116,7 +118,7 @@ impl FieldSpec {
 /// SQL string literal for a path/value: single-quoted with `\` and `'` escaped
 /// (BigQuery accepts backslash escapes in quoted strings).
 pub(crate) fn sql_str(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    BigQuery.quote_literal(s)
 }
 
 /// A JSON scalar as a GoogleSQL literal: strings through [`sql_str`] (so a
@@ -143,7 +145,7 @@ pub(crate) fn sql_literal(v: &Value) -> String {
 /// available outcome; escaping instead yields either the correct identifier or
 /// a loud BigQuery error (#654 M15).
 pub(crate) fn quote_ident(name: &str) -> String {
-    format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
+    BigQuery.quote_ident(name)
 }
 
 /// A single JSONPath member segment. Safe BigQuery identifiers use the `.name`
@@ -454,14 +456,7 @@ pub fn fieldspecs_to_json_schema(fields: &[FieldSpec]) -> Value {
 /// Integers map to `INT64` and floats to `FLOAT64`; a widening goes through
 /// [`widened_bq_type`] instead.
 pub fn base_to_bq(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "INT64",
-        Double => "FLOAT64",
-        Boolean => "BOOL",
-        Text => "STRING",
-        Json => "JSON",
-    }
+    BigQuery.type_name(t)
 }
 
 /// The type a drifted column widens to. An `INT64` column that starts
@@ -472,11 +467,7 @@ pub fn widened_bq_type(
     from: Option<faucet_core::SqlBaseType>,
     to: faucet_core::SqlBaseType,
 ) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match (from, to) {
-        (Some(Integer), Double) => "BIGNUMERIC",
-        (_, other) => base_to_bq(other),
-    }
+    BigQuery.widened_type_name(from, to)
 }
 
 /// `CREATE SCHEMA IF NOT EXISTS `<project>`.`<dataset>`` — best-effort dataset
