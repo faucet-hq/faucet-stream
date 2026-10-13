@@ -560,7 +560,8 @@ async fn children_status(
     if !store.supports_list() {
         return Err("this state store cannot enumerate per-parent bookmarks".into());
     }
-    let prefix = format!("{}::", target.base_key(&child.id));
+    let prefix = faucet_core::StateKey::invocation(target.pipeline.as_str(), child.id.as_str())
+        .children_prefix();
     let keys = store.list(&prefix).await.map_err(|e| e.to_string())?;
     let mut any_ok = false;
     let mut any_running = false;

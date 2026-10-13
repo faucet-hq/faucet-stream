@@ -88,6 +88,11 @@ impl KeySuffix {
         self.render_into(&mut s);
         s
     }
+
+    /// The suffix as it ends a key, separator included (`::__lease__`).
+    pub fn tail(&self) -> String {
+        format!("{KEY_SEPARATOR}{}", self.render())
+    }
 }
 
 fn push(out: &mut String, seg: &str) {
@@ -408,6 +413,12 @@ pub fn encode_component(raw: &str, allow_separators: bool) -> String {
     format!("{readable}.h{hash:016x}")
 }
 
+/// The row id of one backfill unit's invocation, `backfill::{range hash}::{unit}`
+/// — namespaced away from every live row's key.
+pub fn backfill_unit_row(range_hash: &str, unit: &str) -> String {
+    ["backfill", range_hash, unit].join(KEY_SEPARATOR)
+}
+
 /// What [`migrate_state_key`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -516,6 +527,7 @@ mod tests {
             "__rollback__::x"
         );
         assert_eq!(inv.children_prefix(), "p::r::");
+        assert_eq!(KeySuffix::Lease.tail(), "::__lease__");
     }
 
     #[test]
@@ -594,6 +606,7 @@ mod tests {
             let k = StateKey::parse(None, "p", key).unwrap_or_else(|| panic!("{key}"));
             assert_eq!(k.render(), key);
         }
+        assert_eq!(backfill_unit_row("h", "u"), "backfill::h::u");
         let k = StateKey::parse(None, "p", "p::backfill::h::u1::__lease__").unwrap();
         assert_eq!(k.row(), Some("backfill::h::u1"));
         assert_eq!(k.suffix(), Some(&KeySuffix::Lease));

@@ -1849,7 +1849,10 @@ fn plan_exactly_once(
         .collect();
     let keys: Vec<String> = positions
         .iter()
-        .map(|(id, _, _)| format!("'{pipeline}::{id}'"))
+        .map(|(id, _, _)| {
+            let key = crate::state_key::StateKey::invocation(pipeline, id.as_str());
+            format!("'{key}'")
+        })
         .collect();
     Err(FaucetError::State(format!(
         "topology exactly-once: the sink nodes committed different positions ({}), and the \

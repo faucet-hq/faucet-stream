@@ -175,34 +175,10 @@ pub fn cartesian(dims: &[Dim]) -> Vec<HashMap<String, Value>> {
     out
 }
 
-/// Longest raw value kept verbatim in a state-key segment.
-const STATE_KEY_COMPONENT_MAX: usize = 64;
-
-/// Render one fan-out value as a state-key segment (#789 CLI-52/CLI-53). A
-/// value made only of state-key characters is kept as is, so existing keys do
-/// not move; anything else (an email, a space, non-ASCII, `::`, an over-long
-/// value) becomes a readable prefix plus a stable 64-bit hash of the raw value.
-/// `allow_separators` admits `:` and `/` (a child's parent key, which stands
-/// alone after `::`); a product tuple keeps them for its own separators.
+/// Render one fan-out value as a state-key segment (#789 CLI-52/CLI-53) — see
+/// [`faucet_core::state_key::encode_component`].
 pub fn state_key_component(raw: &str, allow_separators: bool) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
-    let legal = |c: char| plain(c) || (allow_separators && matches!(c, ':' | '/'));
-    if !raw.is_empty()
-        && raw.len() <= STATE_KEY_COMPONENT_MAX
-        && raw.chars().all(legal)
-        && !raw.contains("::")
-        && !raw.starts_with(':')
-        && !raw.ends_with(':')
-    {
-        return raw.to_owned();
-    }
-    let readable: String = raw.chars().filter(|c| plain(*c)).take(32).collect();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in raw.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{readable}.h{hash:016x}")
+    faucet_core::state_key::encode_component(raw, allow_separators)
 }
 
 /// Stable, collision-resistant state-key suffix for one product tuple, in

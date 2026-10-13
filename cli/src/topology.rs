@@ -1500,7 +1500,8 @@ pub async fn run_topology(
             .is_some_and(|s| s.kind != "memory")
     {
         for (id, _, _) in sink_nodes(cfg)? {
-            let base = format!("{pipeline_name}::{id}");
+            let base =
+                faucet_core::StateKey::invocation(pipeline_name.as_str(), id.as_str()).render();
             let m = match crate::pipeline_state::markers::RunMarkers::begin(
                 state_store.clone(),
                 &base,
@@ -1920,7 +1921,7 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
         // ── SLA (#202) ───────────────────────────────────────────────────────
         let violations = match cfg.sla.as_ref() {
             Some(spec) => {
-                let base_key = format!("{pipeline_name}::{row}");
+                let base_key = faucet_core::StateKey::invocation(pipeline_name, row).render();
                 let outcome = match &node.error {
                     None => crate::sla::RunOutcome::Success {
                         rows: node.records as u64,
@@ -1954,7 +1955,7 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
                 let outcome = crate::profiling::evaluate_post_run(
                     spec,
                     state_store,
-                    &format!("{pipeline_name}::{row}"),
+                    &faucet_core::StateKey::invocation(pipeline_name, row).render(),
                     pipeline_name,
                     row,
                     run_id,
