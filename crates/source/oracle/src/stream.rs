@@ -32,6 +32,9 @@ pub struct OracleSource {
     pool: OraclePool,
     start_bookmark: Mutex<Option<Value>>,
     applied_shard: Mutex<Option<PkShardBounds>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 static NULL_TEXT: Option<String> = None;
@@ -184,6 +187,7 @@ impl OracleSource {
             pool,
             start_bookmark: Mutex::new(None),
             applied_shard: Mutex::new(None),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -222,15 +226,20 @@ impl OracleSource {
         let planned = plan_query(&self.config, context, start.as_ref());
         let mut job = self.job(&planned);
         job.chunk = usize::MAX;
-        let records = blocking(move || {
-            let mut all = Vec::new();
-            run_query(job, |page| {
-                all.extend(page);
-                true
-            })?;
-            Ok(all)
-        })
-        .await?;
+        let records = self
+            .calls
+            .call_once(
+                "query",
+                blocking(move || {
+                    let mut all = Vec::new();
+                    run_query(job, |page| {
+                        all.extend(page);
+                        true
+                    })?;
+                    Ok(all)
+                }),
+            )
+            .await?;
         let mut running = None;
         let records = apply_incremental(records, planned.incremental.as_ref(), &mut running);
         let bookmark = planned.incremental.as_ref().and(running);
@@ -240,6 +249,17 @@ impl OracleSource {
 
 #[async_trait]
 impl Source for OracleSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -267,9 +287,14 @@ impl Source for OracleSource {
             let handle = tokio::task::spawn_blocking(move || {
                 run_query(job, |page| tx.blocking_send(page).is_ok())
             });
+            let calls = self.calls.get();
+            calls.record("query");
+            // A page of the running query is not a round trip of its own; the
+            // run's deadline and cancel token end the wait for it (#880).
+            let steps = calls.with_roundtrip_metering(false);
             let mut running = None;
             let mut total = 0usize;
-            while let Some(page) = rx.recv().await {
+            while let Some(page) = steps.call_once("query", async { Ok(rx.recv().await) }).await? {
                 let kept = apply_incremental(page, planned.incremental.as_ref(), &mut running);
                 total += kept.len();
                 if !kept.is_empty() {
@@ -362,43 +387,50 @@ impl Source for OracleSource {
           ORDER BY c.OWNER, c.TABLE_NAME, cc.POSITION";
         let pool = self.pool.clone();
         let timeout = call_timeout(self.config.statement_timeout_secs);
-        let (rows, keys) = blocking(move || {
-            let conn = checkout(&pool, Side::Source, timeout)?;
-            let mut keys: Vec<(String, String)> = Vec::new();
-            for r in conn
-                .query_as::<(String, String)>(KEY_SQL, &[])
-                .map_err(|e| ora_err(Side::Source, "primary-key discovery", &e))?
-            {
-                keys.push(r.map_err(|e| ora_err(Side::Source, "primary-key discovery", &e))?);
-            }
-            let rs = conn
-                .query_as::<(
-                    String,
-                    String,
-                    String,
-                    String,
-                    Option<i64>,
-                    String,
-                    Option<i64>,
-                )>(SQL, &[])
-                .map_err(|e| ora_err(Side::Source, "catalog discovery", &e))?;
-            let mut out = Vec::new();
-            for r in rs {
-                let (owner, table, column, data_type, scale, nullable, num_rows) =
-                    r.map_err(|e| ora_err(Side::Source, "catalog discovery", &e))?;
-                out.push(CatalogRow {
-                    owner,
-                    table,
-                    column,
-                    data_type,
-                    scale,
-                    nullable: nullable != "N",
-                    num_rows,
-                });
-            }
-            Ok((out, keys))
-        })
-        .await?;
+        let (rows, keys) = self
+            .calls
+            .call_once(
+                "discover",
+                blocking(move || {
+                    let conn = checkout(&pool, Side::Source, timeout)?;
+                    let mut keys: Vec<(String, String)> = Vec::new();
+                    for r in conn
+                        .query_as::<(String, String)>(KEY_SQL, &[])
+                        .map_err(|e| ora_err(Side::Source, "primary-key discovery", &e))?
+                    {
+                        keys.push(
+                            r.map_err(|e| ora_err(Side::Source, "primary-key discovery", &e))?,
+                        );
+                    }
+                    let rs = conn
+                        .query_as::<(
+                            String,
+                            String,
+                            String,
+                            String,
+                            Option<i64>,
+                            String,
+                            Option<i64>,
+                        )>(SQL, &[])
+                        .map_err(|e| ora_err(Side::Source, "catalog discovery", &e))?;
+                    let mut out = Vec::new();
+                    for r in rs {
+                        let (owner, table, column, data_type, scale, nullable, num_rows) =
+                            r.map_err(|e| ora_err(Side::Source, "catalog discovery", &e))?;
+                        out.push(CatalogRow {
+                            owner,
+                            table,
+                            column,
+                            data_type,
+                            scale,
+                            nullable: nullable != "N",
+                            num_rows,
+                        });
+                    }
+                    Ok((out, keys))
+                }),
+            )
+            .await?;
         Ok(faucet_core::attach_primary_keys(
             descriptors_from_catalog(rows)?,
             keys,
@@ -419,7 +451,7 @@ impl Source for OracleSource {
         let sql = shard_bounds_query(&planned.sql, &key);
         let pool = self.pool.clone();
         let timeout = call_timeout(self.config.statement_timeout_secs);
-        let (lo, hi) = blocking(move || {
+        let (lo, hi) = self.calls.call_once("query", blocking(move || {
             let conn = checkout(&pool, Side::Source, timeout)?;
             let stmt_err = |e: &faucet_common_oracle::oracle::Error| {
                 FaucetError::Source(format!(
@@ -438,7 +470,7 @@ impl Source for OracleSource {
                 .collect();
             stmt.query_row_as_named::<(Option<i64>, Option<i64>)>(&named)
                 .map_err(|e| stmt_err(&e))
-        })
+        }))
         .await?;
         Ok(pk_shards_from_bounds(
             &self.config.shard.as_ref().expect("checked").key,

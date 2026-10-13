@@ -69,3 +69,50 @@ async fn conformance_live_battery() {
     faucet_conformance::assert_write_modes_truthful(&sink, count).await;
     faucet_conformance::assert_schema_evolution_effective(&sink).await;
 }
+
+/// A table another session holds an exclusive lock on stands in for a hung
+/// backend (#880): the write waits on the lock until the deadline or cancel.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::exec(
+        &conn,
+        &["CREATE TABLE \"t\" (\"id\" NUMBER PRIMARY KEY, \"v\" VARCHAR2(200))"],
+    )
+    .await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = keyed(&conn);
+        // Bounds the abandoned statement on the server after the call returns.
+        cfg.statement_timeout_secs = 20;
+        built.push(OracleSink::new(cfg).await.expect("sink"));
+    }
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let lock_cfg = conn.clone();
+    let holder = tokio::task::spawn_blocking(move || {
+        let session = faucet_common_oracle::oracle::Connection::connect(
+            &lock_cfg.username,
+            &lock_cfg.password,
+            lock_cfg.resolve_connect_string().unwrap(),
+        )
+        .expect("connect");
+        session
+            .execute("LOCK TABLE \"t\" IN EXCLUSIVE MODE", &[])
+            .expect("lock");
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        session.rollback().expect("release");
+    });
+    locked_rx.recv().unwrap();
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    holder.await.unwrap();
+}

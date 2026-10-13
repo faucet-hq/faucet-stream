@@ -30,6 +30,8 @@ use crate::plan::{
 /// Oracle Database sink.
 pub struct OracleSink {
     inner: Arc<Inner>,
+    /// Backend-call context (#880): the run's deadline and round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 struct Inner {
@@ -493,8 +495,9 @@ impl OracleSink {
         };
         let sink = Self {
             inner: Arc::new(inner),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         };
-        sink.run(|i| {
+        sink.run("create_table", |i| {
             let conn = i.conn()?;
             i.create_json_table(&conn)
         })
@@ -502,13 +505,16 @@ impl OracleSink {
         Ok(sink)
     }
 
-    async fn run<T, F>(&self, f: F) -> Result<T, FaucetError>
+    /// Run `f` on the blocking pool as one backend call named `op` (#880):
+    /// the run's deadline ends the wait promptly; the session's statement
+    /// timeout bounds the blocking work itself.
+    async fn run<T, F>(&self, op: &'static str, f: F) -> Result<T, FaucetError>
     where
         F: FnOnce(&Inner) -> Result<T, FaucetError> + Send + 'static,
         T: Send + 'static,
     {
         let inner = self.inner.clone();
-        blocking(move || f(&inner)).await
+        self.calls.call_once(op, blocking(move || f(&inner))).await
     }
 
     /// Record keys are identifiers only in `auto_columns` mode; a JSON payload
@@ -523,6 +529,17 @@ impl OracleSink {
 
 #[async_trait]
 impl Sink for OracleSink {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.inner.config.batch_atomicity()
     }
@@ -532,7 +549,7 @@ impl Sink for OracleSink {
             return Ok(0);
         }
         let records = self.cased(records);
-        self.run(move |i| {
+        self.run("write_batch", move |i| {
             let conn = i.conn()?;
             i.ensure_table_ready(&conn, &records)?;
             let (records, spec) = i.fold_page(&conn, &records)?;
@@ -554,7 +571,7 @@ impl Sink for OracleSink {
         let records = self.cased(records);
         let mode = self.inner.config.write.write_mode.as_str();
         let messages = self
-            .run(move |i| {
+            .run("write_batch_partial", move |i| {
                 let conn = i.conn()?;
                 i.ensure_table_ready(&conn, &records)?;
                 let (records, spec) = i.fold_page(&conn, &records)?;
@@ -591,7 +608,7 @@ impl Sink for OracleSink {
     ) -> Result<usize, FaucetError> {
         let records = self.cased(records);
         let (scope, token) = (scope.to_string(), token.to_string());
-        self.run(move |i| {
+        self.run("write_batch_idempotent", move |i| {
             let conn = i.conn()?;
             if !records.is_empty() {
                 i.ensure_table_ready(&conn, &records)?;
@@ -622,7 +639,7 @@ impl Sink for OracleSink {
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let scope = scope.to_string();
-        self.run(move |i| {
+        self.run("last_committed_token", move |i| {
             let conn = i.conn()?;
             i.ensure_token_table(&conn)?;
             i.read_token(&conn, &scope)
@@ -651,7 +668,7 @@ impl Sink for OracleSink {
     /// fresh staging table. A first run (no target, `create_table: true`)
     /// leaves staging to be created from the first page.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.run(|i| {
+        self.run("begin_overwrite", |i| {
             let conn = i.conn()?;
             exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")?;
             i.forget_columns();
@@ -681,7 +698,7 @@ impl Sink for OracleSink {
     /// the old rows until commit), then drop staging. A first run renames
     /// staging into place.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.run(|i| {
+        self.run("commit_overwrite", |i| {
             let conn = i.conn()?;
             if !i.table_exists(&conn, &i.target)? {
                 if i.table_exists(&conn, &i.staging)? {
@@ -711,7 +728,7 @@ impl Sink for OracleSink {
     }
 
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.run(|i| {
+        self.run("abort_overwrite", |i| {
             let conn = i.conn()?;
             exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")
         })
@@ -723,7 +740,7 @@ impl Sink for OracleSink {
     }
 
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.run(|i| {
+        self.run("current_schema", |i| {
             let conn = i.conn()?;
             let cols = i.load_columns(&conn, &i.target)?;
             Ok((!cols.is_empty()).then(|| schema_from_columns(&cols)))
@@ -736,7 +753,7 @@ impl Sink for OracleSink {
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
         let evolution = evolution.clone();
-        self.run(move |i| {
+        self.run("evolve_schema", move |i| {
             let conn = i.conn()?;
             let base = |c: &faucet_core::ColumnChange| {
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text)
@@ -787,7 +804,7 @@ impl Sink for OracleSink {
 
     async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
         let started = std::time::Instant::now();
-        let probe = self.run(|i| {
+        let probe = self.run("check", |i| {
             let conn = i.conn()?;
             let exists = i.table_exists(&conn, &i.target)?;
             Ok(exists || i.config.create_table)

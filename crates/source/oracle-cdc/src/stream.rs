@@ -39,6 +39,9 @@ pub struct OracleCdcSource {
     pending: Mutex<Option<Position>>,
     emitted: Mutex<Option<u64>>,
     lag_warned: AtomicBool,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 struct Shared {
@@ -274,13 +277,14 @@ impl Shared {
 
     /// One fetch cycle: mine windows until idle, emitting a page per committed
     /// transaction. Returns early when the consumer goes away.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn capture(
         &self,
         start: Option<Position>,
         per_txn: bool,
         tx: Sender<StreamPage>,
+        calls: faucet_core::CallContext,
     ) -> Result<(), FaucetError> {
+        let runtime = tokio::runtime::Handle::current();
         let conn = self.conn()?;
         conn.execute(NLS_SESSION_SQL, &[])
             .map_err(|e| src_err("session setup", &e))?;
@@ -407,7 +411,8 @@ impl Shared {
                 break;
             }
             if to >= reachable {
-                std::thread::sleep(self.config.poll_interval);
+                // The poll interval ends early on the run's cancel and deadline.
+                runtime.block_on(calls.wait(self.config.poll_interval))?;
             }
         }
         if !per_txn {
@@ -544,6 +549,7 @@ impl OracleCdcSource {
             pending: Mutex::new(None),
             emitted: Mutex::new(None),
             lag_warned: AtomicBool::new(false),
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -566,7 +572,7 @@ impl OracleCdcSource {
 
     async fn measure_lag(&self, position: u64) -> Result<Option<SourceLag>, FaucetError> {
         let shared = self.shared.clone();
-        blocking(move || {
+        let measured = blocking(move || {
             let conn = shared.conn()?;
             let current: u64 = conn
                 .query_row_as(CURRENT_SCN_SQL, &[])
@@ -584,8 +590,8 @@ impl OracleCdcSource {
                     }
                 }
             }
-        })
-        .await
+        });
+        self.calls.call_once("query", measured).await
     }
 
     fn pages(
@@ -597,10 +603,16 @@ impl OracleCdcSource {
             self.set_emitted(p.commit_scn);
         }
         let shared = self.shared.clone();
+        let calls = self.calls.get();
         Box::pin(async_stream::try_stream! {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamPage>(4);
-            let handle = tokio::task::spawn_blocking(move || shared.capture(start, per_txn, tx));
-            while let Some(page) = rx.recv().await {
+            let capture_calls = calls.clone();
+            let handle =
+                tokio::task::spawn_blocking(move || shared.capture(start, per_txn, tx, capture_calls));
+            // The run's deadline and cancel token end the wait for the next
+            // page with an error (#880); dropping the receiver stops capture.
+            let steps = calls.with_roundtrip_metering(false);
+            while let Some(page) = steps.call_once("poll", async { Ok(rx.recv().await) }).await? {
                 if let Some(scn) = page.bookmark.as_ref().and_then(commit_scn) {
                     self.set_emitted(scn);
                 }
@@ -615,6 +627,17 @@ impl OracleCdcSource {
 
 #[async_trait]
 impl Source for OracleCdcSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         _ctx: &HashMap<String, Value>,
@@ -654,11 +677,15 @@ impl Source for OracleCdcSource {
     /// before a snapshot.
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         let shared = self.shared.clone();
-        blocking(move || {
-            let conn = shared.conn()?;
-            Ok(Some(shared.position_now(&conn)?.to_value()))
-        })
-        .await
+        self.calls
+            .call_once(
+                "query",
+                blocking(move || {
+                    let conn = shared.conn()?;
+                    Ok(Some(shared.position_now(&conn)?.to_value()))
+                }),
+            )
+            .await
     }
 
     /// Seconds of commit time between the capture position and the current
