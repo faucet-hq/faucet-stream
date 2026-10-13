@@ -236,7 +236,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "bigquery": {
       "write_modes": [],
@@ -256,8 +258,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "clickhouse": {
       "write_modes": [],
@@ -278,7 +282,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "csv": {
       "write_modes": [],
@@ -299,7 +305,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "databricks": {
       "write_modes": [],
@@ -319,8 +327,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "delta": {
       "write_modes": [],
@@ -340,8 +350,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "duckdb": {
       "write_modes": [],
@@ -362,7 +374,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "dynamodb": {
       "write_modes": [],
@@ -383,7 +397,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": true,
+      "read_side_effects": false
     },
     "elasticsearch": {
       "write_modes": [],
@@ -404,7 +420,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "file": {
       "write_modes": [],
@@ -425,7 +443,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "gcs": {
       "write_modes": [],
@@ -446,7 +466,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "graphql": {
       "write_modes": [],
@@ -467,7 +489,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "grpc": {
       "write_modes": [],
@@ -488,7 +512,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "iceberg": {
       "write_modes": [],
@@ -508,8 +534,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "kafka": {
       "write_modes": [],
@@ -530,7 +558,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": true
     },
     "kinesis": {
       "write_modes": [],
@@ -551,7 +581,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mongodb": {
       "write_modes": [],
@@ -572,7 +604,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mongodb-cdc": {
       "write_modes": [],
@@ -593,7 +627,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": true,
+      "read_side_effects": true
     },
     "mssql": {
       "write_modes": [],
@@ -614,7 +650,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mssql-cdc": {
       "write_modes": [],
@@ -635,7 +673,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": true,
+      "read_side_effects": true
     },
     "mysql": {
       "write_modes": [],
@@ -656,7 +696,9 @@
       "range_digest": true,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mysql-cdc": {
       "write_modes": [],
@@ -677,7 +719,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": true,
+      "read_side_effects": true
     },
     "nats": {
       "write_modes": [],
@@ -698,7 +742,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "oracle": {
       "write_modes": [],
@@ -719,7 +765,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "oracle-cdc": {
       "write_modes": [],
@@ -740,7 +788,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": true,
+      "read_side_effects": true
     },
     "parquet": {
       "write_modes": [],
@@ -760,8 +810,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "postgres": {
       "write_modes": [],
@@ -782,7 +834,9 @@
       "range_digest": true,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "postgres-cdc": {
       "write_modes": [],
@@ -803,7 +857,9 @@
       "range_digest": false,
       "reports_lag": true,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": true,
+      "read_side_effects": true
     },
     "pubsub": {
       "write_modes": [],
@@ -824,7 +880,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "rabbitmq": {
       "write_modes": [],
@@ -845,7 +903,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "redis": {
       "write_modes": [],
@@ -866,7 +926,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "redshift": {
       "write_modes": [],
@@ -887,7 +949,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "rest": {
       "write_modes": [],
@@ -907,8 +971,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": true
+      "columnar": true,
+      "native": true,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "s3": {
       "write_modes": [],
@@ -929,7 +995,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "sftp": {
       "write_modes": [],
@@ -950,7 +1018,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "singer": {
       "write_modes": [],
@@ -971,7 +1041,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "snowflake": {
       "write_modes": [],
@@ -992,7 +1064,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "spanner": {
       "write_modes": [],
@@ -1013,7 +1087,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "sqlite": {
       "write_modes": [],
@@ -1034,7 +1110,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "sqs": {
       "write_modes": [],
@@ -1055,7 +1133,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "webhook": {
       "write_modes": [],
@@ -1076,7 +1156,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": true
     },
     "websocket": {
       "write_modes": [],
@@ -1097,7 +1179,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": true
     },
     "xml": {
       "write_modes": [],
@@ -1118,7 +1202,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     }
   },
   "sinks": {
@@ -1144,7 +1230,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "bigquery": {
       "write_modes": [
@@ -1169,8 +1257,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": true
+      "columnar": true,
+      "native": true,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "clickhouse": {
       "write_modes": [
@@ -1185,7 +1275,7 @@
       "schema_report": "undeclared",
       "scoped_overwrite": false,
       "direct_overwrite": false,
-      "staged_load": false,
+      "staged_load": true,
       "exactly_once": false,
       "discover": false,
       "shardable": false,
@@ -1193,7 +1283,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "csv": {
       "write_modes": [
@@ -1216,7 +1308,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "databricks": {
       "write_modes": [
@@ -1242,7 +1336,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "delta": {
       "write_modes": [
@@ -1264,8 +1360,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "duckdb": {
       "write_modes": [
@@ -1288,7 +1386,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "dynamodb": {
       "write_modes": [
@@ -1313,7 +1413,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "elasticsearch": {
       "write_modes": [
@@ -1339,7 +1441,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "file": {
       "write_modes": [
@@ -1363,7 +1467,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "gcs": {
       "write_modes": [
@@ -1387,7 +1493,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "http": {
       "write_modes": [
@@ -1410,7 +1518,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "iceberg": {
       "write_modes": [
@@ -1433,7 +1543,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "jsonl": {
       "write_modes": [
@@ -1456,7 +1568,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "kafka": {
       "write_modes": [
@@ -1479,7 +1593,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "kinesis": {
       "write_modes": [
@@ -1502,7 +1618,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mongodb": {
       "write_modes": [
@@ -1528,7 +1646,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mssql": {
       "write_modes": [
@@ -1546,7 +1666,7 @@
       "schema_report": "reported",
       "scoped_overwrite": false,
       "direct_overwrite": false,
-      "staged_load": false,
+      "staged_load": true,
       "exactly_once": false,
       "discover": false,
       "shardable": false,
@@ -1554,7 +1674,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "mysql": {
       "write_modes": [
@@ -1580,7 +1702,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "nats": {
       "write_modes": [
@@ -1603,7 +1727,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "oracle": {
       "write_modes": [
@@ -1629,7 +1755,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "parquet": {
       "write_modes": [
@@ -1651,8 +1779,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "postgres": {
       "write_modes": [
@@ -1678,7 +1808,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "pubsub": {
       "write_modes": [
@@ -1701,7 +1833,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "rabbitmq": {
       "write_modes": [
@@ -1724,7 +1858,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "redis": {
       "write_modes": [
@@ -1747,7 +1883,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "redshift": {
       "write_modes": [
@@ -1770,7 +1908,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "s3": {
       "write_modes": [
@@ -1794,7 +1934,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "sftp": {
       "write_modes": [
@@ -1818,7 +1960,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": true,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "singer": {
       "write_modes": [
@@ -1843,7 +1987,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "snowflake": {
       "write_modes": [
@@ -1865,8 +2011,10 @@
       "range_read": false,
       "range_digest": false,
       "reports_lag": false,
-      "columnar": false,
-      "native": false
+      "columnar": true,
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "spanner": {
       "write_modes": [
@@ -1891,7 +2039,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "sqlite": {
       "write_modes": [
@@ -1917,7 +2067,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "sqs": {
       "write_modes": [
@@ -1940,7 +2092,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     },
     "stdout": {
       "write_modes": [
@@ -1963,7 +2117,9 @@
       "range_digest": false,
       "reports_lag": false,
       "columnar": false,
-      "native": false
+      "native": false,
+      "table_routing": false,
+      "read_side_effects": false
     }
   }
 }
