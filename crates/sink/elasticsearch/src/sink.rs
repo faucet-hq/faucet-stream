@@ -2,11 +2,12 @@
 
 use crate::config::{ElasticsearchAuth, ElasticsearchSinkConfig};
 use async_trait::async_trait;
+use faucet_core::http::Client;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use faucet_core::{
     AuthSpec, FaucetError, SchemaEvolution, SharedAuthProvider, SqlBaseType, json_schema_base_type,
 };
-use reqwest::Client;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,6 +38,10 @@ pub struct ElasticsearchSink {
     /// log emitted by [`evolve_schema`](faucet_core::Sink::evolve_schema) when an
     /// evolution carries widenings / nullability relaxations (no-ops on ES).
     evolve_noop_warned: AtomicBool,
+    /// Backend-call context (#880): `request_timeout_secs` per attempt over
+    /// the run's recorder and deadline. One attempt per `_bulk` request — an
+    /// append without `_id` must not be re-sent — metered as `bulk`.
+    calls: CallSlot,
 }
 
 /// The alias that marks an overwrite run's staging index. `begin_overwrite`
@@ -81,9 +86,10 @@ impl ElasticsearchSink {
         config.validate()?;
         // Bounded connect and request timeouts: a half-open connection or a
         // wedged node must fail the request, not hang the run (#789 MSG-58).
+        let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs))
-            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
+            .timeout(request_timeout)
             .build()
             .map_err(|e| FaucetError::Config(format!("elasticsearch HTTP client: {e}")))?;
         Ok(Self {
@@ -92,6 +98,7 @@ impl ElasticsearchSink {
             auth_provider: None,
             resume_dup_warned: AtomicBool::new(false),
             evolve_noop_warned: AtomicBool::new(false),
+            calls: CallSlot::new(CallContext::new().with_timeout(request_timeout)),
         })
     }
 
@@ -112,8 +119,11 @@ impl ElasticsearchSink {
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Vec<String>>, FaucetError> {
         let url = format!("{}/_alias/{}", self.config.base_url, alias);
-        let resp = Self::apply_auth_value(self.client.get(&url), auth)
-            .send()
+        let resp = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.get(&url), auth),
+            )
             .await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
@@ -159,8 +169,11 @@ impl ElasticsearchSink {
         // No alias of that name. If a concrete index owns the name, refuse —
         // there is no atomic replace of a concrete index.
         let head_url = format!("{}/{}", self.config.base_url, alias);
-        let head = Self::apply_auth_value(self.client.head(&head_url), auth)
-            .send()
+        let head = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.head(&head_url), auth),
+            )
             .await?;
         if head.status().is_success() {
             return Err(FaucetError::Sink(format!(
@@ -180,8 +193,11 @@ impl ElasticsearchSink {
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Value>, FaucetError> {
         let url = format!("{}/{}/_mapping", self.config.base_url, index);
-        let resp = Self::apply_auth_value(self.client.get(&url), auth)
-            .send()
+        let resp = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.get(&url), auth),
+            )
             .await?;
         if !resp.status().is_success() {
             return Ok(None);
@@ -202,8 +218,11 @@ impl ElasticsearchSink {
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Value>, FaucetError> {
         let url = format!("{}/{}/_settings", self.config.base_url, index);
-        let resp = Self::apply_auth_value(self.client.get(&url), auth)
-            .send()
+        let resp = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.get(&url), auth),
+            )
             .await?;
         if !resp.status().is_success() {
             return Ok(None);
@@ -243,7 +262,9 @@ impl ElasticsearchSink {
             .body(serde_json::to_string(&Value::Object(body)).map_err(|e| {
                 FaucetError::Sink(format!("overwrite: serialize create-index body: {e}"))
             })?);
-        let resp = Self::apply_auth_value(req, auth).send().await?;
+        let resp = self
+            .send_once("request", Self::apply_auth_value(req, auth))
+            .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
     }
@@ -255,8 +276,11 @@ impl ElasticsearchSink {
         auth: &ElasticsearchAuth,
     ) -> Result<(), FaucetError> {
         let url = format!("{}/{}/_refresh", self.config.base_url, index);
-        let resp = Self::apply_auth_value(self.client.post(&url), auth)
-            .send()
+        let resp = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.post(&url), auth),
+            )
             .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
@@ -269,8 +293,11 @@ impl ElasticsearchSink {
         auth: &ElasticsearchAuth,
     ) -> Result<(), FaucetError> {
         let url = format!("{}/{}", self.config.base_url, index);
-        let resp = Self::apply_auth_value(self.client.delete(&url), auth)
-            .send()
+        let resp = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.delete(&url), auth),
+            )
             .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
@@ -321,6 +348,16 @@ impl ElasticsearchSink {
         }
     }
 
+    /// Send one request through the call context (#880): bounded by the
+    /// attempt timeout and the run's deadline, metered as `op`, never re-sent.
+    async fn send_once(
+        &self,
+        op: &'static str,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, FaucetError> {
+        self.client.call(&self.calls.get(), op, req).await
+    }
+
     /// Send a pre-built NDJSON `_bulk` body and return the parsed response.
     ///
     /// The transport under [`bulk_items`](Self::bulk_items).
@@ -338,11 +375,11 @@ impl ElasticsearchSink {
         let req = req
             .header("Content-Type", "application/x-ndjson")
             .body(body);
-        let req = Self::apply_auth_value(req, auth);
-        let resp = req.send().await?;
+        let resp = self
+            .send_once("bulk", Self::apply_auth_value(req, auth))
+            .await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let resp_body: Value = resp.json().await?;
-        Ok(resp_body)
+        self.client.json::<Value>(resp).await
     }
 
     /// Send `entries` (one `_bulk` action each) and return one result object
@@ -396,7 +433,7 @@ impl ElasticsearchSink {
                 attempt,
                 "Elasticsearch bulk items rejected as overloaded; retrying them"
             );
-            tokio::time::sleep(item_retry_delay(attempt)).await;
+            self.calls.wait(item_retry_delay(attempt)).await?;
             pending = retry;
         }
         Ok(results)
@@ -492,8 +529,11 @@ impl ElasticsearchSink {
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Value>, FaucetError> {
         let url = format!("{}/{}/_mapping", self.config.base_url, self.config.index);
-        let resp = Self::apply_auth_value(self.client.get(&url), auth)
-            .send()
+        let resp = self
+            .send_once(
+                "request",
+                Self::apply_auth_value(self.client.get(&url), auth),
+            )
             .await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
@@ -600,7 +640,9 @@ impl ElasticsearchSink {
             .body(serde_json::to_string(&body).map_err(|e| {
                 FaucetError::Sink(format!("cleanup: failed to serialize delete query: {e}"))
             })?);
-        let resp = Self::apply_auth_value(req, &auth).send().await?;
+        let resp = self
+            .send_once("request", Self::apply_auth_value(req, &auth))
+            .await?;
 
         // A missing index holds no stale documents. Detect the 404 before
         // `check_http_response`, which treats it as an error.
@@ -1348,7 +1390,9 @@ impl faucet_core::Sink for ElasticsearchSink {
             .body(serde_json::to_string(&body).map_err(|e| {
                 FaucetError::Sink(format!("overwrite: serialize alias actions: {e}"))
             })?);
-        let resp = Self::apply_auth_value(req, &auth).send().await?;
+        let resp = self
+            .send_once("request", Self::apply_auth_value(req, &auth))
+            .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
 
         // Best-effort drop of the now-detached old physical indices.
@@ -1400,7 +1444,7 @@ impl faucet_core::Sink for ElasticsearchSink {
         let auth = self.resolve_auth().await?;
         let url = format!("{}/{}/_mapping", self.config.base_url, self.config.index);
         let req = Self::apply_auth_value(self.client.get(&url), &auth);
-        let resp = req.send().await?;
+        let resp = self.send_once("request", req).await?;
 
         // A missing index is reported as drift-inert (Ok(None)), not an error.
         // Detect the 404 *before* check_http_response, which treats it as an error.
@@ -1479,7 +1523,7 @@ impl faucet_core::Sink for ElasticsearchSink {
                 FaucetError::Sink(format!("failed to serialize mapping update: {e}"))
             })?);
         let req = Self::apply_auth_value(req, &auth);
-        let resp = req.send().await?;
+        let resp = self.send_once("request", req).await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         tracing::debug!(
             index = %self.config.index,
@@ -1526,7 +1570,7 @@ impl faucet_core::Sink for ElasticsearchSink {
         let started = std::time::Instant::now();
         let health_url = format!("{}/_cluster/health", self.config.base_url);
         let req = Self::apply_auth_value(self.client.get(&health_url), &auth).timeout(ctx.timeout);
-        let health_probe = match req.send().await {
+        let health_probe = match self.send_once("request", req).await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     Probe::pass("health", started.elapsed())
@@ -1539,7 +1583,7 @@ impl faucet_core::Sink for ElasticsearchSink {
                     )
                 }
             }
-            Err(e) if e.is_timeout() => {
+            Err(e) if faucet_core::classify(&e) == Some(faucet_core::RetryClass::Timeout) => {
                 Probe::fail_hint("health", started.elapsed(), "timed out", health_hint)
             }
             Err(e) => Probe::fail_hint("health", started.elapsed(), e.to_string(), health_hint),
@@ -1559,7 +1603,7 @@ impl faucet_core::Sink for ElasticsearchSink {
             let index_url = format!("{}/{}", self.config.base_url, self.config.index);
             let req =
                 Self::apply_auth_value(self.client.head(&index_url), &auth).timeout(ctx.timeout);
-            let schema_probe = match req.send().await {
+            let schema_probe = match self.send_once("request", req).await {
                 // 404 → index absent: report as Skip, not a failure (it may be
                 // auto-created on first write).
                 Ok(resp) if resp.status().as_u16() == 404 => {
@@ -1569,7 +1613,7 @@ impl faucet_core::Sink for ElasticsearchSink {
                 // exists (2xx) or the request was rejected for some non-404
                 // reason; either way the endpoint is reachable.
                 Ok(_) => Probe::pass("schema", started.elapsed()),
-                Err(e) if e.is_timeout() => {
+                Err(e) if faucet_core::classify(&e) == Some(faucet_core::RetryClass::Timeout) => {
                     Probe::fail_hint("schema", started.elapsed(), "timed out", index_hint)
                 }
                 Err(e) => Probe::fail_hint("schema", started.elapsed(), e.to_string(), index_hint),
@@ -1735,6 +1779,17 @@ impl faucet_core::Sink for ElasticsearchSink {
 
     fn connector_name(&self) -> &'static str {
         "elasticsearch"
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
     }
 }
 

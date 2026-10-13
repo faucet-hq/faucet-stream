@@ -1,5 +1,5 @@
 //! Exponential backoff retry executor with jitter, over
-//! [`CallContext`](faucet_core::io::CallContext) (#880).
+//! [`CallContext`] (#880).
 
 use faucet_core::FaucetError;
 use faucet_core::io::CallContext;

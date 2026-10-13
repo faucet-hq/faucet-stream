@@ -221,6 +221,14 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// Build a plain `reqwest::Client` with these settings, for a connector
+    /// whose public API already hands out a reqwest client. It follows
+    /// same-origin redirects only; prefer [`build`](Self::build), which also
+    /// follows cross-origin hops safely and bounds reads.
+    pub fn build_reqwest(self) -> Result<reqwest::Client, FaucetError> {
+        Ok(self.build()?.inner)
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<Client, FaucetError> {
         if let Some(e) = self.error {
@@ -346,11 +354,7 @@ impl Client {
             let method = current.method().clone();
             let url = current.url().clone();
             let headers = current.headers().clone();
-            let resp = self
-                .inner
-                .execute(current)
-                .await
-                .map_err(transport_error)?;
+            let resp = self.inner.execute(current).await.map_err(transport_error)?;
             let status = resp.status();
             if !status.is_redirection() || self.max_redirects == 0 {
                 return Ok(resp);
@@ -415,6 +419,34 @@ impl Client {
                     Ok(resp)
                 } else {
                     Err(status_error(resp).await)
+                }
+            }
+        })
+        .await
+    }
+
+    /// Send `request` as one backend call under `ctx` and return the response
+    /// whatever its status — for a connector that classifies statuses itself.
+    /// Attempts are retried under the context's policy only while the request
+    /// can be re-sent; a streamed body goes out once.
+    pub async fn call(
+        &self,
+        ctx: &CallContext,
+        op: &'static str,
+        request: RequestBuilder,
+    ) -> Result<Response, FaucetError> {
+        let mut original = Some(request.build().map_err(transport_error)?);
+        ctx.call(op, || {
+            let attempt = original
+                .as_ref()
+                .and_then(Request::try_clone)
+                .or_else(|| original.take());
+            async move {
+                match attempt {
+                    Some(r) => self.send_request(r).await,
+                    None => Err(FaucetError::Custom(Box::new(std::io::Error::other(
+                        "a streamed request body cannot be sent again",
+                    )))),
                 }
             }
         })
@@ -601,7 +633,8 @@ mod tests {
     fn recorder(
         seen: Seen,
         name: &'static str,
-    ) -> impl Fn(AxHeaders) -> std::future::Ready<&'static str> + Clone + Send + Sync + 'static {
+    ) -> impl Fn(AxHeaders) -> std::future::Ready<&'static str> + Clone + Send + Sync + 'static
+    {
         move |h: AxHeaders| {
             let pairs = h
                 .iter()
@@ -627,31 +660,34 @@ mod tests {
         let to = format!("{other}/land");
         let keep_to = to.clone();
         let same_seen = seen.clone();
-        let origin = serve(
-            Router::new()
-                .route(
-                    "/start",
-                    get(move || {
-                        let to = to.clone();
-                        async move { (AxStatus::FOUND, [("location", to)]).into_response() }
-                    }),
-                )
-                .route(
-                    "/keep",
-                    any(move || {
-                        let to = keep_to.clone();
-                        async move {
-                            (AxStatus::TEMPORARY_REDIRECT, [("location", to)]).into_response()
-                        }
-                    }),
-                )
-                .route(
-                    "/same",
-                    get(|| async { (AxStatus::FOUND, [("location", "/here")]).into_response() }),
-                )
-                .route("/here", get(recorder(same_seen, "same"))),
-        )
-        .await;
+        let origin =
+            serve(
+                Router::new()
+                    .route(
+                        "/start",
+                        get(move || {
+                            let to = to.clone();
+                            async move { (AxStatus::FOUND, [("location", to)]).into_response() }
+                        }),
+                    )
+                    .route(
+                        "/keep",
+                        any(move || {
+                            let to = keep_to.clone();
+                            async move {
+                                (AxStatus::TEMPORARY_REDIRECT, [("location", to)]).into_response()
+                            }
+                        }),
+                    )
+                    .route(
+                        "/same",
+                        get(|| async {
+                            (AxStatus::FOUND, [("location", "/here")]).into_response()
+                        }),
+                    )
+                    .route("/here", get(recorder(same_seen, "same"))),
+            )
+            .await;
         let client = Client::builder()
             .sensitive_header("x-api-key")
             .build()
@@ -675,10 +711,18 @@ mod tests {
         }
         assert!(has(&seen, "other", "x-trace"));
         let resp = client
-            .send(client.post(format!("{origin}/keep")).body("client_secret=s"))
+            .send(
+                client
+                    .post(format!("{origin}/keep"))
+                    .body("client_secret=s"),
+            )
             .await
             .unwrap();
-        assert_eq!(resp.status(), 307, "a body is not replayed to another origin");
+        assert_eq!(
+            resp.status(),
+            307,
+            "a body is not replayed to another origin"
+        );
         client.send(req("/same")).await.unwrap();
         for h in ["authorization", "x-api-key", "x-session", "cookie"] {
             assert!(has(&seen, "same", h), "{h} kept on a same-origin hop");
@@ -693,7 +737,9 @@ mod tests {
             Router::new()
                 .route(
                     "/see-other",
-                    any(|| async { (AxStatus::SEE_OTHER, [("location", "/sink")]).into_response() }),
+                    any(|| async {
+                        (AxStatus::SEE_OTHER, [("location", "/sink")]).into_response()
+                    }),
                 )
                 .route(
                     "/temp",
@@ -780,7 +826,10 @@ mod tests {
             .build()
             .unwrap();
         for path in ["/big", "/chunked"] {
-            let resp = small.send(small.get(format!("{base}{path}"))).await.unwrap();
+            let resp = small
+                .send(small.get(format!("{base}{path}")))
+                .await
+                .unwrap();
             let err = small.bytes(resp).await.unwrap_err();
             let FaucetError::Custom(inner) = &err else {
                 panic!("{err:?}")
@@ -790,11 +839,20 @@ mod tests {
             assert!(tl.to_string().contains("4-byte limit"));
         }
         let client = Client::new().unwrap();
-        assert_eq!(client.max_response_bytes(), Some(DEFAULT_MAX_RESPONSE_BYTES));
-        let resp = client.send(client.get(format!("{base}/json"))).await.unwrap();
+        assert_eq!(
+            client.max_response_bytes(),
+            Some(DEFAULT_MAX_RESPONSE_BYTES)
+        );
+        let resp = client
+            .send(client.get(format!("{base}/json")))
+            .await
+            .unwrap();
         let v: serde_json::Value = client.json(resp).await.unwrap();
         assert_eq!(v["a"], 1);
-        let resp = client.send(client.get(format!("{base}/latin"))).await.unwrap();
+        let resp = client
+            .send(client.get(format!("{base}/latin")))
+            .await
+            .unwrap();
         assert_eq!(client.text(resp).await.unwrap(), "\u{fffd}a");
         let unbounded = Client::builder().max_response_bytes(None).build().unwrap();
         let resp = unbounded
@@ -933,7 +991,19 @@ mod tests {
             Client::builder().sensitive_header("bad header").build(),
             Err(FaucetError::Config(_))
         ));
-        assert!(Client::builder().proxy("http://proxy.local:3128").build().is_ok());
+        assert!(
+            Client::builder()
+                .proxy("http://proxy.local:3128")
+                .build()
+                .is_ok()
+        );
+        assert!(Client::builder().build_reqwest().is_ok());
+        assert!(
+            Client::builder()
+                .sensitive_header("bad header")
+                .build_reqwest()
+                .is_err()
+        );
         assert!(
             Client::builder()
                 .try_configure(|_| Err(FaucetError::Config("no".into())))
@@ -948,6 +1018,61 @@ mod tests {
         assert!(is_cross_origin(&u("https://a/x"), &u("http://a/x")));
         assert!(is_cross_origin(&u("https://a/x"), &u("https://b/x")));
         assert!(is_cross_origin(&u("https://a/x"), &u("https://a:8443/x")));
+    }
+
+    #[tokio::test]
+    async fn call_returns_any_status_and_resends_only_replayable_bodies() {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let h = hits.clone();
+        let base = serve(Router::new().route(
+            "/x",
+            any(move || {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { AxStatus::BAD_GATEWAY.into_response() }
+            }),
+        ))
+        .await;
+        let client = Client::new().unwrap();
+        let resp = client
+            .call(&CallContext::new(), "get", client.get(format!("{base}/x")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502, "statuses are the caller's to classify");
+        let ctx = CallContext::new().with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffKind::None,
+            jitter: false,
+            ..RetryPolicy::default()
+        });
+        let resp = client
+            .call(&ctx, "get", client.get(format!("{base}/x")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502, "a status is not retried here");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let refused = Client::new().unwrap();
+        let err = refused
+            .call(
+                &ctx,
+                "post",
+                refused
+                    .post("http://127.0.0.1:1/x")
+                    .body(reqwest::Body::wrap("s".to_string())),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be sent again"), "{err}");
+        let err = refused
+            .call(&ctx, "get", refused.get("http://127.0.0.1:1/x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Http(_)), "{err:?}");
+        assert!(
+            refused
+                .call(&ctx, "get", refused.get("not a url"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

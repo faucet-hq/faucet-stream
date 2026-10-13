@@ -2,10 +2,10 @@
 
 use crate::config::{ElasticsearchAuth, ElasticsearchSourceConfig};
 use async_trait::async_trait;
-use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
-use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Stream, StreamPage};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
+use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
+use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Stream, StreamPage};
 use serde_json::{Value, json};
 use std::pin::Pin;
 
@@ -424,10 +424,10 @@ impl ElasticsearchSource {
             })
             .await
             .map_err(|e| {
-            FaucetError::Source(format!(
-                "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
-            ))
-        })?;
+                FaucetError::Source(format!(
+                    "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
+                ))
+            })?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         self.client.json(resp).await.map_err(|e| {
             FaucetError::Source(format!(

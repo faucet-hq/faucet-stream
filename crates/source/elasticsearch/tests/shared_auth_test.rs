@@ -1,5 +1,6 @@
 //! Integration tests for the shared `AuthProvider` injection path on
 //! [`ElasticsearchSource`].
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 

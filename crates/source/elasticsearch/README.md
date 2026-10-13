@@ -338,6 +338,16 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [`faucet-sink-elasticsearch`](https://crates.io/crates/faucet-sink-elasticsearch) — the matching bulk-index sink.
 - [`faucet-common-elasticsearch`](https://crates.io/crates/faucet-common-elasticsearch) — the shared `ElasticsearchAuth` enum.
 
+## Timeouts, cancellation and redirects
+
+Search, scroll and discovery requests run through the pipeline's
+`CallContext` (#880): each is bounded by `request_timeout_secs`, stopped by the
+run's cancel token, metered as `search` / `scroll` / `discover`, and sent once
+(a retried scroll could skip a page).
+Redirects are followed by `faucet_core::http::Client`: a hop to another
+origin drops `Authorization`, cookies and every credential header, and a request
+body is never replayed to another origin.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

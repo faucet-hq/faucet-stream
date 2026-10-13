@@ -271,10 +271,10 @@ pub const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// chunks, presigned links, the Files API): connect and idle-read timeouts,
 /// so a half-open connection fails the request instead of hanging the run.
 pub fn http_client() -> Result<reqwest::Client, FaucetError> {
-    reqwest::Client::builder()
+    faucet_core::http::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
-        .build()
+        .build_reqwest()
         .map_err(|e| FaucetError::Config(format!("databricks: cannot build HTTP client: {e}")))
 }
 
@@ -436,6 +436,7 @@ impl StatementClient {
     }
 
     /// Submit a pre-built request body and wait until it is terminal.
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     pub async fn execute_body(&self, body: &Value) -> Result<StatementResponse, FaucetError> {
         let mut auth = self.authorization().await?;
         let started = Instant::now();
@@ -522,6 +523,7 @@ impl StatementClient {
         })
     }
 
+    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     async fn send(
         &self,
         verb: Verb,
@@ -590,6 +592,7 @@ impl StatementClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 
