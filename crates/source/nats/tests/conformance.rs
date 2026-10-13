@@ -360,6 +360,18 @@ mod docker {
         cfg
     }
 
+    /// A durable consumer that does not exist fails the read by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_durable_consumer_is_a_typed_error() {
+        let (_container, server) = start_jetstream().await;
+        jetstream_with(&server, 100, 1).await;
+        let mut cfg = js_config(&server, 1);
+        cfg.jetstream_consumer = Some("nobody".into());
+        let source = NatsSource::new(cfg).await.expect("source new");
+        let err = source.fetch_all().await.unwrap_err().to_string();
+        assert!(err.contains("get_consumer 'nobody'"), "{err}");
+    }
+
     /// `max_messages` pulls only what it needs, so the next run gets the rest
     /// immediately instead of after `ack_wait` (MSG-45); every record carries
     /// its stream sequence for downstream dedupe (MSG-91).
