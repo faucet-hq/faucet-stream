@@ -410,7 +410,8 @@ fn insert_rows(
             }
         })
         .collect();
-    let (written, statements) = engine().insert_statements(&target(table), &columns, records, false)?;
+    let (written, statements) =
+        engine().insert_statements(&target(table), &columns, records, false)?;
     for stmt in &statements {
         execute(conn, stmt)?;
     }

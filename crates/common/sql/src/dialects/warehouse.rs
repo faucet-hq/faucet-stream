@@ -119,7 +119,13 @@ impl SqlDialect for Databricks {
     ) -> Result<String, FaucetError> {
         let defs: Vec<String> = columns
             .iter()
-            .map(|c| format!("{} {}", self.quote_ident(&c.name), self.type_name(c.base_type)))
+            .map(|c| {
+                format!(
+                    "{} {}",
+                    self.quote_ident(&c.name),
+                    self.type_name(c.base_type)
+                )
+            })
             .collect();
         Ok(format!(
             "CREATE TABLE IF NOT EXISTS {} ({}) USING DELTA",

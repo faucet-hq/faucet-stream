@@ -22,7 +22,6 @@ use crate::copy::{
     s3_uri, serialize_csv, serialize_jsonl,
 };
 
-
 /// A sink that loads JSON records into an Amazon Redshift table.
 pub struct RedshiftSink {
     /// Whether the target has been confirmed present for this sink instance

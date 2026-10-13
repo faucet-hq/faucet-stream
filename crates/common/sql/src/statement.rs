@@ -107,7 +107,10 @@ mod tests {
         let v = json!(7);
         let p = Param::borrowed("a", Some("int4"), &v);
         assert!(matches!(p.value, Cow::Borrowed(_)));
-        assert_eq!(Param::owned("a", None, json!("s")).value.as_ref(), &json!("s"));
+        assert_eq!(
+            Param::owned("a", None, json!("s")).value.as_ref(),
+            &json!("s")
+        );
         assert_eq!(Param::null("a", None).value.as_ref(), &Value::Null);
         let s = Statement::bare(StatementKind::CleanupDrop, "DROP");
         assert!(s.params.is_empty());

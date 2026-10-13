@@ -235,7 +235,10 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
                 )
             })
             .collect();
-        (faucet_core::plan_writes_ordered(records, &self.write), failed)
+        (
+            faucet_core::plan_writes_ordered(records, &self.write),
+            failed,
+        )
     }
 
     /// The `CREATE TABLE` for a target inferred from `records`, or `None`
@@ -257,7 +260,10 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
             faucet_core::plan_keyed_columns(records, key)
         };
         match planned {
-            Some(columns) => self.dialect.create_table_sql(target, &columns, key).map(Some),
+            Some(columns) => self
+                .dialect
+                .create_table_sql(target, &columns, key)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -642,8 +648,7 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         let key_types: Vec<Option<String>> = key.iter().map(|k| type_of(k)).collect();
         let key_types_ref: Vec<Option<&str>> = key_types.iter().map(|t| t.as_deref()).collect();
         let scope_types: Vec<Option<String>> = scope_cols.iter().map(|c| type_of(c)).collect();
-        let scope_types_ref: Vec<Option<&str>> =
-            scope_types.iter().map(|t| t.as_deref()).collect();
+        let scope_types_ref: Vec<Option<&str>> = scope_types.iter().map(|t| t.as_deref()).collect();
 
         let drop = self.dialect.cleanup_drop_sql();
         if let Some(sql) = &drop {
@@ -656,7 +661,10 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         exec.execute(&Statement::bare(StatementKind::CleanupCreate, create))
             .await?;
 
-        for chunk in seen.keys().chunks(self.dialect.rows_per_statement(key.len())) {
+        for chunk in seen
+            .keys()
+            .chunks(self.dialect.rows_per_statement(key.len()))
+        {
             let sql = self
                 .dialect
                 .cleanup_insert_sql(key, &key_types_ref, chunk.len())?;

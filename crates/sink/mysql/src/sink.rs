@@ -80,8 +80,7 @@ impl SqlExecutor for MysqlExec<'_> {
             .await?
             .into_iter()
             .map(|(name, column_type, charset, collation)| {
-                let def =
-                    cleanup_temp_type(&column_type, charset.as_deref(), collation.as_deref());
+                let def = cleanup_temp_type(&column_type, charset.as_deref(), collation.as_deref());
                 TableColumn::new(name, def)
             })
             .collect())
@@ -183,7 +182,9 @@ fn safe_charset_name(name: &str) -> bool {
 /// has no typeless column, and a text column still compares correctly against a
 /// numeric one (MySQL coerces).
 fn cleanup_temp_type(column_type: &str, charset: Option<&str>, collation: Option<&str>) -> String {
-    let mut def = safe_type_spec(column_type).unwrap_or("LONGTEXT").to_string();
+    let mut def = safe_type_spec(column_type)
+        .unwrap_or("LONGTEXT")
+        .to_string();
     if let Some(cs) = charset.filter(|c| safe_charset_name(c)) {
         def.push_str(&format!(" CHARACTER SET {cs}"));
     }
@@ -595,14 +596,10 @@ pub(crate) fn match_columns<'a>(
     columns: &'a [(String, String)],
     obj: &'a serde_json::Map<String, Value>,
 ) -> Vec<(&'a String, &'a String, &'a Value)> {
-    faucet_common_sql::mapping::match_record(
-        &engine_columns(columns),
-        obj,
-        Mysql.column_matching(),
-    )
-    .into_iter()
-    .map(|(i, v)| (&columns[i].0, &columns[i].1, v))
-    .collect()
+    faucet_common_sql::mapping::match_record(&engine_columns(columns), obj, Mysql.column_matching())
+        .into_iter()
+        .map(|(i, v)| (&columns[i].0, &columns[i].1, v))
+        .collect()
 }
 
 /// Split a page into per-row outcomes, the records to write, and each written
@@ -1577,9 +1574,7 @@ impl MysqlSink {
                 .bind(legacy)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("MySQL legacy token delete failed: {e}"))
-                })?;
+                .map_err(|e| FaucetError::Sink(format!("MySQL legacy token delete failed: {e}")))?;
         }
 
         tx.commit()

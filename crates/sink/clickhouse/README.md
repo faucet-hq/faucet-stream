@@ -167,6 +167,12 @@ trip (`insert`, `query`). Requests go through `faucet_core::http::Client`, so a
 redirect to another origin drops the credentials. The HTTP client's connect /
 idle-read timeouts are unchanged.
 
+## Shared SQL layer
+
+This sink takes its identifier and literal escaping (backslash escapes), `Nullable(…)` column types and the create-table (`MergeTree`) and add-column text from the `ClickHouse` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Rows travel as `INSERT … FORMAT JSONEachRow` request bodies that the server maps by key, so there is no per-cell statement for the engine to plan.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

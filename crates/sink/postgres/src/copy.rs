@@ -79,7 +79,9 @@ pub(crate) fn build_auto_map_payload(
         // advancing past it (#789 SQL-50).
         MapError::NoMatch { index } => crate::sink::no_matching_column_message(
             index,
-            records[index].as_object().expect("a matched record is an object"),
+            records[index]
+                .as_object()
+                .expect("a matched record is an object"),
             table_columns,
         ),
         _ => "AutoMap requires JSON object records".to_string(),
@@ -87,10 +89,8 @@ pub(crate) fn build_auto_map_payload(
     if rows.is_empty() {
         return Ok(None);
     }
-    let matched_any: Vec<&serde_json::Map<String, Value>> = records
-        .iter()
-        .filter_map(Value::as_object)
-        .collect();
+    let matched_any: Vec<&serde_json::Map<String, Value>> =
+        records.iter().filter_map(Value::as_object).collect();
 
     let insert_columns: Vec<&(String, String)> = union_columns(&rows, columns.len())
         .into_iter()

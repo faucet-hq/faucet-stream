@@ -4,8 +4,8 @@ use crate::config::{SqliteColumnMapping, SqliteSinkConfig};
 use async_trait::async_trait;
 use faucet_common_sql::dialects::{Sqlite, sqlite};
 use faucet_common_sql::{
-    EngineOptions, EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine, Statement,
-    StatementKind, TableColumn, TableTarget,
+    EngineOptions, EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine, Statement, StatementKind,
+    TableColumn, TableTarget,
 };
 use faucet_core::{FaucetError, SchemaEvolution, SqlBaseType};
 use serde_json::Value;
@@ -327,7 +327,9 @@ impl SqlExecutor for SqliteExec<'_> {
                 .await
                 .map_err(|e| FaucetError::Sink(format!("cleanup: table_info query failed: {e}")))?
                 .iter()
-                .map(|row| TableColumn::new(row.get::<String, _>("name"), row.get::<String, _>("type")))
+                .map(|row| {
+                    TableColumn::new(row.get::<String, _>("name"), row.get::<String, _>("type"))
+                })
                 .collect(),
         )
     }
@@ -1061,9 +1063,7 @@ impl faucet_core::Sink for SqliteSink {
                             .execute(&self.pool)
                             .await
                             .map_err(|e| {
-                                FaucetError::Sink(format!(
-                                    "sqlite ADD COLUMN {column} failed: {e}"
-                                ))
+                                FaucetError::Sink(format!("sqlite ADD COLUMN {column} failed: {e}"))
                             })?;
                         }
                         EvolutionStep::Widen { .. } if !widened => {
@@ -1190,11 +1190,12 @@ impl faucet_core::Sink for SqliteSink {
 
                 // For upsert/delete modes, plan the page before opening the transaction
                 // so a key-extraction failure aborts without leaving an open tx.
-                let plans = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-                    None
-                } else {
-                    Some(self.engine.plan_keyed(records)?)
-                };
+                let plans =
+                    if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+                        None
+                    } else {
+                        Some(self.engine.plan_keyed(records)?)
+                    };
 
                 let mut tx = self.begin_write().await?;
 
@@ -1210,7 +1211,9 @@ impl faucet_core::Sink for SqliteSink {
                         SqliteColumnMapping::Json { column } => {
                             self.insert_json_tx(&mut tx, records, column).await?
                         }
-                        SqliteColumnMapping::AutoMap => self.insert_auto_map_tx(&mut tx, records).await?,
+                        SqliteColumnMapping::AutoMap => {
+                            self.insert_auto_map_tx(&mut tx, records).await?
+                        }
                     },
                 };
 

@@ -154,7 +154,9 @@ impl SqlDialect for Mysql {
 
     fn commit_token_upsert_sql(&self) -> String {
         let (t, s, k) = self.commit_token_names();
-        format!("INSERT INTO {t} ({s}, {k}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {k} = VALUES({k})")
+        format!(
+            "INSERT INTO {t} ({s}, {k}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {k} = VALUES({k})"
+        )
     }
 
     /// InnoDB caps an index at 3072 bytes and utf8mb4 text is 4 bytes a

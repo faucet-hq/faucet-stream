@@ -4,8 +4,7 @@
 use base64::Engine;
 use faucet_common_oracle::oracle::sql_type::OracleType;
 use faucet_common_oracle::{
-    TypeFamily, bytes_to_hex, hex_to_bytes, iso_to_oracle_interval, quote_ident_oracle,
-    split_table,
+    TypeFamily, bytes_to_hex, hex_to_bytes, iso_to_oracle_interval, quote_ident_oracle, split_table,
 };
 use faucet_common_sql::dialects::{Oracle, oracle};
 use faucet_common_sql::{SqlDialect, TableTarget};

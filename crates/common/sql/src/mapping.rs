@@ -126,9 +126,7 @@ pub fn field_for<'a>(
                 return None;
             }
             obj.iter()
-                .find(|(k, _)| {
-                    k.to_uppercase() == column && !columns.iter().any(|c| c.name == **k)
-                })
+                .find(|(k, _)| k.to_uppercase() == column && !columns.iter().any(|c| c.name == **k))
                 .map(|(_, v)| v)
         }
     }
@@ -302,7 +300,10 @@ mod tests {
         let o = obj(json!({"id": 1, "name": "x"}));
         let m = match_record(&c, &o, ColumnMatching::Exact);
         assert_eq!(m, vec![(0, &json!(1))]);
-        assert_eq!(unmatched_fields(&o, &c, ColumnMatching::Exact), vec!["name"]);
+        assert_eq!(
+            unmatched_fields(&o, &c, ColumnMatching::Exact),
+            vec!["name"]
+        );
     }
 
     #[test]
@@ -335,7 +336,10 @@ mod tests {
             vec![(0, &json!(2))]
         );
         let o = obj(json!({"zz": 1}));
-        assert_eq!(unmatched_fields(&o, &c, ColumnMatching::FoldUnique), vec!["zz"]);
+        assert_eq!(
+            unmatched_fields(&o, &c, ColumnMatching::FoldUnique),
+            vec!["zz"]
+        );
         let names: Vec<String> = c.iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             Value::Object(fold_record(&names, &obj(json!({"userid": 1, "kind": 2})))),
@@ -351,19 +355,37 @@ mod tests {
             match_record(&c, &o, ColumnMatching::UpperFold),
             vec![(0, &json!(1))]
         );
-        assert_eq!(unmatched_fields(&o, &c, ColumnMatching::UpperFold), vec!["mixed"]);
+        assert_eq!(
+            unmatched_fields(&o, &c, ColumnMatching::UpperFold),
+            vec!["mixed"]
+        );
         let names: Vec<String> = c.iter().map(|c| c.name.clone()).collect();
-        assert_eq!(column_for_field("id", &names, ColumnMatching::UpperFold), Some("ID"));
-        assert_eq!(column_for_field("mixed", &names, ColumnMatching::UpperFold), None);
-        assert_eq!(column_for_field("ID", &names, ColumnMatching::Exact), Some("ID"));
+        assert_eq!(
+            column_for_field("id", &names, ColumnMatching::UpperFold),
+            Some("ID")
+        );
+        assert_eq!(
+            column_for_field("mixed", &names, ColumnMatching::UpperFold),
+            None
+        );
+        assert_eq!(
+            column_for_field("ID", &names, ColumnMatching::Exact),
+            Some("ID")
+        );
         assert_eq!(column_for_field("id", &names, ColumnMatching::Exact), None);
         assert_eq!(
             column_for_field("mixed", &names, ColumnMatching::CaseInsensitive),
             Some("Mixed")
         );
         let dup = vec!["a".to_string(), "A".to_string()];
-        assert_eq!(column_for_field("x", &dup, ColumnMatching::FoldUnique), None);
-        assert_eq!(column_for_field("aa", &dup, ColumnMatching::FoldUnique), None);
+        assert_eq!(
+            column_for_field("x", &dup, ColumnMatching::FoldUnique),
+            None
+        );
+        assert_eq!(
+            column_for_field("aa", &dup, ColumnMatching::FoldUnique),
+            None
+        );
         assert_eq!(
             column_for_field("mixed", &names, ColumnMatching::FoldUnique),
             Some("Mixed")
@@ -374,7 +396,10 @@ mod tests {
     fn mapping_refuses_non_objects_and_unmatched_records() {
         let c = cols(&["id"]);
         let ok = vec![json!({"id": 1})];
-        assert_eq!(map_records(&c, &ok, ColumnMatching::Exact).unwrap().len(), 1);
+        assert_eq!(
+            map_records(&c, &ok, ColumnMatching::Exact).unwrap().len(),
+            1
+        );
         let bad = vec![json!({"id": 1}), json!(3)];
         assert_eq!(
             map_records(&c, &bad, ColumnMatching::Exact),

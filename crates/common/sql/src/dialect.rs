@@ -109,7 +109,9 @@ pub trait SqlDialect: Send + Sync {
         (0..rows)
             .map(|r| {
                 let phs: Vec<String> = (0..width)
-                    .map(|c| self.placeholder(start + r * width + c + 1, types.get(c).copied().flatten()))
+                    .map(|c| {
+                        self.placeholder(start + r * width + c + 1, types.get(c).copied().flatten())
+                    })
                     .collect();
                 format!("({})", phs.join(", "))
             })
@@ -394,7 +396,10 @@ pub trait SqlDialect: Send + Sync {
     /// Read one scope's commit token (binds: scope).
     fn commit_token_select_sql(&self) -> String {
         let (t, s, k) = self.commit_token_names();
-        format!("SELECT {k} FROM {t} WHERE {s} = {}", self.placeholder(1, None))
+        format!(
+            "SELECT {k} FROM {t} WHERE {s} = {}",
+            self.placeholder(1, None)
+        )
     }
 
     /// Delete one scope's commit token (binds: scope).
@@ -475,7 +480,10 @@ mod tests {
         assert_eq!(d.rows_per_statement(0), 10);
         assert_eq!(d.rows_per_statement(50), 1);
         assert_eq!(d.quote_literal("o'k"), "'o''k'");
-        assert!(d.upsert_sql("\"t\"", &["a".into()], &["a".into()], &[], 1).is_err());
+        assert!(
+            d.upsert_sql("\"t\"", &["a".into()], &["a".into()], &[], 1)
+                .is_err()
+        );
         assert_eq!(d.alter_column_type_sql(&t, "a", "X").unwrap(), None);
         assert_eq!(d.drop_not_null_sql(&t, "a").unwrap(), None);
         assert_eq!(d.cleanup_drop_sql(), None);
@@ -492,7 +500,10 @@ mod tests {
         assert_eq!(d.widened_type_name(None, SqlBaseType::Integer), "TEXT");
         assert_eq!(d.cleanup_table_display(&t), "table 't'");
         assert!(d.commit_token_select_sql().starts_with("SELECT \"token\""));
-        assert!(d.commit_token_delete_sql().starts_with("DELETE FROM \"_faucet_commit_token\""));
+        assert!(
+            d.commit_token_delete_sql()
+                .starts_with("DELETE FROM \"_faucet_commit_token\"")
+        );
         assert!(
             d.no_matching_column_message(0, &[], &[], "t")
                 .starts_with("ansi: record 0")

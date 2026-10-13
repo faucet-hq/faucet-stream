@@ -93,7 +93,11 @@ impl SqliteSink {
         )
     }
 
-    async fn columns_of(&self, tx: &mut sqlx::SqliteConnection, table: &str) -> Result<Vec<String>, FaucetError> {
+    async fn columns_of(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        table: &str,
+    ) -> Result<Vec<String>, FaucetError> {
         let rows = sqlx::query("SELECT name FROM pragma_table_info(?) ORDER BY cid")
             .bind(table)
             .fetch_all(&mut *tx)

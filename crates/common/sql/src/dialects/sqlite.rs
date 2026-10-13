@@ -105,7 +105,10 @@ impl SqlDialect for Sqlite {
     }
 
     fn cleanup_drop_sql(&self) -> Option<String> {
-        Some(format!("DROP TABLE IF EXISTS {}", self.cleanup_keys_table()))
+        Some(format!(
+            "DROP TABLE IF EXISTS {}",
+            self.cleanup_keys_table()
+        ))
     }
 
     /// Declared types are filtered through [`safe_type_spec`]; an unusable

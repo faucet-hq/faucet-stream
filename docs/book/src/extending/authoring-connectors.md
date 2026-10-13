@@ -509,6 +509,80 @@ until you call `hang()`, so a client that connects in `new()` can be built
 first and then stalled. A connector with no backend round trip (a local file)
 is listed with its reason in `crates/conformance/call-deadline-exempt.txt`.
 
+## SQL sinks: the shared dialect and engine
+
+A sink that writes rows into a SQL database does not plan its own SQL. The
+`faucet-common-sql` crate holds the planning every SQL sink used to copy:
+
+- **`SqlDialect`** answers "how is this spelled here": identifier quoting
+  (`check_ident` refuses what cannot be quoted), literal escaping,
+  placeholders (`$3::int4`, `?`, `@P3`, `:3`) and the parameter limit, created,
+  key and widened type names, the keyed upsert (`ON CONFLICT`,
+  `ON DUPLICATE KEY`, `MERGE`) and delete statements, the scoped-cleanup
+  statements, the commit-token watermark table and the rollback-journal SQL.
+  Every statement builder is a provided method, so a dialect overrides only
+  where its SQL differs. Built-in dialects live in
+  `faucet_common_sql::dialects`.
+- **`SqlSinkEngine<D>`** owns the decisions: which record field lands in which
+  column (`ColumnMatching`: exact, case-insensitive, fold-to-unique, upper-fold),
+  a record matching no column (an error, never a silent skip), the union column
+  set of an append (a missing column binds NULL), one upsert per set of carried
+  columns (an absent column keeps its stored value), page-ordered keyed groups
+  (`plan_writes_ordered`, the journal written first on the same connection),
+  statements chunked under the parameter limit, create-table and evolution DDL,
+  the cleanup sequence, the commit-token write and the row report
+  (`WriteReport`: a keyed page accepts one row per planned upsert or delete and
+  coalesces the rest).
+
+A backend crate supplies a dialect and a `SqlExecutor` over its driver
+connection or open transaction: it returns the target's live columns (with
+types when its placeholders cast) and binds each planned `Param` as its column
+needs. It keeps what is genuinely its own — transactions, bulk-load paths,
+overwrite swaps, catalog queries — and runs the engine inside its own backend
+call, so the deadline and metering of [`CallContext`](#backend-calls-callcontext-httpclient-batching)
+still cover every statement:
+
+```rust
+use faucet_common_sql::dialects::Postgres;
+use faucet_common_sql::{SqlExecutor, SqlSinkEngine, Statement, TableColumn, TableTarget};
+use faucet_core::{async_trait, FaucetError};
+
+struct Exec<'c> {
+    conn: &'c mut sqlx::PgConnection,
+}
+
+#[async_trait]
+impl SqlExecutor for Exec<'_> {
+    async fn columns(&mut self, t: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        // read the catalog for `t.reference` on `self.conn`
+        # Ok(vec![])
+    }
+    async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+        // bind each `stmt.params` value as its column needs, run `stmt.sql`
+        # Ok(0)
+    }
+}
+
+// In the sink: plan the page, then apply it inside one transaction.
+// let plans = engine.plan_keyed(records)?;
+// engine.apply_plans(&mut Exec { conn: &mut tx }, &target, &plans).await?;
+```
+
+The shared planning matrix (`crates/common/sql/tests/dialect_matrix.rs`) runs
+the same cases — mapping, dedup, upsert/delete ordering, chunking, widening,
+create-table, cleanup, journal and token SQL — against every dialect, so a rule
+fixed for one backend is checked for all of them. A new SQL sink adds its
+dialect there.
+
+Which built-in sinks use how much of it:
+
+| Sink | Uses |
+|---|---|
+| postgres, mysql, sqlite | the engine end to end, over an executor |
+| mssql | the dialect (MERGE, `CAST` placeholders, limits) and the shared mapping; its own retry-classified chunk execution |
+| duckdb | the engine's row planning, executed on the blocking driver |
+| redshift, clickhouse, oracle, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; their own row handling (`COPY`/`JSONEachRow` bodies, array DML, JSON-payload statement APIs) |
+
 ## Make it fast
 
 Performance is the project's first principle, and none of this may trade away

@@ -546,7 +546,8 @@ fn build_alter_type_sql(table_ref: &str, col: &str, kw: &str) -> String {
 /// which would silently round every stored value above 2^53 (#789 SQL-78).
 #[cfg(test)]
 fn widened_keyword(change: &faucet_core::ColumnChange) -> &'static str {
-    let to = faucet_core::json_schema_base_type(&change.to).unwrap_or(faucet_core::SqlBaseType::Text);
+    let to =
+        faucet_core::json_schema_base_type(&change.to).unwrap_or(faucet_core::SqlBaseType::Text);
     let from = change
         .from
         .as_ref()
@@ -650,9 +651,8 @@ impl SqlExecutor for PgExec<'_> {
                     })?
                 }
                 StatementKind::Delete | StatementKind::CleanupLoad => {
-                    pg_bind_text_with(value, udt, binary).map_err(|e| {
-                        FaucetError::Sink(format!("key column {}: {e}", p.column))
-                    })?
+                    pg_bind_text_with(value, udt, binary)
+                        .map_err(|e| FaucetError::Sink(format!("key column {}: {e}", p.column)))?
                 }
                 StatementKind::CleanupDelete => pg_bind_text(value, udt),
                 _ => p.value.as_str().map(str::to_string),
@@ -734,9 +734,9 @@ impl PostgresSink {
         // emitting a zero-column CREATE.
         let create_ref =
             qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        let Some(create) = self
-            .engine
-            .create_table_sql(&target_ref(&create_ref), records, json_column)?
+        let Some(create) =
+            self.engine
+                .create_table_sql(&target_ref(&create_ref), records, json_column)?
         else {
             return Ok(());
         };
