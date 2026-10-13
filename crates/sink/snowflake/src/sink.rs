@@ -840,13 +840,19 @@ fn build_create_table_sql(
     table: &str,
     columns: &[faucet_core::PlannedColumn],
 ) -> String {
-    let cols = faucet_core::render_columns(columns, quote_ident, |_| "STRING");
-    format!(
-        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({cols})",
+    let reference = format!(
+        "{}.{}.{}",
         quote_ident(database),
         quote_ident(schema),
         quote_ident(table)
+    );
+    faucet_common_sql::SqlDialect::create_table_sql(
+        &faucet_common_sql::dialects::Snowflake,
+        &faucet_common_sql::TableTarget::new(table, reference),
+        columns,
+        &[],
     )
+    .expect("snowflake CREATE TABLE")
 }
 
 #[async_trait]
