@@ -68,6 +68,7 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         cancel,
         meter,
     } = req;
+    let _ = (pipeline, row);
     let mut g = Governance::new().with_cancel(cancel.clone());
     if let Some(m) = meter {
         g = g.with_usage_meter(m);
@@ -377,12 +378,9 @@ pub(crate) fn topology_dlq(
 /// MCP `preview` / dry-run tools (#875). A preview writes nothing, so only
 /// masking applies (every rule: there is no destination to scope by); the
 /// rest are opted out by name.
-pub fn preview_governance(
-    #[allow(unused_variables)] masking: Option<&faucet_core::MaskingSpec>,
-) -> CliResult<Governance> {
-    #[allow(unused_mut)]
+#[cfg(feature = "masking")]
+pub fn preview_governance(masking: Option<&faucet_core::MaskingSpec>) -> CliResult<Governance> {
     let mut g = Governance::new();
-    #[cfg(feature = "masking")]
     if let Some(spec) = masking {
         g = g.with_masking(Arc::new(
             faucet_core::CompiledMasking::compile(spec)
@@ -687,6 +685,7 @@ mod tests {
 
     /// A preview writes nothing: only masking applies, the rest is opted out.
     #[test]
+    #[cfg(feature = "masking")]
     fn a_preview_masks_and_opts_out_of_the_write_side() {
         let spec: faucet_core::MaskingSpec = serde_json::from_value(serde_json::json!({
             "rules": [{"match": {"fields": ["email"]}, "action": {"type": "redact"},

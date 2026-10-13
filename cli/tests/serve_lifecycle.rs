@@ -220,8 +220,17 @@ async fn doctor_first_rejects_bad_connector() {
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
 
+    // Inside the temp dir, so the reference policy (#881) admits the paths and
+    // the missing file is left for doctor to catch.
+    let tmp = std::env::temp_dir();
+    let missing = tmp.join("faucet-no-such-file.csv");
+    let out = tmp.join("faucet-doctor-first-out.jsonl");
     let body = serde_json::json!({
-        "config": "version: 1\npipeline:\n  source: { type: csv, config: { path: /no/such/file.csv } }\n  sink: { type: jsonl, config: { path: /tmp/out.jsonl } }\n",
+        "config": format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n",
+            missing.display(),
+            out.display()
+        ),
         "doctor_first": true
     });
     let resp = client
