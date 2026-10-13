@@ -109,6 +109,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The value-fidelity corpus (#885): the wide row, encoded as the
+    /// Statement Execution API returns it (every cell a string, a complex cell
+    /// its JSON text), decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut cols = Vec::new();
+        let mut cells = Vec::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let (ty, cell) = match v {
+                Value::Null => ("STRING", Value::Null),
+                Value::Bool(b) => ("BOOLEAN", json!(b.to_string())),
+                Value::Number(n) if n.is_f64() => ("DOUBLE", json!(n.to_string())),
+                Value::Number(n) => ("LONG", json!(n.to_string())),
+                Value::String(s) if name.starts_with("canonical_decimal") => ("DECIMAL", json!(s)),
+                Value::String(s) => ("STRING", json!(s)),
+                Value::Array(_) => ("ARRAY", json!(v.to_string())),
+                Value::Object(_) => ("STRUCT", json!(v.to_string())),
+            };
+            cols.push(ColumnInfo {
+                name: name.clone(),
+                type_name: ty.into(),
+            });
+            cells.push(cell);
+        }
+        let landed = row_to_json(&cells, &cols);
+        fidelity::assert_round_trip(&[sent], &[landed], fidelity::Tolerance::exact());
+    }
+
     #[test]
     fn duplicate_column_names_are_refused() {
         assert!(check_unique_columns(&cols()).is_ok());

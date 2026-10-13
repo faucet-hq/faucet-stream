@@ -1111,6 +1111,35 @@ mod tests {
     use super::*;
     use faucet_core::drift::ColumnChange;
 
+    /// The value-fidelity corpus (#885): every cell this sink sends, read back
+    /// by the column type it was sent for, is the value it came from.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut landed = serde_json::Map::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let ty = match v {
+                serde_json::Value::String(_) => "STRING",
+                serde_json::Value::Bool(_) => "BOOLEAN",
+                serde_json::Value::Number(n) if n.is_f64() => "DOUBLE",
+                serde_json::Value::Number(_) => "BIGINT",
+                _ => "VARIANT",
+            };
+            let back = match (cell_text_for(v, ty), ty) {
+                (None, _) => serde_json::Value::Null,
+                (Some(text), "STRING") => serde_json::Value::String(text),
+                (Some(text), _) => faucet_core::fidelity::from_str(&text).unwrap(),
+            };
+            landed.insert(name.clone(), back);
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[serde_json::Value::Object(landed)],
+            fidelity::Tolerance::exact(),
+        );
+    }
+
     fn t() -> TableRef {
         TableRef::new(Some("main"), "sales", "orders")
     }

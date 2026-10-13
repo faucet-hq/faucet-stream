@@ -182,8 +182,14 @@ mod tests {
         assert_eq!(kind_of("Nullable(Float64)"), Kind::Float);
         assert_eq!(cell(Kind::Float, Value::String("nan".into())), Value::Null);
         assert_eq!(cell(Kind::Float, Value::String("-inf".into())), Value::Null);
-        assert_eq!(cell(Kind::Float, serde_json::json!(1.5)), serde_json::json!(1.5));
-        assert_eq!(cell(Kind::Float, Value::String("x".into())), serde_json::json!("x"));
+        assert_eq!(
+            cell(Kind::Float, serde_json::json!(1.5)),
+            serde_json::json!(1.5)
+        );
+        assert_eq!(
+            cell(Kind::Float, Value::String("x".into())),
+            serde_json::json!("x")
+        );
     }
     use serde_json::json;
 

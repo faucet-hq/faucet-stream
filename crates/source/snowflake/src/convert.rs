@@ -281,6 +281,39 @@ mod tests {
         }
     }
 
+    /// The value-fidelity corpus (#885): the wide row, encoded as the SQL API
+    /// returns it (every cell a string, a semi-structured cell its JSON text,
+    /// a decimal a `fixed` cell with its scale), decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut cols = Vec::new();
+        let mut cells = Vec::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let (meta, cell) = match v {
+                Value::Null => (col(name, "text"), Value::Null),
+                Value::Bool(b) => (col(name, "boolean"), json!(b.to_string())),
+                Value::Number(n) if n.is_f64() => (col(name, "real"), json!(n.to_string())),
+                Value::Number(n) => (col(name, "fixed"), json!(n.to_string())),
+                Value::String(s) if name == "canonical_decimal" => (col_scaled(name, 9), json!(s)),
+                Value::String(s) if name == "canonical_decimal_scale" => {
+                    (col_scaled(name, 2), json!(s))
+                }
+                Value::String(s) if name == "canonical_big_integer" => {
+                    (col(name, "fixed"), json!(s))
+                }
+                Value::String(s) => (col(name, "text"), json!(s)),
+                Value::Array(_) => (col(name, "array"), json!(v.to_string())),
+                Value::Object(_) => (col(name, "object"), json!(v.to_string())),
+            };
+            cols.push(meta);
+            cells.push(cell);
+        }
+        let landed = row_to_json(&cells, &cols);
+        fidelity::assert_round_trip(&[sent], &[landed], fidelity::Tolerance::exact());
+    }
+
     /// A `fixed` column with an explicit (non-zero) decimal scale.
     fn col_scaled(name: &str, scale: i64) -> ColumnMeta {
         ColumnMeta {

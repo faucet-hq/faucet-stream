@@ -192,11 +192,14 @@ async fn decimals_money_bytes_and_timestamps_keep_their_canonical_rendering() {
     assert_instant(&streamed[0]["at"]);
 
     // A query the text cast cannot wrap (duplicate names) reads NUMERIC natively.
-    let native = query(&url, "SELECT dec_scale, dec_scale FROM typed WHERE __fidelity_id = 'typed'")
-        .await
-        .fetch_all()
-        .await
-        .unwrap();
+    let native = query(
+        &url,
+        "SELECT dec_scale, dec_scale FROM typed WHERE __fidelity_id = 'typed'",
+    )
+    .await
+    .fetch_all()
+    .await
+    .unwrap();
     assert_eq!(native, vec![json!({"dec_scale": "1.50"})]);
 
     // NaN and the infinities have no JSON number: a counted null.
