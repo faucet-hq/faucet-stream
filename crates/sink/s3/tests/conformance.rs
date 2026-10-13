@@ -303,7 +303,9 @@ async fn declared_capabilities() {
         .put_object()
         .bucket(TEST_BUCKET)
         .key("ovw/out-00001.jsonl")
-        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n"))
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n",
+        ))
         .send()
         .await
         .expect("seed object");

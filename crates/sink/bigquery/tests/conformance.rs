@@ -310,7 +310,8 @@ mod fake {
                     }
                 }
                 if q.contains("_faucet_commit_token")
-                    && let (Some(scope), Some(token)) = (param(&body, "scope"), param(&body, "token"))
+                    && let (Some(scope), Some(token)) =
+                        (param(&body, "scope"), param(&body, "token"))
                 {
                     self.tokens.lock().unwrap().insert(scope, token);
                 }
@@ -321,7 +322,9 @@ mod fake {
     }
 }
 
-async fn fake_sink(edit: impl FnOnce(&mut BigQuerySinkConfig)) -> (wiremock::MockServer, fake::BigQuery, BigQuerySink) {
+async fn fake_sink(
+    edit: impl FnOnce(&mut BigQuerySinkConfig),
+) -> (wiremock::MockServer, fake::BigQuery, BigQuerySink) {
     let server = wiremock::MockServer::start().await;
     let bq = fake::BigQuery::new(&server.uri());
     wiremock::Mock::given(wiremock::matchers::any())

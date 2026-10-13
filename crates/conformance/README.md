@@ -30,6 +30,38 @@ this crate — a check that cannot fail is worthless.
 | 11 | `assert_preflight_check_wellformed` | `check()` returns `Ok(CheckReport)` with well-formed probes; a probe failure is a `Fail` probe, not an `Err` |
 | 14 | `assert_descriptor_matches_source` / `_sink` | the connector's static `ConnectorDescriptor` answers, from a config alone, exactly what the connector built from that config declares through `capabilities()` (RFC 0013) — the CLI's load-time gates trust the first, the pipeline the second |
 
+### Declared-capability checks (RFC 0013)
+
+Each proves a sink behaves as a capability it declares says it does:
+
+| # | Function | What it proves |
+|---|---|---|
+| 15 | `assert_partial_outcomes_truthful` | `write_batch_partial` returns one outcome per row and an `Ok` row is in the destination |
+| 16 | `assert_reported_rows_truthful` | `write_batch_reported` accounts for every row offered and `accepted` equals what landed |
+| 17 | `assert_replay_safe` | a replay-safe plain write, retried after a lost response, does not duplicate rows |
+| 18 | `assert_overwrite_lifecycle` | `write_mode: overwrite` stages until commit; an abort leaves the destination as it was |
+| 19 | `assert_batch_atomicity_truthful` | a failed write of a batch declared atomic lands no row; a per-row batch lands exactly its `Ok` rows |
+
+### Which checks a connector must run
+
+`faucet_conformance::required::REQUIREMENTS` maps each declared capability (a
+descriptor flag, a write mode, a trait-method override, a buffering `flush`, a
+declared `BatchAtomicity`) to the assertions that prove it. For the built-in
+connectors `scripts/conformance-coverage.py` (CI `Doc counts` job) enforces the
+table from the committed `declared-capabilities.json` snapshot, each crate's
+`src/` and its `tests/conformance.rs` (or
+`crates/interop-tests/tests/<kind>_conformance.rs`). Checks that cannot run in
+CI are listed with a reason in `conformance-coverage-exempt.txt` (call-deadline
+ones in `call-deadline-exempt.txt`). Regenerate the snapshot after changing a
+connector's declared capabilities:
+
+```bash
+cargo test -p faucet-cli --features full --test declared_capabilities -- --ignored regenerate
+```
+
+A test driving a cloud client whose futures are deeper than the default test
+stack runs its body through `block_on_large_stack`.
+
 ### Descriptor checks the built-in connectors cannot run offline
 
 Every built-in connector calls check 14 from its `tests/conformance.rs` for
@@ -129,6 +161,11 @@ call `assert_source_call_deadline(|| make_source())` or
 `assert_sink_call_deadline(|| make_sink(), &records)`. Each installs a context
 with a short deadline, then one with a cancel token, and fails if the read or
 write does not end within `CALL_BOUND`.
+
+`faucet_conformance::hung::StallingBodyServer` answers HTTP requests through a
+route closure and can stop a response body mid-stream
+(`Reply::stall_body`): the same assertions then prove the connector reads the
+body under the context too (`CallContext::reader`), not only the request.
 
 ## Doubles
 

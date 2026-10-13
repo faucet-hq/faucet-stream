@@ -115,13 +115,15 @@ async fn conformance_cancellation_flushes_and_reports_rows() {
     let capture = CaptureWriter::default();
     let sink = StdoutSink::with_writer(StdoutSinkConfig::new(), Box::new(capture.clone()));
     let capture_ref = &capture;
-    faucet_conformance::assert_cancellation_flushes(&sink, || async move {
-        capture_ref.line_count()
-    })
+    faucet_conformance::assert_cancellation_flushes(
+        &sink,
+        || async move { capture_ref.line_count() },
+    )
     .await;
-    faucet_conformance::assert_reported_rows_truthful(&sink, || async move {
-        capture_ref.line_count()
-    })
+    faucet_conformance::assert_reported_rows_truthful(
+        &sink,
+        || async move { capture_ref.line_count() },
+    )
     .await;
 
     let capped = CaptureWriter::default();

@@ -253,14 +253,19 @@ async fn conformance_declared_capabilities() {
     let conn = connection(port);
     let conn_ref = &conn;
 
-    let sink = SftpSink::new(SftpSinkConfig::new(conn.clone(), format!("{UPLOAD_DIR}/cancel")))
-        .expect("SftpSink::new");
+    let sink = SftpSink::new(SftpSinkConfig::new(
+        conn.clone(),
+        format!("{UPLOAD_DIR}/cancel"),
+    ))
+    .expect("SftpSink::new");
     faucet_conformance::assert_cancellation_flushes(&sink, || async move {
         records_in(conn_ref, &format!("{UPLOAD_DIR}/cancel")).await
     })
     .await;
 
-    let sftp = faucet_common_sftp::connect(&conn).await.expect("seed connect");
+    let sftp = faucet_common_sftp::connect(&conn)
+        .await
+        .expect("seed connect");
     let dir = format!("{UPLOAD_DIR}/ovw");
     sftp.create_dir(dir.as_str()).await.expect("create dir");
     let seed = format!("{dir}/out-00001.jsonl");

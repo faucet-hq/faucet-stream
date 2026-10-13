@@ -123,7 +123,9 @@ async fn conformance_declared_capabilities() {
         "commit_rows": 1000
     });
     let cfg: faucet_sink_redshift::RedshiftSinkConfig = serde_json::from_value(v).unwrap();
-    let sink = faucet_sink_redshift::RedshiftSink::new(cfg).await.expect("sink");
+    let sink = faucet_sink_redshift::RedshiftSink::new(cfg)
+        .await
+        .expect("sink");
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
     faucet_conformance::assert_cancellation_flushes(&sink, count).await;
 }

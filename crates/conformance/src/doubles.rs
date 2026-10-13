@@ -8,7 +8,9 @@
 //! `ErringCheckSink`) exist so the battery's own unit tests can prove each
 //! check actually *fails* when the contract is violated — a check that can
 //! never fail is worthless. The conformant ones (`CountingSource`, `TestSink`,
-//! `EvolvingSink`) demonstrate the contract genuinely.
+//! `EvolvingSink`) demonstrate the contract genuinely. `PartialOutcomeSink`,
+//! `MisreportingSink`, `OverwriteSink` and `AtomicitySink` come in an honest
+//! constructor and one per way of lying, for the declared-capability checks.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -1404,6 +1406,29 @@ mod tests {
         let empty = DiscoverableSource::empty();
         assert!(empty.supports_discover());
         assert!(empty.discover().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn declared_capability_doubles_start_empty_and_name_themselves() {
+        assert!(PartialOutcomeSink::honest().is_empty());
+        assert!(MisreportingSink::honest_skip().is_empty());
+        assert!(OverwriteSink::honest().is_empty());
+        assert!(AtomicitySink::atomic().is_empty());
+        assert_eq!(
+            PartialOutcomeSink::honest().connector_name(),
+            "partial-outcome-sink"
+        );
+        assert_eq!(
+            MisreportingSink::honest_skip().connector_name(),
+            "misreporting-sink"
+        );
+        assert_eq!(OverwriteSink::honest().connector_name(), "overwrite-sink");
+        assert_eq!(AtomicitySink::atomic().connector_name(), "atomicity-sink");
+        assert!(
+            OverwriteSink::honest()
+                .supported_write_modes()
+                .contains(&WriteMode::Overwrite)
+        );
     }
 
     #[tokio::test]

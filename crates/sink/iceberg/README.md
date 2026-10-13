@@ -405,7 +405,9 @@ pipeline's `CallContext` (#880): each is made once (iceberg-rust's own commit
 retry is unchanged), any caller deadline ends it, and each is metered as a round
 trip (`catalog`, `write`, `commit`). A commit the deadline cut short is treated
 as ambiguous: its data files are never cleaned up, whatever
-`cleanup_orphans_on_failure` says.
+`cleanup_orphans_on_failure` says. The orphan-file deletes of a definitive loss
+run under the context too; one the deadline or a cancel cuts short is counted
+as failed and its file is left for `remove_orphan_files`.
 
 ## License
 

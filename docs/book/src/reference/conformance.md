@@ -78,9 +78,9 @@ The score above is a **static** grade (registry entry, config schema, advertised
 capabilities). It is complemented by the
 [`faucet-conformance`](https://crates.io/crates/faucet-conformance) crate — a
 **runtime** test battery a connector calls from its own `tests/` to prove it
-actually upholds the contract, not just advertises it. There are 13 checks; each
-ships with a passing *and* a `#[should_panic]` failing test in the battery, so no
-check can be vacuous.
+actually upholds the contract, not just advertises it. Every check ships with a
+passing *and* a `#[should_panic]` failing test in the battery, so no check can
+be vacuous.
 
 Checks 1–11 run against synthetic in-memory doubles or a single connector
 instance (config-schema validity, bounded-memory paging, bookmark resume,
@@ -108,6 +108,58 @@ One more check pins what the CLI checks a config against:
   it from its `tests/conformance.rs`; the few that connect inside `new()` pin
   their descriptor in unit tests instead (listed in the `faucet-conformance`
   README). See [Declaring capabilities](../extending/authoring-connectors.md#declaring-capabilities).
+
+Five more prove a sink behaves as a capability it declares says it does
+(RFC 0013):
+
+| Check | Proves |
+|---|---|
+| `assert_partial_outcomes_truthful` | `write_batch_partial` returns one outcome per row and every `Ok` row is in the destination |
+| `assert_reported_rows_truthful` | `write_batch_reported` accounts for every row offered and `accepted` equals what landed |
+| `assert_replay_safe` | a plain write the sink calls replay-safe, retried after a lost response, does not duplicate rows |
+| `assert_overwrite_lifecycle` | `write_mode: overwrite` keeps staged rows out of the destination until commit, and an abort leaves it as it was |
+| `assert_batch_atomicity_truthful` | a failed write of a batch declared `atomic` lands no row; a `per_row` batch lands exactly its `Ok` rows |
+
+### A declared capability requires its check
+
+`faucet_conformance::required::REQUIREMENTS` maps each declared capability to
+the assertions that prove it:
+
+| Requirement | Applies when the connector… | Satisfied by |
+|---|---|---|
+| `descriptor` | (every source and sink) | `assert_descriptor_matches_source` / `_sink` |
+| `idempotent_writes` | declares `idempotent_writes` | `assert_idempotent_replay` or `assert_capabilities_truthful` |
+| `keyed_write_modes` | lists `upsert` or `delete` | `assert_write_modes_truthful` |
+| `replay_safe` | declares `keyed_upsert`, or overrides `write_batch_is_replay_safe` | `assert_replay_safe` |
+| `overwrite` | lists `overwrite` | `assert_overwrite_lifecycle` |
+| `schema_evolution` | declares `schema_evolution` | `assert_schema_evolution_effective` |
+| `buffered_flush` | overrides `flush` with a body that does work, or uses the shared file writer | `assert_cancellation_flushes` |
+| `partial_outcomes` | overrides `write_batch_partial` | `assert_partial_outcomes_truthful` |
+| `row_accounting` | overrides `write_batch_reported` | `assert_reported_rows_truthful` |
+| `atomic_batches` | declares `BatchAtomicity::Atomic` for some config | `assert_batch_atomicity_truthful` |
+| `call_deadline` | (every source and sink) | `assert_source_call_deadline` / `assert_sink_call_deadline` |
+| `exactly_once` *(source)* | declares `exactly_once` | `assert_bookmark_roundtrip` |
+| `discover` *(source)* | declares `discover` | `assert_discover_roundtrips` |
+
+CI's `Doc counts` job runs `scripts/conformance-coverage.py`, which fails when a
+built-in connector declares a capability and none of its conformance tests
+(`tests/conformance.rs`, or `crates/interop-tests/tests/<kind>_conformance.rs`
+for a check that needs a second connector) calls a matching assertion. It
+builds no Rust: the table and every connector's kind-level capabilities come
+from the committed `crates/conformance/declared-capabilities.json`, which a
+test in the `Test` job keeps in step with the code. Regenerate it after
+changing a connector's declared capabilities:
+
+```bash
+cargo test -p faucet-cli --features full --test declared_capabilities -- --ignored regenerate
+```
+
+A check that cannot run in CI — no emulator exists for the backend, or the
+backend's own semantics would only be simulated — is listed in
+`crates/conformance/conformance-coverage-exempt.txt` as
+`<crate> <requirement>: <reason>` (call-deadline exemptions stay in
+`call-deadline-exempt.txt`). An exemption for a requirement that does not apply,
+or that the tests already meet, fails the run, so the list cannot go stale.
 
 See [Authoring connectors](../extending/authoring-connectors.md#self-certify-with-the-conformance-battery)
 for how to wire the battery into a new connector.
