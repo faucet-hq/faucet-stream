@@ -42,6 +42,9 @@ async fn drive_progress_or_plain<T>(
     pipeline: &str,
     handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> T {
+    // Boxed: the executor future is large enough to overflow a test thread's
+    // stack when held inline in this frame.
+    let run = Box::pin(run);
     match handle {
         Some(h) => crate::progress::drive(run, pipeline, h).await,
         None => run.await,

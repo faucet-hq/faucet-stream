@@ -2481,15 +2481,17 @@ async fn run_one_invocation(
     let crate::governance::GovernanceBuild {
         governance,
         profiler,
-    } = crate::governance::governance_for(crate::governance::GovernanceRequest {
-        node,
-        opts,
-        pipeline: &pipeline_name,
-        row: &row_id,
-        run_id: &run_id,
-        cancel: &cancel,
-        meter: Some(Arc::clone(&observers.meter)),
-    })
+    } = Box::pin(crate::governance::governance_for(
+        crate::governance::GovernanceRequest {
+            node,
+            opts,
+            pipeline: &pipeline_name,
+            row: &row_id,
+            run_id: &run_id,
+            cancel: &cancel,
+            meter: Some(Arc::clone(&observers.meter)),
+        },
+    ))
     .await?;
     let row_accounts = Arc::clone(&observers.rows);
     // 1) Resolve `${parent.path}` in the per-row source + sink configs.
@@ -2858,7 +2860,7 @@ async fn run_one_invocation(
     //    (cf. #321 H1) is harder to make (#324 C). The identity strings are
     //    borrowed — the lineage START/terminal lifecycle below still needs
     //    `pipeline_name` / `row_id` / `run_id`.
-    let pipeline = build_pipeline(
+    let pipeline = Box::pin(build_pipeline(
         source.as_ref(),
         sink.as_ref(),
         node,
@@ -2873,7 +2875,7 @@ async fn run_one_invocation(
         observers.clone(),
         governance,
         Arc::clone(&row_accounts),
-    )
+    ))
     .await?;
     // ── Lineage: START + heartbeat + terminal ────────────────────────────────
     #[cfg(feature = "lineage")]
@@ -2932,10 +2934,11 @@ async fn run_one_invocation(
     // from this combined `result`, then `?`-propagated below — restoring the
     // original early-return behaviour while still firing the terminal event on
     // both success and error.
-    let result: Result<faucet_core::PipelineResult, FaucetError> = match pipeline.run().await {
-        Ok(r) => sink.flush().await.map(|_| r),
-        Err(e) => Err(e),
-    };
+    let result: Result<faucet_core::PipelineResult, FaucetError> =
+        match Box::pin(pipeline.run()).await {
+            Ok(r) => sink.flush().await.map(|_| r),
+            Err(e) => Err(e),
+        };
     // A duration ceiling cancels cooperatively, so the pipeline returns `Ok`
     // with a partial result; the verdict turns it into the budget failure
     // (a records / bytes crossing already surfaced as the write error).

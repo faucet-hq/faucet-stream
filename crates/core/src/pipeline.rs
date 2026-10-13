@@ -874,7 +874,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         // Same scope derivation as the `Value` path: the state
                         // key (empty when none) — one meaning across paths.
                         let scope = state_key.clone().unwrap_or_default();
-                        return run_stream_native(
+                        return Box::pin(run_stream_native(
                             &wrapped_source,
                             &wrapped_sink,
                             plan,
@@ -890,7 +890,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                 wrapped_sink.connector_name(),
                                 self.batch_outcomes.clone(),
                             ),
-                        )
+                        ))
                         .await;
                     }
                 }
@@ -953,7 +953,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         sink_name,
                         has_dlq: self.dlq.is_some(),
                     };
-                    return run_stream_columnar(
+                    return Box::pin(run_stream_columnar(
                         &wrapped_source,
                         &wrapped_sink,
                         state,
@@ -971,7 +971,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             sink_name,
                             self.batch_outcomes.clone(),
                         ),
-                    )
+                    ))
                     .await;
                 }
             }
@@ -1055,7 +1055,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             }
 
             let run_result = match self.cleanup.clone() {
-                None => run_stream_with(pages, &wrapped_sink, opts, extras).await,
+                None => Box::pin(run_stream_with(pages, &wrapped_sink, opts, extras)).await,
                 Some(policy) => {
                     if !wrapped_sink.supports_cleanup() {
                         return Err(FaucetError::Config(format!(
@@ -1064,7 +1064,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         )));
                     }
                     let tracker = crate::cleanup::CleanupTracker::new(&wrapped_sink, &policy);
-                    let result = run_stream_with(pages, &tracker, opts, extras).await;
+                    let result = Box::pin(run_stream_with(pages, &tracker, opts, extras)).await;
                     match result {
                         Ok(r) => {
                             let cancelled = self.cancel.as_ref().is_some_and(|c| c.is_cancelled());
