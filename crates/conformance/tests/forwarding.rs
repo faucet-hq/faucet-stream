@@ -194,3 +194,36 @@ async fn the_harness_refuses_a_stale_skip_name() {
     let wrapped = FullSink(probe.clone());
     assert_sink_forwards_every_hook(&wrapped, &probe, &["no_such_hook"]).await;
 }
+
+/// Changes `write_batch` only. The reported write must go through it (the
+/// trait default), not straight to the inner sink (#879).
+struct Doubling(HookSink);
+
+#[async_trait]
+impl Sink for Doubling {
+    forward_sink!(0; except write_batch);
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+        Ok(2 * self.0.write_batch(records).await?)
+    }
+}
+
+#[tokio::test]
+async fn a_wrapper_that_changes_write_batch_reports_through_it() {
+    let probe = HookSink::default();
+    let wrapped = Doubling(probe.clone());
+    let report = wrapped.write_batch_reported(&[Value::Null]).await.unwrap();
+    assert_eq!(report.accepted, 2, "the wrapper's own write_batch ran");
+    assert!(!probe.reached().contains(&"write_batch_reported"));
+    assert!(probe.reached().contains(&"write_batch"));
+}
+
+/// A governed destination (#875) forwards every hook its layers do not
+/// change; with no layer configured it forwards every hook.
+#[tokio::test]
+async fn a_governed_sink_forwards_every_hook() {
+    let probe = HookSink::default();
+    let governed = faucet_core::Governance::new()
+        .sink_builder()
+        .build(Box::new(probe.clone()));
+    assert_sink_forwards_every_hook(&governed, &probe, &[]).await;
+}

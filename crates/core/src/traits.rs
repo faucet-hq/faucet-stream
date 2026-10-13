@@ -603,18 +603,24 @@ pub trait Sink: Send + Sync {
     /// Write a batch and report what happened to every row offered (#879).
     ///
     /// The pipeline calls this instead of [`Self::write_batch`] and checks that
-    /// `accepted + coalesced` covers the page; a shortfall fails the page with
-    /// [`FaucetError::RowsUnaccounted`]. The default wraps `write_batch`'s
-    /// count. A sink that merges rows of the same key within a page (keyed
-    /// upsert / delete, last write wins) overrides it and reports the merged
-    /// rows as [`coalesced`](crate::WriteReport::coalesced).
+    /// `accepted + coalesced + skipped` covers the page; a shortfall fails the
+    /// page with [`FaucetError::RowsUnaccounted`]. The default wraps
+    /// `write_batch`'s count; for a sink configured to merge rows by key
+    /// ([`Self::dedups_by_key`] — keyed upsert / delete, last write wins) it
+    /// counts the rows the count falls short by as
+    /// [`coalesced`](crate::WriteReport::coalesced). A sink that declines rows
+    /// by design of its configuration overrides this and reports them as
+    /// [`skipped`](crate::WriteReport::skipped).
     async fn write_batch_reported(
         &self,
         records: &[Value],
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
-        Ok(crate::accounting::WriteReport::accepted(
-            self.write_batch(records).await?,
-        ))
+        let n = self.write_batch(records).await?;
+        Ok(if self.dedups_by_key() {
+            crate::accounting::WriteReport::keyed(records.len(), n)
+        } else {
+            crate::accounting::WriteReport::accepted(n)
+        })
     }
 
     /// What a failed batch write leaves behind (#737): nothing

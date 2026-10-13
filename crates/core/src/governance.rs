@@ -904,3 +904,302 @@ impl Sink for DlqMaskingSink {
         self.inner.write_batch_partial(&self.mask(records)).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::Source;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    type Seen = Arc<Mutex<Vec<(&'static str, Value)>>>;
+
+    /// Records the first record of every page it sees, then forwards.
+    struct Tap {
+        name: &'static str,
+        inner: Box<dyn Sink>,
+        seen: Seen,
+    }
+
+    #[async_trait]
+    impl Sink for Tap {
+        crate::forward_sink!(inner; except write_batch);
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            if let Some(r) = records.first() {
+                self.seen.lock().unwrap().push((self.name, r.clone()));
+            }
+            self.inner.write_batch(records).await
+        }
+    }
+
+    fn tap(
+        name: &'static str,
+        seen: &Seen,
+    ) -> impl FnOnce(Box<dyn Sink>) -> Box<dyn Sink> + Send + 'static {
+        let seen = Arc::clone(seen);
+        move |inner| Box::new(Tap { name, inner, seen })
+    }
+
+    struct Dest(Seen);
+
+    #[async_trait]
+    impl Sink for Dest {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            for r in records {
+                self.0.lock().unwrap().push(("dest", r.clone()));
+            }
+            Ok(records.len())
+        }
+    }
+
+    fn profiler() -> Arc<Mutex<Profiler>> {
+        Arc::new(Mutex::new(Profiler::new(
+            serde_json::from_value(json!({})).unwrap(),
+        )))
+    }
+
+    fn metadata() -> (CompiledMetadata, MetadataContext) {
+        (
+            CompiledMetadata::compile(&crate::metadata::MetadataColumnsSpec::default())
+                .unwrap()
+                .unwrap(),
+            MetadataContext {
+                run_id: "r".into(),
+                source: "s".into(),
+            },
+        )
+    }
+
+    fn is_subsequence(layers: &[SinkLayer]) -> bool {
+        let mut canon = SINK_LAYERS.iter();
+        layers.iter().all(|l| canon.any(|c| c == l))
+    }
+
+    /// The core invariant (#875): the builder wraps the destination in exactly
+    /// the canonical order — metadata below the outer tap and above the inner
+    /// tap, the budget innermost, counting what the destination accepts.
+    #[tokio::test]
+    async fn layers_wrap_the_destination_in_the_canonical_order() {
+        let (meta, ctx) = metadata();
+        let g = Governance::new()
+            .with_budget(BudgetSpec {
+                max_records: Some(10),
+                ..Default::default()
+            })
+            .with_metadata(meta, ctx)
+            .with_profiler(profiler());
+        let seen: Seen = Arc::default();
+        let governed = g
+            .sink_builder()
+            .inner_tap(tap("inner", &seen))
+            .outer_tap(tap("outer", &seen))
+            .build(Box::new(Dest(Arc::clone(&seen))));
+        assert_eq!(
+            governed.layers(),
+            &[
+                SinkLayer::Profiling,
+                SinkLayer::OuterTap,
+                SinkLayer::Metadata,
+                SinkLayer::InnerTap,
+                SinkLayer::Budget,
+            ]
+        );
+        assert!(is_subsequence(governed.layers()));
+        assert!(g.sink_built());
+        governed.write_batch(&[json!({"a": 1})]).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let names: Vec<&str> = seen.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["outer", "inner", "dest"]);
+        assert!(
+            seen[0].1.get("_faucet_run_id").is_none(),
+            "the outer tap sees the source record"
+        );
+        assert_eq!(
+            seen[1].1["_faucet_run_id"], "r",
+            "metadata is stamped above the inner tap"
+        );
+        assert_eq!(governed.budget_state().unwrap().records(), 1);
+        assert!(governed.finish(Ok::<_, FaucetError>(())).is_ok());
+        let _ = governed.into_inner();
+    }
+
+    #[tokio::test]
+    async fn an_empty_governance_builds_the_bare_destination() {
+        let g = Governance::new().with_budget(BudgetSpec::default());
+        assert!(!g.has_sink_layers());
+        assert!(g.budget().is_none());
+        let governed = g.sink_builder().build(Box::new(Dest(Arc::default())));
+        assert!(governed.layers().is_empty());
+        assert!(governed.budget_state().is_none());
+        assert_eq!(governed.write_batch(&[json!({})]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_spent_duration_turns_the_partial_result_into_the_verdict() {
+        let cancel = CancellationToken::new();
+        let g = Governance::new()
+            .with_cancel(cancel.clone())
+            .with_budget(BudgetSpec {
+                max_duration_secs: Some(1),
+                ..Default::default()
+            });
+        let governed = g.sink_builder().build(Box::new(Dest(Arc::default())));
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("the duration ceiling cancels the run");
+        let err = governed.finish(Ok::<_, FaucetError>(())).unwrap_err();
+        assert!(matches!(err, FaucetError::BudgetExceeded { .. }), "{err}");
+    }
+
+    #[test]
+    fn opt_outs_clear_the_pass_and_are_recorded() {
+        let (meta, ctx) = metadata();
+        let g = Governance::new()
+            .with_budget(BudgetSpec {
+                max_records: Some(1),
+                ..Default::default()
+            })
+            .with_metadata(meta, ctx)
+            .with_profiler(profiler())
+            .with_cancel(CancellationToken::new())
+            .with_usage_meter(Arc::new(UsageMeter::new()))
+            .with_resilience(crate::resilience::ResiliencePolicy::default())
+            .with_schema_drift(crate::drift::SchemaDriftPolicy::compile(&serde_json::from_value(json!({})).unwrap()));
+        for p in [
+            Pass::Budget,
+            Pass::Metadata,
+            Pass::Profiling,
+            Pass::Cancel,
+            Pass::Metering,
+            Pass::Resilience,
+            Pass::SchemaDrift,
+        ] {
+            assert!(g.is_active(p), "{p}");
+        }
+        assert!(g.has_sink_layers());
+        let g = g
+            .without(Pass::Budget, "why")
+            .without(Pass::Profiling, "first")
+            .without(Pass::Profiling, "second")
+            .without(Pass::Dlq, "none");
+        assert!(!g.is_active(Pass::Budget));
+        assert!(g.budget_state().is_none());
+        assert!(!g.is_active(Pass::Profiling));
+        assert_eq!(g.opted_out(Pass::Profiling), Some("second"));
+        assert_eq!(g.opted_out(Pass::Budget), Some("why"));
+        assert_eq!(g.opted_out(Pass::Masking), None);
+        assert_eq!(g.opt_outs().len(), 3);
+        assert!(g.active().contains(&Pass::Metadata));
+        assert!(format!("{g:?}").contains("opt_outs"));
+        for p in Pass::ALL {
+            assert_eq!(p.to_string(), p.as_str());
+        }
+        let g = g
+            .without(Pass::Metadata, "m")
+            .without(Pass::Cancel, "c")
+            .without(Pass::Metering, "u")
+            .without(Pass::Resilience, "r")
+            .without(Pass::SchemaDrift, "d");
+        assert!(!g.has_sink_layers());
+        assert!(g.cancel().is_none() && g.usage_meter().is_none() && g.resilience().is_none());
+        assert!(g.schema_drift().is_none() && g.dlq().is_none());
+    }
+
+    struct Rows(Vec<Value>);
+
+    #[async_trait]
+    impl Source for Rows {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A pipeline holding sink-side passes refuses to run a destination that
+    /// did not come from the builder: the passes would silently not apply.
+    #[tokio::test]
+    async fn a_pipeline_refuses_an_unbuilt_destination() {
+        let g = Governance::new().with_budget(BudgetSpec {
+            max_records: Some(5),
+            ..Default::default()
+        });
+        let source = Rows(vec![json!({"a": 1})]);
+        let raw = Dest(Arc::default());
+        let err = crate::Pipeline::new(&source, &raw)
+            .with_governance(g.clone())
+            .run()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Governance::sink_builder"), "{err}");
+        let governed = g.sink_builder().build(Box::new(raw));
+        let r = crate::Pipeline::new(&source, &governed)
+            .with_governance(g)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(r.records_written, 1);
+    }
+
+    #[test]
+    fn compat_features_follow_the_sink_layers() {
+        use crate::compat::Feature as F;
+        let (meta, ctx) = metadata();
+        let g = Governance::new()
+            .with_budget(BudgetSpec {
+                max_bytes: Some(1),
+                ..Default::default()
+            })
+            .with_metadata(meta, ctx)
+            .with_profiler(profiler());
+        let f = g.compat_features();
+        assert!(f.contains(&F::Budget) && f.contains(&F::MetadataColumns));
+        assert!(f.contains(&F::Profiling));
+        assert!(!f.contains(&F::PolicyQuarantine));
+        assert!(!g.policy_quarantines());
+        assert!(!crate::compat::path_allowed(
+            crate::compat::WritePath::Native,
+            &f
+        ));
+        assert!(!crate::compat::path_allowed(
+            crate::compat::WritePath::Columnar,
+            &f
+        ));
+        assert!(crate::compat::path_allowed(crate::compat::WritePath::Row, &f));
+    }
+
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn dlq_only_masking_rewrites_the_envelope_payload() {
+        let spec: crate::masking::MaskingSpec = serde_json::from_value(json!({
+            "rules": [{"match": {"fields": ["email"]}, "action": {"type": "redact"}}]
+        }))
+        .unwrap();
+        let masking = Arc::new(crate::masking::CompiledMasking::compile(&spec).unwrap());
+        let seen: Seen = Arc::default();
+        let dlq = DlqGovernance::new(DlqConfig::new(Arc::new(Dest(Arc::clone(&seen)))))
+            .with_masking(Arc::clone(&masking));
+        let config = Governance::new().with_dlq(dlq).dlq_config().unwrap();
+        let envelope = json!({"payload": {"email": "a@b.co"}, "reason": "partial"});
+        config
+            .sink
+            .write_batch(&[envelope, json!({"reason": "no payload"})])
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0].1["payload"]["email"], "***");
+        assert!(seen[1].1.get("payload").is_none());
+        let elsewhere: crate::masking::MaskingSpec = serde_json::from_value(json!({
+            "rules": [{"match": {"fields": ["x"]}, "action": {"type": "redact"},
+                       "applies_to": ["elsewhere"]}]
+        }))
+        .unwrap();
+        let empty = DlqGovernance::new(DlqConfig::new(Arc::new(Dest(Arc::default()))))
+            .with_masking(Arc::new(
+                crate::masking::CompiledMasking::compile_for_sink(&elsewhere, &["dlq"]).unwrap(),
+            ));
+        assert!(empty.masking.is_none(), "an empty policy is ignored");
+        assert!(Governance::new().dlq_config().is_none());
+    }
+}

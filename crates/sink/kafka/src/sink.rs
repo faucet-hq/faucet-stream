@@ -239,6 +239,15 @@ impl Sink for KafkaSink {
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.write_batch_reported(records).await.map(|r| r.accepted)
+    }
+
+    /// Records dropped by `on_key_error: skip` are reported as skipped, so row
+    /// accounting (#879) does not take them for a silent loss.
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut produced = 0usize;
         let mut skipped = 0usize;
@@ -329,7 +338,7 @@ impl Sink for KafkaSink {
                 "kafka sink: dropped records due to OnKeyError::Skip"
             );
         }
-        Ok(produced)
+        Ok(faucet_core::WriteReport::accepted(produced).with_skipped(skipped))
     }
 
     async fn flush(&self) -> Result<(), FaucetError> {

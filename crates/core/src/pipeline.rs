@@ -2632,18 +2632,29 @@ async fn eo_write_once<Si: Sink + ?Sized>(
 }
 
 /// The row report of an exactly-once page write. The idempotent write returns
-/// a count only, so a sink that merges rows by key (an upsert with a commit
-/// token) is credited with the rows it merged.
+/// a count only and commits the page atomically, so a sink that merges rows by
+/// key is credited with the rows it merged, and any other shortfall (a row the
+/// sink's configuration declines) is counted as skipped with a warning rather
+/// than failing a page whose commit token already covers it.
 fn eo_report<Si: Sink + ?Sized>(
     sink: &Si,
     offered: usize,
     written: usize,
 ) -> crate::accounting::WriteReport {
     if sink.dedups_by_key() {
-        crate::accounting::WriteReport::keyed(offered, written)
-    } else {
-        crate::accounting::WriteReport::accepted(written)
+        return crate::accounting::WriteReport::keyed(offered, written);
     }
+    let short = offered.saturating_sub(written);
+    if short > 0 {
+        tracing::warn!(
+            connector = sink.connector_name(),
+            offered,
+            written,
+            "exactly-once write reported fewer rows than it was offered; the idempotent \
+             write returns a count only, so the difference is counted as skipped"
+        );
+    }
+    crate::accounting::WriteReport::accepted(written).with_skipped(short)
 }
 
 /// Emit the adaptive controller's current state + any adjustment as metrics.
