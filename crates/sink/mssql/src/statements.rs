@@ -614,11 +614,12 @@ mod tests {
         let token = faucet_core::CancellationToken::new();
         token.cancel();
         let cancelled = faucet_core::CallContext::new().with_cancel(token);
+        let same = |e: FaucetError| e;
         let gone = with_call(
             &cancelled,
             "insert",
             async { Ok::<_, FaucetError>(2) },
-            |e| e,
+            same,
         )
         .await;
         assert!(gone.1 && matches!(gone.0, Err(FaucetError::Cancelled { .. })));

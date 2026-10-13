@@ -428,3 +428,63 @@ async fn the_call_deadline_bounds_a_hung_statement() {
     );
     assert!(sink.write_batch(&page()).await.is_err());
 }
+
+#[tokio::test]
+async fn a_long_scope_moves_its_legacy_token_row() {
+    let server = TdsServer::start().await.unwrap();
+    script_table(&server);
+    let sink = MssqlSink::new(auto(&server, WriteMode::Append, &[]))
+        .await
+        .unwrap();
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "mssql",
+        ),
+    ));
+    let scope = "s".repeat(600);
+    assert_eq!(
+        sink.write_batch_idempotent(&page(), &scope, "0001")
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(server.saw("DELETE FROM [_faucet_commit_token]"));
+
+    server.on_times(
+        "DELETE FROM [_faucet_commit_token]",
+        Reply::error("delete refused"),
+        1,
+    );
+    let err = sink
+        .write_batch_idempotent(&page(), &scope, "0002")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("MSSQL legacy token delete failed"), "{err}");
+}
+
+#[tokio::test]
+async fn hung_idempotent_statements_time_out() {
+    let server = TdsServer::start().await.unwrap();
+    script_table(&server);
+    let mut c = auto(&server, WriteMode::Append, &[]);
+    c.statement_timeout_secs = 1;
+    let sink = MssqlSink::new(c).await.unwrap();
+    server.on_times("INSERT INTO", Reply::Hang, 1);
+    let err = sink
+        .write_batch_idempotent(&page(), "p::r", "0001")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("MSSQL insert"), "{err}");
+
+    let mut c = auto(&server, WriteMode::Upsert, &["id"]);
+    c.statement_timeout_secs = 1;
+    let sink = MssqlSink::new(c).await.unwrap();
+    server.on_times("MERGE", Reply::Hang, 1);
+    let err = sink.write_batch(&page()).await.unwrap_err().to_string();
+    assert!(err.contains("MSSQL merge"), "{err}");
+}
