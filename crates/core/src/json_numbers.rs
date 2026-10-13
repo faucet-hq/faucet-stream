@@ -79,6 +79,9 @@ fn normalize(text: &str) -> Option<(bool, String, i64)> {
 /// without its `float_roundtrip` feature serde_json rounds some 16–17 digit
 /// numbers one ULP away from the correctly rounded float (#862 M-008).
 pub fn is_exact(text: &str) -> bool {
+    if short_plain_decimal(text) {
+        return true;
+    }
     if text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok() {
         return true;
     }
@@ -87,6 +90,17 @@ pub fn is_exact(text: &str) -> bool {
     };
     let exact = normalize(text);
     exact.is_some() && exact == normalize(&n.to_string())
+}
+
+/// `-?d+(.d+)?` with at most 15 digits: every such decimal round-trips through
+/// an `f64`, so the common case skips the parse.
+fn short_plain_decimal(text: &str) -> bool {
+    let body = text.strip_prefix('-').unwrap_or(text);
+    let (int, frac) = body.split_once('.').unwrap_or((body, "1"));
+    !int.is_empty()
+        && !frac.is_empty()
+        && int.len() + frac.len() <= 15
+        && int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
 }
 
 /// Byte ranges of the number tokens in JSON `text` (outside strings).
@@ -260,6 +274,11 @@ mod tests {
         ] {
             assert!(!is_exact(inexact), "{inexact}");
         }
+        assert!(short_plain_decimal("-123456789.12345"));
+        assert!(!short_plain_decimal("1234567890.123456"));
+        assert!(!short_plain_decimal("1."));
+        assert!(!short_plain_decimal("-"));
+        assert!(!short_plain_decimal("1e5"));
         assert_eq!(normalize("1.2e"), None);
         assert_eq!(normalize("."), None);
         assert_eq!(normalize("0.000"), Some((false, String::new(), 0)));

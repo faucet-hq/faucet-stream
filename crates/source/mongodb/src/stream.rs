@@ -476,6 +476,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The value-fidelity corpus (#885): each record stored as a BSON document
+    /// reads back, as relaxed extended JSON, unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let landed: Vec<serde_json::Value> = sent
+            .iter()
+            .map(
+                |r| match mongodb::bson::Bson::try_from(r.clone()).unwrap() {
+                    mongodb::bson::Bson::Document(d) => bson_document_to_json_value(&d).unwrap(),
+                    other => panic!("not a document: {other:?}"),
+                },
+            )
+            .collect();
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     #[test]
     fn json_object_to_document() {
         let val = json!({"name": "Alice", "age": 30});

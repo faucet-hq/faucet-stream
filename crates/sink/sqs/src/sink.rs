@@ -750,6 +750,22 @@ mod tests {
         SqsSink::new(config).await.expect("sink builds")
     }
 
+    /// The value-fidelity corpus (#885): every message body this sink encodes
+    /// reads back unchanged.
+    #[tokio::test]
+    async fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sink = offline_sink(SqsSinkConfig::new("https://q")).await;
+        let sent = fidelity::corpus();
+        let (encoded, failures) = sink.encode_records(&sent);
+        assert!(failures.is_empty());
+        let landed: Vec<Value> = encoded
+            .iter()
+            .map(|e| faucet_core::fidelity::from_str(&e.body).unwrap())
+            .collect();
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     #[tokio::test]
     async fn encode_records_partitions_failures_by_index() {
         let mut cfg = SqsSinkConfig::new("https://q");

@@ -13,7 +13,7 @@
 mod remote_matrix;
 
 use faucet_common_sftp::{SftpConnectionConfig, SftpSession, connect};
-use faucet_core::{FaucetError, Sink};
+use faucet_core::{FaucetError, Sink, Source};
 use remote_matrix::{BoxFut, Remote, run_matrix_with};
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -80,6 +80,14 @@ impl Remote for SftpRemote {
         })
     }
 
+    fn source(&self, prefix: &str) -> BoxFut<'_, Result<Box<dyn Source>, FaucetError>> {
+        let cfg = self.config(prefix, json!({}));
+        Box::pin(async move {
+            let cfg = serde_json::from_value(cfg).map_err(FaucetError::Json)?;
+            Ok(Box::new(faucet_source_sftp::SftpSource::new(cfg)?) as Box<dyn Source>)
+        })
+    }
+
     fn objects(&self, prefix: &str) -> BoxFut<'_, Vec<(String, Vec<u8>)>> {
         let dir = format!("/data/{}", prefix.trim_end_matches('/'));
         Box::pin(async move {
@@ -109,13 +117,10 @@ async fn every_writable_format_takes_every_option_on_sftp() {
     };
     let port = container.get_host_port_ipv4(22).await.expect("port");
     let full = std::env::var("FAUCET_MATRIX_FULL").is_ok();
-    run_matrix_with(
-        SftpRemote {
-            port,
-            _c: container,
-        },
-        full,
-        3,
-    )
-    .await;
+    let remote = SftpRemote {
+        port,
+        _c: container,
+    };
+    remote_matrix::assert_corpus_written(&remote).await;
+    run_matrix_with(remote, full, 3).await;
 }

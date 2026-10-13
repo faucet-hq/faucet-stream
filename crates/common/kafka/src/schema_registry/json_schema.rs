@@ -13,7 +13,7 @@ pub async fn decode(
     validate: bool,
 ) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
-    let json: Value = serde_json::from_slice(body)
+    let json: Value = faucet_core::fidelity::from_slice(body)
         .map_err(|e| FaucetError::Source(format!("json-schema decode: {e}")))?;
     if validate {
         let registered = client.get_schema(schema_id).await?;

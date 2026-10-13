@@ -603,6 +603,42 @@ the ordering rules above:
 - Don't log or meter per record. The pipeline already records metrics and spans
   for every call; never use record ids, URLs or cursors as labels.
 
+## Values: the fidelity model
+
+Render every typed value through `faucet_core::fidelity`, not by hand, so a
+value reads the same whichever connector produced it
+([value fidelity](../reference/value-fidelity.md)):
+
+- an exact decimal is a string at its declared scale (`decimal_text`,
+  `decimal_from_i128`) — never `to_f64()` or `parse::<f64>()`;
+- an integer a `Value` cannot hold is a string (`integer_i128`,
+  `integer_text`);
+- a float goes through `float64` / `float32`, which turn `NaN` / `±Infinity`
+  into a `null` the run counts;
+- bytes are base64 (`binary`), instants RFC 3339 with an offset (`timestamp`);
+- a JSON body or payload parses with `fidelity::from_slice`, a JSON column
+  with `fidelity::parse_json`;
+- a sink binds a non-integer number into a SQL column as its shortest text
+  (`non_integer_text`), so the server parses the decimal exactly.
+
+Then run the shared corpus. A source/sink pair does it in
+`crates/interop-tests/tests/`; a connector alone can do it against its
+backend in its own `tests/`, or through its value converter in a `#[cfg(test)]`
+module:
+
+```rust,ignore
+use faucet_conformance::fidelity::{self, Tolerance};
+
+// A sink: write the corpus, read the destination back.
+fidelity::assert_corpus_written(&sink, &fidelity::corpus(), || read_back(), Tolerance::exact()).await;
+// A source over a backend seeded with the corpus.
+fidelity::assert_corpus_read(&source, &fidelity::corpus(), Tolerance::exact()).await;
+```
+
+`scripts/fidelity-coverage.py` fails CI for a built-in connector that runs
+none of these, and `scripts/decimal-f64.py` for a decimal converted through a
+float.
+
 ## Config and schema
 
 Implement `config_schema()` so `faucet schema` and `faucet init` work:

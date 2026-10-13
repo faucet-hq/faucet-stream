@@ -1,0 +1,6 @@
+# Connectors that cannot run the value-fidelity corpus (#885), checked by
+# scripts/fidelity-coverage.py. One `<crate>: <reason>` per line. An entry for a
+# crate that runs the corpus, or that does not exist, fails the check.
+#
+# Every built-in connector runs it today; keep this list empty unless a
+# connector genuinely has no way to (and say why).

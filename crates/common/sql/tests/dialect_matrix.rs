@@ -771,6 +771,11 @@ fn backend_specific_text() {
     assert!(faucet_common_sql::dialects::oracle::quote_ident(&"é".repeat(70)).is_err());
 
     assert_eq!(ClickHouse.placeholder(2, Some("Int64")), "{p2:Int64}");
+    assert_eq!(
+        Redshift.placeholder(3, Some("numeric(38,9)")),
+        "$3::numeric(38,9)"
+    );
+    assert_eq!(Redshift.placeholder(3, None), "$3");
     assert_eq!(ClickHouse.placeholder(1, None), "{p1:String}");
     assert_eq!(BigQuery.placeholder(1, None), "@p1");
     assert_eq!(Databricks.placeholder(1, None), ":p1");

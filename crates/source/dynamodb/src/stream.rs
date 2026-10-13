@@ -815,6 +815,25 @@ fn stream_record_table(mode: crate::config::ReadMode, record: &Value) -> Option<
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
+    /// The value-fidelity corpus (#885) through the attribute-value
+    /// conversion this source reads items through. DynamoDB numbers have no negative zero.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let landed: Vec<serde_json::Value> = sent
+            .iter()
+            .map(|r| {
+                let item = faucet_common_dynamodb::json_to_item(r).unwrap();
+                faucet_common_dynamodb::item_to_json(&item).unwrap()
+            })
+            .collect();
+        fidelity::assert_round_trip(
+            &sent,
+            &landed,
+            fidelity::Tolerance::exact().skipping("negative_zero"),
+        );
+    }
 
     #[test]
     fn routes_only_stream_envelopes() {

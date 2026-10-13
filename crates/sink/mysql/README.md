@@ -506,3 +506,10 @@ unwrapped base64 (any length), `BIT` as its integer and `DECIMAL` as exact text,
 columns out, so a restore writes back exactly what was there. Rolling back an
 overwrite of a table with foreign keys or triggers puts the previous rows back
 in place rather than renaming.
+
+## Value fidelity
+
+A non-integer JSON number is bound as its shortest decimal text (`0.1`), which
+MySQL parses exactly into a `DECIMAL` (or a `DOUBLE`); a bound double would be
+converted from binary. Exact decimals from a source arrive as strings and are
+bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).

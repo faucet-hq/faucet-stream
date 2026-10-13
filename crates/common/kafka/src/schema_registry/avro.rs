@@ -46,7 +46,7 @@ pub async fn encode(
     schema_text: &str,
     value: &Value,
 ) -> Result<Vec<u8>, FaucetError> {
-    encode_with(client, subject, schema_text, value, BytesText::Hex).await
+    encode_with(client, subject, schema_text, value, BytesText::default()).await
 }
 
 /// [`encode`] with an explicit reading of JSON strings for `bytes` / `fixed`
@@ -70,7 +70,7 @@ pub async fn encode_with(
 
 /// Convert an `AvroValue` to JSON against its writer schema, with the same
 /// logical-type mapping as the Avro file format (#789 MSG-27): `decimal` as an
-/// exact decimal string, `bytes`/`fixed` as hex, `date`/`time`/`timestamp` as
+/// exact decimal string, `bytes`/`fixed` as base64, `date`/`time`/`timestamp` as
 /// ISO 8601 strings. apache-avro's generic conversion turned these into int
 /// arrays and day numbers.
 fn avro_to_json(v: &AvroValue, codec: &AvroDatumCodec) -> Result<Value, FaucetError> {
@@ -132,7 +132,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
-        let record = serde_json::json!({"amount": "12.34", "raw": "00ff", "tag": "abcd", "day": "2026-10-07"});
+        let record = serde_json::json!({"amount": "12.34", "raw": "AP8=", "tag": "q80=", "day": "2026-10-07"});
         for _ in 0..2 {
             let bytes = encode(&client, "pay-value", schema_text, &record)
                 .await
@@ -172,21 +172,27 @@ mod tests {
             .unwrap();
         assert_eq!(
             decode(&client, &utf8).await.unwrap(),
-            serde_json::json!({"raw": "63616665"})
+            serde_json::json!({"raw": "Y2FmZQ=="})
         );
-        let hex = encode(&client, "r-value", schema_text, &record)
+        let hex = encode_with(&client, "r-value", schema_text, &record, BytesText::Hex)
             .await
             .unwrap();
-        assert_eq!(decode(&client, &hex).await.unwrap(), record);
+        assert_eq!(
+            decode(&client, &hex).await.unwrap(),
+            serde_json::json!({"raw": "yv4="})
+        );
+        let b64 = serde_json::json!({"raw": "yv4="});
+        let bytes = encode(&client, "r-value", schema_text, &b64).await.unwrap();
+        assert_eq!(decode(&client, &bytes).await.unwrap(), b64);
         let err = encode(
             &client,
             "r-value",
             schema_text,
-            &serde_json::json!({"raw": "hello"}),
+            &serde_json::json!({"raw": "hello!"}),
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("not hex"), "{err}");
+        assert!(err.to_string().contains("not base64"), "{err}");
     }
 
     #[tokio::test]

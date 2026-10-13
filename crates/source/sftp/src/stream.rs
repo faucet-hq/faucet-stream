@@ -500,7 +500,7 @@ impl faucet_core::Source for SftpSource {
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+                            let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
                                 FaucetError::Source(format!(
                                     "SFTP JSON parse error in '{file}' at line {line_num}: {e}"
                                 ))
@@ -537,7 +537,7 @@ impl faucet_core::Source for SftpSource {
                         }
                     }
                     Fetched::JsonArray(text) => {
-                        let value: Value = serde_json::from_str(&text).map_err(|e| {
+                        let value: Value = faucet_core::fidelity::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("SFTP JSON parse error in '{file}': {e}"))
                         })?;
                         let array = match value {

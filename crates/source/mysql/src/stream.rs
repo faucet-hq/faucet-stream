@@ -370,14 +370,17 @@ fn mysql_scalar_to_json(
     if let Ok(v) = row.try_get::<u8, _>(col_name) {
         return Value::Number(v.into());
     }
-    // `f32` first: sqlx's `f64` also accepts FLOAT, widening it.
-    if let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return float_json(v);
+    // A FLOAT through `f32` (sqlx's `f64` also accepts FLOAT, widening it);
+    // only a FLOAT — sqlx's `f32` also accepts DOUBLE, narrowing `1e300`
+    // to infinity (#885).
+    let is_float = row
+        .try_column(col_name)
+        .is_ok_and(|c| sqlx::TypeInfo::name(c.type_info()).eq_ignore_ascii_case("FLOAT"));
+    if is_float && let Ok(v) = row.try_get::<f32, _>(col_name) {
+        return faucet_core::fidelity::float32(v);
     }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
-        return serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null);
+        return faucet_core::fidelity::float64(v);
     }
     if let Ok(v) = row.try_get::<bool, _>(col_name) {
         return Value::Bool(v);
@@ -410,17 +413,6 @@ fn mysql_scalar_to_json(
     }
 
     Value::Null
-}
-
-/// A `FLOAT` through its shortest decimal form: `0.1` stays `0.1` instead of
-/// widening to `0.10000000149011612`.
-fn float_json(v: f32) -> Value {
-    v.to_string()
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
 }
 
 /// A `TIME` as `[-]HH:MM:SS[.fff|.ffffff]`, keeping its sign and hours of 24
@@ -1163,8 +1155,6 @@ mod tests {
         assert_eq!(time_text(&t), "837:59:59.500");
         let t = MySqlTime::new(MySqlTimeSign::Positive, 30, 0, 0, 123_456).unwrap();
         assert_eq!(time_text(&t), "30:00:00.123456");
-        assert_eq!(float_json(0.1), serde_json::json!(0.1));
-        assert_eq!(float_json(f32::NAN), Value::Null);
         assert_eq!(
             session_setup_sql(120).as_deref(),
             Some("SET SESSION net_write_timeout = 120")

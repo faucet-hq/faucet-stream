@@ -222,7 +222,7 @@ pub fn parse_json_each_row(body: &str) -> Result<Vec<Value>, FaucetError> {
         if trimmed.is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+        let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
             FaucetError::Source(format!(
                 "ClickHouse: failed to parse JSONEachRow line {}: {e}",
                 idx + 1

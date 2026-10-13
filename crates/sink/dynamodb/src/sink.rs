@@ -475,6 +475,26 @@ mod tests {
     use faucet_core::Sink as _;
     use serde_json::json;
 
+    /// The value-fidelity corpus (#885) through the attribute-value
+    /// conversion this sink writes items through. DynamoDB numbers have no negative zero.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let landed: Vec<serde_json::Value> = sent
+            .iter()
+            .map(|r| {
+                let item = faucet_common_dynamodb::json_to_item(r).unwrap();
+                faucet_common_dynamodb::item_to_json(&item).unwrap()
+            })
+            .collect();
+        fidelity::assert_round_trip(
+            &sent,
+            &landed,
+            fidelity::Tolerance::exact().skipping("negative_zero"),
+        );
+    }
+
     fn op(canon: &str, rows: Vec<usize>) -> Op {
         Op {
             rows,

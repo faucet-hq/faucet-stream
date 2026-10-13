@@ -225,16 +225,17 @@ Columns are converted to JSON values by probing the row's value with each candid
 | `int8` / `bigint` | number (i64) |
 | `int4` / `integer` | number (i32) |
 | `int2` / `smallint` | number (i16) |
-| `float8` / `double precision` | number (f64); `NaN` / `Infinity` / `-Infinity` as those strings |
-| `float4` / `real` | number, through the value's shortest decimal form (`0.1`, not `0.10000000149011612`); non-finite values as strings |
+| `float8` / `double precision` | number (f64); `NaN` / `Infinity` / `-Infinity` as a `null` counted in the run summary (`non_finite`) |
+| `float4` / `real` | number, through the value's shortest decimal form (`0.1`, not `0.10000000149011612`); non-finite values as a counted `null` |
 | `bool` / `boolean` | boolean |
 | `timestamptz` | string (RFC 3339) |
 | `timestamp`, `date` | string (ISO-8601); `infinity` / `-infinity` as those strings (also for `timestamptz`) |
 | `time` | string, the server's own text (`24:00:00` stays `24:00:00`) |
 | `uuid` | string (canonical hyphenated) |
-| `numeric`, `decimal` | string, exact (`NaN` / `Infinity` too) |
+| `numeric`, `decimal` | string, exact at the declared scale (`1.50`); `NaN` / `Infinity` a counted `null` |
+| `money` | string, the exact amount (`"1234.50"`, read through `money::numeric`, not the locale's `$1,234.50`) |
 | `bytea` | string (base64) |
-| any other type — arrays, enums, `interval`, `inet`/`cidr`, `money`, ranges, `timetz`, `xml`, `hstore`, … | string, the type's own text output (the same text postgres-cdc emits) |
+| any other type — arrays, enums, `interval`, `inet`/`cidr`, ranges, `timetz`, `xml`, `hstore`, … | string, the type's own text output (the same text postgres-cdc emits) |
 | `NULL` | `null` |
 
 Types without an exact native decode are read through their text output: the

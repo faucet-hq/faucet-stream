@@ -26,6 +26,9 @@ pub struct PostgresSource {
     applied_shard: Mutex<Option<PkShardBounds>>,
     /// Columns already warned about under `json_big_numbers: string`.
     json_warned: Mutex<std::collections::HashSet<String>>,
+    /// `NUMERIC` / `MONEY` columns of the query being read, which arrive as
+    /// text and render as exact decimals (#885).
+    decimal_columns: Mutex<std::collections::HashSet<String>>,
     /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
     start_bookmark: Mutex<Option<Value>>,
     /// Backend-call context (#880): the run's deadline, cancel token and
@@ -56,6 +59,7 @@ impl PostgresSource {
             pool,
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
+            decimal_columns: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
             calls: CallSlot::new(CallContext::new().without_timeout()),
         })
@@ -191,6 +195,11 @@ impl PostgresSource {
                     .iter()
                     .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
                     .collect();
+                *self.decimal_columns.lock().expect("decimal columns") = columns
+                    .iter()
+                    .filter(|(_, t)| is_decimal_type(t))
+                    .map(|(n, _)| n.clone())
+                    .collect();
                 text_cast_query(&query, &columns).unwrap_or(query)
             }
             _ => query,
@@ -201,6 +210,11 @@ impl PostgresSource {
         JsonContext {
             mode: self.config.json_big_numbers,
             warned: &self.json_warned,
+            decimal: self
+                .decimal_columns
+                .lock()
+                .expect("decimal columns")
+                .clone(),
         }
     }
 
@@ -274,7 +288,13 @@ fn text_cast_query(query: &str, columns: &[(String, String)]) -> Option<String> 
             // `format('%s', …)` renders through the type's output function —
             // the same text postgres-cdc emits (`::text` adds a netmask to
             // `inet`, for one) — and the guard keeps NULL a NULL.
-            if needs_cast(t) {
+            if t.eq_ignore_ascii_case("MONEY") {
+                // `money` prints in the server's locale (`$1,234.50`); its
+                // `numeric` cast is the exact amount (#885).
+                format!(
+                    "CASE WHEN q.{q} IS NULL THEN NULL ELSE format('%s', q.{q}::numeric) END AS {q}"
+                )
+            } else if needs_cast(t) {
                 format!("CASE WHEN q.{q} IS NULL THEN NULL ELSE format('%s', q.{q}) END AS {q}")
             } else {
                 format!("q.{q}")
@@ -408,33 +428,9 @@ fn is_data_modifying_with(query: &str) -> bool {
     })
 }
 
-/// A float as JSON: a number when finite, else Postgres's own spelling.
-fn float_json(v: f64) -> Value {
-    serde_json::Number::from_f64(v)
-        .map(Value::Number)
-        .unwrap_or_else(|| {
-            Value::String(
-                if v.is_nan() {
-                    "NaN"
-                } else if v > 0.0 {
-                    "Infinity"
-                } else {
-                    "-Infinity"
-                }
-                .to_string(),
-            )
-        })
-}
-
-/// A `real` as JSON through its shortest decimal form: `0.1::real` is `0.1`,
-/// not the widened `0.10000000149011612`.
-fn float4_json(v: f32) -> Value {
-    if !v.is_finite() {
-        return float_json(f64::from(v));
-    }
-    v.to_string()
-        .parse::<f64>()
-        .map_or_else(|_| float_json(f64::from(v)), float_json)
+/// Whether a column of type `t` holds an exact decimal.
+fn is_decimal_type(t: &str) -> bool {
+    t.eq_ignore_ascii_case("NUMERIC") || t.eq_ignore_ascii_case("MONEY")
 }
 
 /// `"infinity"` / `"-infinity"` for Postgres's date / timestamp sentinels
@@ -545,6 +541,10 @@ fn pg_value_to_json(
 
     // Try common scalar types
     if let Ok(v) = row.try_get::<String, _>(col_name) {
+        if json.decimal.contains(col_name) {
+            return faucet_core::fidelity::decimal_text(&v)
+                .map_err(|e| FaucetError::Source(format!("PostgreSQL column {col_name}: {e}")));
+        }
         return Ok(Value::String(v));
     }
     if let Ok(v) = row.try_get::<i64, _>(col_name) {
@@ -557,10 +557,10 @@ fn pg_value_to_json(
         return Ok(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
-        return Ok(float_json(v));
+        return Ok(faucet_core::fidelity::float64(v));
     }
     if let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return Ok(float4_json(v));
+        return Ok(faucet_core::fidelity::float32(v));
     }
     if let Ok(v) = row.try_get::<bool, _>(col_name) {
         return Ok(Value::Bool(v));
@@ -594,7 +594,18 @@ fn pg_value_to_json(
     if let Ok(v) = row.try_get::<sqlx::types::Uuid, _>(col_name) {
         return Ok(Value::String(v.to_string()));
     }
-    // NUMERIC / DECIMAL → string, preserving exact precision.
+    // NUMERIC / DECIMAL (read natively when the text cast could not wrap the
+    // query) → its exact digits at the declared scale.
+    if let Ok(raw) = row.try_get_raw(col_name)
+        && raw.type_info().name().eq_ignore_ascii_case("NUMERIC")
+        && raw.format() == sqlx::postgres::PgValueFormat::Binary
+        && let Some(v) = raw
+            .as_bytes()
+            .ok()
+            .and_then(faucet_core::fidelity::decimal_from_pg_numeric)
+    {
+        return Ok(v);
+    }
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
         return Ok(Value::String(v.to_plain_string()));
     }
@@ -888,6 +899,7 @@ fn descriptors_from_catalog(
 struct JsonContext<'a> {
     mode: faucet_core::JsonBigNumbers,
     warned: &'a Mutex<std::collections::HashSet<String>>,
+    decimal: std::collections::HashSet<String>,
 }
 
 fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Value, FaucetError> {
@@ -1289,8 +1301,11 @@ mod tests {
 
     #[test]
     fn real_values_use_their_shortest_form() {
-        assert_eq!(float4_json(0.1), serde_json::json!(0.1));
-        assert_eq!(float4_json(f32::INFINITY), serde_json::json!("Infinity"));
+        assert_eq!(faucet_core::fidelity::float32(0.1), serde_json::json!(0.1));
+        assert_eq!(
+            faucet_core::fidelity::float32(f32::INFINITY),
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]
@@ -1432,13 +1447,21 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_floats_keep_their_postgres_spelling() {
-        assert_eq!(float_json(1.5), serde_json::json!(1.5));
-        assert_eq!(float_json(f64::NAN), serde_json::json!("NaN"));
-        assert_eq!(float_json(f64::INFINITY), serde_json::json!("Infinity"));
+    fn decimal_types_are_numeric_and_money() {
+        let cols = |c: &[(&str, &str)]| -> Vec<(String, String)> {
+            c.iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect()
+        };
+        assert!(is_decimal_type("NUMERIC"));
+        assert!(is_decimal_type("money"));
+        assert!(!is_decimal_type("FLOAT8"));
         assert_eq!(
-            float_json(f64::NEG_INFINITY),
-            serde_json::json!("-Infinity")
+            text_cast_query("SELECT m FROM t", &cols(&[("m", "MONEY")])).as_deref(),
+            Some(
+                "SELECT CASE WHEN q.\"m\" IS NULL THEN NULL ELSE format('%s', q.\"m\"::numeric) \
+                 END AS \"m\" FROM (SELECT m FROM t\n) AS q"
+            )
         );
     }
     use faucet_core::shard::plan_pk_shards;
@@ -1882,6 +1905,7 @@ mod tests {
             pool,
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
+            decimal_columns: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
             calls: CallSlot::new(CallContext::new().without_timeout()),
         }

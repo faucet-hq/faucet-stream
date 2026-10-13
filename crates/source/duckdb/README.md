@@ -54,7 +54,7 @@ the text casts below are skipped — cast such columns to `VARCHAR` yourself.
 | `HUGEINT` | number when it fits `i64`, else its exact decimal string |
 | `UHUGEINT`, `BIGNUM` | exact decimal string |
 | `DECIMAL` | exact decimal string (a bare literal such as `2.5` is a `DECIMAL`, so it arrives as `"2.5"`; `CAST` to `DOUBLE` for a JSON number) |
-| `DOUBLE` / `REAL` | number (`REAL` through its shortest decimal form, so `0.1` stays `0.1`); NaN / ±Inf as `"NaN"` / `"Infinity"` / `"-Infinity"` |
+| `DOUBLE` / `REAL` | number (`REAL` through its shortest decimal form, so `0.1` stays `0.1`); NaN / ±Inf as a `null` counted in the run summary (`non_finite`) |
 | `BOOLEAN` | bool |
 | `VARCHAR`, `UUID`, `ENUM` | string |
 | `BLOB` | base64 string |

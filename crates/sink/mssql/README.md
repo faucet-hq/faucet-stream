@@ -442,3 +442,11 @@ exist.
 
 
 **Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+
+## Value fidelity
+
+A non-integer JSON number is bound as its shortest decimal text (`0.1`), which
+SQL Server parses exactly into a `DECIMAL` / `NUMERIC` / `MONEY` (or a float
+column); a bound `float` would be converted from binary and land as
+`0.10000000000000001`. Exact decimals from a source arrive as strings and are
+bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).

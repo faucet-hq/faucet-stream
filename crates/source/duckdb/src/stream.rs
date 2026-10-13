@@ -855,8 +855,8 @@ mod tests {
         assert_eq!(row["ub"], json!(18446744073709551615u64));
         assert_eq!(row["uu"], json!("11111111-1111-1111-1111-111111111111"));
         assert_eq!(row["r"], json!(0.1));
-        assert_eq!(row["nd"], json!("NaN"));
-        assert_eq!(row["nr"], json!("-Infinity"));
+        assert_eq!(row["nd"], Value::Null);
+        assert_eq!(row["nr"], Value::Null);
         assert_eq!(row["z"], Value::Null);
     }
 

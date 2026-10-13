@@ -8,8 +8,8 @@
 //!   a number when it fits `i64`, else its exact decimal text; other decimals
 //!   are exact strings;
 //! - `REAL` goes through its shortest decimal form (`0.1`, not
-//!   `0.10000000149011612`); NaN / ±Inf are `"NaN"` / `"Infinity"` /
-//!   `"-Infinity"`, as in every other Arrow-backed path;
+//!   `0.10000000149011612`); NaN / ±Inf are a counted `null`, as in every
+//!   other Arrow-backed path (`faucet_core::fidelity`);
 //! - temporal values are ISO-8601 at their own precision (`TIMESTAMPTZ` with a
 //!   `Z`), `±infinity` sentinels as `"infinity"` / `"-infinity"`;
 //! - `LIST` / `ARRAY` are arrays, `STRUCT` and string-keyed `MAP` objects, other
@@ -58,32 +58,12 @@ pub(crate) fn batch_to_values(
     Ok(rows)
 }
 
-fn non_finite(v: f64) -> Value {
-    Value::String(
-        if v.is_nan() {
-            "NaN"
-        } else if v > 0.0 {
-            "Infinity"
-        } else {
-            "-Infinity"
-        }
-        .into(),
-    )
-}
-
 fn f64_value(v: f64) -> Value {
-    serde_json::Number::from_f64(v).map_or_else(|| non_finite(v), Value::Number)
+    faucet_core::fidelity::float64(v)
 }
 
 fn f32_value(v: f32) -> Value {
-    if !v.is_finite() {
-        return non_finite(f64::from(v));
-    }
-    v.to_string()
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-        .map_or(Value::Null, Value::Number)
+    faucet_core::fidelity::float32(v)
 }
 
 fn infinity(v: i64) -> Value {
@@ -127,9 +107,7 @@ pub(crate) fn array_to_values(array: &ArrayRef, duck_type: &str) -> Result<Vec<V
         DataType::Float32 => prim::<Float32Type, _>(array, f32_value),
         DataType::Float64 => prim::<Float64Type, _>(array, f64_value),
         DataType::Decimal128(_, 0) if duck_type.eq_ignore_ascii_case("HUGEINT") => {
-            prim::<Decimal128Type, _>(array, |v| {
-                i64::try_from(v).map_or_else(|_| Value::String(v.to_string()), Value::from)
-            })
+            prim::<Decimal128Type, _>(array, faucet_core::fidelity::integer_i128)
         }
         DataType::Decimal128(..) => {
             let a = array.as_primitive::<Decimal128Type>();
@@ -460,9 +438,9 @@ mod tests {
 
     #[test]
     fn floats_and_out_of_range_dates() {
-        assert_eq!(f32_value(f32::INFINITY), json!("Infinity"));
-        assert_eq!(f64_value(f64::NEG_INFINITY), json!("-Infinity"));
-        assert_eq!(f64_value(f64::NAN), json!("NaN"));
+        assert_eq!(f32_value(f32::INFINITY), Value::Null);
+        assert_eq!(f64_value(f64::NEG_INFINITY), Value::Null);
+        assert_eq!(f64_value(f64::NAN), Value::Null);
         assert_eq!(f32_value(0.1), json!(0.1));
         assert_eq!(
             conv(Arc::new(Date64Array::from(vec![i64::MAX]))),

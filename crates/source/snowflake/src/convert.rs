@@ -239,88 +239,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// cell whose text is a fractional decimal is preserved as a string regardless
 /// of the reported scale.
 fn parse_number(s: &str, scale: i64) -> Value {
-    let trimmed = s.trim();
-
-    if scale > 0 || is_fractional_decimal(trimmed) {
-        // Fractional fixed value — preserve the exact decimal text losslessly
-        // as a string when it is a well-formed finite decimal. A non-decimal /
-        // non-finite token (shouldn't occur for `fixed`) falls back to numeric
-        // parsing for round-trip safety.
-        if is_finite_decimal(trimmed) {
-            return Value::String(s.to_owned());
-        }
-        return parse_real(s);
-    }
-
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::Number(i.into());
-    }
-    if let Ok(u) = s.parse::<u64>() {
-        return Value::Number(u.into());
-    }
-    // Past u64: only an integer literal stays a (lossless) string; a decimal or
-    // scientific value is genuinely floating-point, so let `parse_real` handle it.
-    let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
-    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Value::String(s.to_owned());
-    }
-    parse_real(s)
-}
-
-/// True when `s` is a finite decimal literal containing a fractional component
-/// (a `.` with digits, or a scientific exponent) — i.e. not a plain integer.
-fn is_fractional_decimal(s: &str) -> bool {
-    is_finite_decimal(s) && (s.contains('.') || s.contains(['e', 'E']))
-}
-
-/// True when `s` is a well-formed finite decimal literal: an optional sign,
-/// decimal digits with at most one decimal point, and an optional scientific
-/// exponent. Rejects `NaN`/`Infinity` and any non-numeric token, so they fall
-/// through to `parse_real`'s round-trip-safe handling.
-fn is_finite_decimal(s: &str) -> bool {
-    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if body.is_empty() {
-        return false;
-    }
-
-    // Split off an optional scientific exponent (`e`/`E` + signed integer).
-    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
-        Some((m, e)) => (m, Some(e)),
-        None => (body, None),
+    let t = s.trim();
+    let exact = if scale > 0 || t.contains(['.', 'e', 'E']) {
+        faucet_core::fidelity::decimal_text(t)
+    } else {
+        faucet_core::fidelity::integer_text(t)
     };
-
-    // Mantissa: digits with at most one decimal point, and at least one digit.
-    let mut seen_dot = false;
-    let mut seen_digit = false;
-    for b in mantissa.bytes() {
-        match b {
-            b'0'..=b'9' => seen_digit = true,
-            b'.' if !seen_dot => seen_dot = true,
-            _ => return false,
-        }
-    }
-    if !seen_digit {
-        return false;
-    }
-
-    // Exponent (if present): optional sign + at least one digit.
-    if let Some(exp) = exponent {
-        let exp_digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
-        if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
-            return false;
-        }
-    }
-
-    true
+    exact.unwrap_or_else(|_| Value::String(s.to_owned()))
 }
 
-/// Parse a floating-point column. Non-finite values (`Infinity`, `NaN`) are
-/// not representable in JSON and fall back to a string for round-trip safety.
+/// Parse a floating-point column. Non-finite values (`Infinity`, `NaN`) have
+/// no JSON number and become a counted `null` (#885).
 fn parse_real(s: &str) -> Value {
     match s.parse::<f64>() {
-        Ok(f) => serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.to_owned())),
+        Ok(f) => faucet_core::fidelity::float64(f),
         Err(_) => Value::String(s.to_owned()),
     }
 }
@@ -347,6 +279,39 @@ mod tests {
             ty: ty.into(),
             scale: 0,
         }
+    }
+
+    /// The value-fidelity corpus (#885): the wide row, encoded as the SQL API
+    /// returns it (every cell a string, a semi-structured cell its JSON text,
+    /// a decimal a `fixed` cell with its scale), decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut cols = Vec::new();
+        let mut cells = Vec::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let (meta, cell) = match v {
+                Value::Null => (col(name, "text"), Value::Null),
+                Value::Bool(b) => (col(name, "boolean"), json!(b.to_string())),
+                Value::Number(n) if n.is_f64() => (col(name, "real"), json!(n.to_string())),
+                Value::Number(n) => (col(name, "fixed"), json!(n.to_string())),
+                Value::String(s) if name == "canonical_decimal" => (col_scaled(name, 9), json!(s)),
+                Value::String(s) if name == "canonical_decimal_scale" => {
+                    (col_scaled(name, 2), json!(s))
+                }
+                Value::String(s) if name == "canonical_big_integer" => {
+                    (col(name, "fixed"), json!(s))
+                }
+                Value::String(s) => (col(name, "text"), json!(s)),
+                Value::Array(_) => (col(name, "array"), json!(v.to_string())),
+                Value::Object(_) => (col(name, "object"), json!(v.to_string())),
+            };
+            cols.push(meta);
+            cells.push(cell);
+        }
+        let landed = row_to_json(&cells, &cols);
+        fidelity::assert_round_trip(&[sent], &[landed], fidelity::Tolerance::exact());
     }
 
     /// A `fixed` column with an explicit (non-zero) decimal scale.
@@ -440,7 +405,7 @@ mod tests {
         // fractional decimal — keep its exact text.
         let row = [json!("1.5e10")];
         let cols = [col_scaled("X", 4)];
-        assert_eq!(row_to_json(&row, &cols), json!({"X": "1.5e10"}));
+        assert_eq!(row_to_json(&row, &cols), json!({"X": "15000000000"}));
     }
 
     #[test]
@@ -458,11 +423,12 @@ mod tests {
     #[test]
     fn fixed_non_decimal_token_falls_back_to_real() {
         // Defensive guard: a `fixed` column reporting scale>0 but carrying a
-        // non-finite/garbage token must not be emitted as a misleading numeric
-        // string. It falls back to parse_real (string for non-finite).
+        // non-finite token is a counted null; garbage stays its text.
         let row = [json!("NaN")];
         let cols = [col_scaled("X", 2)];
-        assert_eq!(row_to_json(&row, &cols), json!({"X": "NaN"}));
+        assert_eq!(row_to_json(&row, &cols), json!({"X": null}));
+        let row = [json!("abc")];
+        assert_eq!(row_to_json(&row, &cols), json!({"X": "abc"}));
     }
 
     #[test]
@@ -633,10 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_real_falls_back_to_string() {
+    fn non_finite_real_is_a_counted_null() {
         let row = [json!("NaN")];
         let cols = [col("X", "real")];
-        // NaN is not representable in JSON; round-trip-safe fallback.
-        assert_eq!(row_to_json(&row, &cols), json!({"X": "NaN"}));
+        assert_eq!(row_to_json(&row, &cols), json!({"X": null}));
+        let row = [json!("x")];
+        assert_eq!(row_to_json(&row, &cols), json!({"X": "x"}));
     }
 }

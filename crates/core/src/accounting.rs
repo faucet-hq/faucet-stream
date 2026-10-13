@@ -115,6 +115,7 @@ pub struct RowAccounts {
     quarantined: AtomicU64,
     dropped: AtomicU64,
     unaccounted: AtomicU64,
+    non_finite: AtomicU64,
 }
 
 /// A point-in-time copy of [`RowAccounts`].
@@ -142,6 +143,9 @@ pub struct RowAccountsSnapshot {
     pub dropped: u64,
     /// Rows a sink lost without saying so (a failed run).
     pub unaccounted: u64,
+    /// Values with no JSON rendering (`NaN`, `±Infinity`) the source wrote as
+    /// `null` (#885). A value count, not a row count.
+    pub non_finite: u64,
 }
 
 impl RowAccountsSnapshot {
@@ -173,6 +177,7 @@ impl RowAccountsSnapshot {
             ("dropped", self.dropped),
             ("filtered by transforms", self.filtered()),
             ("unaccounted", self.unaccounted),
+            ("non-finite values written as null", self.non_finite),
         ] {
             if n > 0 {
                 line.push_str(&format!(", {label} {n}"));
@@ -202,7 +207,12 @@ impl RowAccounts {
             quarantined: g(&self.quarantined),
             dropped: g(&self.dropped),
             unaccounted: g(&self.unaccounted),
+            non_finite: g(&self.non_finite),
         }
+    }
+
+    pub(crate) fn add_non_finite(&self, n: u64) {
+        self.non_finite.fetch_add(n, Ordering::Relaxed);
     }
 
     pub(crate) fn add_transform(&self, input: usize, output: usize) {

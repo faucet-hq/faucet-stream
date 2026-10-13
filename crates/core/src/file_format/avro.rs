@@ -27,10 +27,10 @@
 //! | `uuid` | canonical string | `Utf8` |
 //! | `duration` | `{months, days, millis}` | `Struct` |
 //!
-//! `bytes` and `fixed` are lowercase hex — the same encoding the Arrow JSON
-//! writer uses for binary columns, so an Avro file and a Parquet file carrying
-//! the same bytes produce the same records. `NaN` and the infinities, which
-//! JSON cannot hold, become the strings `"NaN"`, `"Infinity"`, `"-Infinity"`.
+//! `bytes` and `fixed` are standard base64 — the canonical binary rendering of
+//! [`crate::fidelity`], the same one Arrow binary columns get, so an Avro file
+//! and a Parquet file carrying the same bytes produce the same records. `NaN`
+//! and the infinities, which JSON cannot hold, become a counted `null`.
 //!
 //! A union of `null` and one type is that type, nullable. A union of several
 //! non-null types decodes to whichever branch the value holds; on the Arrow
@@ -296,7 +296,7 @@ impl AvroDatumCodec {
 }
 
 /// Convert one decoded Avro datum to JSON with the logical-type mapping in the
-/// module docs (exact decimal strings, hex bytes, ISO temporals). Unlike the
+/// module docs (exact decimal strings, base64 bytes, ISO temporals). Unlike the
 /// file reader, a non-record datum is returned as-is rather than wrapped in
 /// [`VALUE_FIELD`] — the shape a single-message codec (a Kafka value) wants.
 pub fn datum_to_json(datum: &Av, schema: &Schema) -> Result<Value, FaucetError> {
@@ -308,7 +308,7 @@ pub fn datum_to_json(datum: &Av, schema: &Schema) -> Result<Value, FaucetError> 
 /// [`datum_to_json`] produces (the inverse mapping). The error names the path
 /// that did not fit.
 pub fn datum_from_json(value: &Value, schema: &Schema) -> Result<Av, FaucetError> {
-    datum_from_json_with(value, schema, BytesText::Hex)
+    datum_from_json_with(value, schema, BytesText::Base64)
 }
 
 /// How a JSON string is read for an Avro `bytes` / `fixed` value on encode.
@@ -324,9 +324,12 @@ pub fn datum_from_json(value: &Value, schema: &Schema) -> Result<Av, FaucetError
     schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BytesText {
-    /// The string is lowercase hex, the shape [`datum_to_json`] produces.
+    /// The string is standard base64, the shape [`datum_to_json`] produces.
     #[default]
+    Base64,
+    /// The string is lowercase hex (the rendering before #885).
     Hex,
     /// The string's UTF-8 bytes are the value.
     Utf8,
@@ -392,9 +395,13 @@ fn to_json(
         (Av::Boolean(b), _) => Value::Bool(*b),
         (Av::Int(i), _) => json!(i),
         (Av::Long(i), _) => json!(i),
-        (Av::Float(f), _) => float_json(f64::from(*f)),
-        (Av::Double(f), _) => float_json(*f),
-        (Av::Bytes(b), _) | (Av::Fixed(_, b), _) => Value::String(hex(b)),
+        (Av::Float(f), _) if mode == Mode::Arrow && !f.is_finite() => {
+            non_finite_text(f64::from(*f))
+        }
+        (Av::Double(f), _) if mode == Mode::Arrow && !f.is_finite() => non_finite_text(*f),
+        (Av::Float(f), _) => crate::fidelity::float32(*f),
+        (Av::Double(f), _) => crate::fidelity::float64(*f),
+        (Av::Bytes(b), _) | (Av::Fixed(_, b), _) => crate::fidelity::binary(b),
         (Av::String(t), _) => Value::String(t.clone()),
         (Av::Enum(_, sym), _) => Value::String(sym.clone()),
         (Av::Array(items), s) => {
@@ -473,24 +480,19 @@ fn to_json(
     })
 }
 
-fn float_json(f: f64) -> Value {
-    if f.is_nan() {
-        Value::String("NaN".into())
-    } else if f.is_infinite() {
-        Value::String(if f > 0.0 { "Infinity" } else { "-Infinity" }.into())
-    } else {
-        json!(f)
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(b.len() * 2);
-    for byte in b {
-        s.push(DIGITS[(byte >> 4) as usize] as char);
-        s.push(DIGITS[(byte & 0xf) as usize] as char);
-    }
-    s
+/// On the Arrow path a non-finite float stays one: the JSON hop reads these
+/// words back into the `Float` column.
+fn non_finite_text(f: f64) -> Value {
+    Value::String(
+        if f.is_nan() {
+            "NaN"
+        } else if f > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .into(),
+    )
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
@@ -737,10 +739,10 @@ pub fn encode(records: &[Value], opts: &AvroOptions) -> Result<Vec<u8>, FaucetEr
 fn root_from_json(v: &Value, schema: &Schema, names: &Names) -> Result<Av, String> {
     let resolved = resolve(schema, names).map_err(|e| e.to_string())?;
     match resolved {
-        Schema::Record(_) => from_json(v, schema, names, BytesText::Hex, ""),
+        Schema::Record(_) => from_json(v, schema, names, BytesText::Base64, ""),
         _ => {
             let inner = v.get(VALUE_FIELD).unwrap_or(v);
-            from_json(inner, schema, names, BytesText::Hex, "")
+            from_json(inner, schema, names, BytesText::Base64, "")
         }
     }
 }
@@ -1002,7 +1004,13 @@ fn float_from(v: &Value) -> Option<f64> {
 fn bytes_from(v: &Value, text: BytesText) -> Result<Vec<u8>, String> {
     match v {
         Value::String(s) if text == BytesText::Utf8 => Ok(s.as_bytes().to_vec()),
-        Value::String(s) => unhex(s),
+        Value::String(s) if text == BytesText::Hex => unhex(s),
+        Value::String(s) => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| format!("{s:?} is not base64"))
+        }
         Value::Array(items) => items
             .iter()
             .map(|i| {
@@ -1011,7 +1019,7 @@ fn bytes_from(v: &Value, text: BytesText) -> Result<Vec<u8>, String> {
                     .ok_or_else(|| "byte array holds a non-byte".to_string())
             })
             .collect(),
-        other => Err(format!("expected hex bytes, got {}", short(other))),
+        other => Err(format!("expected base64 bytes, got {}", short(other))),
     }
 }
 
@@ -1472,7 +1480,7 @@ mod tests {
             "note": null,
             "either": "text",
             "kind": "B",
-            "raw": "00ff10",
+            "raw": "AP8Q",
             "tags": ["x", "y"],
             "attrs": {"a": 1, "b": 2},
             "ratio": 0.5,
@@ -1497,7 +1505,9 @@ mod tests {
             };
             let bytes = encode(&[logical_record()], &opts).expect("encode");
             let back = decode(&bytes, &AvroOptions::default()).expect("decode");
-            assert_eq!(back, vec![logical_record()], "{codec:?}");
+            let mut expected = logical_record();
+            expected["score"] = Value::Null;
+            assert_eq!(back, vec![expected], "{codec:?}");
         }
     }
 
@@ -1833,7 +1843,19 @@ mod tests {
             )
             .is_ok()
         );
-        assert_eq!(BytesText::default(), BytesText::Hex);
+        assert_eq!(BytesText::default(), BytesText::Base64);
+        assert_eq!(
+            datum_from_json_with(
+                &json!({"raw": "cafe", "tag": "61626364"}),
+                &schema,
+                BytesText::Hex
+            )
+            .unwrap(),
+            Av::Record(vec![
+                ("raw".into(), Av::Bytes(vec![0xca, 0xfe])),
+                ("tag".into(), Av::Fixed(4, b"abcd".to_vec())),
+            ])
+        );
     }
 
     #[test]
@@ -1842,7 +1864,7 @@ mod tests {
         assert!(time_string(-1, 3).is_err());
         assert!(utc_string(i64::MAX, 1_000_000, SecondsFormat::Millis).is_err());
         assert!(local_string(i64::MAX, 1_000_000, 3).is_err());
-        assert_eq!(float_json(f64::NEG_INFINITY), json!("-Infinity"));
+        assert_eq!(crate::fidelity::float64(f64::NEG_INFINITY), Value::Null);
     }
 
     #[cfg(feature = "arrow")]

@@ -1204,6 +1204,30 @@ mod tests {
     use crate::config::SnowflakeAuth;
     use faucet_core::Sink as _;
 
+    /// The value-fidelity corpus (#885): the JSON payload bound to
+    /// `PARSE_JSON(?)` reads back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sink = SnowflakeSink::new(SnowflakeSinkConfig::new(
+            "acct",
+            "wh",
+            "db",
+            "schema",
+            "T",
+            SnowflakeAuth::OAuth { token: "t".into() },
+        ))
+        .unwrap();
+        let sent = fidelity::corpus();
+        let (_, payload) = sink.build_insert(&sent).unwrap();
+        let landed = faucet_core::fidelity::from_str(&payload).unwrap();
+        fidelity::assert_round_trip(
+            &sent,
+            landed.as_array().unwrap(),
+            fidelity::Tolerance::exact(),
+        );
+    }
+
     #[test]
     fn dataset_uri_includes_account_db_schema_table() {
         let config = SnowflakeSinkConfig::new(

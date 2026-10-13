@@ -51,6 +51,18 @@ pub fn decode_array(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
 /// significant digits always survives and is skipped cheaply. Runs only on
 /// input that already parsed, so it never has to report a syntax error.
 fn check_numbers_exact(bytes: &[u8]) -> Result<(), String> {
+    match unfaithful_literals(bytes).first() {
+        Some(r) => check_literal(std::str::from_utf8(&bytes[r.clone()]).unwrap_or_default()),
+        None => Ok(()),
+    }
+}
+
+/// Byte ranges of the number literals in JSON `bytes` (outside strings) that
+/// parse to a value which does not spell them again — see
+/// [`literal_is_faithful`]. A literal of at most 15 significant digits is
+/// always faithful and skipped cheaply.
+pub(crate) fn unfaithful_literals(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
     let mut i = 0;
     let mut in_string = false;
     while i < bytes.len() {
@@ -77,14 +89,17 @@ fn check_numbers_exact(bytes: &[u8]) -> Result<(), String> {
                 i += 1;
             }
             let token = std::str::from_utf8(&bytes[start..i]).unwrap_or_default();
-            if token.bytes().filter(u8::is_ascii_digit).count() > 15 {
-                check_literal(token)?;
+            if token.bytes().filter(u8::is_ascii_digit).count() > 15
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Number>(token)
+                && !literal_is_faithful(token, &parsed)
+            {
+                out.push(start..i);
             }
             continue;
         }
         i += 1;
     }
-    Ok(())
+    out
 }
 
 fn check_literal(token: &str) -> Result<(), String> {

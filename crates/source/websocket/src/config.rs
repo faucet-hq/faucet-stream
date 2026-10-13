@@ -228,7 +228,7 @@ pub(crate) fn decode_frame(
     payload: &[u8],
 ) -> Result<Option<Value>, FaucetError> {
     match format {
-        WsMessageFormat::Json => match serde_json::from_slice::<Value>(payload) {
+        WsMessageFormat::Json => match faucet_core::fidelity::from_slice(payload) {
             Ok(v) => Ok(Some(v)),
             Err(e) => match on_parse_error {
                 OnParseError::Fail => {
@@ -274,6 +274,23 @@ pub(crate) fn shape_record(value: Value, envelope: bool, url: &str, now_ms: u64)
 #[cfg(test)]
 mod config_tests {
     use super::*;
+    /// The value-fidelity corpus (#885): every record, serialized the way a
+    /// producer sends it, decodes back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let mut landed = Vec::new();
+        for record in &sent {
+            let bytes = serde_json::to_vec(record).unwrap();
+            landed.push(
+                decode_frame(WsMessageFormat::Json, OnParseError::Fail, &bytes)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
 
     fn minimal() -> WebsocketSourceConfig {
         WebsocketSourceConfig {

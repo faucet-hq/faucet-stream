@@ -2,8 +2,8 @@
 //!
 //! Delegates to [`faucet_core::columnar::record_batch_to_values`]: null
 //! columns stay present as `null`, decimals keep every digit as a string, and
-//! NaN / ±Infinity come out as the strings `"NaN"` / `"Infinity"` /
-//! `"-Infinity"` rather than `null`.
+//! values follow the canonical renderings of `faucet_core::fidelity` (NaN /
+//! ±Infinity as a counted `null`, binary as base64).
 
 use arrow::array::RecordBatch;
 use faucet_core::FaucetError;
@@ -95,7 +95,7 @@ mod tests {
         let rows = record_batch_to_json(&batch).unwrap();
         assert_eq!(rows[0]["d"], "1234567890123456789012345678.9012345678");
         assert_eq!(rows[1]["d"], Value::Null);
-        assert_eq!(rows[0]["f"], "NaN");
-        assert_eq!(rows[1]["f"], "-Infinity");
+        assert_eq!(rows[0]["f"], Value::Null);
+        assert_eq!(rows[1]["f"], Value::Null);
     }
 }

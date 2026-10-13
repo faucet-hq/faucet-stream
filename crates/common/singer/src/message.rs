@@ -44,7 +44,8 @@ pub fn parse_line(line: &str) -> Result<SingerMessage, String> {
     if trimmed.is_empty() {
         return Err("blank line".to_string());
     }
-    let value: Value = serde_json::from_str(trimmed).map_err(|e| format!("not valid JSON: {e}"))?;
+    let value: Value =
+        faucet_core::fidelity::from_str(trimmed).map_err(|e| format!("not valid JSON: {e}"))?;
     let obj = value
         .as_object()
         .ok_or_else(|| "message is not a JSON object".to_string())?;

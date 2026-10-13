@@ -134,7 +134,7 @@ pub fn row_to_json(
 pub fn parse_json_column(name: &str, value: Value, json_columns: &[String]) -> Value {
     match value {
         Value::String(s) if json_columns.iter().any(|c| c.eq_ignore_ascii_case(name)) => {
-            serde_json::from_str(&s).unwrap_or(Value::String(s))
+            faucet_core::fidelity::parse_json(s.as_bytes()).unwrap_or(Value::String(s))
         }
         other => other,
     }

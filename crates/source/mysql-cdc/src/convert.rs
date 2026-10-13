@@ -20,12 +20,8 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::NULL => Json::Null,
         Value::Int(i) => Json::from(*i),
         Value::UInt(u) => Json::from(*u),
-        Value::Float(f) => serde_json::Number::from_f64(f64::from(*f))
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
-        Value::Double(d) => serde_json::Number::from_f64(*d)
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
+        Value::Float(f) => faucet_core::fidelity::float64(f64::from(*f)),
+        Value::Double(d) => faucet_core::fidelity::float64(*d),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             // Text-like columns decode as UTF-8 strings; binary falls back to base64.
             Ok(s) => Json::String(s.to_owned()),
@@ -329,14 +325,7 @@ fn hinted_value(hint: &ColumnHint, v: &Value) -> Option<Json> {
             let year: u16 = std::str::from_utf8(b).ok()?.parse().ok()?;
             Some(Json::from(if year == 1900 { 0 } else { year }))
         }
-        (ColumnHint::Float, Value::Float(f)) => {
-            let shortest: f64 = f.to_string().parse().ok()?;
-            Some(
-                serde_json::Number::from_f64(shortest)
-                    .map(Json::Number)
-                    .unwrap_or(Json::Null),
-            )
-        }
+        (ColumnHint::Float, Value::Float(f)) => Some(faucet_core::fidelity::float32(*f)),
         (ColumnHint::Binary, Value::Bytes(b)) => Some(Json::String(
             base64::engine::general_purpose::STANDARD.encode(b),
         )),
@@ -401,6 +390,39 @@ pub fn binlog_row_to_json_hinted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The value-fidelity corpus (#885): the wide row as the binlog row values
+    /// MySQL writes for it decodes back unchanged. MySQL's `BOOL` is a
+    /// `TINYINT` (it reads back as `1` / `0`), and a JSON column is decoded
+    /// from its binary form (covered by the `jsonb_*` tests), so nested values
+    /// travel as text here.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let mut sent = fidelity::flat_corpus();
+        let mut landed = Map::new();
+        for (name, v) in sent.as_object_mut().unwrap().iter_mut() {
+            if v.is_object() || v.is_array() {
+                *v = Json::String(v.to_string());
+            }
+            let value = match &*v {
+                Json::Null => Value::NULL,
+                Json::Bool(b) => Value::Int(i64::from(*b)),
+                Json::Number(n) if n.is_f64() => Value::Double(n.as_f64().unwrap()),
+                Json::Number(n) => Value::Int(n.as_i64().unwrap()),
+                Json::String(s) => Value::Bytes(s.as_bytes().to_vec()),
+                _ => unreachable!("nested values were turned into text"),
+            };
+            landed.insert(name.clone(), value_to_json(&value));
+        }
+        fidelity::assert_round_trip(
+            &[sent],
+            &[Json::Object(landed)],
+            fidelity::Tolerance::exact()
+                .skipping("booleans_and_null_true_val")
+                .skipping("booleans_and_null_false_val"),
+        );
+    }
 
     #[test]
     fn binary_columns_follow_the_character_column_charsets() {

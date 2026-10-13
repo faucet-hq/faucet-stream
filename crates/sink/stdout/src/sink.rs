@@ -322,6 +322,27 @@ mod tests {
         (sink, writer)
     }
 
+    /// The value-fidelity corpus (#885): the JSON Lines this sink prints
+    /// parse back unchanged.
+    #[tokio::test]
+    async fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let (sink, capture) = sink_with(StdoutSinkConfig::new());
+        fidelity::assert_corpus_written(
+            &sink,
+            &fidelity::corpus(),
+            || async {
+                capture
+                    .as_str()
+                    .lines()
+                    .map(|l| faucet_core::fidelity::from_str(l).unwrap())
+                    .collect()
+            },
+            fidelity::Tolerance::exact(),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn json_lines_emits_one_record_per_line() {
         let (sink, capture) = sink_with(StdoutSinkConfig::new());

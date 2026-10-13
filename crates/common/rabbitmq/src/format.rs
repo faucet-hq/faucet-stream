@@ -40,7 +40,7 @@ impl RabbitMqValueFormat {
 /// are errors under `json`/`string` and base64 under `bytes`.
 pub fn decode_payload(body: &[u8], format: RabbitMqValueFormat) -> Result<Value, FaucetError> {
     match format {
-        RabbitMqValueFormat::Json => serde_json::from_slice(body).map_err(|e| {
+        RabbitMqValueFormat::Json => faucet_core::fidelity::from_slice(body).map_err(|e| {
             FaucetError::Source(format!("rabbitmq: message body is not valid JSON: {e}"))
         }),
         RabbitMqValueFormat::String => std::str::from_utf8(body)
@@ -114,17 +114,10 @@ fn amqp_value_to_json(v: &AMQPValue) -> Value {
         AMQPValue::LongUInt(n) => Value::from(*n),
         AMQPValue::LongLongInt(n) => Value::from(*n),
         AMQPValue::Timestamp(n) => Value::from(*n),
-        AMQPValue::Float(f) => serde_json::Number::from_f64(f64::from(*f))
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        AMQPValue::Double(f) => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        AMQPValue::Float(f) => faucet_core::fidelity::float32(*f),
+        AMQPValue::Double(f) => faucet_core::fidelity::float64(*f),
         AMQPValue::DecimalValue(d) => {
-            let scaled = f64::from(d.value) / 10f64.powi(i32::from(d.scale));
-            serde_json::Number::from_f64(scaled)
-                .map(Value::Number)
-                .unwrap_or(Value::Null)
+            faucet_core::fidelity::decimal_from_i128(i128::from(d.value), i32::from(d.scale))
         }
         AMQPValue::ShortString(s) => Value::String(s.as_str().to_string()),
         AMQPValue::LongString(s) => match std::str::from_utf8(s.as_bytes()) {
@@ -262,7 +255,7 @@ mod tests {
         assert_eq!(v["f64"], json!(2.5));
         assert_eq!(v["nan"], Value::Null);
         assert_eq!(v["fnan"], Value::Null);
-        assert_eq!(v["dec"], json!(12.34));
+        assert_eq!(v["dec"], json!("12.34"));
         assert_eq!(v["ss"], json!("short"));
         assert_eq!(v["ls"], json!("long"));
         assert_eq!(v["lsbin"], json!("//4="));

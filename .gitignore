@@ -72,6 +72,11 @@ docs/superpowers/
 !/scripts/test_plugin_version.py
 !/scripts/conformance-coverage.py
 !/scripts/test_conformance_coverage.py
+!/scripts/fidelity-coverage.py
+!/scripts/test_fidelity_coverage.py
+!/scripts/decimal-f64.py
+!/scripts/decimal-f64-allow.txt
+!/scripts/test_decimal_f64.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
 /.bench-venv/

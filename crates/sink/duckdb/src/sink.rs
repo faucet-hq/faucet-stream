@@ -427,6 +427,11 @@ fn execute(conn: &Connection, stmt: &Statement<'_>) -> Result<(), FaucetError> {
             Value::String(v) if p.sql_type.is_some_and(is_naive_timestamp) => {
                 DuckValue::Text(utc_wall_time(v).unwrap_or_else(|| v.clone()))
             }
+            // Its shortest text, which DuckDB casts exactly into a DECIMAL or
+            // DOUBLE column, where a bound double converts from binary (#885).
+            _ if p.non_integer_text().is_some() => {
+                DuckValue::Text(p.non_integer_text().expect("checked"))
+            }
             v => json_to_duck(v),
         })
         .collect();

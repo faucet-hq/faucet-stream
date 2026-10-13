@@ -224,6 +224,8 @@ pub fn values_to_record_batch(
     schema: SchemaRef,
 ) -> Result<RecordBatch, FaucetError> {
     check_integral(records, &schema)?;
+    let rehexed = base64_binary_to_hex(records, &schema)?;
+    let records = rehexed.as_deref().unwrap_or(records);
     let mut decoder = arrow_json::ReaderBuilder::new(schema.clone())
         .build_decoder()
         .map_err(|e| te("decoder build", e))?;
@@ -239,6 +241,82 @@ pub fn values_to_record_batch(
         return Ok(batches.pop().unwrap());
     }
     arrow::compute::concat_batches(&schema, &batches).map_err(|e| te("concat", e))
+}
+
+fn holds_binary(dt: &DataType) -> bool {
+    match dt {
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => true,
+        DataType::Struct(fields) => fields.iter().any(|f| holds_binary(f.data_type())),
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            holds_binary(f.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// Binary values travel as base64 (the canonical rendering, [`crate::fidelity`])
+/// but arrow-json reads hex: rewrite the strings bound for binary columns.
+/// `None` when `schema` has none.
+fn base64_binary_to_hex(
+    records: &[Value],
+    schema: &Schema,
+) -> Result<Option<Vec<Value>>, FaucetError> {
+    use base64::Engine as _;
+    fn rewrite(value: &mut Value, dt: &DataType, path: &str) -> Result<(), FaucetError> {
+        match (value, dt) {
+            (Value::String(s), dt) if !dt.is_nested() && holds_binary(dt) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(s.as_bytes())
+                    .map_err(|_| {
+                        FaucetError::Transform(format!(
+                            "columnar shim: field '{path}' holds {s:?}, which is not base64"
+                        ))
+                    })?;
+                *s = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                Ok(())
+            }
+            (Value::Object(map), DataType::Struct(fields)) => {
+                for f in fields {
+                    if let Some(v) = map.get_mut(f.name()) {
+                        rewrite(v, f.data_type(), &format!("{path}.{}", f.name()))?;
+                    }
+                }
+                Ok(())
+            }
+            (
+                Value::Array(items),
+                DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _),
+            ) => {
+                for item in items {
+                    rewrite(item, f.data_type(), path)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    let fields: Vec<&Field> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref())
+        .filter(|f| holds_binary(f.data_type()))
+        .collect();
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    let mut out = records.to_vec();
+    for record in &mut out {
+        let Value::Object(map) = record else { continue };
+        for f in &fields {
+            if let Some(v) = map.get_mut(f.name()) {
+                rewrite(v, f.data_type(), f.name())?;
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Refuse a fractional JSON number bound for an integer column of `schema`,
@@ -327,9 +405,11 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 /// this a `SELECT *`-style identity would silently delete every explicit-null
 /// field (audit #321 H6). An empty batch returns an empty `Vec`.
 ///
-/// Decimals are emitted as exact strings (`"12345678901234567890.12"`) rather
-/// than JSON numbers, which `serde_json` would round through `f64`; non-finite
-/// floats become `"NaN"` / `"Infinity"` / `"-Infinity"` instead of `null`.
+/// Values follow the canonical renderings of [`crate::fidelity`]: decimals are
+/// exact strings (`"12345678901234567890.12"`) rather than JSON numbers, which
+/// `serde_json` would round through `f64`; non-finite floats become a counted
+/// `null`; binary columns are base64; timestamps and times carry their unit's
+/// native precision, and a zoned timestamp its offset.
 pub fn record_batch_to_values(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
     let mut buf = Vec::new();
     {
@@ -355,39 +435,63 @@ impl<F: FnMut(usize) -> String> arrow_json::writer::Encoder for StringEncoder<F>
     }
 }
 
-struct JsonTextEncoder<F: FnMut(usize) -> String>(F);
+struct ValueEncoder<F: FnMut(usize) -> Value>(F);
 
-impl<F: FnMut(usize) -> String> arrow_json::writer::Encoder for JsonTextEncoder<F> {
+impl<F: FnMut(usize) -> Value> arrow_json::writer::Encoder for ValueEncoder<F> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        out.extend_from_slice((self.0)(idx).as_bytes());
+        serde_json::to_writer(&mut *out, &(self.0)(idx)).expect("writing to a Vec cannot fail");
     }
 }
 
-fn non_finite_json(nan: bool, positive: bool) -> String {
-    let text = if nan {
-        "NaN"
-    } else if positive {
-        "Infinity"
-    } else {
-        "-Infinity"
+fn arrow_precision(unit: &arrow::datatypes::TimeUnit) -> crate::fidelity::TimePrecision {
+    use crate::fidelity::TimePrecision;
+    use arrow::datatypes::TimeUnit;
+    match unit {
+        TimeUnit::Second => TimePrecision::Seconds,
+        TimeUnit::Millisecond => TimePrecision::Millis,
+        TimeUnit::Microsecond => TimePrecision::Micros,
+        TimeUnit::Nanosecond => TimePrecision::Nanos,
+    }
+}
+
+/// An epoch offset in `precision` units: an instant in `zone` when the column
+/// has one, a local date-time otherwise.
+fn timestamp_json(
+    v: i64,
+    precision: crate::fidelity::TimePrecision,
+    zone: Option<&arrow::array::timezone::Tz>,
+) -> Value {
+    use crate::fidelity::TimePrecision;
+    let utc = match precision {
+        TimePrecision::Seconds => chrono::DateTime::from_timestamp(v, 0),
+        TimePrecision::Millis => chrono::DateTime::from_timestamp_millis(v),
+        TimePrecision::Micros => chrono::DateTime::from_timestamp_micros(v),
+        _ => Some(chrono::DateTime::from_timestamp_nanos(v)),
     };
-    format!("\"{text}\"")
-}
-
-fn f64_json(v: f64) -> String {
-    if v.is_finite() {
-        Value::from(v).to_string()
-    } else {
-        non_finite_json(v.is_nan(), v.is_sign_positive())
+    match (utc, zone) {
+        (Some(utc), Some(tz)) => crate::fidelity::timestamp(&utc.with_timezone(tz), precision),
+        (Some(utc), None) => crate::fidelity::timestamp_naive(&utc.naive_utc(), precision),
+        (None, _) => Value::from(v),
     }
 }
 
-fn f32_json(v: f32) -> String {
-    if v.is_finite() {
-        serde_json::to_string(&v).expect("a finite f32 always serializes")
-    } else {
-        non_finite_json(v.is_nan(), v.is_sign_positive())
-    }
+/// A time of day `v` units after midnight.
+fn time_json(v: i64, unit: &arrow::datatypes::TimeUnit) -> Value {
+    use arrow::datatypes::TimeUnit;
+    let (per_second, nanos_per_unit) = match unit {
+        TimeUnit::Second => (1, 1_000_000_000),
+        TimeUnit::Millisecond => (1_000, 1_000_000),
+        TimeUnit::Microsecond => (1_000_000, 1_000),
+        TimeUnit::Nanosecond => (1_000_000_000, 1),
+    };
+    u32::try_from(v.div_euclid(per_second))
+        .ok()
+        .zip(u32::try_from(v.rem_euclid(per_second) * nanos_per_unit).ok())
+        .and_then(|(s, n)| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, n))
+        .map_or_else(
+            || Value::from(v),
+            |t| crate::fidelity::time(&t, arrow_precision(unit)),
+        )
 }
 
 fn nullable<'a>(
@@ -407,7 +511,9 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
         use arrow::array::AsArray;
         use arrow::datatypes::{
             DataType, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, Float16Type,
-            Float32Type, Float64Type,
+            Float32Type, Float64Type, Time32MillisecondType, Time32SecondType,
+            Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType,
+            TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
         };
         let enc = match array.data_type() {
             DataType::Decimal32(..) => {
@@ -431,14 +537,20 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
                 if a.values().iter().all(|v| v.is_finite()) {
                     return Ok(None);
                 }
-                nullable(JsonTextEncoder(move |i| f64_json(a.value(i))), array)
+                nullable(
+                    ValueEncoder(move |i| crate::fidelity::float64(a.value(i))),
+                    array,
+                )
             }
             DataType::Float32 => {
                 let a = array.as_primitive::<Float32Type>();
                 if a.values().iter().all(|v| v.is_finite()) {
                     return Ok(None);
                 }
-                nullable(JsonTextEncoder(move |i| f32_json(a.value(i))), array)
+                nullable(
+                    ValueEncoder(move |i| crate::fidelity::float32(a.value(i))),
+                    array,
+                )
             }
             DataType::Float16 => {
                 let a = array.as_primitive::<Float16Type>();
@@ -446,9 +558,101 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
                     return Ok(None);
                 }
                 nullable(
-                    JsonTextEncoder(move |i| f32_json(f32::from(a.value(i)))),
+                    ValueEncoder(move |i| crate::fidelity::float32(f32::from(a.value(i)))),
                     array,
                 )
+            }
+            DataType::Binary => {
+                let a = array.as_binary::<i32>();
+                nullable(
+                    ValueEncoder(move |i| crate::fidelity::binary(a.value(i))),
+                    array,
+                )
+            }
+            DataType::LargeBinary => {
+                let a = array.as_binary::<i64>();
+                nullable(
+                    ValueEncoder(move |i| crate::fidelity::binary(a.value(i))),
+                    array,
+                )
+            }
+            DataType::BinaryView => {
+                let a = array.as_binary_view();
+                nullable(
+                    ValueEncoder(move |i| crate::fidelity::binary(a.value(i))),
+                    array,
+                )
+            }
+            DataType::FixedSizeBinary(_) => {
+                let a = array.as_fixed_size_binary();
+                nullable(
+                    ValueEncoder(move |i| crate::fidelity::binary(a.value(i))),
+                    array,
+                )
+            }
+            DataType::Timestamp(unit, tz) => {
+                let zone = match tz {
+                    Some(name) => match name.parse::<arrow::array::timezone::Tz>() {
+                        Ok(z) => Some(z),
+                        Err(_) => return Ok(None),
+                    },
+                    None => None,
+                };
+                let precision = arrow_precision(unit);
+                let values: Vec<i64> = match unit {
+                    TimeUnit::Second => array
+                        .as_primitive::<TimestampSecondType>()
+                        .values()
+                        .to_vec(),
+                    TimeUnit::Millisecond => array
+                        .as_primitive::<TimestampMillisecondType>()
+                        .values()
+                        .to_vec(),
+                    TimeUnit::Microsecond => array
+                        .as_primitive::<TimestampMicrosecondType>()
+                        .values()
+                        .to_vec(),
+                    TimeUnit::Nanosecond => array
+                        .as_primitive::<TimestampNanosecondType>()
+                        .values()
+                        .to_vec(),
+                };
+                nullable(
+                    ValueEncoder(move |i| timestamp_json(values[i], precision, zone.as_ref())),
+                    array,
+                )
+            }
+            DataType::Time32(unit) => {
+                let unit = *unit;
+                let values: Vec<i64> = match unit {
+                    TimeUnit::Second => array
+                        .as_primitive::<Time32SecondType>()
+                        .values()
+                        .iter()
+                        .map(|v| i64::from(*v))
+                        .collect(),
+                    _ => array
+                        .as_primitive::<Time32MillisecondType>()
+                        .values()
+                        .iter()
+                        .map(|v| i64::from(*v))
+                        .collect(),
+                };
+                nullable(ValueEncoder(move |i| time_json(values[i], &unit)), array)
+            }
+            DataType::Time64(unit) => {
+                let unit = *unit;
+                let values: Vec<i64> = match unit {
+                    TimeUnit::Nanosecond => array
+                        .as_primitive::<Time64NanosecondType>()
+                        .values()
+                        .to_vec(),
+                    _ => array
+                        .as_primitive::<Time64MicrosecondType>()
+                        .values()
+                        .to_vec(),
+                };
+                nullable(ValueEncoder(move |i| time_json(values[i], &unit)), array)
             }
             _ => return Ok(None),
         };
@@ -615,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_floats_become_strings_not_nulls() {
+    fn non_finite_floats_become_counted_nulls() {
         use arrow::array::{Float32Array, Float64Array};
         use arrow::datatypes::{DataType, Field};
         let halves = arrow::compute::cast(
@@ -647,19 +851,26 @@ mod tests {
             ],
         )
         .unwrap();
-        let rows = record_batch_to_values(&batch).unwrap();
-        assert_eq!(rows[0]["d"], json!("NaN"));
-        assert_eq!(rows[1]["d"], json!("Infinity"));
+        let counter = crate::fidelity::NonFiniteCounter::new();
+        let rows = counter.scope_sync(|| record_batch_to_values(&batch).unwrap());
+        assert_eq!(rows[0]["d"], json!(null));
+        assert_eq!(rows[1]["d"], json!(null));
         assert_eq!(rows[2]["d"], json!(1.5));
         assert_eq!(rows[3]["d"], json!(null));
-        assert_eq!(rows[0]["f"], json!("-Infinity"));
+        assert_eq!(rows[0]["f"], json!(null));
         assert_eq!(rows[1]["f"].to_string(), "0.1");
-        assert_eq!(rows[2]["f"], json!("NaN"));
-        assert_eq!(rows[0]["h"], json!("Infinity"));
+        assert_eq!(rows[2]["f"], json!(null));
+        assert_eq!(rows[0]["h"], json!(null));
         assert_eq!(rows[1]["h"], json!(0.5));
         assert_eq!(rows[2]["h"], json!(null));
-        assert_eq!(rows[3]["h"], json!("NaN"));
+        assert_eq!(rows[3]["h"], json!(null));
+        assert_eq!(counter.count(), 6, "every non-finite value is counted");
 
+        let rows = vec![
+            json!({"d": "NaN", "f": 1.0, "h": 1.0}),
+            json!({"d": "Infinity", "f": 1.0, "h": 1.0}),
+            json!({"d": 1.5, "f": 1.0, "h": 1.0}),
+        ];
         let back = values_to_record_batch(&rows, schema).unwrap();
         let d = back
             .column(0)
@@ -769,5 +980,151 @@ mod wide_integer_tests {
         };
         assert!(err.contains("\"ids\""), "{err}");
         assert!(err.contains("list"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod fidelity_rendering_tests {
+    use super::*;
+    use arrow::array::{
+        BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use arrow::datatypes::TimeUnit;
+    use serde_json::json;
+
+    fn one_column(name: &str, array: arrow::array::ArrayRef) -> Vec<Value> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            array.data_type().clone(),
+            true,
+        )]));
+        record_batch_to_values(&RecordBatch::try_new(schema, vec![array]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn binary_columns_render_as_base64() {
+        let bytes: &[u8] = &[0, 1, 2, 255];
+        for array in [
+            Arc::new(BinaryArray::from(vec![Some(bytes), None])) as arrow::array::ArrayRef,
+            Arc::new(LargeBinaryArray::from(vec![Some(bytes), None])),
+            Arc::new(BinaryViewArray::from(vec![Some(bytes), None])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some(bytes), None].into_iter(),
+                    4,
+                )
+                .unwrap(),
+            ),
+        ] {
+            let rows = one_column("b", array);
+            assert_eq!(rows[0]["b"], json!("AAEC/w=="));
+            assert_eq!(rows[1]["b"], json!(null));
+        }
+    }
+
+    #[test]
+    fn timestamps_keep_their_unit_and_zone() {
+        let micros = 1_758_198_896_123_000i64;
+        let rows = one_column(
+            "t",
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(micros), None])),
+        );
+        assert_eq!(rows[0]["t"], json!("2025-09-18T12:34:56.123000"));
+        assert_eq!(rows[1]["t"], json!(null));
+        let rows = one_column(
+            "t",
+            Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("+05:30")),
+        );
+        assert_eq!(rows[0]["t"], json!("2025-09-18T18:04:56.123000+05:30"));
+        let rows = one_column(
+            "t",
+            Arc::new(TimestampMillisecondArray::from(vec![1_500]).with_timezone("+00:00")),
+        );
+        assert_eq!(rows[0]["t"], json!("1970-01-01T00:00:01.500Z"));
+        let rows = one_column("t", Arc::new(TimestampSecondArray::from(vec![-1])));
+        assert_eq!(rows[0]["t"], json!("1969-12-31T23:59:59"));
+        let rows = one_column("t", Arc::new(TimestampNanosecondArray::from(vec![1])));
+        assert_eq!(rows[0]["t"], json!("1970-01-01T00:00:00.000000001"));
+        let rows = one_column("t", Arc::new(TimestampSecondArray::from(vec![i64::MAX])));
+        assert_eq!(
+            rows[0]["t"],
+            json!(i64::MAX),
+            "out of range keeps the raw value"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_zone_falls_back_to_the_default_encoder() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Second, Some("Not/AZone".into())),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![0]).with_timezone("Not/AZone"),
+            )],
+        )
+        .unwrap();
+        assert!(record_batch_to_values(&batch).is_err());
+    }
+
+    #[test]
+    fn times_keep_their_unit() {
+        let rows = one_column("t", Arc::new(Time32SecondArray::from(vec![3661])));
+        assert_eq!(rows[0]["t"], json!("01:01:01"));
+        let rows = one_column("t", Arc::new(Time32MillisecondArray::from(vec![1_500])));
+        assert_eq!(rows[0]["t"], json!("00:00:01.500"));
+        let rows = one_column("t", Arc::new(Time64MicrosecondArray::from(vec![1])));
+        assert_eq!(rows[0]["t"], json!("00:00:00.000001"));
+        let rows = one_column("t", Arc::new(Time64NanosecondArray::from(vec![7, -1])));
+        assert_eq!(rows[0]["t"], json!("00:00:00.000000007"));
+        assert_eq!(rows[1]["t"], json!(-1), "out of range keeps the raw value");
+    }
+}
+
+#[cfg(test)]
+mod binary_round_trip_tests {
+    use super::*;
+    use arrow::datatypes::Fields;
+    use serde_json::json;
+
+    #[test]
+    fn base64_binary_round_trips_through_a_batch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Binary, true),
+            Field::new("f", DataType::FixedSizeBinary(2), true),
+            Field::new(
+                "s",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "x",
+                    DataType::LargeBinary,
+                    true,
+                )])),
+                true,
+            ),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+                true,
+            ),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let rows = vec![
+            json!({"b": "AAEC/w==", "f": "AP8=", "s": {"x": "aGk="}, "l": ["AQ==", null], "n": 1}),
+            json!({"b": null, "f": null, "s": null, "l": null, "n": null}),
+            json!("not an object"),
+        ];
+        let batch = values_to_record_batch(&rows[..2], schema.clone()).unwrap();
+        assert_eq!(record_batch_to_values(&batch).unwrap(), rows[..2].to_vec());
+        assert!(base64_binary_to_hex(&rows, &schema).unwrap().is_some());
+        let err = values_to_record_batch(&[json!({"b": "zz!"})], schema).unwrap_err();
+        assert!(err.to_string().contains("not base64"), "{err}");
+        let plain = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+        assert!(base64_binary_to_hex(&rows, &plain).unwrap().is_none());
     }
 }

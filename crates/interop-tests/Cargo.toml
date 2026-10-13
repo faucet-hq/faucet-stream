@@ -27,32 +27,55 @@ faucet-core = { workspace = true, features = ["arrow", "compression", "encryptio
 faucet-conformance = { workspace = true, features = ["containers"] }
 faucet-common-oracle.workspace = true
 faucet-common-sftp.workspace = true
+faucet-common-spanner.workspace = true
 faucet-common-iceberg = { workspace = true, features = ["catalog-sql"] }
 
+faucet-source-clickhouse.workspace = true
 faucet-source-csv = { workspace = true, features = ["compression"] }
+faucet-source-azure-blob = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-delta = { workspace = true, features = ["arrow"] }
+faucet-source-duckdb.workspace = true
+faucet-source-graphql.workspace = true
+faucet-source-elasticsearch.workspace = true
 faucet-source-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
 faucet-source-gcs = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-iceberg = { workspace = true, features = ["arrow", "catalog-sql"] }
+faucet-source-mysql.workspace = true
 faucet-source-oracle.workspace = true
+faucet-source-postgres.workspace = true
+faucet-source-postgres-cdc.workspace = true
 faucet-source-parquet = { workspace = true, features = ["arrow"] }
 faucet-source-rabbitmq.workspace = true
+faucet-source-redshift.workspace = true
 faucet-source-rest.workspace = true
 faucet-source-s3 = { workspace = true, features = ["arrow", "compression", "file-formats"] }
+faucet-source-spanner.workspace = true
+faucet-source-sqlite.workspace = true
+faucet-source-webhook.workspace = true
+faucet-source-xml.workspace = true
+faucet-source-sftp = { workspace = true, features = ["file-formats"] }
 
 faucet-sink-azure-blob = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
+faucet-sink-clickhouse.workspace = true
 faucet-sink-csv = { workspace = true, features = ["compression"] }
 faucet-sink-delta = { workspace = true, features = ["arrow"] }
+faucet-sink-duckdb.workspace = true
+faucet-sink-http.workspace = true
+faucet-sink-elasticsearch.workspace = true
 faucet-sink-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
 faucet-sink-gcs = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-iceberg = { workspace = true, features = ["catalog-sql"] }
 faucet-sink-jsonl = { workspace = true, features = ["compression", "encryption"] }
+faucet-sink-mysql.workspace = true
 faucet-sink-oracle.workspace = true
+faucet-sink-postgres.workspace = true
 faucet-sink-parquet = { workspace = true, features = ["arrow"] }
 faucet-sink-rabbitmq.workspace = true
+faucet-sink-redshift.workspace = true
 faucet-sink-s3 = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-sftp = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-singer.workspace = true
+faucet-sink-spanner.workspace = true
 faucet-sink-sqlite.workspace = true
 
 arrow.workspace = true
@@ -67,6 +90,9 @@ bytes.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 futures.workspace = true
+gcloud-gax.workspace = true
+gcloud-googleapis.workspace = true
+gcloud-spanner.workspace = true
 iceberg = "0.10.0"
 iceberg-catalog-sql = "0.10.0"
 lapin.workspace = true
@@ -75,10 +101,10 @@ parquet.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "any", "json"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "mysql", "any", "json"] }
 tempfile.workspace = true
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["azurite", "minio"] }
+testcontainers-modules = { version = "0.15", features = ["azurite", "clickhouse", "minio", "mysql", "postgres"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 urlencoding.workspace = true
 uuid.workspace = true

@@ -400,7 +400,31 @@ exactly-once path does the same through `Sink::write_batch_idempotent_reported`
 (default: `write_batch_idempotent`'s count): a short report fails the page after
 the sink committed its token and before the bookmark is persisted, so the next
 run resumes from the sink's watermark and the run is never reported green.
-`Pipeline::with_row_accounts(Arc<RowAccounts>)` exposes the counts.
+`Pipeline::with_row_accounts(Arc<RowAccounts>)` exposes the counts, including
+`non_finite` — values with no JSON rendering a source wrote as `null`.
+
+## Value fidelity
+
+`fidelity` is the single definition of how a typed backend value becomes JSON
+(RFC 0013, #885): exact decimals and integers past `i64`/`u64` as strings,
+floats with `NaN`/`±Infinity` as a counted `null`, binary as base64, instants
+as RFC 3339 with an offset at the unit's precision. Every built-in connector
+renders through it; a connector author should too:
+
+```rust
+use faucet_core::fidelity;
+
+assert_eq!(fidelity::decimal_from_i128(150, 2), serde_json::json!("1.50"));
+assert_eq!(fidelity::integer_i128(1 << 70), serde_json::json!("1180591620717411303424"));
+assert_eq!(fidelity::binary(&[0, 255]), serde_json::json!("AP8="));
+// A JSON payload, every number exact.
+let v = fidelity::from_str(r#"{"id": 18446744073709551616}"#).unwrap();
+assert_eq!(v["id"], serde_json::json!("18446744073709551616"));
+```
+
+`Pipeline::run` counts the non-finite values a run's source wrote as `null`
+(`RowAccountsSnapshot::non_finite`, `faucet_fidelity_non_finite_total`). See
+the [value fidelity reference](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
 
 ## Effectively-once delivery
 
@@ -682,6 +706,8 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
 | `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870) |
 | `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
+| `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
+| `json_numbers` | `parse_json_exact` / `JsonBigNumbers` — exactness of numbers in JSON text a database stored |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
 | `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
 | `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |

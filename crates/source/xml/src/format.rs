@@ -154,9 +154,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
         Data::String(s) => Value::String(s.clone()),
         Data::Bool(b) => Value::Bool(*b),
         Data::Int(i) => Value::from(*i),
-        Data::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        Data::Float(f) => faucet_core::fidelity::float64(*f),
         Data::DateTime(dt) => Value::String(excel_datetime_text(dt)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),

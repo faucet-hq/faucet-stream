@@ -17,8 +17,8 @@
 //!
 //! | BigQuery type                          | JSON output                      |
 //! |----------------------------------------|----------------------------------|
-//! | `INTEGER` / `INT64`                    | `Number` (i64 if it fits, else f64) |
-//! | `FLOAT` / `FLOAT64`                    | `Number` (f64)                   |
+//! | `INTEGER` / `INT64`                    | `Number` (an unparseable cell stays a `String`) |
+//! | `FLOAT` / `FLOAT64`                    | `Number` (f64; `NaN` / `Infinity` → counted `null`) |
 //! | `NUMERIC` / `BIGNUMERIC`               | `String` (full precision preserved) |
 //! | `BOOLEAN` / `BOOL`                     | `Bool`                           |
 //! | `RECORD` / `STRUCT`                    | nested `Object`                  |
@@ -178,17 +178,13 @@ fn record_to_json(payload: &Value, field: &TableFieldSchema) -> Value {
 }
 
 fn parse_integer(s: &str) -> Value {
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::Number(i.into());
-    }
-    parse_float(s)
+    faucet_core::fidelity::integer_text(s).unwrap_or_else(|_| Value::String(s.to_owned()))
 }
 
+/// A FLOAT64 cell; `NaN` / `Infinity` become a counted `null` (#885).
 fn parse_float(s: &str) -> Value {
     match s.parse::<f64>() {
-        Ok(f) => serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.to_owned())),
+        Ok(f) => faucet_core::fidelity::float64(f),
         Err(_) => Value::String(s.to_owned()),
     }
 }
@@ -215,6 +211,34 @@ mod tests {
     fn repeated(mut f: TableFieldSchema) -> TableFieldSchema {
         f.mode = Some("REPEATED".to_string());
         f
+    }
+
+    /// The value-fidelity corpus (#885): the wide row, encoded as the REST API
+    /// returns it (every scalar a string, a JSON column its text), decodes
+    /// back unchanged.
+    #[test]
+    fn the_fidelity_corpus_decodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::flat_corpus();
+        let mut fields = Vec::new();
+        let mut values = Vec::new();
+        for (name, v) in sent.as_object().unwrap() {
+            let (ty, cell) = match v {
+                Value::Null => (FieldType::String, Value::Null),
+                Value::Bool(b) => (FieldType::Boolean, json!(b.to_string())),
+                Value::Number(n) if n.is_f64() => (FieldType::Float, json!(n.to_string())),
+                Value::Number(n) => (FieldType::Integer, json!(n.to_string())),
+                Value::String(s) if name.starts_with("canonical_decimal") => {
+                    (FieldType::Numeric, json!(s))
+                }
+                Value::String(s) => (FieldType::String, json!(s)),
+                other => (FieldType::Json, json!(other.to_string())),
+            };
+            fields.push(field(name, ty));
+            values.push(cell);
+        }
+        let landed = row_to_json(&cells(values), &fields);
+        fidelity::assert_round_trip(&[sent], &[landed], fidelity::Tolerance::exact());
     }
 
     fn cells(values: Vec<Value>) -> TableRow {
