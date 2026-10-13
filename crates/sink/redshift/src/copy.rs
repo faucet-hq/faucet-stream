@@ -103,9 +103,14 @@ pub(crate) fn copy_statement(
 
 /// Build a multi-row `INSERT INTO table (cols) VALUES ($1,$2),($3,$4)…`.
 /// Placeholders are numbered `$1..=$(num_rows*columns.len())`.
-pub(crate) fn insert_statement(table_ref: &str, columns: &[String], num_rows: usize) -> String {
+pub(crate) fn insert_statement(
+    table_ref: &str,
+    columns: &[String],
+    casts: &[Option<&str>],
+    num_rows: usize,
+) -> String {
     Redshift
-        .insert_sql(table_ref, columns, &[], num_rows)
+        .insert_sql(table_ref, columns, casts, num_rows)
         .expect("redshift INSERT")
 }
 
@@ -360,7 +365,7 @@ mod tests {
 
     #[test]
     fn insert_statement_numbers_placeholders_per_row() {
-        let sql = insert_statement("\"t\"", &["a".into(), "b".into()], 2);
+        let sql = insert_statement("\"t\"", &["a".into(), "b".into()], &[], 2);
         assert_eq!(
             sql,
             "INSERT INTO \"t\" (\"a\", \"b\") VALUES ($1, $2), ($3, $4)"
@@ -369,8 +374,8 @@ mod tests {
 
     #[test]
     fn insert_statement_single_row() {
-        let sql = insert_statement("\"t\"", &["a".into()], 1);
-        assert_eq!(sql, "INSERT INTO \"t\" (\"a\") VALUES ($1)");
+        let sql = insert_statement("\"t\"", &["a".into()], &[Some("numeric(10,2)")], 1);
+        assert_eq!(sql, "INSERT INTO \"t\" (\"a\") VALUES ($1::numeric(10,2))");
     }
 
     #[test]

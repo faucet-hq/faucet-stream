@@ -23,8 +23,13 @@ impl SqlDialect for Redshift {
         faucet_core::util::quote_ident(name)
     }
 
-    fn placeholder(&self, n: usize, _sql_type: Option<&str>) -> String {
-        format!("${n}")
+    /// `$n`, cast to `sql_type` when given: a value bound as text then
+    /// lands in an exact-decimal column parsed by the server (#885).
+    fn placeholder(&self, n: usize, sql_type: Option<&str>) -> String {
+        match sql_type {
+            Some(t) => format!("${n}::{t}"),
+            None => format!("${n}"),
+        }
     }
 
     fn param_limit(&self) -> usize {

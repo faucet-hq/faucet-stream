@@ -140,9 +140,7 @@ fn money_json(text: &str) -> Result<Value, FaucetError> {
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
         .collect();
-    let decimal_at = kept
-        .rfind(['.', ','])
-        .filter(|&i| kept.len() - i - 1 != 3);
+    let decimal_at = kept.rfind(['.', ',']).filter(|&i| kept.len() - i - 1 != 3);
     let mut digits = String::with_capacity(kept.len() + 1);
     if negative {
         digits.push('-');
@@ -366,7 +364,11 @@ mod tests {
             ("￥1,235", "1235"),
             ("$0.07", "0.07"),
         ] {
-            assert_eq!(text_to_json(OID_MONEY, text).unwrap(), json!(exact), "{text}");
+            assert_eq!(
+                text_to_json(OID_MONEY, text).unwrap(),
+                json!(exact),
+                "{text}"
+            );
         }
         assert!(text_to_json(OID_MONEY, "n/a").is_err());
         assert_eq!(

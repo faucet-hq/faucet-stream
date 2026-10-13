@@ -308,6 +308,82 @@ pub fn non_integer_text(n: &Number) -> Option<String> {
     n.is_f64().then(|| n.to_string())
 }
 
+/// A PostgreSQL-wire binary `NUMERIC` (`ndigits`, `weight`, `sign`,
+/// `dscale`, then base-10000 digits) as an exact decimal string at its
+/// display scale — the column's declared scale. `NaN` / `±Infinity` are a
+/// counted `null`. `None` when the bytes are not a binary numeric.
+pub fn decimal_from_pg_numeric(bytes: &[u8]) -> Option<Value> {
+    let word = |i: usize| -> Option<u16> {
+        Some(u16::from_be_bytes([*bytes.get(i)?, *bytes.get(i + 1)?]))
+    };
+    let ndigits = usize::from(word(0)?);
+    let weight = i64::from(word(2)? as i16);
+    let sign = word(4)?;
+    let dscale = usize::from(word(6)?);
+    if matches!(sign, 0xC000 | 0xD000 | 0xF000) {
+        record_non_finite();
+        return Some(Value::Null);
+    }
+    if !matches!(sign, 0x0000 | 0x4000) || bytes.len() != 8 + 2 * ndigits {
+        return None;
+    }
+    let digits: Vec<u16> = (0..ndigits)
+        .map(|i| word(8 + 2 * i))
+        .collect::<Option<_>>()?;
+    if digits.iter().any(|d| *d > 9999) {
+        return None;
+    }
+    let group = |g: i64| -> u16 {
+        usize::try_from(g)
+            .ok()
+            .and_then(|i| digits.get(i).copied())
+            .unwrap_or(0)
+    };
+    let mut text = String::new();
+    if sign == 0x4000 {
+        text.push('-');
+    }
+    if weight < 0 {
+        text.push('0');
+    } else {
+        text.push_str(&group(0).to_string());
+        for g in 1..=weight {
+            text.push_str(&format!("{:04}", group(g)));
+        }
+    }
+    if dscale > 0 {
+        let mut frac = String::new();
+        let mut g = weight + 1;
+        while frac.len() < dscale {
+            frac.push_str(&format!("{:04}", group(g)));
+            g += 1;
+        }
+        frac.truncate(dscale);
+        text.push('.');
+        text.push_str(&frac);
+    }
+    decimal_text(&text).ok()
+}
+
+/// Whether a SQL column type holds an exact decimal (`NUMERIC(p,s)`,
+/// `DECIMAL`, `MONEY`, `NUMBER`, `BIGNUMERIC`): a sink binds such a column's
+/// value as text, so the server parses exactly the digits the record holds.
+pub fn is_exact_decimal_type(sql_type: &str) -> bool {
+    let t = sql_type.trim().to_ascii_lowercase();
+    [
+        "numeric",
+        "decimal",
+        "dec",
+        "money",
+        "smallmoney",
+        "number",
+        "bignumeric",
+        "bigdecimal",
+    ]
+    .iter()
+    .any(|p| t == *p || t.starts_with(&format!("{p}(")) || t.starts_with(&format!("{p} ")))
+}
+
 /// Bytes as standard base64 with padding.
 pub fn binary(bytes: &[u8]) -> Value {
     Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -652,6 +728,97 @@ mod tests {
         );
         assert_eq!(non_integer_text(&n(json!(7))), None);
         assert_eq!(non_integer_text(&n(json!(u64::MAX))), None);
+    }
+
+    /// `NUMERIC` in the PostgreSQL binary wire format.
+    fn pg_numeric(weight: i16, sign: u16, dscale: u16, digits: &[u16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for w in [digits.len() as u16, weight as u16, sign, dscale] {
+            b.extend_from_slice(&w.to_be_bytes());
+        }
+        for d in digits {
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn binary_pg_numerics_keep_their_scale() {
+        // 1.50 at scale 2.
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(0, 0, 2, &[1, 5000])),
+            Some(json!("1.50"))
+        );
+        // 12345678901234567890.123456789 at scale 9.
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(
+                4,
+                0,
+                9,
+                &[1234, 5678, 9012, 3456, 7890, 1234, 5678, 9000]
+            )),
+            Some(json!("12345678901234567890.123456789"))
+        );
+        // -0.0005 at scale 4: weight -1 skips the units group.
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(-1, 0x4000, 4, &[5])),
+            Some(json!("-0.0005"))
+        );
+        // 0.00000001: weight -2.
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(-2, 0, 8, &[1])),
+            Some(json!("0.00000001"))
+        );
+        // 20000 (trailing zero group dropped by the server), scale 0.
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(1, 0, 0, &[2])),
+            Some(json!("20000"))
+        );
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(0, 0, 0, &[])),
+            Some(json!("0"))
+        );
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(0, 0xC000, 0, &[])),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(0, 0x1234, 0, &[])),
+            None
+        );
+        assert_eq!(
+            decimal_from_pg_numeric(&pg_numeric(0, 0, 0, &[10000])),
+            None
+        );
+        assert_eq!(decimal_from_pg_numeric(&[0, 1]), None);
+        let mut short = pg_numeric(0, 0, 0, &[1, 2]);
+        short.pop();
+        assert_eq!(decimal_from_pg_numeric(&short), None);
+    }
+
+    #[test]
+    fn exact_decimal_types_are_recognised() {
+        for t in [
+            "NUMERIC(38,9)",
+            "numeric",
+            "DECIMAL(10, 2)",
+            "money",
+            "NUMBER",
+            "dec(5)",
+            "BIGNUMERIC",
+        ] {
+            assert!(is_exact_decimal_type(t), "{t}");
+        }
+        for t in [
+            "double precision",
+            "real",
+            "bigint",
+            "text",
+            "numerical_thing",
+            "decimals",
+        ] {
+            assert!(!is_exact_decimal_type(t), "{t}");
+        }
     }
 
     #[test]

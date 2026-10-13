@@ -42,6 +42,7 @@ faucet-source-postgres.workspace = true
 faucet-source-postgres-cdc.workspace = true
 faucet-source-parquet = { workspace = true, features = ["arrow"] }
 faucet-source-rabbitmq.workspace = true
+faucet-source-redshift.workspace = true
 faucet-source-rest.workspace = true
 faucet-source-s3 = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-sqlite.workspace = true
@@ -62,6 +63,7 @@ faucet-sink-oracle.workspace = true
 faucet-sink-postgres.workspace = true
 faucet-sink-parquet = { workspace = true, features = ["arrow"] }
 faucet-sink-rabbitmq.workspace = true
+faucet-sink-redshift.workspace = true
 faucet-sink-s3 = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-sftp = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-singer.workspace = true

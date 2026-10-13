@@ -29,6 +29,28 @@ pub(crate) fn pg_value_to_json(
         return Ok(Value::Null);
     }
     let type_name = raw.type_info().name().to_string();
+    // NUMERIC at its declared scale, exactly (#885).
+    if type_name.eq_ignore_ascii_case("NUMERIC")
+        && raw.format() == sqlx::postgres::PgValueFormat::Binary
+        && let Some(v) = raw
+            .as_bytes()
+            .ok()
+            .and_then(faucet_core::fidelity::decimal_from_pg_numeric)
+    {
+        return Ok(v);
+    }
+    // JSON with every number exact.
+    if matches!(type_name.as_str(), "JSON" | "JSONB")
+        && let Ok(bytes) = raw.as_bytes()
+    {
+        let text = match (type_name.as_str(), raw.format()) {
+            ("JSONB", sqlx::postgres::PgValueFormat::Binary) => bytes.get(1..).unwrap_or_default(),
+            _ => bytes,
+        };
+        if let Ok(v) = faucet_core::fidelity::parse_json(text) {
+            return Ok(v);
+        }
+    }
     if let Ok(v) = row.try_get::<Value, _>(col_name) {
         return Ok(v);
     }

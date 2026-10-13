@@ -594,7 +594,18 @@ fn pg_value_to_json(
     if let Ok(v) = row.try_get::<sqlx::types::Uuid, _>(col_name) {
         return Ok(Value::String(v.to_string()));
     }
-    // NUMERIC / DECIMAL → string, preserving exact precision.
+    // NUMERIC / DECIMAL (read natively when the text cast could not wrap the
+    // query) → its exact digits at the declared scale.
+    if let Ok(raw) = row.try_get_raw(col_name)
+        && raw.type_info().name().eq_ignore_ascii_case("NUMERIC")
+        && raw.format() == sqlx::postgres::PgValueFormat::Binary
+        && let Some(v) = raw
+            .as_bytes()
+            .ok()
+            .and_then(faucet_core::fidelity::decimal_from_pg_numeric)
+    {
+        return Ok(v);
+    }
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
         return Ok(Value::String(v.to_plain_string()));
     }
