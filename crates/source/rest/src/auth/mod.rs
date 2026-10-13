@@ -27,6 +27,16 @@ pub enum TokenBodyEncoding {
     Form,
 }
 
+/// The reqwest client a one-shot token fetch uses, built through
+/// [`faucet_core::http`] (#880). It follows no redirects: a token request
+/// carries its secret in the body, which must not be replayed elsewhere.
+pub(crate) fn token_client() -> reqwest::Client {
+    faucet_core::http::Client::new()
+        .expect("a default HTTP client always builds")
+        .inner()
+        .clone()
+}
+
 /// Supported authentication methods.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]

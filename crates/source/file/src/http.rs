@@ -25,7 +25,7 @@ pub struct HttpMeta {
 /// A client for one remote file.
 #[derive(Debug, Clone)]
 pub struct HttpFetcher {
-    client: reqwest::Client,
+    client: faucet_core::http::Client,
     headers: HeaderMap,
     retries: u32,
 }
@@ -57,9 +57,14 @@ impl HttpFetcher {
                 .map_err(|e| FaucetError::Config(format!("file source: header {k:?}: {e}")))?;
             map.insert(name, value);
         }
-        let client = reqwest::Client::builder()
+        let mut builder = faucet_core::http::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
+            .max_response_bytes(None);
+        for name in headers.keys() {
+            builder = builder.sensitive_header(name);
+        }
+        let client = builder
             .build()
             .map_err(|e| FaucetError::Config(format!("file source: http client: {e}")))?;
         Ok(Self {
@@ -102,9 +107,11 @@ impl HttpFetcher {
             slot.record(op);
             let result = self
                 .client
-                .request(method.clone(), url)
-                .headers(self.headers.clone())
-                .send()
+                .send(
+                    self.client
+                        .request(method.clone(), url)
+                        .headers(self.headers.clone()),
+                )
                 .await;
             let (class, wait, detail) = match result {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
@@ -130,12 +137,15 @@ impl HttpFetcher {
                     });
                 }
                 Err(e) => {
-                    let class = if e.is_timeout() {
-                        RetryClass::Timeout
-                    } else {
-                        RetryClass::Connection
+                    let class = match faucet_core::resilience::classify(&e) {
+                        Some(RetryClass::Timeout) => RetryClass::Timeout,
+                        _ => RetryClass::Connection,
                     };
-                    (class, backoff(attempt), e.to_string())
+                    let detail = match &e {
+                        FaucetError::Http(inner) => inner.to_string(),
+                        other => other.to_string(),
+                    };
+                    (class, backoff(attempt), detail)
                 }
             };
             if attempt >= self.retries {
@@ -147,8 +157,10 @@ impl HttpFetcher {
             slot.retry(class);
             if class == RetryClass::RateLimited {
                 let _timer = slot.throttle_wait_timer();
+                #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
                 tokio::time::sleep(wait).await;
             } else {
+                #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
                 tokio::time::sleep(wait).await;
             }
             attempt += 1;

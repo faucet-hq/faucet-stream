@@ -105,6 +105,7 @@ impl WebhookSource {
                 })
                 .into_future(),
         );
+        #[allow(clippy::disallowed_methods)] // the collection window, not a backend wait
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(self.config.timeout_secs));
         let done_notified = state.done.notified();
 
@@ -421,6 +422,7 @@ impl faucet_core::Source for WebhookSource {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests post to the server with a plain client
 mod tests {
     fn state(max_payloads: Option<usize>, closed: bool) -> std::sync::Arc<super::AppState> {
         std::sync::Arc::new(super::AppState {

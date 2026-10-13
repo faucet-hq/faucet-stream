@@ -121,3 +121,31 @@ async fn conformance_preflight_check_wellformed() {
     let source = WebsocketSource::new(base_config("ws://127.0.0.1:1")).unwrap();
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 }
+
+// ── Check: the handshake honours the call deadline and cancel (#880) ─────────
+
+/// A server that accepts TCP connections and never answers the handshake.
+async fn spawn_silent_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("ws://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let url = spawn_silent_server().await;
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        WebsocketSource::new(WebsocketSourceConfig {
+            reconnect: true,
+            ..base_config(&url)
+        })
+        .unwrap()
+    })
+    .await;
+}

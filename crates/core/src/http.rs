@@ -114,7 +114,7 @@ impl ClientBuilder {
     #[allow(clippy::disallowed_methods)] // the one sanctioned reqwest client constructor
     pub fn new() -> Self {
         Self {
-            inner: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+            inner: reqwest::Client::builder(),
             max_response_bytes: Some(DEFAULT_MAX_RESPONSE_BYTES),
             max_redirects: DEFAULT_MAX_REDIRECTS,
             sensitive: Vec::new(),
@@ -227,12 +227,33 @@ impl ClientBuilder {
             return Err(e);
         }
         Ok(Client {
-            inner: self.inner.build()?,
+            inner: self
+                .inner
+                .redirect(same_origin_redirects(self.max_redirects))
+                .build()?,
             max_response_bytes: self.max_response_bytes,
             max_redirects: self.max_redirects,
             sensitive: self.sensitive.into(),
         })
     }
+}
+
+/// reqwest's own redirect policy for a [`Client`]: follow a same-origin hop
+/// up to `max`, stop at a hop to another origin. [`Client::send`] follows that
+/// one with the credentials stripped; a request sent straight from a
+/// [`RequestBuilder`] gets the 3xx back, so nothing leaks either way.
+fn same_origin_redirects(max: usize) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let cross = attempt
+            .previous()
+            .last()
+            .is_some_and(|prev| is_cross_origin(prev, attempt.url()));
+        if cross || attempt.previous().len() > max {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// An HTTP client for connectors. Cheap to clone; build one in `new()` and
@@ -267,8 +288,9 @@ impl Client {
     }
 
     /// The underlying reqwest client, for request shapes this type does not
-    /// cover. Requests sent through it skip the redirect handling; send them
-    /// with [`send`](Self::send) instead.
+    /// cover. It follows same-origin redirects only: a request sent straight
+    /// from it gets a cross-origin 3xx back instead of following it. Send
+    /// through [`send`](Self::send) to follow those with credentials stripped.
     pub fn inner(&self) -> &reqwest::Client {
         &self.inner
     }
@@ -341,7 +363,15 @@ impl Client {
             else {
                 return Ok(resp);
             };
-            if hops >= self.max_redirects {
+            let from = resp.url().clone();
+            // reqwest follows same-origin hops itself and stops only at the
+            // limit or on a body it cannot replay.
+            let same_origin = !is_cross_origin(&from, &next_url);
+            let rewritten = from != url && !matches!(method, Method::GET | Method::HEAD);
+            if (same_origin && template.is_none()) || (!same_origin && rewritten) {
+                return Ok(resp);
+            }
+            if same_origin || hops >= self.max_redirects {
                 return Err(FaucetError::HttpStatus {
                     status: status.as_u16(),
                     url: crate::util::redact_uri_credentials(url.as_str()),
@@ -351,7 +381,7 @@ impl Client {
             let Some(next) = redirect_request(
                 status,
                 method,
-                &url,
+                &from,
                 next_url,
                 headers,
                 template,
@@ -412,8 +442,9 @@ impl Client {
     }
 }
 
-/// The request for the next redirect hop, or `None` when the hop cannot be
-/// replayed (a streamed body).
+/// The request for the next redirect hop, or `None` when the hop is not
+/// followed: a streamed body cannot be replayed, and a body is never replayed
+/// to another origin (it may carry credentials, like a token form).
 fn redirect_request(
     status: StatusCode,
     method: Method,
@@ -426,7 +457,8 @@ fn redirect_request(
     let to_get = status == StatusCode::SEE_OTHER
         || ((status == StatusCode::MOVED_PERMANENTLY || status == StatusCode::FOUND)
             && method == Method::POST);
-    if is_cross_origin(from, &to) {
+    let cross = is_cross_origin(from, &to);
+    if cross {
         strip_credentials(&mut headers, sensitive);
     }
     let mut next = if to_get {
@@ -446,6 +478,9 @@ fn redirect_request(
         Request::new(method, to)
     } else {
         let mut next = template?;
+        if cross && next.body().is_some() {
+            return None;
+        }
         *next.url_mut() = to;
         next
     };
@@ -590,6 +625,7 @@ mod tests {
         let seen: Seen = Arc::default();
         let other = serve(Router::new().route("/land", get(recorder(seen.clone(), "other")))).await;
         let to = format!("{other}/land");
+        let keep_to = to.clone();
         let same_seen = seen.clone();
         let origin = serve(
             Router::new()
@@ -598,6 +634,15 @@ mod tests {
                     get(move || {
                         let to = to.clone();
                         async move { (AxStatus::FOUND, [("location", to)]).into_response() }
+                    }),
+                )
+                .route(
+                    "/keep",
+                    any(move || {
+                        let to = keep_to.clone();
+                        async move {
+                            (AxStatus::TEMPORARY_REDIRECT, [("location", to)]).into_response()
+                        }
                     }),
                 )
                 .route(
@@ -629,6 +674,11 @@ mod tests {
             assert!(!has(&seen, "other", h), "{h} leaked cross-origin");
         }
         assert!(has(&seen, "other", "x-trace"));
+        let resp = client
+            .send(client.post(format!("{origin}/keep")).body("client_secret=s"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307, "a body is not replayed to another origin");
         client.send(req("/same")).await.unwrap();
         for h in ["authorization", "x-api-key", "x-session", "cookie"] {
             assert!(has(&seen, "same", h), "{h} kept on a same-origin hop");

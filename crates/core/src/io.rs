@@ -272,6 +272,40 @@ impl CallContext {
         }
     }
 
+    /// Wait `duration` the way a call waits: ended early with
+    /// [`FaucetError::Cancelled`] when the token fires, and with
+    /// [`FaucetError::Timeout`] when the deadline comes first. For a pause that
+    /// is not a retry — a poll interval, a server-requested pacing delay.
+    #[allow(clippy::disallowed_methods)] // the sanctioned connector wait
+    pub async fn wait(&self, duration: Duration) -> Result<(), FaucetError> {
+        if self.is_cancelled() {
+            return Err(cancelled_error("wait"));
+        }
+        let cancelled = async {
+            match &self.inner.cancel {
+                Some(c) => c.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let end = Instant::now() + duration;
+        match self.inner.deadline {
+            Some(deadline) if deadline < end => {
+                tokio::select! {
+                    biased;
+                    _ = cancelled => Err(cancelled_error("wait")),
+                    _ = tokio::time::sleep_until(deadline) => Err(deadline_error("wait")),
+                }
+            }
+            _ => {
+                tokio::select! {
+                    biased;
+                    _ = cancelled => Err(cancelled_error("wait")),
+                    _ = tokio::time::sleep_until(end) => Ok(()),
+                }
+            }
+        }
+    }
+
     /// The bound for the next attempt: the attempt timeout, cut to what is
     /// left of the deadline. `Err` once the deadline has passed.
     fn attempt_bound(&self, op: &'static str) -> Result<Option<Duration>, FaucetError> {
@@ -474,6 +508,11 @@ impl CallSlot {
         self.get().record(op);
     }
 
+    /// Wait through the effective context ([`CallContext::wait`]).
+    pub async fn wait(&self, duration: Duration) -> Result<(), FaucetError> {
+        self.get().wait(duration).await
+    }
+
     /// Run `f` through the effective context ([`CallContext::call`]).
     pub async fn call<T, F, Fut>(&self, op: &'static str, f: F) -> Result<T, FaucetError>
     where
@@ -626,6 +665,38 @@ mod tests {
             .await;
         assert!(matches!(r, Err(FaucetError::Cancelled { .. })));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_honours_cancel_and_deadline() {
+        let start = Instant::now();
+        CallContext::new()
+            .wait(Duration::from_secs(4))
+            .await
+            .unwrap();
+        assert!(Instant::now() - start >= Duration::from_secs(4));
+        let ctx = CallContext::new().with_deadline(Instant::now() + Duration::from_secs(1));
+        assert!(matches!(
+            ctx.wait(Duration::from_secs(10)).await,
+            Err(FaucetError::Timeout { .. })
+        ));
+        let token = CancellationToken::new();
+        let ctx = CallContext::new().with_cancel(token.clone());
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            t.cancel();
+        });
+        assert!(matches!(
+            ctx.wait(Duration::from_secs(10)).await,
+            Err(FaucetError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            ctx.wait(Duration::ZERO).await,
+            Err(FaucetError::Cancelled { .. })
+        ));
+        let slot = CallSlot::default();
+        slot.wait(Duration::from_millis(1)).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

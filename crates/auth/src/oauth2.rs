@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use faucet_core::{AuthProvider, Credential, FaucetError, StateStore};
-use reqwest::Client;
+use faucet_core::http::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -89,7 +89,7 @@ impl OAuth2ClientCredentialsProvider {
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
         let scope = self.scopes.join(" ");
-        let reply = crate::retry::send_token_request(|| {
+        let reply = crate::retry::send_token_request(&self.http, || {
             Ok(self.http.post(&self.token_url).form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", self.client_id.as_str()),
@@ -369,7 +369,7 @@ impl OAuth2RefreshProvider {
             form.push(("scope", scope));
         }
         let reply =
-            crate::retry::send_token_request(|| Ok(self.http.post(&self.token_url).form(&form)))
+            crate::retry::send_token_request(&self.http, || Ok(self.http.post(&self.token_url).form(&form)))
                 .await?;
         let body = parse_token_response(reply)?;
         state.access_token = Some(body.access_token.clone());

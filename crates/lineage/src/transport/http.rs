@@ -7,7 +7,7 @@ use faucet_core::FaucetError;
 use std::time::Duration;
 
 pub struct HttpTransport {
-    client: reqwest::Client,
+    client: faucet_core::http::Client,
     url: String,
     auth: Option<HttpAuth>,
 }
@@ -18,10 +18,13 @@ impl HttpTransport {
         timeout: Duration,
         auth: Option<HttpAuth>,
     ) -> Result<Self, FaucetError> {
-        let client = reqwest::Client::builder()
+        let client = faucet_core::http::Client::builder()
             .timeout(timeout)
             .build()
-            .map_err(|e| FaucetError::Custom(Box::new(e)))?;
+            .map_err(|e| match e {
+                FaucetError::Http(e) => FaucetError::Custom(Box::new(e)),
+                other => other,
+            })?;
         Ok(Self { client, url, auth })
     }
 }
@@ -37,10 +40,10 @@ impl Transport for HttpTransport {
         if let Some(HttpAuth::Bearer { token }) = &self.auth {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| FaucetError::Custom(Box::new(e.without_url())))?;
+        let resp = self.client.send(req).await.map_err(|e| match e {
+            FaucetError::Http(e) => FaucetError::Custom(Box::new(e.without_url())),
+            other => other,
+        })?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FaucetError::HttpStatus {

@@ -69,6 +69,7 @@ fn rejecting_close(frame: Option<&CloseFrame>) -> Option<FaucetError> {
 /// both the ceiling and the decorrelating jitter, so many clients watching one
 /// feed don't all redial on the same tick. Pure.
 /// Sleep `delay`, returning early when the run is cancelled.
+#[allow(clippy::disallowed_methods)] // reconnect cadence of a live feed, cancel-aware
 async fn sleep_or_cancel(delay: Duration, cancel: &CancellationToken) {
     tokio::select! {
         biased;
@@ -142,6 +143,11 @@ pub struct WebsocketSource {
     /// The run's cancellation token ([`Source::set_cancel`]): on cancel the
     /// stream stops reading and yields what it has buffered.
     cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// Backend-call context (#880) for the handshake: the run's recorder and
+    /// deadline, metered as `connect`. One attempt — the reconnect loop owns
+    /// retries — and no extra attempt timeout: `connect_timeout` bounds each
+    /// step.
+    calls: faucet_core::CallSlot,
 }
 
 impl WebsocketSource {
@@ -154,6 +160,11 @@ impl WebsocketSource {
             config,
             auth_provider: None,
             cancel: std::sync::Mutex::new(None),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_retry()
+                    .without_timeout(),
+            ),
         })
     }
 
@@ -166,6 +177,17 @@ impl WebsocketSource {
         self
     }
 
+    /// Whether a connect error came from the run's call context running out —
+    /// cancelled, or past its deadline — so reconnecting cannot help.
+    fn call_budget_spent(&self, e: &FaucetError) -> bool {
+        matches!(e, FaucetError::Cancelled { .. })
+            || self
+                .calls
+                .get()
+                .deadline()
+                .is_some_and(|d| tokio::time::Instant::now() >= d)
+    }
+
     /// Connect, apply auth + size limits, and send the subscribe frames.
     ///
     /// Auth is resolved here (not once at construction) so that reconnects
@@ -173,10 +195,13 @@ impl WebsocketSource {
     /// handshake the server rejects (a `401`, or a status the provider declares)
     /// re-authenticates the provider and connects once more (#789 API-06).
     async fn connect(&self, url: &str) -> Result<WsStream, FaucetError> {
-        faucet_core::send_with_reauth(self.auth_provider.as_ref(), |cred| {
-            self.connect_with(url, cred)
-        })
-        .await
+        self.calls
+            .call("connect", || {
+                faucet_core::send_with_reauth(self.auth_provider.as_ref(), |cred| {
+                    self.connect_with(url, cred)
+                })
+            })
+            .await
     }
 
     async fn connect_with(
@@ -316,6 +341,11 @@ impl Source for WebsocketSource {
                     // handshake: a server that accepts and then closes would
                     // otherwise never reach `max_reconnect_attempts` (API-33).
                     Ok(ws) => ws,
+                    // A cancelled or out-of-time call context ends the read.
+                    Err(e) if self.call_budget_spent(&e) => {
+                        Err(e)?;
+                        break 'outer;
+                    }
                     Err(e) => {
                         if reconnect
                             && max_attempts.is_none_or(|m| reconnect_attempts < m)
@@ -493,6 +523,17 @@ impl Source for WebsocketSource {
 
             tracing::info!(messages = total, "websocket source: stream complete");
         })
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
     }
 
     fn set_cancel(&self, cancel: CancellationToken) -> bool {

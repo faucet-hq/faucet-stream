@@ -61,3 +61,19 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// A hung endpoint: the write ends at the call deadline and on cancel (#880).
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let url = format!("{}/ingest", server.uri());
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || HttpSink::new(HttpSinkConfig::new(url.clone())),
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}
