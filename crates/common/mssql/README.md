@@ -131,6 +131,10 @@ None. This crate has no optional features — it is pure config + pool plumbing 
 - [`faucet-core`](https://crates.io/crates/faucet-core) — traits, `FaucetError`, and the pipeline runtime.
 - [faucet-stream documentation](https://faucet-hq.github.io/faucet-stream/) — connector reference and cookbook.
 
+## Timeouts, cancellation and retries
+
+`statement_call_context(statement_timeout_secs)` builds the call settings the MSSQL connectors share (#880), and `call_statement` runs one statement through a `CallContext`, reporting whether the call was cut short — the signal to `replace_connection` before a desynced connection returns to the pool.
+
 ## License
 
 Licensed under either of:

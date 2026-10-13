@@ -411,6 +411,10 @@ already landed a second time). See
 
 Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema. Cleanup needs `column_mapping: auto_columns`; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every statement runs through the pipeline's `CallContext` (#880) as one backend call (`insert`, `merge`, `begin`, `commit`, `rollback`, `query`, `statement`, `copy`): the run's deadline ends it promptly, `statement_timeout_secs` still bounds each data statement (DDL and the overwrite swap are bounded only by the deadline), and a statement cut short leaves its connection mid-response, so the connection is replaced and the server rolls its transaction back. Each counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. A chunk the server itself rolled back (deadlock victim, lock timeout) is re-run after a backoff that also ends at the deadline; nothing else is retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

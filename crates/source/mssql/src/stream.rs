@@ -18,7 +18,9 @@ use futures::{Stream, TryStreamExt};
 use serde_json::Value;
 use tiberius::{QueryItem, ToSql};
 
-use faucet_common_mssql::{MssqlPool, build_pool, quote_ident_mssql, with_statement_timeout};
+use faucet_common_mssql::{
+    MssqlPool, build_pool, call_statement, quote_ident_mssql, statement_call_context,
+};
 
 use crate::config::{MssqlReplication, MssqlSourceConfig};
 use crate::convert::row_to_json;
@@ -37,6 +39,9 @@ pub struct MssqlSource {
     applied_shard: Mutex<Option<PkShardBounds>>,
     /// Set once the float-MONEY fallback warning has been logged.
     money_warned: AtomicBool,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder.
+    calls: faucet_core::CallSlot,
 }
 
 impl MssqlSource {
@@ -44,20 +49,62 @@ impl MssqlSource {
     pub async fn new(config: MssqlSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let pool = build_pool(&config.connection, config.max_connections).await?;
+        let calls =
+            faucet_core::CallSlot::new(statement_call_context(config.statement_timeout_secs));
         Ok(Self {
             config,
             pool,
             start_bookmark: Mutex::new(None),
             applied_shard: Mutex::new(None),
             money_warned: AtomicBool::new(false),
+            calls,
         })
     }
 
-    fn timeout(&self) -> Option<Duration> {
+    /// The configured statement timeout, `None` when disabled.
+    fn statement_timeout(&self) -> Option<Duration> {
         match self.config.statement_timeout_secs {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
         }
+    }
+
+    /// Run `fut` as one backend call through `ctx` (#880); see
+    /// [`call_statement`]. The caller replaces the connection when the call
+    /// was cut short.
+    async fn bounded<T>(
+        &self,
+        ctx: &faucet_core::CallContext,
+        op: &'static str,
+        fut: impl std::future::Future<Output = Result<T, FaucetError>>,
+        timed_out: impl FnOnce() -> FaucetError,
+    ) -> (Result<T, FaucetError>, bool) {
+        call_statement(ctx, op, self.statement_timeout(), fut, timed_out).await
+    }
+
+    /// Replace a connection a cut-short statement left desynced, so the pool
+    /// never hands it out again.
+    async fn recover(&self, conn: &mut faucet_common_mssql::MssqlPooledConnection<'_>) {
+        if let Err(e) = faucet_common_mssql::replace_connection(&self.config.connection, conn).await
+        {
+            tracing::warn!(error = %e, "MSSQL: could not replace a desynced connection");
+        }
+    }
+
+    /// Check a connection out of the pool under the call context.
+    async fn checkout(
+        &self,
+    ) -> Result<faucet_common_mssql::MssqlPooledConnection<'_>, FaucetError> {
+        self.calls
+            .get()
+            .with_roundtrip_metering(false)
+            .call_once("checkout", async {
+                self.pool
+                    .get()
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("MSSQL pool checkout failed: {e}")))
+            })
+            .await
     }
 
     fn current_start(&self) -> Option<Value> {
@@ -298,6 +345,17 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
 
 #[async_trait]
 impl Source for MssqlSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -328,60 +386,89 @@ impl Source for MssqlSource {
         let (query, values, incr) = build_query_and_params(&self.config, context, start.as_ref());
 
         Box::pin(async_stream::try_stream! {
-            let mut conn = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| FaucetError::Source(format!("MSSQL pool checkout failed: {e}")))?;
+            let mut conn = self.checkout().await?;
 
-            let planned = match self.timeout() {
-                Some(t) => with_statement_timeout(
-                    t,
-                    async { Ok(money::plan(&mut conn, &query, &values).await) },
-                    || FaucetError::Source("MSSQL result-shape probe timed out".into()),
-                )
-                .await?,
-                None => money::plan(&mut conn, &query, &values).await,
+            let planned = {
+                let (out, cut) = self.bounded(&self.calls.get(), "describe", async { Ok(money::plan(&mut conn, &query, &values).await) }, || FaucetError::Source("MSSQL result-shape probe timed out".into())).await;
+                if cut {
+                    self.recover(&mut conn).await;
+                }
+                out?
             };
             let query = self.shard_wrap(money::resolve(query, planned, &self.money_warned));
 
             // Scope the borrowed param slice to the query() call — the
             // QueryStream borrows the connection, not the params.
-            let mut stream = {
-                let owned: Vec<OwnedParam> = values.iter().map(OwnedParam::from_value).collect();
-                let refs: Vec<&dyn ToSql> = owned.iter().map(OwnedParam::as_tosql).collect();
-                let query_fut = conn.query(&query, &refs);
-                match self.timeout() {
-                    Some(t) => {
-                        with_statement_timeout(t, async {
-                            query_fut.await.map_err(|e| {
-                                FaucetError::Source(format!("MSSQL query failed: {e}"))
-                            })
-                        }, || FaucetError::Source("MSSQL query timed out".into()))
-                        .await?
-                    }
-                    None => query_fut
-                        .await
-                        .map_err(|e| FaucetError::Source(format!("MSSQL query failed: {e}")))?,
-                }
-            };
-
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
             let mut running_max: Option<Value> = None;
             let mut total = 0usize;
 
-            let idle = self.timeout();
-            while let Some(item) = next_row(&mut stream, idle).await? {
-                let QueryItem::Row(row) = item else { continue };
-                buffer.push(row_to_json(&row)?);
-                if buffer.len() >= chunk {
-                    let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-                    let kept = apply_incremental(page, incr.as_ref(), &mut running_max);
-                    total += kept.len();
-                    if !kept.is_empty() {
-                        yield StreamPage { records: kept, bookmark: None };
+            // The query and its row stream borrow the connection; a call cut
+            // short leaves the block with the error, and the connection is
+            // replaced once the borrow has ended.
+            let mut cut_short = false;
+            let failure: Option<FaucetError> = 'read: {
+                let (started, cut) = {
+                    let owned: Vec<OwnedParam> = values.iter().map(OwnedParam::from_value).collect();
+                    let refs: Vec<&dyn ToSql> = owned.iter().map(OwnedParam::as_tosql).collect();
+                    let query_fut = conn.query(&query, &refs);
+                    self.bounded(
+                        &self.calls.get(),
+                        "query",
+                        async {
+                            query_fut
+                                .await
+                                .map_err(|e| FaucetError::Source(format!("MSSQL query failed: {e}")))
+                        },
+                        || FaucetError::Source("MSSQL query timed out".into()),
+                    )
+                    .await
+                };
+                let mut stream = match started {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        cut_short = cut;
+                        break 'read Some(e);
+                    }
+                };
+
+                // `statement_timeout_secs` bounds every wait for a row, not
+                // only the first; a row read is not a round trip of its own.
+                let steps = self.calls.get().with_roundtrip_metering(false);
+                let idle = self.config.statement_timeout_secs;
+                loop {
+                    let (next, cut) = self
+                        .bounded(&steps, "query", next_row(&mut stream, None), || {
+                            FaucetError::Source(format!(
+                                "MSSQL row stream: no row within statement_timeout_secs ({idle}s)"
+                            ))
+                        })
+                        .await;
+                    let item = match next {
+                        Ok(Some(item)) => item,
+                        Ok(None) => break 'read None,
+                        Err(e) => {
+                            cut_short = cut;
+                            break 'read Some(e);
+                        }
+                    };
+                    let QueryItem::Row(row) = item else { continue };
+                    buffer.push(row_to_json(&row)?);
+                    if buffer.len() >= chunk {
+                        let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
+                        let kept = apply_incremental(page, incr.as_ref(), &mut running_max);
+                        total += kept.len();
+                        if !kept.is_empty() {
+                            yield StreamPage { records: kept, bookmark: None };
+                        }
                     }
                 }
+            };
+            if let Some(e) = failure {
+                if cut_short {
+                    self.recover(&mut conn).await;
+                }
+                Err(e)?;
             }
 
             // Final page carries the bookmark so the pipeline persists only
@@ -499,10 +586,7 @@ impl Source for MssqlSource {
             FaucetError::Source(format!("mssql: catalog discovery failed: {e}"))
         };
 
-        let mut conn =
-            self.pool.get().await.map_err(|e| {
-                FaucetError::Source(format!("mssql: catalog discovery failed: {e}"))
-            })?;
+        let mut conn = self.checkout().await?;
 
         let rows = {
             let run = async {
@@ -513,14 +597,16 @@ impl Source for MssqlSource {
                     .await
                     .map_err(map_err)
             };
-            match self.timeout() {
-                Some(t) => {
-                    with_statement_timeout(t, run, || {
+            {
+                let (out, cut) = self
+                    .bounded(&self.calls.get(), "query", run, || {
                         FaucetError::Source("mssql: catalog discovery timed out".into())
                     })
-                    .await?
+                    .await;
+                if cut {
+                    self.recover(&mut conn).await;
                 }
-                None => run.await?,
+                out?
             }
         };
 
@@ -557,14 +643,16 @@ impl Source for MssqlSource {
                     .await
                     .map_err(map_err)
             };
-            match self.timeout() {
-                Some(t) => {
-                    with_statement_timeout(t, run, || {
+            {
+                let (out, cut) = self
+                    .bounded(&self.calls.get(), "query", run, || {
                         FaucetError::Source("mssql: catalog discovery timed out".into())
                     })
-                    .await
+                    .await;
+                if cut {
+                    self.recover(&mut conn).await;
                 }
-                None => run.await,
+                out
             }
         };
         match est_rows {
@@ -604,14 +692,16 @@ impl Source for MssqlSource {
                     .await
                     .map_err(map_err)
             };
-            match self.timeout() {
-                Some(t) => {
-                    with_statement_timeout(t, run, || {
+            {
+                let (out, cut) = self
+                    .bounded(&self.calls.get(), "query", run, || {
                         FaucetError::Source("mssql: primary-key discovery timed out".into())
                     })
-                    .await?
+                    .await;
+                if cut {
+                    self.recover(&mut conn).await;
                 }
-                None => run.await?,
+                out?
             }
         };
         let mut keys: Vec<(String, String)> = Vec::with_capacity(key_rows.len());
@@ -653,11 +743,7 @@ impl Source for MssqlSource {
         let key = quote_ident_mssql(&shard_cfg.key)?;
         let bounds_sql = pk_bounds_query(&inner, &key, "BIGINT");
 
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| FaucetError::Source(format!("MSSQL pool checkout failed: {e}")))?;
+        let mut conn = self.checkout().await?;
 
         let rows = {
             let owned: Vec<OwnedParam> = values.iter().map(OwnedParam::from_value).collect();
@@ -684,14 +770,16 @@ impl Source for MssqlSource {
                         ))
                     })
             };
-            match self.timeout() {
-                Some(t) => {
-                    with_statement_timeout(t, run, || {
+            {
+                let (out, cut) = self
+                    .bounded(&self.calls.get(), "query", run, || {
                         FaucetError::Source("MSSQL shard-bounds query timed out".into())
                     })
-                    .await?
+                    .await;
+                if cut {
+                    self.recover(&mut conn).await;
                 }
-                None => run.await?,
+                out?
             }
         };
 
@@ -731,22 +819,21 @@ impl MssqlSource {
         let start = self.current_start();
         let (query, values, incr) = build_query_and_params(&self.config, context, start.as_ref());
 
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| FaucetError::Source(format!("MSSQL pool checkout failed: {e}")))?;
+        let mut conn = self.checkout().await?;
 
-        let planned = match self.timeout() {
-            Some(t) => {
-                with_statement_timeout(
-                    t,
+        let planned = {
+            let (out, cut) = self
+                .bounded(
+                    &self.calls.get(),
+                    "describe",
                     async { Ok(money::plan(&mut conn, &query, &values).await) },
                     || FaucetError::Source("MSSQL result-shape probe timed out".into()),
                 )
-                .await?
+                .await;
+            if cut {
+                self.recover(&mut conn).await;
             }
-            None => money::plan(&mut conn, &query, &values).await,
+            out?
         };
         let query = self.shard_wrap(money::resolve(query, planned, &self.money_warned));
 
@@ -761,14 +848,16 @@ impl MssqlSource {
                     .await
                     .map_err(|e| FaucetError::Source(format!("MSSQL result read failed: {e}")))
             };
-            match self.timeout() {
-                Some(t) => {
-                    with_statement_timeout(t, run, || {
+            {
+                let (out, cut) = self
+                    .bounded(&self.calls.get(), "query", run, || {
                         FaucetError::Source("MSSQL query timed out".into())
                     })
-                    .await?
+                    .await;
+                if cut {
+                    self.recover(&mut conn).await;
                 }
-                None => run.await?,
+                out?
             }
         };
 

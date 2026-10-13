@@ -166,6 +166,43 @@ where
     }
 }
 
+/// The call settings of an MSSQL connector (#880): `statement_timeout_secs`
+/// (`0` = none) bounds each statement and each wait for a row; a statement is
+/// never retried.
+pub fn statement_call_context(statement_timeout_secs: u64) -> faucet_core::CallContext {
+    let ctx = faucet_core::CallContext::new().without_retry();
+    match statement_timeout_secs {
+        0 => ctx.without_timeout(),
+        secs => ctx.with_timeout(Duration::from_secs(secs)),
+    }
+}
+
+/// Run one statement future as a backend call named `op` through `ctx` (#880).
+///
+/// Returns its result and whether the call cut it short — the statement
+/// timeout, the run's deadline or a cancel. A statement dropped mid-TDS leaves
+/// its connection desynced, so the caller must [`replace_connection`] before
+/// the connection returns to the pool. A cut by the statement timeout itself
+/// (an attempt bound equal to `statement_timeout`) surfaces as `timed_out()`.
+pub async fn call_statement<T, F>(
+    ctx: &faucet_core::CallContext,
+    op: &'static str,
+    statement_timeout: Option<Duration>,
+    fut: F,
+    timed_out: impl FnOnce() -> FaucetError,
+) -> (Result<T, FaucetError>, bool)
+where
+    F: Future<Output = Result<T, FaucetError>>,
+{
+    match ctx.call_once(op, async { Ok(fut.await) }).await {
+        Ok(result) => (result, false),
+        Err(FaucetError::Timeout { after, .. }) if Some(after) == statement_timeout => {
+            (Err(timed_out()), true)
+        }
+        Err(e) => (Err(e), true),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
@@ -266,5 +303,50 @@ mod tests {
         assert!(socket2::SockRef::from(&tcp).keepalive().unwrap());
         assert!(tcp.nodelay().unwrap());
         let _ = manager(Config::new());
+    }
+
+    #[tokio::test]
+    async fn call_statement_reports_which_side_cut_it_short() {
+        let ctx = statement_call_context(0);
+        assert!(ctx.timeout().is_none());
+        let ok = call_statement(&ctx, "query", None, async { Ok(1) }, || {
+            FaucetError::Source("late".into())
+        })
+        .await;
+        assert_eq!((ok.0.unwrap(), ok.1), (1, false));
+        let failed = call_statement(
+            &ctx,
+            "query",
+            None,
+            async { Err::<u8, _>(FaucetError::Source("boom".into())) },
+            || FaucetError::Source("late".into()),
+        )
+        .await;
+        assert!(!failed.1 && failed.0.unwrap_err().to_string().contains("boom"));
+
+        let bound = Duration::from_millis(10);
+        let ctx = faucet_core::CallContext::new().with_timeout(bound);
+        let slow = call_statement(
+            &ctx,
+            "query",
+            Some(bound),
+            std::future::pending::<Result<u8, FaucetError>>(),
+            || FaucetError::Source("query timed out".into()),
+        )
+        .await;
+        assert!(slow.1);
+        assert!(matches!(slow.0, Err(FaucetError::Source(m)) if m == "query timed out"));
+
+        let ctx = statement_call_context(300)
+            .with_deadline(tokio::time::Instant::now() + Duration::from_millis(10));
+        let late = call_statement(
+            &ctx,
+            "query",
+            Some(Duration::from_secs(300)),
+            std::future::pending::<Result<u8, FaucetError>>(),
+            || FaucetError::Source("unused".into()),
+        )
+        .await;
+        assert!(late.1 && matches!(late.0, Err(FaucetError::Timeout { .. })));
     }
 }
