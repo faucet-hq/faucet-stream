@@ -6,8 +6,12 @@
 //! — no process-global `SPANNER_EMULATOR_HOST` env var, so parallel tests
 //! never race.
 
+#![allow(dead_code)] // each test binary uses a different subset of the helpers
+
 use faucet_common_spanner::SpannerConnection;
-use gcloud_googleapis::spanner::admin::database::v1::CreateDatabaseRequest;
+use gcloud_googleapis::spanner::admin::database::v1::{
+    CreateDatabaseRequest, UpdateDatabaseDdlRequest,
+};
 use gcloud_googleapis::spanner::admin::instance::v1::{CreateInstanceRequest, Instance};
 use gcloud_spanner::statement::Statement;
 use testcontainers::core::ContainerPort;
@@ -49,6 +53,7 @@ pub fn connection(database: &str, host: &str) -> SpannerConnection {
         auth: Default::default(),
         max_sessions: 20,
         emulator_host: Some(host.into()),
+        dialect: Default::default(),
     }
 }
 
@@ -116,13 +121,61 @@ pub async fn create_database(database: &str, ddl: Vec<String>) -> SpannerConnect
     conn
 }
 
+/// `DatabaseDialect::POSTGRESQL` on the wire.
+const DIALECT_POSTGRESQL: i32 = 2;
+
+/// Create a fresh **PostgreSQL-dialect** database and apply `ddl` (PG
+/// databases cannot take DDL in the create request). The returned connection
+/// carries `dialect: postgresql`.
+pub async fn create_pg_database(database: &str, ddl: Vec<String>) -> SpannerConnection {
+    let host = emulator_host().await;
+    let mut conn = connection(database, &host);
+    conn.dialect = faucet_common_spanner::SpannerDialect::Postgresql;
+    let admin = conn.connect_admin().await.expect("admin connect");
+    admin
+        .database()
+        .create_database(
+            CreateDatabaseRequest {
+                parent: format!("projects/{PROJECT}/instances/{INSTANCE}"),
+                create_statement: format!("CREATE DATABASE \"{database}\""),
+                database_dialect: DIALECT_POSTGRESQL,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create pg database")
+        .wait(None)
+        .await
+        .expect("pg database LRO");
+    if !ddl.is_empty() {
+        admin
+            .database()
+            .update_database_ddl(
+                UpdateDatabaseDdlRequest {
+                    database: conn.database_path(),
+                    statements: ddl,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("pg ddl")
+            .wait(None)
+            .await
+            .expect("pg ddl LRO");
+    }
+    conn
+}
+
 /// Count rows in `table` via a raw client.
 pub async fn count_rows(conn: &SpannerConnection, table: &str) -> usize {
     let client = conn.connect().await.expect("count client");
     let mut tx = client.single().await.expect("single txn");
     let mut iter = tx
         .query(Statement::new(format!(
-            "SELECT COUNT(*) AS c FROM `{table}`"
+            "SELECT COUNT(*) AS c FROM {}",
+            conn.dialect.quote_ident(table)
         )))
         .await
         .expect("count query");

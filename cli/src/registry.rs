@@ -531,6 +531,15 @@ pub async fn build_source(
                 decode::<faucet_source_spanner::SpannerSourceConfig>("source", "spanner", config)?;
             boxed_source(faucet_source_spanner::SpannerSource::new(cfg)).await
         }
+        #[cfg(feature = "source-spanner-cdc")]
+        "spanner-cdc" => {
+            let cfg = decode::<faucet_source_spanner_cdc::SpannerCdcSourceConfig>(
+                "source",
+                "spanner-cdc",
+                config,
+            )?;
+            boxed_source(faucet_source_spanner_cdc::SpannerCdcSource::new(cfg)).await
+        }
         #[cfg(feature = "source-parquet")]
         "parquet" => {
             let cfg =
@@ -912,6 +921,7 @@ pub const LAG_SOURCE_KINDS: &[&str] = &[
     "mssql-cdc",
     "mongodb-cdc",
     "oracle-cdc",
+    "spanner-cdc",
     "kafka",
     "kinesis",
     "dynamodb",
@@ -930,6 +940,8 @@ pub fn source_state_schema(kind: &str) -> u32 {
     match kind {
         #[cfg(feature = "source-mongodb-cdc")]
         "mongodb-cdc" => faucet_source_mongodb_cdc::STATE_SCHEMA,
+        #[cfg(feature = "source-spanner-cdc")]
+        "spanner-cdc" => faucet_source_spanner_cdc::STATE_SCHEMA,
         _ => 0,
     }
 }
@@ -941,6 +953,8 @@ pub fn migrate_source_state(kind: &str, from: u32, data: Value) -> Result<Value,
     match kind {
         #[cfg(feature = "source-mongodb-cdc")]
         "mongodb-cdc" => faucet_source_mongodb_cdc::migrate_state(from, data),
+        #[cfg(feature = "source-spanner-cdc")]
+        "spanner-cdc" => faucet_source_spanner_cdc::migrate_state(from, data),
         _ if from == source_state_schema(kind) => Ok(data),
         _ => Err(FaucetError::State(format!(
             "{kind} has no migration from bookmark schema {from} to {}",
@@ -1881,6 +1895,13 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
             config,
             |c| c.validate(),
         ),
+        #[cfg(feature = "source-spanner-cdc")]
+        "spanner-cdc" => check_with::<faucet_source_spanner_cdc::SpannerCdcSourceConfig, _, _>(
+            "spanner-cdc",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-parquet")]
         "parquet" => check::<faucet_source_parquet::ParquetSourceConfig>("parquet", name, config),
         #[cfg(feature = "source-delta")]
@@ -2391,6 +2412,8 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         "kinesis" => Ok(schema::<faucet_source_kinesis::KinesisSourceConfig>()),
         #[cfg(feature = "source-spanner")]
         "spanner" => Ok(schema::<faucet_source_spanner::SpannerSourceConfig>()),
+        #[cfg(feature = "source-spanner-cdc")]
+        "spanner-cdc" => Ok(schema::<faucet_source_spanner_cdc::SpannerCdcSourceConfig>()),
         #[cfg(feature = "source-parquet")]
         "parquet" => Ok(schema::<faucet_source_parquet::ParquetSourceConfig>()),
         #[cfg(feature = "source-delta")]
@@ -2642,6 +2665,8 @@ pub(crate) fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)>
     v.push(("kinesis", "AWS Kinesis Data Streams consumer. Per-shard workers with resumable sequence-number checkpoints and idle/max-messages termination."));
     #[cfg(feature = "source-spanner")]
     v.push(("spanner", "Google Cloud Spanner query source. Streaming SQL reads with incremental replication bookmarks, stale reads, and PK-range sharding."));
+    #[cfg(feature = "source-spanner-cdc")]
+    v.push(("spanner-cdc", "Google Cloud Spanner change streams (CDC) source. Per-partition tailing with a resumable partition-tree bookmark."));
     #[cfg(feature = "source-parquet")]
     v.push(("parquet", deprecated("parquet")));
     #[cfg(feature = "source-delta")]

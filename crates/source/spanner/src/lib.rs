@@ -30,5 +30,5 @@ mod config;
 mod stream;
 
 pub use config::{ShardConfig, SpannerReplication, SpannerSourceConfig};
-pub use faucet_common_spanner::{SpannerConnection, SpannerCredentials};
+pub use faucet_common_spanner::{SpannerConnection, SpannerCredentials, SpannerDialect};
 pub use stream::SpannerSource;

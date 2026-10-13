@@ -58,6 +58,7 @@ source = [
     "source-bigquery",
     "source-snowflake",
     "source-spanner",
+    "source-spanner-cdc",
     "source-singer",
 ]
 ## All sink connectors.
@@ -329,6 +330,8 @@ source-bigquery = ["dep:faucet-source-bigquery", "dep:faucet-common-bigquery"]
 source-snowflake = ["dep:faucet-source-snowflake", "dep:faucet-common-snowflake"]
 ## Enable the Google Cloud Spanner query source.
 source-spanner = ["dep:faucet-source-spanner", "dep:faucet-common-spanner"]
+## Enable the Google Cloud Spanner change streams (CDC) source.
+source-spanner-cdc = ["dep:faucet-source-spanner-cdc", "dep:faucet-common-spanner"]
 
 ## Individual sink connectors.
 sink-bigquery = ["dep:faucet-sink-bigquery"]
@@ -482,6 +485,7 @@ faucet-source-gcs = { workspace = true, optional = true }
 faucet-source-bigquery = { workspace = true, optional = true }
 faucet-source-snowflake = { workspace = true, optional = true }
 faucet-source-spanner = { workspace = true, optional = true }
+faucet-source-spanner-cdc = { workspace = true, optional = true }
 faucet-sink-bigquery = { workspace = true, optional = true }
 faucet-sink-iceberg = { workspace = true, optional = true }
 faucet-sink-postgres = { workspace = true, optional = true }
@@ -699,8 +703,8 @@ features = [
     "source-mssql-cdc", "source-mysql", "source-mysql-cdc", "source-nats", "source-parquet",
     "source-postgres", "source-postgres-cdc", "source-pubsub", "source-rabbitmq",
     "source-redis", "source-redshift", "source-rest-excel", "source-s3", "source-sftp",
-    "source-singer", "source-snowflake", "source-spanner", "source-sqlite", "source-sqs",
-    "source-webhook", "source-websocket", "source-xml-excel", "state", "transform-cast",
+    "source-singer", "source-snowflake", "source-spanner", "source-spanner-cdc", "source-sqlite",
+    "source-sqs", "source-webhook", "source-websocket", "source-xml-excel", "state", "transform-cast",
     "transform-coalesce", "transform-cross-join", "transform-drop", "transform-explode",
     "transform-filter", "transform-flatten", "transform-hash", "transform-json-encode",
     "transform-json-parse", "transform-keys-case", "transform-lookup", "transform-redact",

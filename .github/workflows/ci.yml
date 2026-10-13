@@ -519,6 +519,7 @@ jobs:
           - source-bigquery
           - source-snowflake
           - source-spanner
+          - source-spanner-cdc
           - source-singer
           # Sinks
           - sink-bigquery

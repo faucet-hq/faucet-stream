@@ -57,6 +57,7 @@ members = [
     "crates/source/bigquery",
     "crates/source/snowflake",
     "crates/source/spanner",
+    "crates/source/spanner-cdc",
     "crates/source/delta",
     "crates/source/databricks",
     "crates/sink/bigquery",
@@ -192,6 +193,7 @@ faucet-source-parquet = { path = "crates/source/parquet", version = "1" }
 faucet-source-bigquery = { path = "crates/source/bigquery", version = "1" }
 faucet-source-snowflake = { path = "crates/source/snowflake", version = "1" }
 faucet-source-spanner = { path = "crates/source/spanner", version = "1" }
+faucet-source-spanner-cdc = { path = "crates/source/spanner-cdc", version = "1" }
 faucet-source-delta = { path = "crates/source/delta", version = "1" }
 faucet-source-databricks = { path = "crates/source/databricks", version = "1" }
 faucet-sink-mysql = { path = "crates/sink/mysql", version = "1" }

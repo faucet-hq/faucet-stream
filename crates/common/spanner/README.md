@@ -23,12 +23,20 @@ sink crate rather than this one directly.
   connector configs: `project_id` / `instance` / `database` / `auth` /
   `max_sessions` (session-pool bound; channels sized at one per 100 sessions)
   / `emulator_host` (per-connector emulator override — the process-global
-  `SPANNER_EMULATOR_HOST` env var is also honored when unset). Provides
+  `SPANNER_EMULATOR_HOST` env var is also honored when unset) / `dialect`
+  (`google_standard_sql` by default, or `postgresql`). Provides
   `connect()` (data-plane client) and `connect_admin()` (DDL/instance admin
   client) plus `database_path()`.
 
+- **`SpannerDialect`** (module `dialect`) — the GoogleSQL / PostgreSQL
+  differences in one place: identifier quoting, placeholders and bind names,
+  catalog queries, DDL type names, scope casts, and `named_to_positional`
+  (rewrites `@name` to `$N` for PostgreSQL). The GoogleSQL output is the
+  pre-existing text, unchanged.
+
 - **`types`** — `parse_spanner_type` (`INFORMATION_SCHEMA` type strings →
-  `SpannerType`, including `ARRAY<…>`) and `spanner_type_to_json_schema`.
+  `SpannerType`, including `ARRAY<…>`), `parse_pg_spanner_type` (the
+  PostgreSQL spellings) and `spanner_type_to_json_schema`.
 
 - **`decode`** — generic Spanner row → `serde_json::Value` decoding for
   arbitrary queries: INT64 stays a lossless JSON integer, NUMERIC stays a

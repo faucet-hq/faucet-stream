@@ -277,7 +277,7 @@ warehouse is dbt's job, and the two work well together
 
 ## Connectors
 
-<!--COUNT:sources-->43<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
+<!--COUNT:sources-->44<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
 connector depends only on `faucet-core`, so any source works with any sink.
 
 | Category | Sources | Sinks |

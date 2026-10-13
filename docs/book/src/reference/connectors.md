@@ -1,6 +1,6 @@
 # Connector catalog
 
-faucet-stream ships **<!--COUNT:sources-->43<!--/COUNT--> sources** and **<!--COUNT:sinks-->35<!--/COUNT--> sinks**. Each is a Cargo feature
+faucet-stream ships **<!--COUNT:sources-->44<!--/COUNT--> sources** and **<!--COUNT:sinks-->35<!--/COUNT--> sinks**. Each is a Cargo feature
 (`source-<name>` / `sink-<name>`) and an independently published crate. Full API
 docs are on [docs.rs](https://docs.rs/faucet-stream).
 
@@ -69,7 +69,8 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | ClickHouse | T1 ✅ | `source-clickhouse` | ✓ | ✓ | ✗ | ✗ | ✗ | HTTP interface, `FORMAT JSONEachRow` streaming; incremental replication |
 | BigQuery | T1 ✅ᵐ | `source-bigquery` | ✓ | ✗ | ✗ | ✗ | ✓ | `jobs.query` + pageToken pagination |
 | Snowflake | T1 ✅ᵐ | `source-snowflake` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL REST API, server-side partitions |
-| Cloud Spanner | T1 ✅ᵉ | `source-spanner` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | streaming SQL (gRPC), incremental `@bookmark` replication, stale reads, PK-range sharding |
+| Cloud Spanner | T1 ✅ᵉ | `source-spanner` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | streaming SQL (gRPC), incremental `@bookmark` replication, stale reads, PK-range sharding; GoogleSQL or PostgreSQL dialect (`dialect:`) |
+| Cloud Spanner CDC | T1 ✅ᵉ | `source-spanner-cdc` | ✓ | ✓ | ✗ | ✗ | ✗ | change streams (partition tree, parents-before-children ordering), transaction-atomic pages, per-partition bookmarks; at-least-once; GoogleSQL or PostgreSQL dialect (`dialect:`); `MUTABLE_KEY_RANGE` refused |
 | Singer bridge ⚠️ | T2 ⚠️ | `source-singer` | ✓ | ✓⁹ | ✗ | ✗ | ✗ | runs an external Singer tap; NDJSON over stdout, STATE→bookmark. **Tier-2 / experimental** |
 
 ¹⁰ **Discover** = enumerates the datasets behind the connection for
@@ -281,7 +282,7 @@ config this project treats as a defect.
 | Apache Kafka | T1 ✅ | `sink-kafka` | ✓ | ✗ | ✗ | **✓** | best-effort | producer, batched sends, multi-topic routing; transactional producer + compacted watermark side-topic for effectively-once |
 | AWS Kinesis | T1 ✅ | `sink-kinesis` | ✓ | ✗ | ✗ | ✗ | best-effort | batched PutRecords; partition-key routing, per-entry partial-failure retry (DLQ-routable) |
 | Google Cloud Pub/Sub | T1 ✅ᵉ | `sink-pubsub` | ✓ | ✗ | ✗ | ✗ | per-row | batched publish; optional ordering key, per-entry partial-failure retry (DLQ-routable) |
-| Cloud Spanner | T1 ✅ᵉ | `sink-spanner` | ✓ | ✗ | **✓** | **✓** | best-effort | batched mutations (`insert` / `insert_or_update` / `delete`), cell-budget chunking, commit-token transaction for effectively-once |
+| Cloud Spanner | T1 ✅ᵉ | `sink-spanner` | ✓ | ✗ | **✓** | **✓** | best-effort | batched mutations (`insert` / `insert_or_update` / `delete`), cell-budget chunking, commit-token transaction for effectively-once; GoogleSQL or PostgreSQL dialect (`dialect:`) |
 | Apache Parquet *(deprecated: use `file`)* | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | best-effort | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
 | Apache Delta Lake | T1 ✅ | `sink-delta` | ✓ | ✗⁶ | ✗ | ✗ | atomic (unless `target_file_size` splits a page) | append-only; local FS or S3/Azure/GCS; schema-inferred table creation, partitioning, one commit per flush |
 | Apache Iceberg | T2 | `sink-iceberg` | ✓ | ✗⁶ | ✗ | **✓** | per-row | REST/Glue/SQL/HMS catalog, local + cloud (S3/GCS) warehouses, `fast_append` snapshot, Parquet data files |

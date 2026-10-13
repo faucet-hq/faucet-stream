@@ -48,6 +48,7 @@ cargo add faucet-stream --features full
 | `source-grpc` | no | gRPC — dynamic protobuf via prost-reflect (unary + server-streaming) |
 | `source-postgres` | no | PostgreSQL — run SQL, return rows as JSON |
 | `source-postgres-cdc` | no | PostgreSQL CDC — logical replication (pgoutput), resumable |
+| `source-spanner-cdc` | no | Cloud Spanner change streams — partition-aware CDC, resumable |
 | `source-mysql` | no | MySQL — SQL queries as JSON |
 | `source-mysql-cdc` | no | MySQL CDC — binlog replication, resumable |
 | `source-mssql` | no | Microsoft SQL Server — streaming, incremental replication |

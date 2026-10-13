@@ -30,5 +30,5 @@ mod config;
 mod sink;
 
 pub use config::SpannerSinkConfig;
-pub use faucet_common_spanner::{SpannerConnection, SpannerCredentials};
+pub use faucet_common_spanner::{SpannerConnection, SpannerCredentials, SpannerDialect};
 pub use sink::SpannerSink;

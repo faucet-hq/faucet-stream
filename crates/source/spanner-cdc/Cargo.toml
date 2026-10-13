@@ -1,0 +1,52 @@
+[package]
+name = "faucet-source-spanner-cdc"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Google Cloud Spanner change streams (CDC) source for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["spanner", "gcp", "cdc", "changestream", "etl"]
+categories.workspace = true
+
+[dependencies]
+faucet-core.workspace = true
+faucet-common-spanner.workspace = true
+gcloud-spanner.workspace = true
+gcloud-googleapis.workspace = true
+gcloud-gax.workspace = true
+prost-types = "0.14"
+chrono.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+futures.workspace = true
+
+[dev-dependencies]
+faucet-conformance.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
+testcontainers = "0.27"
+futures.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides.
+#
+# Additive evolution is a MINOR bump by declared contract (CLAUDE.md
+# "API-Evolution & Versioning Policy"): struct-literal construction and
+# exhaustive matching of config/data types are NOT part of this crate's
+# stability surface — construct via serde deserialization, `new()`/`Default`,
+# or builders, and match with a `_` arm. So adding an optional config field
+# never forces a major. Every other API-stability lint stays at its default
+# (deny) level, so genuine removals and signature changes still fail the gate.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

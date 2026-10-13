@@ -114,6 +114,7 @@ source = [
     "source-bigquery",
     "source-snowflake",
     "source-spanner",
+    "source-spanner-cdc",
     "source-singer",
 ]
 sink = [
@@ -206,6 +207,7 @@ source-gcs = ["dep:faucet-source-gcs"]
 source-bigquery = ["dep:faucet-source-bigquery"]
 source-snowflake = ["dep:faucet-source-snowflake"]
 source-spanner = ["dep:faucet-source-spanner"]
+source-spanner-cdc = ["dep:faucet-source-spanner-cdc"]
 source-singer = ["dep:faucet-source-singer"]
 
 sink-bigquery = ["dep:faucet-sink-bigquery"]
@@ -603,6 +605,7 @@ faucet-source-gcs = { workspace = true, optional = true }
 faucet-source-bigquery = { workspace = true, optional = true }
 faucet-source-snowflake = { workspace = true, optional = true }
 faucet-source-spanner = { workspace = true, optional = true }
+faucet-source-spanner-cdc = { workspace = true, optional = true }
 faucet-source-singer = { workspace = true, optional = true }
 faucet-sink-bigquery = { workspace = true, optional = true }
 faucet-sink-iceberg = { workspace = true, optional = true }
@@ -781,7 +784,8 @@ features = [
     "source-mysql-cdc", "source-nats", "source-parquet", "source-postgres",
     "source-postgres-cdc", "source-pubsub", "source-rabbitmq", "source-redis",
     "source-redshift", "source-rest-excel", "source-s3", "source-sftp", "source-singer",
-    "source-snowflake", "source-spanner", "source-sqlite", "source-sqs", "source-webhook",
+    "source-snowflake", "source-spanner", "source-spanner-cdc", "source-sqlite", "source-sqs",
+    "source-webhook",
     "source-websocket", "source-xml-excel", "state", "templates-sync-object-store", "tenants",
     "transform-wasm", "transforms", "triggers-object-store", "triggers-redis",
 ]

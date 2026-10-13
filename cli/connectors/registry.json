@@ -300,6 +300,15 @@
       "description": "Google Cloud Spanner query source (streaming SQL, incremental replication)"
     },
     {
+      "name": "spanner-cdc",
+      "kind": "source",
+      "title": "Cloud Spanner CDC",
+      "category": "cdc",
+      "verified": true,
+      "tier": "stable",
+      "description": "Google Cloud Spanner change streams (CDC) source"
+    },
+    {
       "name": "bigquery",
       "kind": "sink",
       "title": "Google BigQuery",
