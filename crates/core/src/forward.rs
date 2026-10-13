@@ -45,6 +45,15 @@ pub mod __forward {
     pub use chrono;
     /// Whether this build of `faucet-core` has the `arrow` hooks.
     pub const ARROW: bool = cfg!(feature = "arrow");
+
+    /// The future an `#[async_trait]` hook returns.
+    pub type Fut<'a, T> = ::core::pin::Pin<Box<dyn ::core::future::Future<Output = T> + Send + 'a>>;
+    /// A hook's fallible result.
+    pub type Res<T> = Result<T, crate::FaucetError>;
+    /// The parent-record context a fetch receives.
+    pub type Ctx = std::collections::HashMap<String, crate::Value>;
+    /// A page stream a source returns.
+    pub type Pages<'a, T> = ::core::pin::Pin<Box<dyn crate::Stream<Item = Res<T>> + Send + 'a>>;
 }
 
 /// Emits its input only when `faucet-core` was built with `arrow`.
@@ -107,41 +116,403 @@ macro_rules! forward_source {
     ($inner:tt) => { $crate::forward_source!($inner; except); };
     ($inner:tt; except $($skip:ident),* $(,)?) => {
         $crate::__faucet_forward_known!(@source [$($skip)*]);
-        $crate::__faucet_forward_filter!(fetch_with_context [$($skip)*] { fn fetch_with_context<'life0, 'life1, 'async_trait>(&'life0 self, context: &'life1 ::std::collections::HashMap<::std::string::String, $crate::Value>) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<$crate::Value>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.fetch_with_context(context) } });
-        $crate::__faucet_forward_filter!(fetch_all [$($skip)*] { fn fetch_all<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<$crate::Value>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.fetch_all() } });
-        $crate::__faucet_forward_filter!(fetch_with_context_incremental [$($skip)*] { fn fetch_with_context_incremental<'life0, 'life1, 'async_trait>(&'life0 self, context: &'life1 ::std::collections::HashMap<::std::string::String, $crate::Value>) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(::std::vec::Vec<$crate::Value>, ::core::option::Option<$crate::Value>), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.fetch_with_context_incremental(context) } });
-        $crate::__faucet_forward_filter!(fetch_all_incremental [$($skip)*] { fn fetch_all_incremental<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(::std::vec::Vec<$crate::Value>, ::core::option::Option<$crate::Value>), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.fetch_all_incremental() } });
-        $crate::__faucet_forward_filter!(stream_pages [$($skip)*] { fn stream_pages<'a>(&'a self, context: &'a ::std::collections::HashMap<::std::string::String, $crate::Value>, batch_size: usize) -> ::core::pin::Pin<::std::boxed::Box<dyn $crate::Stream<Item = ::core::result::Result<$crate::pipeline::StreamPage, $crate::FaucetError>> + ::core::marker::Send + 'a>> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.stream_pages(context, batch_size) } });
-        $crate::__faucet_if_arrow! { $crate::__faucet_forward_filter!(supports_columnar [$($skip)*] { fn supports_columnar(&self) -> bool { #[allow(unused_imports)] use $crate::Source as _; self.$inner.supports_columnar() } }); }
-        $crate::__faucet_if_arrow! { $crate::__faucet_forward_filter!(stream_batches [$($skip)*] { fn stream_batches<'a>(&'a self, context: &'a ::std::collections::HashMap<::std::string::String, $crate::Value>, batch_size: usize) -> ::core::pin::Pin<::std::boxed::Box<dyn $crate::Stream<Item = ::core::result::Result<$crate::columnar::ColumnarPage, $crate::FaucetError>> + ::core::marker::Send + 'a>> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.stream_batches(context, batch_size) } }); }
-        $crate::__faucet_forward_filter!(native_output_formats [$($skip)*] { fn native_output_formats(&self) -> &'static [$crate::native::NativeFormat] { #[allow(unused_imports)] use $crate::Source as _; self.$inner.native_output_formats() } });
-        $crate::__faucet_forward_filter!(stream_native [$($skip)*] { fn stream_native<'a>(&'a self, context: &'a ::std::collections::HashMap<::std::string::String, $crate::Value>, format: $crate::native::NativeFormat, batch_size: usize) -> ::core::pin::Pin<::std::boxed::Box<dyn $crate::Stream<Item = ::core::result::Result<$crate::native::NativeBatch, $crate::FaucetError>> + ::core::marker::Send + 'a>> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.stream_native(context, format, batch_size) } });
-        $crate::__faucet_forward_filter!(config_schema [$($skip)*] { fn config_schema(&self) -> $crate::Value { #[allow(unused_imports)] use $crate::Source as _; self.$inner.config_schema() } });
-        $crate::__faucet_forward_filter!(state_key [$($skip)*] { fn state_key(&self) -> ::core::option::Option<::std::string::String> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.state_key() } });
-        $crate::__faucet_forward_filter!(apply_start_bookmark [$($skip)*] { fn apply_start_bookmark<'life0, 'async_trait>(&'life0 self, bookmark: $crate::Value) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.apply_start_bookmark(bookmark) } });
-        $crate::__faucet_forward_filter!(capture_resume_position [$($skip)*] { fn capture_resume_position<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::core::option::Option<$crate::Value>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.capture_resume_position() } });
-        $crate::__faucet_forward_filter!(lag [$($skip)*] { fn lag<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::core::option::Option<$crate::lag::SourceLag>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.lag() } });
-        $crate::__faucet_forward_filter!(state_schema [$($skip)*] { fn state_schema(&self) -> u32 { #[allow(unused_imports)] use $crate::Source as _; self.$inner.state_schema() } });
-        $crate::__faucet_forward_filter!(migrate_state [$($skip)*] { fn migrate_state(&self, from: u32, data: $crate::Value) -> ::core::result::Result<$crate::Value, $crate::FaucetError> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.migrate_state(from, data) } });
-        $crate::__faucet_forward_filter!(supports_exactly_once [$($skip)*] { fn supports_exactly_once(&self) -> bool { #[allow(unused_imports)] use $crate::Source as _; self.$inner.supports_exactly_once() } });
-        $crate::__faucet_forward_filter!(consumes_destructively [$($skip)*] { fn consumes_destructively(&self) -> bool { #[allow(unused_imports)] use $crate::Source as _; self.$inner.consumes_destructively() } });
-        $crate::__faucet_forward_filter!(replay_guarantee [$($skip)*] { fn replay_guarantee(&self) -> $crate::idempotency::ReplayGuarantee { #[allow(unused_imports)] use $crate::Source as _; self.$inner.replay_guarantee() } });
-        $crate::__faucet_forward_filter!(is_shardable [$($skip)*] { fn is_shardable(&self) -> bool { #[allow(unused_imports)] use $crate::Source as _; self.$inner.is_shardable() } });
-        $crate::__faucet_forward_filter!(enumerate_shards [$($skip)*] { fn enumerate_shards<'life0, 'async_trait>(&'life0 self, target: usize) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<$crate::shard::ShardSpec>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.enumerate_shards(target) } });
-        $crate::__faucet_forward_filter!(apply_shard [$($skip)*] { fn apply_shard<'life0, 'life1, 'async_trait>(&'life0 self, shard: &'life1 $crate::shard::ShardSpec) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.apply_shard(shard) } });
-        $crate::__faucet_forward_filter!(range_digest [$($skip)*] { fn range_digest<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, range: &'life1 $crate::diff::KeyRange, key: &'life2 str, columns: &'life3 [::std::string::String]) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::core::option::Option<$crate::diff::ServerDigest>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.range_digest(range, key, columns) } });
-        $crate::__faucet_forward_filter!(supports_discover [$($skip)*] { fn supports_discover(&self) -> bool { #[allow(unused_imports)] use $crate::Source as _; self.$inner.supports_discover() } });
-        $crate::__faucet_forward_filter!(discover [$($skip)*] { fn discover<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<$crate::discover::DatasetDescriptor>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.discover() } });
-        $crate::__faucet_forward_filter!(record_table [$($skip)*] { fn record_table(&self, record: &$crate::Value) -> ::core::option::Option<::std::string::String> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.record_table(record) } });
-        $crate::__faucet_forward_filter!(position_le [$($skip)*] { fn position_le(&self, a: &$crate::Value, b: &$crate::Value) -> ::core::option::Option<bool> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.position_le(a, b) } });
-        $crate::__faucet_forward_filter!(record_covered [$($skip)*] { fn record_covered(&self, record: &$crate::Value, position: &$crate::Value) -> ::core::option::Option<bool> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.record_covered(record, position) } });
-        $crate::__faucet_forward_filter!(position_min [$($skip)*] { fn position_min(&self, positions: &[$crate::Value]) -> ::core::option::Option<$crate::Value> { #[allow(unused_imports)] use $crate::Source as _; self.$inner.position_min(positions) } });
-        $crate::__faucet_forward_filter!(connector_name [$($skip)*] { fn connector_name(&self) -> &'static str { #[allow(unused_imports)] use $crate::Source as _; self.$inner.connector_name() } });
-        $crate::__faucet_forward_filter!(set_roundtrip_recorder [$($skip)*] { fn set_roundtrip_recorder(&self, recorder: ::std::sync::Arc<$crate::observability::RoundtripRecorder>) -> () { #[allow(unused_imports)] use $crate::Source as _; self.$inner.set_roundtrip_recorder(recorder) } });
-        $crate::__faucet_forward_filter!(set_run_clock [$($skip)*] { fn set_run_clock(&self, now: $crate::forward::__forward::chrono::DateTime<$crate::forward::__forward::chrono::Utc>) -> () { #[allow(unused_imports)] use $crate::Source as _; self.$inner.set_run_clock(now) } });
-        $crate::__faucet_forward_filter!(set_cancel [$($skip)*] { fn set_cancel(&self, cancel: $crate::CancellationToken) -> bool { #[allow(unused_imports)] use $crate::Source as _; self.$inner.set_cancel(cancel) } });
-        $crate::__faucet_forward_filter!(dataset_uri [$($skip)*] { fn dataset_uri(&self) -> ::std::string::String { #[allow(unused_imports)] use $crate::Source as _; self.$inner.dataset_uri() } });
-        $crate::__faucet_forward_filter!(check [$($skip)*] { fn check<'life0, 'life1, 'async_trait>(&'life0 self, ctx: &'life1 $crate::check::CheckContext) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<$crate::check::CheckReport, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Source as _; self.$inner.check(ctx) } });
+        $crate::__faucet_forward_filter!(fetch_with_context [$($skip)*] {
+            fn fetch_with_context<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                context: &'life1 $crate::forward::__forward::Ctx,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::std::vec::Vec<$crate::Value>>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.fetch_with_context(context)
+            }
+        });
+        $crate::__faucet_forward_filter!(fetch_all [$($skip)*] {
+            fn fetch_all<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::std::vec::Vec<$crate::Value>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.fetch_all()
+            }
+        });
+        $crate::__faucet_forward_filter!(fetch_with_context_incremental [$($skip)*] {
+            fn fetch_with_context_incremental<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                context: &'life1 $crate::forward::__forward::Ctx,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<(::std::vec::Vec<$crate::Value>, ::core::option::Option<$crate::Value>)>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.fetch_with_context_incremental(context)
+            }
+        });
+        $crate::__faucet_forward_filter!(fetch_all_incremental [$($skip)*] {
+            fn fetch_all_incremental<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<(::std::vec::Vec<$crate::Value>, ::core::option::Option<$crate::Value>)>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.fetch_all_incremental()
+            }
+        });
+        $crate::__faucet_forward_filter!(stream_pages [$($skip)*] {
+            fn stream_pages<'a>(
+                &'a self,
+                context: &'a $crate::forward::__forward::Ctx,
+                batch_size: usize,
+            ) -> $crate::forward::__forward::Pages<'a, $crate::pipeline::StreamPage>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.stream_pages(context, batch_size)
+            }
+        });
+        $crate::__faucet_if_arrow! {
+            $crate::__faucet_forward_filter!(supports_columnar [$($skip)*] {
+                fn supports_columnar(&self) -> bool
+                {
+                    #[allow(unused_imports)]
+                    use $crate::Source as _;
+                    self.$inner.supports_columnar()
+                }
+            });
+        }
+        $crate::__faucet_if_arrow! {
+            $crate::__faucet_forward_filter!(stream_batches [$($skip)*] {
+                fn stream_batches<'a>(
+                    &'a self,
+                    context: &'a $crate::forward::__forward::Ctx,
+                    batch_size: usize,
+                ) -> $crate::forward::__forward::Pages<'a, $crate::columnar::ColumnarPage>
+                {
+                    #[allow(unused_imports)]
+                    use $crate::Source as _;
+                    self.$inner.stream_batches(context, batch_size)
+                }
+            });
+        }
+        $crate::__faucet_forward_filter!(native_output_formats [$($skip)*] {
+            fn native_output_formats(&self) -> &'static [$crate::native::NativeFormat]
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.native_output_formats()
+            }
+        });
+        $crate::__faucet_forward_filter!(stream_native [$($skip)*] {
+            fn stream_native<'a>(
+                &'a self,
+                context: &'a $crate::forward::__forward::Ctx,
+                format: $crate::native::NativeFormat,
+                batch_size: usize,
+            ) -> $crate::forward::__forward::Pages<'a, $crate::native::NativeBatch>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.stream_native(context, format, batch_size)
+            }
+        });
+        $crate::__faucet_forward_filter!(config_schema [$($skip)*] {
+            fn config_schema(&self) -> $crate::Value
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.config_schema()
+            }
+        });
+        $crate::__faucet_forward_filter!(state_key [$($skip)*] {
+            fn state_key(&self) -> ::core::option::Option<::std::string::String>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.state_key()
+            }
+        });
+        $crate::__faucet_forward_filter!(apply_start_bookmark [$($skip)*] {
+            fn apply_start_bookmark<'life0, 'async_trait>(
+                &'life0 self,
+                bookmark: $crate::Value,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.apply_start_bookmark(bookmark)
+            }
+        });
+        $crate::__faucet_forward_filter!(capture_resume_position [$($skip)*] {
+            fn capture_resume_position<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<$crate::Value>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.capture_resume_position()
+            }
+        });
+        $crate::__faucet_forward_filter!(lag [$($skip)*] {
+            fn lag<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<$crate::lag::SourceLag>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.lag()
+            }
+        });
+        $crate::__faucet_forward_filter!(state_schema [$($skip)*] {
+            fn state_schema(&self) -> u32
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.state_schema()
+            }
+        });
+        $crate::__faucet_forward_filter!(migrate_state [$($skip)*] {
+            fn migrate_state(
+                &self,
+                from: u32,
+                data: $crate::Value,
+            ) -> $crate::forward::__forward::Res<$crate::Value>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.migrate_state(from, data)
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_exactly_once [$($skip)*] {
+            fn supports_exactly_once(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.supports_exactly_once()
+            }
+        });
+        $crate::__faucet_forward_filter!(consumes_destructively [$($skip)*] {
+            fn consumes_destructively(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.consumes_destructively()
+            }
+        });
+        $crate::__faucet_forward_filter!(replay_guarantee [$($skip)*] {
+            fn replay_guarantee(&self) -> $crate::idempotency::ReplayGuarantee
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.replay_guarantee()
+            }
+        });
+        $crate::__faucet_forward_filter!(is_shardable [$($skip)*] {
+            fn is_shardable(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.is_shardable()
+            }
+        });
+        $crate::__faucet_forward_filter!(enumerate_shards [$($skip)*] {
+            fn enumerate_shards<'life0, 'async_trait>(
+                &'life0 self,
+                target: usize,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::std::vec::Vec<$crate::shard::ShardSpec>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.enumerate_shards(target)
+            }
+        });
+        $crate::__faucet_forward_filter!(apply_shard [$($skip)*] {
+            fn apply_shard<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                shard: &'life1 $crate::shard::ShardSpec,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.apply_shard(shard)
+            }
+        });
+        $crate::__faucet_forward_filter!(range_digest [$($skip)*] {
+            fn range_digest<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+                &'life0 self,
+                range: &'life1 $crate::diff::KeyRange,
+                key: &'life2 str,
+                columns: &'life3 [::std::string::String],
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<$crate::diff::ServerDigest>>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                'life3: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.range_digest(range, key, columns)
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_discover [$($skip)*] {
+            fn supports_discover(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.supports_discover()
+            }
+        });
+        $crate::__faucet_forward_filter!(discover [$($skip)*] {
+            fn discover<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::std::vec::Vec<$crate::discover::DatasetDescriptor>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.discover()
+            }
+        });
+        $crate::__faucet_forward_filter!(record_table [$($skip)*] {
+            fn record_table(
+                &self,
+                record: &$crate::Value,
+            ) -> ::core::option::Option<::std::string::String>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.record_table(record)
+            }
+        });
+        $crate::__faucet_forward_filter!(position_le [$($skip)*] {
+            fn position_le(
+                &self,
+                a: &$crate::Value,
+                b: &$crate::Value,
+            ) -> ::core::option::Option<bool>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.position_le(a, b)
+            }
+        });
+        $crate::__faucet_forward_filter!(record_covered [$($skip)*] {
+            fn record_covered(
+                &self,
+                record: &$crate::Value,
+                position: &$crate::Value,
+            ) -> ::core::option::Option<bool>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.record_covered(record, position)
+            }
+        });
+        $crate::__faucet_forward_filter!(position_min [$($skip)*] {
+            fn position_min(
+                &self,
+                positions: &[$crate::Value],
+            ) -> ::core::option::Option<$crate::Value>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.position_min(positions)
+            }
+        });
+        $crate::__faucet_forward_filter!(connector_name [$($skip)*] {
+            fn connector_name(&self) -> &'static str
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.connector_name()
+            }
+        });
+        $crate::__faucet_forward_filter!(set_roundtrip_recorder [$($skip)*] {
+            fn set_roundtrip_recorder(
+                &self,
+                recorder: ::std::sync::Arc<$crate::observability::RoundtripRecorder>,
+            ) -> ()
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.set_roundtrip_recorder(recorder)
+            }
+        });
+        $crate::__faucet_forward_filter!(set_run_clock [$($skip)*] {
+            fn set_run_clock(
+                &self,
+                now: $crate::forward::__forward::chrono::DateTime<$crate::forward::__forward::chrono::Utc>,
+            ) -> ()
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.set_run_clock(now)
+            }
+        });
+        $crate::__faucet_forward_filter!(set_cancel [$($skip)*] {
+            fn set_cancel(&self, cancel: $crate::CancellationToken) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.set_cancel(cancel)
+            }
+        });
+        $crate::__faucet_forward_filter!(dataset_uri [$($skip)*] {
+            fn dataset_uri(&self) -> ::std::string::String
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.dataset_uri()
+            }
+        });
+        $crate::__faucet_forward_filter!(check [$($skip)*] {
+            fn check<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                ctx: &'life1 $crate::check::CheckContext,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<$crate::check::CheckReport>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.check(ctx)
+            }
+        });
     };
 }
 
@@ -199,45 +570,472 @@ macro_rules! forward_sink {
     ($inner:tt) => { $crate::forward_sink!($inner; except); };
     ($inner:tt; except $($skip:ident),* $(,)?) => {
         $crate::__faucet_forward_known!(@sink [$($skip)*]);
-        $crate::__faucet_forward_filter!(write_batch [$($skip)*] { fn write_batch<'life0, 'life1, 'async_trait>(&'life0 self, records: &'life1 [$crate::Value]) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<usize, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.write_batch(records) } });
-        $crate::__faucet_forward_filter!(flush [$($skip)*] { fn flush<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.flush() } });
-        $crate::__faucet_forward_filter!(write_batch_partial [$($skip)*] { fn write_batch_partial<'life0, 'life1, 'async_trait>(&'life0 self, records: &'life1 [$crate::Value]) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<$crate::traits::RowOutcome>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.write_batch_partial(records) } });
-        $crate::__faucet_forward_filter!(batch_atomicity [$($skip)*] { fn batch_atomicity(&self) -> $crate::dlq::BatchAtomicity { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.batch_atomicity() } });
-        $crate::__faucet_forward_filter!(admit_page [$($skip)*] { fn admit_page<'life0, 'life1, 'async_trait>(&'life0 self, records: &'life1 [$crate::Value]) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.admit_page(records) } });
-        $crate::__faucet_if_arrow! { $crate::__faucet_forward_filter!(supports_columnar [$($skip)*] { fn supports_columnar(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supports_columnar() } }); }
-        $crate::__faucet_if_arrow! { $crate::__faucet_forward_filter!(write_batch_columnar [$($skip)*] { fn write_batch_columnar<'life0, 'life1, 'async_trait>(&'life0 self, batch: &'life1 $crate::forward::__forward::arrow::array::RecordBatch) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<usize, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.write_batch_columnar(batch) } }); }
-        $crate::__faucet_forward_filter!(native_load_capabilities [$($skip)*] { fn native_load_capabilities(&self) -> ::std::vec::Vec<$crate::native::NativeLoadCapability> { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.native_load_capabilities() } });
-        $crate::__faucet_forward_filter!(load_native [$($skip)*] { fn load_native<'life0, 'life1, 'async_trait>(&'life0 self, batch: $crate::native::NativeBatch, scope: &'life1 str, ctx: $crate::native::NativeLoadContext) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<usize, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.load_native(batch, scope, ctx) } });
-        $crate::__faucet_forward_filter!(supports_idempotent_writes [$($skip)*] { fn supports_idempotent_writes(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supports_idempotent_writes() } });
-        $crate::__faucet_forward_filter!(sink_guarantee [$($skip)*] { fn sink_guarantee(&self) -> $crate::idempotency::SinkGuarantee { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.sink_guarantee() } });
-        $crate::__faucet_forward_filter!(write_batch_is_replay_safe [$($skip)*] { fn write_batch_is_replay_safe(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.write_batch_is_replay_safe() } });
-        $crate::__faucet_forward_filter!(dedups_by_key [$($skip)*] { fn dedups_by_key(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.dedups_by_key() } });
-        $crate::__faucet_forward_filter!(supported_write_modes [$($skip)*] { fn supported_write_modes(&self) -> &'static [$crate::write_mode::WriteMode] { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supported_write_modes() } });
-        $crate::__faucet_forward_filter!(current_schema [$($skip)*] { fn current_schema<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::core::option::Option<$crate::Value>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.current_schema() } });
-        $crate::__faucet_forward_filter!(supports_schema_evolution [$($skip)*] { fn supports_schema_evolution(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supports_schema_evolution() } });
-        $crate::__faucet_forward_filter!(evolve_schema [$($skip)*] { fn evolve_schema<'life0, 'life1, 'async_trait>(&'life0 self, evolution: &'life1 $crate::drift::SchemaEvolution) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.evolve_schema(evolution) } });
-        $crate::__faucet_forward_filter!(supports_cleanup [$($skip)*] { fn supports_cleanup(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supports_cleanup() } });
-        $crate::__faucet_forward_filter!(supports_staged_load [$($skip)*] { fn supports_staged_load(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supports_staged_load() } });
-        $crate::__faucet_forward_filter!(cleanup_scope [$($skip)*] { fn cleanup_scope<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, scope: &'life1 ::std::collections::BTreeMap<::std::string::String, $crate::Value>, seen: &'life2 $crate::cleanup::SeenKeys) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<u64, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.cleanup_scope(scope, seen) } });
-        $crate::__faucet_forward_filter!(write_batch_idempotent [$($skip)*] { fn write_batch_idempotent<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, records: &'life1 [$crate::Value], scope: &'life2 str, token: &'life3 str) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<usize, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.write_batch_idempotent(records, scope, token) } });
-        $crate::__faucet_forward_filter!(last_committed_token [$($skip)*] { fn last_committed_token<'life0, 'life1, 'async_trait>(&'life0 self, scope: &'life1 str) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::core::option::Option<::std::string::String>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.last_committed_token(scope) } });
-        $crate::__faucet_forward_filter!(is_overwrite [$($skip)*] { fn is_overwrite(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.is_overwrite() } });
-        $crate::__faucet_forward_filter!(begin_overwrite [$($skip)*] { fn begin_overwrite<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.begin_overwrite() } });
-        $crate::__faucet_forward_filter!(commit_overwrite [$($skip)*] { fn commit_overwrite<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.commit_overwrite() } });
-        $crate::__faucet_forward_filter!(supports_rollback [$($skip)*] { fn supports_rollback(&self) -> bool { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.supports_rollback() } });
-        $crate::__faucet_forward_filter!(rollback_run [$($skip)*] { fn rollback_run<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, run_id: &'life1 str, opts: &'life2 $crate::rollback::RollbackOptions) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<$crate::rollback::RollbackOutcome, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.rollback_run(run_id, opts) } });
-        $crate::__faucet_forward_filter!(forget_run [$($skip)*] { fn forget_run<'life0, 'life1, 'async_trait>(&'life0 self, run_id: &'life1 str) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.forget_run(run_id) } });
-        $crate::__faucet_forward_filter!(rewind_commit_token [$($skip)*] { fn rewind_commit_token<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, scope: &'life1 str, token: ::core::option::Option<&'life2 str>) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.rewind_commit_token(scope, token) } });
-        $crate::__faucet_forward_filter!(readback_source [$($skip)*] { fn readback_source(&self) -> ::core::option::Option<(::std::string::String, $crate::Value)> { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.readback_source() } });
-        $crate::__faucet_forward_filter!(abort_overwrite [$($skip)*] { fn abort_overwrite<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.abort_overwrite() } });
-        $crate::__faucet_forward_filter!(complete_run [$($skip)*] { fn complete_run<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<(), $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.complete_run() } });
-        $crate::__faucet_forward_filter!(overwrite_staging_exists [$($skip)*] { fn overwrite_staging_exists<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<::core::option::Option<bool>, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.overwrite_staging_exists() } });
-        $crate::__faucet_forward_filter!(config_schema [$($skip)*] { fn config_schema(&self) -> $crate::Value { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.config_schema() } });
-        $crate::__faucet_forward_filter!(connector_name [$($skip)*] { fn connector_name(&self) -> &'static str { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.connector_name() } });
-        $crate::__faucet_forward_filter!(set_roundtrip_recorder [$($skip)*] { fn set_roundtrip_recorder(&self, recorder: ::std::sync::Arc<$crate::observability::RoundtripRecorder>) -> () { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.set_roundtrip_recorder(recorder) } });
-        $crate::__faucet_forward_filter!(dataset_uri [$($skip)*] { fn dataset_uri(&self) -> ::std::string::String { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.dataset_uri() } });
-        $crate::__faucet_forward_filter!(local_outputs [$($skip)*] { fn local_outputs<'life0, 'async_trait>(&'life0 self) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::std::vec::Vec<$crate::local_outputs::LocalOutput>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.local_outputs() } });
-        $crate::__faucet_forward_filter!(check [$($skip)*] { fn check<'life0, 'life1, 'async_trait>(&'life0 self, ctx: &'life1 $crate::check::CheckContext) -> ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ::core::result::Result<$crate::check::CheckReport, $crate::FaucetError>> + ::core::marker::Send + 'async_trait>> where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait { #[allow(unused_imports)] use $crate::Sink as _; self.$inner.check(ctx) } });
+        $crate::__faucet_forward_filter!(write_batch [$($skip)*] {
+            fn write_batch<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                records: &'life1 [$crate::Value],
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<usize>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.write_batch(records)
+            }
+        });
+        $crate::__faucet_forward_filter!(flush [$($skip)*] {
+            fn flush<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.flush()
+            }
+        });
+        $crate::__faucet_forward_filter!(write_batch_partial [$($skip)*] {
+            fn write_batch_partial<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                records: &'life1 [$crate::Value],
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::std::vec::Vec<$crate::traits::RowOutcome>>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.write_batch_partial(records)
+            }
+        });
+        $crate::__faucet_forward_filter!(batch_atomicity [$($skip)*] {
+            fn batch_atomicity(&self) -> $crate::dlq::BatchAtomicity
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.batch_atomicity()
+            }
+        });
+        $crate::__faucet_forward_filter!(admit_page [$($skip)*] {
+            fn admit_page<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                records: &'life1 [$crate::Value],
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.admit_page(records)
+            }
+        });
+        $crate::__faucet_if_arrow! {
+            $crate::__faucet_forward_filter!(supports_columnar [$($skip)*] {
+                fn supports_columnar(&self) -> bool
+                {
+                    #[allow(unused_imports)]
+                    use $crate::Sink as _;
+                    self.$inner.supports_columnar()
+                }
+            });
+        }
+        $crate::__faucet_if_arrow! {
+            $crate::__faucet_forward_filter!(write_batch_columnar [$($skip)*] {
+                fn write_batch_columnar<'life0, 'life1, 'async_trait>(
+                    &'life0 self,
+                    batch: &'life1 $crate::forward::__forward::arrow::array::RecordBatch,
+                ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<usize>>
+                where
+                    'life0: 'async_trait,
+                    'life1: 'async_trait,
+                    Self: 'async_trait,
+                {
+                    #[allow(unused_imports)]
+                    use $crate::Sink as _;
+                    self.$inner.write_batch_columnar(batch)
+                }
+            });
+        }
+        $crate::__faucet_forward_filter!(native_load_capabilities [$($skip)*] {
+            fn native_load_capabilities(
+                &self,
+            ) -> ::std::vec::Vec<$crate::native::NativeLoadCapability>
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.native_load_capabilities()
+            }
+        });
+        $crate::__faucet_forward_filter!(load_native [$($skip)*] {
+            fn load_native<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                batch: $crate::native::NativeBatch,
+                scope: &'life1 str,
+                ctx: $crate::native::NativeLoadContext,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<usize>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.load_native(batch, scope, ctx)
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_idempotent_writes [$($skip)*] {
+            fn supports_idempotent_writes(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.supports_idempotent_writes()
+            }
+        });
+        $crate::__faucet_forward_filter!(sink_guarantee [$($skip)*] {
+            fn sink_guarantee(&self) -> $crate::idempotency::SinkGuarantee
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.sink_guarantee()
+            }
+        });
+        $crate::__faucet_forward_filter!(write_batch_is_replay_safe [$($skip)*] {
+            fn write_batch_is_replay_safe(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.write_batch_is_replay_safe()
+            }
+        });
+        $crate::__faucet_forward_filter!(dedups_by_key [$($skip)*] {
+            fn dedups_by_key(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.dedups_by_key()
+            }
+        });
+        $crate::__faucet_forward_filter!(supported_write_modes [$($skip)*] {
+            fn supported_write_modes(&self) -> &'static [$crate::write_mode::WriteMode]
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.supported_write_modes()
+            }
+        });
+        $crate::__faucet_forward_filter!(current_schema [$($skip)*] {
+            fn current_schema<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<$crate::Value>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.current_schema()
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_schema_evolution [$($skip)*] {
+            fn supports_schema_evolution(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.supports_schema_evolution()
+            }
+        });
+        $crate::__faucet_forward_filter!(evolve_schema [$($skip)*] {
+            fn evolve_schema<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                evolution: &'life1 $crate::drift::SchemaEvolution,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.evolve_schema(evolution)
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_cleanup [$($skip)*] {
+            fn supports_cleanup(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.supports_cleanup()
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_staged_load [$($skip)*] {
+            fn supports_staged_load(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.supports_staged_load()
+            }
+        });
+        $crate::__faucet_forward_filter!(cleanup_scope [$($skip)*] {
+            fn cleanup_scope<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                scope: &'life1 ::std::collections::BTreeMap<::std::string::String, $crate::Value>,
+                seen: &'life2 $crate::cleanup::SeenKeys,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<u64>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.cleanup_scope(scope, seen)
+            }
+        });
+        $crate::__faucet_forward_filter!(write_batch_idempotent [$($skip)*] {
+            fn write_batch_idempotent<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+                &'life0 self,
+                records: &'life1 [$crate::Value],
+                scope: &'life2 str,
+                token: &'life3 str,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<usize>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                'life3: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.write_batch_idempotent(records, scope, token)
+            }
+        });
+        $crate::__faucet_forward_filter!(last_committed_token [$($skip)*] {
+            fn last_committed_token<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                scope: &'life1 str,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<::std::string::String>>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.last_committed_token(scope)
+            }
+        });
+        $crate::__faucet_forward_filter!(is_overwrite [$($skip)*] {
+            fn is_overwrite(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.is_overwrite()
+            }
+        });
+        $crate::__faucet_forward_filter!(begin_overwrite [$($skip)*] {
+            fn begin_overwrite<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.begin_overwrite()
+            }
+        });
+        $crate::__faucet_forward_filter!(commit_overwrite [$($skip)*] {
+            fn commit_overwrite<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.commit_overwrite()
+            }
+        });
+        $crate::__faucet_forward_filter!(supports_rollback [$($skip)*] {
+            fn supports_rollback(&self) -> bool
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.supports_rollback()
+            }
+        });
+        $crate::__faucet_forward_filter!(rollback_run [$($skip)*] {
+            fn rollback_run<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                run_id: &'life1 str,
+                opts: &'life2 $crate::rollback::RollbackOptions,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<$crate::rollback::RollbackOutcome>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.rollback_run(run_id, opts)
+            }
+        });
+        $crate::__faucet_forward_filter!(forget_run [$($skip)*] {
+            fn forget_run<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                run_id: &'life1 str,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.forget_run(run_id)
+            }
+        });
+        $crate::__faucet_forward_filter!(rewind_commit_token [$($skip)*] {
+            fn rewind_commit_token<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                scope: &'life1 str,
+                token: ::core::option::Option<&'life2 str>,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.rewind_commit_token(scope, token)
+            }
+        });
+        $crate::__faucet_forward_filter!(readback_source [$($skip)*] {
+            fn readback_source(
+                &self,
+            ) -> ::core::option::Option<(::std::string::String, $crate::Value)>
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.readback_source()
+            }
+        });
+        $crate::__faucet_forward_filter!(abort_overwrite [$($skip)*] {
+            fn abort_overwrite<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.abort_overwrite()
+            }
+        });
+        $crate::__faucet_forward_filter!(complete_run [$($skip)*] {
+            fn complete_run<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.complete_run()
+            }
+        });
+        $crate::__faucet_forward_filter!(overwrite_staging_exists [$($skip)*] {
+            fn overwrite_staging_exists<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<bool>>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.overwrite_staging_exists()
+            }
+        });
+        $crate::__faucet_forward_filter!(config_schema [$($skip)*] {
+            fn config_schema(&self) -> $crate::Value
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.config_schema()
+            }
+        });
+        $crate::__faucet_forward_filter!(connector_name [$($skip)*] {
+            fn connector_name(&self) -> &'static str
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.connector_name()
+            }
+        });
+        $crate::__faucet_forward_filter!(set_roundtrip_recorder [$($skip)*] {
+            fn set_roundtrip_recorder(
+                &self,
+                recorder: ::std::sync::Arc<$crate::observability::RoundtripRecorder>,
+            ) -> ()
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.set_roundtrip_recorder(recorder)
+            }
+        });
+        $crate::__faucet_forward_filter!(dataset_uri [$($skip)*] {
+            fn dataset_uri(&self) -> ::std::string::String
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.dataset_uri()
+            }
+        });
+        $crate::__faucet_forward_filter!(local_outputs [$($skip)*] {
+            fn local_outputs<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> $crate::forward::__forward::Fut<'async_trait, ::std::vec::Vec<$crate::local_outputs::LocalOutput>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.local_outputs()
+            }
+        });
+        $crate::__faucet_forward_filter!(check [$($skip)*] {
+            fn check<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                ctx: &'life1 $crate::check::CheckContext,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<$crate::check::CheckReport>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.check(ctx)
+            }
+        });
     };
 }
 

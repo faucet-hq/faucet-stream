@@ -291,9 +291,12 @@ impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
 
 #[async_trait::async_trait]
 impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
-    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
-    }
+    // The columnar and native paths carry no keys to record, so they stay at the
+    // trait default (off); everything else reaches the wrapped sink.
+    crate::forward_sink!(inner; except
+        write_batch, write_batch_partial, write_batch_idempotent, supports_columnar,
+        write_batch_columnar, native_load_capabilities, load_native);
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let n = self.inner.write_batch(records).await?;
         self.record(records);
@@ -324,123 +327,6 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
             .await?;
         self.record(records);
         Ok(n)
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
-    }
-
-    // ── Pure forwarding below ────────────────────────────────────────────────
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &BTreeMap<String, Value>,
-        seen: &SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-    fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-    fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
-        &self,
-        evolution: &crate::drift::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    async fn local_outputs(&self) -> Vec<crate::local_outputs::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn supports_staged_load(&self) -> bool {
-        self.inner.supports_staged_load()
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &crate::rollback::RollbackOptions,
-    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-    async fn check(
-        &self,
-        ctx: &crate::check::CheckContext,
-    ) -> Result<crate::check::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
     }
 }
 

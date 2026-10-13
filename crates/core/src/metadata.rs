@@ -18,7 +18,6 @@ use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A metadata column to stamp onto every row.
@@ -298,6 +297,12 @@ impl MetadataSink {
 
 #[async_trait::async_trait]
 impl Sink for MetadataSink {
+    // The columnar and native paths carry no per-row Value to stamp, so they stay
+    // at the trait default (off); everything else reaches the wrapped sink.
+    crate::forward_sink!(inner; except
+        admit_page, write_batch, write_batch_partial, write_batch_idempotent, begin_overwrite,
+        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
         self.inner.admit_page(&self.preview(records)).await
     }
@@ -323,123 +328,10 @@ impl Sink for MetadataSink {
             .await
     }
 
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
-    }
-
-    // ── Pure forwarding ──────────────────────────────────────────────────────
-    async fn local_outputs(&self) -> Vec<crate::local_outputs::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-    async fn check(
-        &self,
-        ctx: &crate::check::CheckContext,
-    ) -> Result<crate::check::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
-    }
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &BTreeMap<String, Value>,
-        seen: &crate::cleanup::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-    fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-    fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
-        &self,
-        evolution: &crate::drift::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         // Before the staging clone is taken from the target.
         self.ensure_columns().await?;
         self.inner.begin_overwrite().await
-    }
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-    fn supports_staged_load(&self) -> bool {
-        self.inner.supports_staged_load()
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &crate::rollback::RollbackOptions,
-    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
     }
 }
 
@@ -743,7 +635,10 @@ mod tests {
         let _ = sink.check(&crate::check::CheckContext::default()).await;
         assert!(!sink.supports_cleanup());
         let _ = sink
-            .cleanup_scope(&BTreeMap::new(), &crate::cleanup::SeenKeys::new())
+            .cleanup_scope(
+                &std::collections::BTreeMap::new(),
+                &crate::cleanup::SeenKeys::new(),
+            )
             .await;
         assert!(!sink.supports_idempotent_writes());
         assert!(sink.last_committed_token("s").await.unwrap().is_none());
