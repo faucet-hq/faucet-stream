@@ -124,3 +124,29 @@ fn conformance_descriptor_matches_built_source() {
         );
     }
 }
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn hung_source(endpoint: &str, kind: RpcKind) -> GrpcStream {
+    let config = GrpcStreamConfig::new(
+        endpoint,
+        "faucet.test.echo.EchoService",
+        "List",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 1 }))
+    .rpc_kind(kind);
+    GrpcStream::new(config).expect("grpc stream builds from a valid config")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    for kind in [RpcKind::Unary, RpcKind::ServerStreaming] {
+        faucet_conformance::calls::assert_source_call_deadline(|| hung_source(&endpoint, kind))
+            .await;
+    }
+}

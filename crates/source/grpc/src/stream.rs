@@ -3,6 +3,7 @@
 use crate::config::{GrpcAuth, GrpcStreamConfig, MetadataEntry, RpcKind};
 use async_trait::async_trait;
 use base64::Engine as _;
+use faucet_core::CallExt as _;
 use faucet_core::{AuthSpec, Credential, FaucetError, SharedAuthProvider, StreamPage};
 use futures_core::Stream;
 use prost::Message;
@@ -22,6 +23,9 @@ pub struct GrpcStream {
     /// Optional shared auth provider. When set, takes precedence over inline
     /// auth in `config.auth`. Injected via [`GrpcStream::with_auth_provider`].
     auth_provider: Option<SharedAuthProvider>,
+    /// Backend-call context (#880): connects, calls, every streamed message
+    /// and every reconnect backoff run through it.
+    calls: faucet_core::CallSlot,
 }
 
 impl GrpcStream {
@@ -50,6 +54,7 @@ impl GrpcStream {
             config,
             pool,
             auth_provider: None,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -88,7 +93,11 @@ impl GrpcStream {
 
         match self.config.rpc_kind {
             RpcKind::Unary => {
-                self.unary_call(endpoint, path, output_desc, request_bytes)
+                self.calls
+                    .call_once(
+                        "call",
+                        self.unary_call(endpoint, path, output_desc, request_bytes),
+                    )
                     .await
             }
             RpcKind::ServerStreaming => {
@@ -214,7 +223,6 @@ impl GrpcStream {
     /// Drive a server-streaming RPC, yielding a page each time `page_chunk`
     /// records accumulate. Transient failures reconnect with backoff; others
     /// end the stream with an error.
-    #[allow(clippy::disallowed_methods)] // TODO(#880): migrate to CallContext
     fn server_stream_resolved<'a>(
         &'a self,
         endpoint: String,
@@ -230,14 +238,26 @@ impl GrpcStream {
             let mut emitted: usize = 0;
             let mut attempt: u32 = 0;
             let mut reauthed = false;
+            let calls = self.calls.get();
+            let reads = calls.clone().with_roundtrip_metering(false);
             loop {
                 let failure = 'attempt: {
-                    let (mut streaming, sent) = match self
-                        .open_server_stream(&endpoint, path.clone(), output_desc.clone(), request_bytes.clone())
-                        .await
-                    {
-                        Ok(opened) => opened,
-                        Err(failure) => break 'attempt failure,
+                    let opened = calls
+                        .call_once("open", async {
+                            Ok(self
+                                .open_server_stream(
+                                    &endpoint,
+                                    path.clone(),
+                                    output_desc.clone(),
+                                    request_bytes.clone(),
+                                )
+                                .await)
+                        })
+                        .await;
+                    let (mut streaming, sent) = match opened {
+                        Ok(Ok(opened)) => opened,
+                        Ok(Err(failure)) => break 'attempt failure,
+                        Err(spent) => break 'attempt Failure::Fatal(spent),
                     };
                     let skip = if self.config.reconnect_replay_from_start { emitted } else { 0 };
                     let mut position: usize = 0;
@@ -255,7 +275,9 @@ impl GrpcStream {
                             .idle_timeout
                             .map(|t| t.saturating_sub(last_message.elapsed()));
                         let wait = next_wait(idle_left, !buffer.is_empty());
-                        let Some(next) = with_timeout(wait, streaming.message()).await else {
+                        let Some(next) =
+                            with_timeout(wait, streaming.message().within_ctx(&reads, "read")).await
+                        else {
                             if wait == idle_left {
                                 break 'attempt Failure::Idle(FaucetError::Source(format!(
                                     "gRPC server-streaming received no message for {}s",
@@ -264,6 +286,10 @@ impl GrpcStream {
                             }
                             yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
                             continue;
+                        };
+                        let next = match next {
+                            Ok(next) => next,
+                            Err(spent) => break 'attempt Failure::Fatal(spent),
                         };
                         match next {
                             Ok(Some(msg)) => {
@@ -311,7 +337,7 @@ impl GrpcStream {
                             "gRPC server-streaming idle; reconnecting (not counted against \
                              reconnect_max_attempts)"
                         );
-                        tokio::time::sleep(self.config.reconnect_initial_backoff).await;
+                        calls.wait(self.config.reconnect_initial_backoff).await?;
                     }
                     Failure::Unauthenticated { error, sent } => {
                         if !reauthed
@@ -353,7 +379,7 @@ impl GrpcStream {
                             error = %error,
                             "gRPC server-streaming transient error, reconnecting"
                         );
-                        tokio::time::sleep(backoff).await;
+                        calls.wait(backoff).await?;
                     }
                 }
             }
@@ -547,6 +573,17 @@ impl faucet_core::Source for GrpcStream {
 
     fn connector_name(&self) -> &'static str {
         "grpc"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn config_schema(&self) -> serde_json::Value {
