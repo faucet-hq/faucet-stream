@@ -82,6 +82,7 @@
 //! retry of start-up failures, an optional readiness probe, and the
 //! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule.
 
+pub mod calls;
 #[cfg(feature = "containers")]
 pub mod containers;
 pub mod doubles;

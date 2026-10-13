@@ -295,6 +295,15 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_is_not_retriable() {
+        let err = FaucetError::Cancelled {
+            operation: "page call".into(),
+        };
+        assert!(!err.is_retriable());
+        assert_eq!(err.to_string(), "page call cancelled");
+    }
+
+    #[test]
     fn timeout_is_retriable_and_names_the_operation() {
         let err = FaucetError::Timeout {
             operation: "nats publish".into(),

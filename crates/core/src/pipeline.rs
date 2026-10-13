@@ -8902,3 +8902,85 @@ mod overwrite_flush_tests {
         assert_eq!(flushes(&fail_events), 2);
     }
 }
+
+#[cfg(test)]
+mod call_context_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Seen(Mutex<Option<crate::io::CallContext>>);
+
+    struct CtxSource {
+        seen: Seen,
+        drains: bool,
+    }
+
+    #[async_trait]
+    impl Source for CtxSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![json!({"a": 1})])
+        }
+        fn set_cancel(&self, _cancel: crate::CancellationToken) -> bool {
+            self.drains
+        }
+        fn set_call_context(&self, ctx: crate::io::CallContext) {
+            *self.seen.0.lock().unwrap() = Some(ctx);
+        }
+    }
+
+    #[derive(Default)]
+    struct CtxSink(Seen);
+
+    #[async_trait]
+    impl Sink for CtxSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        fn set_call_context(&self, ctx: crate::io::CallContext) {
+            *self.0.0.lock().unwrap() = Some(ctx);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_installs_call_contexts() {
+        for drains in [false, true] {
+            let source = CtxSource {
+                seen: Seen::default(),
+                drains,
+            };
+            let sink = CtxSink::default();
+            let token = crate::CancellationToken::new();
+            Pipeline::new(&source, &sink)
+                .with_cancel(token)
+                .with_call_context(
+                    crate::io::CallContext::new().with_timeout(std::time::Duration::from_secs(7)),
+                )
+                .run()
+                .await
+                .unwrap();
+            let src = source.seen.0.lock().unwrap().clone().unwrap();
+            let snk = sink.0.0.lock().unwrap().clone().unwrap();
+            assert_eq!(src.cancel().is_some(), !drains, "draining sources keep their own cancel");
+            assert!(snk.cancel().is_none(), "a sink is never cancelled mid-flush");
+            assert!(src.recorder().is_some() && snk.recorder().is_some());
+            assert_eq!(src.timeout(), Some(std::time::Duration::from_secs(7)));
+            assert_eq!(snk.timeout(), Some(std::time::Duration::from_secs(7)));
+            assert!(src.retry().is_none() && snk.retry().is_none());
+        }
+        let source = CtxSource {
+            seen: Seen::default(),
+            drains: false,
+        };
+        let sink = CtxSink::default();
+        Pipeline::new(&source, &sink).run().await.unwrap();
+        let src = source.seen.0.lock().unwrap().clone().unwrap();
+        assert!(src.cancel().is_none());
+        assert_eq!(src.timeout(), Some(crate::io::DEFAULT_CALL_TIMEOUT));
+    }
+}
