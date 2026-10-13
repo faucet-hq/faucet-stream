@@ -48,6 +48,9 @@ async fn range_digest_reflects_content_and_bounds() {
     .await
     .unwrap();
 
+    let caps = a.capabilities();
+    assert!(caps.range_read() && caps.range_digest());
+
     let da = a
         .range_digest(&KeyRange::ALL, "id", &cols)
         .await
