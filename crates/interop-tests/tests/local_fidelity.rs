@@ -182,7 +182,7 @@ async fn iceberg_sink_and_iceberg_source_keep_the_wide_row() {
     let sink = faucet_sink_iceberg::IcebergSink::new(cfg).await.unwrap();
     let sent = wide_arrow();
     write(&sink, &sent).await;
-    let source = lake.source("corpus", json!({})).await;
+    let source: faucet_source_iceberg::IcebergSource = lake.source("corpus", json!({})).await;
     fidelity::assert_corpus_read(&source, &sent, typed(Tolerance::exact())).await;
 }
 
