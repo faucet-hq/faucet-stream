@@ -54,6 +54,20 @@ pub struct KafkaSource {
     /// falling back to the value's (#789 MSG-95).
     #[cfg(feature = "schema-registry")]
     key_sr_client: Option<SchemaRegistryClient>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// round-trip recorder for the broker metadata calls, the terminal offset
+    /// commit and the poll loop.
+    calls: faucet_core::CallSlot,
+}
+
+/// The error a call context ends with: its cancel token firing or its
+/// deadline passing. Pending while neither happens.
+async fn call_end(ctx: &faucet_core::CallContext) -> FaucetError {
+    loop {
+        if let Err(e) = ctx.wait(Duration::from_secs(86_400)).await {
+            return e;
+        }
+    }
 }
 
 /// Messages left in one partition: from the next offset to read (or, with no
@@ -125,6 +139,7 @@ impl KafkaSource {
             sr_client,
             #[cfg(feature = "schema-registry")]
             key_sr_client,
+            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -239,7 +254,7 @@ impl KafkaSource {
             let to_fetch = need_watermark.clone();
             // `fetch_watermarks` is a blocking librdkafka broker call — run it
             // off the async runtime.
-            let resolved = tokio::task::spawn_blocking(move || {
+            let lookup = tokio::task::spawn_blocking(move || {
                 to_fetch
                     .into_iter()
                     .filter_map(|(topic, partition)| {
@@ -251,9 +266,12 @@ impl KafkaSource {
                             })
                     })
                     .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default();
+            });
+            let resolved = self
+                .calls
+                .call_once("metadata", async { Ok(lookup.await.unwrap_or_default()) })
+                .await
+                .unwrap_or_default();
 
             if let Ok(mut cache) = self.assigned_floor.lock() {
                 for (topic, partition, floor) in resolved {
@@ -378,17 +396,27 @@ impl KafkaSource {
             // `commit(…, Sync)` is a blocking broker round-trip — run it off
             // the async runtime.
             let consumer = Arc::clone(&self.consumer);
-            match tokio::task::spawn_blocking(move || consumer.commit(&tpl, CommitMode::Sync)).await
+            let commit =
+                tokio::task::spawn_blocking(move || consumer.commit(&tpl, CommitMode::Sync));
+            match self
+                .calls
+                .call_once("commit", async { Ok(commit.await) })
+                .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => tracing::warn!(
                     error = %e,
                     "kafka member mode: terminal offset commit failed; \
                      the group's next member may re-read the tail (at-least-once)"
                 ),
-                Err(join_err) => tracing::warn!(
+                Ok(Err(join_err)) => tracing::warn!(
                     error = %join_err,
                     "kafka member mode: terminal offset commit task failed"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "kafka member mode: terminal offset commit cut short; \
+                     the group's next member may re-read the tail (at-least-once)"
                 ),
             }
         } else if let Err(e) = self.consumer.commit(&tpl, CommitMode::Async) {
@@ -408,7 +436,7 @@ impl KafkaSource {
         let topics = self.config.topics.clone();
         // `fetch_metadata` is a blocking librdkafka broker call — run it off
         // the async runtime.
-        tokio::task::spawn_blocking(move || {
+        let lookup = tokio::task::spawn_blocking(move || {
             let mut total = 0usize;
             for topic in &topics {
                 match consumer.fetch_metadata(Some(topic), Duration::from_secs(5)) {
@@ -441,10 +469,12 @@ impl KafkaSource {
                 }
             }
             Some(total)
-        })
-        .await
-        .ok()
-        .flatten()
+        });
+        self.calls
+            .call_once("metadata", async { Ok(lookup.await.ok().flatten()) })
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn message_to_value(
@@ -582,6 +612,25 @@ pub(crate) fn is_transient_consume_error(e: &rdkafka::error::KafkaError) -> bool
 
 #[async_trait]
 impl Source for KafkaSource {
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        #[cfg(feature = "schema-registry")]
+        for client in [&self.sr_client, &self.key_sr_client].into_iter().flatten() {
+            client.set_call_context(ctx.clone());
+        }
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        #[cfg(feature = "schema-registry")]
+        for client in [&self.sr_client, &self.key_sr_client].into_iter().flatten() {
+            client.set_roundtrip_recorder(std::sync::Arc::clone(&recorder));
+        }
+        self.calls.install_recorder(recorder);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -600,6 +649,7 @@ impl Source for KafkaSource {
         let mut last_message_at = Instant::now();
         let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
         let idle_timeout = self.config.idle_timeout;
+        let calls = self.calls.get();
 
         loop {
             // Surface any error raised by the rebalance callback (e.g. a
@@ -621,6 +671,7 @@ impl Source for KafkaSource {
                     tracing::info!("kafka source: ctrl_c received, stopping cleanly");
                     break;
                 }
+                end = call_end(&calls) => return Err(end),
                 recv = tokio::time::timeout(poll_budget, self.consumer.recv()) => {
                     match recv {
                         Ok(Ok(msg)) => {
@@ -722,6 +773,7 @@ impl Source for KafkaSource {
 
         Box::pin(async_stream::try_stream! {
             self.ensure_subscribed()?;
+            let calls = self.calls.get();
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut pending_offsets: HashMap<(String, i32), i64> = HashMap::new();
             let mut last_message_at = Instant::now();
@@ -763,6 +815,9 @@ impl Source for KafkaSource {
                         tracing::info!("kafka source: ctrl_c received, stopping cleanly");
                         stop = true;
                     }
+                    // The run's deadline and cancel token end the stream with
+                    // an error (#880); the pipeline has already stopped reading.
+                    end = call_end(&calls) => fatal = Some(end),
                     recv = tokio::time::timeout(poll_budget, self.consumer.recv()) => {
                         match recv {
                             Ok(Ok(msg)) => {
@@ -915,7 +970,7 @@ impl Source for KafkaSource {
         );
         let consumer = Arc::clone(&self.consumer);
         let topics = self.config.topics.clone();
-        tokio::task::spawn_blocking(move || {
+        let lookup = tokio::task::spawn_blocking(move || {
             let timeout = Duration::from_secs(5);
             let mut total = 0u64;
             for topic in &topics {
@@ -941,9 +996,14 @@ impl Source for KafkaSource {
                 }
             }
             Ok(Some(faucet_core::SourceLag::events(total)))
-        })
-        .await
-        .map_err(|e| FaucetError::Source(format!("kafka lag task: {e}")))?
+        });
+        self.calls
+            .call_once("metadata", async {
+                lookup
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("kafka lag task: {e}")))?
+            })
+            .await
     }
 
     /// Kafka partitions are immutable, ordered logs and every emitted page

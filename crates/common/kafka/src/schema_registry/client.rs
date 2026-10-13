@@ -46,6 +46,10 @@ pub struct SchemaRegistryClient {
     /// parses an Avro schema, compiles a `.proto` or builds a JSON Schema
     /// validator once per schema rather than once per message (#789 MSG-65).
     parsed: Arc<std::sync::Mutex<LruCache<String, Arc<dyn std::any::Any + Send + Sync>>>>,
+    /// Backend-call context (#880), shared by clones: the connector forwards
+    /// the run's context here, so a registry request ends at the run's
+    /// deadline and is metered (`schema`, `register`).
+    calls: Arc<faucet_core::CallSlot>,
 }
 
 impl SchemaRegistryClient {
@@ -63,7 +67,23 @@ impl SchemaRegistryClient {
             cache: Arc::new(Mutex::new(LruCache::new(capacity))),
             register_cache: Arc::new(Mutex::new(LruCache::new(capacity))),
             parsed: Arc::new(std::sync::Mutex::new(LruCache::new(capacity))),
+            calls: Arc::new(faucet_core::CallSlot::new(
+                faucet_core::CallContext::new().without_timeout(),
+            )),
         })
+    }
+
+    /// Install the run's call context (the connector forwards its own).
+    pub fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    /// Install the round-trip recorder registry requests are counted on.
+    pub fn set_roundtrip_recorder(
+        &self,
+        recorder: Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     /// The parsed form of `text` for codec `kind`, built with `build` on the
@@ -107,21 +127,25 @@ impl SchemaRegistryClient {
         }
 
         let url = format!("{}/schemas/ids/{schema_id}", self.base_url);
-        let resp = self
-            .apply_auth(self.http.get(&url))
-            .send()
-            .await
-            .map_err(FaucetError::Http)?;
-        if !resp.status().is_success() {
-            return Err(FaucetError::Source(format!(
-                "schema registry GET {url} returned {}",
-                resp.status()
-            )));
-        }
-        let schema: RegistrySchema = resp
-            .json()
-            .await
-            .map_err(|e| FaucetError::Source(format!("schema registry JSON decode: {e}")))?;
+        let schema: RegistrySchema = self
+            .calls
+            .call_once("schema", async {
+                let resp = self
+                    .apply_auth(self.http.get(&url))
+                    .send()
+                    .await
+                    .map_err(FaucetError::Http)?;
+                if !resp.status().is_success() {
+                    return Err(FaucetError::Source(format!(
+                        "schema registry GET {url} returned {}",
+                        resp.status()
+                    )));
+                }
+                resp.json()
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("schema registry JSON decode: {e}")))
+            })
+            .await?;
 
         let mut cache = self.cache.lock().await;
         cache.put(schema_id, schema.clone());
@@ -155,31 +179,35 @@ impl SchemaRegistryClient {
             "schemaType": schema_type,
             "schema": schema_text,
         });
-        let resp = self
-            .apply_auth(
-                self.http
-                    .post(&url)
-                    .header("Content-Type", "application/vnd.schemaregistry.v1+json")
-                    .json(&body),
-            )
-            .send()
-            .await
-            .map_err(FaucetError::Http)?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(FaucetError::Sink(format!(
-                "schema registry POST {url} returned {status}: {body}"
-            )));
-        }
         #[derive(Deserialize)]
         struct RegisterResp {
             id: u32,
         }
-        let parsed: RegisterResp = resp
-            .json()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("schema registry register JSON decode: {e}")))?;
+        let parsed: RegisterResp = self
+            .calls
+            .call_once("register", async {
+                let resp = self
+                    .apply_auth(
+                        self.http
+                            .post(&url)
+                            .header("Content-Type", "application/vnd.schemaregistry.v1+json")
+                            .json(&body),
+                    )
+                    .send()
+                    .await
+                    .map_err(FaucetError::Http)?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(FaucetError::Sink(format!(
+                        "schema registry POST {url} returned {status}: {body}"
+                    )));
+                }
+                resp.json().await.map_err(|e| {
+                    FaucetError::Sink(format!("schema registry register JSON decode: {e}"))
+                })
+            })
+            .await?;
         self.register_cache.lock().await.put(cache_key, parsed.id);
         Ok(parsed.id)
     }
@@ -209,6 +237,25 @@ mod tests {
         let first = client.get_schema(1).await.unwrap();
         let second = client.get_schema(1).await.unwrap();
         assert_eq!(first.schema, second.schema);
+    }
+
+    #[tokio::test]
+    async fn a_hung_registry_request_ends_at_the_call_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/7"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        client
+            .set_call_context(faucet_core::CallContext::new().with_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+            ));
+        let started = std::time::Instant::now();
+        let err = client.get_schema(7).await.unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]

@@ -192,3 +192,26 @@ async fn conformance_descriptor_matches_built_sink() {
         );
     }
 }
+
+/// A broker that cannot be reached stands in for a hung backend (#880): the
+/// delivery of a produced record waits until the deadline or the cancel.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let raw = r#"{"brokers": "127.0.0.1:1", "topic": {"type": "fixed", "name": "t"}}"#;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let cfg: faucet_sink_kafka::KafkaSinkConfig =
+            faucet_core::serde_json::from_str(raw).expect("config");
+        built.push(
+            faucet_sink_kafka::KafkaSink::new(cfg)
+                .await
+                .expect("offline build"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
+}

@@ -481,6 +481,10 @@ already landed a second time). See
 
 Declares `write_mode: append` and idempotent (exactly-once) writes. Under `value_format: confluent_avro` (the `schema-registry` feature) it declares that it drops record fields the Avro schema lacks, so `on_drift: fail` is refused at load time. `faucet list --json` prints the declaration.
 
+## Timeouts, cancellation and retries
+
+Every produced record's delivery, the `QueueFull` backoff, the transaction calls (`init`, `commit`) and the commit-token read run through the pipeline's `CallContext` (#880): the run's deadline ends a delivery that an unreachable or stalled cluster never confirms, and a `QueueFull` wait, promptly; a commit cut short is aborted. Each counts as one round trip (`produce`, `init`, `commit`, `metadata`, `read_token`) in `faucet_sink_roundtrips_total`, and Schema Registry requests run under the same context (`schema`, `register`). The sink never re-sends a delivered-or-unknown record itself.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
