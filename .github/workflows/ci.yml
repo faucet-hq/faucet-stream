@@ -1047,18 +1047,24 @@ jobs:
           # Libraries and connectors first, then faucet-cli, with the first
           # batch's test executables and containers dropped in between: all of
           # them at once (plus the instrumented build) exhausts the runner disk.
+          # The staged-load execution shims need a live warehouse that can reach
+          # a live bucket, so they are excluded here, in codecov.yml, and in
+          # scripts/patch-coverage.py (all three kept in sync).
           retry cargo test --workspace --exclude faucet-cli --all-features --test '*'
+          # Report this batch before deleting its executables: llvm-cov maps the
+          # profile data through the binaries, so a deleted binary's counts are lost.
+          cargo llvm-cov report --lcov --output-path integration-libs.lcov --ignore-filename-regex "$IGNORE_RE"
           cargo test --workspace --exclude faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
             | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+          rm -f target/*.profraw
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
           retry cargo test -p faucet-cli --all-features --test '*'
-          # The staged-load execution shims need a live warehouse that can reach
-          # a live bucket, so they are excluded here, in codecov.yml, and in
-          # scripts/patch-coverage.py (all three kept in sync).
-          cargo llvm-cov report --lcov --output-path integration.lcov --ignore-filename-regex "$IGNORE_RE"
+          cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE"
+          # Both scripts merge a file's records across reports (a line hit in either counts).
+          cat integration-libs.lcov integration-cli.lcov > integration.lcov
 
           echo "::group::teardown before the unit phase"
           df -h /
