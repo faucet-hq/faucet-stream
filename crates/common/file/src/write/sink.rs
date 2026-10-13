@@ -301,3 +301,203 @@ macro_rules! delegate_sink {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::write::remote::tests::Mem;
+    use crate::write::{Area, LocalBackend, ObjectClient, RemoteBackend, object_layout};
+    use faucet_core::check::{Probe, ProbeStatus};
+    use faucet_core::io::CallContext;
+    use faucet_core::observability::RoundtripSide;
+    use faucet_core::{Compression, FileFormat};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Identity {
+        installs: Arc<AtomicUsize>,
+    }
+
+    #[faucet_core::async_trait]
+    impl SinkIdentity for Identity {
+        fn connector_name(&self) -> &'static str {
+            "test"
+        }
+        fn config_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn dataset_uri(&self) -> String {
+            "test://out".into()
+        }
+        async fn check(&self, _ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+            Ok(CheckReport::single(Probe::pass(
+                "identity",
+                std::time::Duration::ZERO,
+            )))
+        }
+        fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+        }
+        fn set_call_context(&self, _ctx: CallContext) {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A store client that answers the preflight probe and counts installs.
+    struct Probed {
+        mem: Arc<Mem>,
+        installs: Arc<AtomicUsize>,
+    }
+
+    #[faucet_core::async_trait]
+    impl ObjectClient for Probed {
+        fn describe(&self, key: &str) -> String {
+            self.mem.describe(key)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+            self.mem.list(prefix).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
+            self.mem.exists(key).await
+        }
+        async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
+            self.mem.download(key, to).await
+        }
+        async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
+            self.mem.upload(from, key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+            self.mem.delete(key).await
+        }
+        fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+        }
+        fn set_call_context(&self, _ctx: CallContext) {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn check(&self, _ctx: &CheckContext) -> Result<Option<CheckReport>, FaucetError> {
+            Ok(Some(CheckReport::single(Probe::fail(
+                "store",
+                std::time::Duration::ZERO,
+                "unreachable",
+            ))))
+        }
+    }
+
+    /// A store's own backend type, as a common crate defines one.
+    struct Named {
+        remote: RemoteBackend,
+    }
+
+    crate::delegate_storage_backend!(Named, remote);
+
+    fn recorder() -> Arc<RoundtripRecorder> {
+        Arc::new(RoundtripRecorder::new(
+            RoundtripSide::Sink,
+            "p",
+            "r",
+            "test",
+        ))
+    }
+
+    fn jsonl() -> WriteSettings {
+        WriteSettings::new(FileFormat::JsonLines, Compression::None)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backend_without_a_probe_falls_back_to_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        let (d, t) = NameTemplate::from_path(
+            path.to_str().unwrap(),
+            FileFormat::JsonLines,
+            Compression::None,
+            false,
+        )
+        .unwrap();
+        let identity = Identity::default();
+        let installs = identity.installs.clone();
+        let backend = Arc::new(LocalBackend::new(&d, &t, true));
+        let sink = FileSink::build(jsonl(), t, backend, identity).unwrap();
+        assert_eq!(sink.format(), FileFormat::JsonLines);
+        assert!(
+            sink.backend()
+                .local_path(Area::Destination, "out.jsonl")
+                .is_some()
+        );
+        let report = sink.check(&CheckContext::default()).await.unwrap();
+        assert_eq!(report.probes[0].name, "identity");
+        sink.set_call_context(CallContext::new());
+        sink.set_roundtrip_recorder(recorder());
+        assert_eq!(installs.load(Ordering::SeqCst), 2);
+        let rows = [serde_json::json!({"a": 1})];
+        assert_eq!(sink.write_batch(&rows).await.unwrap(), 1);
+        sink.flush().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backends_probe_and_hooks_win_through_a_named_backend() {
+        let installs = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(Probed {
+            mem: Arc::new(Mem::default()),
+            installs: installs.clone(),
+        });
+        let (base, t) = object_layout(
+            "pre/",
+            Some("x.jsonl"),
+            ".jsonl",
+            FileFormat::JsonLines,
+            Compression::None,
+            false,
+        )
+        .unwrap();
+        let remote = RemoteBackend::new(client, base, &t, None).unwrap();
+        let backend = Arc::new(Named { remote });
+        assert!(
+            backend
+                .describe(Area::Destination, "x.jsonl")
+                .ends_with("pre/x.jsonl")
+        );
+        let sink = FileSink::build(jsonl(), t, backend, Identity::default()).unwrap();
+        let report = sink.check(&CheckContext::default()).await.unwrap();
+        assert!(matches!(report.probes[0].status, ProbeStatus::Fail { .. }));
+        sink.set_call_context(CallContext::new());
+        sink.set_roundtrip_recorder(recorder());
+        assert_eq!(installs.load(Ordering::SeqCst), 2);
+        let rows = [serde_json::json!({"a": 1})];
+        assert_eq!(sink.write_batch(&rows).await.unwrap(), 1);
+        sink.flush().await.unwrap();
+        sink.complete_run().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_writer_sink_is_the_file_sink_with_the_backend_unnamed() {
+        let mem = Arc::new(Mem::default());
+        let (base, t) = object_layout(
+            "pre/",
+            None,
+            ".jsonl",
+            FileFormat::JsonLines,
+            Compression::None,
+            false,
+        )
+        .unwrap();
+        let remote = RemoteBackend::new(mem.clone(), base, &t, None).unwrap();
+        let writer = FileWriter::new(jsonl(), t, Arc::new(remote)).unwrap();
+        let sink = WriterSink::new(writer, Identity::default());
+        assert_eq!(sink.format(), FileFormat::JsonLines);
+        assert_eq!(sink.writer().settings().format, FileFormat::JsonLines);
+        assert_eq!(sink.connector_name(), "test");
+        assert_eq!(sink.dataset_uri(), "test://out");
+        assert!(sink.config_schema().is_object());
+        assert!(sink.readback_source().is_none());
+        let report = sink.check(&CheckContext::default()).await.unwrap();
+        assert_eq!(report.probes[0].name, "identity");
+        let rows = [serde_json::json!({"a": 1})];
+        assert_eq!(sink.write_batch(&rows).await.unwrap(), 1);
+        sink.flush().await.unwrap();
+        assert_eq!(mem.keys().len(), 1);
+    }
+}
