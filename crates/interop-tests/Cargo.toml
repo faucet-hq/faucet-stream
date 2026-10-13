@@ -40,6 +40,7 @@ faucet-source-elasticsearch.workspace = true
 faucet-source-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
 faucet-source-gcs = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-iceberg = { workspace = true, features = ["arrow", "catalog-sql"] }
+faucet-source-mysql.workspace = true
 faucet-source-oracle.workspace = true
 faucet-source-postgres.workspace = true
 faucet-source-postgres-cdc.workspace = true
@@ -65,6 +66,7 @@ faucet-sink-file = { workspace = true, features = ["arrow", "encryption", "file-
 faucet-sink-gcs = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-sink-iceberg = { workspace = true, features = ["catalog-sql"] }
 faucet-sink-jsonl = { workspace = true, features = ["compression", "encryption"] }
+faucet-sink-mysql.workspace = true
 faucet-sink-oracle.workspace = true
 faucet-sink-postgres.workspace = true
 faucet-sink-parquet = { workspace = true, features = ["arrow"] }
@@ -99,10 +101,10 @@ parquet.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "json"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "mysql", "any", "json"] }
 tempfile.workspace = true
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["azurite", "clickhouse", "minio", "postgres"] }
+testcontainers-modules = { version = "0.15", features = ["azurite", "clickhouse", "minio", "mysql", "postgres"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 urlencoding.workspace = true
 uuid.workspace = true

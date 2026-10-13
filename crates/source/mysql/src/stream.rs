@@ -370,8 +370,13 @@ fn mysql_scalar_to_json(
     if let Ok(v) = row.try_get::<u8, _>(col_name) {
         return Value::Number(v.into());
     }
-    // `f32` first: sqlx's `f64` also accepts FLOAT, widening it.
-    if let Ok(v) = row.try_get::<f32, _>(col_name) {
+    // A FLOAT through `f32` (sqlx's `f64` also accepts FLOAT, widening it);
+    // only a FLOAT — sqlx's `f32` also accepts DOUBLE, narrowing `1e300`
+    // to infinity (#885).
+    let is_float = row
+        .try_column(col_name)
+        .is_ok_and(|c| sqlx::TypeInfo::name(c.type_info()).eq_ignore_ascii_case("FLOAT"));
+    if is_float && let Ok(v) = row.try_get::<f32, _>(col_name) {
         return faucet_core::fidelity::float32(v);
     }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
