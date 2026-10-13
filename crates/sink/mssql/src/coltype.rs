@@ -118,11 +118,9 @@ pub(crate) fn binary_flags(infos: &[ColumnInfo], columns: &[String]) -> Vec<bool
 }
 
 /// `@P{n}`, wrapped in `CAST(… AS <ty>)` when the column has a cast target.
+#[cfg(test)]
 pub(crate) fn placeholder(n: usize, cast: Option<&str>) -> String {
-    match cast {
-        Some(ty) => format!("CAST(@P{n} AS {ty})"),
-        None => format!("@P{n}"),
-    }
+    faucet_common_sql::SqlDialect::placeholder(&faucet_common_sql::dialects::Mssql, n, cast)
 }
 
 #[cfg(test)]

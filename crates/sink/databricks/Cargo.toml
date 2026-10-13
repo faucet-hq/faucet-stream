@@ -18,6 +18,7 @@ staging = ["dep:object_store"]
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-sql.workspace = true
 faucet-common-databricks.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

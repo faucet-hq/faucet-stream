@@ -5,7 +5,7 @@ use faucet_core::FaucetError;
 use faucet_core::shard::PkShardBounds;
 
 /// Oracle's identifier length limit (12.2+), in bytes.
-pub const MAX_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_IDENTIFIER_BYTES: usize = faucet_common_sql::dialects::oracle::MAX_IDENTIFIER_BYTES;
 
 /// Quote an Oracle identifier as `"name"`.
 ///
@@ -13,20 +13,7 @@ pub const MAX_IDENTIFIER_BYTES: usize = 128;
 /// double quote or NUL — Oracle has no escape for `"` inside a quoted name, so
 /// one is rejected rather than risk an injection.
 pub fn quote_ident_oracle(name: &str) -> Result<String, FaucetError> {
-    if name.is_empty() {
-        return Err(FaucetError::Config("empty Oracle identifier".into()));
-    }
-    if name.contains('"') || name.contains('\0') {
-        return Err(FaucetError::Config(format!(
-            "invalid Oracle identifier {name:?}: '\"' and NUL are not allowed"
-        )));
-    }
-    if name.len() > MAX_IDENTIFIER_BYTES {
-        return Err(FaucetError::Config(format!(
-            "Oracle identifier {name:?} exceeds {MAX_IDENTIFIER_BYTES} bytes"
-        )));
-    }
-    Ok(format!("\"{name}\""))
+    faucet_common_sql::dialects::oracle::quote_ident(name)
 }
 
 /// Split `OWNER.TABLE` (or a bare `TABLE`) into its parts.
@@ -53,7 +40,7 @@ pub fn quote_table_oracle(table: &str) -> Result<String, FaucetError> {
 
 /// Render a string as an Oracle single-quoted literal, doubling interior quotes.
 pub fn string_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    faucet_common_sql::SqlDialect::quote_literal(&faucet_common_sql::dialects::Oracle, s)
 }
 
 /// Strip trailing whitespace and statement terminators so a query can be

@@ -10,8 +10,9 @@ use crate::config::{DuckdbColumnMapping, DuckdbSinkConfig};
 use async_trait::async_trait;
 use duckdb::types::Value as DuckValue;
 use duckdb::{AccessMode, Config, Connection};
+use faucet_common_sql::dialects::Duckdb;
+use faucet_common_sql::{SqlDialect, SqlSinkEngine, Statement, TableColumn, TableTarget};
 use faucet_core::FaucetError;
-use faucet_core::util::quote_ident;
 
 use serde_json::Value;
 use std::collections::HashSet;
@@ -22,41 +23,39 @@ use std::sync::{Arc, Mutex};
 /// identifier `"analytics.events"` (which names a table with a dot in it and can
 /// never resolve). Mirrors the ClickHouse sink's `quote_table` (#456 L3).
 fn quote_table(table: &str) -> String {
-    table
-        .split('.')
-        .map(quote_ident)
-        .collect::<Vec<_>>()
-        .join(".")
+    faucet_common_sql::dialects::duckdb::quote_table(table)
 }
 
-/// Map a [`faucet_core::SqlBaseType`] to the DuckDB type keyword used when
-/// auto-creating a table (#580). Integers land as `BIGINT` and floats as
-/// `DOUBLE` so a later, wider value never overflows a narrower column;
-/// nested values land as `JSON` text, matching how the writer serialises them.
+/// The engine target of `table`.
+fn target(table: &str) -> TableTarget {
+    TableTarget::new(table, quote_table(table))
+}
+
+/// The shared SQL planning engine (#884) for an append-only DuckDB table.
+fn engine() -> SqlSinkEngine<Duckdb> {
+    SqlSinkEngine::new(Duckdb, faucet_core::WriteSpec::default())
+}
+
+/// The DuckDB type keyword for a [`faucet_core::SqlBaseType`] (#580): integers
+/// land as `BIGINT` and floats as `DOUBLE` so a later, wider value never
+/// overflows a narrower column; nested values land as JSON text.
+#[cfg(test)]
 fn duckdb_keyword(t: faucet_core::SqlBaseType) -> &'static str {
-    use faucet_core::SqlBaseType::*;
-    match t {
-        Integer => "BIGINT",
-        Double => "DOUBLE",
-        Boolean => "BOOLEAN",
-        Text => "TEXT",
-        Json => "TEXT",
-    }
+    Duckdb.type_name(t)
 }
 
-/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580). JSON mode
+/// stores the whole record in one column, so the page's own shape is
+/// irrelevant there.
 fn build_create_table_sql(
     table: &str,
     columns: &[faucet_core::PlannedColumn],
     json_column: Option<&str>,
-) -> String {
-    let cols = match json_column {
-        // JSON mode stores the whole record in one column, so the page's own
-        // shape is irrelevant — the table is the same whatever arrives.
-        Some(col) => format!("{} TEXT NOT NULL", quote_ident(col)),
-        None => faucet_core::render_columns(columns, quote_ident, duckdb_keyword),
-    };
-    format!("CREATE TABLE IF NOT EXISTS {} ({cols})", quote_table(table))
+) -> Result<String, FaucetError> {
+    match json_column {
+        Some(col) => Duckdb.create_json_table_sql(&target(table), col),
+        None => Duckdb.create_table_sql(&target(table), columns, &[]),
+    }
 }
 
 /// The bare table name of a possibly schema-qualified target, plus its schema —
@@ -152,11 +151,8 @@ fn no_matching_column_message(
     obj: &serde_json::Map<String, Value>,
     columns: &[String],
 ) -> String {
-    format!(
-        "duckdb: record {idx} has no field matching a column of the target table \
-         (record fields: {:?}; table columns: {columns:?})",
-        obj.keys().collect::<Vec<_>>()
-    )
+    let columns: Vec<TableColumn> = columns.iter().map(TableColumn::untyped).collect();
+    faucet_common_sql::no_match_message(&Duckdb, idx, obj, &columns, "")
 }
 
 /// The error for fields the target has no column for (`create_table` off).
@@ -312,24 +308,9 @@ fn insert_json(
     if records.is_empty() {
         return Ok(0);
     }
-    let placeholders = vec!["(?)"; records.len()].join(", ");
-    let sql = format!(
-        "INSERT INTO {} ({}) VALUES {}",
-        quote_table(table),
-        quote_ident(column),
-        placeholders
-    );
-    let mut params: Vec<DuckValue> = Vec::with_capacity(records.len());
-    for r in records {
-        let text = serde_json::to_string(r)
-            .map_err(|e| FaucetError::Sink(format!("failed to serialize record: {e}")))?;
-        params.push(DuckValue::Text(text));
+    for stmt in &engine().json_insert_statements(&target(table), column, records)? {
+        execute(conn, stmt)?;
     }
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| FaucetError::Sink(format!("DuckDB prepare failed: {e}")))?;
-    stmt.execute(duckdb::params_from_iter(params))
-        .map_err(|e| FaucetError::Sink(format!("DuckDB insert failed: {e}")))?;
     Ok(records.len())
 }
 
@@ -377,17 +358,6 @@ fn is_naive_timestamp(ty: &str) -> bool {
         && t != "TIMESTAMPTZ"
 }
 
-/// The value a record carries for `col`. DuckDB identifiers are
-/// case-insensitive, so a field matches its column exactly first and otherwise
-/// ignoring ASCII case.
-fn field_value<'a>(obj: &'a serde_json::Map<String, Value>, col: &str) -> Option<&'a Value> {
-    obj.get(col).or_else(|| {
-        obj.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(col))
-            .map(|(_, v)| v)
-    })
-}
-
 /// Record fields (first-seen order) that match no column of the table, exactly
 /// or ignoring ASCII case.
 fn missing_fields(records: &[Value], cols: &[String]) -> Vec<String> {
@@ -406,12 +376,9 @@ fn missing_fields(records: &[Value], cols: &[String]) -> Vec<String> {
 
 /// `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, typed like an auto-created column.
 fn add_column_sql(table: &str, column: &faucet_core::PlannedColumn) -> String {
-    let def =
-        faucet_core::render_columns(std::slice::from_ref(column), quote_ident, duckdb_keyword);
-    format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {def}",
-        quote_table(table)
-    )
+    Duckdb
+        .add_column_sql(&target(table), &column.name, column.base_type)
+        .expect("duckdb ADD COLUMN")
 }
 
 /// An ISO 8601 timestamp carrying an offset as UTC wall time; `None` otherwise.
@@ -420,6 +387,10 @@ fn utc_wall_time(s: &str) -> Option<String> {
     Some(dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string())
 }
 
+/// Append `records` over the table's columns: the engine maps each record
+/// onto them (exactly, else ignoring ASCII case), refuses a record with no
+/// matching column (skipping it would count it written while nothing landed),
+/// and writes the union of carried columns — a row missing one binds NULL.
 fn insert_rows(
     conn: &Connection,
     table: &str,
@@ -427,68 +398,45 @@ fn insert_rows(
     cols: &[String],
     naive_ts: &HashSet<String>,
 ) -> Result<usize, FaucetError> {
-    // The INSERT column set is the union of table columns present in any
-    // record (declared order); a row missing a unioned column binds SQL NULL.
-    // A record with no matching column is refused: skipping it would count it
-    // written while nothing landed.
-    let mut used: HashSet<&str> = HashSet::new();
-    let mut rows: Vec<&serde_json::Map<String, Value>> = Vec::with_capacity(records.len());
-    for (idx, rec) in records.iter().enumerate() {
-        let obj = rec
-            .as_object()
-            .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
-        if !cols.iter().any(|c| field_value(obj, c).is_some()) {
-            return Err(FaucetError::Sink(no_matching_column_message(
-                idx, obj, cols,
-            )));
-        }
-        for c in cols {
-            if field_value(obj, c).is_some() {
-                used.insert(c.as_str());
-            }
-        }
-        rows.push(obj);
-    }
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
-    let insert_cols: Vec<&String> = cols.iter().filter(|c| used.contains(c.as_str())).collect();
-    let num_cols = insert_cols.len();
-    let col_list = insert_cols
+    // A tz-less timestamp column is marked so its offset-bearing strings are
+    // converted to UTC wall time at bind.
+    let columns: Vec<TableColumn> = cols
         .iter()
-        .map(|c| quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let row_ph = format!("({})", vec!["?"; num_cols].join(", "));
-    let values = vec![row_ph.as_str(); rows.len()].join(", ");
-    let sql = format!(
-        "INSERT INTO {} ({}) VALUES {}",
-        quote_table(table),
-        col_list,
-        values
-    );
-
-    let mut params: Vec<DuckValue> = Vec::with_capacity(rows.len() * num_cols);
-    for obj in &rows {
-        for c in &insert_cols {
-            let value = match field_value(obj, c) {
-                Some(Value::String(v)) if naive_ts.contains(c.as_str()) => {
-                    DuckValue::Text(utc_wall_time(v).unwrap_or_else(|| v.clone()))
-                }
-                Some(v) => json_to_duck(v),
-                None => DuckValue::Null,
-            };
-            params.push(value);
-        }
+        .map(|c| {
+            if naive_ts.contains(c) {
+                TableColumn::new(c.clone(), "TIMESTAMP")
+            } else {
+                TableColumn::untyped(c.clone())
+            }
+        })
+        .collect();
+    let (written, statements) =
+        engine().insert_statements(&target(table), &columns, records, false)?;
+    for stmt in &statements {
+        execute(conn, stmt)?;
     }
+    Ok(written)
+}
 
-    let mut stmt = conn
-        .prepare(&sql)
+/// Bind and run one planned statement.
+fn execute(conn: &Connection, stmt: &Statement<'_>) -> Result<(), FaucetError> {
+    let params: Vec<DuckValue> = stmt
+        .params
+        .iter()
+        .map(|p| match p.value.as_ref() {
+            Value::String(v) if p.sql_type.is_some_and(is_naive_timestamp) => {
+                DuckValue::Text(utc_wall_time(v).unwrap_or_else(|| v.clone()))
+            }
+            v => json_to_duck(v),
+        })
+        .collect();
+    let mut prepared = conn
+        .prepare(&stmt.sql)
         .map_err(|e| FaucetError::Sink(format!("DuckDB prepare failed: {e}")))?;
-    stmt.execute(duckdb::params_from_iter(params))
+    prepared
+        .execute(duckdb::params_from_iter(params))
         .map_err(|e| FaucetError::Sink(format!("DuckDB insert failed: {e}")))?;
-    Ok(rows.len())
+    Ok(())
 }
 
 /// Apply the whole batch inside one `BEGIN`/`COMMIT` transaction, re-chunking
@@ -581,7 +529,7 @@ impl DuckdbSink {
         };
         let mut seen = HashSet::new();
         columns.retain(|c| seen.insert(c.name.to_ascii_lowercase()));
-        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
+        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column)?;
         guard
             .execute_batch(&sql)
             .map_err(|e| FaucetError::Sink(format!("duckdb CREATE TABLE failed: {e}")))?;

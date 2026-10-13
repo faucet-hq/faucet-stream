@@ -460,6 +460,12 @@ so a deadline ends them. `job_timeout` still cancels a job that runs too long.
 Upload clients are built by `faucet_core::http`, so a redirect to another
 origin never carries the bearer token.
 
+## Shared SQL layer
+
+This sink takes its identifier and literal escaping, column types and exact widening (`BIGNUMERIC`) from the `BigQuery` dialect of
+[`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
+place every SQL sink gets them. Rows travel as one JSON payload (`UNNEST(JSON_QUERY_ARRAY(@payload))`) through the jobs API, with a presence-flag `MERGE` for upserts, so there is no per-cell statement for the engine to plan.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

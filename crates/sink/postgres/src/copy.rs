@@ -70,38 +70,31 @@ pub(crate) fn build_auto_map_payload(
     table_columns: &[(String, String)],
     binary: BinaryEncoding,
 ) -> Result<Option<CopyPayload>, String> {
-    // Pass 1: validate + find which table columns any record uses.
-    let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut matched_any: Vec<&serde_json::Map<String, Value>> = Vec::with_capacity(records.len());
-    for (idx, record) in records.iter().enumerate() {
-        let obj = record
-            .as_object()
-            .ok_or_else(|| "AutoMap requires JSON object records".to_string())?;
-        let mut matched = false;
-        for (col, _) in table_columns {
-            if obj.contains_key(col) {
-                used.insert(col.as_str());
-                matched = true;
-            }
-        }
-        if !matched {
-            // Never a silent skip: the row would be lost with the bookmark
-            // advancing past it (#789 SQL-50).
-            return Err(crate::sink::no_matching_column_message(
-                idx,
-                obj,
-                table_columns,
-            ));
-        }
-        matched_any.push(obj);
-    }
-    if matched_any.is_empty() {
+    // Pass 1: validate + find which table columns any record uses — the
+    // engine's exact-name mapping, as the INSERT path does.
+    use faucet_common_sql::mapping::{ColumnMatching, MapError, map_records, union_columns};
+    let columns = crate::sink::table_columns(table_columns);
+    let rows = map_records(&columns, records, ColumnMatching::Exact).map_err(|e| match e {
+        // Never a silent skip: the row would be lost with the bookmark
+        // advancing past it (#789 SQL-50).
+        MapError::NoMatch { index } => crate::sink::no_matching_column_message(
+            index,
+            records[index]
+                .as_object()
+                .expect("a matched record is an object"),
+            table_columns,
+        ),
+        _ => "AutoMap requires JSON object records".to_string(),
+    })?;
+    if rows.is_empty() {
         return Ok(None);
     }
+    let matched_any: Vec<&serde_json::Map<String, Value>> =
+        records.iter().filter_map(Value::as_object).collect();
 
-    let insert_columns: Vec<&(String, String)> = table_columns
-        .iter()
-        .filter(|(c, _)| used.contains(c.as_str()))
+    let insert_columns: Vec<&(String, String)> = union_columns(&rows, columns.len())
+        .into_iter()
+        .map(|i| &table_columns[i])
         .collect();
 
     // Pass 2: encode rows.

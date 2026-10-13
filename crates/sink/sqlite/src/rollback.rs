@@ -19,21 +19,9 @@ type Tx<'c> = sqlx::Transaction<'c, sqlx::Sqlite>;
 /// SQLite's default bind-variable ceiling.
 const MAX_SQLITE_PARAMS: usize = 32766;
 
-fn placeholder(_n: usize) -> String {
-    "?".to_string()
-}
-
 fn journal_sql() -> JournalSql {
-    JournalSql {
-        quote: quote_ident_sqlite,
-        placeholder,
-        before_type: "TEXT",
-        insert_prefix: "INSERT OR IGNORE",
-        insert_suffix: "",
-        now: "(datetime('now'))",
-        key_column: faucet_core::rollback::KEY_COLUMN_TEXT,
-        primary_key: faucet_core::rollback::PRIMARY_KEY_TEXT,
-    }
+    faucet_common_sql::SqlDialect::journal_sql(&faucet_common_sql::dialects::Sqlite)
+        .expect("the sqlite dialect journals")
 }
 
 fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -105,18 +93,22 @@ impl SqliteSink {
         )
     }
 
-    async fn columns_of(&self, tx: &mut Tx<'_>, table: &str) -> Result<Vec<String>, FaucetError> {
+    async fn columns_of(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        table: &str,
+    ) -> Result<Vec<String>, FaucetError> {
         let rows = sqlx::query("SELECT name FROM pragma_table_info(?) ORDER BY cid")
             .bind(table)
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| sink_err("read table columns", e))?;
         Ok(rows.iter().map(|r| r.get::<String, _>("name")).collect())
     }
 
-    async fn ensure_journal(&self, tx: &mut Tx<'_>) -> Result<(), FaucetError> {
+    async fn ensure_journal(&self, tx: &mut sqlx::SqliteConnection) -> Result<(), FaucetError> {
         sqlx::query(&journal_sql().create())
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await
             .map_err(|e| sink_err("create journal", e))?;
         Ok(())
@@ -128,7 +120,7 @@ impl SqliteSink {
     /// no current row is journaled with a null image so the restore deletes it.
     pub(crate) async fn journal_plan(
         &self,
-        tx: &mut Tx<'_>,
+        tx: &mut sqlx::SqliteConnection,
         plan: &faucet_core::WritePlan,
         run_id: &str,
     ) -> Result<(), FaucetError> {
@@ -158,7 +150,7 @@ impl SqliteSink {
                 }
             }
             let rows = q
-                .fetch_all(&mut **tx)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| sink_err("read before-images", e))?;
             let mut before: std::collections::HashMap<usize, String> =
@@ -181,7 +173,7 @@ impl SqliteSink {
                     .bind(kj)
                     .bind(img);
             }
-            q.execute(&mut **tx)
+            q.execute(&mut *tx)
                 .await
                 .map_err(|e| sink_err("write journal", e))?;
         }

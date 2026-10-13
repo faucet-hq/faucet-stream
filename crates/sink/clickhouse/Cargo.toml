@@ -19,6 +19,7 @@ staging = ["faucet-core/staging"]
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-sql.workspace = true
 faucet-common-clickhouse.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }

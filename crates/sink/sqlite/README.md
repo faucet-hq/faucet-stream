@@ -435,6 +435,18 @@ Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (e
 
 Every sink operation runs through the pipeline's `CallContext` (#880) as one backend call named after the operation (`write_batch`, `write_batch_partial`, `write_batch_idempotent`, `last_committed_token`, the overwrite, schema, cleanup and rollback steps): the run's deadline ends it promptly and its transaction rolls back (`busy_timeout_secs` bounds a wait on a locked file), and it counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The sink never retries a write itself; a `resilience:` policy retries a page only when the write is replay-safe (a keyed upsert).
 
+## Shared SQL layer
+
+This sink runs on [`faucet-common-sql`](../../common/sql/README.md)'s
+`SqlSinkEngine` with the `Sqlite` dialect (RFC 0013, #884): column mapping
+(exact first, else ignoring ASCII case), the union column set of an append, one upsert per set of carried
+columns, page-ordered keyed groups with the rollback journal written first,
+statements chunked under the parameter limit, create-table and evolution DDL,
+the scoped-cleanup sequence, the commit-token write and the row report all come
+from the engine, so they behave the same here as in every other SQL sink. The
+sink supplies the connection (an executor over its driver) and keeps its own
+transactions (`BEGIN IMMEDIATE`) and the overwrite swap.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
