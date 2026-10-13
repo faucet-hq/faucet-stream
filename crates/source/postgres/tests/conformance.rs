@@ -119,3 +119,20 @@ async fn conformance_errors_not_panics() {
     .expect("source builds; the query only fails at read time");
     faucet_conformance::assert_errors_not_panics(&source).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A query the server sits on stands in for a hung backend (#880).
+    let (_container, url) = start_postgres().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            PostgresSource::new(PostgresSourceConfig::new(&url, "SELECT pg_sleep(60)"))
+                .await
+                .expect("source new"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

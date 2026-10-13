@@ -411,7 +411,14 @@ impl CallContext {
     where
         Fut: Future<Output = Result<T, FaucetError>>,
     {
-        let single = self.clone().without_retry();
+        let reset;
+        let single = match &self.inner.retry {
+            Some(p) if p.max_attempts > 1 => {
+                reset = self.clone().without_retry();
+                &reset
+            }
+            _ => self,
+        };
         let mut fut = Some(fut);
         single
             .call(op, || {

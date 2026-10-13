@@ -2,6 +2,7 @@
 
 use crate::config::{BOOKMARK_TOKEN, MysqlReplication, MysqlSourceConfig};
 use async_trait::async_trait;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
@@ -26,6 +27,9 @@ pub struct MysqlSource {
     json_warned: Mutex<std::collections::HashSet<String>>,
     /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
     start_bookmark: Mutex<Option<Value>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// recorder. `read_timeout_secs` stays the per-read bound.
+    calls: CallSlot,
 }
 
 /// Quote a MySQL identifier with backticks (MySQL's default identifier
@@ -76,6 +80,7 @@ impl MysqlSource {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
+            calls: CallSlot::new(CallContext::new().without_timeout()),
         })
     }
 
@@ -170,7 +175,16 @@ impl MysqlSource {
         bind_values: &[Value],
     ) -> std::collections::HashSet<String> {
         use sqlx::{Executor, TypeInfo};
-        let Ok(described) = (&self.pool).describe(query).await else {
+        let described = self
+            .calls
+            .call_once("describe", async {
+                (&self.pool)
+                    .describe(query)
+                    .await
+                    .map_err(|e| FaucetError::Source(e.to_string()))
+            })
+            .await;
+        let Ok(described) = described else {
             return Default::default();
         };
         let flagged: Vec<String> = described
@@ -190,10 +204,16 @@ impl MysqlSource {
         let Some(probe) = charset_probe_query(query, &all) else {
             return Default::default();
         };
-        let row = match bind_params(sqlx::query(&probe), bind_values)
-            .fetch_one(&self.pool)
-            .await
-        {
+        let probed = self
+            .calls
+            .call_once("describe", async {
+                bind_params(sqlx::query(&probe), bind_values)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Source(e.to_string()))
+            })
+            .await;
+        let row = match probed {
             Ok(row) => row,
             Err(e) => {
                 tracing::debug!(error = %e, "mysql: charset probe failed; binary-collation text stays base64");
@@ -741,7 +761,13 @@ impl faucet_core::Source for MysqlSource {
         let text_columns = self.text_columns(&query_str, &bind_values).await;
         let query = bind_params(sqlx::query(&query_str), &bind_values);
 
-        let rows = bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)).await?;
+        let rows = self
+            .calls
+            .call_once(
+                "query",
+                bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)),
+            )
+            .await?;
 
         let records: Vec<Value> = rows
             .iter()
@@ -776,13 +802,19 @@ impl faucet_core::Source for MysqlSource {
             let text_columns = self.text_columns(&query_str, &bind_values).await;
             let query = bind_params(sqlx::query(&query_str), &bind_values);
 
+            let calls = self.calls.get();
+            calls.record("query");
+            let steps = calls.with_roundtrip_metering(false);
             let mut rows = query.fetch(&self.pool);
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
+            while let Some(row) = steps
+                .call_once("query", bounded_read(self.config.read_timeout_secs, rows.try_next()))
+                .await?
+            {
                 let record = row_to_json(&row, &text_columns, &self.json_context())?;
                 if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
                     buffer.push(record);
@@ -847,6 +879,17 @@ impl faucet_core::Source for MysqlSource {
         Ok(())
     }
 
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn connector_name(&self) -> &'static str {
         "mysql"
     }
@@ -898,10 +941,14 @@ impl faucet_core::Source for MysqlSource {
              WHERE t.table_type = 'BASE TABLE' \
                AND c.table_schema = DATABASE() \
              ORDER BY c.table_name, c.ordinal_position";
-        let rows = sqlx::query(sql)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Source(format!("mysql: catalog discovery failed: {e}")))?;
+        let rows = self
+            .calls
+            .call_once("discover", async {
+                sqlx::query(sql).fetch_all(&self.pool).await.map_err(|e| {
+                    FaucetError::Source(format!("mysql: catalog discovery failed: {e}"))
+                })
+            })
+            .await?;
 
         let catalog: Vec<CatalogRow> = rows
             .iter()
@@ -922,7 +969,10 @@ impl faucet_core::Source for MysqlSource {
             })
             .collect::<Result<_, _>>()?;
 
-        let keys = primary_keys(&self.pool).await?;
+        let keys = self
+            .calls
+            .call_once("discover", primary_keys(&self.pool))
+            .await?;
         Ok(faucet_core::attach_primary_keys(
             descriptors_from_catalog(catalog),
             keys,
@@ -950,16 +1000,21 @@ impl faucet_core::Source for MysqlSource {
             }
         };
         let bounds_sql = pk_bounds_query(&base, &quote_ident_mysql(&shard_cfg.key), "SIGNED");
-        let row = bind_params(sqlx::query(&bounds_sql), &binds)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!(
-                    "mysql: failed to compute shard bounds for key {:?} \
+        let row = self
+            .calls
+            .call_once("query", async {
+                bind_params(sqlx::query(&bounds_sql), &binds)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Source(format!(
+                            "mysql: failed to compute shard bounds for key {:?} \
                      (it must be an integer-typed column): {e}",
-                    shard_cfg.key
-                ))
-            })?;
+                            shard_cfg.key
+                        ))
+                    })
+            })
+            .await?;
 
         let lo: Option<i64> = row
             .try_get("lo")
@@ -998,10 +1053,15 @@ impl faucet_core::Source for MysqlSource {
         };
         let inner = bounds.wrap(&base, quote_ident_mysql);
         let sql = digest_query(&inner, key, columns);
-        let row = bind_params(sqlx::query(&sql), &binds)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Source(format!("mysql: range digest failed: {e}")))?;
+        let row = self
+            .calls
+            .call_once("query", async {
+                bind_params(sqlx::query(&sql), &binds)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("mysql: range digest failed: {e}")))
+            })
+            .await?;
         let rows: i64 = row
             .try_get("rows")
             .map_err(|e| FaucetError::Source(format!("mysql: digest decode: {e}")))?;
@@ -1306,6 +1366,7 @@ mod tests {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
+            calls: CallSlot::new(CallContext::new().without_timeout()),
         }
     }
 

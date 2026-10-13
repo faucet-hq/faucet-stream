@@ -436,6 +436,10 @@ where its previous owner left off.
 Outside the cluster coordinator the `shard` config has **no effect** — a plain
 `faucet run` streams the whole query.
 
+## Timeouts, cancellation and retries
+
+Every query runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end an in-flight query, or a stalled row read, promptly; `read_timeout_secs` still bounds each server read. Each query counts as one `query` round trip in `faucet_source_roundtrips_total` (`describe` for the charset probe, `discover` for catalog reads). Reads are not retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

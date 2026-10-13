@@ -2,6 +2,7 @@
 
 use crate::config::{BOOKMARK_TOKEN, PostgresReplication, PostgresSourceConfig};
 use async_trait::async_trait;
+use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
@@ -27,6 +28,9 @@ pub struct PostgresSource {
     json_warned: Mutex<std::collections::HashSet<String>>,
     /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
     start_bookmark: Mutex<Option<Value>>,
+    /// Backend-call context (#880): the run's deadline, cancel token and
+    /// recorder. `read_timeout_secs` stays the per-read bound.
+    calls: CallSlot,
 }
 
 impl PostgresSource {
@@ -53,7 +57,19 @@ impl PostgresSource {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
+            calls: CallSlot::new(CallContext::new().without_timeout()),
         })
+    }
+
+    /// Run one server read as a backend call named `op`.
+    async fn read<T>(
+        &self,
+        op: &'static str,
+        fut: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<Result<T, sqlx::Error>, FaucetError> {
+        self.calls
+            .call_once(op, bounded(self.config.read_timeout_secs, fut))
+            .await
     }
 
     /// The cursor column and starting position of an incremental read.
@@ -95,7 +111,8 @@ impl PostgresSource {
             context,
         )
         .0;
-        let described = bounded(self.config.read_timeout_secs, (&self.pool).describe(&probe))
+        let described = self
+            .read("describe", (&self.pool).describe(&probe))
             .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
@@ -167,7 +184,7 @@ impl PostgresSource {
     /// returned unchanged, so its own error surfaces when it runs.
     async fn typed_query(&self, query: String) -> String {
         use sqlx::Executor;
-        match bounded(self.config.read_timeout_secs, (&self.pool).describe(&query)).await {
+        match self.read("describe", (&self.pool).describe(&query)).await {
             Ok(Ok(described)) => {
                 let columns: Vec<(String, String)> = described
                     .columns()
@@ -896,7 +913,13 @@ impl faucet_core::Source for PostgresSource {
         let query_str = self.typed_query(self.shard_wrap(query_str)).await;
         let query = bind_params(sqlx::query(&query_str), &self.config.params, &bind_values)?;
 
-        let rows = bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)).await?;
+        let rows = self
+            .calls
+            .call_once(
+                "query",
+                bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)),
+            )
+            .await?;
 
         let records: Vec<Value> = rows
             .iter()
@@ -934,13 +957,19 @@ impl faucet_core::Source for PostgresSource {
                 &bind_values,
             )?;
 
+            let calls = self.calls.get();
+            calls.record("query");
+            let steps = calls.with_roundtrip_metering(false);
             let mut rows = query.fetch(&self.pool);
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
+            while let Some(row) = steps
+                .call_once("query", bounded_read(self.config.read_timeout_secs, rows.try_next()))
+                .await?
+            {
                 let record = row_to_json(&row, &self.json_context())?;
                 if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
                     buffer.push(record);
@@ -1005,6 +1034,17 @@ impl faucet_core::Source for PostgresSource {
         Ok(())
     }
 
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
     fn connector_name(&self) -> &'static str {
         "postgres"
     }
@@ -1060,12 +1100,10 @@ impl faucet_core::Source for PostgresSource {
                         AND pc.relname = t.table_name
                         AND pc.relispartition)
              ORDER BY c.table_schema, c.table_name, c.ordinal_position"#;
-        let rows = bounded(
-            self.config.read_timeout_secs,
-            sqlx::query(sql).fetch_all(&self.pool),
-        )
-        .await?
-        .map_err(|e| FaucetError::Source(format!("postgres: catalog discovery failed: {e}")))?;
+        let rows = self
+            .read("discover", sqlx::query(sql).fetch_all(&self.pool))
+            .await?
+            .map_err(|e| FaucetError::Source(format!("postgres: catalog discovery failed: {e}")))?;
 
         let catalog: Vec<CatalogRow> = rows
             .iter()
@@ -1086,7 +1124,8 @@ impl faucet_core::Source for PostgresSource {
             })
             .collect::<Result<_, _>>()?;
 
-        let keys = bounded(self.config.read_timeout_secs, primary_keys(&self.pool))
+        let keys = self
+            .read("discover", primary_keys(&self.pool))
             .await?
             .map_err(key_discovery_error)?;
         Ok(faucet_core::attach_primary_keys(
@@ -1118,7 +1157,8 @@ impl faucet_core::Source for PostgresSource {
         };
         let bounds_sql = pk_bounds_query(&base, &quote_ident(&shard_cfg.key), "BIGINT");
         let query = bind_params(sqlx::query(&bounds_sql), &self.config.params, &binds)?;
-        let row = bounded(self.config.read_timeout_secs, query.fetch_one(&self.pool))
+        let row = self
+            .read("query", query.fetch_one(&self.pool))
             .await?
             .map_err(|e| {
                 FaucetError::Source(format!(
@@ -1170,7 +1210,8 @@ impl faucet_core::Source for PostgresSource {
         let inner = bounds.wrap(&base, quote_ident);
         let sql = digest_query(&inner, key, columns);
         let query = bind_params(sqlx::query(&sql), &self.config.params, &binds)?;
-        let row = bounded(self.config.read_timeout_secs, query.fetch_one(&self.pool))
+        let row = self
+            .read("query", query.fetch_one(&self.pool))
             .await?
             .map_err(|e| FaucetError::Source(format!("postgres: range digest failed: {e}")))?;
         let rows: i64 = row
@@ -1842,6 +1883,7 @@ mod tests {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
+            calls: CallSlot::new(CallContext::new().without_timeout()),
         }
     }
 
