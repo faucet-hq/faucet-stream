@@ -515,6 +515,131 @@ async fn key_bounds_http_failure_is_a_typed_source_error() {
     );
 }
 
+fn ledger_partitioned(base: &str) -> RestStreamConfig {
+    let mut cfg = RestStreamConfig::new(base, "/Ledger");
+    cfg.odata = Some(
+        serde_json::from_value(json!({
+            "version": "v4",
+            "entity": "Ledger",
+            "partition": { "objects": "Ledger", "key": "RecId" }
+        }))
+        .unwrap(),
+    );
+    cfg.records_path = Some("$.value[*]".into());
+    cfg.max_retries = 0;
+    cfg
+}
+
+async fn first_page_error(cfg: RestStreamConfig) -> String {
+    let stream = RestStream::new(cfg).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    pages
+        .next()
+        .await
+        .expect("a page result")
+        .expect_err("the key-bounds request must fail")
+        .to_string()
+}
+
+#[tokio::test]
+async fn key_bounds_transport_failure_is_a_typed_source_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let err = first_page_error(ledger_partitioned(&base)).await;
+    assert!(err.contains("key-bounds request failed"), "{err}");
+}
+
+#[tokio::test]
+async fn key_bounds_non_json_body_is_a_typed_source_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Ledger"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+    let err = first_page_error(ledger_partitioned(&server.uri())).await;
+    assert!(err.contains("key-bounds body"), "{err}");
+}
+
+/// Mount key bounds 1..1 and one data row, all requiring `header: value`.
+async fn mount_ledger_behind(server: &MockServer, name: &str, value: &str) {
+    Mock::given(method("GET"))
+        .and(path("/Ledger"))
+        .and(wiremock::matchers::header(name, value))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "RecId": 1 }] })),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn drain_records(cfg: RestStreamConfig) -> usize {
+    let stream = RestStream::new(cfg).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    let mut n = 0;
+    while let Some(p) = pages.next().await {
+        n += p.expect("a page").records.len();
+    }
+    n
+}
+
+/// The key-bounds requests carry the inline credential: an OAuth2 or
+/// token-endpoint bearer fetched through its cache, an API-key header, or
+/// custom headers.
+#[tokio::test]
+async fn key_bounds_requests_carry_every_inline_credential() {
+    use faucet_source_rest::Auth;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "tok", "expires_in": 3600 })),
+        )
+        .mount(&server)
+        .await;
+    mount_ledger_behind(&server, "authorization", "Bearer tok").await;
+    mount_ledger_behind(&server, "x-key", "k").await;
+    mount_ledger_behind(&server, "x-tenant", "t").await;
+
+    let oauth = ledger_partitioned(&server.uri()).auth(Auth::OAuth2 {
+        token_url: format!("{}/token", server.uri()),
+        client_id: "id".into(),
+        client_secret: "secret".into(),
+        scopes: vec![],
+        expiry_ratio: 0.9,
+    });
+    assert_eq!(drain_records(oauth).await, 1);
+
+    let endpoint = ledger_partitioned(&server.uri()).auth(Auth::TokenEndpoint {
+        url: format!("{}/token", server.uri()),
+        method: reqwest::Method::POST,
+        headers: Default::default(),
+        body: None,
+        token_path: "$.access_token".into(),
+        expiry_path: None,
+        expiry_ratio: 0.9,
+        encoding: Default::default(),
+        response_validator: None,
+    });
+    assert_eq!(drain_records(endpoint).await, 1);
+
+    let mut api_key = ledger_partitioned(&server.uri()).auth(Auth::ApiKey {
+        header: "x-key".into(),
+        value: "k".into(),
+    });
+    api_key.timeout = None;
+    assert_eq!(drain_records(api_key).await, 1);
+
+    let custom = ledger_partitioned(&server.uri()).auth(Auth::Custom {
+        headers: HashMap::from([("x-tenant".to_string(), "t".to_string())]),
+    });
+    assert_eq!(drain_records(custom).await, 1);
+}
+
 // ── Generic `discovery:` recipe ──────────────────────────────────────────────
 
 fn recipe_config(server: &MockServer, recipe: Value) -> RestStreamConfig {
