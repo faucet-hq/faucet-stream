@@ -1668,3 +1668,20 @@ async fn source_driver_defaults_and_overrides_reach_the_source() {
     assert!(b.supports_discover());
     assert!(b.discover().await.unwrap().is_empty());
 }
+
+#[test]
+fn pages_of_chunks_and_puts_the_bookmark_last() {
+    let rows = |n: usize| (0..n).map(|i| json!(i)).collect::<Vec<_>>();
+    let pages: Vec<_> = pages_of(rows(5), Some(json!("b")), 2).collect();
+    assert_eq!(
+        pages.iter().map(|p| p.records.len()).collect::<Vec<_>>(),
+        vec![2, 2, 1]
+    );
+    assert!(pages[..2].iter().all(|p| p.bookmark.is_none()));
+    assert_eq!(pages[2].bookmark, Some(json!("b")));
+    assert_eq!(pages_of(rows(5), None, 0).count(), 1);
+    let empty: Vec<_> = pages_of(Vec::new(), Some(json!(1)), 10).collect();
+    assert_eq!(empty.len(), 1);
+    assert!(empty[0].records.is_empty());
+    assert_eq!(pages_of(Vec::new(), None, 10).count(), 0);
+}

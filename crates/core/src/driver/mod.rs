@@ -93,7 +93,7 @@ pub use sink::{
 };
 #[cfg(feature = "arrow")]
 pub use source::ColumnarStream;
-pub use source::{DriverSource, NativeStream, PageStream, SourceDriver};
+pub use source::{DriverSource, NativeStream, PageStream, SourceDriver, pages_of};
 
 #[cfg(test)]
 mod tests;

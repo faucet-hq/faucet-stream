@@ -227,6 +227,55 @@ pub type NativeStream<'a> =
 pub type ColumnarStream<'a> =
     Pin<Box<dyn Stream<Item = Result<crate::columnar::ColumnarPage, FaucetError>> + Send + 'a>>;
 
+/// Split a buffered read into pages of `batch_size` records (`0`: one page),
+/// the bookmark on the last page — the shape a source without a native paging
+/// primitive streams in. An empty read yields one empty page only when it
+/// carries a bookmark.
+///
+/// ```
+/// use faucet_core::driver::pages_of;
+/// use faucet_core::json;
+///
+/// let pages: Vec<_> = pages_of(vec![json!(1), json!(2), json!(3)], Some(json!(3)), 2).collect();
+/// assert_eq!(pages.len(), 2);
+/// assert_eq!(pages[0].bookmark, None);
+/// assert_eq!(pages[1].bookmark, Some(json!(3)));
+/// ```
+pub fn pages_of(
+    records: Vec<Value>,
+    bookmark: Option<Value>,
+    batch_size: usize,
+) -> impl Iterator<Item = StreamPage> + Send {
+    let chunk = if batch_size == 0 {
+        usize::MAX
+    } else {
+        batch_size
+    };
+    let total = records.len();
+    let empty = (total == 0 && bookmark.is_some()).then(|| StreamPage {
+        records: Vec::new(),
+        bookmark: bookmark.clone(),
+    });
+    let mut iter = records.into_iter();
+    let mut consumed = 0usize;
+    let pages = std::iter::from_fn(move || {
+        let batch: Vec<Value> = iter.by_ref().take(chunk).collect();
+        if batch.is_empty() {
+            return None;
+        }
+        consumed += batch.len();
+        Some(StreamPage {
+            bookmark: if consumed >= total {
+                bookmark.clone()
+            } else {
+                None
+            },
+            records: batch,
+        })
+    });
+    empty.into_iter().chain(pages)
+}
+
 /// A [`SourceDriver`] as a [`Source`] (RFC 0014): every fetch is the driver's
 /// page stream, and the run's call context reaches every read.
 pub struct DriverSource<D> {
