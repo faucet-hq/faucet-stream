@@ -3,6 +3,7 @@
 use crate::config::{XmlAuth, XmlPagination, XmlStreamConfig};
 use crate::convert;
 use async_trait::async_trait;
+use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
@@ -133,6 +134,11 @@ const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// A configured XML API source that handles pagination and extraction.
 pub struct XmlStream {
+    inner: DriverSource<XmlDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct XmlDriver {
     config: XmlStreamConfig,
     client: Client,
     /// Optional shared auth provider. When present it takes precedence over
@@ -144,10 +150,6 @@ pub struct XmlStream {
     /// reproduce the legacy `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`
     /// constants; overridable via [`with_retry_policy`](Self::with_retry_policy).
     retry_policy: faucet_core::RetryPolicy,
-    /// Backend-call context (#880): this source's retry policy over the run's
-    /// cancel token, recorder and deadline. Meters `request` round trips and
-    /// throttling (#638, #734).
-    calls: CallSlot,
 }
 
 /// Attach a mutual-TLS client identity to the HTTP client builder (#495). Only
@@ -228,8 +230,9 @@ impl XmlStream {
     /// (or the TLS identity) fails to build, matching the pre-existing
     /// `Client::new()` behavior.
     pub fn new(config: XmlStreamConfig) -> Self {
-        Self::try_new(config)
-            .expect("XmlStream::new: client build failed; use try_new() for fallible construction")
+        Self {
+            inner: DriverSource::new(XmlDriver::new(config)),
+        }
     }
 
     /// Fallible constructor — builds the HTTP client, including any mutual-TLS
@@ -241,6 +244,71 @@ impl XmlStream {
     /// applies the `tls:` block, so `new()` remains infallible for non-TLS
     /// configs exactly as before.
     pub fn try_new(config: XmlStreamConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSource::new(XmlDriver::try_new(config)?),
+        })
+    }
+
+    /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
+    /// request failures, replacing the default derived from
+    /// `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`. Used by the CLI to inject a
+    /// pipeline-level `resilience:` policy into the source.
+    pub fn with_retry_policy(self, policy: faucet_core::RetryPolicy) -> Self {
+        let mut driver = self.inner.into_driver();
+        driver.retry_policy = policy;
+        Self {
+            inner: DriverSource::new(driver),
+        }
+    }
+
+    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set,
+    /// the provider supplies the credential for every request (taking precedence
+    /// over inline auth), so several sources can share one token with
+    /// single-flight refresh. Used by the CLI to resolve `auth: { ref }`, and by
+    /// library callers who construct one provider and inject it into many
+    /// sources.
+    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
+        self.inner.driver_mut().auth_provider = Some(provider);
+        self
+    }
+
+    /// Fetch all records across all pages.
+    pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
+        self.inner
+            .driver()
+            .fetch_all_with_context(self.inner.calls(), &HashMap::new())
+            .await
+    }
+
+    #[cfg(test)]
+    fn effective_records_path(&self) -> Option<String> {
+        self.inner.driver().effective_records_path()
+    }
+
+    #[cfg(test)]
+    fn extract_records_eager(
+        &self,
+        xml_text: &str,
+        fault_logged: &mut bool,
+    ) -> Result<Vec<Value>, FaucetError> {
+        self.inner
+            .driver()
+            .extract_records_eager(xml_text, fault_logged)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Source for XmlStream {
+    faucet_core::forward_source!(inner);
+}
+
+impl XmlDriver {
+    fn new(config: XmlStreamConfig) -> Self {
+        Self::try_new(config)
+            .expect("XmlStream::new: client build failed; use try_new() for fallible construction")
+    }
+
+    fn try_new(config: XmlStreamConfig) -> Result<Self, FaucetError> {
         let mut builder = Client::builder();
         if let Some(t) = config.timeout {
             builder = builder.timeout(t);
@@ -270,31 +338,8 @@ impl XmlStream {
             config,
             client,
             auth_provider: None,
-            calls: CallSlot::new(CallContext::new().with_retry(retry_policy.clone())),
             retry_policy,
         })
-    }
-
-    /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
-    /// request failures, replacing the default derived from
-    /// `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`. Used by the CLI to inject a
-    /// pipeline-level `resilience:` policy into the source.
-    pub fn with_retry_policy(mut self, policy: faucet_core::RetryPolicy) -> Self {
-        self.calls
-            .set_local(self.calls.local().clone().with_retry(policy.clone()));
-        self.retry_policy = policy;
-        self
-    }
-
-    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set,
-    /// the provider supplies the credential for every request (taking precedence
-    /// over inline auth), so several sources can share one token with
-    /// single-flight refresh. Used by the CLI to resolve `auth: { ref }`, and by
-    /// library callers who construct one provider and inject it into many
-    /// sources.
-    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
-        self
     }
 
     /// The effective record element path after applying SOAP ergonomics.
@@ -367,19 +412,15 @@ impl XmlStream {
         Ok(records)
     }
 
-    /// Fetch all records across all pages.
-    pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
-        self.fetch_all_with_context(&HashMap::new()).await
-    }
-
     /// Fetch all records, substituting parent context into path, query_params, and body.
     async fn fetch_all_with_context(
         &self,
+        calls: &CallSlot,
         context: &HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
         use futures::StreamExt;
         let mut all_records = Vec::new();
-        let mut pages = self.http_pages(context);
+        let mut pages = self.http_pages(calls, context);
         while let Some(page) = pages.next().await {
             all_records.extend(page?);
         }
@@ -420,6 +461,7 @@ impl XmlStream {
     /// holds at most one response's records at a time.
     fn http_pages<'a>(
         &'a self,
+        calls: &'a CallSlot,
         context: &'a HashMap<String, Value>,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + 'a>> {
         Box::pin(async_stream::try_stream! {
@@ -452,7 +494,7 @@ impl XmlStream {
                     }
                     _ => None,
                 };
-                let xml_text = self.execute_request(&params, context, next).await?;
+                let xml_text = self.execute_request(calls, &params, context, next).await?;
                 let records = self.page_records(&xml_text, &mut fault_logged).await?;
                 let record_count = records.len();
                 let fingerprint = page_fingerprint(&records);
@@ -545,11 +587,15 @@ impl XmlStream {
     /// the provider re-authenticate and run it once more (#789 API-06).
     async fn execute_request(
         &self,
+        calls: &CallSlot,
         params: &HashMap<String, String>,
         context: &HashMap<String, serde_json::Value>,
         next: Option<(&str, &str)>,
     ) -> Result<String, FaucetError> {
-        match self.execute_request_once(params, context, next).await {
+        match self
+            .execute_request_once(calls, params, context, next)
+            .await
+        {
             Err(e)
                 if self
                     .auth_provider
@@ -565,7 +611,8 @@ impl XmlStream {
                 provider
                     .invalidate(&faucet_core::Credential::Token(String::new()))
                     .await?;
-                self.execute_request_once(params, context, next).await
+                self.execute_request_once(calls, params, context, next)
+                    .await
             }
             other => other,
         }
@@ -573,6 +620,7 @@ impl XmlStream {
 
     async fn execute_request_once(
         &self,
+        calls: &CallSlot,
         params: &HashMap<String, String>,
         context: &HashMap<String, serde_json::Value>,
         next: Option<(&str, &str)>,
@@ -758,7 +806,7 @@ impl XmlStream {
         // Retry transient failures (5xx / connection resets) with jittered
         // backoff, matching the REST source's reliability layer (#78/#16).
         // The request body is a String, so `try_clone` always succeeds.
-        self.calls
+        calls
             .call("request", || {
                 let attempt = req.try_clone();
                 async move {
@@ -782,12 +830,24 @@ impl XmlStream {
 }
 
 #[async_trait]
-impl faucet_core::Source for XmlStream {
-    async fn fetch_with_context(
+impl SourceDriver for XmlDriver {
+    /// This source's retry policy over the run's cancel token, recorder and
+    /// deadline (#880). Meters `request` round trips and throttling (#638,
+    /// #734).
+    fn call_context(&self) -> CallContext {
+        CallContext::new().with_retry(self.retry_policy.clone())
+    }
+
+    async fn fetch(
         &self,
-        context: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        self.fetch_all_with_context(context).await
+        calls: &CallSlot,
+        context: &HashMap<String, Value>,
+    ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+        Some(
+            self.fetch_all_with_context(calls, context)
+                .await
+                .map(|records| (records, None)),
+        )
     }
 
     /// Stream records from the XML response without materialising the whole
@@ -812,11 +872,12 @@ impl faucet_core::Source for XmlStream {
     /// Bookmarks are always `None` — the XML source has no
     /// incremental-replication mode today; pagination only walks the
     /// API's own page-number / offset cursor.
-    fn stream_pages<'a>(
+    fn read<'a>(
         &'a self,
+        calls: &'a CallSlot,
         context: &'a HashMap<String, Value>,
         _batch_size: usize,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+    ) -> PageStream<'a> {
         let batch_size = self.config.batch_size;
         let chunk = if batch_size == 0 {
             usize::MAX
@@ -828,7 +889,7 @@ impl faucet_core::Source for XmlStream {
             use futures::StreamExt;
             let mut buffer: Vec<Value> = Vec::new();
             let mut total = 0usize;
-            let mut pages = self.http_pages(context);
+            let mut pages = self.http_pages(calls, context);
             while let Some(page) = pages.next().await {
                 for rec in page? {
                     buffer.push(rec);
@@ -849,17 +910,6 @@ impl faucet_core::Source for XmlStream {
 
     fn connector_name(&self) -> &'static str {
         "xml"
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -1085,8 +1135,11 @@ mod tests {
     #[test]
     fn default_retry_policy_reproduces_legacy_constants() {
         let source = XmlStream::new(XmlStreamConfig::new("https://soap.example.com", "/svc"));
-        assert_eq!(source.retry_policy.max_attempts, RETRY_MAX_ATTEMPTS + 1);
-        assert_eq!(source.retry_policy.base, RETRY_BASE_BACKOFF);
+        assert_eq!(
+            source.inner.driver().retry_policy.max_attempts,
+            RETRY_MAX_ATTEMPTS + 1
+        );
+        assert_eq!(source.inner.driver().retry_policy.base, RETRY_BASE_BACKOFF);
     }
 
     #[test]
@@ -1098,8 +1151,11 @@ mod tests {
         };
         let source = XmlStream::new(XmlStreamConfig::new("https://soap.example.com", "/svc"))
             .with_retry_policy(policy);
-        assert_eq!(source.retry_policy.max_attempts, 9);
-        assert_eq!(source.retry_policy.base, Duration::from_secs(7));
+        assert_eq!(source.inner.driver().retry_policy.max_attempts, 9);
+        assert_eq!(
+            source.inner.driver().retry_policy.base,
+            Duration::from_secs(7)
+        );
     }
 }
 
