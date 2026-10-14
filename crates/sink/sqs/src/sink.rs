@@ -1,9 +1,14 @@
 //! The SQS `Sink` implementation: encode → size-aware chunking →
 //! bounded-concurrency `SendMessageBatch` → per-entry partial-failure retry.
+//!
+//! Built on the messaging family driver (RFC 0014): `SqsDriver` encodes one
+//! record and publishes a page's messages; `MessageSinkDriver` reports each
+//! row and serves the plain, reported and per-row write paths.
 
 use crate::config::SqsSinkConfig;
 use aws_sdk_sqs::Client;
 use aws_sdk_sqs::types::SendMessageBatchRequestEntry;
+use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome};
 use serde_json::Value;
@@ -142,11 +147,21 @@ fn clone_outcome(o: &Result<(), FaucetError>) -> Result<(), FaucetError> {
 }
 
 /// AWS SQS sink. See the crate README for semantics.
+///
+/// Built on the messaging family driver (RFC 0014).
 pub struct SqsSink {
+    inner: DriverSink<MessageSinkDriver<SqsDriver>>,
+}
+
+/// The SQS I/O primitives the messaging driver runs on.
+pub(crate) struct SqsDriver {
     config: SqsSinkConfig,
     client: Client,
-    calls: CallSlot,
 }
+
+/// The header that carries a message's `MessageDeduplicationId` from
+/// [`SqsDriver::encode`] to [`SqsDriver::publish`].
+const DEDUP_HEADER: &str = "MessageDeduplicationId";
 
 impl SqsSink {
     /// Create a new SQS sink. Validates the config and builds the AWS client
@@ -160,67 +175,61 @@ impl SqsSink {
         )
         .await?;
         Ok(Self {
-            config,
-            client,
-            calls: CallSlot::new(CallContext::new().without_retry()),
+            inner: DriverSink::new(MessageSinkDriver::new(SqsDriver { config, client })),
         })
     }
 
     /// Encode every record; per-record failures (serialization, oversized body,
     /// unresolvable dedup id) land in the error map keyed by input index.
+    #[cfg(test)]
     pub(crate) fn encode_records(
         &self,
         records: &[Value],
     ) -> (Vec<Encoded>, BTreeMap<usize, FaucetError>) {
+        let driver = self.inner.driver().driver();
         let mut encoded = Vec::with_capacity(records.len());
         let mut failures = BTreeMap::new();
         for (index, record) in records.iter().enumerate() {
-            let body = match serde_json::to_string(record) {
-                Ok(b) => b,
+            match driver.encode(record) {
+                Ok(m) => encoded.push(Encoded::from_message(index, m)),
                 Err(e) => {
-                    failures.insert(
-                        index,
-                        FaucetError::Sink(format!("sqs: record does not serialize to JSON: {e}")),
-                    );
-                    continue;
+                    failures.insert(index, e);
                 }
-            };
-            if body.len() > crate::config::MAX_MESSAGE_BYTES {
-                failures.insert(
-                    index,
-                    FaucetError::Sink(format!(
-                        "sqs: message body is {} bytes, above the SQS {} byte limit — never sent",
-                        body.len(),
-                        crate::config::MAX_MESSAGE_BYTES
-                    )),
-                );
-                continue;
             }
-            let dedup_id = match &self.config.message_deduplication_id_field {
-                Some(field) => match dedup_id_for(record, field) {
-                    Ok(id) => Some(id),
-                    Err(err) => {
-                        failures.insert(index, err);
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            encoded.push(Encoded {
-                index,
-                body,
-                group_id: self.config.message_group_id.clone(),
-                dedup_id,
-            });
         }
         (encoded, failures)
     }
+}
 
+#[faucet_core::async_trait]
+impl faucet_core::Sink for SqsSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl Encoded {
+    /// The entry for message `m` at position `index` of its page.
+    fn from_message(index: usize, m: OutboundMessage) -> Self {
+        let dedup_id = m
+            .headers
+            .iter()
+            .find(|(name, _)| name == DEDUP_HEADER)
+            .map(|(_, v)| v.clone());
+        Self {
+            index,
+            body: String::from_utf8(m.payload).unwrap_or_default(),
+            group_id: m.key.map(|k| String::from_utf8_lossy(&k).into_owned()),
+            dedup_id,
+        }
+    }
+}
+
+impl SqsDriver {
     /// Send one chunk, retrying per-entry partial failures with backoff.
     /// Returns per-entry outcomes keyed by input index; a whole-request failure
     /// that outlives the retry budget is the outer `Err`.
     async fn put_chunk(
         &self,
+        calls: &CallSlot,
         mut pending: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
         let retry_cfg = self.config.retry_spec();
@@ -244,8 +253,7 @@ impl SqsSink {
                 })
                 .collect::<Result<_, _>>()?;
 
-            let response = self
-                .calls
+            let response = calls
                 .call("put", || async {
                     Ok(self
                         .client
@@ -320,7 +328,7 @@ impl SqsSink {
                         delay_ms = delay.as_millis() as u64,
                         "sqs: retrying partially-failed SendMessageBatch entries"
                     );
-                    self.calls.wait(delay).await?;
+                    calls.wait(delay).await?;
                 }
                 Err(err) => {
                     use aws_sdk_sqs::error::ProvideErrorMetadata as _;
@@ -352,7 +360,7 @@ impl SqsSink {
                         delay_ms = delay.as_millis() as u64,
                         "sqs: SendMessageBatch request failed; retrying"
                     );
-                    self.calls.wait(delay).await?;
+                    calls.wait(delay).await?;
                 }
             }
         }
@@ -363,11 +371,12 @@ impl SqsSink {
     /// request limit and refuses the batch as too long.
     async fn put_chunk_sized(
         &self,
+        calls: &CallSlot,
         chunk: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
         let total: usize = chunk.iter().map(Encoded::request_bytes).sum();
         let backup = (chunk.len() > 1 && total > LEGACY_BATCH_BYTES).then(|| chunk.clone());
-        match self.put_chunk(chunk).await {
+        match self.put_chunk(calls, chunk).await {
             Err(e) if backup.is_some() && e.to_string().contains("BatchRequestTooLong") => {
                 let mut merged = BTreeMap::new();
                 for part in chunk_requests(
@@ -375,7 +384,7 @@ impl SqsSink {
                     self.config.batch_size,
                     LEGACY_BATCH_BYTES,
                 ) {
-                    merged.extend(self.put_chunk(part).await?);
+                    merged.extend(self.put_chunk(calls, part).await?);
                 }
                 Ok(merged)
             }
@@ -387,6 +396,7 @@ impl SqsSink {
     /// per-entry outcomes.
     async fn ship(
         &self,
+        calls: &CallSlot,
         encoded: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
         use futures::StreamExt;
@@ -417,7 +427,7 @@ impl SqsSink {
                 }
                 let indices: Vec<usize> = send.iter().map(|e| e.index).collect();
                 let groups: Vec<Option<String>> = send.iter().map(|e| e.group_id.clone()).collect();
-                let result = self.put_chunk_sized(send).await;
+                let result = self.put_chunk_sized(calls, send).await;
                 merge_chunk(&mut merged, &mut failed_groups, indices, groups, result);
             }
             return Ok(merged);
@@ -427,7 +437,7 @@ impl SqsSink {
         let mut stream = futures::stream::iter(chunks.into_iter().map(|chunk| async move {
             let indices: Vec<usize> = chunk.iter().map(|e| e.index).collect();
             let groups: Vec<Option<String>> = chunk.iter().map(|e| e.group_id.clone()).collect();
-            (indices, groups, self.put_chunk_sized(chunk).await)
+            (indices, groups, self.put_chunk_sized(calls, chunk).await)
         }))
         .buffered(self.config.effective_concurrency());
         let mut failed_groups: HashSet<Option<String>> = HashSet::new();
@@ -468,78 +478,13 @@ fn merge_chunk(
 }
 
 #[faucet_core::async_trait]
-impl faucet_core::Sink for SqsSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let (encoded, encode_failures) = self.encode_records(records);
-        let outcomes = self.ship(encoded).await?;
-        let delivered = outcomes.values().filter(|o| o.is_ok()).count();
-        let failed = encode_failures.len() + outcomes.len() - delivered;
-        if failed > 0 {
-            let first = encode_failures
-                .values()
-                .next()
-                .map(ToString::to_string)
-                .or_else(|| {
-                    outcomes
-                        .values()
-                        .find_map(|o| o.as_ref().err().map(ToString::to_string))
-                })
-                .unwrap_or_default();
-            return Err(FaucetError::Sink(format!(
-                "sqs: {failed} of {} record(s) failed (first: {first})",
-                records.len()
-            )));
-        }
-        tracing::info!(
-            queue = %self.config.queue_url,
-            records = delivered,
-            "sqs sink write complete"
-        );
-        Ok(delivered)
-    }
-
-    /// Per-row outcomes in input order: encode failures, oversized bodies, and
-    /// per-entry `SendMessageBatch` rejections (after the retry budget) come
-    /// back as `Err` rows for the DLQ router; a whole-request failure that
-    /// outlives every retry propagates as the outer `Err`.
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        let (encoded, mut encode_failures) = self.encode_records(records);
-        let mut shipped = self.ship(encoded).await?;
-        Ok((0..records.len())
-            .map(|i| {
-                if let Some(err) = encode_failures.remove(&i) {
-                    Err(err)
-                } else {
-                    shipped.remove(&i).unwrap_or(Ok(()))
-                }
-            })
-            .collect())
-    }
-
-    fn config_schema(&self) -> Value {
-        serde_json::to_value(faucet_core::schema_for!(SqsSinkConfig)).expect("schema serialization")
-    }
-
+impl MessageDriver for SqsDriver {
     fn connector_name(&self) -> &'static str {
         "sqs"
     }
 
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
+    fn config_schema(&self) -> Value {
+        serde_json::to_value(faucet_core::schema_for!(SqsSinkConfig)).expect("schema serialization")
     }
 
     fn dataset_uri(&self) -> String {
@@ -556,16 +501,89 @@ impl faucet_core::Sink for SqsSink {
         )
     }
 
+    fn call_context(&self) -> CallContext {
+        CallContext::new().without_retry()
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    /// A record that does not serialize, whose body is above the SQS limit, or
+    /// whose dedup id cannot be resolved fails alone.
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        let body = serde_json::to_string(record).map_err(json_error)?;
+        if body.len() > crate::config::MAX_MESSAGE_BYTES {
+            return Err(FaucetError::Sink(format!(
+                "sqs: message body is {} bytes, above the SQS {} byte limit — never sent",
+                body.len(),
+                crate::config::MAX_MESSAGE_BYTES
+            )));
+        }
+        let mut m = OutboundMessage::new(self.config.queue_url.clone(), body);
+        if let Some(field) = &self.config.message_deduplication_id_field {
+            m = m.with_header(DEDUP_HEADER, dedup_id_for(record, field)?);
+        }
+        if let Some(group) = &self.config.message_group_id {
+            m = m.with_key(group.clone().into_bytes());
+        }
+        Ok(m)
+    }
+
+    /// `publish` chunks, retries and bounds its own `put` calls.
+    fn publish_is_one_call(&self) -> bool {
+        false
+    }
+
+    /// The page's messages in `SendMessageBatch` requests: size-aware chunks,
+    /// bounded concurrency (one at a time on a FIFO queue), per-entry retry. A
+    /// whole-request failure that outlives every retry is reported on each
+    /// entry of its request (#789 MSG-93).
+    async fn publish(
+        &self,
+        calls: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
+        let n = group.len();
+        let encoded = group
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| Encoded::from_message(i, m))
+            .collect();
+        let mut shipped = self.ship(calls, encoded).await?;
+        let outcomes: Vec<RowOutcome> = (0..n)
+            .map(|i| shipped.remove(&i).unwrap_or(Ok(())))
+            .collect();
+        let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
+        tracing::info!(
+            queue = %self.config.queue_url,
+            records = delivered,
+            "sqs sink write complete"
+        );
+        Ok(outcomes)
+    }
+
+    fn page_error(&self, offered: usize, failed: &[(usize, FaucetError)]) -> Option<FaucetError> {
+        let first = failed
+            .first()
+            .map(|(_, e)| e.to_string())
+            .unwrap_or_default();
+        Some(FaucetError::Sink(format!(
+            "sqs: {} of {offered} record(s) failed (first: {first})",
+            failed.len()
+        )))
+    }
+
     /// Side-effect-free probe: `GetQueueAttributes` (no messages written).
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::CheckContext,
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
         use aws_sdk_sqs::types::QueueAttributeName;
-        let sent = self
-            .calls
+        let sent = calls
             .get()
             .with_timeout(ctx.timeout)
             .call("attributes", || async {
@@ -609,6 +627,11 @@ impl faucet_core::Sink for SqsSink {
     }
 }
 
+/// The error for a record that does not serialize to JSON.
+fn json_error(e: serde_json::Error) -> FaucetError {
+    FaucetError::Sink(format!("sqs: record does not serialize to JSON: {e}"))
+}
+
 /// Why a FIFO queue would reject every message: it needs a deduplication id
 /// per message unless the queue derives one from the body.
 fn fifo_dedup_problem(fifo: bool, content_dedup: bool, dedup_field: bool) -> Option<String> {
@@ -623,6 +646,16 @@ fn fifo_dedup_problem(fifo: bool, content_dedup: bool, dedup_field: bool) -> Opt
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_serialization_failure_names_the_record() {
+        let e = serde_json::from_str::<Value>("{").unwrap_err();
+        assert!(
+            json_error(e)
+                .to_string()
+                .contains("record does not serialize to JSON")
+        );
+    }
 
     #[test]
     fn a_fifo_queue_needs_a_deduplication_source() {

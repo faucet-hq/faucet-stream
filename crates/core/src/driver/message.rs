@@ -140,6 +140,25 @@ pub trait MessageDriver: Send + Sync {
     fn transactions(&self) -> Option<&dyn MessageTransactions> {
         None
     }
+
+    /// Whether the adapter runs each [`publish`](Self::publish) and
+    /// [`flush`](Self::flush) as one backend call (op `publish` / `flush`,
+    /// bounded by [`group_timeout`](Self::group_timeout) and the run's call
+    /// context). Return `false` for a driver whose `publish` makes its own
+    /// calls through the slot — its own op labels, request chunking, retries
+    /// and bounds; the adapter then awaits it directly. Default: `true`.
+    fn publish_is_one_call(&self) -> bool {
+        true
+    }
+
+    /// The error a whole-page write (the plain and reported paths) fails
+    /// with when rows of `offered` failed, given `(index, error)` for each
+    /// in index order. `None` (the default): the first failed row's own
+    /// error.
+    fn page_error(&self, offered: usize, failed: &[(usize, FaucetError)]) -> Option<FaucetError> {
+        let _ = (offered, failed);
+        None
+    }
 }
 
 /// A producer's transaction primitives. With them, [`MessageSinkDriver`]
@@ -202,6 +221,14 @@ impl<D: MessageDriver> MessageSinkDriver<D> {
         fut: impl std::future::Future<Output = Result<T, FaucetError>> + Send,
     ) -> Result<Result<T, FaucetError>, FaucetError> {
         let timeout = self.driver.group_timeout();
+        if !self.driver.publish_is_one_call() {
+            return match timeout {
+                Some(after) => tokio::time::timeout(after, fut)
+                    .await
+                    .map_err(|_| self.timeout(what, after)),
+                None => Ok(fut.await),
+            };
+        }
         calls
             .call_once(what, async {
                 match timeout {
@@ -331,11 +358,16 @@ impl<D: MessageDriver> SinkDriver for MessageSinkDriver<D> {
         &self,
         calls: &CallSlot,
         rows: &[Value],
-        _policy: RowPolicy,
+        policy: RowPolicy,
     ) -> Result<PageWrite, FaucetError> {
-        Ok(PageWrite::from_outcomes(
-            self.publish_all(calls, rows).await?,
-        ))
+        let write = PageWrite::from_outcomes(self.publish_all(calls, rows).await?);
+        if policy == RowPolicy::WholePage
+            && !write.failed.is_empty()
+            && let Some(e) = self.driver.page_error(rows.len(), &write.failed)
+        {
+            return Err(e);
+        }
+        Ok(write)
     }
 
     async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {

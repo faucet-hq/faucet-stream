@@ -1,4 +1,9 @@
 //! KafkaSink: the producer implementation.
+//!
+//! Built on the core sink driver (RFC 0014): `KafkaDriver` implements
+//! `SinkDriver` (produce a page, flush) and `CommitTokenDriver` (a page and its
+//! commit token in one producer transaction, the token read back from the
+//! compacted side-topic); `DriverSink` derives the capabilities from them.
 
 use crate::config::{KafkaSinkConfig, KafkaSinkTopic};
 use crate::encode;
@@ -7,7 +12,8 @@ use async_trait::async_trait;
 #[cfg(feature = "schema-registry")]
 use faucet_common_kafka::KafkaValueFormat;
 use faucet_common_kafka::OnKeyError;
-use faucet_core::{FaucetError, Sink};
+use faucet_core::driver::{CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError, Sink};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, OwnedHeaders};
@@ -20,6 +26,11 @@ use std::time::Duration;
 use faucet_common_kafka::schema_registry::client::SchemaRegistryClient;
 
 pub struct KafkaSink {
+    inner: DriverSink<KafkaDriver>,
+}
+
+/// The producer primitives the sink runs on.
+pub(crate) struct KafkaDriver {
     config: KafkaSinkConfig,
     producer: Arc<FutureProducer>,
     /// Lazily-built transactional producer for exactly-once writes. Built on
@@ -32,9 +43,6 @@ pub struct KafkaSink {
     /// falling back to the value's (#789 MSG-95).
     #[cfg(feature = "schema-registry")]
     key_sr_client: Option<SchemaRegistryClient>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder
-    /// for produces, transaction calls and the token read.
-    calls: faucet_core::CallSlot,
 }
 
 impl KafkaSink {
@@ -56,17 +64,25 @@ impl KafkaSink {
         };
 
         Ok(Self {
-            config,
-            producer: Arc::new(producer),
-            txn: tokio::sync::OnceCell::new(),
-            #[cfg(feature = "schema-registry")]
-            sr_client,
-            #[cfg(feature = "schema-registry")]
-            key_sr_client,
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+            inner: DriverSink::new(KafkaDriver {
+                config,
+                producer: Arc::new(producer),
+                txn: tokio::sync::OnceCell::new(),
+                #[cfg(feature = "schema-registry")]
+                sr_client,
+                #[cfg(feature = "schema-registry")]
+                key_sr_client,
+            }),
         })
     }
+}
 
+#[async_trait]
+impl Sink for KafkaSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl KafkaDriver {
     fn resolve_topic(&self, record: &Value) -> Result<String, FaucetError> {
         match &self.config.topic {
             KafkaSinkTopic::Fixed { name } => Ok(name.clone()),
@@ -163,7 +179,11 @@ impl KafkaSink {
     /// `init_transactions` — which also fences any zombie producer sharing this
     /// `transactional.id`. Cached for the run; a fatal producer error fails the
     /// run and the whole sink is rebuilt on the next run.
-    async fn txn_producer(&self, scope: &str) -> Result<Arc<FutureProducer>, FaucetError> {
+    async fn txn_producer(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Arc<FutureProducer>, FaucetError> {
         self.txn
             .get_or_try_init(|| async {
                 let eo = self.config.exactly_once_spec();
@@ -195,7 +215,7 @@ impl KafkaSink {
                 let p = producer.clone();
                 let timeout = self.config.message_timeout;
                 let init = tokio::task::spawn_blocking(move || p.init_transactions(timeout));
-                self.calls
+                calls
                     .call_once("init", async {
                         init.await
                             .map_err(|e| {
@@ -234,13 +254,22 @@ fn build_sr_client(
 }
 
 #[async_trait]
-impl Sink for KafkaSink {
+impl SinkDriver for KafkaDriver {
+    fn connector_name(&self) -> &'static str {
+        "kafka"
+    }
+
+    fn config_schema(&self) -> Value {
+        let schema = schemars::schema_for!(KafkaSinkConfig);
+        serde_json::to_value(&schema).unwrap_or(Value::Null)
+    }
+
     fn set_call_context(&self, ctx: faucet_core::CallContext) {
         #[cfg(feature = "schema-registry")]
         for client in [&self.sr_client, &self.key_sr_client].into_iter().flatten() {
             client.set_call_context(ctx.clone());
         }
-        self.calls.install(ctx);
+        let _ = ctx;
     }
 
     fn set_roundtrip_recorder(
@@ -251,7 +280,7 @@ impl Sink for KafkaSink {
         for client in [&self.sr_client, &self.key_sr_client].into_iter().flatten() {
             client.set_roundtrip_recorder(std::sync::Arc::clone(&recorder));
         }
-        self.calls.install_recorder(recorder);
+        let _ = recorder;
     }
 
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
@@ -267,17 +296,18 @@ impl Sink for KafkaSink {
         format!("kafka://{}?topic={}", self.config.brokers, topic)
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.write_batch_reported(records).await.map(|r| r.accepted)
-    }
-
     /// Records dropped by `on_key_error: skip` are reported as skipped, so row
     /// accounting (#879) does not take them for a silent loss.
-    async fn write_batch_reported(
+    ///
+    /// Every policy writes the whole page or fails it: a record that cannot be
+    /// encoded or routed fails the page.
+    async fn write(
         &self,
+        calls: &CallSlot,
         records: &[Value],
-    ) -> Result<faucet_core::WriteReport, FaucetError> {
-        let calls = self.calls.get();
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        let calls = calls.get();
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut produced = 0usize;
         let mut skipped = 0usize;
@@ -370,21 +400,23 @@ impl Sink for KafkaSink {
                 "kafka sink: dropped records due to OnKeyError::Skip"
             );
         }
-        Ok(faucet_core::WriteReport::accepted(produced).with_skipped(skipped))
+        Ok(PageWrite::reported(
+            faucet_core::WriteReport::accepted(produced).with_skipped(skipped),
+        ))
     }
 
-    async fn flush(&self) -> Result<(), FaucetError> {
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
         self.producer
             .flush(self.config.message_timeout)
             .map_err(|e| FaucetError::Sink(format!("kafka producer flush: {e}")))?;
         Ok(())
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
     }
 
-    fn capabilities(&self) -> faucet_core::Capabilities {
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         #[cfg(feature = "schema-registry")]
         let avro = matches!(
             self.config.value_format,
@@ -392,15 +424,78 @@ impl Sink for KafkaSink {
         );
         #[cfg(not(feature = "schema-registry"))]
         let avro = false;
-        faucet_core::Capabilities::of_sink(self)
+        derived
             .to_builder()
             .schema_report(crate::descriptor::schema_report(avro))
             .build()
     }
 
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+    /// Preflight check (`faucet doctor`).
+    ///
+    /// Fetches cluster metadata for all topics via the existing producer's
+    /// underlying client (`producer.client().fetch_metadata(None, timeout)`),
+    /// which validates broker connectivity and authentication without
+    /// producing any messages. `fetch_metadata` is a blocking librdkafka
+    /// call, so it runs on a blocking thread; the whole probe is bounded by
+    /// `ctx.timeout` (also passed to librdkafka as its own metadata timeout).
+    /// Connection/auth failures surface as a `Fail` probe with a hint; no
+    /// credentials are placed in the reason/hint.
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        ctx: &faucet_core::check::CheckContext,
+    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+        use faucet_core::check::{CheckReport, Probe};
+
+        let started = std::time::Instant::now();
+        let producer = self.producer.clone();
+        let timeout = ctx.timeout;
+
+        // `fetch_metadata` blocks (FFI into librdkafka), so run it off the
+        // async runtime. Bound the await with `ctx.timeout` as well, in case
+        // the blocking call ignores its own deadline.
+        let join = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || producer.client().fetch_metadata(None, timeout)),
+        )
+        .await;
+
+        let probe = match join {
+            Ok(Ok(Ok(_metadata))) => Probe::pass("metadata", started.elapsed()),
+            Ok(Ok(Err(e))) => Probe::fail_hint(
+                "metadata",
+                started.elapsed(),
+                format!("kafka fetch_metadata failed: {e}"),
+                "Verify the broker list is reachable and that any SASL/TLS \
+                 credentials and protocol settings are correct.",
+            ),
+            Ok(Err(join_err)) => Probe::fail(
+                "metadata",
+                started.elapsed(),
+                format!("kafka metadata probe task failed: {join_err}"),
+            ),
+            Err(_elapsed) => Probe::fail_hint(
+                "metadata",
+                started.elapsed(),
+                format!("kafka fetch_metadata timed out after {timeout:?}"),
+                "Check broker reachability and authentication; the cluster did \
+                 not return metadata within the timeout.",
+            ),
+        };
+
+        Ok(CheckReport::single(probe))
+    }
+}
+
+#[async_trait]
+impl CommitTokenDriver for KafkaDriver {
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
         let base = crate::idempotent::client_config_base(&self.config)?;
-        self.calls
+        calls
             .call_once(
                 "metadata",
                 crate::idempotent::ensure_commit_topic(&self.config, &base),
@@ -409,8 +504,8 @@ impl Sink for KafkaSink {
         // init_transactions fences and aborts this scope's own transaction
         // left open by a crash, which would otherwise hold the side-topic's
         // stable offset until the broker's timeout sweep.
-        self.txn_producer(scope).await?;
-        self.calls
+        self.txn_producer(calls, scope).await?;
+        calls
             .call_once(
                 "read_token",
                 crate::idempotent::read_last_token(&self.config, &base, scope),
@@ -418,28 +513,17 @@ impl Sink for KafkaSink {
             .await
     }
 
-    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
-    async fn write_batch_idempotent(
-        &self,
-        records: &[Value],
-        scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        self.write_batch_idempotent_reported(records, scope, token)
-            .await
-            .map(|r| r.accepted)
-    }
-
     /// Records skipped under `on_key_error: skip` are reported as skipped, so
     /// the exactly-once page accounts for every row it was offered (#879).
-    async fn write_batch_idempotent_reported(
+    async fn write_with_token(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
-        let producer = self.txn_producer(scope).await?;
-        let calls = self.calls.get();
+        let producer = self.txn_producer(calls, scope).await?;
+        let calls = calls.get();
 
         producer
             .begin_transaction()
@@ -588,70 +672,6 @@ impl Sink for KafkaSink {
         }
         Ok(faucet_core::WriteReport::accepted(produced).with_skipped(skipped))
     }
-
-    fn connector_name(&self) -> &'static str {
-        "kafka"
-    }
-
-    fn config_schema(&self) -> Value {
-        let schema = schemars::schema_for!(KafkaSinkConfig);
-        serde_json::to_value(&schema).unwrap_or(Value::Null)
-    }
-
-    /// Preflight check (`faucet doctor`).
-    ///
-    /// Fetches cluster metadata for all topics via the existing producer's
-    /// underlying client (`producer.client().fetch_metadata(None, timeout)`),
-    /// which validates broker connectivity and authentication without
-    /// producing any messages. `fetch_metadata` is a blocking librdkafka
-    /// call, so it runs on a blocking thread; the whole probe is bounded by
-    /// `ctx.timeout` (also passed to librdkafka as its own metadata timeout).
-    /// Connection/auth failures surface as a `Fail` probe with a hint; no
-    /// credentials are placed in the reason/hint.
-    async fn check(
-        &self,
-        ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::{CheckReport, Probe};
-
-        let started = std::time::Instant::now();
-        let producer = self.producer.clone();
-        let timeout = ctx.timeout;
-
-        // `fetch_metadata` blocks (FFI into librdkafka), so run it off the
-        // async runtime. Bound the await with `ctx.timeout` as well, in case
-        // the blocking call ignores its own deadline.
-        let join = tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || producer.client().fetch_metadata(None, timeout)),
-        )
-        .await;
-
-        let probe = match join {
-            Ok(Ok(Ok(_metadata))) => Probe::pass("metadata", started.elapsed()),
-            Ok(Ok(Err(e))) => Probe::fail_hint(
-                "metadata",
-                started.elapsed(),
-                format!("kafka fetch_metadata failed: {e}"),
-                "Verify the broker list is reachable and that any SASL/TLS \
-                 credentials and protocol settings are correct.",
-            ),
-            Ok(Err(join_err)) => Probe::fail(
-                "metadata",
-                started.elapsed(),
-                format!("kafka metadata probe task failed: {join_err}"),
-            ),
-            Err(_elapsed) => Probe::fail_hint(
-                "metadata",
-                started.elapsed(),
-                format!("kafka fetch_metadata timed out after {timeout:?}"),
-                "Check broker reachability and authentication; the cluster did \
-                 not return metadata within the timeout.",
-            ),
-        };
-
-        Ok(CheckReport::single(probe))
-    }
 }
 
 /// Send a single record, retrying on `QueueFull` up to `max_retries` times
@@ -769,6 +789,22 @@ async fn send_with_queue_full_retry(
 
 #[cfg(test)]
 mod tests {
+    use faucet_core::Sink as _;
+
+    /// The sink builds offline (the producer connects lazily) and describes
+    /// its config.
+    #[tokio::test]
+    async fn the_config_schema_describes_the_sink_config() {
+        let cfg: crate::KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "127.0.0.1:1",
+            "topic": {"type": "fixed", "name": "t"}
+        }))
+        .unwrap();
+        let sink = crate::KafkaSink::new(cfg).await.unwrap();
+        assert!(sink.config_schema()["properties"]["brokers"].is_object());
+        assert_eq!(sink.connector_name(), "kafka");
+    }
+
     // dataset_uri test is skipped: KafkaSink::new() requires a live Kafka
     // broker (creates a FutureProducer in new()), and no offline constructor
     // exists.

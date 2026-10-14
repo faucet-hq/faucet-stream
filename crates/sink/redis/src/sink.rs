@@ -1,8 +1,14 @@
 //! Redis sink executor.
+//!
+//! Built on the core sink driver (RFC 0014): `RedisDriver` implements
+//! `SinkDriver` (one write primitive for the plain, reported and per-row
+//! paths) and `CommitTokenDriver` (the exactly-once script and the watermark
+//! read); `DriverSink` derives the capabilities from them.
 
 use crate::config::{RedisSinkConfig, RedisSinkType};
 use async_trait::async_trait;
-use faucet_core::{FaucetError, RowOutcome};
+use faucet_core::driver::{CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError, WriteReport};
 use redis::aio::ConnectionManager;
 use serde_json::Value;
 
@@ -11,12 +17,15 @@ use serde_json::Value;
 /// The connection is established once during construction and reused across
 /// all `write_batch()` calls.
 pub struct RedisSink {
+    inner: std::panic::AssertUnwindSafe<DriverSink<RedisDriver>>,
+}
+
+/// The Redis I/O primitives the sink runs on.
+pub(crate) struct RedisDriver {
     config: RedisSinkConfig,
     /// Reconnects after the server connection drops (a failover), where a
     /// bare multiplexed connection failed every later command (#789 MSG-78).
-    conn: std::panic::AssertUnwindSafe<ConnectionManager>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder.
-    calls: std::panic::AssertUnwindSafe<faucet_core::CallSlot>,
+    conn: ConnectionManager,
 }
 
 /// The exactly-once write: every data command and the watermark in one Lua
@@ -67,21 +76,28 @@ impl RedisSink {
             .map_err(|e| FaucetError::Sink(format!("Redis connection failed: {e}")))?;
 
         Ok(Self {
-            config,
-            conn: std::panic::AssertUnwindSafe(conn),
-            calls: std::panic::AssertUnwindSafe(faucet_core::CallSlot::new(
-                faucet_core::CallContext::new().without_timeout(),
-            )),
+            inner: std::panic::AssertUnwindSafe(DriverSink::new(RedisDriver { config, conn })),
         })
     }
+}
 
+#[async_trait]
+impl faucet_core::Sink for RedisSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl RedisDriver {
     fn command(&self, record: &Value) -> Result<Vec<String>, FaucetError> {
         record_command_args_with(&self.config, record)
     }
 
     /// Pipeline `commands` in `batch_size` chunks.
-    async fn run_commands(&self, commands: &[Vec<String>]) -> Result<(), FaucetError> {
-        let mut conn = self.conn.0.clone();
+    async fn run_commands(
+        &self,
+        calls: &CallSlot,
+        commands: &[Vec<String>],
+    ) -> Result<(), FaucetError> {
+        let mut conn = self.conn.clone();
         let chunk = if self.config.batch_size == 0 {
             commands.len().max(1)
         } else {
@@ -96,7 +112,7 @@ impl RedisSink {
                 }
                 pipe.add_command(cmd);
             }
-            self.calls
+            calls
                 .call_once("pipeline", async {
                     pipe.query_async::<()>(&mut conn).await.map_err(|e| {
                         FaucetError::Sink(format!("Redis pipeline execution failed: {e}"))
@@ -109,22 +125,7 @@ impl RedisSink {
 }
 
 #[async_trait]
-impl faucet_core::Sink for RedisSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
+impl SinkDriver for RedisDriver {
     fn connector_name(&self) -> &'static str {
         "redis"
     }
@@ -147,16 +148,21 @@ impl faucet_core::Sink for RedisSink {
         )
     }
 
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     /// Non-mutating preflight probe: issue a Redis `PING` over the shared
     /// reconnecting connection (probe name `"ping"`).
     async fn check(
         &self,
+        _calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
         // The connection manager is cheaply cloneable; clone to satisfy &self.
-        let mut conn = self.conn.0.clone();
+        let mut conn = self.conn.clone();
         let started = std::time::Instant::now();
         let hint = "check the Redis url / that the server is reachable and accepting connections";
 
@@ -173,46 +179,50 @@ impl faucet_core::Sink for RedisSink {
         Ok(CheckReport::single(probe))
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    /// The whole-page paths build every command before sending any, so a bad
+    /// record fails the batch without having written the rows before it. The
+    /// per-row path fails only the rows whose command cannot be built (a
+    /// `KeyValue` record with a missing, null, object or array key) and
+    /// writes the rest (#789 MSG-20).
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok(PageWrite::accepted(0));
         }
-        // Build every command before sending any, so a bad record fails the
-        // batch without having written the rows before it.
-        let commands = records
-            .iter()
-            .map(|r| self.command(r))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.run_commands(&commands).await?;
-        tracing::debug!(records = records.len(), "Redis batch written");
-        Ok(records.len())
-    }
-
-    /// Rows whose command cannot be built (a `KeyValue` record with a
-    /// missing, null, object or array key) fail on their own and are DLQ'd;
-    /// the rest are written (#789 MSG-20).
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(records.len());
+        if policy == RowPolicy::WholePage {
+            let commands = records
+                .iter()
+                .map(|r| self.command(r))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.run_commands(calls, &commands).await?;
+            tracing::debug!(records = records.len(), "Redis batch written");
+            return Ok(PageWrite::accepted(records.len()));
+        }
+        let mut failed = Vec::new();
         let mut commands = Vec::with_capacity(records.len());
-        for r in records {
+        for (i, r) in records.iter().enumerate() {
             match self.command(r) {
-                Ok(c) => {
-                    commands.push(c);
-                    outcomes.push(Ok(()));
-                }
-                Err(e) => outcomes.push(Err(e)),
+                Ok(c) => commands.push(c),
+                Err(e) => failed.push((i, e)),
             }
         }
         if !commands.is_empty() {
-            self.run_commands(&commands).await?;
+            self.run_commands(calls, &commands).await?;
         }
-        Ok(outcomes)
+        Ok(PageWrite::accepted(commands.len()).with_failures(failed))
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
     }
+}
 
+#[async_trait]
+impl CommitTokenDriver for RedisDriver {
     /// Write `records` AND durably record `token` for `scope` in one atomic
     /// Lua script.
     ///
@@ -224,13 +234,14 @@ impl faucet_core::Sink for RedisSink {
     /// **`batch_size` re-chunking does NOT apply on this path.** Splitting the
     /// page across several scripts would break atomicity, so the entire page
     /// is one script regardless of `batch_size`.
-    async fn write_batch_idempotent(
+    async fn write_with_token(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
-    ) -> Result<usize, FaucetError> {
-        let mut conn = self.conn.0.clone();
+    ) -> Result<WriteReport, FaucetError> {
+        let mut conn = self.conn.clone();
         let commands = records
             .iter()
             .map(|r| self.command(r))
@@ -248,7 +259,7 @@ impl faucet_core::Sink for RedisSink {
                 script.arg(a);
             }
         }
-        self.calls
+        calls
             .call_once("script", async {
                 script.invoke_async::<i64>(&mut conn).await.map_err(|e| {
                     FaucetError::Sink(format!(
@@ -265,14 +276,18 @@ impl faucet_core::Sink for RedisSink {
             scope,
             "Redis atomic batch + commit token written"
         );
-        Ok(records.len())
+        Ok(WriteReport::accepted(records.len()))
     }
 
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        let mut conn = self.conn.0.clone();
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let mut conn = self.conn.clone();
         // The token is opaque to the sink (it may carry an embedded resume
         // bookmark after a '#'); never parse it here — just hand it back.
-        self.calls
+        calls
             .call_once("get", async {
                 redis::cmd("GET")
                     .arg(commit_token_key(scope))

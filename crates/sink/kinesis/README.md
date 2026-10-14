@@ -86,6 +86,18 @@ and metered as a `put` round trip. The per-entry partial-failure retry and its
 backoff (the `retry:` block) are unchanged; the backoff waits through the same
 context, so a deadline ends it.
 
+## How it is built
+
+The sink runs on the messaging family driver (RFC 0014): `KinesisDriver`
+implements `faucet_core::driver::MessageDriver` — encode a record (payload,
+partition key, explicit hash key, `max_record_size_bytes`) and publish a page's
+records (per-key lanes in parallel, size-aware `PutRecords` chunks, per-entry
+retry, a failed key failing its later records) — and `MessageSinkDriver`
+reports each row and serves the plain, reported and per-row write paths. The
+driver makes its own `put` calls (`publish_is_one_call` is `false`), so the
+round-trip labels and retry behaviour are unchanged. The public type and
+config are unchanged.
+
 ## License
 
 MIT OR Apache-2.0

@@ -229,3 +229,34 @@ async fn check_fails_a_fifo_queue_without_a_deduplication_source() {
     let report = sink.check(&ctx).await.unwrap();
     assert_eq!(report.failed_count(), 0, "{report:?}");
 }
+
+/// A request refused with a retriable error code is sent again after the
+/// backoff, and the page lands on the retry.
+#[tokio::test]
+async fn a_retriable_request_failure_is_retried_after_the_backoff() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_json(json!({
+                    "__type": "com.amazonaws.sqs#InternalError",
+                    "message": "try later"
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(reply(&["0"], json!([])))
+        .mount(&server)
+        .await;
+    let sink = SqsSink::new(config(&server.uri(), "orders", 10))
+        .await
+        .unwrap();
+
+    assert_eq!(sink.write_batch(&[json!({"n": 1})]).await.unwrap(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}

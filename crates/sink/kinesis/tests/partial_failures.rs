@@ -170,3 +170,30 @@ async fn an_explicit_hash_key_outside_the_kinesis_range_fails_only_its_row() {
     assert_eq!(entries[0]["PartitionKey"], "c");
     assert_eq!(entries[0]["ExplicitHashKey"], "5");
 }
+
+/// A request refused with a retriable error code is sent again after the
+/// backoff, and the page lands on the retry.
+#[tokio::test]
+async fn a_retriable_request_failure_is_retried_after_the_backoff() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "Kinesis_20131202.PutRecords"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/x-amz-json-1.1")
+                .set_body_json(json!({"__type": "InternalFailure", "message": "try later"})),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    put_records(&server, 1, json!([ok()])).await;
+    let sink = KinesisSink::new(config(&server.uri(), 500)).await.unwrap();
+
+    assert_eq!(
+        sink.write_batch(&[json!({"k": "a", "n": 1})])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}

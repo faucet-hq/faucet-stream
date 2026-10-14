@@ -104,6 +104,18 @@ Declares `write_mode: append` only; no idempotent writes. `faucet list --json` p
 
 The connect and each publish group run through the pipeline's `CallContext` (#880): the run's deadline ends them promptly, `publish_timeout_secs` still bounds each group, and the rows of a group cut short fail per row (DLQ-routable). Each counts as one round trip (`connect`, `publish`) in `faucet_sink_roundtrips_total`. The sink never re-publishes itself.
 
+## How it is built
+
+The sink runs on the messaging family driver (RFC 0014): `RabbitMqDriver`
+implements `faucet_core::driver::MessageDriver` — resolve the routing key and
+encode a record, then publish a page's messages (open or reopen the channel,
+publish each `batch_size` chunk and await its confirms under
+`publish_timeout_secs`) — and `MessageSinkDriver` reports each row and serves
+the plain, reported and per-row write paths. The driver opens the channel and
+bounds its chunks itself (`publish_is_one_call` is `false`), so a page whose
+rows all fail to route never connects, and the `connect` / `publish` round
+trips are unchanged. The public type and config are unchanged.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

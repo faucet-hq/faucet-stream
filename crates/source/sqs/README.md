@@ -96,6 +96,19 @@ stops an in-flight receive and the empty-poll pause, and each is metered as a
 round trip (`receive`, `delete`, `visibility`). The AWS SDK's own retry is
 unchanged.
 
+## How it is built
+
+The source implements `faucet_core::Source` directly rather than the
+messaging family's `MessageConsumer` (RFC 0014). Its delete-after-write
+semantics match `MessageSourceDriver`, but the rest does not: a page is
+assembled from several 10-message receives up to `batch_size`, a FIFO queue
+emits a page after every receive, idleness is a time window
+(`idle_timeout_secs`) measured from the last message, held receipt handles
+have their visibility extended, and every page carries the bookmark
+`{queue, consumed}`. `MessageSourceDriver` emits one receive per page, ends
+on consecutive empty receives and bookmarks `{consumed}`, so it would change
+those semantics.
+
 ## License
 
 MIT OR Apache-2.0

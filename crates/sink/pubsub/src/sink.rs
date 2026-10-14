@@ -6,11 +6,16 @@
 //! differing SDK version is localised to `PubsubSink::new`, `publish_chunk`,
 //! and `check`. The record→message logic (`encode_records`,
 //! `assemble_row_outcomes`) is pure and unit-tested offline.
+//!
+//! Built on the messaging family driver (RFC 0014): `PubsubDriver` encodes one
+//! record and publishes a page's messages; `MessageSinkDriver` reports each row
+//! and serves the plain, reported and per-row write paths.
 
 use crate::config::PubsubSinkConfig;
 use crate::encode::{Prepared, prepare};
 use faucet_common_pubsub::PubsubMessage;
-use faucet_core::{FaucetError, RowOutcome};
+use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
+use faucet_core::{CallSlot, FaucetError, RowOutcome};
 use gcloud_pubsub::client::Client;
 use gcloud_pubsub::publisher::{Publisher, PublisherConfig};
 use serde_json::Value;
@@ -25,19 +30,25 @@ pub(crate) const MAX_CHUNK_BYTES: usize = 9_000_000;
 const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Google Cloud Pub/Sub sink. See the crate README for semantics.
+///
+/// Built on the messaging family driver (RFC 0014).
 pub struct PubsubSink {
+    inner: DriverSink<MessageSinkDriver<PubsubDriver>>,
+}
+
+/// The Pub/Sub I/O primitives the messaging driver runs on. Every publish
+/// confirmation is awaited through the run's call slot (#880); the SDK bundles
+/// messages into RPCs itself, so waits are not counted as round trips.
+pub(crate) struct PubsubDriver {
     config: PubsubSinkConfig,
     client: Client,
     publisher: Publisher,
-    /// Backend-call context (#880): every publish confirmation is awaited
-    /// through it. The SDK bundles messages into RPCs itself, so waits are not
-    /// counted as round trips.
-    calls: faucet_core::CallSlot,
 }
 
 /// Encode every record; per-record failures (bad payload, unresolvable
 /// ordering key, malformed attributes) land in the error map keyed by input
 /// index. Pure.
+#[cfg(test)]
 pub(crate) fn encode_records(
     records: &[Value],
     config: &PubsubSinkConfig,
@@ -199,28 +210,45 @@ impl PubsubSink {
             .topic(&config.topic)
             .new_publisher(Some(publisher_config(&config)));
         Ok(Self {
-            config,
-            client,
-            publisher,
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry()
-                    .with_roundtrip_metering(false),
-            ),
+            inner: DriverSink::new(MessageSinkDriver::new(PubsubDriver {
+                config,
+                client,
+                publisher,
+            })),
         })
     }
+}
 
+#[faucet_core::async_trait]
+impl faucet_core::Sink for PubsubSink {
+    faucet_core::forward_sink!(inner);
+}
+
+/// Bytes, ordering key and attributes of a message, back from
+/// [`PubsubDriver::encode`]'s [`OutboundMessage`].
+fn prepared_from(m: OutboundMessage) -> Prepared {
+    Prepared {
+        data: m.payload,
+        attributes: m.headers.into_iter().collect(),
+        ordering_key: m
+            .key
+            .map(|k| String::from_utf8_lossy(&k).into_owned())
+            .unwrap_or_default(),
+    }
+}
+
+impl PubsubDriver {
     /// Publish one chunk of prepared records concurrently, returning per-index
     /// outcomes.
     async fn publish_chunk(
         &self,
+        calls: &CallSlot,
         chunk: Vec<(usize, Prepared)>,
     ) -> BTreeMap<usize, Result<(), FaucetError>> {
         use futures::StreamExt;
         // Enqueue every message; the publisher bundles them internally.
         use faucet_core::CallExt as _;
-        let calls = self.calls.get();
+        let calls = calls.get();
         let mut awaiters = Vec::with_capacity(chunk.len());
         let mut keys: BTreeMap<usize, String> = BTreeMap::new();
         let mut outcomes = BTreeMap::new();
@@ -278,6 +306,7 @@ impl PubsubSink {
     /// an ordering key fails, later messages with that key are not published.
     async fn publish_all(
         &self,
+        calls: &CallSlot,
         prepared: Vec<(usize, Prepared)>,
     ) -> BTreeMap<usize, Result<(), FaucetError>> {
         let mut merged = BTreeMap::new();
@@ -293,9 +322,9 @@ impl PubsubSink {
                 .filter(|(_, p)| !p.ordering_key.is_empty())
                 .map(|(i, p)| (*i, p.ordering_key.clone()))
                 .collect();
-            let outcomes = self.publish_chunk(send).await;
+            let outcomes = self.publish_chunk(calls, send).await;
             // The publisher bundles messages itself; one page is one round trip.
-            self.calls.record("publish");
+            calls.record("publish");
             for (index, outcome) in &outcomes {
                 if outcome.is_err()
                     && let Some(key) = keys.get(index)
@@ -310,73 +339,14 @@ impl PubsubSink {
 }
 
 #[faucet_core::async_trait]
-impl faucet_core::Sink for PubsubSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let (prepared, encode_failures) = encode_records(records, &self.config);
-        let outcomes = self.publish_all(prepared).await;
-        let delivered = outcomes.values().filter(|o| o.is_ok()).count();
-        let failed = encode_failures.len() + (outcomes.len() - delivered);
-        if failed > 0 {
-            let first = encode_failures
-                .values()
-                .next()
-                .map(ToString::to_string)
-                .or_else(|| {
-                    outcomes
-                        .values()
-                        .find_map(|o| o.as_ref().err().map(ToString::to_string))
-                })
-                .unwrap_or_default();
-            return Err(FaucetError::Sink(format!(
-                "pubsub: {failed} of {} record(s) failed to publish (first: {first})",
-                records.len()
-            )));
-        }
-        tracing::info!(
-            topic = %self.config.topic,
-            records = delivered,
-            "pubsub sink write complete"
-        );
-        Ok(delivered)
-    }
-
-    /// Per-row outcomes in input order: encode failures and per-message publish
-    /// rejections come back as `Err` rows for the DLQ router.
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        let (prepared, encode_failures) = encode_records(records, &self.config);
-        let shipped = self.publish_all(prepared).await;
-        Ok(assemble_row_outcomes(
-            records.len(),
-            encode_failures,
-            shipped,
-        ))
+impl MessageDriver for PubsubDriver {
+    fn connector_name(&self) -> &'static str {
+        "pubsub"
     }
 
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(PubsubSinkConfig))
             .expect("schema serialization")
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "pubsub"
-    }
-
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -391,15 +361,83 @@ impl faucet_core::Sink for PubsubSink {
         )
     }
 
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
+            .with_roundtrip_metering(false)
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    /// A record with a bad payload, an unresolvable ordering key or malformed
+    /// attributes fails alone.
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        let p = prepare(
+            record,
+            self.config.value_format,
+            &self.config.ordering_key,
+            self.config.attributes_field.as_deref(),
+        )?;
+        let mut m = OutboundMessage::new(self.config.topic.clone(), p.data);
+        if !p.ordering_key.is_empty() {
+            m = m.with_key(p.ordering_key.into_bytes());
+        }
+        for (k, v) in p.attributes {
+            m = m.with_header(k, v);
+        }
+        Ok(m)
+    }
+
+    /// `publish` awaits every confirmation through the slot itself.
+    fn publish_is_one_call(&self) -> bool {
+        false
+    }
+
+    /// The page's messages in chunks of at most `batch_size` messages and
+    /// [`MAX_CHUNK_BYTES`]; per-message outcomes, with the later messages of
+    /// a failed ordering key failed or held back.
+    async fn publish(
+        &self,
+        calls: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
+        let n = group.len();
+        let prepared = group.into_iter().map(prepared_from).enumerate().collect();
+        let shipped = self.publish_all(calls, prepared).await;
+        let outcomes = assemble_row_outcomes(n, BTreeMap::new(), shipped);
+        let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
+        tracing::info!(
+            topic = %self.config.topic,
+            records = delivered,
+            "pubsub sink write complete"
+        );
+        Ok(outcomes)
+    }
+
+    fn page_error(&self, offered: usize, failed: &[(usize, FaucetError)]) -> Option<FaucetError> {
+        let first = failed
+            .first()
+            .map(|(_, e)| e.to_string())
+            .unwrap_or_default();
+        Some(FaucetError::Sink(format!(
+            "pubsub: {} of {offered} record(s) failed to publish (first: {first})",
+            failed.len()
+        )))
+    }
+
     /// Side-effect-free probe: confirm the topic exists (no messages written).
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::CheckContext,
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
         let topic = self.client.topic(&self.config.topic);
-        let fut = faucet_core::CallExt::within(topic.exists(None), &self.calls, "exists");
+        let fut = faucet_core::CallExt::within(topic.exists(None), calls, "exists");
         let probe = match tokio::time::timeout(ctx.timeout, fut).await {
             Err(_) => Probe::fail("topic_exists", start.elapsed(), "timed out"),
             Ok(Err(e)) => Probe::fail("topic_exists", start.elapsed(), e.to_string()),

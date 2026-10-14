@@ -1,11 +1,16 @@
 //! The Kinesis `Sink` implementation: encode → size-aware chunking →
 //! bounded-concurrency `PutRecords` → per-entry partial-failure retry.
+//!
+//! Built on the messaging family driver (RFC 0014): `KinesisDriver` encodes
+//! one record and publishes a page's records; `MessageSinkDriver` reports each
+//! row and serves the plain, reported and per-row write paths.
 
 use crate::config::KinesisSinkConfig;
 use crate::partition::{derive_explicit_hash_key, derive_partition_key, encode_payload};
 use aws_sdk_kinesis::Client;
 use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::PutRecordsRequestEntry;
+use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome};
 use serde_json::Value;
@@ -138,11 +143,21 @@ pub(crate) fn chunk_requests(
 }
 
 /// AWS Kinesis Data Streams sink. See the crate README for semantics.
+///
+/// Built on the messaging family driver (RFC 0014).
 pub struct KinesisSink {
+    inner: DriverSink<MessageSinkDriver<KinesisDriver>>,
+}
+
+/// The Kinesis I/O primitives the messaging driver runs on.
+pub(crate) struct KinesisDriver {
     config: KinesisSinkConfig,
     client: Client,
-    calls: CallSlot,
 }
+
+/// The header that carries a record's explicit hash key from
+/// [`KinesisDriver::encode`] to [`KinesisDriver::publish`].
+const HASH_KEY_HEADER: &str = "ExplicitHashKey";
 
 impl KinesisSink {
     /// Create a new Kinesis sink. Validates the config and builds the AWS
@@ -156,60 +171,64 @@ impl KinesisSink {
         )
         .await?;
         Ok(Self {
-            config,
-            client,
-            calls: CallSlot::new(CallContext::new().without_retry()),
+            inner: DriverSink::new(MessageSinkDriver::new(KinesisDriver { config, client })),
         })
     }
 
     /// Encode every record; per-record failures (bad payload for the format,
     /// unresolvable partition key, oversized) land in the error map.
+    #[cfg(test)]
     pub(crate) fn encode_records(
         &self,
         records: &[Value],
     ) -> (Vec<Encoded>, BTreeMap<usize, FaucetError>) {
+        let driver = self.inner.driver().driver();
         let mut encoded = Vec::with_capacity(records.len());
         let mut failures = BTreeMap::new();
         for (index, record) in records.iter().enumerate() {
-            let one = derive_partition_key(record, &self.config.partition_key)
-                .and_then(|partition_key| {
-                    derive_explicit_hash_key(record, &self.config.explicit_hash_key)
-                        .map(|hash_key| (partition_key, hash_key))
-                })
-                .and_then(|(partition_key, hash_key)| {
-                    encode_payload(record, self.config.value_format).map(|data| Encoded {
-                        index,
-                        partition_key,
-                        hash_key,
-                        data,
-                    })
-                });
-            match one {
-                Ok(e) if e.request_bytes() > self.config.max_record_size_bytes => {
-                    failures.insert(
-                        index,
-                        FaucetError::Sink(format!(
-                            "kinesis: record is {} bytes (data + partition key), above \
-                             max_record_size_bytes {} — never sent",
-                            e.request_bytes(),
-                            self.config.max_record_size_bytes
-                        )),
-                    );
-                }
-                Ok(e) => encoded.push(e),
-                Err(err) => {
-                    failures.insert(index, err);
+            match driver.encode(record) {
+                Ok(m) => encoded.push(Encoded::from_message(index, m)),
+                Err(e) => {
+                    failures.insert(index, e);
                 }
             }
         }
         (encoded, failures)
     }
+}
 
+#[faucet_core::async_trait]
+impl faucet_core::Sink for KinesisSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl Encoded {
+    /// The entry for message `m` at position `index` of its page.
+    fn from_message(index: usize, m: OutboundMessage) -> Self {
+        let hash_key = m
+            .headers
+            .into_iter()
+            .find(|(name, _)| name == HASH_KEY_HEADER)
+            .map(|(_, v)| v);
+        Self {
+            index,
+            partition_key: m
+                .key
+                .map(|k| String::from_utf8_lossy(&k).into_owned())
+                .unwrap_or_default(),
+            hash_key,
+            data: m.payload,
+        }
+    }
+}
+
+impl KinesisDriver {
     /// Send one chunk, retrying per-entry partial failures with backoff.
     /// Returns per-entry outcomes keyed by input index; a whole-request
     /// failure that outlives the retry budget is the outer `Err`.
     async fn put_chunk(
         &self,
+        calls: &CallSlot,
         mut pending: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
         let retry_cfg = self.config.retry_spec();
@@ -231,8 +250,7 @@ impl KinesisSink {
                 })
                 .collect::<Result<_, _>>()?;
 
-            let response = self
-                .calls
+            let response = calls
                 .call("put", || async {
                     Ok(self
                         .client
@@ -297,7 +315,7 @@ impl KinesisSink {
                         delay_ms = delay.as_millis() as u64,
                         "kinesis: retrying partially-failed PutRecords entries"
                     );
-                    self.calls.wait(delay).await?;
+                    calls.wait(delay).await?;
                     pending = retry;
                 }
                 Err(err) => {
@@ -330,7 +348,7 @@ impl KinesisSink {
                         delay_ms = delay.as_millis() as u64,
                         "kinesis: PutRecords request failed; retrying"
                     );
-                    self.calls.wait(delay).await?;
+                    calls.wait(delay).await?;
                 }
             }
         }
@@ -340,6 +358,7 @@ impl KinesisSink {
     /// per-entry outcomes.
     async fn ship(
         &self,
+        calls: &CallSlot,
         encoded: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
         use futures::StreamExt;
@@ -373,7 +392,7 @@ impl KinesisSink {
                             .iter()
                             .map(|e| (e.index, e.order_key().to_string()))
                             .collect();
-                        let result = self.put_chunk(send).await?;
+                        let result = self.put_chunk(calls, send).await?;
                         for (idx, key) in keys {
                             if result.get(&idx).is_some_and(Result::is_err) {
                                 dead.insert(key);
@@ -393,79 +412,14 @@ impl KinesisSink {
 }
 
 #[faucet_core::async_trait]
-impl faucet_core::Sink for KinesisSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let (encoded, encode_failures) = self.encode_records(records);
-        let outcomes = self.ship(encoded).await?;
-        let delivered = outcomes.values().filter(|o| o.is_ok()).count();
-        let failed = encode_failures.len() + outcomes.len() - delivered;
-        if failed > 0 {
-            let first = encode_failures
-                .values()
-                .next()
-                .map(ToString::to_string)
-                .or_else(|| {
-                    outcomes
-                        .values()
-                        .find_map(|o| o.as_ref().err().map(ToString::to_string))
-                })
-                .unwrap_or_default();
-            return Err(FaucetError::Sink(format!(
-                "kinesis: {failed} of {} record(s) failed (first: {first})",
-                records.len()
-            )));
-        }
-        tracing::info!(
-            stream = %self.config.stream_name,
-            records = delivered,
-            "kinesis sink write complete"
-        );
-        Ok(delivered)
-    }
-
-    /// Per-row outcomes in input order: encode failures, oversized records,
-    /// and per-entry `PutRecords` rejections (after the retry budget) come
-    /// back as `Err` rows for the DLQ router; a whole-request failure that
-    /// outlives every retry propagates as the outer `Err`.
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        let (encoded, mut encode_failures) = self.encode_records(records);
-        let mut shipped = self.ship(encoded).await?;
-        Ok((0..records.len())
-            .map(|i| {
-                if let Some(err) = encode_failures.remove(&i) {
-                    Err(err)
-                } else {
-                    shipped.remove(&i).unwrap_or(Ok(()))
-                }
-            })
-            .collect())
+impl MessageDriver for KinesisDriver {
+    fn connector_name(&self) -> &'static str {
+        "kinesis"
     }
 
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(KinesisSinkConfig))
             .expect("schema serialization")
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "kinesis"
-    }
-
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -476,15 +430,88 @@ impl faucet_core::Sink for KinesisSink {
         )
     }
 
+    fn call_context(&self) -> CallContext {
+        CallContext::new().without_retry()
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    /// A record with a bad payload for the format, an unresolvable partition
+    /// or hash key, or above `max_record_size_bytes` fails alone.
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        let partition_key = derive_partition_key(record, &self.config.partition_key)?;
+        let hash_key = derive_explicit_hash_key(record, &self.config.explicit_hash_key)?;
+        let data = encode_payload(record, self.config.value_format)?;
+        let bytes = data.len() + partition_key.len();
+        if bytes > self.config.max_record_size_bytes {
+            return Err(FaucetError::Sink(format!(
+                "kinesis: record is {bytes} bytes (data + partition key), above \
+                 max_record_size_bytes {} — never sent",
+                self.config.max_record_size_bytes
+            )));
+        }
+        let mut m = OutboundMessage::new(self.config.stream_name.clone(), data)
+            .with_key(partition_key.into_bytes());
+        if let Some(h) = hash_key {
+            m = m.with_header(HASH_KEY_HEADER, h);
+        }
+        Ok(m)
+    }
+
+    /// `publish` chunks, retries and bounds its own `put` calls.
+    fn publish_is_one_call(&self) -> bool {
+        false
+    }
+
+    /// The page's records in `PutRecords` requests: per-key lanes run
+    /// concurrently, size-aware chunks, per-entry retry. A whole-request
+    /// failure that outlives every retry fails the page.
+    async fn publish(
+        &self,
+        calls: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
+        let n = group.len();
+        let encoded = group
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| Encoded::from_message(i, m))
+            .collect();
+        let mut shipped = self.ship(calls, encoded).await?;
+        let outcomes: Vec<RowOutcome> = (0..n)
+            .map(|i| shipped.remove(&i).unwrap_or(Ok(())))
+            .collect();
+        let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
+        tracing::info!(
+            stream = %self.config.stream_name,
+            records = delivered,
+            "kinesis sink write complete"
+        );
+        Ok(outcomes)
+    }
+
+    fn page_error(&self, offered: usize, failed: &[(usize, FaucetError)]) -> Option<FaucetError> {
+        let first = failed
+            .first()
+            .map(|(_, e)| e.to_string())
+            .unwrap_or_default();
+        Some(FaucetError::Sink(format!(
+            "kinesis: {} of {offered} record(s) failed (first: {first})",
+            failed.len()
+        )))
+    }
+
     /// Side-effect-free probe: `DescribeStreamSummary` (no records written).
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::CheckContext,
     ) -> Result<faucet_core::CheckReport, FaucetError> {
         use faucet_core::{CheckReport, Probe};
         let start = std::time::Instant::now();
-        let sent = self
-            .calls
+        let sent = calls
             .get()
             .with_timeout(ctx.timeout)
             .call("describe", || async {
