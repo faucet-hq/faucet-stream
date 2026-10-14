@@ -171,6 +171,10 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
         invocations.push(inv);
     }
 
+    if let Some(inv) = probe_undescribed_plugins(&crate::registry::undescribed_plugins()) {
+        invocations.push(inv);
+    }
+
     redact_invocations(&mut invocations);
     let (_passed, failed, _skipped) = tally(&invocations);
 
@@ -308,6 +312,35 @@ async fn stateful_probes(
 /// it fails when the provider's refresh token is still stored only under the
 /// shared key earlier versions used (#862 M-077). `None` when there is no such
 /// provider.
+/// One probe per connector plugin registered without a descriptor (RFC 0014):
+/// its capabilities are not checked at load time. A skip, so it informs
+/// without failing the run.
+pub fn probe_undescribed_plugins(plugins: &[String]) -> Option<InvocationOut> {
+    if plugins.is_empty() {
+        return None;
+    }
+    let probes = plugins
+        .iter()
+        .map(|plugin| {
+            let mut probe = Probe::skip(
+                "descriptor",
+                "registered without a ConnectorDescriptor: its capabilities are not checked at \
+                 load time and it is treated as a plain connector",
+            );
+            probe.hint =
+                Some("register it with register_source_described / register_sink_described".into());
+            ProbeOut::from_probe("plugins", plugin.clone(), probe)
+        })
+        .collect();
+    Some(InvocationOut {
+        id: "plugins".to_string(),
+        delivery: None,
+        probes,
+        source_kind: "—".to_string(),
+        sink_kind: "—".to_string(),
+    })
+}
+
 pub async fn probe_auth_persist(
     specs: Option<&std::collections::HashMap<String, serde_json::Value>>,
 ) -> Option<InvocationOut> {
@@ -1155,6 +1188,24 @@ fn render_lints(path: &Path, findings: &[LintFinding], json: bool) -> usize {
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    /// RFC 0014: each plugin without a descriptor is a skipped probe line.
+    #[test]
+    fn undescribed_plugins_are_listed_as_skips() {
+        assert!(probe_undescribed_plugins(&[]).is_none());
+        let inv = probe_undescribed_plugins(&["sink:acme".into()]).unwrap();
+        assert_eq!(inv.id, "plugins");
+        assert_eq!(inv.probes.len(), 1);
+        assert_eq!(inv.probes[0].role, "plugins");
+        assert_eq!(inv.probes[0].connector, "sink:acme");
+        assert!(matches!(inv.probes[0].status, ProbeStatus::Skip { .. }));
+        assert!(
+            inv.probes[0]
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("register_sink_described"))
+        );
+    }
 
     /// `${now.*}` is rendered with the probe's clock, so a dated path is
     /// probed where a run would read it; a backfill/partition token is

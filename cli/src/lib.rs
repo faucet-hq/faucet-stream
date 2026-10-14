@@ -193,6 +193,10 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
         crate::cli::set_log_format(cli.log_format);
         mcp::install_stderr_tracing(&cli.log_level, cli.log_format);
     }
+    // `serve` warns once its own subscriber is in place.
+    if !is_serve {
+        registry::warn_undescribed_plugins();
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

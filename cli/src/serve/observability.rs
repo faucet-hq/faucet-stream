@@ -138,6 +138,7 @@ fn install_subscriber(level: &str, format: crate::cli::LogFormat, hub: LogHub) {
     if initialised.is_err() {
         tracing::warn!("tracing subscriber already installed; continuing");
     }
+    crate::registry::warn_undescribed_plugins();
 }
 
 #[cfg(not(feature = "observability"))]

@@ -343,6 +343,47 @@ fn global() -> &'static PluginRegistry {
     GLOBAL_REGISTRY.get_or_init(PluginRegistry::default)
 }
 
+/// The custom connectors registered without a [`ConnectorDescriptor`]
+/// (`source:<name>` / `sink:<name>`), sorted. Their capabilities cannot be
+/// checked before they are built, so the load-time gates treat them as plain
+/// (RFC 0014): `faucet doctor` lists each one, and
+/// [`warn_undescribed_plugins`] logs them once at startup.
+pub fn undescribed_plugins() -> Vec<String> {
+    undescribed_in(global())
+}
+
+fn undescribed_in(registry: &PluginRegistry) -> Vec<String> {
+    let mut out: Vec<String> = registry
+        .sources
+        .iter()
+        .filter(|(_, e)| e.descriptor.is_none())
+        .map(|(n, _)| format!("source:{n}"))
+        .chain(
+            registry
+                .sinks
+                .iter()
+                .filter(|(_, e)| e.descriptor.is_none())
+                .map(|(n, _)| format!("sink:{n}")),
+        )
+        .collect();
+    out.sort();
+    out
+}
+
+/// Log a warning naming every plugin registered without a descriptor (see
+/// [`undescribed_plugins`]). Called once, after the process installs its log
+/// subscriber.
+pub fn warn_undescribed_plugins() {
+    for plugin in undescribed_plugins() {
+        tracing::warn!(
+            plugin = %plugin,
+            "connector plugin registered without a ConnectorDescriptor: its capabilities \
+             cannot be checked at load time, so it is treated as a plain connector; register \
+             it with register_source_described / register_sink_described (RFC 0014)"
+        );
+    }
+}
+
 /// The custom connectors registered through a [`PluginRegistry`]
 /// (`source:<name>` / `sink:<name>`), sorted — part of a template test
 /// result's provenance (#856).
@@ -3218,6 +3259,39 @@ mod tests {
             "{:?}",
             reg.errors
         );
+    }
+
+    /// RFC 0014: a plugin registered without a descriptor is listed (and
+    /// warned about); a described one is not.
+    #[test]
+    fn plugins_without_a_descriptor_are_listed() {
+        fn caps(_: &Value) -> faucet_core::Capabilities {
+            faucet_core::Capabilities::append_only_sink()
+        }
+        let reg = PluginRegistry::new()
+            .register_source(
+                "plain_src",
+                |_| Ok(Box::new(DummySource) as Box<dyn Source>),
+            )
+            .register_sink("plain_sink", |_| Err(CliError::Config("unused".into())))
+            .register_sink_described(
+                ConnectorDescriptor::new("described_sink", caps),
+                |_| Err(CliError::Config("unused".into())),
+                || serde_json::json!({"type": "object"}),
+                "",
+            );
+        assert_eq!(
+            undescribed_in(&reg),
+            vec![
+                "sink:plain_sink".to_string(),
+                "source:plain_src".to_string()
+            ]
+        );
+        assert!(
+            undescribed_plugins().is_empty(),
+            "the default binary has none"
+        );
+        warn_undescribed_plugins();
     }
 
     #[test]
