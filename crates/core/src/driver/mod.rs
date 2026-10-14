@@ -91,7 +91,9 @@ pub use sink::{
     CleanupDriver, CommitTokenDriver, DriverSink, PageWrite, RollbackDriver, RowPolicy,
     SchemaDriver, SinkDriver, StagingDriver,
 };
-pub use source::{DriverSource, PageStream, SourceDriver};
+#[cfg(feature = "arrow")]
+pub use source::ColumnarStream;
+pub use source::{DriverSource, NativeStream, PageStream, SourceDriver};
 
 #[cfg(test)]
 mod tests;
