@@ -1241,7 +1241,8 @@ mod tests {
         .unwrap();
         sink.flush().await.unwrap();
         assert!(
-            !sink.d()
+            !sink
+                .d()
                 .warned_unknown
                 .load(std::sync::atomic::Ordering::Relaxed),
             "first-batch union must not trigger the unknown-field warning"
