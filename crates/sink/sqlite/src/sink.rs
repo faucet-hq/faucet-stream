@@ -4,10 +4,13 @@ use crate::config::{SqliteColumnMapping, SqliteSinkConfig};
 use async_trait::async_trait;
 use faucet_common_sql::dialects::{Sqlite, sqlite};
 use faucet_common_sql::{
-    EngineOptions, EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine, Statement, StatementKind,
-    TableColumn, TableTarget,
+    EngineOptions, EvolutionStep, SqlDialect, SqlDriver, SqlExecutor, SqlLayout, SqlSinkDriver,
+    SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
 };
-use faucet_core::{FaucetError, SchemaEvolution, SqlBaseType};
+#[cfg(test)]
+use faucet_core::SchemaEvolution;
+use faucet_core::driver::{DriverSink, RollbackDriver};
+use faucet_core::{FaucetError, SqlBaseType};
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -284,24 +287,32 @@ pub(crate) fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String 
 pub(crate) const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
 
 /// A sink that writes JSON records to a SQLite table.
+///
+/// Built on the SQL family driver (RFC 0014): [`SqliteDriver`] holds the
+/// SQLite I/O, and [`SqlSinkDriver`] drives writes, per-row outcomes, the
+/// exactly-once commit, cleanup, the overwrite lifecycle and schema evolution
+/// from it.
 pub struct SqliteSink {
+    /// The connection pool (shared with the driver).
+    #[cfg_attr(not(test), allow(dead_code))] // read by the unit tests
+    pub(crate) pool: SqlitePool,
+    inner: DriverSink<SqlSinkDriver<SqliteDriver>>,
+}
+
+/// The SQLite I/O primitives the SQL family driver runs on.
+pub(crate) struct SqliteDriver {
     pub(crate) config: SqliteSinkConfig,
     pub(crate) pool: SqlitePool,
-    /// Whether the target has been confirmed present for this sink instance
-    /// (#580). One check per run, not per page.
-    table_ready: std::sync::atomic::AtomicBool,
     /// The shared SQL planning engine (#884).
     pub(crate) engine: SqlSinkEngine<Sqlite>,
-    /// Backend-call context (#880): the run's deadline, cancel token and
-    /// round-trip recorder.
-    calls: faucet_core::CallSlot,
+    layout: SqlLayout,
 }
 
 /// The engine's view of one SQLite connection (or open transaction): every
 /// statement of an engine call runs on it, inside the sink's backend call.
 pub(crate) struct SqliteExec<'c> {
     pub(crate) conn: &'c mut sqlx::SqliteConnection,
-    pub(crate) sink: &'c SqliteSink,
+    pub(crate) sink: &'c SqliteDriver,
 }
 
 #[async_trait]
@@ -367,6 +378,50 @@ impl SqlExecutor for SqliteExec<'_> {
     }
 }
 
+/// A connection the SQL family driver runs statements on: an open write
+/// transaction, or a pooled connection for catalog reads.
+pub(crate) enum SqliteConn<'c> {
+    /// A `BEGIN IMMEDIATE` transaction.
+    Tx(sqlx::Transaction<'c, sqlx::Sqlite>, &'c SqliteDriver),
+    /// A plain pooled connection.
+    Pooled(sqlx::pool::PoolConnection<sqlx::Sqlite>, &'c SqliteDriver),
+}
+
+impl SqliteConn<'_> {
+    fn exec(&mut self) -> SqliteExec<'_> {
+        match self {
+            SqliteConn::Tx(tx, sink) => SqliteExec { conn: tx, sink },
+            SqliteConn::Pooled(conn, sink) => SqliteExec { conn, sink },
+        }
+    }
+}
+
+#[async_trait]
+impl SqlExecutor for SqliteConn<'_> {
+    async fn columns(&mut self, target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        self.exec().columns(target).await
+    }
+
+    async fn cleanup_columns(
+        &mut self,
+        target: &TableTarget,
+    ) -> Result<Vec<TableColumn>, FaucetError> {
+        self.exec().cleanup_columns(target).await
+    }
+
+    async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+        self.exec().execute(stmt).await
+    }
+
+    async fn journal_plan(
+        &mut self,
+        plan: &faucet_core::WritePlan,
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        self.exec().journal_plan(plan, run_id).await
+    }
+}
+
 /// Create the directory a database file lives in, so `./out/db.sqlite` works
 /// before `./out` exists — as every other file-writing sink does (#822).
 /// `create_if_missing` creates only the file. In-memory databases (and a bare
@@ -393,72 +448,6 @@ fn ensure_database_dir(filename: &std::path::Path) -> Result<(), FaucetError> {
 }
 
 impl SqliteSink {
-    /// Make sure the target table exists before the first write (#580).
-    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
-        use std::sync::atomic::Ordering;
-        if self.table_ready.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if !self.config.create_table {
-            if !self.table_exists(&self.config.table_name).await? {
-                return Err(faucet_core::missing_target_error(
-                    "sqlite sink",
-                    &self.config.table_name,
-                ));
-            }
-            self.table_ready.store(true, Ordering::Relaxed);
-            return Ok(());
-        }
-
-        let json_column = match &self.config.column_mapping {
-            SqliteColumnMapping::AutoMap => None,
-            SqliteColumnMapping::Json { column } => Some(column.as_str()),
-        };
-        // An overwrite writes to staging. On a first run (no target) nothing
-        // else creates staging, so it is created here from the page (#676).
-        // A column-mapped page with nothing to infer from leaves it for the
-        // next page.
-        let Some(sql) =
-            self.engine
-                .create_table_sql(&target(&self.effective_table()), records, json_column)?
-        else {
-            return Ok(());
-        };
-        sqlx::query(&sql)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite CREATE TABLE failed: {e}")))?;
-        self.table_ready.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
-        let exists: Option<String> =
-            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
-                .bind(table)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("SQLite table probe failed: {e}")))?;
-        Ok(exists.is_some())
-    }
-
-    /// Tables (other than the target and its own staging/previous copies) whose
-    /// foreign keys reference the target.
-    async fn referencing_tables(&self) -> Result<Vec<String>, FaucetError> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
-             WHERE m.type = 'table' AND f.\"table\" = ? COLLATE NOCASE AND m.name <> ? \
-             ORDER BY m.name",
-        )
-        .bind(&self.config.table_name)
-        .bind(&self.config.table_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: read foreign keys: {e}")))?;
-        let staging = self.staging_table();
-        Ok(rows.into_iter().filter(|t| *t != staging).collect())
-    }
-
     /// Create a new SQLite sink. Establishes a connection pool.
     ///
     /// The pool opens each connection with `journal_mode = WAL` and the
@@ -497,103 +486,61 @@ impl SqliteSink {
 
         let engine = SqlSinkEngine::new(Sqlite, config.write.clone())
             .with_options(EngineOptions::new().warn_unmatched_fields(true));
-        Ok(Self {
+        let mut layout = SqlLayout::new(config.table_name.clone())
+            .create_table(config.create_table)
+            .batch_size(config.batch_size);
+        if let SqliteColumnMapping::Json { column } = &config.column_mapping {
+            layout = layout.json_column(column.clone());
+        }
+        let driver = SqliteDriver {
             config,
-            pool,
-            table_ready: std::sync::atomic::AtomicBool::new(false),
+            pool: pool.clone(),
             engine,
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+            layout,
+        };
+        Ok(Self {
+            pool,
+            inner: DriverSink::new(SqlSinkDriver::new(driver)),
         })
     }
+}
 
-    /// The staging table name used while an overwrite run is in flight.
-    fn staging_table(&self) -> String {
-        format!(
-            "{}{}",
-            self.config.table_name,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+#[async_trait]
+impl faucet_core::Sink for SqliteSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl SqliteDriver {
+    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(table)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("SQLite table probe failed: {e}")))?;
+        Ok(exists.is_some())
+    }
+
+    /// Tables (other than the target and its own staging/previous copies) whose
+    /// foreign keys reference the target.
+    async fn referencing_tables(&self) -> Result<Vec<String>, FaucetError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
+             WHERE m.type = 'table' AND f.\"table\" = ? COLLATE NOCASE AND m.name <> ? \
+             ORDER BY m.name",
         )
+        .bind(&self.config.table_name)
+        .bind(&self.config.table_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: read foreign keys: {e}")))?;
+        let staging = self.staging_table();
+        Ok(rows.into_iter().filter(|t| *t != staging).collect())
     }
 
-    /// The table the data-write path targets. For `write_mode: overwrite` every
-    /// write in this sink's lifetime lands in the staging table (created by
-    /// [`begin_overwrite`], swapped into the real table by
-    /// [`commit_overwrite`]); otherwise it is the configured table.
-    fn effective_table(&self) -> String {
-        if self.config.write.is_overwrite() {
-            self.staging_table()
-        } else {
-            self.config.table_name.clone()
-        }
-    }
-
-    /// Open a write transaction (`BEGIN IMMEDIATE`, see [`BEGIN_WRITE`]).
-    async fn begin_write(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, FaucetError> {
-        self.pool
-            .begin_with(BEGIN_WRITE)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))
-    }
-
-    async fn commit_write(tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(), FaucetError> {
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))
-    }
-
-    /// Insert JSON-column records on the caller's connection; the engine
-    /// sub-chunks at SQLite's bind-variable cap (one variable per row).
-    async fn insert_json_tx(
-        &self,
-        conn: &mut sqlx::SqliteConnection,
-        records: &[Value],
-        column: &str,
-    ) -> Result<usize, FaucetError> {
-        let mut exec = SqliteExec { conn, sink: self };
-        self.engine
-            .insert_json(&mut exec, &target(&self.effective_table()), column, records)
-            .await
-    }
-
-    /// Insert a batch of records using JSON column mode, in its own
-    /// `BEGIN`/`COMMIT` transaction.
-    async fn insert_json(&self, records: &[Value], column: &str) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let mut tx = self.begin_write().await?;
-        let n = self.insert_json_tx(&mut tx, records, column).await?;
-        Self::commit_write(tx).await?;
-        Ok(n)
-    }
-
-    /// Insert a batch of records using auto-mapped columns, in its own
-    /// `BEGIN`/`COMMIT` transaction.
-    async fn insert_auto_map(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let mut tx = self.begin_write().await?;
-        let written = self.insert_auto_map_tx(&mut tx, records).await?;
-        Self::commit_write(tx).await?;
-        Ok(written)
-    }
-
-    /// Auto-map append on the caller's connection: the engine maps each
-    /// record onto the live columns (`pragma_table_info`, read on the same
-    /// connection so a single-connection pool cannot deadlock), refuses a
-    /// record matching no column (#789 SQL-70), warns once about unmatched
-    /// fields, and writes the union column set in chunks under SQLite's
-    /// bind-variable cap.
-    async fn insert_auto_map_tx(
-        &self,
-        conn: &mut sqlx::SqliteConnection,
-        records: &[Value],
-    ) -> Result<usize, FaucetError> {
-        let mut exec = SqliteExec { conn, sink: self };
-        self.engine
-            .insert(&mut exec, &target(&self.effective_table()), records, false)
-            .await
+    /// The staging table used while an overwrite run is in flight.
+    fn staging_table(&self) -> String {
+        self.layout.staging_table()
     }
 
     /// Delete rows whose key columns match any of `deletes`
@@ -610,60 +557,6 @@ impl SqliteSink {
             .await
     }
 
-    /// Apply planned upsert/delete groups inside one `BEGIN`/`COMMIT`
-    /// transaction, so they commit atomically.
-    async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
-        let mut tx = self.begin_write().await?;
-        let affected = self.apply_plans_in(&mut tx, plans).await?;
-        Self::commit_write(tx).await?;
-        Ok(affected)
-    }
-
-    /// Each plan's journal (with `rollback.journal`, #706), upserts, then
-    /// deletes, in page order, on the caller's transaction. Plans come from
-    /// [`faucet_core::plan_writes_ordered`], so a delete that precedes an
-    /// upsert of a key equal under a `NOCASE` key column runs before it.
-    async fn apply_plans_in(
-        &self,
-        conn: &mut sqlx::SqliteConnection,
-        plans: &[faucet_core::WritePlan],
-    ) -> Result<usize, FaucetError> {
-        let mut exec = SqliteExec { conn, sink: self };
-        self.engine
-            .apply_plans(&mut exec, &target(&self.config.table_name), plans)
-            .await
-    }
-
-    /// Delete rows in `scope` whose key was not written by this run (#478).
-    ///
-    /// The engine loads the written keys into a `temp` key table and deletes
-    /// with `NOT EXISTS` (the key set routinely exceeds the bind cap), all in
-    /// one transaction so the delete is all-or-nothing. Every statement runs
-    /// on the transaction's own connection: the temp table lives in that
-    /// connection's `temp` schema, and with a single-connection pool a query
-    /// sent to the pool instead would deadlock.
-    async fn cleanup_scope_impl(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.engine.check_cleanup_key()?;
-        let mut tx = self.begin_write().await?;
-        let deleted = {
-            let mut exec = SqliteExec {
-                conn: &mut tx,
-                sink: self,
-            };
-            self.engine
-                .cleanup(&mut exec, &target(&self.config.table_name), scope, seen)
-                .await?
-        };
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: commit failed: {e}")))?;
-        Ok(deleted)
-    }
-
     /// Ensure the commit-token watermark table exists.
     pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         sqlx::query(&Sqlite.commit_token_table_sql())
@@ -675,20 +568,16 @@ impl SqliteSink {
 }
 
 #[async_trait]
-impl faucet_core::Sink for SqliteSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
+impl SqlDriver for SqliteDriver {
+    type Dialect = Sqlite;
+    type Conn<'a> = SqliteConn<'a>;
+
+    fn engine(&self) -> &SqlSinkEngine<Sqlite> {
+        &self.engine
     }
 
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
+    fn layout(&self) -> &SqlLayout {
+        &self.layout
     }
 
     fn connector_name(&self) -> &'static str {
@@ -742,240 +631,165 @@ impl faucet_core::Sink for SqliteSink {
         Ok(CheckReport::single(probe))
     }
 
-    fn supports_cleanup(&self) -> bool {
-        // Column-mapping mode only: the scope + key predicates address real
-        // columns, which a single JSON payload column does not have.
-        matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap)
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
     }
 
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.calls
-            .call_once("cleanup_scope", async {
-                self.cleanup_scope_impl(scope, seen).await
-            })
+    fn target(&self, table: &str) -> TableTarget {
+        target(table)
+    }
+
+    /// Open a write transaction (`BEGIN IMMEDIATE`, see [`BEGIN_WRITE`]).
+    async fn begin(&self) -> Result<SqliteConn<'_>, FaucetError> {
+        let tx = self
+            .pool
+            .begin_with(BEGIN_WRITE)
             .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
+        Ok(SqliteConn::Tx(tx, self))
     }
 
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        &[
-            faucet_core::WriteMode::Append,
-            faucet_core::WriteMode::Upsert,
-            faucet_core::WriteMode::Delete,
-            faucet_core::WriteMode::Overwrite,
-        ]
+    async fn commit(&self, conn: SqliteConn<'_>) -> Result<(), FaucetError> {
+        match conn {
+            SqliteConn::Tx(tx, _) => tx
+                .commit()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}"))),
+            SqliteConn::Pooled(..) => Ok(()),
+        }
     }
 
-    fn dedups_by_key(&self) -> bool {
-        self.config.write.dedups_by_key()
-    }
-
-    /// Column-mapping mode only: the run-id column, the journaled keys and the
-    /// kept previous table all address real columns (#706).
-    fn supports_rollback(&self) -> bool {
-        self.rollback_supported()
-    }
-
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &faucet_core::rollback::RollbackOptions,
-    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.calls
-            .call_once("rollback_run", async {
-                self.rollback_run_impl(run_id, opts).await
-            })
+    async fn connection(&self) -> Result<SqliteConn<'_>, FaucetError> {
+        let conn = self
+            .pool
+            .acquire()
             .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite connection acquire failed: {e}")))?;
+        Ok(SqliteConn::Pooled(conn, self))
     }
 
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("forget_run", async { self.forget_run_impl(run_id).await })
+    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        SqliteDriver::table_exists(self, table).await
+    }
+
+    async fn ddl(&self, sql: &str, what: &'static str) -> Result<(), FaucetError> {
+        sqlx::query(sql)
+            .execute(&self.pool)
             .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite {what} failed: {e}")))?;
+        Ok(())
     }
 
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("rewind_commit_token", async {
-                self.rewind_commit_token_impl(scope, token).await
-            })
+    async fn read_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+        let row = sqlx::query(&Sqlite.commit_token_select_sql())
+            .bind(scope)
+            .fetch_optional(&self.pool)
             .await
-    }
-
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.readback_source_impl()
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.config.write.is_overwrite()
+            .map_err(|e| FaucetError::Sink(format!("SQLite token read failed: {e}")))?;
+        Ok(row.map(|r| r.get::<String, _>(0)))
     }
 
     /// Create the staging table from the target's own definition (so defaults,
-    /// generated columns and constraints carry over), dropping any leftover
-    /// staging table from a previously-crashed run first. A target that another
+    /// generated columns and constraints carry over). A target that another
     /// table references by foreign key is refused: the swap deletes and
     /// re-inserts its rows, which would cascade into or break that table.
-    ///
-    /// A missing target with `create_table: true` (a first run) has no shape to
-    /// clone: the first write creates staging from the page, and the commit
-    /// renames it into place (#676). Every step reads the database rather than
-    /// sink-instance memory, because the CLI runs begin, the writes and the
-    /// commit on different sink instances.
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("begin_overwrite", async {
-                let staging = quote_ident_sqlite(&self.staging_table());
-                sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: drop stale staging: {e}")))?;
-                if self.config.create_table && !self.table_exists(&self.config.table_name).await? {
-                    return Ok(());
-                }
-                let referencing = self.referencing_tables().await?;
-                if !referencing.is_empty() {
-                    return Err(FaucetError::Config(format!(
-                        "sqlite overwrite: table '{}' is referenced by a foreign key from {}; replacing \
-                         its rows would cascade into or break those tables. Use write_mode: upsert, or \
-                         drop the foreign key",
-                        self.config.table_name,
-                        referencing.join(", ")
-                    )));
-                }
-                let create_sql: Option<String> =
-                    sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
-                        .bind(&self.config.table_name)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(sink_err("sqlite overwrite: read target definition"))?;
-                let create_sql = create_sql.ok_or_else(|| {
-                    FaucetError::Sink(format!(
-                        "sqlite overwrite: create staging from '{}': the table does not exist",
-                        self.config.table_name
-                    ))
-                })?;
-                let ddl = staging_definition(&create_sql, &self.staging_table(), &self.config.table_name)?;
-                sqlx::query(&ddl)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: create staging: {e}")))?;
-                Ok(())
-            })
+    async fn create_staging(&self) -> Result<(), FaucetError> {
+        let referencing = self.referencing_tables().await?;
+        if !referencing.is_empty() {
+            return Err(FaucetError::Config(format!(
+                "sqlite overwrite: table '{}' is referenced by a foreign key from {}; replacing \
+                 its rows would cascade into or break those tables. Use write_mode: upsert, or \
+                 drop the foreign key",
+                self.config.table_name,
+                referencing.join(", ")
+            )));
+        }
+        let create_sql: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(&self.config.table_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(sink_err("sqlite overwrite: read target definition"))?;
+        let create_sql = create_sql.ok_or_else(|| {
+            FaucetError::Sink(format!(
+                "sqlite overwrite: create staging from '{}': the table does not exist",
+                self.config.table_name
+            ))
+        })?;
+        let ddl = staging_definition(&create_sql, &self.staging_table(), &self.config.table_name)?;
+        sqlx::query(&ddl)
+            .execute(&self.pool)
             .await
+            .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: create staging: {e}")))?;
+        Ok(())
+    }
+
+    /// First run: staging holds everything; rename it into place. With
+    /// `rollback.keep_previous`, an empty previous copy makes the first run
+    /// undoable: its rollback empties the table it created (#789 SQL-151).
+    async fn publish_staging(&self) -> Result<(), FaucetError> {
+        let staging = quote_ident_sqlite(&self.staging_table());
+        let mut tx = self
+            .pool
+            .begin_with(BEGIN_WRITE)
+            .await
+            .map_err(sink_err("sqlite overwrite: begin publish"))?;
+        if self.config.write.keeps_previous() {
+            let prev = quote_ident_sqlite(&self.previous_table());
+            for stmt in [
+                format!("DROP TABLE IF EXISTS {prev}"),
+                format!("CREATE TABLE {prev} AS SELECT * FROM {staging} WHERE 0"),
+            ] {
+                sqlx::query(&stmt)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sink_err("sqlite overwrite: keep previous copy"))?;
+            }
+        }
+        sqlx::query(&format!(
+            "ALTER TABLE {staging} RENAME TO {}",
+            quote_ident_sqlite(&self.config.table_name)
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(sink_err("sqlite overwrite: publish staging"))?;
+        tx.commit()
+            .await
+            .map_err(sink_err("sqlite overwrite: commit publish"))
     }
 
     /// Atomically replace the destination with the staged rows in one
     /// transaction: `DELETE FROM target; INSERT INTO target (cols) SELECT cols
     /// FROM staging; DROP TABLE staging`, over the target's non-generated
-    /// columns. SQLite DDL is transactional, so a failure
-    /// anywhere rolls the whole swap back and the prior rows survive.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("commit_overwrite", async {
-                let staging = quote_ident_sqlite(&self.staging_table());
-                if !self.table_exists(&self.config.table_name).await? {
-                    // First run: staging holds everything; publish it as the target.
-                    // A run that wrote nothing has no staging either, and leaves no table.
-                    if self.table_exists(&self.staging_table()).await? {
-                        let mut tx = self
-                            .pool
-                            .begin_with(BEGIN_WRITE)
-                            .await
-                            .map_err(sink_err("sqlite overwrite: begin publish"))?;
-                        // An empty previous copy makes the first run undoable: its
-                        // rollback empties the table it created (#789 SQL-151).
-                        if self.config.write.keeps_previous() {
-                            let prev = quote_ident_sqlite(&self.previous_table());
-                            for stmt in [
-                                format!("DROP TABLE IF EXISTS {prev}"),
-                                format!("CREATE TABLE {prev} AS SELECT * FROM {staging} WHERE 0"),
-                            ] {
-                                sqlx::query(&stmt)
-                                    .execute(&mut *tx)
-                                    .await
-                                    .map_err(sink_err("sqlite overwrite: keep previous copy"))?;
-                            }
-                        }
-                        sqlx::query(&format!(
-                            "ALTER TABLE {staging} RENAME TO {}",
-                            quote_ident_sqlite(&self.config.table_name)
-                        ))
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(sink_err("sqlite overwrite: publish staging"))?;
-                        tx.commit()
-                            .await
-                            .map_err(sink_err("sqlite overwrite: commit publish"))?;
-                    }
-                    return Ok(());
-                }
-                let target = quote_ident_sqlite(&self.config.table_name);
-                let mut tx = self
-                    .pool
-                    .begin_with(BEGIN_WRITE)
-                    .await
-                    .map_err(sink_err("sqlite overwrite: begin swap"))?;
-                // `rollback.keep_previous`: snapshot the rows about to be replaced, in
-                // the same transaction, so a rollback can swap them back (#706).
-                if self.config.write.keeps_previous() {
-                    self.keep_previous_copy(&mut tx).await?;
-                }
-                let cols =
-                    column_list(&insertable_columns(&mut tx, &self.config.table_name).await?);
-                for stmt in [
-                    format!("DELETE FROM {target}"),
-                    format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}"),
-                    format!("DROP TABLE {staging}"),
-                ] {
-                    sqlx::query(&stmt)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(sink_err("sqlite overwrite swap failed"))?;
-                }
-                tx.commit()
-                    .await
-                    .map_err(sink_err("sqlite overwrite: commit swap"))?;
-                Ok(())
-            })
+    /// columns. SQLite DDL is transactional, so a failure anywhere rolls the
+    /// whole swap back and the prior rows survive.
+    async fn swap_staging(&self) -> Result<(), FaucetError> {
+        let staging = quote_ident_sqlite(&self.staging_table());
+        let target = quote_ident_sqlite(&self.config.table_name);
+        let mut tx = self
+            .pool
+            .begin_with(BEGIN_WRITE)
             .await
-    }
-
-    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.calls
-            .call_once("overwrite_staging_exists", async {
-                Ok(Some(self.table_exists(&self.staging_table()).await?))
-            })
-            .await
-    }
-
-    /// Drop the staging table so a failed/cancelled overwrite leaves nothing
-    /// behind. Best-effort — the destination was never touched (on a first run
-    /// it was never created).
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("abort_overwrite", async {
-                sqlx::query(&format!(
-                    "DROP TABLE IF EXISTS {}",
-                    quote_ident_sqlite(&self.staging_table())
-                ))
-                .execute(&self.pool)
+            .map_err(sink_err("sqlite overwrite: begin swap"))?;
+        // `rollback.keep_previous`: snapshot the rows about to be replaced, in
+        // the same transaction, so a rollback can swap them back (#706).
+        if self.config.write.keeps_previous() {
+            self.keep_previous_copy(&mut tx).await?;
+        }
+        let cols = column_list(&insertable_columns(&mut tx, &self.config.table_name).await?);
+        for stmt in [
+            format!("DELETE FROM {target}"),
+            format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}"),
+            format!("DROP TABLE {staging}"),
+        ] {
+            sqlx::query(&stmt)
+                .execute(&mut *tx)
                 .await
-                .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: drop staging: {e}")))?;
-                Ok(())
-            })
+                .map_err(sink_err("sqlite overwrite swap failed"))?;
+        }
+        tx.commit()
             .await
-    }
-
-    fn supports_schema_evolution(&self) -> bool {
-        true
+            .map_err(sink_err("sqlite overwrite: commit swap"))
     }
 
     /// Read the live destination schema via `PRAGMA table_info`, shaped as an
@@ -989,301 +803,148 @@ impl faucet_core::Sink for SqliteSink {
     /// connection acquired from the pool (a standalone read — not inside an open
     /// transaction).
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
-        self.calls
-            .call_once("current_schema", async {
-                // JSON-column mode stores each record whole; the physical columns are
-                // not the record's fields, so there is nothing to drift against
-                // (#789 SQL-20).
-                if !matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap) {
-                    return Ok(None);
-                }
-                let rows = sqlx::query(&format!(
-                    "PRAGMA table_info({})",
-                    quote_ident_sqlite(&self.config.table_name)
-                ))
-                .fetch_all(&self.pool)
-                .await
-                .map_err(sink_err("sqlite current_schema query failed"))?;
+        // JSON-column mode stores each record whole; the physical columns are
+        // not the record's fields, so there is nothing to drift against
+        // (#789 SQL-20).
+        if !matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap) {
+            return Ok(None);
+        }
+        let rows = sqlx::query(&format!(
+            "PRAGMA table_info({})",
+            quote_ident_sqlite(&self.config.table_name)
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sink_err("sqlite current_schema query failed"))?;
 
-                if rows.is_empty() {
-                    return Ok(None); // table does not exist yet (or has no columns)
-                }
+        if rows.is_empty() {
+            return Ok(None); // table does not exist yet (or has no columns)
+        }
 
-                let mut props = serde_json::Map::new();
-                for row in &rows {
-                    let name: String = row.get("name");
-                    let declared: String = row.get("type");
-                    let notnull: i64 = row.get("notnull");
-                    props.insert(
-                        name,
-                        sqlite_affinity_to_json_schema(&declared, notnull == 0),
-                    );
-                }
-                Ok(Some(
-                    serde_json::json!({ "type": "object", "properties": props }),
-                ))
-            })
+        let mut props = serde_json::Map::new();
+        for row in &rows {
+            let name: String = row.get("name");
+            let declared: String = row.get("type");
+            let notnull: i64 = row.get("notnull");
+            props.insert(
+                name,
+                sqlite_affinity_to_json_schema(&declared, notnull == 0),
+            );
+        }
+        Ok(Some(
+            serde_json::json!({ "type": "object", "properties": props }),
+        ))
+    }
+
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the current columns are
+    /// read first and an addition already present is skipped.
+    async fn existing_columns(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<String>>, FaucetError> {
+        Ok(Some(
+            sqlx::query(&format!(
+                "PRAGMA table_info({})",
+                quote_ident_sqlite(&self.config.table_name)
+            ))
+            .fetch_all(&self.pool)
             .await
+            .map_err(|e| FaucetError::Sink(format!("sqlite evolve table_info failed: {e}")))?
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect(),
+        ))
     }
 
     /// Apply an additive schema evolution to the destination table (issue #194).
     ///
-    /// - **Additions** — `ALTER TABLE … ADD COLUMN`. SQLite has no
-    ///   `ADD COLUMN IF NOT EXISTS`, so the current columns are read first and a
-    ///   column already present is silently skipped (idempotency by pre-check).
+    /// - **Additions** — `ALTER TABLE … ADD COLUMN`.
     /// - **Widenings** — a no-op under SQLite's dynamic typing: a column already
     ///   accepts a value of any type, so there is nothing to ALTER. Logged once
     ///   at `debug`.
     /// - **Nullability relaxations** — a no-op: SQLite cannot drop a `NOT NULL`
     ///   constraint in place (it requires a full table rebuild, which is out of
-    ///   scope here). Logged once at `debug`; the column is left as-is.
-    async fn evolve_schema(&self, evolution: &SchemaEvolution) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("evolve_schema", async {
-                // Read the current column set so additions are idempotent (no
-                // `ADD COLUMN IF NOT EXISTS` in SQLite).
-                let existing: std::collections::HashSet<String> = sqlx::query(&format!(
-                    "PRAGMA table_info({})",
-                    quote_ident_sqlite(&self.config.table_name)
-                ))
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("sqlite evolve table_info failed: {e}")))?
-                .iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-
-                let mut widened = false;
-                for step in self.engine.evolution_steps(evolution, Some(&existing)) {
-                    match step {
-                        EvolutionStep::Add { column, base } => {
-                            sqlx::query(&build_add_column_sql(
-                                &self.config.table_name,
-                                &column,
-                                base,
-                            ))
-                            .execute(&self.pool)
-                            .await
-                            .map_err(|e| {
-                                FaucetError::Sink(format!("sqlite ADD COLUMN {column} failed: {e}"))
-                            })?;
-                        }
-                        EvolutionStep::Widen { .. } if !widened => {
-                            widened = true;
-                            tracing::debug!(
-                                "sqlite: type widening is a no-op under dynamic typing"
-                            );
-                        }
-                        EvolutionStep::Relax { column } => {
-                            tracing::debug!(
-                                "sqlite cannot relax NOT NULL in place; column {column} left as-is"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                Ok(())
-            })
-            .await
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.calls
-            .call_once("write_batch", self.write_rows(records))
-            .await
-    }
-
-    async fn write_batch_reported(
-        &self,
-        records: &[Value],
-    ) -> Result<faucet_core::WriteReport, FaucetError> {
-        self.calls
-            .call_once("write_batch", self.write_rows_reported(records))
-            .await
-    }
-
-    /// Write a batch and report per-row outcomes.
-    ///
-    /// In append mode this delegates to [`write_batch`](faucet_core::Sink::write_batch) and
-    /// maps a single success onto an all-`Ok(())` vector (the trait default).
-    /// In upsert/delete mode the good rows are applied (upserts + deletes), and
-    /// only the rows whose key could not be extracted (missing / null key) are
-    /// reported as `Err` so the pipeline routes them to the DLQ per-row instead
-    /// of sending the whole page.
-    async fn write_batch_partial(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        self.calls
-            .call_once("write_batch_partial", async {
-                // The DLQ and exactly-once paths must create a missing target too (#676).
-                self.ensure_table_ready(records).await?;
-                if !matches!(
-                    self.config.write.write_mode,
-                    faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-                ) {
-                    // Append and overwrite: insert-shaped. A record matching no column
-                    // is that row's failure, not a silent skip (#789 SQL-70).
-                    if !matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap) {
-                        self.write_rows(records).await?;
-                        return Ok(records.iter().map(|_| Ok(())).collect());
-                    }
-                    let table = target(&self.effective_table());
-                    let mut conn = self.pool.acquire().await.map_err(|e| {
-                        FaucetError::Sink(format!("SQLite connection acquire failed: {e}"))
-                    })?;
-                    let columns = SqliteExec {
-                        conn: &mut conn,
-                        sink: self,
-                    }
-                    .columns(&table)
-                    .await?;
-                    drop(conn);
-                    let split =
-                        self.engine
-                            .split_writable(&table, records, &columns, true, |_, _, _| None);
-                    self.write_rows(&split.writable).await?;
-                    return Ok(split.outcomes);
-                }
-
-                let (plans, failed) = self.engine.plan_keyed_partial(records);
-                self.apply_plans(&plans).await?;
-
-                let mut outcomes: Vec<faucet_core::RowOutcome> =
-                    records.iter().map(|_| Ok(())).collect();
-                for (idx, e) in failed {
-                    outcomes[idx] = Err(e);
-                }
-                Ok(outcomes)
-            })
-            .await
-    }
-
-    fn supports_idempotent_writes(&self) -> bool {
-        true
-    }
-
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.calls
-            .call_once("last_committed_token", async {
-                self.ensure_commit_table().await?;
-                let row = sqlx::query(&Sqlite.commit_token_select_sql())
-                    .bind(scope)
-                    .fetch_optional(&self.pool)
+    ///   scope here). Logged at `debug`; the column is left as-is.
+    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
+        let mut widened = false;
+        for step in steps {
+            match step {
+                EvolutionStep::Add { column, base } => {
+                    sqlx::query(&build_add_column_sql(
+                        &self.config.table_name,
+                        &column,
+                        base,
+                    ))
+                    .execute(&self.pool)
                     .await
-                    .map_err(|e| FaucetError::Sink(format!("SQLite token read failed: {e}")))?;
-                Ok(row.map(|r| r.get::<String, _>(0)))
-            })
-            .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("sqlite ADD COLUMN {column} failed: {e}"))
+                    })?;
+                }
+                EvolutionStep::Widen { .. } if !widened => {
+                    widened = true;
+                    tracing::debug!("sqlite: type widening is a no-op under dynamic typing");
+                }
+                EvolutionStep::Relax { column } => {
+                    tracing::debug!(
+                        "sqlite cannot relax NOT NULL in place; column {column} left as-is"
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
-    async fn write_batch_idempotent(
-        &self,
-        records: &[Value],
-        scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        self.calls
-            .call_once("write_batch_idempotent", async {
-                // The DLQ and exactly-once paths must create a missing target too (#676).
-                self.ensure_table_ready(records).await?;
-                self.ensure_commit_table().await?;
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        Some(self)
+    }
 
-                // For upsert/delete modes, plan the page before opening the transaction
-                // so a key-extraction failure aborts without leaving an open tx.
-                let plans =
-                    if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-                        None
-                    } else {
-                        Some(self.engine.plan_keyed(records)?)
-                    };
-
-                let mut tx = self.begin_write().await?;
-
-                // Data write and the commit-token upsert share ONE transaction so the
-                // page is committed atomically with its watermark: on crash either both
-                // land or neither does, which is what makes a replay skip-on-resume
-                // produce zero duplicates. For upsert/delete the planned upserts/deletes
-                // commit together with the watermark in this same tx (no nested tx —
-                // we reuse `apply_plans_in` directly on this transaction).
-                let written = match &plans {
-                    Some(plans) => self.apply_plans_in(&mut tx, plans).await?,
-                    None => match &self.config.column_mapping {
-                        SqliteColumnMapping::Json { column } => {
-                            self.insert_json_tx(&mut tx, records, column).await?
-                        }
-                        SqliteColumnMapping::AutoMap => {
-                            self.insert_auto_map_tx(&mut tx, records).await?
-                        }
-                    },
-                };
-
-                {
-                    let mut exec = SqliteExec {
-                        conn: &mut tx,
-                        sink: self,
-                    };
-                    self.engine.write_token(&mut exec, scope, token).await?;
-                }
-
-                Self::commit_write(tx).await?;
-                Ok(written)
-            })
-            .await
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
     }
 }
 
-impl SqliteSink {
-    async fn write_rows(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.write_rows_reported(records).await.map(|r| r.accepted)
+#[async_trait]
+impl RollbackDriver for SqliteDriver {
+    fn enabled(&self) -> bool {
+        self.rollback_supported()
     }
 
-    /// Write a page and report what happened to each offered row: a keyed
-    /// page accepts one row per planned upsert/delete and coalesces the rest.
-    async fn write_rows_reported(
+    async fn rollback_run(
         &self,
-        records: &[Value],
-    ) -> Result<faucet_core::WriteReport, FaucetError> {
-        if records.is_empty() {
-            return Ok(faucet_core::WriteReport::accepted(0));
-        }
-        self.ensure_table_ready(records).await?;
+        calls: &faucet_core::CallSlot,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        calls
+            .call_once("rollback_run", self.rollback_run_impl(run_id, opts))
+            .await
+    }
 
-        // Upsert/delete modes: plan the writes and apply atomically. Append and
-        // overwrite are insert-shaped and fall through (overwrite lands in the
-        // staging table via `effective_table`).
-        if self.engine.is_keyed() {
-            let plans = self.engine.plan_keyed(records)?;
-            let written = self.apply_plans(&plans).await?;
-            return Ok(self.engine.report(records.len(), written, &plans));
-        }
+    async fn forget_run(
+        &self,
+        calls: &faucet_core::CallSlot,
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        calls
+            .call_once("forget_run", self.forget_run_impl(run_id))
+            .await
+    }
 
-        // `batch_size = 0` is the "no batching" sentinel: write the entire
-        // upstream slice as a single multi-row INSERT inside one
-        // `BEGIN`/`COMMIT` transaction, preserving `StreamPage` framing.
-        // Otherwise re-chunk into `batch_size` slices so each transaction
-        // stays near SQLite's sweet spot (~1000 rows per multi-row INSERT).
-        let effective_chunk = if self.config.batch_size == 0 {
-            records.len()
-        } else {
-            self.config.batch_size
-        };
-
-        let mut total = 0;
-        for chunk in records.chunks(effective_chunk) {
-            total += match &self.config.column_mapping {
-                SqliteColumnMapping::Json { column } => self.insert_json(chunk, column).await?,
-                SqliteColumnMapping::AutoMap => self.insert_auto_map(chunk).await?,
-            };
-        }
-
-        tracing::info!(
-            table = %self.config.table_name,
-            rows = total,
-            "SQLite write complete"
-        );
-        Ok(self.engine.report(records.len(), total, &[]))
+    async fn rewind_commit_token(
+        &self,
+        calls: &faucet_core::CallSlot,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        calls
+            .call_once(
+                "rewind_commit_token",
+                self.rewind_commit_token_impl(scope, token),
+            )
+            .await
     }
 }
 

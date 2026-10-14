@@ -5,7 +5,7 @@
 
 use crate::config::SqliteColumnMapping;
 use crate::sink::quote_ident_sqlite;
-use crate::sink::{BEGIN_WRITE, SqliteSink};
+use crate::sink::{BEGIN_WRITE, SqliteDriver};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, canonical_key,
@@ -83,7 +83,7 @@ fn column_path(column: &str) -> String {
     format!("$.\"{column}\"")
 }
 
-impl SqliteSink {
+impl SqliteDriver {
     /// `<table>__faucet_prev` — the replaced table an overwrite keeps.
     pub(crate) fn previous_table(&self) -> String {
         format!(

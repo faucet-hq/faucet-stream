@@ -9,7 +9,8 @@
 use crate::config::NatsSinkConfig;
 use async_trait::async_trait;
 use bytes::Bytes;
-use faucet_core::{FaucetError, Sink};
+use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
+use faucet_core::{CallSlot, FaucetError, Sink};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -19,11 +20,18 @@ use tokio::sync::OnceCell;
 /// The client is built lazily on the first write (see [`NatsSink::new`]), so an
 /// unreachable server fails on the first `write_batch` rather than at
 /// construction time. The client is reused across batches.
+///
+/// Built on the messaging family driver (RFC 0014): [`NatsDriver`] encodes and
+/// publishes; [`MessageSinkDriver`] drives the `batch_size` groups, the
+/// `publish_timeout_secs` bound and the per-row outcomes.
 pub struct NatsSink {
+    inner: DriverSink<MessageSinkDriver<NatsDriver>>,
+}
+
+/// The NATS I/O primitives the messaging driver runs on.
+pub(crate) struct NatsDriver {
     config: NatsSinkConfig,
     client: OnceCell<async_nats::Client>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder.
-    calls: faucet_core::CallSlot,
 }
 
 impl NatsSink {
@@ -32,121 +40,36 @@ impl NatsSink {
     pub async fn new(config: NatsSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         Ok(Self {
-            config,
-            client: OnceCell::new(),
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+            inner: DriverSink::new(MessageSinkDriver::new(NatsDriver {
+                config,
+                client: OnceCell::new(),
+            })),
         })
     }
 
-    /// Lazily build (once) and return the shared NATS client.
-    async fn client(&self) -> Result<async_nats::Client, FaucetError> {
+    #[cfg(test)]
+    fn resolve_subject(&self, record: &Value) -> Result<String, FaucetError> {
+        self.inner.driver().driver().resolve_subject(record)
+    }
+}
+
+#[async_trait]
+impl Sink for NatsSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl NatsDriver {
+    /// The shared NATS client, built once.
+    async fn client(&self, calls: &CallSlot) -> Result<async_nats::Client, FaucetError> {
         self.client
             .get_or_try_init(|| {
-                self.calls.call_once(
+                calls.call_once(
                     "connect",
                     faucet_common_nats::connect(&self.config.connection),
                 )
             })
             .await
             .cloned()
-    }
-
-    /// Bound `fut` by `publish_timeout_secs` (#789 MSG-59), run as one backend
-    /// call named `what` under the run's call context (#880).
-    async fn bounded<F: std::future::Future>(
-        &self,
-        fut: F,
-        what: &'static str,
-    ) -> Result<F::Output, FaucetError> {
-        let after = Duration::from_secs(self.config.publish_timeout_secs);
-        self.calls
-            .call_once(what, async {
-                tokio::time::timeout(after, fut)
-                    .await
-                    .map_err(|_| timeout_error(what, after))
-            })
-            .await
-    }
-
-    /// Publish every record in `batch_size` groups and return one outcome
-    /// per record. A record whose subject cannot be resolved fails alone.
-    /// Core NATS: a group's publishes then a flush. JetStream: the group's
-    /// publishes, then each acknowledgement (#789 MSG-31).
-    async fn publish_all(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
-        if records.is_empty() {
-            return Ok(outcomes);
-        }
-        let client = self.client().await?;
-        let js = self
-            .config
-            .jetstream
-            .then(|| async_nats::jetstream::new(client.clone()));
-        let group = if self.config.batch_size == 0 {
-            records.len()
-        } else {
-            self.config.batch_size
-        };
-        for (offset, chunk) in records.chunks(group).enumerate() {
-            let base = offset * group;
-            let work = async {
-                let mut acks = Vec::new();
-                for (i, record) in chunk.iter().enumerate() {
-                    let subject = match self.resolve_subject(record) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            outcomes[base + i] = Err(e);
-                            continue;
-                        }
-                    };
-                    let payload = message_payload(record)?;
-                    match &js {
-                        Some(js) => match js.publish(subject, payload).await {
-                            Ok(ack) => acks.push((base + i, ack)),
-                            Err(e) => {
-                                outcomes[base + i] =
-                                    Err(FaucetError::Sink(format!("nats jetstream publish: {e}")))
-                            }
-                        },
-                        None => client
-                            .publish(subject, payload)
-                            .await
-                            .map_err(|e| FaucetError::Sink(format!("nats publish: {e}")))?,
-                    }
-                }
-                if js.is_some() {
-                    for (idx, ack) in acks {
-                        if let Err(e) = ack.await {
-                            outcomes[idx] = Err(FaucetError::Sink(format!(
-                                "nats jetstream publish not acknowledged: {e}"
-                            )));
-                        }
-                    }
-                } else {
-                    client
-                        .flush()
-                        .await
-                        .map_err(|e| FaucetError::Sink(format!("nats flush: {e}")))?;
-                }
-                Ok::<(), FaucetError>(())
-            };
-            match self.bounded(work, "publish").await {
-                Ok(done) => done?,
-                Err(FaucetError::Timeout { .. }) => {
-                    let after = Duration::from_secs(self.config.publish_timeout_secs);
-                    fail_unconfirmed(&mut outcomes[base..], "publish", after);
-                    return Ok(outcomes);
-                }
-                Err(e) => {
-                    fail_cut(&mut outcomes[base..], &e);
-                    return Ok(outcomes);
-                }
-            }
-        }
-        Ok(outcomes)
     }
 
     /// Resolve the destination subject for a record: the per-record
@@ -170,82 +93,14 @@ impl NatsSink {
     }
 }
 
-/// The typed, retriable error for a `what` that outlived `after`.
-fn timeout_error(what: &str, after: Duration) -> FaucetError {
-    FaucetError::Timeout {
-        operation: format!("nats {what}"),
-        after,
-    }
-}
-
-/// A publish group that timed out leaves its unconfirmed rows, and every row
-/// of the groups after it, failed with the timeout; outcomes already decided
-/// (earlier groups, rows that failed on their own) are kept.
-fn fail_unconfirmed(outcomes: &mut [faucet_core::RowOutcome], what: &str, after: Duration) {
-    for outcome in outcomes.iter_mut().filter(|o| o.is_ok()) {
-        *outcome = Err(timeout_error(what, after));
-    }
-}
-
-/// Like [`fail_unconfirmed`], for a publish group the run's call context
-/// cancelled: every row not yet decided fails with that error.
-fn fail_cut(outcomes: &mut [faucet_core::RowOutcome], cause: &FaucetError) {
-    for outcome in outcomes.iter_mut().filter(|o| o.is_ok()) {
-        *outcome = Err(match cause {
-            FaucetError::Cancelled { operation } => FaucetError::Cancelled {
-                operation: operation.clone(),
-            },
-            other => FaucetError::Sink(format!("nats publish: {other}")),
-        });
-    }
-}
-
 #[async_trait]
-impl Sink for NatsSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        let outcomes = self.publish_all(records).await?;
-        match outcomes.into_iter().find_map(Result::err) {
-            Some(e) => Err(e),
-            None => Ok(records.len()),
-        }
-    }
-
-    async fn write_batch_partial(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        self.publish_all(records).await
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        let client = self.client().await?;
-        self.bounded(client.flush(), "flush")
-            .await?
-            .map_err(|e| FaucetError::Sink(format!("nats flush: {e}")))?;
-        Ok(())
+impl MessageDriver for NatsDriver {
+    fn connector_name(&self) -> &'static str {
+        "nats"
     }
 
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(NatsSinkConfig)).unwrap_or(Value::Null)
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "nats"
     }
 
     fn dataset_uri(&self) -> String {
@@ -254,6 +109,79 @@ impl Sink for NatsSink {
             None => self.config.subject.clone(),
         };
         faucet_common_nats::dataset_uri(&self.config.connection.servers, &subject)
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    /// A record whose subject cannot be resolved fails alone.
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        let subject = self.resolve_subject(record)?;
+        Ok(OutboundMessage::new(subject, message_payload(record)?))
+    }
+
+    fn group_size(&self) -> usize {
+        self.config.batch_size
+    }
+
+    /// Every group is bounded by `publish_timeout_secs` (#789 MSG-59).
+    fn group_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(self.config.publish_timeout_secs))
+    }
+
+    async fn connect(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.client(calls).await.map(|_| ())
+    }
+
+    /// Core NATS: the group's publishes then a flush. JetStream: the group's
+    /// publishes, then each acknowledgement (#789 MSG-31).
+    async fn publish(
+        &self,
+        calls: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let client = self.client(calls).await?;
+        let mut outcomes: Vec<faucet_core::RowOutcome> = group.iter().map(|_| Ok(())).collect();
+        if self.config.jetstream {
+            let js = async_nats::jetstream::new(client);
+            let mut acks = Vec::new();
+            for (i, m) in group.into_iter().enumerate() {
+                match js.publish(m.destination, Bytes::from(m.payload)).await {
+                    Ok(ack) => acks.push((i, ack)),
+                    Err(e) => {
+                        outcomes[i] = Err(FaucetError::Sink(format!("nats jetstream publish: {e}")))
+                    }
+                }
+            }
+            for (i, ack) in acks {
+                if let Err(e) = ack.await {
+                    outcomes[i] = Err(FaucetError::Sink(format!(
+                        "nats jetstream publish not acknowledged: {e}"
+                    )));
+                }
+            }
+        } else {
+            for m in group {
+                client
+                    .publish(m.destination, Bytes::from(m.payload))
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("nats publish: {e}")))?;
+            }
+            client
+                .flush()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("nats flush: {e}")))?;
+        }
+        Ok(outcomes)
+    }
+
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.client(calls)
+            .await?
+            .flush()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("nats flush: {e}")))
     }
 }
 
@@ -279,67 +207,23 @@ mod tests {
         fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
     }
 
-    #[tokio::test]
-    async fn an_operation_past_its_bound_is_a_typed_timeout() {
-        let mut cfg = NatsSinkConfig::new("subj");
-        cfg.publish_timeout_secs = 1;
-        let sink = NatsSink::new(cfg).await.unwrap();
-        let err = sink
-            .bounded(std::future::pending::<()>(), "flush")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, FaucetError::Timeout { operation, after }
-                if operation == "nats flush" && *after == Duration::from_secs(1)),
-            "{err:?}"
-        );
-        assert!(err.is_retriable());
-    }
-
-    #[test]
-    fn a_cancelled_group_fails_only_rows_not_yet_decided() {
-        let mut outcomes: Vec<faucet_core::RowOutcome> =
-            vec![Err(FaucetError::Sink("own".into())), Ok(()), Ok(())];
-        fail_cut(
-            &mut outcomes,
-            &FaucetError::Cancelled {
-                operation: "publish call".into(),
-            },
-        );
-        assert!(matches!(&outcomes[0], Err(FaucetError::Sink(m)) if m == "own"));
-        assert!(matches!(&outcomes[1], Err(FaucetError::Cancelled { .. })));
-        fail_cut(&mut outcomes[2..], &FaucetError::Source("x".into()));
-        assert!(matches!(&outcomes[2], Err(FaucetError::Cancelled { .. })));
-        let mut fresh: Vec<faucet_core::RowOutcome> = vec![Ok(())];
-        fail_cut(&mut fresh, &FaucetError::Source("x".into()));
-        assert!(matches!(&fresh[0], Err(FaucetError::Sink(m)) if m.contains("x")));
-    }
-
-    #[test]
-    fn a_timeout_fails_only_rows_not_yet_decided() {
-        let mut outcomes: Vec<faucet_core::RowOutcome> =
-            vec![Ok(()), Err(FaucetError::Sink("bad subject".into())), Ok(())];
-        fail_unconfirmed(&mut outcomes[1..], "publish", Duration::from_secs(30));
-        assert!(outcomes[0].is_ok());
-        assert!(
-            outcomes[1]
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("bad subject")
-        );
-        let timed_out = outcomes[2].as_ref().unwrap_err();
-        assert!(
-            matches!(timed_out, FaucetError::Timeout { operation, after }
-                if operation == "nats publish" && *after == Duration::from_secs(30)),
-            "{timed_out:?}"
-        );
-        assert_eq!(
-            faucet_core::resilience::classify(timed_out),
-            Some(faucet_core::resilience::RetryClass::Timeout)
-        );
-    }
     use serde_json::json;
+
+    /// Grouping and the publish bound reach the messaging driver.
+    #[tokio::test]
+    async fn the_driver_publishes_in_batch_size_groups_bounded_by_the_timeout() {
+        let mut cfg = NatsSinkConfig::new("events.out");
+        cfg.batch_size = 7;
+        cfg.publish_timeout_secs = 3;
+        let sink = NatsSink::new(cfg).await.unwrap();
+        let driver = sink.inner.driver().driver();
+        assert_eq!(driver.group_size(), 7);
+        assert_eq!(driver.group_timeout(), Some(Duration::from_secs(3)));
+        let m = driver.encode(&json!({"id": 1})).unwrap();
+        assert_eq!(m.destination, "events.out");
+        assert_eq!(m.payload, br#"{"id":1}"#.to_vec());
+        assert!(!sink.supports_idempotent_writes());
+    }
 
     #[tokio::test]
     async fn new_validates_config() {

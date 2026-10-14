@@ -2,11 +2,11 @@
 
 use crate::config::{HttpBatchMode, HttpSinkAuth, HttpSinkConfig};
 use async_trait::async_trait;
+use faucet_core::driver::{DriverSink, HttpBatching, HttpDriver, HttpSinkDriver};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response_rate_limited};
 use faucet_core::{AuthSpec, Credential, FaucetError, SharedAuthProvider};
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -26,15 +26,29 @@ fn credential_to_auth(cred: Credential) -> HttpSinkAuth {
 }
 
 /// An HTTP sink that sends records to an HTTP endpoint.
+///
+/// Built on the HTTP family driver (RFC 0014): [`Endpoint`] authenticates a
+/// page and sends one body; [`HttpSinkDriver`] drives the batch mode, the
+/// in-flight limit and which rows a failed request leaves undelivered.
 pub struct HttpSink {
+    inner: DriverSink<HttpSinkDriver<Endpoint>>,
+}
+
+/// The HTTP I/O primitives the HTTP family driver runs on.
+pub(crate) struct Endpoint {
     config: HttpSinkConfig,
     client: Client,
     /// Optional shared auth provider. When set, it takes precedence over inline
     /// auth. Set via [`HttpSink::with_auth_provider`].
     auth_provider: Option<SharedAuthProvider>,
-    /// Backend-call context (#880): `max_retries` over the run's recorder and
-    /// deadline; meters each `send` round trip.
-    calls: CallSlot,
+}
+
+/// One page's credentials: the auth every request applies, and the shared
+/// provider's credential it came from (so a rejected request can tell the
+/// provider which one went stale).
+pub(crate) struct Session {
+    auth: HttpSinkAuth,
+    sent: Option<Credential>,
 }
 
 /// Base delay for a retried request; the cap and jitter come from the core
@@ -80,14 +94,15 @@ impl HttpSink {
                 }
             }
         }
-        let calls = CallSlot::new(CallContext::new().with_retry(retry_policy(config.max_retries)));
-        Self {
+        let endpoint = Endpoint {
             client: builder
                 .build()
                 .expect("an HTTP client with only timeouts set always builds"),
             config,
             auth_provider: None,
-            calls,
+        };
+        Self {
+            inner: DriverSink::new(HttpSinkDriver::new(endpoint)),
         }
     }
 
@@ -98,10 +113,29 @@ impl HttpSink {
     /// by library callers who construct one provider and inject it into many
     /// sinks.
     pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
+        self.inner.driver_mut().driver_mut().auth_provider = Some(provider);
         self
     }
 
+    #[cfg(test)]
+    fn build_request_with_auth(
+        &self,
+        body: &Value,
+        auth: &HttpSinkAuth,
+    ) -> Result<reqwest::RequestBuilder, FaucetError> {
+        self.inner
+            .driver()
+            .driver()
+            .build_request_with_auth(body, auth)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for HttpSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl Endpoint {
     /// Resolve the effective auth for the current batch (the provider, if
     /// any, takes precedence over inline auth; a bare `AuthSpec::Reference`
     /// with no provider is an error), plus the shared provider's credential it
@@ -178,8 +212,13 @@ impl HttpSink {
 
     /// Send a single request with retry logic, using the pre-resolved `auth`.
     /// A transport error and a retriable status take the same retry path.
-    async fn send_with_retry(&self, body: &Value, auth: &HttpSinkAuth) -> Result<(), FaucetError> {
-        self.calls
+    async fn send_with_retry(
+        &self,
+        calls: &CallSlot,
+        body: &Value,
+        auth: &HttpSinkAuth,
+    ) -> Result<(), FaucetError> {
+        calls
             .call("send", || async {
                 let req = self.build_request_with_auth(body, auth)?;
                 let resp = self.client.send(req).await?;
@@ -191,57 +230,14 @@ impl HttpSink {
             })
             .await
     }
-
-    /// [`send_with_retry`](Self::send_with_retry), re-authenticating once when
-    /// the server rejects the shared provider's credential `sent` (#789 API-06).
-    /// The provider refreshes once even when concurrent requests all hit the
-    /// same rejection.
-    async fn send(
-        &self,
-        body: &Value,
-        auth: &HttpSinkAuth,
-        sent: Option<&Credential>,
-    ) -> Result<(), FaucetError> {
-        match self.send_with_retry(body, auth).await {
-            Err(e) => match (&self.auth_provider, sent) {
-                (Some(provider), Some(sent))
-                    if faucet_core::rejects_credential(&e, provider.as_ref()) =>
-                {
-                    let name = provider.provider_name();
-                    tracing::warn!(
-                        provider = name,
-                        "the server rejected the shared credential; re-authenticating and \
-                         retrying once"
-                    );
-                    let fresh = credential_to_auth(provider.invalidate(sent).await?);
-                    self.send_with_retry(body, &fresh).await
-                }
-                _ => Err(e),
-            },
-            ok => ok,
-        }
-    }
 }
 
 #[async_trait]
-impl faucet_core::Sink for HttpSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
+impl HttpDriver for Endpoint {
+    type Session = Session;
 
     fn connector_name(&self) -> &'static str {
         "http"
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -253,6 +249,63 @@ impl faucet_core::Sink for HttpSink {
         faucet_core::redact_uri_credentials(&self.config.url)
     }
 
+    /// `max_retries` over the run's recorder and deadline; each `send` round
+    /// trip is metered.
+    fn call_context(&self) -> CallContext {
+        CallContext::new().with_retry(retry_policy(self.config.max_retries))
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    fn batching(&self) -> HttpBatching {
+        match &self.config.batch_mode {
+            HttpBatchMode::Individual => HttpBatching::PerRecord {
+                concurrency: self.config.concurrency,
+            },
+            HttpBatchMode::Array => HttpBatching::Array {
+                batch_size: self.config.batch_size,
+            },
+        }
+    }
+
+    /// Resolve auth once per batch (provider-first, then inline).
+    async fn session(&self, _calls: &CallSlot) -> Result<Session, FaucetError> {
+        let (auth, sent) = self.resolve_auth_and_credential().await?;
+        Ok(Session { auth, sent })
+    }
+
+    /// [`send_with_retry`](Self::send_with_retry), re-authenticating once when
+    /// the server rejects the shared provider's credential (#789 API-06). The
+    /// provider refreshes once even when concurrent requests all hit the same
+    /// rejection.
+    async fn send(
+        &self,
+        calls: &CallSlot,
+        session: &Session,
+        body: &Value,
+    ) -> Result<(), FaucetError> {
+        match self.send_with_retry(calls, body, &session.auth).await {
+            Err(e) => match (&self.auth_provider, session.sent.as_ref()) {
+                (Some(provider), Some(sent))
+                    if faucet_core::rejects_credential(&e, provider.as_ref()) =>
+                {
+                    let name = provider.provider_name();
+                    tracing::warn!(
+                        provider = name,
+                        "the server rejected the shared credential; re-authenticating and \
+                         retrying once"
+                    );
+                    let fresh = credential_to_auth(provider.invalidate(sent).await?);
+                    self.send_with_retry(calls, body, &fresh).await
+                }
+                _ => Err(e),
+            },
+            ok => ok,
+        }
+    }
+
     /// Non-mutating preflight probe (probe name `"network"`).
     ///
     /// Issues a lightweight `HEAD` request to the configured endpoint over the
@@ -262,10 +315,10 @@ impl faucet_core::Sink for HttpSink {
     /// transport/connection error (no response at all) is a failure.
     async fn check(
         &self,
+        _calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
-
         // Resolve auth so authenticated endpoints don't reject the connection
         // before we learn the host is reachable. An unresolvable auth ref is a
         // configuration failure surfaced on this probe.
@@ -280,10 +333,8 @@ impl faucet_core::Sink for HttpSink {
                 )));
             }
         };
-
         let started = std::time::Instant::now();
         let hint = "check the url / DNS / TLS / that the host is reachable";
-
         let req = self
             .client
             .head(&self.config.url)
@@ -299,7 +350,6 @@ impl faucet_core::Sink for HttpSink {
                 )));
             }
         };
-
         let probe = match tokio::time::timeout(ctx.timeout, self.client.send(req)).await {
             // Any HTTP response means DNS + TCP + TLS + the host all work.
             Ok(Ok(_)) => Probe::pass("network", started.elapsed()),
@@ -308,209 +358,6 @@ impl faucet_core::Sink for HttpSink {
             Err(_) => Probe::fail_hint("network", started.elapsed(), "timed out", hint),
         };
         Ok(CheckReport::single(probe))
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        // Resolve auth once per batch (provider-first, then inline).
-        let (auth, sent) = self.resolve_auth_and_credential().await?;
-        let sent = sent.as_ref();
-
-        match &self.config.batch_mode {
-            HttpBatchMode::Individual => {
-                // Run `send_with_retry` for every record with at most
-                // `concurrency` in-flight at once. We drive a
-                // `FuturesUnordered` directly, refilling it as each future
-                // completes, instead of acquiring permits up-front the way
-                // the previous semaphore-based code did — that approach
-                // deadlocked because permits were acquired sequentially in
-                // a loop before any future actually ran, so after
-                // `concurrency` iterations the next `acquire_owned().await`
-                // would block forever (closes #59).
-                let concurrency = self.config.concurrency.max(1);
-                let mut in_flight = FuturesUnordered::new();
-                let mut iter = records.iter();
-                for record in iter.by_ref().take(concurrency) {
-                    in_flight.push(self.send(record, &auth, sent));
-                }
-                while let Some(result) = in_flight.next().await {
-                    result?;
-                    if let Some(record) = iter.next() {
-                        in_flight.push(self.send(record, &auth, sent));
-                    }
-                }
-
-                tracing::debug!(records = records.len(), "HTTP individual batch written");
-                Ok(records.len())
-            }
-            HttpBatchMode::Array => {
-                // `batch_size = 0` is the "no batching" sentinel: forward
-                // whatever upstream handed us as a single JSON-array POST,
-                // preserving `StreamPage` framing. Otherwise re-chunk into
-                // `batch_size` slices and issue one POST per chunk.
-                let mut total = 0;
-                for chunk in faucet_core::batching::chunks(records, self.config.batch_size) {
-                    let array = Value::Array(chunk.to_vec());
-                    self.send(&array, &auth, sent).await?;
-                    total += chunk.len();
-                }
-                tracing::debug!(
-                    records = total,
-                    batch_size = self.config.batch_size,
-                    "HTTP array batch written"
-                );
-                Ok(total)
-            }
-        }
-    }
-
-    /// Report per-row outcomes so the DLQ router dead-letters only the records
-    /// that genuinely failed.
-    ///
-    /// In **Individual** mode every record is an independent POST, so each
-    /// record's success/failure is attributable: we attempt *all* of them
-    /// (unlike `write_batch`, whose `?` short-circuits on the first failure)
-    /// and return one `Ok`/`Err` per record. Without this
-    /// override the default impl would surface the first error as an outer
-    /// `Err`, and under `on_batch_error: dlq_all` the pipeline would route the
-    /// *entire* batch to the DLQ — duplicating the already-delivered rows
-    /// against a non-idempotent endpoint (#146 M14).
-    ///
-    /// In **Array** mode the page is POSTed chunk-by-chunk (`batch_size`
-    /// slices), so forward progress is *not* atomic across the whole page —
-    /// each chunk is a separate, independently-committed array POST. The
-    /// override is therefore **chunk-aware** rather than all-or-nothing: it
-    /// iterates the chunks itself and POSTs each array; a row whose chunk was
-    /// delivered is reported `Ok(())`, while the rows of the first failing
-    /// chunk (and every not-yet-sent chunk after it) are reported `Err`.
-    ///
-    /// This is the fix for the duplicate-data bug (F15 / audit #264): the old
-    /// implementation delegated to the all-or-nothing `write_batch`, so a late
-    /// chunk failure surfaced the *whole* page as an outer `Err`. Under
-    /// `on_batch_error: dlq_all` the router then dead-lettered every row —
-    /// including rows from earlier chunks already successfully delivered to the
-    /// live endpoint — producing silent downstream duplicates. By reporting
-    /// per-row outcomes, an already-delivered row is **never** marked failed and
-    /// so can never land in the DLQ.
-    ///
-    /// Within a single failed chunk a single array POST cannot attribute the
-    /// failure to specific rows, so all rows of *that* chunk are reported `Err`
-    /// (acceptable — none of them were delivered). When the **first** chunk
-    /// fails (nothing has been delivered yet) the override preserves the
-    /// original all-or-nothing contract and surfaces an outer `Err`, so the
-    /// router's `on_batch_error` policy (abort vs. dead-letter) still applies to
-    /// a wholly-undelivered page exactly as before.
-    async fn write_batch_partial(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let (auth, sent) = self.resolve_auth_and_credential().await?;
-        let sent = sent.as_ref();
-
-        match &self.config.batch_mode {
-            HttpBatchMode::Individual => {
-                let concurrency = self.config.concurrency.max(1);
-                let auth = &auth;
-                // Attempt every record (failures don't short-circuit the
-                // siblings) with at most `concurrency` POSTs in flight. Tag each
-                // outcome with its index so we can restore record order after
-                // the unordered completion. The per-record futures are built
-                // eagerly (lazy, not yet polled) so `buffer_unordered` drives a
-                // single concrete future type.
-                let pending: Vec<_> = records
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, record)| async move { (idx, self.send(record, auth, sent).await) })
-                    .collect();
-                let mut indexed: Vec<(usize, faucet_core::RowOutcome)> =
-                    futures::stream::iter(pending)
-                        .buffer_unordered(concurrency)
-                        .collect()
-                        .await;
-                indexed.sort_by_key(|(idx, _)| *idx);
-                tracing::debug!(
-                    records = records.len(),
-                    "HTTP individual partial batch written"
-                );
-                Ok(indexed.into_iter().map(|(_, outcome)| outcome).collect())
-            }
-            HttpBatchMode::Array => {
-                // `batch_size = 0` is the "no batching" sentinel: forward the
-                // whole page as a single array POST (one chunk). Otherwise
-                // re-chunk into `batch_size` slices and POST one array per
-                // chunk — mirroring `write_batch`, but tracking per-chunk
-                // delivery so a late failure doesn't poison earlier chunks that
-                // were already delivered.
-                let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
-                let mut delivered = 0usize;
-                let mut chunks = faucet_core::batching::chunks(records, self.config.batch_size);
-                let mut failed_chunk: Option<FaucetError> = None;
-
-                for chunk in chunks.by_ref() {
-                    let array = Value::Array(chunk.to_vec());
-                    match self.send(&array, &auth, sent).await {
-                        Ok(()) => {
-                            // This chunk was delivered to the live endpoint.
-                            outcomes.extend(chunk.iter().map(|_| Ok(())));
-                            delivered += chunk.len();
-                        }
-                        Err(e) => {
-                            // First failing chunk before any delivery: preserve
-                            // the original all-or-nothing contract so the
-                            // router's `on_batch_error` policy still governs a
-                            // wholly-undelivered page.
-                            if delivered == 0 {
-                                return Err(e);
-                            }
-                            // Otherwise some earlier chunk(s) were delivered;
-                            // mark this chunk's rows (and all remaining,
-                            // never-sent chunks) failed without poisoning the
-                            // delivered rows.
-                            failed_chunk = Some(e);
-                            outcomes.extend(chunk.iter().map(|_| {
-                                Err(FaucetError::Sink(
-                                    "array-mode chunk POST failed; rows not delivered".into(),
-                                ))
-                            }));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(e) = failed_chunk {
-                    // Remaining chunks were never sent — report them failed too
-                    // so the DLQ captures every undelivered row.
-                    let msg = e.to_string();
-                    for chunk in chunks {
-                        outcomes.extend(chunk.iter().map(|_| {
-                            Err(FaucetError::Sink(format!(
-                                "array-mode chunk not sent after earlier failure: {msg}"
-                            )))
-                        }));
-                    }
-                }
-
-                debug_assert_eq!(
-                    outcomes.len(),
-                    records.len(),
-                    "one outcome per record in array mode"
-                );
-                tracing::debug!(
-                    delivered,
-                    records = records.len(),
-                    batch_size = self.config.batch_size,
-                    "HTTP array partial batch written"
-                );
-                Ok(outcomes)
-            }
-        }
     }
 }
 
