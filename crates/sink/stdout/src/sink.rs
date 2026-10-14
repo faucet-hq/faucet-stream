@@ -19,7 +19,7 @@ struct State {
 
 /// A sink that writes records to standard output or standard error.
 ///
-/// Built on the family-neutral sink driver (RFC 0014): [`StdoutDriver`]
+/// Built on the family-neutral sink driver (RFC 0014): `StdoutDriver`
 /// encodes and writes each page; [`DriverSink`] derives the capabilities and
 /// serves the write paths.
 pub struct StdoutSink {
