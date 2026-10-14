@@ -421,6 +421,22 @@ This sink takes its SQL text (the keyed `MERGE` upsert and delete, `CAST`-typed 
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. Statement execution stays here: each chunk runs over `tiberius` with typed failure classification (rolled back / infrastructure / row rejected), transient re-runs and per-row isolation for the DLQ, which the engine's executor model does not express.
 
+## How it is built
+
+The sink runs on the core sink driver (RFC 0014): `MssqlDriver` implements
+`faucet_core::driver::SinkDriver` with the `StagingDriver` (`SELECT … INTO`
+clone, transactional swap or first-run `sp_rename`, drop, staging probe),
+`CommitTokenDriver` (page and token `MERGE` in one `BEGIN TRAN`),
+`CleanupDriver` (column-mapping mode only) and `SchemaDriver` groups, and
+`MssqlSink` wraps it in a `DriverSink`, which derives the capabilities from
+those groups and serves the write paths with row accounting. It is not on the
+SQL family driver (`faucet_common_sql::SqlDriver`): its writes classify each
+chunk's failure, re-run server-rolled-back chunks, isolate rejected rows and
+replace a connection a cut-short statement desynced, none of which the
+generic statement executor expresses. Each statement still runs as one
+backend call on the driver's own call slot, which the adapter keeps in step
+with the run's context. The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

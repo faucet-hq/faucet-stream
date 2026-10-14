@@ -13,9 +13,9 @@
 use faucet_core::FaucetError;
 use serde_json::Value;
 
-use crate::sink::MssqlSink;
+use crate::sink::MssqlDriver;
 
-impl MssqlSink {
+impl MssqlDriver {
     /// Staged bulk load (#528): upload the page to Azure and `COPY INTO`.
     pub(crate) async fn write_batch_staged(
         &self,
