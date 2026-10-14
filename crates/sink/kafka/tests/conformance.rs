@@ -177,6 +177,9 @@ mod idempotent {
         };
         faucet_conformance::assert_reported_rows_truthful(&sink, count).await;
         faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+        // RFC 0014: the sink runs on the core sink driver.
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+        faucet_conformance::assert_driver_row_paths_agree(&sink).await;
     }
 }
 

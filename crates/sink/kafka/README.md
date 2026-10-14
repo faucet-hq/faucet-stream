@@ -436,6 +436,19 @@ In a full pipeline, wire the sink into `faucet_core::Pipeline` (or `run_stream`)
 3. Records are enqueued into a `FuturesUnordered` up to the effective in-flight cap; `QueueFull` rejections back off and retry.
 4. `flush()` blocks until all in-flight deliveries are acknowledged (or `message_timeout` elapses) before the pipeline advances the bookmark.
 
+### How it is built
+
+The sink runs on the core sink driver (RFC 0014): `KafkaDriver` implements
+`faucet_core::driver::SinkDriver` — produce a page, flush the producer — and
+`CommitTokenDriver` — the page and its commit-token record in one producer
+transaction, and the token read back from the compacted side-topic — and
+`DriverSink` derives the exactly-once capability from that group. It is not
+on the messaging family's `MessageDriver`: encoding is asynchronous (a schema
+registry lookup), a record dropped by `on_key_error: skip` is reported as
+skipped rather than failed, and a record that cannot be encoded fails the
+whole page and aborts its transaction — none of which the per-message
+`MessageSinkDriver` expresses. The public type and config are unchanged.
+
 ## Lineage dataset URI
 
 `kafka://<brokers>?topic=<topic>` for a fixed topic, or `kafka://<brokers>?topic=(from_path:<path>)` for dynamic routing — e.g. `kafka://kafka.example.com:9092?topic=orders`.
