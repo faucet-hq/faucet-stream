@@ -751,6 +751,8 @@ struct Broker {
     timeout: Option<Duration>,
     size: usize,
     tx: Option<Tx>,
+    own_calls: bool,
+    page_err: bool,
 }
 
 #[derive(Default)]
@@ -815,6 +817,18 @@ impl MessageDriver for Broker {
     }
     fn transactions(&self) -> Option<&dyn MessageTransactions> {
         self.tx.as_ref().map(|t| t as &dyn MessageTransactions)
+    }
+    fn publish_is_one_call(&self) -> bool {
+        !self.own_calls
+    }
+    fn page_error(&self, offered: usize, failed: &[(usize, FaucetError)]) -> Option<FaucetError> {
+        self.page_err.then(|| {
+            FaucetError::Sink(format!(
+                "{} of {offered} failed (first at {})",
+                failed.len(),
+                failed[0].0
+            ))
+        })
     }
 }
 
@@ -882,6 +896,71 @@ async fn a_message_sink_reports_each_row_and_fails_the_page_on_the_first() {
     sink.flush().await.unwrap();
     assert!(!sink.supports_idempotent_writes());
     assert!(sink.last_committed_token("s").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_driver_can_word_the_whole_page_error() {
+    let broker = Broker {
+        page_err: true,
+        ..Default::default()
+    };
+    let sink = DriverSink::new(MessageSinkDriver::new(broker));
+    let page = [msg("a"), json!({}), json!({})];
+    let err = sink.write_batch(&page).await.unwrap_err();
+    assert_eq!(err.to_string(), "Sink error: 2 of 3 failed (first at 1)");
+    let outcomes = sink.write_batch_partial(&page).await.unwrap();
+    assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_err());
+    assert_eq!(sink.write_batch(&[msg("b")]).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_driver_making_its_own_calls_is_awaited_directly() {
+    let cancelled = || {
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        CallContext::new().with_cancel(token)
+    };
+    let wrapped = DriverSink::new(MessageSinkDriver::new(Broker::default()));
+    wrapped.set_call_context(cancelled());
+    let outcomes = wrapped.write_batch_partial(&[msg("a")]).await.unwrap();
+    assert!(matches!(outcomes[0], Err(FaucetError::Cancelled { .. })));
+
+    let own = DriverSink::new(MessageSinkDriver::new(Broker {
+        own_calls: true,
+        ..Default::default()
+    }));
+    own.set_call_context(cancelled());
+    let outcomes = own.write_batch_partial(&[msg("a")]).await.unwrap();
+    assert!(outcomes[0].is_ok(), "{outcomes:?}");
+    own.flush().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_driver_making_its_own_calls_is_still_bounded_by_the_group_timeout() {
+    let broker = Broker {
+        own_calls: true,
+        size: 1,
+        timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    *broker.hang_group.lock().unwrap() = Some(0);
+    broker.hang_flush.store(true, Ordering::SeqCst);
+    let sink = DriverSink::new(MessageSinkDriver::new(broker));
+    let outcomes = sink
+        .write_batch_partial(&[msg("a"), msg("b")])
+        .await
+        .unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Err(FaucetError::Timeout { .. }))),
+        "{outcomes:?}"
+    );
+    let err = sink.flush().await.unwrap_err();
+    assert!(
+        matches!(&err, FaucetError::Timeout { operation, .. } if operation == "broker flush"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
