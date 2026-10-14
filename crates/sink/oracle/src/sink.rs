@@ -12,8 +12,11 @@ use faucet_common_oracle::{
     OraclePool, Side, blocking, call_timeout, checkout, connect_pool, ora_err, quote_table_oracle,
 };
 use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::driver::{
+    CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver, StagingDriver,
+};
 use faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX;
-use faucet_core::{FaucetError, RowOutcome, Sink, WriteMode, WritePlan};
+use faucet_core::{CallSlot, FaucetError, RowOutcome, Sink, WriteMode, WritePlan, WriteReport};
 use serde_json::Value;
 
 use crate::config::{IdentifierCase, OracleColumnMapping, OracleSinkConfig};
@@ -28,10 +31,17 @@ use crate::plan::{
 };
 
 /// Oracle Database sink.
+///
+/// Built on the core sink driver (RFC 0014): `OracleDriver` holds the
+/// blocking ODPI-C I/O with its staging, commit-token and schema groups, and
+/// a [`DriverSink`] derives the capabilities and serves the write paths.
 pub struct OracleSink {
+    inner: DriverSink<OracleDriver>,
+}
+
+/// The Oracle I/O the sink driver runs on.
+struct OracleDriver {
     inner: Arc<Inner>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder.
-    calls: faucet_core::CallSlot,
 }
 
 struct Inner {
@@ -493,28 +503,38 @@ impl OracleSink {
             columns: Mutex::new(None),
             ready: AtomicBool::new(false),
         };
-        let sink = Self {
+        let driver = OracleDriver {
             inner: Arc::new(inner),
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         };
-        sink.run("create_table", |i| {
-            let conn = i.conn()?;
-            i.create_json_table(&conn)
+        let setup = faucet_core::CallSlot::new(driver.call_context());
+        driver
+            .run(&setup, "create_table", |i| {
+                let conn = i.conn()?;
+                i.create_json_table(&conn)
+            })
+            .await?;
+        Ok(Self {
+            inner: DriverSink::new(driver),
         })
-        .await?;
-        Ok(sink)
     }
+}
 
+#[async_trait]
+impl Sink for OracleSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl OracleDriver {
     /// Run `f` on the blocking pool as one backend call named `op` (#880):
     /// the run's deadline ends the wait promptly; the session's statement
     /// timeout bounds the blocking work itself.
-    async fn run<T, F>(&self, op: &'static str, f: F) -> Result<T, FaucetError>
+    async fn run<T, F>(&self, calls: &CallSlot, op: &'static str, f: F) -> Result<T, FaucetError>
     where
         F: FnOnce(&Inner) -> Result<T, FaucetError> + Send + 'static,
         T: Send + 'static,
     {
         let inner = self.inner.clone();
-        self.calls.call_once(op, blocking(move || f(&inner))).await
+        calls.call_once(op, blocking(move || f(&inner))).await
     }
 
     /// Record keys are identifiers only in `auto_columns` mode; a JSON payload
@@ -525,31 +545,13 @@ impl OracleSink {
             && matches!(cfg.column_mapping, OracleColumnMapping::AutoColumns { .. });
         case_records(records, upper).into_owned()
     }
-}
 
-#[async_trait]
-impl Sink for OracleSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.inner.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
         let records = self.cased(records);
-        self.run("write_batch", move |i| {
+        self.run(calls, "write_batch", move |i| {
             let conn = i.conn()?;
             i.ensure_table_ready(&conn, &records)?;
             let (records, spec) = i.fold_page(&conn, &records)?;
@@ -564,14 +566,18 @@ impl Sink for OracleSink {
         .await
     }
 
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+    async fn write_partial(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
         let records = self.cased(records);
         let mode = self.inner.config.write.write_mode.as_str();
         let messages = self
-            .run("write_batch_partial", move |i| {
+            .run(calls, "write_batch_partial", move |i| {
                 let conn = i.conn()?;
                 i.ensure_table_ready(&conn, &records)?;
                 let (records, spec) = i.fold_page(&conn, &records)?;
@@ -596,202 +602,25 @@ impl Sink for OracleSink {
             .collect())
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
+    /// A keyed page accepts one row per planned write and coalesces the rest.
+    fn report(&self, offered: usize, written: usize) -> WriteReport {
+        if self.inner.config.write.dedups_by_key() {
+            WriteReport::keyed(offered, written)
+        } else {
+            WriteReport::accepted(written)
+        }
     }
+}
 
-    async fn write_batch_idempotent(
-        &self,
-        records: &[Value],
-        scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        let records = self.cased(records);
-        let (scope, token) = (scope.to_string(), token.to_string());
-        self.run("write_batch_idempotent", move |i| {
-            let conn = i.conn()?;
-            if !records.is_empty() {
-                i.ensure_table_ready(&conn, &records)?;
-            }
-            i.ensure_token_table(&conn)?;
-            let (records, spec) = if records.is_empty() {
-                (records, i.config.write.clone())
-            } else {
-                i.fold_page(&conn, &records)?
-            };
-            let plan = if i.is_keyed() {
-                Some(i.plan(&records, &spec)?)
-            } else {
-                None
-            };
-            in_transaction(&conn, |c| {
-                let n = match &plan {
-                    Some(p) => i.apply_plan(c, p)?,
-                    None if records.is_empty() => 0,
-                    None => i.append(c, &records, false).map(|_| records.len())?,
-                };
-                i.write_token(c, &scope, &token)?;
-                Ok(n)
-            })
-        })
-        .await
-    }
-
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        let scope = scope.to_string();
-        self.run("last_committed_token", move |i| {
-            let conn = i.conn()?;
-            i.ensure_token_table(&conn)?;
-            i.read_token(&conn, &scope)
-        })
-        .await
-    }
-
-    fn dedups_by_key(&self) -> bool {
-        self.inner.config.write.dedups_by_key()
-    }
-
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        &[
-            WriteMode::Append,
-            WriteMode::Upsert,
-            WriteMode::Delete,
-            WriteMode::Overwrite,
-        ]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.inner.config.write.is_overwrite()
-    }
-
-    /// Drop any leftover staging, then clone the target's structure into a
-    /// fresh staging table. A first run (no target, `create_table: true`)
-    /// leaves staging to be created from the first page.
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.run("begin_overwrite", |i| {
-            let conn = i.conn()?;
-            exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")?;
-            i.forget_columns();
-            i.ready.store(false, Ordering::Relaxed);
-            let exists = i.table_exists(&conn, &i.target)?;
-            if !exists && i.config.create_table {
-                return Ok(());
-            }
-            if !exists {
-                return Err(faucet_core::missing_target_error("oracle sink", &i.target));
-            }
-            exec(
-                &conn,
-                &clone_table_sql(&i.staging_quoted, &i.target_quoted),
-                "create staging",
-            )?;
-            let target_cols = i.load_columns(&conn, &i.target)?;
-            for sql in staging_fixups_sql(&i.staging_quoted, &target_cols)? {
-                exec(&conn, &sql, "staging defaults")?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Replace the target's rows with staging's in one transaction (readers see
-    /// the old rows until commit), then drop staging. A first run renames
-    /// staging into place.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.run("commit_overwrite", |i| {
-            let conn = i.conn()?;
-            if !i.table_exists(&conn, &i.target)? {
-                if i.table_exists(&conn, &i.staging)? {
-                    exec(
-                        &conn,
-                        &rename_sql(&i.staging_quoted, &i.target)?,
-                        "publish staging",
-                    )?;
-                }
-                return Ok(());
-            }
-            let target_cols = i.load_columns(&conn, &i.target)?;
-            let swap = overwrite_swap_sql(&i.target_quoted, &i.staging_quoted, &target_cols)?;
-            // The swap copies the whole table in one round trip each; the
-            // per-call statement timeout is for page writes, not this.
-            conn.set_call_timeout(None)
-                .map_err(|e| sink_err("set call timeout", &e))?;
-            in_transaction(&conn, |c| {
-                for sql in &swap {
-                    exec(c, sql, "overwrite swap")?;
-                }
-                Ok(())
-            })?;
-            exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")
-        })
-        .await
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.run("abort_overwrite", |i| {
-            let conn = i.conn()?;
-            exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")
-        })
-        .await
-    }
-
-    fn supports_schema_evolution(&self) -> bool {
-        true
-    }
-
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.run("current_schema", |i| {
-            let conn = i.conn()?;
-            let cols = i.load_columns(&conn, &i.target)?;
-            Ok((!cols.is_empty()).then(|| schema_from_columns(&cols)))
-        })
-        .await
-    }
-
-    async fn evolve_schema(
-        &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        let evolution = evolution.clone();
-        self.run("evolve_schema", move |i| {
-            let conn = i.conn()?;
-            let base = |c: &faucet_core::ColumnChange| {
-                faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text)
-            };
-            for c in &evolution.additions {
-                exec(
-                    &conn,
-                    &add_column_sql(&i.target_quoted, &c.name, base(c))?,
-                    "add column",
-                )?;
-            }
-            for c in &evolution.widenings {
-                exec(
-                    &conn,
-                    &widen_column_sql(&i.target_quoted, &c.name, base(c))?,
-                    "widen column",
-                )?;
-            }
-            for col in &evolution.relax_nullability {
-                exec(
-                    &conn,
-                    &relax_null_sql(&i.target_quoted, col)?,
-                    "relax not null",
-                )?;
-            }
-            i.forget_columns();
-            Ok(())
-        })
-        .await
+#[async_trait]
+impl SinkDriver for OracleDriver {
+    fn connector_name(&self) -> &'static str {
+        "oracle"
     }
 
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(OracleSinkConfig))
             .expect("schema serialization")
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "oracle"
     }
 
     fn dataset_uri(&self) -> String {
@@ -802,9 +631,13 @@ impl Sink for OracleSink {
         )
     }
 
-    async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+    async fn check(
+        &self,
+        calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<CheckReport, FaucetError> {
         let started = std::time::Instant::now();
-        let probe = self.run("check", |i| {
+        let probe = self.run(calls, "check", |i| {
             let conn = i.conn()?;
             let exists = i.table_exists(&conn, &i.target)?;
             Ok(exists || i.config.create_table)
@@ -838,5 +671,250 @@ impl Sink for OracleSink {
             )],
         };
         Ok(CheckReport { probes })
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => {
+                let n = self.write_page(calls, rows).await?;
+                Ok(PageWrite::reported(self.report(rows.len(), n)))
+            }
+        }
+    }
+
+    fn write_modes(&self) -> &'static [WriteMode] {
+        &[
+            WriteMode::Append,
+            WriteMode::Upsert,
+            WriteMode::Delete,
+            WriteMode::Overwrite,
+        ]
+    }
+
+    fn dedups_by_key(&self) -> bool {
+        self.inner.config.write.dedups_by_key()
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.config.batch_atomicity()
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
+    }
+
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
+    }
+
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl StagingDriver for OracleDriver {
+    fn active(&self) -> bool {
+        self.inner.config.write.is_overwrite()
+    }
+
+    /// Drop any leftover staging, then clone the target's structure into a
+    /// fresh staging table. A first run (no target, `create_table: true`)
+    /// leaves staging to be created from the first page.
+    async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.run(calls, "begin_overwrite", |i| {
+            let conn = i.conn()?;
+            exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")?;
+            i.forget_columns();
+            i.ready.store(false, Ordering::Relaxed);
+            let exists = i.table_exists(&conn, &i.target)?;
+            if !exists && i.config.create_table {
+                return Ok(());
+            }
+            if !exists {
+                return Err(faucet_core::missing_target_error("oracle sink", &i.target));
+            }
+            exec(
+                &conn,
+                &clone_table_sql(&i.staging_quoted, &i.target_quoted),
+                "create staging",
+            )?;
+            let target_cols = i.load_columns(&conn, &i.target)?;
+            for sql in staging_fixups_sql(&i.staging_quoted, &target_cols)? {
+                exec(&conn, &sql, "staging defaults")?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Replace the target's rows with staging's in one transaction (readers see
+    /// the old rows until commit), then drop staging. A first run renames
+    /// staging into place.
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.run(calls, "commit_overwrite", |i| {
+            let conn = i.conn()?;
+            if !i.table_exists(&conn, &i.target)? {
+                if i.table_exists(&conn, &i.staging)? {
+                    exec(
+                        &conn,
+                        &rename_sql(&i.staging_quoted, &i.target)?,
+                        "publish staging",
+                    )?;
+                }
+                return Ok(());
+            }
+            let target_cols = i.load_columns(&conn, &i.target)?;
+            let swap = overwrite_swap_sql(&i.target_quoted, &i.staging_quoted, &target_cols)?;
+            // The swap copies the whole table in one round trip each; the
+            // per-call statement timeout is for page writes, not this.
+            conn.set_call_timeout(None)
+                .map_err(|e| sink_err("set call timeout", &e))?;
+            in_transaction(&conn, |c| {
+                for sql in &swap {
+                    exec(c, sql, "overwrite swap")?;
+                }
+                Ok(())
+            })?;
+            exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")
+        })
+        .await
+    }
+
+    async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.run(calls, "abort_overwrite", |i| {
+            let conn = i.conn()?;
+            exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")
+        })
+        .await
+    }
+
+    /// Whether the `<table>__faucet_ovw` staging table exists (read-only).
+    async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
+        self.run(calls, "overwrite_staging_exists", |i| {
+            let conn = i.conn()?;
+            i.table_exists(&conn, &i.staging)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl CommitTokenDriver for OracleDriver {
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let scope = scope.to_string();
+        self.run(calls, "last_committed_token", move |i| {
+            let conn = i.conn()?;
+            i.ensure_token_table(&conn)?;
+            i.read_token(&conn, &scope)
+        })
+        .await
+    }
+
+    async fn write_with_token(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<WriteReport, FaucetError> {
+        let offered = rows.len();
+        let records = self.cased(rows);
+        let (scope, token) = (scope.to_string(), token.to_string());
+        let n = self
+            .run(calls, "write_batch_idempotent", move |i| {
+                let conn = i.conn()?;
+                if !records.is_empty() {
+                    i.ensure_table_ready(&conn, &records)?;
+                }
+                i.ensure_token_table(&conn)?;
+                let (records, spec) = if records.is_empty() {
+                    (records, i.config.write.clone())
+                } else {
+                    i.fold_page(&conn, &records)?
+                };
+                let plan = if i.is_keyed() {
+                    Some(i.plan(&records, &spec)?)
+                } else {
+                    None
+                };
+                in_transaction(&conn, |c| {
+                    let n = match &plan {
+                        Some(p) => i.apply_plan(c, p)?,
+                        None if records.is_empty() => 0,
+                        None => i.append(c, &records, false).map(|_| records.len())?,
+                    };
+                    i.write_token(c, &scope, &token)?;
+                    Ok(n)
+                })
+            })
+            .await?;
+        Ok(self.report(offered, n))
+    }
+}
+
+#[async_trait]
+impl SchemaDriver for OracleDriver {
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        self.run(calls, "current_schema", |i| {
+            let conn = i.conn()?;
+            let cols = i.load_columns(&conn, &i.target)?;
+            Ok((!cols.is_empty()).then(|| schema_from_columns(&cols)))
+        })
+        .await
+    }
+
+    fn evolvable(&self) -> bool {
+        true
+    }
+
+    async fn evolve(
+        &self,
+        calls: &CallSlot,
+        evolution: &faucet_core::SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        let evolution = evolution.clone();
+        self.run(calls, "evolve_schema", move |i| {
+            let conn = i.conn()?;
+            let base = |c: &faucet_core::ColumnChange| {
+                faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text)
+            };
+            for c in &evolution.additions {
+                exec(
+                    &conn,
+                    &add_column_sql(&i.target_quoted, &c.name, base(c))?,
+                    "add column",
+                )?;
+            }
+            for c in &evolution.widenings {
+                exec(
+                    &conn,
+                    &widen_column_sql(&i.target_quoted, &c.name, base(c))?,
+                    "widen column",
+                )?;
+            }
+            for col in &evolution.relax_nullability {
+                exec(
+                    &conn,
+                    &relax_null_sql(&i.target_quoted, col)?,
+                    "relax not null",
+                )?;
+            }
+            i.forget_columns();
+            Ok(())
+        })
+        .await
     }
 }

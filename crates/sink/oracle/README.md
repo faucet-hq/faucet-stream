@@ -109,6 +109,19 @@ This sink takes its identifier rules (quoted, refusing `"`, NUL, empty and over-
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. Execution stays here: the driver is blocking and writes run as array DML (one statement bound for a whole chunk), which the engine's statement-per-chunk executor does not model.
 
+## How it is built
+
+The sink runs on the core sink driver (RFC 0014): `OracleDriver` implements
+`faucet_core::driver::SinkDriver` with the `StagingDriver` (clone, swap or
+first-run rename, drop; `overwrite_staging_exists` now answers from the
+dictionary), `CommitTokenDriver` (page and token in one transaction) and
+`SchemaDriver` groups, each a blocking ODPI-C call on the blocking pool, and
+`OracleSink` wraps it in a `DriverSink`, which derives the capabilities from
+those groups and serves the write paths with row accounting. It is not on the
+SQL family driver (`faucet_common_sql::SqlDriver`): that adapter runs
+statements through an async executor, and Oracle writes are blocking array
+DML. The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
