@@ -409,6 +409,19 @@ as ambiguous: its data files are never cleaned up, whatever
 run under the context too; one the deadline or a cancel cuts short is counted
 as failed and its file is left for `remove_orphan_files`.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `IcebergDriver`
+implements `faucet_core::driver::SinkDriver` (Parquet data files written per
+page, committed as a `fast_append` snapshot on flush, per-row Arrow-conversion
+outcomes) plus the lifecycle groups — `CommitTokenDriver` (the page's
+snapshot carries the `faucet.commit-scope` / `faucet.commit-token` summary
+properties) and `SchemaDriver` (the table schema, and adding columns).
+`IcebergSink` wraps it in a `DriverSink`, which derives every capability from
+those groups and serves the write paths with row accounting. Every catalog
+call, data-file write and commit is a call through the run's call context
+with the same op labels as before. The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -130,3 +130,34 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_sink_call_deadline(make, &[serde_json::json!({"id": 1})])
         .await;
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver with the
+/// commit-token and schema groups. Offline against a SQLite catalog.
+#[cfg(feature = "catalog-sql")]
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_driver_truthful() {
+    use faucet_core::Sink as _;
+    use faucet_sink_iceberg::{IcebergSink, IcebergSinkConfig};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("catalog.db");
+    let warehouse_path = dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse_path).expect("create warehouse dir");
+    let cfg: IcebergSinkConfig = serde_json::from_value(serde_json::json!({
+        "catalog": {
+            "type": "sql",
+            "uri": format!("sqlite:{}?mode=rwc", db_path.display()),
+            "warehouse": format!("file://{}", warehouse_path.display())
+        },
+        "namespace": ["db"],
+        "table": "conformance_driver",
+        "create_if_missing": true,
+        "batch_size": 0
+    }))
+    .expect("sink config parse");
+    let sink = IcebergSink::new(cfg).await.expect("IcebergSink::new");
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    sink.flush().await.expect("commit");
+    assert!(sink.current_schema().await.expect("schema").is_some());
+}

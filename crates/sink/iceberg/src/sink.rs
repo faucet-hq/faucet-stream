@@ -53,7 +53,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use faucet_core::FaucetError;
+use faucet_core::driver::{
+    CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver,
+};
+use faucet_core::{CallSlot, FaucetError};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, Transform, UnboundPartitionSpec};
 use iceberg::table::Table;
@@ -172,18 +175,20 @@ fn legacy_token_property(scope: &str) -> String {
 /// Writes records to an Iceberg table via the `fast_append` transaction action,
 /// creating one snapshot per `flush()` call.
 pub struct IcebergSink {
+    inner: DriverSink<IcebergDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct IcebergDriver {
     config: IcebergSinkConfig,
     catalog: Arc<dyn Catalog>,
     state: Mutex<SinkState>,
-    /// Backend-call context (#880): catalog calls, data-file writes and the
-    /// snapshot commit run through it, once.
-    calls: faucet_core::CallSlot,
 }
 
 impl std::fmt::Debug for IcebergSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergSink")
-            .field("config", &self.config)
+            .field("config", &self.inner.driver().config)
             .finish_non_exhaustive()
     }
 }
@@ -194,6 +199,27 @@ impl IcebergSink {
     /// Validates the config, builds the catalog client, and — when
     /// `create_if_missing: false` — loads and validates the target table.
     pub async fn new(config: IcebergSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(IcebergDriver::new(config).await?),
+        })
+    }
+
+    #[cfg(test)]
+    fn build_partition_spec(
+        pfs: &[PartitionField],
+        iceberg_schema: &iceberg::spec::Schema,
+    ) -> Result<Option<UnboundPartitionSpec>, FaucetError> {
+        IcebergDriver::build_partition_spec(pfs, iceberg_schema)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for IcebergSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl IcebergDriver {
+    async fn new(config: IcebergSinkConfig) -> Result<Self, FaucetError> {
         // `validate()` enforces append-only (rejects upsert/delete/overwrite)
         // among the other config checks, before any catalog I/O.
         config.validate()?;
@@ -221,11 +247,6 @@ impl IcebergSink {
             config,
             catalog,
             state: Mutex::new(SinkState::new(preloaded)),
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
         })
     }
 
@@ -281,14 +302,14 @@ impl IcebergSink {
     /// `state.table` in place on first creation.
     async fn resolve_table(
         &self,
+        calls: &CallSlot,
         state: &mut SinkState,
         records: &[Value],
     ) -> Result<Table, FaucetError> {
         if let Some(ref table) = state.table {
             return Ok(table.clone());
         }
-        let table = self
-            .calls
+        let table = calls
             .call_once("catalog", self.load_or_create_table(records))
             .await?;
         state.table = Some(table.clone());
@@ -372,11 +393,15 @@ impl IcebergSink {
 
     /// Ensure the writer in `state` is open for `table`. Opens a new
     /// `TableWriter` if none is currently open.
-    async fn ensure_writer(&self, state: &mut SinkState, table: &Table) -> Result<(), FaucetError> {
+    async fn ensure_writer(
+        &self,
+        calls: &CallSlot,
+        state: &mut SinkState,
+        table: &Table,
+    ) -> Result<(), FaucetError> {
         if state.writer.is_none() {
             let compression = compression_from_str(&self.config.parquet.compression)?;
-            let writer = self
-                .calls
+            let writer = calls
                 .call_once(
                     "write",
                     TableWriter::new(table, compression, self.config.target_file_size_mb),
@@ -393,6 +418,7 @@ impl IcebergSink {
     /// failure part-way poisons the sink.
     async fn write_page(
         &self,
+        calls: &CallSlot,
         state: &mut SinkState,
         records: &[Value],
         chunk: usize,
@@ -402,8 +428,8 @@ impl IcebergSink {
             return Ok(0);
         }
 
-        let table = self.resolve_table(state, records).await?;
-        self.ensure_writer(state, &table).await?;
+        let table = self.resolve_table(calls, state, records).await?;
+        self.ensure_writer(calls, state, &table).await?;
 
         // Convert to Arrow using the table's current schema.
         let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
@@ -418,7 +444,7 @@ impl IcebergSink {
         for batch in batches {
             row_count += batch.num_rows();
             let writer = state.writer.as_mut().expect("writer is set above");
-            if let Err(e) = self.calls.call_once("write", writer.write(batch)).await {
+            if let Err(e) = calls.call_once("write", writer.write(batch)).await {
                 state.poison(&e);
                 return Err(e);
             }
@@ -441,10 +467,8 @@ impl IcebergSink {
     /// Returns `Ok(None)` if the table does not exist yet (first run before any
     /// data has been written), `Ok(Some(table))` if it exists, or `Err` on a
     /// catalog communication failure.
-    async fn load_table_readonly(&self) -> Result<Option<Table>, FaucetError> {
-        self.calls
-            .call_once("catalog", self.read_table_readonly())
-            .await
+    async fn load_table_readonly(&self, calls: &CallSlot) -> Result<Option<Table>, FaucetError> {
+        calls.call_once("catalog", self.read_table_readonly()).await
     }
 
     async fn read_table_readonly(&self) -> Result<Option<Table>, FaucetError> {
@@ -483,7 +507,11 @@ impl IcebergSink {
     /// files are deleted before the error propagates; an ambiguous failure is
     /// never cleaned up. Either way the original error is returned so the run
     /// aborts without advancing the bookmark.
-    async fn commit_pending(&self, state: &mut SinkState) -> Result<(), FaucetError> {
+    async fn commit_pending(
+        &self,
+        calls: &CallSlot,
+        state: &mut SinkState,
+    ) -> Result<(), FaucetError> {
         let files = std::mem::take(&mut state.pending_files);
 
         if files.is_empty() {
@@ -547,7 +575,7 @@ impl IcebergSink {
         let outcome = match prepared {
             Ok(tx) => commit_outcome(
                 tx.commit(self.catalog.as_ref())
-                    .within(&self.calls, "commit")
+                    .within(calls, "commit")
                     .await,
             ),
             Err(e) => Err((FaucetError::Sink(format!("iceberg: {e}")), true)),
@@ -556,7 +584,7 @@ impl IcebergSink {
             Ok(updated_table) => updated_table,
             Err((err, definite_loss)) => {
                 maybe_cleanup_orphans(
-                    &self.calls,
+                    calls,
                     table.file_io(),
                     &self.config.table,
                     self.config.cleanup_orphans_on_failure,
@@ -733,24 +761,21 @@ pub(crate) async fn delete_data_files(
 // ── Sink trait ────────────────────────────────────────────────────────────────
 
 #[async_trait]
-impl faucet_core::Sink for IcebergSink {
+impl SinkDriver for IcebergDriver {
+    /// Catalog calls, data-file writes and the snapshot commit run through
+    /// the call context, once (#880).
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
 
     fn connector_name(&self) -> &'static str {
         "iceberg"
-    }
-
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
     }
 
     fn config_schema(&self) -> Value {
@@ -781,6 +806,7 @@ impl faucet_core::Sink for IcebergSink {
     /// bounded by `ctx.timeout`. A catalog connection failure surfaces as `Fail`.
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
@@ -803,9 +829,7 @@ impl faucet_core::Sink for IcebergSink {
 
         let probe_result = tokio::time::timeout(
             ctx.timeout,
-            self.catalog
-                .table_exists(&tid)
-                .within(&self.calls, "catalog"),
+            self.catalog.table_exists(&tid).within(calls, "catalog"),
         )
         .await
         .map(|r| match r {
@@ -836,126 +860,60 @@ impl faucet_core::Sink for IcebergSink {
         Ok(CheckReport::single(probe))
     }
 
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
         // Append only — equality-delete upsert is version-gated on iceberg-rust
         // (tracked as a follow-up to #190 / #179).
         &[faucet_core::WriteMode::Append]
     }
 
-    /// Report the live table schema as an `infer_schema`-shaped JSON object so
-    /// the schema-drift policy (issue #194) can diff each page against the real
-    /// destination.
-    ///
-    /// Loads the table read-only via the catalog; a not-yet-created table (or
-    /// any "table absent" case) returns `Ok(None)` so drift handling stays inert
-    /// until the table exists — only a genuine catalog communication failure
-    /// surfaces as `Err`. On success the table's `current_schema()` is converted
-    /// to Arrow (via `iceberg_to_arrow_schema`) and then to the JSON shape.
-    ///
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        let table = match self.load_table_readonly().await? {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
-        Ok(Some(arrow_to_json_schema(&arrow_schema)))
-    }
-
-    /// Additive schema evolution (#255). iceberg-rust 0.10.0 exposes a
-    /// `Transaction::update_schema` action with `add_column`, so `on_drift:
-    /// evolve` can add new (optional) columns to the destination table.
-    fn supports_schema_evolution(&self) -> bool {
-        true
-    }
-
-    /// Apply an additive schema evolution by adding each new column as an
-    /// **optional** field in a single `update_schema` transaction commit.
-    /// The open writer is closed (its files stay pending for the next commit)
-    /// and later writes decode against the evolved schema.
-    ///
-    /// iceberg-rust 0.10.0's `UpdateSchemaAction` exposes `add_column` /
-    /// `delete_column` but **no** in-place type-promotion or nullability
-    /// relaxation, so `widenings` / `relax_nullability` are not applicable yet
-    /// and are rejected with a typed error rather than silently ignored (which
-    /// would leave the table unable to accept the widened data). Row-level
-    /// overwrite/upsert remain separately blocked upstream (#179 / #225).
-    async fn evolve_schema(
+    async fn write(
         &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        if !evolution.widenings.is_empty() || !evolution.relax_nullability.is_empty() {
-            return Err(FaucetError::Sink(format!(
-                "iceberg: additive schema evolution supports new columns only in iceberg-rust \
-                 0.10.0 (no in-place type promotion or nullability relaxation); requested \
-                 {} widening(s) + {} nullability relaxation(s)",
-                evolution.widenings.len(),
-                evolution.relax_nullability.len()
-            )));
+        calls: &CallSlot,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_rows(calls, records).await?,
+            )),
+            _ => Ok(PageWrite::accepted(
+                self.write_records(calls, records).await?,
+            )),
         }
-        if evolution.additions.is_empty() {
-            return Ok(());
-        }
-        // The table must exist to evolve it; if absent (e.g. a race with table
-        // creation), stay inert — the create path lays down the full schema.
-        let mut state = self.state.lock().await;
-        let table = match self.load_table_readonly().await? {
-            Some(t) => t,
-            None => return Ok(()),
-        };
+    }
 
-        let tx = Transaction::new(&table);
-        let mut action = tx.update_schema();
-        for add in &evolution.additions {
-            let field_type = crate::schema::json_fragment_to_iceberg_type(&add.to)?;
-            action = action.add_column(AddColumn::optional(&add.name, field_type));
-        }
-        let tx = action.apply(tx).map_err(evolve_schema_err)?;
-        let evolved = tx
-            .commit(self.catalog.as_ref())
-            .await
-            .map_err(evolve_schema_err)?;
-        self.calls
+    /// Flush buffered data files to a committed Iceberg snapshot.
+    ///
+    /// 1. Close the open writer (if any) → collect `DataFile`s.
+    /// 2. If no `DataFile`s accumulated → **no-op** (empty snapshot not committed).
+    /// 3. Commit via `Transaction::fast_append`.
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let mut state = self.state.lock().await;
+        state.check_poisoned()?;
+
+        // Step 1: close the open writer and collect its data files.
+        calls
             .call_once("write", Self::close_writer(&mut state))
             .await?;
-        state.table = Some(evolved);
+
+        // Step 2 + 3: commit pending files (or no-op when empty).
+        self.commit_pending(calls, &mut state).await?;
+
+        tracing::debug!(table = %self.config.table, "iceberg: flush complete");
         Ok(())
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
     }
 
-    /// Write `records` and durably record the exactly-once `(scope, token)` in
-    /// the same atomic `fast_append` snapshot commit.
-    ///
-    /// The token is stashed on `SinkState::pending_commit` here and merged into
-    /// the snapshot's summary properties inside `commit_pending` (called from
-    /// `flush`). Both the data files and the token properties land in the same
-    /// `Transaction::fast_append` commit, so they are atomic by Iceberg's
-    /// optimistic-concurrency guarantee.
-    async fn write_batch_idempotent(
-        &self,
-        records: &[Value],
-        scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        let mut state = self.state.lock().await;
-        match self
-            .write_page(&mut state, records, self.config.batch_size)
-            .await
-        {
-            Ok(n) => {
-                state.pending_commit = Some((scope.to_string(), token.to_string()));
-                Ok(n)
-            }
-            // A failure before anything reached the writer (table resolution,
-            // a record that does not fit) leaves no uncommitted rows of this
-            // page, so the sink stays usable; a writer failure part-way has
-            // already poisoned it in `write_page`.
-            Err(e) => Err(e),
-        }
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
     }
+}
 
+#[async_trait]
+impl CommitTokenDriver for IcebergDriver {
     /// Return the last commit token recorded for `scope` in this table's
     /// snapshot history, or `None` if no token has been committed yet.
     ///
@@ -969,8 +927,12 @@ impl faucet_core::Sink for IcebergSink {
     /// committed max, causing the pipeline to re-write already-committed pages
     /// on resume (duplicate rows, silently breaking exactly-once). If the table
     /// does not yet exist `Ok(None)` is returned immediately.
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        let table = match self.load_table_readonly().await? {
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let table = match self.load_table_readonly(calls).await? {
             Some(t) => t,
             None => return Ok(None),
         };
@@ -1000,18 +962,119 @@ impl faucet_core::Sink for IcebergSink {
         ))
     }
 
+    async fn write_with_token(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        Ok(faucet_core::WriteReport::accepted(
+            self.write_idempotent(calls, records, scope, token).await?,
+        ))
+    }
+}
+
+#[async_trait]
+impl SchemaDriver for IcebergDriver {
+    /// Report the live table schema as an `infer_schema`-shaped JSON object so
+    /// the schema-drift policy (issue #194) can diff each page against the real
+    /// destination.
+    ///
+    /// Loads the table read-only via the catalog; a not-yet-created table (or
+    /// any "table absent" case) returns `Ok(None)` so drift handling stays inert
+    /// until the table exists — only a genuine catalog communication failure
+    /// surfaces as `Err`. On success the table's `current_schema()` is converted
+    /// to Arrow (via `iceberg_to_arrow_schema`) and then to the JSON shape.
+    ///
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        let table = match self.load_table_readonly(calls).await? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
+        Ok(Some(arrow_to_json_schema(&arrow_schema)))
+    }
+
+    /// Additive schema evolution (#255). iceberg-rust 0.10.0 exposes a
+    /// `Transaction::update_schema` action with `add_column`, so `on_drift:
+    /// evolve` can add new (optional) columns to the destination table.
+    fn evolvable(&self) -> bool {
+        true
+    }
+
+    /// Apply an additive schema evolution by adding each new column as an
+    /// **optional** field in a single `update_schema` transaction commit.
+    /// The open writer is closed (its files stay pending for the next commit)
+    /// and later writes decode against the evolved schema.
+    ///
+    /// iceberg-rust 0.10.0's `UpdateSchemaAction` exposes `add_column` /
+    /// `delete_column` but **no** in-place type-promotion or nullability
+    /// relaxation, so `widenings` / `relax_nullability` are not applicable yet
+    /// and are rejected with a typed error rather than silently ignored (which
+    /// would leave the table unable to accept the widened data). Row-level
+    /// overwrite/upsert remain separately blocked upstream (#179 / #225).
+    async fn evolve(
+        &self,
+        calls: &CallSlot,
+        evolution: &faucet_core::SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        if !evolution.widenings.is_empty() || !evolution.relax_nullability.is_empty() {
+            return Err(FaucetError::Sink(format!(
+                "iceberg: additive schema evolution supports new columns only in iceberg-rust \
+                 0.10.0 (no in-place type promotion or nullability relaxation); requested \
+                 {} widening(s) + {} nullability relaxation(s)",
+                evolution.widenings.len(),
+                evolution.relax_nullability.len()
+            )));
+        }
+        if evolution.additions.is_empty() {
+            return Ok(());
+        }
+        // The table must exist to evolve it; if absent (e.g. a race with table
+        // creation), stay inert — the create path lays down the full schema.
+        let mut state = self.state.lock().await;
+        let table = match self.load_table_readonly(calls).await? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let tx = Transaction::new(&table);
+        let mut action = tx.update_schema();
+        for add in &evolution.additions {
+            let field_type = crate::schema::json_fragment_to_iceberg_type(&add.to)?;
+            action = action.add_column(AddColumn::optional(&add.name, field_type));
+        }
+        let tx = action.apply(tx).map_err(evolve_schema_err)?;
+        let evolved = tx
+            .commit(self.catalog.as_ref())
+            .await
+            .map_err(evolve_schema_err)?;
+        calls
+            .call_once("write", Self::close_writer(&mut state))
+            .await?;
+        state.table = Some(evolved);
+        Ok(())
+    }
+}
+
+impl IcebergDriver {
     /// Write a batch of records to the Iceberg table.
     ///
     /// When `config.batch_size > 0` the records are re-chunked before writing.
     /// `batch_size = 0` passes the entire page through as a single chunk.
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
 
         let mut state = self.state.lock().await;
         let total = self
-            .write_page(&mut state, records, self.config.batch_size)
+            .write_page(calls, &mut state, records, self.config.batch_size)
             .await?;
 
         tracing::debug!(
@@ -1021,27 +1084,6 @@ impl faucet_core::Sink for IcebergSink {
         );
 
         Ok(total)
-    }
-
-    /// Flush buffered data files to a committed Iceberg snapshot.
-    ///
-    /// 1. Close the open writer (if any) → collect `DataFile`s.
-    /// 2. If no `DataFile`s accumulated → **no-op** (empty snapshot not committed).
-    /// 3. Commit via `Transaction::fast_append`.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        let mut state = self.state.lock().await;
-        state.check_poisoned()?;
-
-        // Step 1: close the open writer and collect its data files.
-        self.calls
-            .call_once("write", Self::close_writer(&mut state))
-            .await?;
-
-        // Step 2 + 3: commit pending files (or no-op when empty).
-        self.commit_pending(&mut state).await?;
-
-        tracing::debug!(table = %self.config.table, "iceberg: flush complete");
-        Ok(())
     }
 
     /// Write records, returning a per-row outcome for DLQ routing.
@@ -1058,8 +1100,9 @@ impl faucet_core::Sink for IcebergSink {
     /// which we can surface per-row errors is the JSON→Arrow conversion step.
     /// Rows that fail that step are routed to DLQ; the remainder are written
     /// as a batch.
-    async fn write_batch_partial(
+    async fn write_rows(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         if records.is_empty() {
@@ -1071,7 +1114,7 @@ impl faucet_core::Sink for IcebergSink {
 
         // Resolve table (and potentially create it) from the full record set so
         // schema inference uses all records.
-        let table = self.resolve_table(&mut state, records).await?;
+        let table = self.resolve_table(calls, &mut state, records).await?;
         let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
         state.warn_dropped_fields(&arrow_schema, records);
 
@@ -1098,7 +1141,7 @@ impl faucet_core::Sink for IcebergSink {
 
         // Write the good records as a batch (outer-Err on transport failure).
         if !good_records.is_empty() {
-            self.ensure_writer(&mut state, &table).await?;
+            self.ensure_writer(calls, &mut state, &table).await?;
             let batch = json_to_record_batch(&good_records, &arrow_schema)?;
             let writer = state.writer.as_mut().expect("writer set above");
             if let Err(e) = writer.write(batch).await {
@@ -1108,6 +1151,38 @@ impl faucet_core::Sink for IcebergSink {
         }
 
         Ok(outcomes)
+    }
+
+    /// Write `records` and durably record the exactly-once `(scope, token)` in
+    /// the same atomic `fast_append` snapshot commit.
+    ///
+    /// The token is stashed on `SinkState::pending_commit` here and merged into
+    /// the snapshot's summary properties inside `commit_pending` (called from
+    /// `flush`). Both the data files and the token properties land in the same
+    /// `Transaction::fast_append` commit, so they are atomic by Iceberg's
+    /// optimistic-concurrency guarantee.
+    async fn write_idempotent(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<usize, FaucetError> {
+        let mut state = self.state.lock().await;
+        match self
+            .write_page(calls, &mut state, records, self.config.batch_size)
+            .await
+        {
+            Ok(n) => {
+                state.pending_commit = Some((scope.to_string(), token.to_string()));
+                Ok(n)
+            }
+            // A failure before anything reached the writer (table resolution,
+            // a record that does not fit) leaves no uncommitted rows of this
+            // page, so the sink stays usable; a writer failure part-way has
+            // already poisoned it in `write_page`.
+            Err(e) => Err(e),
+        }
     }
 }
 
