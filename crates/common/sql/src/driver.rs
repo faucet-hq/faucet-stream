@@ -647,3 +647,163 @@ impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
             .await
     }
 }
+
+#[cfg(test)]
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks DriverSink implements
+mod tests {
+    use super::*;
+    use crate::dialects::Sqlite;
+    use crate::mapping::TableColumn;
+    use crate::statement::Statement;
+    use faucet_core::driver::DriverSink;
+    use faucet_core::{Sink, WriteSpec};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// A backend that records the SQL it is asked to run.
+    struct Mem {
+        engine: SqlSinkEngine<Sqlite>,
+        layout: SqlLayout,
+        exists: bool,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Mem {
+        fn new(layout: SqlLayout, exists: bool) -> Self {
+            Self {
+                engine: SqlSinkEngine::new(Sqlite, WriteSpec::default()),
+                layout,
+                exists,
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    struct Conn<'a>(&'a Mem);
+
+    #[faucet_core::async_trait]
+    impl SqlExecutor for Conn<'_> {
+        async fn columns(&mut self, _: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+            Ok(vec![TableColumn::untyped("id")])
+        }
+        async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+            self.0.log.lock().unwrap().push(stmt.sql.clone());
+            Ok(1)
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl SqlDriver for Mem {
+        type Dialect = Sqlite;
+        type Conn<'a> = Conn<'a>;
+        fn engine(&self) -> &SqlSinkEngine<Sqlite> {
+            &self.engine
+        }
+        fn layout(&self) -> &SqlLayout {
+            &self.layout
+        }
+        fn connector_name(&self) -> &'static str {
+            "mem"
+        }
+        fn config_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn dataset_uri(&self) -> String {
+            "mem://t".into()
+        }
+        async fn begin(&self) -> Result<Conn<'_>, FaucetError> {
+            Ok(Conn(self))
+        }
+        async fn commit(&self, _: Conn<'_>) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn connection(&self) -> Result<Conn<'_>, FaucetError> {
+            Ok(Conn(self))
+        }
+        async fn table_exists(&self, _: &str) -> Result<bool, FaucetError> {
+            Ok(self.exists)
+        }
+        async fn ddl(&self, sql: &str, _: &'static str) -> Result<(), FaucetError> {
+            self.log.lock().unwrap().push(sql.to_string());
+            Ok(())
+        }
+        async fn read_token(&self, _: &str) -> Result<Option<String>, FaucetError> {
+            Ok(None)
+        }
+        async fn create_staging(&self) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn publish_staging(&self) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn swap_staging(&self) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_defaults_hold_and_a_missing_table_is_refused_without_create_table() {
+        let sink = DriverSink::new(SqlSinkDriver::new(Mem::new(
+            SqlLayout::new("t").create_table(false),
+            false,
+        )));
+        assert_eq!(sink.batch_atomicity(), BatchAtomicity::Atomic);
+        assert_eq!(sink.supported_write_modes().len(), 4);
+        assert!(sink.readback_source().is_none() && !sink.supports_rollback());
+        assert_eq!(sink.connector_name(), "mem");
+        assert_eq!(sink.dataset_uri(), "mem://t");
+        assert!(sink.config_schema().is_object());
+        let report = sink
+            .check(&faucet_core::check::CheckContext::default())
+            .await
+            .unwrap();
+        assert_eq!(report.probes[0].name, "check");
+        let err = sink.write_batch(&[json!({"id": 1})]).await.unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let err = sink
+            .evolve_schema(&faucet_core::SchemaEvolution::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support schema evolution")
+        );
+        assert_eq!(
+            sink.driver().driver().target("a`b").reference,
+            "`a``b`",
+            "the default target quotes with the dialect"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_table_is_checked_once_and_a_shapeless_page_creates_nothing() {
+        let sink = DriverSink::new(SqlSinkDriver::new(Mem::new(
+            SqlLayout::new("t").create_table(false),
+            true,
+        )));
+        assert_eq!(sink.write_batch(&[json!({"id": 1})]).await.unwrap(), 1);
+        assert_eq!(sink.write_batch(&[json!({"id": 2})]).await.unwrap(), 1);
+        let created = DriverSink::new(SqlSinkDriver::new(Mem::new(SqlLayout::new("t"), false)));
+        created
+            .driver()
+            .ensure_table_ready(&[json!({})])
+            .await
+            .unwrap();
+        assert!(
+            created.driver().driver().log().is_empty(),
+            "nothing to infer from, so nothing is created yet"
+        );
+        created
+            .driver()
+            .ensure_table_ready(&[json!({"id": 1})])
+            .await
+            .unwrap();
+        assert!(created.driver().driver().log()[0].starts_with("CREATE TABLE"));
+    }
+}

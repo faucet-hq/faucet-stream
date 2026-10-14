@@ -1284,6 +1284,47 @@ mod tests {
         );
     }
 
+    /// Every SQLite primitive names its step when the pool is gone.
+    #[tokio::test]
+    #[allow(deprecated)] // probes the commit-token read the driver serves
+    async fn a_closed_pool_fails_each_primitive_with_its_step() {
+        let sink = SqliteSink::new(auto_map_cfg(
+            "sqlite::memory:",
+            faucet_core::WriteMode::Append,
+            &[],
+        ))
+        .await
+        .unwrap();
+        sink.pool.close().await;
+        let msg = |r: Result<(), FaucetError>| r.unwrap_err().to_string();
+        assert!(
+            msg(sink
+                .write_batch(&[serde_json::json!({"id": 1})])
+                .await
+                .map(|_| ()))
+            .contains("SQLite")
+        );
+        assert!(msg(sink.last_committed_token("s").await.map(|_| ())).contains("SQLite"));
+        assert!(
+            msg(sink
+                .write_batch_partial(&[serde_json::json!({"id": 1})])
+                .await
+                .map(|_| ()))
+            .contains("SQLite")
+        );
+        let evolution = SchemaEvolution::default();
+        assert!(msg(sink.evolve_schema(&evolution).await).contains("sqlite"));
+        let driver = sink.inner.driver().driver();
+        assert!(msg(SqlDriver::begin(driver).await.map(|_| ())).contains("transaction begin"));
+        assert!(
+            msg(SqlDriver::connection(driver).await.map(|_| ())).contains("connection acquire")
+        );
+        assert!(
+            msg(SqlDriver::ddl(driver, "SELECT 1", "probe").await).contains("SQLite probe failed")
+        );
+        assert!(msg(SqlDriver::read_token(driver, "s").await.map(|_| ())).contains("token read"));
+    }
+
     #[tokio::test]
     async fn adding_a_column_to_a_view_reports_the_column() {
         let dir = tempfile::TempDir::new().unwrap();

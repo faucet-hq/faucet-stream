@@ -499,6 +499,7 @@ mod tests {
         let backend = Arc::new(LocalBackend::new(&d, &t, true));
         let sink = FileSink::build(jsonl(), t, backend, identity).unwrap();
         assert_eq!(sink.format(), FileFormat::JsonLines);
+        assert_eq!(sink.driver().format(), FileFormat::JsonLines);
         assert!(
             sink.backend()
                 .local_path(Area::Destination, "out.jsonl")

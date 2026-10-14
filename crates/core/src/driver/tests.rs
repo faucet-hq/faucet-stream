@@ -1322,3 +1322,131 @@ async fn array_requests_never_report_a_delivered_row_failed() {
     .unwrap();
     assert_eq!(report.probes[0].name, "check");
 }
+
+// ── trait defaults ─────────────────────────────────────────────────────────
+
+/// A producer with only the required primitives; `bad` makes it return the
+/// wrong number of outcomes.
+struct Minimal {
+    bad: bool,
+}
+
+#[async_trait]
+impl MessageDriver for Minimal {
+    fn connector_name(&self) -> &'static str {
+        "minimal"
+    }
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        if record.is_null() {
+            return Err(FaucetError::Sink("null record".into()));
+        }
+        Ok(OutboundMessage::new("d", record.to_string()))
+    }
+    async fn publish(
+        &self,
+        _: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
+        let n = if self.bad {
+            group.len() + 1
+        } else {
+            group.len()
+        };
+        Ok((0..n).map(|_| Ok(())).collect())
+    }
+}
+
+#[tokio::test]
+async fn a_minimal_message_driver_takes_the_defaults() {
+    let sink = DriverSink::new(MessageSinkDriver::new(Minimal { bad: false }));
+    assert_eq!(sink.batch_atomicity(), crate::BatchAtomicity::BestEffort);
+    let outcomes = sink
+        .write_batch_partial(&[json!(1), json!(2), Value::Null])
+        .await
+        .unwrap();
+    assert!(outcomes[0].is_ok() && outcomes[1].is_ok() && outcomes[2].is_err());
+    let outcomes = sink.write_batch_partial(&[Value::Null]).await.unwrap();
+    assert!(
+        outcomes[0].is_err(),
+        "a group no row of which encodes is skipped"
+    );
+    sink.flush().await.unwrap();
+    let wrong = DriverSink::new(MessageSinkDriver::new(Minimal { bad: true }));
+    let err = wrong.write_batch(&[json!(1)]).await.unwrap_err();
+    assert!(
+        err.to_string().contains("2 outcomes for a group of 1"),
+        "{err}"
+    );
+}
+
+/// A consumer that is empty on its first receive, then has one message,
+/// then is empty again; with the default limits it reads that one.
+struct Trickle(Mutex<Vec<Vec<InboundMessage>>>);
+
+#[async_trait]
+impl MessageConsumer for Trickle {
+    fn connector_name(&self) -> &'static str {
+        "trickle"
+    }
+    fn idle_receives_to_stop(&self) -> u32 {
+        2
+    }
+    async fn receive(&self, _: &CallSlot, _: usize) -> Result<Vec<InboundMessage>, FaucetError> {
+        Ok(self.0.lock().unwrap().pop().unwrap_or_default())
+    }
+    async fn ack(&self, _: &CallSlot, _: Vec<AckToken>) -> Result<(), FaucetError> {
+        Ok(())
+    }
+    fn decode(&self, m: &InboundMessage) -> Result<Value, FaucetError> {
+        Ok(json!(m.payload.len()))
+    }
+}
+
+#[tokio::test]
+async fn a_consumer_with_default_limits_reads_until_idle() {
+    let consumer = Trickle(Mutex::new(vec![
+        vec![],
+        vec![InboundMessage::new(
+            "q",
+            b"abc".to_vec(),
+            AckToken("1".into()),
+        )],
+        vec![],
+    ]));
+    assert!(consumer.max_messages().is_none());
+    let source = DriverSource::new(MessageSourceDriver::new(consumer));
+    let ctx = HashMap::new();
+    let pages: Vec<_> = futures::StreamExt::collect::<Vec<_>>(source.stream_pages(&ctx, 0)).await;
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].as_ref().unwrap().records, vec![json!(3)]);
+}
+
+#[tokio::test]
+async fn the_remaining_defaults_answer() {
+    struct Schemaless;
+    #[async_trait]
+    impl SchemaDriver for Schemaless {
+        async fn current_schema(&self, _: &CallSlot) -> Result<Option<Value>, FaucetError> {
+            Ok(None)
+        }
+    }
+    let calls = CallSlot::new(CallContext::new());
+    assert!(!Schemaless.evolvable());
+    assert!(
+        Schemaless
+            .evolve(&calls, &SchemaEvolution::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        SinkDriver::batch_atomicity(&Bare),
+        crate::BatchAtomicity::BestEffort
+    );
+    let caps = DriverSource::new(FailingRead).capabilities();
+    assert!(!caps.reports_lag());
+    let http = Endpoint::new(HttpBatching::PerRecord { concurrency: 1 }, None);
+    assert_eq!(
+        HttpDriver::batch_atomicity(&http),
+        crate::BatchAtomicity::BestEffort
+    );
+}

@@ -226,6 +226,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_and_a_per_record_subject_uri() {
+        let mut cfg = NatsSinkConfig::new("events.out");
+        cfg.subject_field = Some("topic".into());
+        let sink = NatsSink::new(cfg).await.unwrap();
+        assert!(sink.config_schema().is_object());
+        assert!(sink.dataset_uri().contains("from_field:topic"));
+    }
+
+    #[tokio::test]
     async fn new_validates_config() {
         let mut cfg = NatsSinkConfig::new("x");
         cfg.subject = " ".into();

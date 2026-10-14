@@ -701,6 +701,7 @@ mod tests {
                     .write_modes([faucet_core::WriteMode::Append])
                     .build(),
                 "idem_broken" => base.to_builder().idempotent_writes(true).build(),
+                "evolve_broken" => base.to_builder().schema_evolution(true).build(),
                 _ => base,
             }
         }
@@ -781,6 +782,7 @@ mod tests {
         check20_fails_on_a_broken_declared_watermark: "idem_broken" => "watermark read errored";
         check20_fails_on_an_undeclared_cleanup: "cleanup" => "cleanup_scope answered";
         check20_fails_on_an_undeclared_evolution: "evolve" => "an empty evolution succeeded";
+        check20_fails_on_a_broken_declared_evolution: "evolve_broken" => "an empty evolution failed";
         check20_fails_on_an_undeclared_rollback: "rollback" => "rollback_run answered";
         check21_fails_on_a_short_plain_write: "short_plain" => "plain write accepted 2 of 3";
         check21_fails_on_a_short_report: "short_reported" => "reported write left rows";
@@ -889,5 +891,16 @@ mod tests {
         let sink = faucet_core::driver::DriverSink::new(Lifecycle::default());
         assert_driver_declarations_truthful(&sink).await;
         assert_driver_row_paths_agree(&sink).await;
+        #[allow(deprecated)] // the lifecycle hooks the double implements
+        {
+            sink.begin_overwrite().await.unwrap();
+            sink.commit_overwrite().await.unwrap();
+            sink.abort_overwrite().await.unwrap();
+            let r = sink
+                .write_batch_idempotent_reported(&rows(1..=2), "s", "t")
+                .await
+                .unwrap();
+            assert_eq!(r.accepted, 2);
+        }
     }
 }
