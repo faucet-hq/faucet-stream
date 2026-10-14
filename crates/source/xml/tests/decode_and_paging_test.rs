@@ -397,3 +397,67 @@ async fn decode_pipeline_renders_excel_dates_as_iso_text() {
         "a date header is named by its ISO date"
     );
 }
+
+/// A zipped JSON report member keeps its numbers exact: an integer beyond
+/// `u64` and a decimal longer than a double stay their digits.
+#[tokio::test]
+async fn a_zipped_json_member_decodes_with_exact_numbers() {
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+    let server = MockServer::start().await;
+    let mut cur = std::io::Cursor::new(Vec::new());
+    {
+        let mut zw = zip::ZipWriter::new(&mut cur);
+        zw.start_file("report.json", SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(
+            br#"{"rows":[{"id":98765432109876543210987,"amount":12345.678901234567890123,"ratio":0.25,"n":7}]}"#,
+        )
+        .unwrap();
+        zw.finish().unwrap();
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(cur.into_inner());
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("<r><bytes>{b64}</bytes></r>")),
+        )
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "bytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            DecodeStep::Unzip {
+                unzip: faucet_source_xml::decode::UnzipSpec {
+                    member: Some("*.json".into()),
+                },
+            },
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Json,
+                    records_path: Some("$.rows[*]".into()),
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            },
+        ]);
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["id"],
+        serde_json::json!("98765432109876543210987")
+    );
+    assert_eq!(
+        records[0]["amount"],
+        serde_json::json!("12345.678901234567890123")
+    );
+    assert_eq!(records[0]["ratio"], serde_json::json!(0.25));
+    assert_eq!(records[0]["n"], serde_json::json!(7));
+}
