@@ -2,7 +2,10 @@
 
 use crate::config::MongoSinkConfig;
 use async_trait::async_trait;
-use faucet_core::FaucetError;
+use faucet_core::driver::{
+    CleanupDriver, CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SinkDriver, StagingDriver,
+};
+use faucet_core::{CallSlot, FaucetError};
 use futures::StreamExt;
 use mongodb::Client;
 use mongodb::bson::{self, Bson, Document};
@@ -30,7 +33,7 @@ const NAMESPACE_EXISTS_CODE: i32 = 48;
 ///
 /// Returns a `Sink` error if the map does not convert to a BSON document.
 fn json_map_to_bson_filter(map: &Map<String, Value>) -> Result<Document, FaucetError> {
-    MongoSink::value_to_document(&Value::Object(map.clone()))
+    MongoDriver::value_to_document(&Value::Object(map.clone()))
 }
 
 /// A single planned upsert/delete op, pre-converted to BSON so all conversion
@@ -417,6 +420,11 @@ fn cleanup_filter_json(
 /// Each record must be a JSON object. Non-object values produce an error.
 /// Records are inserted in batches using `insert_many`.
 pub struct MongoSink {
+    inner: DriverSink<MongoDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct MongoDriver {
     config: MongoSinkConfig,
     client: Client,
     /// One-shot guard for pre-creating the data + watermark collections before
@@ -425,13 +433,34 @@ pub struct MongoSink {
     /// must exist up front on MongoDB < 4.4; pre-creating keeps the
     /// exactly-once path portable and removes a first-run failure mode.
     eo_collections_ready: tokio::sync::OnceCell<()>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder.
-    calls: faucet_core::CallSlot,
 }
 
 impl MongoSink {
     /// Create a new MongoDB sink, establishing the client connection.
     pub async fn new(config: MongoSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(MongoDriver::new(config).await?),
+        })
+    }
+
+    #[cfg(test)]
+    fn filter_from_row(row: &Value, key: &[String]) -> Result<Document, FaucetError> {
+        MongoDriver::filter_from_row(row, key)
+    }
+
+    #[cfg(test)]
+    fn value_to_document(val: &Value) -> Result<Document, FaucetError> {
+        MongoDriver::value_to_document(val)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for MongoSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl MongoDriver {
+    async fn new(config: MongoSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         // Validate write-mode config up front (config-only, so before connecting
         // is fine): upsert/delete require a non-empty `key`. MongoDB is
@@ -445,7 +474,6 @@ impl MongoSink {
             config,
             client,
             eo_collections_ready: tokio::sync::OnceCell::new(),
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
 
@@ -506,6 +534,7 @@ impl MongoSink {
     /// that, the documents still pending fail per row.
     async fn insert_partial(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         let collection = self
@@ -546,8 +575,7 @@ impl MongoSink {
             let opts = mongodb::options::InsertManyOptions::builder()
                 .ordered(ordered)
                 .build();
-            let called = self
-                .calls
+            let called = calls
                 .call_once("insert", async {
                     Ok(collection
                         .insert_many(batch.iter().map(|(_, d)| d))
@@ -595,7 +623,7 @@ impl MongoSink {
                         resends += 1;
                         tracing::warn!(error = %e, resends, "MongoDB insert_many failed; re-sending the batch");
                         let backoff = std::time::Duration::from_millis(200 << resends);
-                        if let Err(e) = self.calls.wait(backoff).await {
+                        if let Err(e) = calls.wait(backoff).await {
                             return cut_short(e, inserted_any, pending, outcomes);
                         }
                         continue;
@@ -974,16 +1002,10 @@ impl MongoSink {
 }
 
 #[async_trait]
-impl faucet_core::Sink for MongoSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
+impl SinkDriver for MongoDriver {
+    /// The run's deadline and round-trip recorder (#880), no attempt timeout.
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new().without_timeout()
     }
 
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
@@ -999,29 +1021,7 @@ impl faucet_core::Sink for MongoSink {
             .expect("schema serialization")
     }
 
-    fn supports_cleanup(&self) -> bool {
-        // Unconditional: MongoDB is schemaless, so the scope and key predicates
-        // address document fields that need no declaration up front (there is no
-        // column-mapping mode to exclude, as on the SQL sinks). The remaining
-        // requirement — a non-empty `key` — is enforced by `WriteSpec::validate`
-        // at config-load time (cleanup implies `write_mode: upsert`) and again in
-        // `cleanup_scope`.
-        true
-    }
-
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.calls
-            .call_once("cleanup_scope", async {
-                self.cleanup_scope_impl(scope, seen).await
-            })
-            .await
-    }
-
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
         &[
             faucet_core::WriteMode::Append,
             faucet_core::WriteMode::Upsert,
@@ -1030,7 +1030,83 @@ impl faucet_core::Sink for MongoSink {
         ]
     }
 
-    fn is_overwrite(&self) -> bool {
+    fn dedups_by_key(&self) -> bool {
+        self.config.write.dedups_by_key()
+    }
+
+    fn dataset_uri(&self) -> String {
+        collection_uri(
+            &self.config.connection_uri,
+            &self.config.database,
+            &self.config.collection,
+        )
+    }
+
+    /// Non-mutating preflight probe: run the `ping` admin command against the
+    /// configured database via the existing client (probe name `"ping"`).
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        ctx: &faucet_core::check::CheckContext,
+    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+        use faucet_core::check::{CheckReport, Probe};
+
+        let started = std::time::Instant::now();
+        let hint = "check connection_uri / credentials / that the MongoDB server is reachable";
+
+        let db = self.client.database(&self.config.database);
+        let probe =
+            match tokio::time::timeout(ctx.timeout, db.run_command(bson::doc! {"ping": 1})).await {
+                Ok(Ok(_)) => Probe::pass("ping", started.elapsed()),
+                Ok(Err(e)) => Probe::fail_hint("ping", started.elapsed(), e.to_string(), hint),
+                Err(_) => Probe::fail_hint("ping", started.elapsed(), "timed out", hint),
+            };
+        Ok(CheckReport::single(probe))
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_rows(calls, records).await?,
+            )),
+            _ => {
+                let n = self.write_records(calls, records).await?;
+                Ok(PageWrite::reported(if self.dedups_by_key() {
+                    faucet_core::WriteReport::keyed(records.len(), n)
+                } else {
+                    faucet_core::WriteReport::accepted(n)
+                }))
+            }
+        }
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
+    }
+
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
+    }
+
+    /// Unconditional: MongoDB is schemaless, so the scope and key predicates
+    /// address document fields that need no declaration up front (there is no
+    /// column-mapping mode to exclude, as on the SQL sinks). The remaining
+    /// requirement — a non-empty `key` — is enforced by `WriteSpec::validate`
+    /// at config-load time (cleanup implies `write_mode: upsert`) and again in
+    /// `delete_absent`.
+    fn cleanup(&self) -> Option<&dyn CleanupDriver> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl StagingDriver for MongoDriver {
+    fn active(&self) -> bool {
         self.config.write.is_overwrite()
     }
 
@@ -1040,8 +1116,8 @@ impl faucet_core::Sink for MongoSink {
     /// [`commit_overwrite`](faucet_core::Sink::commit_overwrite) keeps them. With
     /// no destination yet an empty staging collection is created, so a run
     /// whose source returns no rows still commits (#789 MSG-52).
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
+    async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        calls
             .call_once("begin_overwrite", async {
                 let db = self.client.database(&self.config.database);
                 // Best-effort drop; a missing namespace is not an error for our purpose.
@@ -1065,8 +1141,8 @@ impl faucet_core::Sink for MongoSink {
     /// Requires the `renameCollection` privilege and that both collections live
     /// in the same database. `renameCollection` is not supported on sharded
     /// collections — a documented limitation of overwrite on MongoDB.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        calls
             .call_once("commit_overwrite", async {
                 let from = format!("{}.{}", self.config.database, self.staging_collection());
                 let to = format!("{}.{}", self.config.database, self.config.collection);
@@ -1084,26 +1160,10 @@ impl faucet_core::Sink for MongoSink {
             .await
     }
 
-    /// Probe for the `<collection>__faucet_ovw` staging collection (read-only).
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.calls
-            .call_once("overwrite_staging_exists", async {
-                let names = self
-                    .client
-                    .database(&self.config.database)
-                    .list_collection_names()
-                    .filter(bson::doc! { "name": self.staging_collection() })
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
-                Ok(Some(!names.is_empty()))
-            })
-            .await
-    }
-
     /// Drop the staging collection so a failed/cancelled overwrite leaves
     /// nothing behind. Best-effort — the destination was never touched.
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
+    async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        calls
             .call_once("abort_overwrite", async {
                 ignore_error(
                     "mongodb overwrite: staging drop on abort (ignored)",
@@ -1118,39 +1178,79 @@ impl faucet_core::Sink for MongoSink {
             .await
     }
 
-    fn dedups_by_key(&self) -> bool {
-        self.config.write.dedups_by_key()
+    /// Probe for the `<collection>__faucet_ovw` staging collection (read-only).
+    async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
+        calls
+            .call_once("overwrite_staging_exists", async {
+                let names = self
+                    .client
+                    .database(&self.config.database)
+                    .list_collection_names()
+                    .filter(bson::doc! { "name": self.staging_collection() })
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
+                Ok(!names.is_empty())
+            })
+            .await
     }
+}
 
-    fn dataset_uri(&self) -> String {
-        collection_uri(
-            &self.config.connection_uri,
-            &self.config.database,
-            &self.config.collection,
-        )
-    }
-
-    /// Non-mutating preflight probe: run the `ping` admin command against the
-    /// configured database via the existing client (probe name `"ping"`).
-    async fn check(
+#[async_trait]
+impl CommitTokenDriver for MongoDriver {
+    /// Read the current watermark for `scope` from the
+    /// [`_faucet_commit_token`](faucet_core::idempotency::COMMIT_TOKEN_TABLE)
+    /// collection. Returns `Ok(None)` for an unknown scope (or a missing
+    /// collection). The token is opaque and returned verbatim — never parsed.
+    async fn last_token(
         &self,
-        ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::{CheckReport, Probe};
-
-        let started = std::time::Instant::now();
-        let hint = "check connection_uri / credentials / that the MongoDB server is reachable";
-
-        let db = self.client.database(&self.config.database);
-        let probe =
-            match tokio::time::timeout(ctx.timeout, db.run_command(bson::doc! {"ping": 1})).await {
-                Ok(Ok(_)) => Probe::pass("ping", started.elapsed()),
-                Ok(Err(e)) => Probe::fail_hint("ping", started.elapsed(), e.to_string(), hint),
-                Err(_) => Probe::fail_hint("ping", started.elapsed(), "timed out", hint),
-            };
-        Ok(CheckReport::single(probe))
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        calls
+            .call_once("last_committed_token", async {
+                let doc = self
+                    .commit_token_collection()
+                    .find_one(commit_token_filter(scope))
+                    .await
+                    .map_err(sink_err("MongoDB commit-token read failed"))?;
+                doc.map(|d| token_from_commit_doc(&d)).transpose()
+            })
+            .await
     }
 
+    async fn write_with_token(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let n = self.write_idempotent(calls, records, scope, token).await?;
+        Ok(if self.dedups_by_key() {
+            faucet_core::WriteReport::keyed(records.len(), n)
+        } else {
+            faucet_core::WriteReport::accepted(n)
+        })
+    }
+}
+
+#[async_trait]
+impl CleanupDriver for MongoDriver {
+    async fn delete_absent(
+        &self,
+        calls: &CallSlot,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        calls
+            .call_once("cleanup_scope", async {
+                self.cleanup_scope_impl(scope, seen).await
+            })
+            .await
+    }
+}
+
+impl MongoDriver {
     /// Write records to MongoDB.
     ///
     /// When `config.batch_size > 0` and the input slice is larger than
@@ -1159,8 +1259,12 @@ impl faucet_core::Sink for MongoSink {
     /// `config.batch_size == 0`, the entire slice is sent in a single
     /// `insert_many` request — useful when upstream `StreamPage`s are already
     /// sized for MongoDB's preferred per-request limits.
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.calls
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
+        calls
             .call_once("write_batch", async {
                 if records.is_empty() {
                     return Ok(0);
@@ -1243,19 +1347,20 @@ impl faucet_core::Sink for MongoSink {
     /// only the rows whose key could not be extracted (missing / null key) are
     /// reported as `Err` so the pipeline routes them to the DLQ per-row instead
     /// of sending the whole page.
-    async fn write_batch_partial(
+    async fn write_rows(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         if !matches!(
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
-            return self.insert_partial(records).await;
+            return self.insert_partial(calls, records).await;
         }
 
         let plan = faucet_core::plan_writes_exact(records, &self.config.write);
-        self.calls
+        calls
             .call_once("write_batch_partial", self.apply_plan(&plan))
             .await?;
 
@@ -1267,27 +1372,6 @@ impl faucet_core::Sink for MongoSink {
             )));
         }
         Ok(outcomes)
-    }
-
-    fn supports_idempotent_writes(&self) -> bool {
-        true
-    }
-
-    /// Read the current watermark for `scope` from the
-    /// [`_faucet_commit_token`](faucet_core::idempotency::COMMIT_TOKEN_TABLE)
-    /// collection. Returns `Ok(None)` for an unknown scope (or a missing
-    /// collection). The token is opaque and returned verbatim — never parsed.
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.calls
-            .call_once("last_committed_token", async {
-                let doc = self
-                    .commit_token_collection()
-                    .find_one(commit_token_filter(scope))
-                    .await
-                    .map_err(sink_err("MongoDB commit-token read failed"))?;
-                doc.map(|d| token_from_commit_doc(&d)).transpose()
-            })
-            .await
     }
 
     /// Write one page and its commit-token watermark **atomically**, inside a
@@ -1309,13 +1393,14 @@ impl faucet_core::Sink for MongoSink {
     ///   `UnknownTransactionCommitResult` (bounded), per the driver's
     ///   recommended pattern; any other failure aborts the transaction
     ///   (best-effort) and surfaces the original error.
-    async fn write_batch_idempotent(
+    async fn write_idempotent(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        self.calls
+        calls
             .call_once("write_batch_idempotent", async {
                 self.ensure_exactly_once_collections().await?;
 

@@ -182,6 +182,21 @@ not yet confirmed fails the run. Spawning the target does not block the
 runtime: a transient `Text file busy` retry waits through the same context.
 `flush_timeout_secs` and the stdin write timeout are unchanged.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `SingerDriver`
+implements `faucet_core::driver::SinkDriver` — spawn the target, send
+`SCHEMA` / `RECORD` lines, confirm at flush — and `StagingDriver` for
+`write_mode: overwrite`: stage fixes the run's table version, publish
+confirms the records and sends `ACTIVATE_VERSION`, discard stops the target
+without activating. The overwrite leaves no staging object, so the staging
+probe answers "unknown". `SingerSink` wraps it in a `DriverSink`, which
+derives the capabilities (lowering the keyed-upsert guarantee to
+at-least-once, since the target owns convergence) and serves the write paths
+with row accounting. Every write and confirmation is a call through the
+run's call context (op labels `write`, `confirm`). The public type and config
+are unchanged.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

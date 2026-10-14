@@ -3,8 +3,10 @@
 use crate::config::{SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig};
 use async_trait::async_trait;
 use axum::{Router, extract::State, http::StatusCode, routing::post};
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
+use faucet_core::{CallSlot, FaucetError};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
@@ -33,7 +35,7 @@ const RETRY_AFTER_SECS: &str = "60";
 /// How long in-flight requests get to finish once the window closes.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl WebhookSource {
+impl WebhookDriver {
     fn new_state(&self) -> Arc<AppState> {
         Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
@@ -59,17 +61,35 @@ impl WebhookSource {
 /// A webhook receiver source that starts a temporary HTTP server and
 /// collects incoming POST payloads as records.
 pub struct WebhookSource {
+    inner: DriverSource<WebhookDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct WebhookDriver {
     config: WebhookSourceConfig,
 }
 
 impl WebhookSource {
     /// Create a new webhook source from the given configuration.
     pub fn new(config: WebhookSourceConfig) -> Self {
-        Self { config }
+        Self {
+            inner: DriverSource::new(WebhookDriver { config }),
+        }
     }
 
     /// Start the webhook server, collect payloads, and return them.
     pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
+        self.inner.driver().fetch_all().await
+    }
+}
+
+#[async_trait]
+impl faucet_core::Source for WebhookSource {
+    faucet_core::forward_source!(inner);
+}
+
+impl WebhookDriver {
+    async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
         self.config.validate()?;
         self.receive(&self.config.path).await
     }
@@ -348,33 +368,28 @@ async fn webhook_handler(
 }
 
 #[async_trait]
-impl faucet_core::Source for WebhookSource {
-    async fn fetch_with_context(
-        &self,
-        context: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        if context.is_empty() {
-            return WebhookSource::fetch_all(self).await;
-        }
+impl SourceDriver for WebhookDriver {
+    /// Serve until the collection window closes, then emit what arrived:
+    /// one page per `batch_size` records.
+    fn read<'a>(
+        &'a self,
+        _calls: &'a CallSlot,
+        context: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> PageStream<'a> {
+        Box::pin(faucet_core::async_stream::try_stream! {
+            for page in faucet_core::driver::pages_of(self.fetch_with_context(context).await?, None, batch_size) {
+                yield page;
+            }
+        })
+    }
 
-        // Substitute context into the webhook path, percent-encoding each
-        // value so a parent value cannot add segments or route syntax (API-49).
-        let encoded: std::collections::HashMap<String, Value> = context
-            .iter()
-            .map(|(k, v)| {
-                let raw = match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (
-                    k.clone(),
-                    Value::String(urlencoding::encode(&raw).into_owned()),
-                )
-            })
-            .collect();
-        self.config.validate_settings()?;
-        let resolved_path = faucet_core::util::substitute_context(&self.config.path, &encoded);
-        self.receive(&resolved_path).await
+    async fn fetch(
+        &self,
+        _calls: &CallSlot,
+        context: &HashMap<String, Value>,
+    ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+        Some(self.fetch_with_context(context).await.map(|r| (r, None)))
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -382,11 +397,8 @@ impl faucet_core::Source for WebhookSource {
             .expect("schema serialization")
     }
 
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::of_source(self)
-            .to_builder()
-            .read_side_effects(true)
-            .build()
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().read_side_effects(true).build()
     }
 
     fn connector_name(&self) -> &'static str {
@@ -407,8 +419,9 @@ impl faucet_core::Source for WebhookSource {
     /// error (port in use, permission denied, bad address) fails the probe.
     async fn check(
         &self,
+        _calls: &CallSlot,
         _ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+    ) -> Result<Option<faucet_core::check::CheckReport>, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
         let start = std::time::Instant::now();
@@ -416,15 +429,48 @@ impl faucet_core::Source for WebhookSource {
             Ok(listener) => {
                 // Drop the listener immediately so we don't hold the port.
                 drop(listener);
-                Ok(CheckReport::single(Probe::pass("io", start.elapsed())))
+                Ok(Some(CheckReport::single(Probe::pass(
+                    "io",
+                    start.elapsed(),
+                ))))
             }
-            Err(e) => Ok(CheckReport::single(Probe::fail_hint(
+            Err(e) => Ok(Some(CheckReport::single(Probe::fail_hint(
                 "io",
                 start.elapsed(),
                 e.to_string(),
                 format!("{} is not bindable", self.config.listen_addr),
-            ))),
+            )))),
         }
+    }
+}
+
+impl WebhookDriver {
+    async fn fetch_with_context(
+        &self,
+        context: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        if context.is_empty() {
+            return self.fetch_all().await;
+        }
+
+        // Substitute context into the webhook path, percent-encoding each
+        // value so a parent value cannot add segments or route syntax (API-49).
+        let encoded: std::collections::HashMap<String, Value> = context
+            .iter()
+            .map(|(k, v)| {
+                let raw = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (
+                    k.clone(),
+                    Value::String(urlencoding::encode(&raw).into_owned()),
+                )
+            })
+            .collect();
+        self.config.validate_settings()?;
+        let resolved_path = faucet_core::util::substitute_context(&self.config.path, &encoded);
+        self.receive(&resolved_path).await
     }
 }
 

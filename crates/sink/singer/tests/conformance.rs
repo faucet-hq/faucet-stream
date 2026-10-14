@@ -76,3 +76,33 @@ async fn conformance_cancellation_flushes() {
     })
     .await;
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver; its overwrite
+/// is a table version, so the staging probe answers "unknown".
+#[cfg(unix)]
+#[tokio::test]
+#[allow(deprecated)] // probes the 1.x staging hook the driver answers until faucet-core 2.0 (RFC 0014)
+async fn conformance_driver_truthful() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.jsonl");
+    let mut cfg = SingerSinkConfig::new(format!(
+        "{}/tests/fake_targets/fake_target.py",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    cfg.target_config = json!({ "path": out });
+    cfg.stream = Some("orders".into());
+    let sink = SingerSink::new(cfg).unwrap();
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    faucet_core::Sink::flush(&sink).await.unwrap();
+    let written = std::fs::read_to_string(&out)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    assert_eq!(written, 12);
+    assert_eq!(
+        faucet_core::Sink::overwrite_staging_exists(&sink)
+            .await
+            .unwrap(),
+        None
+    );
+}

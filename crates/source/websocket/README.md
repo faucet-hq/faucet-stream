@@ -338,6 +338,17 @@ The handshake runs through the pipeline's `CallContext` (#880): metered as
 `connect` and ended by a caller deadline or cancel token, after which the
 source stops instead of reconnecting.
 
+## How it is built
+
+The source runs on the family-neutral source driver (RFC 0014):
+`WebsocketDriver` implements `faucet_core::driver::SourceDriver` — `read`
+connects, subscribes, reconnects and pages the frames by `batch_size`, taking
+the run's cancellation token so a cancelled run yields what it buffered;
+`check` only probes TCP reachability — and `WebsocketSource` wraps it in a
+`DriverSource`, which hands the run's call context to every handshake (op
+label `connect`). Reads have side effects, which the driver adds to the
+derived capabilities. The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

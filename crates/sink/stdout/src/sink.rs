@@ -2,7 +2,8 @@
 
 use crate::config::{StdStream, StdoutFormat, StdoutSinkConfig};
 use async_trait::async_trait;
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError};
 use serde_json::Value;
 use std::io;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -17,9 +18,23 @@ struct State {
 }
 
 /// A sink that writes records to standard output or standard error.
+///
+/// Built on the family-neutral sink driver (RFC 0014): `StdoutDriver`
+/// encodes and writes each page; [`DriverSink`] derives the capabilities and
+/// serves the write paths.
 pub struct StdoutSink {
+    inner: DriverSink<StdoutDriver>,
+}
+
+/// The stdout/stderr I/O primitives.
+pub(crate) struct StdoutDriver {
     config: StdoutSinkConfig,
     state: Mutex<State>,
+}
+
+#[async_trait]
+impl faucet_core::Sink for StdoutSink {
+    faucet_core::forward_sink!(inner);
 }
 
 impl StdoutSink {
@@ -40,15 +55,19 @@ impl StdoutSink {
         writer: Box<dyn AsyncWrite + Unpin + Send>,
     ) -> Self {
         Self {
-            config,
-            state: Mutex::new(State {
-                writer,
-                written: 0,
-                closed: false,
+            inner: DriverSink::new(StdoutDriver {
+                config,
+                state: Mutex::new(State {
+                    writer,
+                    written: 0,
+                    closed: false,
+                }),
             }),
         }
     }
+}
 
+impl StdoutDriver {
     fn encode(&self, record: &Value) -> Result<Vec<u8>, FaucetError> {
         match self.config.format {
             StdoutFormat::JsonLines => {
@@ -135,7 +154,7 @@ fn csv_cell(value: &Value) -> Result<String, FaucetError> {
 }
 
 #[async_trait]
-impl faucet_core::Sink for StdoutSink {
+impl SinkDriver for StdoutDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -157,7 +176,47 @@ impl faucet_core::Sink for StdoutSink {
         }
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    /// Records past `max_records`, or after the consumer closed the pipe, are
+    /// dropped by design and reported as skipped (#879).
+    async fn write(
+        &self,
+        _calls: &CallSlot,
+        records: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        let n = self.write_records(records).await?;
+        Ok(PageWrite::reported(
+            faucet_core::WriteReport::accepted(n).with_skipped(records.len().saturating_sub(n)),
+        ))
+    }
+
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        let mut state = self.state.lock().await;
+        state
+            .writer
+            .flush()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))
+    }
+
+    /// Preflight probe for `faucet doctor`. The standard streams are always
+    /// reachable (the OS hands them to every process), so there is nothing to
+    /// fail on — this always passes immediately.
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        _ctx: &faucet_core::check::CheckContext,
+    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+        use faucet_core::check::{CheckReport, Probe};
+        Ok(CheckReport::single(Probe::pass(
+            "io",
+            std::time::Duration::ZERO,
+        )))
+    }
+}
+
+impl StdoutDriver {
+    async fn write_records(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -199,39 +258,6 @@ impl faucet_core::Sink for StdoutSink {
             written_this_call += 1;
         }
         Ok(written_this_call)
-    }
-
-    /// Records past `max_records`, or after the consumer closed the pipe, are
-    /// dropped by design and reported as skipped (#879).
-    async fn write_batch_reported(
-        &self,
-        records: &[Value],
-    ) -> Result<faucet_core::WriteReport, FaucetError> {
-        let n = self.write_batch(records).await?;
-        Ok(faucet_core::WriteReport::accepted(n).with_skipped(records.len().saturating_sub(n)))
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        let mut state = self.state.lock().await;
-        state
-            .writer
-            .flush()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))
-    }
-
-    /// Preflight probe for `faucet doctor`. The standard streams are always
-    /// reachable (the OS hands them to every process), so there is nothing to
-    /// fail on — this always passes immediately.
-    async fn check(
-        &self,
-        _ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::{CheckReport, Probe};
-        Ok(CheckReport::single(Probe::pass(
-            "io",
-            std::time::Duration::ZERO,
-        )))
     }
 }
 

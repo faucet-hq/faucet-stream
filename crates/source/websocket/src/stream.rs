@@ -3,14 +3,14 @@
 use crate::config::{WebsocketAuth, WebsocketSourceConfig, decode_frame, shape_record};
 use async_trait::async_trait;
 use base64::Engine;
+use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
 use faucet_core::{
-    AuthSpec, CancellationToken, Credential, FaucetError, SharedAuthProvider, Source, Stream,
+    AuthSpec, CallSlot, CancellationToken, Credential, FaucetError, SharedAuthProvider, Source,
     StreamPage,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -135,6 +135,11 @@ pub(crate) fn apply_auth(request: &mut Request, auth: &WebsocketAuth) -> Result<
 
 /// A WebSocket streaming source.
 pub struct WebsocketSource {
+    inner: DriverSource<WebsocketDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct WebsocketDriver {
     config: WebsocketSourceConfig,
     /// Optional shared auth provider. When present, its [`Credential`] is
     /// resolved on every (re)connect so a freshly-rotated token is used after
@@ -143,11 +148,6 @@ pub struct WebsocketSource {
     /// The run's cancellation token ([`Source::set_cancel`]): on cancel the
     /// stream stops reading and yields what it has buffered.
     cancel: std::sync::Mutex<Option<CancellationToken>>,
-    /// Backend-call context (#880) for the handshake: the run's recorder and
-    /// deadline, metered as `connect`. One attempt — the reconnect loop owns
-    /// retries — and no extra attempt timeout: `connect_timeout` bounds each
-    /// step.
-    calls: faucet_core::CallSlot,
 }
 
 impl WebsocketSource {
@@ -157,14 +157,11 @@ impl WebsocketSource {
     pub fn new(config: WebsocketSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         Ok(Self {
-            config,
-            auth_provider: None,
-            cancel: std::sync::Mutex::new(None),
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_retry()
-                    .without_timeout(),
-            ),
+            inner: DriverSource::new(WebsocketDriver {
+                config,
+                auth_provider: None,
+                cancel: std::sync::Mutex::new(None),
+            }),
         })
     }
 
@@ -173,16 +170,31 @@ impl WebsocketSource {
     /// refreshed token is used automatically after reconnect. Takes precedence
     /// over inline auth.
     pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
+        self.inner.driver_mut().auth_provider = Some(provider);
         self
     }
 
+    #[cfg(test)]
+    async fn connect_with(
+        &self,
+        url: &str,
+        cred: Option<faucet_core::Credential>,
+    ) -> Result<WsStream, FaucetError> {
+        self.inner.driver().connect_with(url, cred).await
+    }
+}
+
+#[async_trait]
+impl Source for WebsocketSource {
+    faucet_core::forward_source!(inner);
+}
+
+impl WebsocketDriver {
     /// Whether a connect error came from the run's call context running out —
     /// cancelled, or past its deadline — so reconnecting cannot help.
-    fn call_budget_spent(&self, e: &FaucetError) -> bool {
+    fn call_budget_spent(&self, calls: &CallSlot, e: &FaucetError) -> bool {
         matches!(e, FaucetError::Cancelled { .. })
-            || self
-                .calls
+            || calls
                 .get()
                 .deadline()
                 .is_some_and(|d| tokio::time::Instant::now() >= d)
@@ -194,8 +206,8 @@ impl WebsocketSource {
     /// always pick up a freshly-rotated token from a shared provider, and a
     /// handshake the server rejects (a `401`, or a status the provider declares)
     /// re-authenticates the provider and connects once more (#789 API-06).
-    async fn connect(&self, url: &str) -> Result<WsStream, FaucetError> {
-        self.calls
+    async fn connect(&self, calls: &CallSlot, url: &str) -> Result<WsStream, FaucetError> {
+        calls
             .call("connect", || {
                 faucet_core::send_with_reauth(self.auth_provider.as_ref(), |cred| {
                     self.connect_with(url, cred)
@@ -263,28 +275,23 @@ impl WebsocketSource {
 }
 
 #[async_trait]
-impl Source for WebsocketSource {
-    /// Drain the entire run window into memory. This buffers every record the
-    /// run produces (bounded only by `max_messages` / `idle_timeout`); prefer
-    /// [`Source::stream_pages`] for large or long-running feeds so memory stays
-    /// bounded at `batch_size`.
-    async fn fetch_with_context(
-        &self,
-        context: &HashMap<String, Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        let mut out = Vec::new();
-        let mut pages = self.stream_pages(context, self.config.batch_size);
-        while let Some(page) = pages.next().await {
-            out.extend(page?.records);
-        }
-        Ok(out)
+impl SourceDriver for WebsocketDriver {
+    /// The handshake runs through the call context: the run's recorder and
+    /// deadline, metered as `connect` (#880). One attempt — the reconnect loop
+    /// owns retries — and no extra attempt timeout: `connect_timeout` bounds
+    /// each step.
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_retry()
+            .without_timeout()
     }
 
-    fn stream_pages<'a>(
+    fn read<'a>(
         &'a self,
+        calls: &'a CallSlot,
         context: &'a HashMap<String, Value>,
         _batch_size: usize,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+    ) -> PageStream<'a> {
         let resolved_url = faucet_core::util::substitute_context(&self.config.url, context);
         let record_url = crate::config::envelope_url(&resolved_url);
         let batch_size = self.config.batch_size;
@@ -331,7 +338,7 @@ impl Source for WebsocketSource {
                 let connected = tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
-                    r = self.connect(&resolved_url) => Some(r),
+                    r = self.connect(calls, &resolved_url) => Some(r),
                 };
                 let Some(connected) = connected else {
                     break 'outer;
@@ -342,7 +349,7 @@ impl Source for WebsocketSource {
                     // otherwise never reach `max_reconnect_attempts` (API-33).
                     Ok(ws) => ws,
                     // A cancelled or out-of-time call context ends the read.
-                    Err(e) if self.call_budget_spent(&e) => {
+                    Err(e) if self.call_budget_spent(calls, &e) => {
                         Err(e)?;
                         break 'outer;
                     }
@@ -525,17 +532,6 @@ impl Source for WebsocketSource {
         })
     }
 
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
     fn set_cancel(&self, cancel: CancellationToken) -> bool {
         *self
             .cancel
@@ -549,11 +545,8 @@ impl Source for WebsocketSource {
         serde_json::to_value(&schema).unwrap_or(Value::Null)
     }
 
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::of_source(self)
-            .to_builder()
-            .read_side_effects(true)
-            .build()
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().read_side_effects(true).build()
     }
 
     fn connector_name(&self) -> &'static str {
@@ -564,6 +557,16 @@ impl Source for WebsocketSource {
         faucet_core::redact_uri_credentials(&self.config.url)
     }
 
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        ctx: &faucet_core::check::CheckContext,
+    ) -> Result<Option<faucet_core::check::CheckReport>, FaucetError> {
+        self.probe(ctx).await.map(Some)
+    }
+}
+
+impl WebsocketDriver {
     /// Preflight probe that does **not** open the WebSocket stream.
     ///
     /// The default `Source::check` would call `stream_pages`, which connects,
@@ -573,7 +576,7 @@ impl Source for WebsocketSource {
     /// `ws://`/`wss://` URL, resolve host + port (default 80 for `ws`, 443 for
     /// `wss`), open a [`tokio::net::TcpStream`] (no WS upgrade handshake, no
     /// auth, no frames), and immediately drop it.
-    async fn check(
+    async fn probe(
         &self,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {

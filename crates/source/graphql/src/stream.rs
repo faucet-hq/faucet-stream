@@ -6,6 +6,7 @@ use crate::config::{
 };
 use async_trait::async_trait;
 use base64::Engine as _;
+use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::{
@@ -14,12 +15,11 @@ use faucet_core::replication::{
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
 use faucet_core::{
     AuthSpec, Credential, FaucetError, ReplicationKey, ReplicationMethod, SharedAuthProvider,
-    Stream, StreamPage,
+    StreamPage,
 };
 use jsonpath_rust::JsonPath;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::time::Duration;
 
 /// Retries on transient (5xx / connection) failures before giving up.
@@ -29,6 +29,11 @@ const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// A configured GraphQL source that handles pagination and extraction.
 pub struct GraphqlStream {
+    inner: DriverSource<GraphqlDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct GraphqlDriver {
     config: GraphqlStreamConfig,
     client: Client,
     /// Optional shared auth provider. When set, it takes precedence over inline
@@ -39,10 +44,6 @@ pub struct GraphqlStream {
     /// reproduce the legacy `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`
     /// constants; overridable via [`with_retry_policy`](Self::with_retry_policy).
     retry_policy: faucet_core::RetryPolicy,
-    /// Backend-call context (#880): this source's retry policy over the run's
-    /// cancel token, recorder and deadline. Meters `request` round trips and
-    /// throttling (#638, #734).
-    calls: CallSlot,
     /// Bookmark restored by the pipeline before a run (#751); wins over
     /// `start_replication_value`.
     runtime_start: std::sync::Mutex<Option<Value>>,
@@ -135,9 +136,9 @@ impl GraphqlStream {
     /// (or the TLS identity) fails to build, matching the pre-existing
     /// `Client::new()` behavior.
     pub fn new(config: GraphqlStreamConfig) -> Self {
-        Self::try_new(config).expect(
-            "GraphqlStream::new: client build failed; use try_new() for fallible construction",
-        )
+        Self {
+            inner: DriverSource::new(GraphqlDriver::new(config)),
+        }
     }
 
     /// Fallible constructor — builds the HTTP client, including any mutual-TLS
@@ -147,6 +148,65 @@ impl GraphqlStream {
     /// [`GraphqlStreamConfig::validate`] for the rest, keeping `new()` infallible
     /// for non-TLS configs exactly as before.
     pub fn try_new(config: GraphqlStreamConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSource::new(GraphqlDriver::try_new(config)?),
+        })
+    }
+
+    /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
+    /// request failures, replacing the default derived from
+    /// `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`. Used by the CLI to inject a
+    /// pipeline-level `resilience:` policy into the source.
+    pub fn with_retry_policy(self, policy: faucet_core::RetryPolicy) -> Self {
+        let mut driver = self.inner.into_driver();
+        driver.retry_policy = policy;
+        Self {
+            inner: DriverSource::new(driver),
+        }
+    }
+
+    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set, the
+    /// provider supplies the credential for every request (taking precedence
+    /// over inline auth), so several sources can share one token with
+    /// single-flight refresh. Used by the CLI to resolve `auth: { ref }`, and by
+    /// library callers who construct one provider and inject it into many sources.
+    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
+        self.inner.driver_mut().auth_provider = Some(provider);
+        self
+    }
+
+    /// Fetch all records across all pages.
+    pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
+        self.inner
+            .driver()
+            .fetch_all_with_context(self.inner.calls(), &std::collections::HashMap::new())
+            .await
+    }
+
+    #[cfg(test)]
+    fn bind_bookmark(&self, variables: &mut Value, start: &Value) -> Result<(), FaucetError> {
+        self.inner.driver().bind_bookmark(variables, start)
+    }
+
+    #[cfg(test)]
+    fn extract_records(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
+        self.inner.driver().extract_records(body)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Source for GraphqlStream {
+    faucet_core::forward_source!(inner);
+}
+
+impl GraphqlDriver {
+    fn new(config: GraphqlStreamConfig) -> Self {
+        Self::try_new(config).expect(
+            "GraphqlStream::new: client build failed; use try_new() for fallible construction",
+        )
+    }
+
+    fn try_new(config: GraphqlStreamConfig) -> Result<Self, FaucetError> {
         let mut builder = Client::builder();
         if let Some(t) = config.timeout {
             builder = builder.timeout(t);
@@ -176,37 +236,9 @@ impl GraphqlStream {
             config,
             client,
             auth_provider: None,
-            calls: CallSlot::new(CallContext::new().with_retry(retry_policy.clone())),
             retry_policy,
             runtime_start: std::sync::Mutex::new(None),
         })
-    }
-
-    /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
-    /// request failures, replacing the default derived from
-    /// `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`. Used by the CLI to inject a
-    /// pipeline-level `resilience:` policy into the source.
-    pub fn with_retry_policy(mut self, policy: faucet_core::RetryPolicy) -> Self {
-        self.calls
-            .set_local(self.calls.local().clone().with_retry(policy.clone()));
-        self.retry_policy = policy;
-        self
-    }
-
-    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set, the
-    /// provider supplies the credential for every request (taking precedence
-    /// over inline auth), so several sources can share one token with
-    /// single-flight refresh. Used by the CLI to resolve `auth: { ref }`, and by
-    /// library callers who construct one provider and inject it into many sources.
-    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
-        self
-    }
-
-    /// Fetch all records across all pages.
-    pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
-        self.fetch_all_with_context(&std::collections::HashMap::new())
-            .await
     }
 
     /// Fetch all records, merging parent context values into GraphQL variables.
@@ -214,10 +246,11 @@ impl GraphqlStream {
     /// incremental filtering behave identically.
     async fn fetch_all_with_context(
         &self,
+        calls: &CallSlot,
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
         use futures::StreamExt as _;
-        let mut pages = self.stream_pages_inner(context);
+        let mut pages = self.stream_pages_inner(calls, context);
         let mut all_records = Vec::new();
         while let Some(page) = pages.next().await {
             all_records.extend(page?.records);
@@ -274,6 +307,7 @@ impl GraphqlStream {
     /// active pagination style uses is injected — the other stays inert.
     async fn execute_query(
         &self,
+        calls: &CallSlot,
         cursor: &Option<String>,
         offset: usize,
         context: &std::collections::HashMap<String, Value>,
@@ -398,7 +432,7 @@ impl GraphqlStream {
                 // rule marks them as throttling (#767), which retries the whole
                 // request here.
                 let matches = std::sync::atomic::AtomicU32::new(0);
-                self.calls
+                calls
                     .call("request", || {
                         let attempt = req.try_clone();
                         let matches = &matches;
@@ -516,10 +550,11 @@ impl GraphqlStream {
     /// never below the start bookmark) rides only the final page, or a
     /// trailing empty page when `max_pages` truncates; full-table runs carry
     /// no bookmark.
-    fn stream_pages_inner(
-        &self,
+    fn stream_pages_inner<'a>(
+        &'a self,
+        calls: &'a CallSlot,
         context: &std::collections::HashMap<String, Value>,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + '_>> {
+    ) -> PageStream<'a> {
         // Own the context so it can live inside the async-stream generator.
         let owned_context: std::collections::HashMap<String, Value> = context.clone();
 
@@ -552,7 +587,7 @@ impl GraphqlStream {
                 }
 
                 let body = self
-                    .execute_query(&cursor, offset, &owned_context, start.as_ref())
+                    .execute_query(calls, &cursor, offset, &owned_context, start.as_ref())
                     .await?;
                 let mut records = self.extract_records(&body)?;
                 let records_in_page = records.len();
@@ -688,12 +723,24 @@ impl GraphqlStream {
 }
 
 #[async_trait]
-impl faucet_core::Source for GraphqlStream {
-    async fn fetch_with_context(
+impl SourceDriver for GraphqlDriver {
+    /// This source's retry policy over the run's cancel token, recorder and
+    /// deadline (#880). Meters `request` round trips and throttling (#638,
+    /// #734).
+    fn call_context(&self) -> CallContext {
+        CallContext::new().with_retry(self.retry_policy.clone())
+    }
+
+    async fn fetch(
         &self,
-        context: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        self.fetch_all_with_context(context).await
+        calls: &CallSlot,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+        Some(
+            self.fetch_all_with_context(calls, context)
+                .await
+                .map(|records| (records, None)),
+        )
     }
 
     /// Stream GraphQL responses page-by-page without buffering the full
@@ -702,12 +749,13 @@ impl faucet_core::Source for GraphqlStream {
     /// the user-facing knob the README documents, and routing the
     /// pipeline-supplied hint through it would silently override an
     /// explicit config value.
-    fn stream_pages<'a>(
+    fn read<'a>(
         &'a self,
+        calls: &'a CallSlot,
         context: &'a std::collections::HashMap<String, Value>,
         _batch_size: usize,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
-        self.stream_pages_inner(context)
+    ) -> PageStream<'a> {
+        self.stream_pages_inner(calls, context)
     }
 
     fn connector_name(&self) -> &'static str {
@@ -724,7 +772,7 @@ impl faucet_core::Source for GraphqlStream {
                     "graphql:{:016x}",
                     faucet_core::shard::shard_hash(&format!(
                         "{}\n{}\n{}",
-                        faucet_core::Source::dataset_uri(self),
+                        SourceDriver::dataset_uri(self),
                         self.config.query,
                         self.config.variables
                     ))
@@ -733,24 +781,13 @@ impl faucet_core::Source for GraphqlStream {
         })
     }
 
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+    async fn resume_from(&self, bookmark: Value) -> Result<(), FaucetError> {
         let mut guard = self
             .runtime_start
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(bookmark);
         Ok(())
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -1259,8 +1296,11 @@ mod tests {
             "https://api.example.com/graphql",
             "query { id }",
         ));
-        assert_eq!(stream.retry_policy.max_attempts, RETRY_MAX_ATTEMPTS + 1);
-        assert_eq!(stream.retry_policy.base, RETRY_BASE_BACKOFF);
+        assert_eq!(
+            stream.inner.driver().retry_policy.max_attempts,
+            RETRY_MAX_ATTEMPTS + 1
+        );
+        assert_eq!(stream.inner.driver().retry_policy.base, RETRY_BASE_BACKOFF);
     }
 
     #[test]
@@ -1275,8 +1315,11 @@ mod tests {
             "query { id }",
         ))
         .with_retry_policy(policy);
-        assert_eq!(stream.retry_policy.max_attempts, 9);
-        assert_eq!(stream.retry_policy.base, Duration::from_secs(7));
+        assert_eq!(stream.inner.driver().retry_policy.max_attempts, 9);
+        assert_eq!(
+            stream.inner.driver().retry_policy.base,
+            Duration::from_secs(7)
+        );
     }
 
     #[test]

@@ -86,3 +86,14 @@ and each is metered as a round trip (`open`, `write`, `commit`). A failed or
 cut-short commit poisons the sink for the rest of the run — the buffered rows
 are gone, so the run fails and the page is replayed rather than reported
 written.
+
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `DeltaDriver`
+implements `faucet_core::driver::SinkDriver` (plus `ColumnarDriver`, so Arrow
+batches go straight to the `RecordBatchWriter`) — open or create the table,
+buffer a page, commit on flush or at `target_file_size` — and `DeltaSink`
+wraps it in a `DriverSink`, which derives the capabilities (append only) and
+serves the plain, reported and per-row write paths with row accounting. Every
+table open, write and commit is a call through the run's call context (op
+labels `open`, `write`, `commit`). The public type and config are unchanged.

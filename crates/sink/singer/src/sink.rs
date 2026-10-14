@@ -17,7 +17,8 @@ use faucet_common_singer::message::{
 };
 use faucet_common_singer::{Redactor, write_private_json};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
-use faucet_core::{FaucetError, Sink, Value, WriteMode, async_trait, schema_for};
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver, StagingDriver};
+use faucet_core::{CallSlot, FaucetError, Sink, Value, WriteMode, async_trait, schema_for};
 use tokio::sync::Mutex;
 
 use crate::config::{FlushOn, SingerSinkConfig};
@@ -51,13 +52,15 @@ const WRITE_CHUNK: usize = 64 * 1024;
 /// dependency for pipelines that use it, and throughput is Singer-class
 /// rather than faucet-class. See the crate README.
 pub struct SingerSink {
+    inner: DriverSink<SingerDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct SingerDriver {
     config: SingerSinkConfig,
     redactor: Redactor,
     inner: Mutex<Inner>,
     version: OnceLock<i64>,
-    /// Backend-call context (#880): every write to the target and every wait
-    /// for its confirmation run through it, once.
-    calls: faucet_core::CallSlot,
 }
 
 #[derive(Default)]
@@ -95,25 +98,38 @@ impl SingerSink {
     pub fn new(config: SingerSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         Ok(Self {
-            redactor: Redactor::from_config(&config.target_config),
-            config,
-            inner: Mutex::new(Inner::default()),
-            version: OnceLock::new(),
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
+            inner: DriverSink::new(SingerDriver {
+                redactor: Redactor::from_config(&config.target_config),
+                config,
+                inner: Mutex::new(Inner::default()),
+                version: OnceLock::new(),
+            }),
         })
     }
 
     /// The configuration this sink was built from.
     pub fn config(&self) -> &SingerSinkConfig {
-        &self.config
+        &self.inner.driver().config
     }
 
     /// The table version records carry under `write_mode: overwrite`.
     pub fn activate_version(&self) -> i64 {
+        self.inner.driver().activate_version()
+    }
+
+    #[cfg(test)]
+    fn known_schema(&self, inner: &Inner) -> Option<Value> {
+        self.inner.driver().known_schema(inner)
+    }
+}
+
+#[async_trait]
+impl Sink for SingerSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl SingerDriver {
+    fn activate_version(&self) -> i64 {
         *self.version.get_or_init(|| {
             self.config.activate_version.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -145,11 +161,15 @@ impl SingerSink {
             .or_else(|| inner.inferred.is_object().then(|| inner.inferred.clone()))
     }
 
-    async fn write_page(&self, inner: &mut Inner, records: &[Value]) -> Result<(), FaucetError> {
+    async fn write_page(
+        &self,
+        calls: &CallSlot,
+        inner: &mut Inner,
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
         if inner.process.is_none() {
-            inner.process = Some(
-                TargetProcess::spawn_in(&self.config, &self.redactor, &self.calls.get()).await?,
-            );
+            inner.process =
+                Some(TargetProcess::spawn_in(&self.config, &self.redactor, &calls.get()).await?);
             inner.sent_schema = None;
         }
         let stream = self.config.stream_name();
@@ -243,8 +263,185 @@ pub(crate) fn resolve_command(command: &str) -> Option<std::path::PathBuf> {
 }
 
 #[async_trait]
-impl Sink for SingerSink {
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+impl SinkDriver for SingerDriver {
+    /// Every write to the target and every wait for its confirmation run
+    /// through the call context, once (#880).
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        Ok(PageWrite::accepted(
+            self.write_records(calls, records).await?,
+        ))
+    }
+
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let mut inner = self.inner.lock().await;
+        inner.check_poisoned()?;
+        let result = calls.call_once("confirm", self.confirm(&mut inner)).await;
+        if let Err(e) = &result {
+            inner.sent_schema = None;
+            inner.poison(e);
+        }
+        result
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    fn write_modes(&self) -> &'static [WriteMode] {
+        &[WriteMode::Append, WriteMode::Upsert, WriteMode::Overwrite]
+    }
+
+    fn dedups_by_key(&self) -> bool {
+        false
+    }
+
+    /// `key` goes to an external target whose convergence faucet cannot vouch for.
+    fn sink_guarantee(&self, _derived: faucet_core::SinkGuarantee) -> faucet_core::SinkGuarantee {
+        faucet_core::SinkGuarantee::AtLeastOnce
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
+    }
+
+    fn config_schema(&self) -> Value {
+        serde_json::to_value(schema_for!(SingerSinkConfig)).unwrap_or_default()
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "singer"
+    }
+
+    fn dataset_uri(&self) -> String {
+        let target = std::path::Path::new(&self.config.target_command)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.config.target_command.clone());
+        format!("singer://{target}/{}", self.config.stream_name())
+    }
+
+    /// Non-mutating preflight: the target executable resolves, and its config
+    /// can be materialized to a private temp file. The target is not run — a
+    /// Singer target has no side-effect-free probe mode.
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        _ctx: &CheckContext,
+    ) -> Result<CheckReport, FaucetError> {
+        let start = Instant::now();
+        let command = self.redactor.redact(&self.config.target_command);
+        let executable = match resolve_command(&self.config.target_command) {
+            Some(_) => Probe::pass("executable", start.elapsed()),
+            None => Probe::fail_hint(
+                "executable",
+                start.elapsed(),
+                format!("singer target '{command}' was not found"),
+                "install the target (e.g. `pipx install target-jsonl`) or set `target_command` to its absolute path",
+            ),
+        };
+        let start = Instant::now();
+        let config = match write_private_json("config", &self.config.target_config) {
+            Ok(_) => Probe::pass("config", start.elapsed()),
+            Err(reason) => Probe::fail("config", start.elapsed(), reason),
+        };
+        Ok(CheckReport {
+            probes: vec![executable, config],
+        })
+    }
+}
+
+#[async_trait]
+impl StagingDriver for SingerDriver {
+    fn active(&self) -> bool {
+        self.config.write.is_overwrite()
+    }
+
+    async fn stage(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.activate_version();
+        Ok(())
+    }
+
+    /// Confirm this instance's own records, then run the target once more to
+    /// send `ACTIVATE_VERSION`: the target makes this run's version live and
+    /// discards rows from earlier versions.
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let mut inner = self.inner.lock().await;
+        inner.check_poisoned()?;
+        if let Err(e) = calls.call_once("confirm", self.confirm(&mut inner)).await {
+            inner.poison(&e);
+            return Err(e);
+        }
+        let stream = self.config.stream_name();
+        let mut process =
+            TargetProcess::spawn_in(&self.config, &self.redactor, &calls.get()).await?;
+        let mut buf = Vec::new();
+        // The committing sink is usually not one of the writers: it sends the
+        // schema the run's writers sent. An empty SCHEMA could reset the
+        // target's table, so none is sent when no schema is known (API-60).
+        let written = take_overwrite_schema(&self.run_key());
+        if let Some(schema) = self
+            .config
+            .schema
+            .clone()
+            .or(written)
+            .or_else(|| self.known_schema(&inner))
+        {
+            write_schema(
+                &mut buf,
+                stream,
+                &schema,
+                &self.config.effective_key_properties(),
+            );
+        }
+        write_activate_version(&mut buf, stream, self.activate_version());
+        inner.flush_seq += 1;
+        write_state(&mut buf, &flush_marker(stream, inner.flush_seq));
+        let seq = inner.flush_seq;
+        calls
+            .call_once("confirm", async {
+                process.write(&buf).await?;
+                process.finish_confirmed(seq, self.timeout()).await
+            })
+            .await
+    }
+
+    /// Stop the target without activating: the previous version stays live,
+    /// and a later successful overwrite discards this run's rows.
+    async fn discard(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        take_overwrite_schema(&self.run_key());
+        let mut inner = self.inner.lock().await;
+        self.stop(&mut inner).await;
+        Ok(())
+    }
+
+    /// The overwrite is a table version the target activates; there is no
+    /// staging object to look for.
+    async fn staged(&self, _calls: &CallSlot) -> Result<bool, FaucetError> {
+        Ok(false)
+    }
+
+    fn reports_staged(&self) -> bool {
+        false
+    }
+}
+
+impl SingerDriver {
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -272,9 +469,8 @@ impl Sink for SingerSink {
         let earlier = inner.unconfirmed_pages;
         inner.interrupted = true;
         inner.unconfirmed_pages += 1;
-        let result = self
-            .calls
-            .call_once("write", self.write_page(&mut inner, records))
+        let result = calls
+            .call_once("write", self.write_page(calls, &mut inner, records))
             .await;
         inner.interrupted = false;
         if let Err(e) = result {
@@ -285,155 +481,6 @@ impl Sink for SingerSink {
             return Err(e);
         }
         Ok(records.len())
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        let mut inner = self.inner.lock().await;
-        inner.check_poisoned()?;
-        let result = self
-            .calls
-            .call_once("confirm", self.confirm(&mut inner))
-            .await;
-        if let Err(e) = &result {
-            inner.sent_schema = None;
-            inner.poison(e);
-        }
-        result
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        &[WriteMode::Append, WriteMode::Upsert, WriteMode::Overwrite]
-    }
-
-    fn dedups_by_key(&self) -> bool {
-        false
-    }
-
-    /// `key` goes to an external target whose convergence faucet cannot vouch for.
-    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
-        faucet_core::SinkGuarantee::AtLeastOnce
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.config.write.is_overwrite()
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.activate_version();
-        Ok(())
-    }
-
-    /// Confirm this instance's own records, then run the target once more to
-    /// send `ACTIVATE_VERSION`: the target makes this run's version live and
-    /// discards rows from earlier versions.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        let mut inner = self.inner.lock().await;
-        inner.check_poisoned()?;
-        if let Err(e) = self
-            .calls
-            .call_once("confirm", self.confirm(&mut inner))
-            .await
-        {
-            inner.poison(&e);
-            return Err(e);
-        }
-        let stream = self.config.stream_name();
-        let mut process =
-            TargetProcess::spawn_in(&self.config, &self.redactor, &self.calls.get()).await?;
-        let mut buf = Vec::new();
-        // The committing sink is usually not one of the writers: it sends the
-        // schema the run's writers sent. An empty SCHEMA could reset the
-        // target's table, so none is sent when no schema is known (API-60).
-        let written = take_overwrite_schema(&self.run_key());
-        if let Some(schema) = self
-            .config
-            .schema
-            .clone()
-            .or(written)
-            .or_else(|| self.known_schema(&inner))
-        {
-            write_schema(
-                &mut buf,
-                stream,
-                &schema,
-                &self.config.effective_key_properties(),
-            );
-        }
-        write_activate_version(&mut buf, stream, self.activate_version());
-        inner.flush_seq += 1;
-        write_state(&mut buf, &flush_marker(stream, inner.flush_seq));
-        let seq = inner.flush_seq;
-        self.calls
-            .call_once("confirm", async {
-                process.write(&buf).await?;
-                process.finish_confirmed(seq, self.timeout()).await
-            })
-            .await
-    }
-
-    /// Stop the target without activating: the previous version stays live,
-    /// and a later successful overwrite discards this run's rows.
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        take_overwrite_schema(&self.run_key());
-        let mut inner = self.inner.lock().await;
-        self.stop(&mut inner).await;
-        Ok(())
-    }
-
-    fn config_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(SingerSinkConfig)).unwrap_or_default()
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "singer"
-    }
-
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn dataset_uri(&self) -> String {
-        let target = std::path::Path::new(&self.config.target_command)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.config.target_command.clone());
-        format!("singer://{target}/{}", self.config.stream_name())
-    }
-
-    /// Non-mutating preflight: the target executable resolves, and its config
-    /// can be materialized to a private temp file. The target is not run — a
-    /// Singer target has no side-effect-free probe mode.
-    async fn check(&self, _ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
-        let start = Instant::now();
-        let command = self.redactor.redact(&self.config.target_command);
-        let executable = match resolve_command(&self.config.target_command) {
-            Some(_) => Probe::pass("executable", start.elapsed()),
-            None => Probe::fail_hint(
-                "executable",
-                start.elapsed(),
-                format!("singer target '{command}' was not found"),
-                "install the target (e.g. `pipx install target-jsonl`) or set `target_command` to its absolute path",
-            ),
-        };
-        let start = Instant::now();
-        let config = match write_private_json("config", &self.config.target_config) {
-            Ok(_) => Probe::pass("config", start.elapsed()),
-            Err(reason) => Probe::fail("config", start.elapsed(), reason),
-        };
-        Ok(CheckReport {
-            probes: vec![executable, config],
-        })
     }
 }
 

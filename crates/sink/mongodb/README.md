@@ -341,6 +341,20 @@ Declares `write_mode: append | upsert | delete | overwrite`, idempotent (exactly
 
 Every sink operation runs through the pipeline's `CallContext` (#880) as one backend call named after it (`write_batch`, `write_batch_idempotent`, `last_committed_token`, the overwrite and cleanup steps; each `insert_many` of the per-row path is an `insert`): the run's deadline ends it promptly and it counts as one round trip with that `op` in `faucet_sink_roundtrips_total`. The per-row path still re-sends a batch that failed without per-document errors (the documents keep their `_id`, so a re-send cannot insert one twice); the backoff between re-sends also ends at the deadline.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `MongoDriver`
+implements `faucet_core::driver::SinkDriver` (`insert_many` appends, planned
+`replace_one` / `delete_one` for upsert and delete, per-document outcomes)
+plus the lifecycle groups — `StagingDriver` (the `__faucet_ovw` staging
+collection and the `renameCollection` swap), `CommitTokenDriver` (the page and
+its `_faucet_commit_token` watermark in one multi-document transaction) and
+`CleanupDriver` (one scoped `delete_many`). `MongoSink` wraps it in a
+`DriverSink`, which derives every capability from those groups and serves the
+write paths with row accounting. Every request is a call through the run's
+call context with the same op labels as before. The public type and config
+are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

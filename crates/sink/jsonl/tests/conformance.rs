@@ -103,3 +103,15 @@ fn descriptor_matches_built_sink() {
         &built,
     );
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver.
+#[tokio::test]
+async fn conformance_driver_truthful() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("driver.jsonl");
+    let sink = JsonlSink::new(JsonlSinkConfig::new(&path));
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    sink.flush().await.unwrap();
+    assert_eq!(count_lines(&path), 12);
+}

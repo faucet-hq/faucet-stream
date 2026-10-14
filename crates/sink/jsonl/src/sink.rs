@@ -2,7 +2,8 @@
 
 use crate::config::JsonlSinkConfig;
 use async_trait::async_trait;
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError};
 use serde_json::Value;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -26,6 +27,11 @@ use tokio::sync::Mutex;
     note = "use faucet-sink-file: FileSinkConfig writing a `.jsonl` path"
 )]
 pub struct JsonlSink {
+    inner: DriverSink<JsonlDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct JsonlDriver {
     config: JsonlSinkConfig,
     /// Compiled at-rest encryption (#207), initialized on first use so
     /// `new()` stays infallible. `Err` results surface as typed sink errors.
@@ -50,6 +56,19 @@ pub struct JsonlSink {
 impl JsonlSink {
     /// Create a new JSON Lines sink. The file is opened on first write.
     pub fn new(config: JsonlSinkConfig) -> Self {
+        Self {
+            inner: DriverSink::new(JsonlDriver::new(config)),
+        }
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for JsonlSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl JsonlDriver {
+    fn new(config: JsonlSinkConfig) -> Self {
         Self {
             config,
             #[cfg(feature = "encryption")]
@@ -320,7 +339,7 @@ async fn trim_partial_line(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[async_trait]
-impl faucet_core::Sink for JsonlSink {
+impl SinkDriver for JsonlDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -342,7 +361,66 @@ impl faucet_core::Sink for JsonlSink {
         self.outputs.snapshot()
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write(
+        &self,
+        _calls: &CallSlot,
+        records: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        Ok(PageWrite::accepted(self.write_records(records).await?))
+    }
+
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        let mut guard = self.writer.lock().await;
+        if let Some(mut writer) = guard.take() {
+            use tokio::io::AsyncWriteExt;
+            writer
+                .shutdown()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))?;
+            // Durable before the pipeline records the bookmark.
+            OpenOptions::new()
+                .append(true)
+                .open(&self.config.path)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("fsync open failed: {e}")))?
+                .sync_all()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("fsync failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// With `append: false` the file must hold exactly this run's output, so a
+    /// successful run that wrote no record still truncates it to an empty (or
+    /// empty-compressed) file rather than leaving the previous run's rows in
+    /// place (#753). Only reached after a successful, uncancelled run.
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.config.append || self.opened_once.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        drop(self.ensure_open().await?);
+        self.flush(calls).await
+    }
+
+    /// Preflight probe for `faucet doctor`. Verifies the configured output
+    /// path's parent directory exists and is writable by creating, then
+    /// immediately removing, a uniquely-named temp file there. Never touches
+    /// the user's actual output file, so it is fully idempotent.
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        _ctx: &faucet_core::check::CheckContext,
+    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+        use faucet_core::check::CheckReport;
+        let start = std::time::Instant::now();
+        let probe = crate::probe::probe_parent_writable(&self.config.path, start).await;
+        Ok(CheckReport::single(probe))
+    }
+}
+
+impl JsonlDriver {
+    async fn write_records(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -394,53 +472,6 @@ impl faucet_core::Sink for JsonlSink {
 
         tracing::debug!(records = records.len(), "JSONL batch written");
         Ok(records.len())
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        let mut guard = self.writer.lock().await;
-        if let Some(mut writer) = guard.take() {
-            use tokio::io::AsyncWriteExt;
-            writer
-                .shutdown()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))?;
-            // Durable before the pipeline records the bookmark.
-            OpenOptions::new()
-                .append(true)
-                .open(&self.config.path)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("fsync open failed: {e}")))?
-                .sync_all()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("fsync failed: {e}")))?;
-        }
-        Ok(())
-    }
-
-    /// With `append: false` the file must hold exactly this run's output, so a
-    /// successful run that wrote no record still truncates it to an empty (or
-    /// empty-compressed) file rather than leaving the previous run's rows in
-    /// place (#753). Only reached after a successful, uncancelled run.
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        if self.config.append || self.opened_once.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(());
-        }
-        drop(self.ensure_open().await?);
-        self.flush().await
-    }
-
-    /// Preflight probe for `faucet doctor`. Verifies the configured output
-    /// path's parent directory exists and is writable by creating, then
-    /// immediately removing, a uniquely-named temp file there. Never touches
-    /// the user's actual output file, so it is fully idempotent.
-    async fn check(
-        &self,
-        _ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::CheckReport;
-        let start = std::time::Instant::now();
-        let probe = crate::probe::probe_parent_writable(&self.config.path, start).await;
-        Ok(CheckReport::single(probe))
     }
 }
 

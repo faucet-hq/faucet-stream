@@ -16,6 +16,7 @@ use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, Shared
 
 /// faucet-auth's `FLOW_SESSION_KEY`: the captured key naming a flow session.
 const FLOW_SESSION_KEY: &str = "__session__";
+use faucet_core::driver::{DriverSource, SourceDriver};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
 use futures_core::Stream;
@@ -30,6 +31,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 /// A configured REST API stream that handles pagination, auth, and extraction.
 pub struct RestStream {
+    inner: DriverSource<RestDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct RestDriver {
     config: RestStreamConfig,
     client: Client,
     /// Client for streamed result downloads: `timeout` bounds connect and each
@@ -521,6 +527,165 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
 
 impl RestStream {
     /// Create a new stream from the given configuration.
+    pub fn new(config: RestStreamConfig) -> Result<Self, FaucetError> {
+        Ok(Self::wrap(RestDriver::new(config)?))
+    }
+
+    fn wrap(driver: RestDriver) -> Self {
+        Self {
+            inner: DriverSource::new(driver),
+        }
+    }
+
+    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set, the
+    /// provider supplies the credential for every request (taking precedence
+    /// over inline auth), so several sources can share one token with
+    /// single-flight refresh. Used by the CLI to resolve `auth: { ref }`, and by
+    /// library callers who construct one provider and inject it into many
+    /// sources.
+    pub fn with_auth_provider(self, provider: SharedAuthProvider) -> Self {
+        Self::wrap(self.inner.into_driver().with_auth_provider(provider))
+    }
+
+    /// Pin the run clock — the "now" upper bound of datetime window slicing
+    /// (#527) and the async-job lookback — to an RFC 3339 instant. An
+    /// unparseable value leaves the wall clock in use. Takes a string so callers
+    /// need not depend on `chrono`; the pipeline sets it via
+    /// [`faucet_core::Source::set_run_clock`].
+    pub fn with_run_clock_rfc3339(self, rfc3339: &str) -> Self {
+        Self::wrap(self.inner.into_driver().with_run_clock_rfc3339(rfc3339))
+    }
+
+    /// Alias of [`with_run_clock_rfc3339`](Self::with_run_clock_rfc3339).
+    #[doc(hidden)]
+    pub fn with_now_override_rfc3339(self, rfc3339: &str) -> Self {
+        self.with_run_clock_rfc3339(rfc3339)
+    }
+
+    /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
+    /// request failures, used by the CLI to inject a pipeline-level
+    /// `resilience:` policy.
+    ///
+    /// **Legacy-field precedence:** the REST connector predates the unified
+    /// resilience policy and exposes its own `max_retries` / `retry_backoff`
+    /// config fields. If the user has set either of those away from its default
+    /// (`max_retries: 3`, `retry_backoff: 1s`), those explicit values win and the
+    /// injected `policy` is ignored — an explicit per-connector setting is never
+    /// silently overridden by a pipeline-wide default. When both fields are at
+    /// their defaults, the injected policy takes effect.
+    ///
+    /// **Inert fields on REST:** because the REST source keeps its own
+    /// `429`/`Retry-After`-aware retry runner, it honors only the injected
+    /// policy's `max_attempts` (→ `max_retries`) and `base` (→ `retry_backoff`).
+    /// The policy's `max` (per-sleep cap), `jitter`, and `retry_on` fields are
+    /// **not** honored here — they apply on the `xml`/`graphql` sources and on
+    /// every sink-side write.
+    pub fn with_retry_policy(self, policy: faucet_core::RetryPolicy) -> Self {
+        Self::wrap(self.inner.into_driver().with_retry_policy(policy))
+    }
+
+    /// Fetch all records across all pages as raw JSON values.
+    ///
+    /// When `partitions` are configured, the stream is executed once per
+    /// partition and all results are concatenated.
+    ///
+    /// When `replication_method` is `Incremental` and `replication_key` +
+    /// `start_replication_value` are both set, records at or before the
+    /// bookmark are filtered out.
+    pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
+        self.inner.driver().fetch_all().await
+    }
+
+    /// Fetch all records and deserialize into typed structs.
+    pub async fn fetch_all_as<T: for<'de> Deserialize<'de>>(&self) -> Result<Vec<T>, FaucetError> {
+        self.inner.driver().fetch_all_as().await
+    }
+
+    /// Infer a JSON Schema for this stream's records.
+    ///
+    /// If a `schema` is already set on the config, it is returned immediately
+    /// without making any HTTP requests.
+    ///
+    /// Otherwise the stream fetches up to `schema_sample_size` records
+    /// (respecting `max_pages`) and derives a JSON Schema from them.  Fields
+    /// that are absent in some records, or that carry a `null` value, are
+    /// marked as nullable (`["<type>", "null"]`).
+    ///
+    /// Set `schema_sample_size` to `0` to sample all available records.
+    pub async fn infer_schema(&self) -> Result<Value, FaucetError> {
+        self.inner.driver().infer_schema().await
+    }
+
+    /// Fetch all records in incremental mode, returning the records along with
+    /// the maximum value of `replication_key` observed across those records.
+    ///
+    /// The returned bookmark should be persisted by the caller and passed back
+    /// as `start_replication_value` on the next run.
+    ///
+    /// If no `replication_key` is configured, this behaves identically to
+    /// [`fetch_all`](Self::fetch_all) and the bookmark is `None`.
+    pub async fn fetch_all_incremental(&self) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        self.inner.driver().fetch_all_incremental().await
+    }
+
+    /// Stream API pages without buffering the full result set.
+    ///
+    /// This is a thin convenience wrapper around the
+    /// [`Source::stream_pages`](faucet_core::Source::stream_pages) trait
+    /// method — it discards bookmarks and yields one `Vec<Value>` per
+    /// upstream API page. Use the trait method directly if you need
+    /// per-page bookmarks for incremental replication.
+    ///
+    /// Note: this inherent convenience method does not fan out over
+    /// `partitions`. The `Source::stream_pages` trait impl (what the pipeline
+    /// drives) and [`fetch_all`](Self::fetch_all) do handle multi-partition
+    /// streams (#535).
+    ///
+    /// ```rust,no_run
+    /// use faucet_source_rest::{RestStream, RestStreamConfig};
+    /// use futures::StreamExt;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let stream = RestStream::new(RestStreamConfig::new("https://api.example.com", "/items"))?;
+    /// let mut pages = stream.stream_pages();
+    /// while let Some(page) = pages.next().await {
+    ///     let records = page?;
+    ///     println!("got {} records", records.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stream_pages(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
+        self.inner.driver().stream_pages()
+    }
+
+    #[cfg(test)]
+    fn extract_page(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
+        self.inner.driver().extract_page(body)
+    }
+
+    #[cfg(test)]
+    fn async_job_new_bookmark(&self) -> Option<Value> {
+        self.inner.driver().async_job_new_bookmark()
+    }
+
+    #[cfg(test)]
+    async fn incremental_submit_json(
+        &self,
+        job: &crate::async_job::AsyncJobConfig,
+    ) -> Result<Option<Value>, FaucetError> {
+        self.inner.driver().incremental_submit_json(job).await
+    }
+}
+
+#[async_trait]
+impl faucet_core::Source for RestStream {
+    faucet_core::forward_source!(inner);
+}
+
+impl RestDriver {
     pub fn new(mut config: RestStreamConfig) -> Result<Self, FaucetError> {
         // Derive OData request defaults (paging, `$.value`, query sugar, Prefer)
         // before validation so the checks see the effective request shape.
@@ -772,33 +937,16 @@ impl RestStream {
         max_replication_value_path(records, key).cloned()
     }
 
-    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set, the
-    /// provider supplies the credential for every request (taking precedence
-    /// over inline auth), so several sources can share one token with
-    /// single-flight refresh. Used by the CLI to resolve `auth: { ref }`, and by
-    /// library callers who construct one provider and inject it into many
-    /// sources.
     pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
         self.auth_provider = Some(provider);
         self
     }
 
-    /// Pin the run clock — the "now" upper bound of datetime window slicing
-    /// (#527) and the async-job lookback — to an RFC 3339 instant. An
-    /// unparseable value leaves the wall clock in use. Takes a string so callers
-    /// need not depend on `chrono`; the pipeline sets it via
-    /// [`faucet_core::Source::set_run_clock`].
     pub fn with_run_clock_rfc3339(self, rfc3339: &str) -> Self {
         if let Ok(d) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
-            faucet_core::Source::set_run_clock(&self, d.with_timezone(&chrono::Utc));
+            SourceDriver::set_run_clock(&self, d.with_timezone(&chrono::Utc));
         }
         self
-    }
-
-    /// Alias of [`with_run_clock_rfc3339`](Self::with_run_clock_rfc3339).
-    #[doc(hidden)]
-    pub fn with_now_override_rfc3339(self, rfc3339: &str) -> Self {
-        self.with_run_clock_rfc3339(rfc3339)
     }
 
     /// The run clock, or the wall clock when none was set.
@@ -810,24 +958,6 @@ impl RestStream {
             .unwrap_or_else(chrono::Utc::now)
     }
 
-    /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
-    /// request failures, used by the CLI to inject a pipeline-level
-    /// `resilience:` policy.
-    ///
-    /// **Legacy-field precedence:** the REST connector predates the unified
-    /// resilience policy and exposes its own `max_retries` / `retry_backoff`
-    /// config fields. If the user has set either of those away from its default
-    /// (`max_retries: 3`, `retry_backoff: 1s`), those explicit values win and the
-    /// injected `policy` is ignored — an explicit per-connector setting is never
-    /// silently overridden by a pipeline-wide default. When both fields are at
-    /// their defaults, the injected policy takes effect.
-    ///
-    /// **Inert fields on REST:** because the REST source keeps its own
-    /// `429`/`Retry-After`-aware retry runner, it honors only the injected
-    /// policy's `max_attempts` (→ `max_retries`) and `base` (→ `retry_backoff`).
-    /// The policy's `max` (per-sleep cap), `jitter`, and `retry_on` fields are
-    /// **not** honored here — they apply on the `xml`/`graphql` sources and on
-    /// every sink-side write.
     pub fn with_retry_policy(mut self, policy: faucet_core::RetryPolicy) -> Self {
         let user_changed_legacy_fields = self.config.max_retries != DEFAULT_MAX_RETRIES
             || self.config.retry_backoff != DEFAULT_RETRY_BACKOFF;
@@ -837,14 +967,6 @@ impl RestStream {
         self
     }
 
-    /// Fetch all records across all pages as raw JSON values.
-    ///
-    /// When `partitions` are configured, the stream is executed once per
-    /// partition and all results are concatenated.
-    ///
-    /// When `replication_method` is `Incremental` and `replication_key` +
-    /// `start_replication_value` are both set, records at or before the
-    /// bookmark are filtered out.
     pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
         if self.config.partitions.is_empty() {
             self.fetch_partition(None, None).await
@@ -870,7 +992,6 @@ impl RestStream {
         }
     }
 
-    /// Fetch all records and deserialize into typed structs.
     pub async fn fetch_all_as<T: for<'de> Deserialize<'de>>(&self) -> Result<Vec<T>, FaucetError> {
         let values = self.fetch_all().await?;
         values
@@ -879,17 +1000,6 @@ impl RestStream {
             .collect()
     }
 
-    /// Infer a JSON Schema for this stream's records.
-    ///
-    /// If a `schema` is already set on the config, it is returned immediately
-    /// without making any HTTP requests.
-    ///
-    /// Otherwise the stream fetches up to `schema_sample_size` records
-    /// (respecting `max_pages`) and derives a JSON Schema from them.  Fields
-    /// that are absent in some records, or that carry a `null` value, are
-    /// marked as nullable (`["<type>", "null"]`).
-    ///
-    /// Set `schema_sample_size` to `0` to sample all available records.
     pub async fn infer_schema(&self) -> Result<Value, FaucetError> {
         if let Some(ref s) = self.config.schema {
             return Ok(s.clone());
@@ -902,47 +1012,12 @@ impl RestStream {
         Ok(schema::infer_schema(&records))
     }
 
-    /// Fetch all records in incremental mode, returning the records along with
-    /// the maximum value of `replication_key` observed across those records.
-    ///
-    /// The returned bookmark should be persisted by the caller and passed back
-    /// as `start_replication_value` on the next run.
-    ///
-    /// If no `replication_key` is configured, this behaves identically to
-    /// [`fetch_all`](Self::fetch_all) and the bookmark is `None`.
     pub async fn fetch_all_incremental(&self) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let records = self.fetch_all().await?;
         let bookmark = self.page_replication_max(&records, false);
         Ok((records, bookmark))
     }
 
-    /// Stream API pages without buffering the full result set.
-    ///
-    /// This is a thin convenience wrapper around the
-    /// [`Source::stream_pages`](faucet_core::Source::stream_pages) trait
-    /// method — it discards bookmarks and yields one `Vec<Value>` per
-    /// upstream API page. Use the trait method directly if you need
-    /// per-page bookmarks for incremental replication.
-    ///
-    /// Note: this inherent convenience method does not fan out over
-    /// `partitions`. The `Source::stream_pages` trait impl (what the pipeline
-    /// drives) and [`fetch_all`](Self::fetch_all) do handle multi-partition
-    /// streams (#535).
-    ///
-    /// ```rust,no_run
-    /// use faucet_source_rest::{RestStream, RestStreamConfig};
-    /// use futures::StreamExt;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let stream = RestStream::new(RestStreamConfig::new("https://api.example.com", "/items"))?;
-    /// let mut pages = stream.stream_pages();
-    /// while let Some(page) = pages.next().await {
-    ///     let records = page?;
-    ///     println!("got {} records", records.len());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn stream_pages(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
@@ -3116,36 +3191,19 @@ fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
 }
 
 #[async_trait]
-impl faucet_core::Source for RestStream {
-    async fn fetch_with_context(
+impl SourceDriver for RestDriver {
+    /// The buffered path (`fetch_all` with partitions, or a parent context
+    /// merged into each partition), with the page's replication high-water
+    /// mark as the bookmark.
+    async fn fetch(
         &self,
-        context: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        if context.is_empty() {
-            // No parent context — use normal fetch_all with partitions
-            RestStream::fetch_all(self).await
-        } else if self.config.partitions.is_empty() {
-            // Parent context, no partitions — use context directly as partition context
-            self.fetch_partition(Some(context), None).await
-        } else {
-            // Both parent context and partitions — merge context into each partition
-            let mut all_records = Vec::new();
-            for partition in &self.config.partitions {
-                let mut merged = context.clone();
-                merged.extend(partition.iter().map(|(k, v)| (k.clone(), v.clone())));
-                all_records.extend(self.fetch_partition(Some(&merged), None).await?);
-            }
-            Ok(all_records)
-        }
-    }
-
-    async fn fetch_with_context_incremental(
-        &self,
-        context: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        let records = self.fetch_with_context(context).await?;
-        let bookmark = self.page_replication_max(&records, false);
-        Ok((records, bookmark))
+        _calls: &CallSlot,
+        context: &HashMap<String, Value>,
+    ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+        Some(self.fetch_with_context(context).await.map(|records| {
+            let bookmark = self.page_replication_max(&records, false);
+            (records, bookmark)
+        }))
     }
 
     fn connector_name(&self) -> &'static str {
@@ -3225,14 +3283,15 @@ impl faucet_core::Source for RestStream {
             .then(|| {
                 format!(
                     "rest:{:016x}",
-                    faucet_core::shard::shard_hash(&faucet_core::Source::dataset_uri(self))
+                    faucet_core::shard::shard_hash(&SourceDriver::dataset_uri(self))
                 )
             })
         })
     }
 
-    fn stream_pages<'a>(
+    fn read<'a>(
         &'a self,
+        _calls: &'a CallSlot,
         context: &'a HashMap<String, Value>,
         batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
@@ -3349,7 +3408,7 @@ impl faucet_core::Source for RestStream {
         })
     }
 
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+    async fn resume_from(&self, bookmark: Value) -> Result<(), FaucetError> {
         *self.runtime_start.lock().await = Some(bookmark);
         Ok(())
     }
@@ -3372,8 +3431,9 @@ impl faucet_core::Source for RestStream {
         }
     }
 
-    fn stream_native<'a>(
+    fn read_native<'a>(
         &'a self,
+        _calls: &'a CallSlot,
         _context: &'a HashMap<String, Value>,
         format: faucet_core::NativeFormat,
         _batch_size: usize,
@@ -3490,8 +3550,9 @@ impl faucet_core::Source for RestStream {
     }
 
     #[cfg(feature = "arrow")]
-    fn stream_batches<'a>(
+    fn read_columnar<'a>(
         &'a self,
+        _calls: &'a CallSlot,
         _context: &'a HashMap<String, Value>,
         batch_size: usize,
     ) -> Pin<
@@ -3585,7 +3646,10 @@ impl faucet_core::Source for RestStream {
         self.config.discovery.is_some() || self.config.odata.is_some()
     }
 
-    async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
+    async fn discover(
+        &self,
+        _calls: &CallSlot,
+    ) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
         if let Some(spec) = &self.config.discovery {
             return self.discover_via_recipe(spec).await;
         }
@@ -3680,7 +3744,31 @@ impl faucet_core::Source for RestStream {
     }
 }
 
-impl RestStream {
+impl RestDriver {
+    async fn fetch_with_context(
+        &self,
+        context: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        if context.is_empty() {
+            // No parent context — use normal fetch_all with partitions
+            RestDriver::fetch_all(self).await
+        } else if self.config.partitions.is_empty() {
+            // Parent context, no partitions — use context directly as partition context
+            self.fetch_partition(Some(context), None).await
+        } else {
+            // Both parent context and partitions — merge context into each partition
+            let mut all_records = Vec::new();
+            for partition in &self.config.partitions {
+                let mut merged = context.clone();
+                merged.extend(partition.iter().map(|(k, v)| (k.clone(), v.clone())));
+                all_records.extend(self.fetch_partition(Some(&merged), None).await?);
+            }
+            Ok(all_records)
+        }
+    }
+}
+
+impl RestDriver {
     /// Authed GET for a discovery probe, returning the response body as text.
     /// Shared by the OData `$metadata` and describe-recipe paths.
     async fn discover_get_text(&self, url: &str, what: &str) -> Result<String, FaucetError> {
@@ -4116,8 +4204,11 @@ mod tests {
             ..faucet_core::RetryPolicy::default()
         };
         let stream = stream.with_retry_policy(injected);
-        assert_eq!(stream.retry_policy.max_attempts, 9);
-        assert_eq!(stream.retry_policy.base, Duration::from_secs(7));
+        assert_eq!(stream.inner.driver().retry_policy.max_attempts, 9);
+        assert_eq!(
+            stream.inner.driver().retry_policy.base,
+            Duration::from_secs(7)
+        );
     }
 
     #[test]
@@ -4127,7 +4218,7 @@ mod tests {
         let config = RestStreamConfig::new("https://api.example.com", "/items").max_retries(7);
         let stream = RestStream::new(config).unwrap();
         // Default policy derived from legacy fields: max_attempts = 7 + 1.
-        assert_eq!(stream.retry_policy.max_attempts, 8);
+        assert_eq!(stream.inner.driver().retry_policy.max_attempts, 8);
         let injected = faucet_core::RetryPolicy {
             max_attempts: 99,
             base: Duration::from_secs(42),
@@ -4135,8 +4226,11 @@ mod tests {
         };
         let stream = stream.with_retry_policy(injected);
         // Unchanged: the legacy max_retries(7) still wins.
-        assert_eq!(stream.retry_policy.max_attempts, 8);
-        assert_eq!(stream.retry_policy.base, DEFAULT_RETRY_BACKOFF);
+        assert_eq!(stream.inner.driver().retry_policy.max_attempts, 8);
+        assert_eq!(
+            stream.inner.driver().retry_policy.base,
+            DEFAULT_RETRY_BACKOFF
+        );
     }
 
     #[test]
@@ -4580,7 +4674,7 @@ mod tests {
         let s = RestStream::new(cfg).unwrap();
         assert_eq!(s.incremental_submit_json(&job).await.unwrap(), None);
         let bad = RestStream::new(RestStreamConfig::new("https://shop.example", "/g")).unwrap();
-        *bad.runtime_start.lock().await = Some(json!({ "not": "a scalar" }));
+        *bad.inner.driver().runtime_start.lock().await = Some(json!({ "not": "a scalar" }));
         assert!(bad.incremental_submit_json(&template_job()).await.is_err());
     }
 

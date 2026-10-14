@@ -2,7 +2,8 @@
 
 use crate::config::CsvSinkConfig;
 use async_trait::async_trait;
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError};
 use serde_json::Value;
 use std::fs::OpenOptions;
 use std::sync::Mutex;
@@ -72,6 +73,11 @@ struct WriterState {
     note = "use faucet-sink-file: FileSinkConfig with `format: csv`, CSV options under `csv:`"
 )]
 pub struct CsvSink {
+    inner: DriverSink<CsvDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct CsvDriver {
     config: CsvSinkConfig,
     state: Mutex<Option<WriterState>>,
     /// The column order frozen at the first open, retained **across `flush()`**.
@@ -108,6 +114,29 @@ impl CsvSink {
     /// Create a new CSV sink. The file is opened on the first `write_batch` call.
     pub fn new(config: CsvSinkConfig) -> Self {
         Self {
+            inner: DriverSink::new(CsvDriver::new(config)),
+        }
+    }
+
+    #[cfg(test)]
+    fn d(&self) -> &CsvDriver {
+        self.inner.driver()
+    }
+
+    #[cfg(test)]
+    fn value_to_csv_field(value: &Value) -> String {
+        CsvDriver::value_to_csv_field(value)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for CsvSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl CsvDriver {
+    fn new(config: CsvSinkConfig) -> Self {
+        Self {
             config,
             state: Mutex::new(None),
             frozen_columns: Mutex::new(None),
@@ -142,15 +171,15 @@ impl CsvSink {
 }
 
 #[async_trait]
-impl faucet_core::Sink for CsvSink {
+impl SinkDriver for CsvDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
 
     /// Derived, plus [`SchemaReport::DropsUnknownFields`](faucet_core::SchemaReport)
     /// under `on_unknown_field: warn`, whose frozen header drops new fields.
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        let base = faucet_core::Capabilities::of_sink(self);
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        let base = derived;
         if self.config.on_unknown_field == crate::config::OnUnknownField::Warn {
             base.to_builder()
                 .schema_report(faucet_core::SchemaReport::DropsUnknownFields)
@@ -176,7 +205,98 @@ impl faucet_core::Sink for CsvSink {
         self.outputs.snapshot()
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write(
+        &self,
+        _calls: &CallSlot,
+        records: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        Ok(PageWrite::accepted(self.write_records(records).await?))
+    }
+
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.check_poisoned()?;
+        // Take the state out of the mutex so we can move it into a blocking
+        // task. Replacing it with None means the next write_batch reopens
+        // the file in append mode — for compressed output this starts a
+        // fresh gzip/zstd member, which decoders read back transparently.
+        let state = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|e| FaucetError::Sink(format!("CSV sink lock poisoned: {e}")))?;
+            guard.take()
+        };
+        if let Some(state) = state {
+            tokio::task::spawn_blocking(move || -> Result<(), FaucetError> {
+                let WriterState { writer, .. } = state;
+                // Flush the csv serializer's buffer and recover the inner
+                // writer so the compression encoder can be finalised with its
+                // error captured, rather than swallowed on drop (#78/#41).
+                let inner = writer
+                    .into_inner()
+                    .map_err(|e| FaucetError::Sink(format!("CSV flush failed: {e}")))?;
+                #[cfg(feature = "compression")]
+                let file = inner.finish().map_err(|e| {
+                    FaucetError::Sink(format!("CSV compression finalise failed: {e}"))
+                })?;
+                #[cfg(not(feature = "compression"))]
+                let file = inner;
+                // Durable before the pipeline records the bookmark.
+                file.sync_all()
+                    .map_err(|e| FaucetError::Sink(format!("CSV fsync failed: {e}")))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| FaucetError::Sink(format!("CSV flush task failed: {e}")))??;
+        }
+        Ok(())
+    }
+
+    /// With `append: false` the file must hold exactly this run's output, so a
+    /// successful run that wrote no record still truncates it (#753). There is
+    /// no record to derive a header from, so the result is an empty file (an
+    /// empty gzip / zstd stream under compression). Only reached after a
+    /// successful, uncancelled run.
+    async fn complete_run(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.config.append || self.opened_once.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.outputs
+            .record_open_probing_with(std::path::PathBuf::from(&self.config.path), true);
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || truncate_blocking(&config))
+            .await
+            .map_err(|e| FaucetError::Sink(format!("CSV truncate task failed: {e}")))??;
+        self.opened_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Preflight probe for `faucet doctor`. Verifies the configured output
+    /// path's parent directory exists and is writable by creating, then
+    /// immediately removing, a uniquely-named temp file there. Never touches
+    /// the user's actual output file, so it is fully idempotent.
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        _ctx: &faucet_core::check::CheckContext,
+    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+        use faucet_core::check::CheckReport;
+        let path = self.config.path.clone();
+        // The filesystem probe is synchronous; run it on a blocking thread to
+        // stay off the async runtime, matching how the sink does its I/O.
+        let probe = tokio::task::spawn_blocking(move || {
+            crate::probe::probe_parent_writable(&path, std::time::Instant::now())
+        })
+        .await
+        .map_err(|e| FaucetError::Sink(format!("CSV check task failed: {e}")))?;
+        Ok(CheckReport::single(probe))
+    }
+}
+
+impl CsvDriver {
+    async fn write_records(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.check_poisoned()?;
         if records.is_empty() {
             return Ok(0);
@@ -284,85 +404,6 @@ impl faucet_core::Sink for CsvSink {
         }
 
         Ok(count)
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.check_poisoned()?;
-        // Take the state out of the mutex so we can move it into a blocking
-        // task. Replacing it with None means the next write_batch reopens
-        // the file in append mode — for compressed output this starts a
-        // fresh gzip/zstd member, which decoders read back transparently.
-        let state = {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|e| FaucetError::Sink(format!("CSV sink lock poisoned: {e}")))?;
-            guard.take()
-        };
-        if let Some(state) = state {
-            tokio::task::spawn_blocking(move || -> Result<(), FaucetError> {
-                let WriterState { writer, .. } = state;
-                // Flush the csv serializer's buffer and recover the inner
-                // writer so the compression encoder can be finalised with its
-                // error captured, rather than swallowed on drop (#78/#41).
-                let inner = writer
-                    .into_inner()
-                    .map_err(|e| FaucetError::Sink(format!("CSV flush failed: {e}")))?;
-                #[cfg(feature = "compression")]
-                let file = inner.finish().map_err(|e| {
-                    FaucetError::Sink(format!("CSV compression finalise failed: {e}"))
-                })?;
-                #[cfg(not(feature = "compression"))]
-                let file = inner;
-                // Durable before the pipeline records the bookmark.
-                file.sync_all()
-                    .map_err(|e| FaucetError::Sink(format!("CSV fsync failed: {e}")))?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| FaucetError::Sink(format!("CSV flush task failed: {e}")))??;
-        }
-        Ok(())
-    }
-
-    /// With `append: false` the file must hold exactly this run's output, so a
-    /// successful run that wrote no record still truncates it (#753). There is
-    /// no record to derive a header from, so the result is an empty file (an
-    /// empty gzip / zstd stream under compression). Only reached after a
-    /// successful, uncancelled run.
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        if self.config.append || self.opened_once.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(());
-        }
-        self.outputs
-            .record_open_probing_with(std::path::PathBuf::from(&self.config.path), true);
-        let config = self.config.clone();
-        tokio::task::spawn_blocking(move || truncate_blocking(&config))
-            .await
-            .map_err(|e| FaucetError::Sink(format!("CSV truncate task failed: {e}")))??;
-        self.opened_once
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Preflight probe for `faucet doctor`. Verifies the configured output
-    /// path's parent directory exists and is writable by creating, then
-    /// immediately removing, a uniquely-named temp file there. Never touches
-    /// the user's actual output file, so it is fully idempotent.
-    async fn check(
-        &self,
-        _ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::CheckReport;
-        let path = self.config.path.clone();
-        // The filesystem probe is synchronous; run it on a blocking thread to
-        // stay off the async runtime, matching how the sink does its I/O.
-        let probe = tokio::task::spawn_blocking(move || {
-            crate::probe::probe_parent_writable(&path, std::time::Instant::now())
-        })
-        .await
-        .map_err(|e| FaucetError::Sink(format!("CSV check task failed: {e}")))?;
-        Ok(CheckReport::single(probe))
     }
 }
 
@@ -817,7 +858,7 @@ fn write_rows_to<W: std::io::Write>(
             .map(|col| {
                 record
                     .get(col)
-                    .map(CsvSink::value_to_csv_field)
+                    .map(CsvDriver::value_to_csv_field)
                     .unwrap_or_default()
             })
             .collect();
@@ -989,7 +1030,7 @@ mod tests {
     async fn a_poisoned_sink_refuses_writes_and_flushes() {
         let tmp = NamedTempFile::new().unwrap();
         let sink = CsvSink::new(CsvSinkConfig::new(tmp.path().to_str().unwrap()));
-        *sink.poisoned.lock().unwrap() = Some("lost rows".into());
+        *sink.d().poisoned.lock().unwrap() = Some("lost rows".into());
         let err = sink.write_batch(&[json!({"a": 1})]).await.unwrap_err();
         assert!(err.to_string().contains("lost rows"), "{err}");
         assert!(sink.flush().await.is_err());
@@ -1137,7 +1178,8 @@ mod tests {
         assert_eq!(count, 1);
         // The one-shot warn flag must have latched (warning path exercised).
         assert!(
-            sink.warned_unknown
+            sink.d()
+                .warned_unknown
                 .load(std::sync::atomic::Ordering::Relaxed),
             "the unknown-field warning must have fired"
         );
@@ -1200,6 +1242,7 @@ mod tests {
         sink.flush().await.unwrap();
         assert!(
             !sink
+                .d()
                 .warned_unknown
                 .load(std::sync::atomic::Ordering::Relaxed),
             "first-batch union must not trigger the unknown-field warning"

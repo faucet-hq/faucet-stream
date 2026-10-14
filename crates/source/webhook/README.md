@@ -329,6 +329,17 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabilities: no exactly-once replay, discovery, sharding, columnar or native path. `faucet list --json` prints the declaration.
 
+## How it is built
+
+The source runs on the family-neutral source driver (RFC 0014):
+`WebhookDriver` implements `faucet_core::driver::SourceDriver` — `fetch`
+serves the endpoint until the window closes and returns what arrived, `read`
+pages that by `batch_size` (`faucet_core::driver::pages_of`), and `check`
+probes the listen address without starting the receive loop — and
+`WebhookSource` wraps it in a `DriverSource`. Reads have side effects (a
+sender is answered), which the driver adds to the derived capabilities. The
+public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

@@ -62,7 +62,7 @@ async fn conformance_keyed_battery() {
     let Some((_c, endpoint, client)) = start().await else {
         return;
     };
-    for t in ["caps", "modes", "replay", "declared"] {
+    for t in ["caps", "modes", "replay", "declared", "driver"] {
         keyed_table(&client, t).await;
     }
 
@@ -84,6 +84,12 @@ async fn conformance_keyed_battery() {
     faucet_conformance::assert_partial_outcomes_truthful(&sink, || count(&client, "declared"))
         .await;
     faucet_conformance::assert_replay_safe(&sink, || count(&client, "declared")).await;
+
+    // RFC 0014: the sink runs on the family-neutral sink driver.
+    let sink = keyed_sink(&endpoint, "driver").await;
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    assert_eq!(count(&client, "driver").await, 12);
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

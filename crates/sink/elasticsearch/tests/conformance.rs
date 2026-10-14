@@ -319,3 +319,35 @@ async fn conformance_roundtrips_recorded() {
     let sink = ElasticsearchSink::new(ElasticsearchSinkConfig::new(server.uri(), "idx")).unwrap();
     faucet_conformance::calls::assert_sink_records_roundtrips(&sink, &[json!({"id": 1})]).await;
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver with the
+/// staging, schema and cleanup groups.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)] // probes the 1.x staging hook the driver answers until faucet-core 2.0 (RFC 0014)
+async fn conformance_driver_truthful() {
+    let server = MockServer::start().await;
+    let store = BulkDocStore::new();
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(store.clone())
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"acknowledged": true})))
+        .mount(&server)
+        .await;
+    let config = ElasticsearchSinkConfig {
+        write: WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".to_string()],
+            delete_marker: None,
+            rollback: None,
+        },
+        ..ElasticsearchSinkConfig::new(server.uri(), "idx")
+    };
+    let sink = ElasticsearchSink::new(config).unwrap();
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    assert_eq!(store.count(), 12);
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), None);
+}

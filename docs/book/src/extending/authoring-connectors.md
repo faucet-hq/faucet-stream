@@ -114,11 +114,22 @@ The groups are `StagingDriver` (overwrite), `CommitTokenDriver`
 batches directly). `DriverSink` serves the plain, reported and per-row write
 paths from `write`, checks every result against the rows offered (a write that
 loses rows fails with `RowsUnaccounted`), and `DriverSink::check_declarations`
-refuses write modes that disagree with the groups.
+refuses write modes that disagree with the groups. An overwrite whose
+destination has no staging object to look for (a table version a target
+activates) returns `false` from `StagingDriver::reports_staged`, and the
+staging probe answers "unknown"; a destination that cannot vouch for keyed
+convergence lowers the derived guarantee with `SinkDriver::sink_guarantee`.
 
 A source is the same shape: `SourceDriver::read` streams `StreamPage`s (each
 with the bookmark to resume after it), and `DriverSource` provides the fetch,
-stream, resume and probe hooks from it.
+stream, resume and probe hooks from it. A source with its own buffered path
+returns it from `fetch` (the buffered fetches use it instead of draining
+`read`); one with no native paging reads everything and pages it with
+`faucet_core::driver::pages_of`. The optional primitives — `read_native`
+(raw bytes), `read_columnar` (Arrow), `discover`, `set_run_clock` — reach
+the matching `Source` hooks, and `set_call_context` /
+`set_roundtrip_recorder` hand the run's context to a driver whose client
+keeps its own call slot.
 
 ### A SQL sink
 

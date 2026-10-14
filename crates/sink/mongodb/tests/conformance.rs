@@ -158,6 +158,18 @@ mod idempotent {
         let overwrite = MongoSink::new(config).await.expect("overwrite sink new");
         faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
     }
+    /// RFC 0014: the sink runs on the family-neutral sink driver with the
+    /// staging, commit-token and cleanup groups.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_driver_truthful() {
+        let (_container, uri, sink) = fresh_sink().await;
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+        faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+        assert_eq!(count_docs(&uri).await, 12);
+        let (_keyed_container, _keyed_uri, keyed) = keyed_sink().await;
+        faucet_conformance::assert_driver_declarations_truthful(&keyed).await;
+        faucet_conformance::assert_driver_row_paths_agree(&keyed).await;
+    }
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

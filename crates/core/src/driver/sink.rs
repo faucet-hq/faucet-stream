@@ -18,6 +18,7 @@ use crate::cleanup::SeenKeys;
 use crate::dlq::BatchAtomicity;
 use crate::drift::SchemaEvolution;
 use crate::error::FaucetError;
+use crate::idempotency::SinkGuarantee;
 use crate::io::{CallContext, CallSlot};
 use crate::local_outputs::LocalOutput;
 use crate::observability::RoundtripRecorder;
@@ -113,6 +114,14 @@ pub trait StagingDriver: Send + Sync {
 
     /// Whether a staging target exists right now (a read-only probe).
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError>;
+
+    /// Whether [`staged`](Self::staged) can answer. A destination whose
+    /// overwrite leaves no staging object it can look for returns `false`,
+    /// and [`Sink::overwrite_staging_exists`] reports "unknown". Default:
+    /// `true`.
+    fn reports_staged(&self) -> bool {
+        true
+    }
 }
 
 /// The exactly-once primitives of a destination: rows and a commit token
@@ -344,6 +353,13 @@ pub trait SinkDriver: Send + Sync {
         derived
     }
 
+    /// Adjust the delivery guarantee [`DriverSink`] derived (an external
+    /// target whose keyed convergence faucet cannot vouch for). Default:
+    /// unchanged.
+    fn sink_guarantee(&self, derived: SinkGuarantee) -> SinkGuarantee {
+        derived
+    }
+
     /// The overwrite primitives.
     fn staging(&self) -> Option<&dyn StagingDriver> {
         None
@@ -568,6 +584,17 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
         self.driver.capabilities(Capabilities::of_sink(self))
     }
 
+    fn sink_guarantee(&self) -> SinkGuarantee {
+        let derived = if self.supports_idempotent_writes() {
+            SinkGuarantee::AtomicWatermark
+        } else if self.driver.write_modes().contains(&WriteMode::Upsert) {
+            SinkGuarantee::KeyedUpsert
+        } else {
+            SinkGuarantee::AtLeastOnce
+        };
+        self.driver.sink_guarantee(derived)
+    }
+
     fn write_batch_is_replay_safe(&self) -> bool {
         self.driver.write_is_replay_safe()
     }
@@ -680,8 +707,8 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
 
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
         match self.driver.staging() {
-            Some(s) => s.staged(&self.calls).await.map(Some),
-            None => Ok(None),
+            Some(s) if s.reports_staged() => s.staged(&self.calls).await.map(Some),
+            _ => Ok(None),
         }
     }
 

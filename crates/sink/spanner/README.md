@@ -150,6 +150,20 @@ read-write transaction is unchanged), any caller deadline ends it, and each is
 metered as a round trip (`metadata`, `commit`, `ddl`, `query`).
 `ddl_timeout_secs` still bounds a schema change.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `SpannerDriver`
+implements `faucet_core::driver::SinkDriver` (`Insert` / `InsertOrUpdate` /
+`Delete` mutations, chunked by the commit cell budget, with per-row key
+failures) plus the lifecycle groups — `CommitTokenDriver` (the page and its
+`faucet_commit_token` row in one read-write transaction), `SchemaDriver`
+(`INFORMATION_SCHEMA` reads and additive DDL) and `CleanupDriver` (scoped
+read-then-delete in one transaction). `SpannerSink` wraps it in a
+`DriverSink`, which derives every capability from those groups and serves the
+write paths with row accounting. Every read, commit and DDL operation is a
+call through the run's call context with the same op labels as before. The
+public type and config are unchanged.
+
 ## License
 
 MIT OR Apache-2.0

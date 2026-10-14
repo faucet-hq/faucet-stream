@@ -455,6 +455,16 @@ Redirects are followed by `faucet_core::http::Client`: a hop to another
 origin drops `Authorization`, cookies and every credential header, and a request
 body is never replayed to another origin.
 
+## How it is built
+
+The source runs on the family-neutral source driver (RFC 0014): `XmlDriver`
+implements `faucet_core::driver::SourceDriver` — `read` streams the response
+records page by page (event-driven parse, pagination, SOAP), and `fetch` keeps
+the buffered all-at-once path — and `XmlStream` wraps it in a `DriverSource`,
+which owns the run's call context and hands it to every request (op label
+`request`, with this source's retry policy as its local default). The public
+type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

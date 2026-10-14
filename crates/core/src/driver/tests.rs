@@ -1450,3 +1450,238 @@ async fn the_remaining_defaults_answer() {
         crate::BatchAtomicity::BestEffort
     );
 }
+
+#[test]
+fn sink_guarantee_is_derived_and_a_driver_may_lower_it() {
+    use crate::idempotency::SinkGuarantee;
+    struct Keyed(bool);
+    #[async_trait]
+    impl SinkDriver for Keyed {
+        fn connector_name(&self) -> &'static str {
+            "keyed"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            r: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(r.len()))
+        }
+        fn write_modes(&self) -> &'static [WriteMode] {
+            &[WriteMode::Append, WriteMode::Upsert]
+        }
+        fn sink_guarantee(&self, derived: SinkGuarantee) -> SinkGuarantee {
+            if self.0 {
+                SinkGuarantee::AtLeastOnce
+            } else {
+                derived
+            }
+        }
+    }
+    assert_eq!(
+        DriverSink::new(Keyed(false)).sink_guarantee(),
+        SinkGuarantee::KeyedUpsert
+    );
+    assert_eq!(
+        DriverSink::new(Keyed(true)).sink_guarantee(),
+        SinkGuarantee::AtLeastOnce
+    );
+    struct Plain;
+    #[async_trait]
+    impl SinkDriver for Plain {
+        fn connector_name(&self) -> &'static str {
+            "plain"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            r: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(r.len()))
+        }
+    }
+    assert_eq!(
+        DriverSink::new(Plain).sink_guarantee(),
+        SinkGuarantee::AtLeastOnce
+    );
+}
+
+#[tokio::test]
+async fn a_staging_driver_that_cannot_look_for_staging_reports_unknown() {
+    struct Versioned;
+    #[async_trait]
+    impl SinkDriver for Versioned {
+        fn connector_name(&self) -> &'static str {
+            "versioned"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            r: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(r.len()))
+        }
+        fn write_modes(&self) -> &'static [WriteMode] {
+            &[WriteMode::Append, WriteMode::Overwrite]
+        }
+        fn staging(&self) -> Option<&dyn StagingDriver> {
+            Some(self)
+        }
+    }
+    #[async_trait]
+    impl StagingDriver for Versioned {
+        fn active(&self) -> bool {
+            true
+        }
+        async fn stage(&self, _: &CallSlot) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn publish(&self, _: &CallSlot) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn discard(&self, _: &CallSlot) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn staged(&self, _: &CallSlot) -> Result<bool, FaucetError> {
+            unreachable!("never probed")
+        }
+        fn reports_staged(&self) -> bool {
+            false
+        }
+    }
+    let sink = DriverSink::new(Versioned);
+    assert!(sink.is_overwrite());
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), None);
+    sink.begin_overwrite().await.unwrap();
+    sink.commit_overwrite().await.unwrap();
+    sink.abort_overwrite().await.unwrap();
+}
+
+#[tokio::test]
+async fn source_driver_defaults_and_overrides_reach_the_source() {
+    struct Plain;
+    #[async_trait]
+    impl SourceDriver for Plain {
+        fn connector_name(&self) -> &'static str {
+            "plain"
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a CallSlot,
+            _: &'a HashMap<String, Value>,
+            _: usize,
+        ) -> PageStream<'a> {
+            Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+                records: vec![json!(1)],
+                bookmark: Some(json!(1)),
+            })]))
+        }
+    }
+    let plain = DriverSource::new(Plain);
+    plain.set_run_clock(chrono::Utc::now());
+    plain.set_call_context(CallContext::new());
+    assert!(plain.native_output_formats().is_empty());
+    assert!(!plain.supports_discover());
+    assert!(
+        plain
+            .discover()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("discovery")
+    );
+    let empty = HashMap::new();
+    let mut native = plain.stream_native(&empty, crate::native::NativeFormat::NdJson, 1);
+    use futures::StreamExt as _;
+    assert!(native.next().await.unwrap().is_err());
+    #[cfg(feature = "arrow")]
+    {
+        assert!(!plain.supports_columnar());
+        let mut cols = plain.stream_batches(&empty, 1);
+        assert!(cols.next().await.unwrap().is_err());
+    }
+    assert_eq!(
+        plain.fetch_all_incremental().await.unwrap().1,
+        Some(json!(1))
+    );
+
+    struct Buffered(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl SourceDriver for Buffered {
+        fn connector_name(&self) -> &'static str {
+            "buffered"
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a CallSlot,
+            _: &'a HashMap<String, Value>,
+            _: usize,
+        ) -> PageStream<'a> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn fetch(
+            &self,
+            _: &CallSlot,
+            _: &HashMap<String, Value>,
+        ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+            Some(Ok((vec![json!("a"), json!("b")], None)))
+        }
+        fn set_run_clock(&self, _: chrono::DateTime<chrono::Utc>) {
+            self.0.lock().unwrap().push("clock".into());
+        }
+        fn set_call_context(&self, _: CallContext) {
+            self.0.lock().unwrap().push("ctx".into());
+        }
+        fn set_roundtrip_recorder(&self, _: Arc<crate::observability::RoundtripRecorder>) {
+            self.0.lock().unwrap().push("recorder".into());
+        }
+        fn native_output_formats(&self) -> &'static [crate::native::NativeFormat] {
+            &[crate::native::NativeFormat::NdJson]
+        }
+        fn supports_discover(&self) -> bool {
+            true
+        }
+        async fn discover(
+            &self,
+            _: &CallSlot,
+        ) -> Result<Vec<crate::discover::DatasetDescriptor>, FaucetError> {
+            Ok(Vec::new())
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let b = DriverSource::new(Buffered(Arc::clone(&log)));
+    assert_eq!(b.fetch_all().await.unwrap().len(), 2);
+    assert_eq!(b.fetch_all_incremental().await.unwrap().1, None);
+    b.set_run_clock(chrono::Utc::now());
+    b.set_call_context(CallContext::new());
+    b.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+        crate::observability::RoundtripSide::Source,
+        "p",
+        "r",
+        "buffered",
+    )));
+    assert_eq!(*log.lock().unwrap(), vec!["clock", "ctx", "recorder"]);
+    assert_eq!(b.native_output_formats().len(), 1);
+    assert!(b.supports_discover());
+    assert!(b.discover().await.unwrap().is_empty());
+}
+
+#[test]
+fn pages_of_chunks_and_puts_the_bookmark_last() {
+    let rows = |n: usize| (0..n).map(|i| json!(i)).collect::<Vec<_>>();
+    let pages: Vec<_> = pages_of(rows(5), Some(json!("b")), 2).collect();
+    assert_eq!(
+        pages.iter().map(|p| p.records.len()).collect::<Vec<_>>(),
+        vec![2, 2, 1]
+    );
+    assert!(pages[..2].iter().all(|p| p.bookmark.is_none()));
+    assert_eq!(pages[2].bookmark, Some(json!("b")));
+    assert_eq!(pages_of(rows(5), None, 0).count(), 1);
+    let empty: Vec<_> = pages_of(Vec::new(), Some(json!(1)), 10).collect();
+    assert_eq!(empty.len(), 1);
+    assert!(empty[0].records.is_empty());
+    assert_eq!(pages_of(Vec::new(), None, 10).count(), 0);
+}
