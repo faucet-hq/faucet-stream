@@ -7,8 +7,9 @@ use faucet_common_snowflake::{
     CancelOnDrop, SnowflakeAuth, authorization_header, cancel_statement, credential_to_auth,
     http_client, snowflake_token_type,
 };
+use faucet_core::driver::{CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SinkDriver};
 use faucet_core::util::quote_ident;
-use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider};
+use faucet_core::{AuthSpec, CallSlot, FaucetError, SharedAuthProvider, WriteReport};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,7 +17,16 @@ use tokio::sync::OnceCell;
 
 /// A sink that writes JSON records to a Snowflake table using the
 /// SQL REST API.
+///
+/// Built on the family-neutral sink driver (RFC 0014): [`SnowflakeDriver`]
+/// holds the statement paths and [`DriverSink`] serves the plain, reported,
+/// per-row and exactly-once writes from them.
 pub struct SnowflakeSink {
+    inner: DriverSink<SnowflakeDriver>,
+}
+
+/// The Snowflake I/O primitives the sink runs on.
+pub(crate) struct SnowflakeDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
@@ -27,15 +37,13 @@ pub struct SnowflakeSink {
     pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     config: SnowflakeSinkConfig,
     client: Client,
-    /// Backend-call context (#880): every request runs through it, once.
-    calls: faucet_core::CallSlot,
     /// Optional explicit endpoint override. When `None`, the URL is derived
     /// from `config.account`. Used by tests to point the sink at a mock
     /// server, and useful for proxies / private-link deployments.
     endpoint: Option<String>,
     /// Optional shared auth provider. When set, takes precedence over inline
     /// auth; the provider yields a `Bearer` or `Token` credential mapped onto
-    /// [`SnowflakeAuth::OAuth`]. Set via [`Self::with_auth_provider`].
+    /// [`SnowflakeAuth::OAuth`]. Set via [`SnowflakeSink::with_auth_provider`].
     auth_provider: Option<SharedAuthProvider>,
     /// One-shot guard so the exactly-once watermark table's
     /// `CREATE TABLE IF NOT EXISTS` DDL runs at most once per sink instance
@@ -98,7 +106,7 @@ struct SnowflakeResponse {
     statement_handle: Option<String>,
     /// Result rows for a completed query (`[["cell", …], …]`); the SQL REST
     /// API renders every cell as a JSON string (or `null`). Only consumed by
-    /// [`SnowflakeSink::last_committed_token`].
+    /// the watermark read.
     #[serde(default)]
     data: Option<Vec<Vec<Value>>>,
 }
@@ -119,7 +127,7 @@ fn check_statement_code(sf_resp: &SnowflakeResponse) -> Result<(), FaucetError> 
     Ok(())
 }
 
-impl SnowflakeSink {
+impl SnowflakeDriver {
     /// Commit one accumulated group as a single warehouse operation (#617).
     ///
     /// `batch_size` still bounds the size of an individual REST request, so a
@@ -127,7 +135,11 @@ impl SnowflakeSink {
     /// sweet spot — but the *group* is what accumulation controls, and a small
     /// source page no longer forces its own query.
     /// On failure, also returns how many leading rows did land.
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
+    async fn commit_group(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+    ) -> Result<(), (usize, FaucetError)> {
         let chunk = if self.config.batch_size == 0 {
             rows.len().max(1)
         } else {
@@ -148,7 +160,7 @@ impl SnowflakeSink {
                 warn_if_oversized_statement(&sql);
                 let parameters =
                     json!({ "MULTI_STATEMENT_COUNT": (inserts.len() + 2).to_string() });
-                self.execute_statement(&sql, None, Some(parameters))
+                self.execute_statement(calls, &sql, None, Some(parameters))
                     .await
                     .map_err(|e| (done, e))?;
                 done += slice.len();
@@ -158,7 +170,7 @@ impl SnowflakeSink {
                 let part = &slice[range];
                 let (sql, payload) = self.build_insert(part).map_err(|e| (done, e))?;
                 let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
-                self.execute_sql(&sql, Some(bindings))
+                self.execute_sql(calls, &sql, Some(bindings))
                     .await
                     .map_err(|e| (done, e))?;
                 done += part.len();
@@ -172,10 +184,11 @@ impl SnowflakeSink {
     /// write or `flush` commits them instead of dropping them (SQL-04).
     async fn commit_or_restore(
         &self,
+        calls: &CallSlot,
         rows: Vec<Value>,
         keep_end: usize,
     ) -> Result<(), FaucetError> {
-        if let Err((done, e)) = self.commit_group(&rows).await {
+        if let Err((done, e)) = self.commit_group(calls, &rows).await {
             if done < keep_end {
                 let mut rows = rows;
                 rows.truncate(keep_end);
@@ -191,7 +204,11 @@ impl SnowflakeSink {
     ///
     /// Snowflake DDL auto-commits, so the `CREATE TABLE IF NOT EXISTS` is its
     /// own request — the same rule the watermark table already follows.
-    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_table_ready(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
         use std::sync::atomic::Ordering;
         if self.table_ready.load(Ordering::Relaxed) || !self.config.create_table {
             // With `create_table: false` there is nothing to do here: the
@@ -211,7 +228,7 @@ impl SnowflakeSink {
             &self.config.table,
             &columns,
         );
-        self.execute_sql(&sql, None).await?;
+        self.execute_sql(calls, &sql, None).await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -220,10 +237,10 @@ impl SnowflakeSink {
     /// a column: with `create_table` a missing one is added as a nullable
     /// `STRING`; without it the write fails naming the fields, before any row
     /// of the page is buffered.
-    async fn ensure_columns(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_columns(&self, calls: &CallSlot, records: &[Value]) -> Result<(), FaucetError> {
         let loaded = self.columns.lock().map(|c| c.is_some()).unwrap_or(false);
         if !loaded {
-            let cols = self.describe_table().await?;
+            let cols = self.describe_table(calls).await?;
             if let Ok(mut slot) = self.columns.lock() {
                 slot.get_or_insert(cols);
             }
@@ -258,7 +275,7 @@ impl SnowflakeSink {
                 quote_ident(&self.config.table),
                 quote_ident(column)
             );
-            self.execute_sql(&sql, None).await?;
+            self.execute_sql(calls, &sql, None).await?;
             if let Ok(mut slot) = self.columns.lock()
                 && let Some(cols) = slot.as_mut()
             {
@@ -269,7 +286,7 @@ impl SnowflakeSink {
     }
 
     /// Read the target's column names and types from `information_schema`.
-    async fn describe_table(&self) -> Result<TableColumns, FaucetError> {
+    async fn describe_table(&self, calls: &CallSlot) -> Result<TableColumns, FaucetError> {
         let sql = format!(
             "SELECT column_name, data_type FROM {}.information_schema.columns \
              WHERE table_schema = ? AND table_name = ?",
@@ -279,7 +296,9 @@ impl SnowflakeSink {
             "1": { "type": "TEXT", "value": self.config.schema },
             "2": { "type": "TEXT", "value": self.config.table },
         });
-        let resp = self.execute_statement(&sql, Some(bindings), None).await?;
+        let resp = self
+            .execute_statement(calls, &sql, Some(bindings), None)
+            .await?;
         Ok(table_columns(resp.data.unwrap_or_default()))
     }
 
@@ -333,11 +352,7 @@ impl SnowflakeSink {
             .collect()
     }
 
-    /// Create a new Snowflake sink.
-    ///
-    /// Returns [`FaucetError::Config`] if `batch_size` exceeds
-    /// `MAX_BATCH_SIZE` (#78/#44).
-    pub fn new(config: SnowflakeSinkConfig) -> Result<Self, FaucetError> {
+    fn new(config: SnowflakeSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         // `bulk_load` (Arrow columnar COPY) only functions with the `arrow`
         // feature compiled in — reject a config that requests it otherwise so
@@ -359,40 +374,12 @@ impl SnowflakeSink {
             columns: std::sync::Mutex::new(None),
             config,
             client: http_client()?,
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
             endpoint: None,
             auth_provider: None,
             commit_table_ready: OnceCell::new(),
             #[cfg(feature = "arrow")]
             bulk_store: OnceCell::new(),
         })
-    }
-
-    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set,
-    /// the provider supplies the credential for every request (taking
-    /// precedence over inline auth), so several sinks can share one OAuth
-    /// token with single-flight refresh. Used by the CLI to resolve
-    /// `auth: { ref }`, and by library callers who inject a provider directly.
-    ///
-    /// The provider must yield a `Bearer` or `Token` credential, which maps
-    /// onto [`SnowflakeAuth::OAuth`]. Key-pair JWT cannot be supplied via a
-    /// provider (JWT is minted locally from the RSA key).
-    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
-        self
-    }
-
-    /// Override the API endpoint URL (full URL including
-    /// `/api/v2/statements`). When set, this URL is used verbatim instead
-    /// of the account-derived `https://{account}.snowflakecomputing.com/...`
-    /// URL. Intended for tests (wiremock) and proxy / private-link setups.
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = Some(endpoint.into());
-        self
     }
 
     /// Build the SQL REST API endpoint URL.
@@ -438,8 +425,13 @@ impl SnowflakeSink {
     /// bindings (`{"1": {"type": "TEXT", "value": ...}}`). Convenience
     /// wrapper over [`Self::execute_statement`] for callers that don't need
     /// the parsed response.
-    async fn execute_sql(&self, sql: &str, bindings: Option<Value>) -> Result<(), FaucetError> {
-        self.execute_statement(sql, bindings, None)
+    async fn execute_sql(
+        &self,
+        calls: &CallSlot,
+        sql: &str,
+        bindings: Option<Value>,
+    ) -> Result<(), FaucetError> {
+        self.execute_statement(calls, sql, bindings, None)
             .await
             .map(|_| ())
     }
@@ -453,6 +445,7 @@ impl SnowflakeSink {
     /// `MULTI_STATEMENT_COUNT` for a multi-statement transaction).
     async fn execute_statement(
         &self,
+        calls: &CallSlot,
         sql: &str,
         bindings: Option<Value>,
         parameters: Option<Value>,
@@ -477,8 +470,7 @@ impl SnowflakeSink {
             body["parameters"] = parameters;
         }
 
-        let resp = self
-            .calls
+        let resp = calls
             .call("submit", || async {
                 Ok(self
                     .client
@@ -519,7 +511,7 @@ impl SnowflakeSink {
                     "Snowflake returned HTTP 202 without a statementHandle to poll".into(),
                 )
             })?;
-            return self.poll_until_complete(&handle).await;
+            return self.poll_until_complete(calls, &handle).await;
         }
 
         check_statement_code(&sf_resp)?;
@@ -530,7 +522,11 @@ impl SnowflakeSink {
     /// executing (HTTP 200 + code `090001`), bounded by `poll_timeout`.
     /// Returns the final parsed response (which carries the result `data`
     /// for a completed query).
-    async fn poll_until_complete(&self, handle: &str) -> Result<SnowflakeResponse, FaucetError> {
+    async fn poll_until_complete(
+        &self,
+        calls: &CallSlot,
+        handle: &str,
+    ) -> Result<SnowflakeResponse, FaucetError> {
         let url = format!("{}/{}", self.api_url(), handle);
         let poll_timeout = self.config.poll_timeout;
         let started = std::time::Instant::now();
@@ -543,8 +539,7 @@ impl SnowflakeSink {
             // rotation (#146).
             let (auth, token_type) = self.auth_header().await?;
             guard.set_auth(auth.clone(), token_type);
-            let resp = self
-                .calls
+            let resp = calls
                 .call("poll", || async {
                     Ok(self
                         .client
@@ -572,9 +567,7 @@ impl SnowflakeSink {
                         poll_timeout.as_secs()
                     )));
                 }
-                self.calls
-                    .wait(std::time::Duration::from_millis(500))
-                    .await?;
+                calls.wait(std::time::Duration::from_millis(500)).await?;
                 continue;
             }
             if !status.is_success() {
@@ -600,14 +593,14 @@ impl SnowflakeSink {
     /// transaction. On failure the guard cell stays empty, so the next call
     /// retries the DDL instead of proceeding against a possibly-missing
     /// table.
-    async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
+    async fn ensure_commit_table(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         self.commit_table_ready
             .get_or_try_init(|| async {
                 let sql = idempotent::build_create_commit_table(
                     &self.config.database,
                     &self.config.schema,
                 );
-                self.execute_sql(&sql, None).await
+                self.execute_sql(calls, &sql, None).await
             })
             .await
             .map(|_| ())
@@ -855,8 +848,174 @@ fn build_create_table_sql(
     .expect("snowflake CREATE TABLE")
 }
 
+impl SnowflakeSink {
+    /// Create a new Snowflake sink.
+    ///
+    /// Returns [`FaucetError::Config`] if `batch_size` exceeds
+    /// `MAX_BATCH_SIZE` (#78/#44).
+    pub fn new(config: SnowflakeSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(SnowflakeDriver::new(config)?),
+        })
+    }
+
+    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set,
+    /// the provider supplies the credential for every request (taking
+    /// precedence over inline auth), so several sinks can share one OAuth
+    /// token with single-flight refresh. Used by the CLI to resolve
+    /// `auth: { ref }`, and by library callers who inject a provider directly.
+    ///
+    /// The provider must yield a `Bearer` or `Token` credential, which maps
+    /// onto [`SnowflakeAuth::OAuth`]. Key-pair JWT cannot be supplied via a
+    /// provider (JWT is minted locally from the RSA key).
+    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
+        self.inner.driver_mut().auth_provider = Some(provider);
+        self
+    }
+
+    /// Override the API endpoint URL (full URL including
+    /// `/api/v2/statements`). When set, this URL is used verbatim instead
+    /// of the account-derived `https://{account}.snowflakecomputing.com/...`
+    /// URL. Intended for tests (wiremock) and proxy / private-link setups.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.inner.driver_mut().endpoint = Some(endpoint.into());
+        self
+    }
+}
+
+#[cfg(test)]
+impl SnowflakeSink {
+    fn driver(&self) -> &SnowflakeDriver {
+        self.inner.driver()
+    }
+    fn api_url(&self) -> String {
+        self.driver().api_url()
+    }
+    async fn auth_header(&self) -> Result<(String, &'static str), FaucetError> {
+        self.driver().auth_header().await
+    }
+    fn build_insert(&self, records: &[Value]) -> Result<(String, String), FaucetError> {
+        self.driver().build_insert(records)
+    }
+    fn normalize_records(&self, records: &[Value]) -> Result<Vec<Value>, FaucetError> {
+        self.driver().normalize_records(records)
+    }
+    fn column_union(records: &[Value]) -> Result<Vec<String>, FaucetError> {
+        SnowflakeDriver::column_union(records)
+    }
+}
+
 #[async_trait]
 impl faucet_core::Sink for SnowflakeSink {
+    #[cfg(feature = "arrow")]
+    faucet_core::forward_sink!(inner; except write_batch_columnar);
+    #[cfg(not(feature = "arrow"))]
+    faucet_core::forward_sink!(inner);
+
+    /// Write one Arrow [`RecordBatch`](arrow::array::RecordBatch) through the
+    /// `bulk_load` external stage. A sink with no stage does not advertise
+    /// columnar; calling this directly fails rather than taking the row path.
+    #[cfg(feature = "arrow")]
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        if batch.num_rows() > 0 && self.inner.driver().config.bulk_load.is_none() {
+            return Err(FaucetError::Sink(
+                "Snowflake columnar write requested with no `bulk_load` stage configured".into(),
+            ));
+        }
+        self.inner.write_batch_columnar(batch).await
+    }
+}
+
+impl SnowflakeDriver {
+    /// Commit whatever the cross-page accumulator holds (#617).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so a buffered group is always committed before the bookmark
+    /// advances — records left in the accumulator after a "successful" run
+    /// would be data loss with a green exit code.
+    async fn flush_pending(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let group = {
+            let mut open = self.pending.lock().await;
+            open.finish()
+        };
+        if let Some(rows) = group {
+            let len = rows.len();
+            self.commit_or_restore(calls, rows, len).await?;
+        }
+        Ok(())
+    }
+
+    /// The DLQ path commits per page (SQL-21): earlier buffered rows are
+    /// committed first, then this page alone, so a failed commit names exactly
+    /// the rows of *this* page that did not land.
+    async fn write_partial(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.flush_pending(calls).await?;
+        self.ensure_table_ready(calls, records).await?;
+        self.ensure_columns(calls, records).await?;
+        match self.commit_group(calls, records).await {
+            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
+            Err((0, e)) => Err(e),
+            Err((done, e)) => {
+                let message = e.to_string();
+                Ok((0..records.len())
+                    .map(|i| {
+                        if i < done {
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink(format!(
+                                "snowflake: write failed: {message}"
+                            )))
+                        }
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_table_ready(calls, records).await?;
+        self.ensure_columns(calls, records).await?;
+
+        // Accumulate across calls and commit once per threshold (#617). A
+        // warehouse query per small page is dominated by per-query overhead,
+        // and `batch_size` could only ever split a page, never merge two.
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.push_page(records)
+        };
+        if let Some(rows) = group {
+            let keep_end = rows.len() - records.len();
+            self.commit_or_restore(calls, rows, keep_end).await?;
+        }
+        let total = records.len();
+
+        tracing::info!(
+            table = %format!(
+                "{}.{}.{}",
+                self.config.database, self.config.schema, self.config.table
+            ),
+            rows = total,
+            "Snowflake write complete"
+        );
+        Ok(total)
+    }
+}
+
+#[async_trait]
+impl SinkDriver for SnowflakeDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -865,20 +1024,15 @@ impl faucet_core::Sink for SnowflakeSink {
         "snowflake"
     }
 
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
     }
 
     /// Snowflake bulk-loads via `COPY INTO … FROM @stage` under `bulk_load`
     /// (#528). Advertise the `staging` capability.
-    fn supports_staged_load(&self) -> bool {
+    fn staged_load(&self) -> bool {
         true
     }
 
@@ -905,13 +1059,15 @@ impl faucet_core::Sink for SnowflakeSink {
     /// `Fail` probe with a hint. Tokens are never placed in the reason/hint.
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
         let started = std::time::Instant::now();
 
-        let result = tokio::time::timeout(ctx.timeout, self.execute_sql("SELECT 1", None)).await;
+        let result =
+            tokio::time::timeout(ctx.timeout, self.execute_sql(calls, "SELECT 1", None)).await;
 
         let probe = match result {
             Ok(Ok(())) => Probe::pass("auth", started.elapsed()),
@@ -935,90 +1091,80 @@ impl faucet_core::Sink for SnowflakeSink {
         Ok(CheckReport::single(probe))
     }
 
-    /// Commit whatever the cross-page accumulator holds (#617).
-    ///
-    /// The pipeline calls `flush` at every bookmark-carrying page and once at
-    /// the end, so a buffered group is always committed before the bookmark
-    /// advances — records left in the accumulator after a "successful" run
-    /// would be data loss with a green exit code.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        let group = {
-            let mut open = self.pending.lock().await;
-            open.finish()
-        };
-        if let Some(rows) = group {
-            let len = rows.len();
-            self.commit_or_restore(rows, len).await?;
-        }
-        Ok(())
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.flush_pending(calls).await
     }
 
-    /// The DLQ path commits per page (SQL-21): earlier buffered rows are
-    /// committed first, then this page alone, so a failed commit names exactly
-    /// the rows of *this* page that did not land.
-    async fn write_batch_partial(
+    async fn write(
         &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.flush().await?;
-        self.ensure_table_ready(records).await?;
-        self.ensure_columns(records).await?;
-        match self.commit_group(records).await {
-            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
-            Err((0, e)) => Err(e),
-            Err((done, e)) => {
-                let message = e.to_string();
-                Ok((0..records.len())
-                    .map(|i| {
-                        if i < done {
-                            Ok(())
-                        } else {
-                            Err(FaucetError::Sink(format!(
-                                "snowflake: write failed: {message}"
-                            )))
-                        }
-                    })
-                    .collect())
-            }
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => Ok(PageWrite::accepted(self.write_page(calls, rows).await?)),
         }
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        self.ensure_table_ready(records).await?;
-        self.ensure_columns(records).await?;
-
-        // Accumulate across calls and commit once per threshold (#617). A
-        // warehouse query per small page is dominated by per-query overhead,
-        // and `batch_size` could only ever split a page, never merge two.
-        let group = {
-            let mut pending = self.pending.lock().await;
-            pending.push_page(records)
-        };
-        if let Some(rows) = group {
-            let keep_end = rows.len() - records.len();
-            self.commit_or_restore(rows, keep_end).await?;
-        }
-        let total = records.len();
-
-        tracing::info!(
-            table = %format!(
-                "{}.{}.{}",
-                self.config.database, self.config.schema, self.config.table
-            ),
-            rows = total,
-            "Snowflake write complete"
-        );
-        Ok(total)
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
+    /// Columnar bulk-load is available only when a `bulk_load` external stage
+    /// is configured (#381). Otherwise the sink participates on the row path.
+    #[cfg(feature = "arrow")]
+    fn columnar(&self) -> Option<&dyn faucet_core::driver::ColumnarDriver> {
+        self.config
+            .bulk_load
+            .is_some()
+            .then_some(self as &dyn faucet_core::driver::ColumnarDriver)
+    }
+}
+
+#[async_trait]
+impl CommitTokenDriver for SnowflakeDriver {
+    /// Read the last durably-committed token for `scope` from the watermark
+    /// table, so the pipeline can skip already-committed pages on resume.
+    ///
+    /// The token string is treated as **opaque** — it may carry a `#` + JSON
+    /// bookmark suffix appended by core; this sink never parses or validates
+    /// its format.
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        self.ensure_commit_table(calls).await?;
+
+        let sql = idempotent::build_select_token(&self.config.database, &self.config.schema);
+        let bindings = json!({ "1": { "type": "TEXT", "value": scope } });
+        let resp = self
+            .execute_statement(calls, &sql, Some(bindings), None)
+            .await?;
+
+        // A completed SELECT always carries a `data` array (empty when the
+        // scope has no watermark row yet). If it is somehow absent we cannot
+        // tell "no committed token" from "token present but unreadable" — and
+        // a wrong `None` would replay an already-committed page, producing
+        // duplicates. Fail safe instead.
+        let rows = resp.data.ok_or_else(|| {
+            FaucetError::Sink(
+                "Snowflake watermark read returned no result data; cannot trust the token result"
+                    .into(),
+            )
+        })?;
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => match row.first() {
+                Some(Value::String(token)) => Ok(Some(token.clone())),
+                other => Err(FaucetError::Sink(format!(
+                    "Snowflake watermark row has an unexpected token cell: {other:?}"
+                ))),
+            },
+        }
     }
 
     /// Atomically write `records` and record `token` for `scope` in one
@@ -1034,16 +1180,17 @@ impl faucet_core::Sink for SnowflakeSink {
     /// page across transactions would break the atomicity of rows + token).
     /// An empty page still advances the watermark via a commit-only
     /// `BEGIN; MERGE; COMMIT;` transaction.
-    async fn write_batch_idempotent(
+    async fn write_with_token(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
-    ) -> Result<usize, FaucetError> {
-        self.ensure_commit_table().await?;
+    ) -> Result<WriteReport, FaucetError> {
+        self.ensure_commit_table(calls).await?;
         if !records.is_empty() {
-            self.ensure_table_ready(records).await?;
-            self.ensure_columns(records).await?;
+            self.ensure_table_ready(calls, records).await?;
+            self.ensure_columns(calls, records).await?;
         }
 
         let (sql, count) = if records.is_empty() {
@@ -1071,7 +1218,8 @@ impl faucet_core::Sink for SnowflakeSink {
 
         warn_if_oversized_statement(&sql);
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
-        self.execute_statement(&sql, None, Some(parameters)).await?;
+        self.execute_statement(calls, &sql, None, Some(parameters))
+            .await?;
 
         tracing::info!(
             table = %format!(
@@ -1082,61 +1230,22 @@ impl faucet_core::Sink for SnowflakeSink {
             token = %token,
             "Snowflake exactly-once page committed"
         );
-        Ok(records.len())
+        Ok(WriteReport::accepted(records.len()))
     }
+}
 
-    /// Read the last durably-committed token for `scope` from the watermark
-    /// table, so the pipeline can skip already-committed pages on resume.
-    ///
-    /// The token string is treated as **opaque** — it may carry a `#` + JSON
-    /// bookmark suffix appended by core; this sink never parses or validates
-    /// its format.
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.ensure_commit_table().await?;
-
-        let sql = idempotent::build_select_token(&self.config.database, &self.config.schema);
-        let bindings = json!({ "1": { "type": "TEXT", "value": scope } });
-        let resp = self.execute_statement(&sql, Some(bindings), None).await?;
-
-        // A completed SELECT always carries a `data` array (empty when the
-        // scope has no watermark row yet). If it is somehow absent we cannot
-        // tell "no committed token" from "token present but unreadable" — and
-        // a wrong `None` would replay an already-committed page, producing
-        // duplicates. Fail safe instead.
-        let rows = resp.data.ok_or_else(|| {
-            FaucetError::Sink(
-                "Snowflake watermark read returned no result data; cannot trust the token result"
-                    .into(),
-            )
-        })?;
-        match rows.first() {
-            None => Ok(None),
-            Some(row) => match row.first() {
-                Some(Value::String(token)) => Ok(Some(token.clone())),
-                other => Err(FaucetError::Sink(format!(
-                    "Snowflake watermark row has an unexpected token cell: {other:?}"
-                ))),
-            },
-        }
-    }
-
-    /// Columnar bulk-load is available only when a `bulk_load` external stage
-    /// is configured (#381). Otherwise the sink participates on the row path
-    /// via the default `write_batch_columnar` fallback.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.config.bulk_load.is_some()
-    }
-
-    /// Write one Arrow [`RecordBatch`](arrow::array::RecordBatch) by encoding
-    /// it to a self-contained Parquet file, uploading it to the external
-    /// stage's backing storage, and issuing `COPY INTO … FILE_FORMAT=(TYPE=
-    /// PARQUET)` over the SQL REST API. Append-only — the exactly-once
-    /// watermark path stays on the `Value` route (the pipeline never selects
-    /// the columnar loop when exactly-once is configured).
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
+/// Write one Arrow [`RecordBatch`](arrow::array::RecordBatch) by encoding
+/// it to a self-contained Parquet file, uploading it to the external
+/// stage's backing storage, and issuing `COPY INTO … FILE_FORMAT=(TYPE=
+/// PARQUET)` over the SQL REST API. Append-only — the exactly-once
+/// watermark path stays on the `Value` route (the pipeline never selects
+/// the columnar loop when exactly-once is configured).
+#[cfg(feature = "arrow")]
+#[async_trait]
+impl faucet_core::driver::ColumnarDriver for SnowflakeDriver {
+    async fn write_columnar(
         &self,
+        calls: &CallSlot,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
         if batch.num_rows() == 0 {
@@ -1160,7 +1269,7 @@ impl faucet_core::Sink for SnowflakeSink {
             .get_or_try_init(|| async { crate::bulk::resolve_store(stage) })
             .await?;
         let file = format!("faucet-{}.parquet", uuid::Uuid::new_v4());
-        self.calls
+        calls
             .call_once("stage", crate::bulk::upload(store, &file, bytes))
             .await?;
 
@@ -1172,7 +1281,7 @@ impl faucet_core::Sink for SnowflakeSink {
             stage,
             &file,
         );
-        self.execute_sql(&sql, None).await?;
+        self.execute_sql(calls, &sql, None).await?;
 
         tracing::info!(
             table = %format!(
@@ -1337,7 +1446,7 @@ mod tests {
             SnowflakeAuth::OAuth { token: "t".into() },
         ))
         .unwrap();
-        *sink.columns.lock().unwrap() = Some(cols);
+        *sink.driver().columns.lock().unwrap() = Some(cols);
         let out = sink
             .normalize_records(&[
                 json!({"id": 1, "amount": "9.99", "created": "2024-01-02T03:04:05Z"}),
