@@ -3959,7 +3959,7 @@ impl Sink for CapturingSink {
     // wrapped sink.
     faucet_core::forward_sink!(inner; except
         write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported, supports_columnar, write_batch_columnar,
+        write_batch_idempotent_reported, write_governed, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
 
     async fn write_batch_reported(
@@ -3967,6 +3967,23 @@ impl Sink for CapturingSink {
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let report = self.inner.write_batch_reported(records).await?;
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+        Ok(report)
+    }
+
+    async fn write_governed(
+        &self,
+        page: &faucet_core::governance::GovernedPage<'_>,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let records = page.records();
+        let report = self.inner.write_governed(page).await?;
         let n = (report.accepted + report.coalesced).min(records.len());
         let mut buf = self.captured.lock().await;
         buf.extend(
@@ -4075,7 +4092,7 @@ impl Sink for LimitedSink {
     // and native paths stay at the trait default (the idempotent default calls
     // write_batch); everything else reaches the wrapped sink.
     faucet_core::forward_sink!(inner; except
-        write_batch_partial, commit_overwrite, write_batch, write_batch_reported,
+        write_batch_partial, commit_overwrite, write_batch, write_batch_reported, write_governed,
         supports_idempotent_writes,
         write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
@@ -4126,6 +4143,22 @@ impl Sink for LimitedSink {
         self.remaining
             .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
         Ok(report.with_skipped(report.skipped + (records.len() - take)))
+    }
+
+    async fn write_governed(
+        &self,
+        page: &faucet_core::governance::GovernedPage<'_>,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let take = remaining.min(page.len());
+        let report = if take == 0 {
+            faucet_core::WriteReport::default()
+        } else {
+            self.inner.write_governed(&page.slice(0..take)).await?
+        };
+        self.remaining
+            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
+        Ok(report.with_skipped(report.skipped + (page.len() - take)))
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);

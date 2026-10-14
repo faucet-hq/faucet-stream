@@ -235,7 +235,8 @@ impl Sink for SamplingSink {
     // columnar build the fast path stays at the trait default (off).
     faucet_core::forward_sink!(inner; except
         write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported, load_native, write_batch_columnar, supports_columnar);
+        write_batch_idempotent_reported, write_governed, load_native, write_batch_columnar,
+        supports_columnar);
 
     async fn write_batch_reported(
         &self,
@@ -243,6 +244,15 @@ impl Sink for SamplingSink {
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let r = self.inner.write_batch_reported(records).await?;
         self.state.observe(records);
+        Ok(r)
+    }
+
+    async fn write_governed(
+        &self,
+        page: &faucet_core::governance::GovernedPage<'_>,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let r = self.inner.write_governed(page).await?;
+        self.state.observe(page.records());
         Ok(r)
     }
 
