@@ -126,6 +126,9 @@ async fn conformance_capabilities_truthful() {
     // The honest branch must leave the append-only sink non-idempotent.
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
+    // RFC 0014: the sink runs on the object-store family driver.
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 }
 
 /// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`

@@ -186,6 +186,9 @@ async fn declared_capabilities() {
         visible_records(host_ref, bucket, "cancel/").await
     })
     .await;
+    // RFC 0014: the sink runs on the object-store family driver.
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 
     reqwest::Client::new()
         .post(format!(
