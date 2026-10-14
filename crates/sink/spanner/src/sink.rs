@@ -15,7 +15,10 @@ use faucet_common_spanner::encode::{EncodedKind, canonical_kind, encode_to_kind}
 use faucet_common_spanner::quote_ident_spanner;
 use faucet_common_spanner::types::{SpannerType, parse_spanner_type, spanner_type_to_json_schema};
 use faucet_core::CallExt as _;
-use faucet_core::FaucetError;
+use faucet_core::driver::{
+    CleanupDriver, CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver,
+};
+use faucet_core::{CallSlot, FaucetError};
 use gcloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
 use gcloud_googleapis::spanner::v1::Mutation;
 use gcloud_spanner::client::Client;
@@ -476,6 +479,11 @@ fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
 
 /// A sink that writes JSON records to a Cloud Spanner table.
 pub struct SpannerSink {
+    inner: DriverSink<SpannerDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct SpannerDriver {
     config: SpannerSinkConfig,
     client: Client,
     /// Cached table metadata; `None` until first use, cleared by
@@ -485,15 +493,25 @@ pub struct SpannerSink {
     token_table_ready: tokio::sync::OnceCell<()>,
     /// Record fields already warned-about as having no matching column.
     warned_fields: std::sync::Mutex<HashSet<String>>,
-    /// Backend-call context (#880): every read, commit and DDL operation runs
-    /// through it, once.
-    calls: faucet_core::CallSlot,
 }
 
 impl SpannerSink {
     /// Create a new Spanner sink. Validates the config and builds the client
     /// (session pool). Table metadata is read lazily on first write.
     pub async fn new(config: SpannerSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(SpannerDriver::new(config).await?),
+        })
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for SpannerSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl SpannerDriver {
+    async fn new(config: SpannerSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let client = config.connection.connect().await?;
         Ok(Self {
@@ -502,17 +520,12 @@ impl SpannerSink {
             meta: tokio::sync::RwLock::new(None),
             token_table_ready: tokio::sync::OnceCell::new(),
             warned_fields: std::sync::Mutex::new(HashSet::new()),
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
         })
     }
 
     /// [`read_meta`](Self::read_meta) as one `metadata` call (#880).
-    async fn fetch_meta(&self) -> Result<Option<TableMeta>, FaucetError> {
-        self.calls.call_once("metadata", self.read_meta()).await
+    async fn fetch_meta(&self, calls: &CallSlot) -> Result<Option<TableMeta>, FaucetError> {
+        calls.call_once("metadata", self.read_meta()).await
     }
 
     /// Read `(columns, pk)` for the target table from `INFORMATION_SCHEMA`.
@@ -590,7 +603,11 @@ impl SpannerSink {
 
     /// Cached metadata, fetched on first use. Errors when the table is absent
     /// — every caller here is a write path that requires it.
-    async fn require_meta(&self, records: &[Value]) -> Result<Arc<TableMeta>, FaucetError> {
+    async fn require_meta(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Arc<TableMeta>, FaucetError> {
         if let Some(meta) = self.meta.read().await.as_ref() {
             return Ok(Arc::clone(meta));
         }
@@ -599,11 +616,11 @@ impl SpannerSink {
         if let Some(meta) = slot.as_ref() {
             return Ok(Arc::clone(meta));
         }
-        let fetched = match self.fetch_meta().await? {
+        let fetched = match self.fetch_meta(calls).await? {
             Some(m) => m,
             None => {
-                self.create_target(records).await?;
-                self.fetch_meta().await?.ok_or_else(|| {
+                self.create_target(calls, records).await?;
+                self.fetch_meta(calls).await?.ok_or_else(|| {
                     FaucetError::Sink(format!(
                         "spanner table `{}` does not exist in {} even after CREATE TABLE",
                         self.config.table_name,
@@ -673,7 +690,7 @@ impl SpannerSink {
     /// `delete` already require and which Spanner requires to equal the PK.
     /// Without it, a made-up key column would be worse than a clear error:
     /// it becomes the table's physical layout and cannot be changed later.
-    async fn create_target(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn create_target(&self, calls: &CallSlot, records: &[Value]) -> Result<(), FaucetError> {
         if !self.config.create_table {
             return Err(faucet_core::missing_target_error(
                 "spanner sink",
@@ -726,14 +743,12 @@ impl SpannerSink {
             cols.join(", "),
             pk.join(", ")
         );
-        self.run_ddl(vec![ddl]).await
+        self.run_ddl(calls, vec![ddl]).await
     }
     /// Run DDL statements through the admin API, bounded by
     /// `ddl_timeout_secs`.
-    async fn run_ddl(&self, statements: Vec<String>) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("ddl", self.submit_ddl(statements))
-            .await
+    async fn run_ddl(&self, calls: &CallSlot, statements: Vec<String>) -> Result<(), FaucetError> {
+        calls.call_once("ddl", self.submit_ddl(statements)).await
     }
 
     async fn submit_ddl(&self, statements: Vec<String>) -> Result<(), FaucetError> {
@@ -762,9 +777,9 @@ impl SpannerSink {
     }
 
     /// Ensure the commit-token watermark table exists (once per sink).
-    async fn ensure_token_table(&self) -> Result<(), FaucetError> {
+    async fn ensure_token_table(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         self.token_table_ready
-            .get_or_try_init(|| async { self.run_ddl(vec![commit_token_ddl()]).await })
+            .get_or_try_init(|| async { self.run_ddl(calls, vec![commit_token_ddl()]).await })
             .await?;
         Ok(())
     }
@@ -784,6 +799,7 @@ impl SpannerSink {
     /// the case this feature exists for.
     async fn cleanup_scope_impl(
         &self,
+        calls: &CallSlot,
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
@@ -794,7 +810,7 @@ impl SpannerSink {
                 "spanner cleanup requires a non-empty `key`".to_string(),
             ));
         }
-        let meta = self.require_meta(&[]).await?;
+        let meta = self.require_meta(calls, &[]).await?;
         // The delete is by primary key, so the same PK-equality rule the
         // upsert/delete write path enforces applies here.
         validate_key_matches_pk(key, &meta.pk, table)?;
@@ -839,8 +855,7 @@ impl SpannerSink {
             meta: Arc::clone(&meta),
             seen: seen_fingerprints,
         });
-        let (_, outcome) = self
-            .calls
+        let (_, outcome) = calls
             .call_once("commit", async {
                 Ok(self
                     .client
@@ -950,7 +965,15 @@ async fn run_cleanup_txn(
 }
 
 #[async_trait]
-impl faucet_core::Sink for SpannerSink {
+impl SinkDriver for SpannerDriver {
+    /// Every read, commit and DDL operation runs through the call context,
+    /// once (#880).
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -964,18 +987,7 @@ impl faucet_core::Sink for SpannerSink {
         "spanner"
     }
 
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
         &[
             faucet_core::WriteMode::Append,
             faucet_core::WriteMode::Upsert,
@@ -985,105 +997,6 @@ impl faucet_core::Sink for SpannerSink {
 
     fn dedups_by_key(&self) -> bool {
         self.config.write.dedups_by_key()
-    }
-
-    /// Scoped cleanup is available whenever the sink can delete by key, which
-    /// on Spanner means the configured `key` is the table's PRIMARY KEY — a
-    /// requirement `cleanup_scope` re-checks against the live table (this hook
-    /// runs before any metadata read, so it cannot check it here).
-    fn supports_cleanup(&self) -> bool {
-        true
-    }
-
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
-    }
-
-    fn supports_schema_evolution(&self) -> bool {
-        true
-    }
-
-    /// Read the live destination schema from `INFORMATION_SCHEMA` as an
-    /// `infer_schema`-shaped object, or `None` when the table does not exist
-    /// yet (issue #194). Always fetches fresh — the drift pass caches on its
-    /// side and refreshes after `evolve`.
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        Ok(self.fetch_meta().await?.map(|m| current_schema_json(&m)))
-    }
-
-    /// Apply additive schema evolution: new columns via `ADD COLUMN IF NOT
-    /// EXISTS`; nullability relaxations by re-emitting the column at its
-    /// current type without `NOT NULL`. Spanner cannot change a column's base
-    /// type (e.g. INT64→FLOAT64), so a base-type widening is a typed error —
-    /// set `allow_type_widening: false` so the drift policy classifies it
-    /// `incompatible` and routes it via `on_incompatible` instead.
-    async fn evolve_schema(
-        &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        let table = &self.config.table_name;
-        let mut statements: Vec<String> = Vec::new();
-
-        for c in &evolution.additions {
-            let t =
-                faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
-            statements.push(build_add_column_sql(table, &c.name, t));
-        }
-
-        // Widenings: Spanner can only "widen" nullability. A widening whose
-        // base type actually changes is unsupported.
-        let meta = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
-            None
-        } else {
-            Some(self.require_meta(&[]).await?)
-        };
-        for c in &evolution.widenings {
-            let from_base = c.from.as_ref().and_then(faucet_core::json_schema_base_type);
-            let to_base = faucet_core::json_schema_base_type(&c.to);
-            if from_base != to_base {
-                return Err(FaucetError::Sink(format!(
-                    "spanner cannot widen column `{}`'s base type ({:?} -> {:?}): Spanner does \
-                     not support changing a column's type; set `allow_type_widening: false` so \
-                     the drift policy treats this as incompatible",
-                    c.name, from_base, to_base
-                )));
-            }
-            let meta = meta.as_ref().expect("meta fetched when widenings present");
-            let ty = meta.type_of(&c.name).ok_or_else(|| {
-                FaucetError::Sink(format!(
-                    "spanner widen: column `{}` not found in table `{table}`",
-                    c.name
-                ))
-            })?;
-            let ddl = spanner_type_ddl(ty).map_err(|e| {
-                FaucetError::Sink(format!("spanner widen column `{}`: {e}", c.name))
-            })?;
-            statements.push(build_alter_column_sql(table, &c.name, &ddl));
-        }
-        for col in &evolution.relax_nullability {
-            let meta = meta
-                .as_ref()
-                .expect("meta fetched when relaxations present");
-            let ty = meta.type_of(col).ok_or_else(|| {
-                FaucetError::Sink(format!(
-                    "spanner relax: column `{col}` not found in table `{table}`"
-                ))
-            })?;
-            let ddl = spanner_type_ddl(ty)
-                .map_err(|e| FaucetError::Sink(format!("spanner relax column `{col}`: {e}")))?;
-            statements.push(build_alter_column_sql(table, col, &ddl));
-        }
-
-        if !statements.is_empty() {
-            self.run_ddl(statements).await?;
-            // The table changed shape — drop the cached metadata.
-            *self.meta.write().await = None;
-        }
-        Ok(())
     }
 
     fn dataset_uri(&self) -> String {
@@ -1101,6 +1014,7 @@ impl faucet_core::Sink for SpannerSink {
     /// configured `key` equals the table's PRIMARY KEY. Non-mutating.
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
@@ -1116,11 +1030,7 @@ impl faucet_core::Sink for SpannerSink {
                 iter.next().await.map_err(|e| e.to_string())?;
                 Ok::<(), String>(())
             };
-            match self
-                .calls
-                .call_once("query", async { Ok(ping.await) })
-                .await
-            {
+            match calls.call_once("query", async { Ok(ping.await) }).await {
                 Ok(r) => r,
                 Err(e) => Err(e.to_string()),
             }
@@ -1142,7 +1052,7 @@ impl faucet_core::Sink for SpannerSink {
         };
 
         let started = std::time::Instant::now();
-        let schema = match tokio::time::timeout(ctx.timeout, self.fetch_meta()).await {
+        let schema = match tokio::time::timeout(ctx.timeout, self.fetch_meta(calls)).await {
             Ok(Ok(Some(meta))) => {
                 if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
                     Probe::pass("schema", started.elapsed())
@@ -1195,22 +1105,199 @@ impl faucet_core::Sink for SpannerSink {
         })
     }
 
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_rows(calls, records).await?,
+            )),
+            _ => {
+                let n = self.write_records(calls, records).await?;
+                Ok(PageWrite::reported(if self.dedups_by_key() {
+                    faucet_core::WriteReport::keyed(records.len(), n)
+                } else {
+                    faucet_core::WriteReport::accepted(n)
+                }))
+            }
+        }
+    }
+
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        // Every commit is already durable; nothing is buffered client-side.
+        Ok(())
+    }
+
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
+    }
+
+    fn cleanup(&self) -> Option<&dyn CleanupDriver> {
+        Some(self)
+    }
+
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl CommitTokenDriver for SpannerDriver {
+    /// Read the last committed watermark token for `scope` from the
+    /// `faucet_commit_token` table. `Ok(None)` when the table (or row) does
+    /// not exist yet.
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        calls
+            .call_once("query", self.read_committed_token(scope))
+            .await
+    }
+
+    async fn write_with_token(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let n = self.write_idempotent(calls, records, scope, token).await?;
+        Ok(if self.dedups_by_key() {
+            faucet_core::WriteReport::keyed(records.len(), n)
+        } else {
+            faucet_core::WriteReport::accepted(n)
+        })
+    }
+}
+
+#[async_trait]
+impl SchemaDriver for SpannerDriver {
+    /// Read the live destination schema from `INFORMATION_SCHEMA` as an
+    /// `infer_schema`-shaped object, or `None` when the table does not exist
+    /// yet (issue #194). Always fetches fresh — the drift pass caches on its
+    /// side and refreshes after `evolve`.
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        Ok(self
+            .fetch_meta(calls)
+            .await?
+            .map(|m| current_schema_json(&m)))
+    }
+
+    fn evolvable(&self) -> bool {
+        true
+    }
+
+    /// Apply additive schema evolution: new columns via `ADD COLUMN IF NOT
+    /// EXISTS`; nullability relaxations by re-emitting the column at its
+    /// current type without `NOT NULL`. Spanner cannot change a column's base
+    /// type (e.g. INT64→FLOAT64), so a base-type widening is a typed error —
+    /// set `allow_type_widening: false` so the drift policy classifies it
+    /// `incompatible` and routes it via `on_incompatible` instead.
+    async fn evolve(
+        &self,
+        calls: &CallSlot,
+        evolution: &faucet_core::SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        let table = &self.config.table_name;
+        let mut statements: Vec<String> = Vec::new();
+
+        for c in &evolution.additions {
+            let t =
+                faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
+            statements.push(build_add_column_sql(table, &c.name, t));
+        }
+
+        // Widenings: Spanner can only "widen" nullability. A widening whose
+        // base type actually changes is unsupported.
+        let meta = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
+            None
+        } else {
+            Some(self.require_meta(calls, &[]).await?)
+        };
+        for c in &evolution.widenings {
+            let from_base = c.from.as_ref().and_then(faucet_core::json_schema_base_type);
+            let to_base = faucet_core::json_schema_base_type(&c.to);
+            if from_base != to_base {
+                return Err(FaucetError::Sink(format!(
+                    "spanner cannot widen column `{}`'s base type ({:?} -> {:?}): Spanner does \
+                     not support changing a column's type; set `allow_type_widening: false` so \
+                     the drift policy treats this as incompatible",
+                    c.name, from_base, to_base
+                )));
+            }
+            let meta = meta.as_ref().expect("meta fetched when widenings present");
+            let ty = meta.type_of(&c.name).ok_or_else(|| {
+                FaucetError::Sink(format!(
+                    "spanner widen: column `{}` not found in table `{table}`",
+                    c.name
+                ))
+            })?;
+            let ddl = spanner_type_ddl(ty).map_err(|e| {
+                FaucetError::Sink(format!("spanner widen column `{}`: {e}", c.name))
+            })?;
+            statements.push(build_alter_column_sql(table, &c.name, &ddl));
+        }
+        for col in &evolution.relax_nullability {
+            let meta = meta
+                .as_ref()
+                .expect("meta fetched when relaxations present");
+            let ty = meta.type_of(col).ok_or_else(|| {
+                FaucetError::Sink(format!(
+                    "spanner relax: column `{col}` not found in table `{table}`"
+                ))
+            })?;
+            let ddl = spanner_type_ddl(ty)
+                .map_err(|e| FaucetError::Sink(format!("spanner relax column `{col}`: {e}")))?;
+            statements.push(build_alter_column_sql(table, col, &ddl));
+        }
+
+        if !statements.is_empty() {
+            self.run_ddl(calls, statements).await?;
+            // The table changed shape — drop the cached metadata.
+            *self.meta.write().await = None;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CleanupDriver for SpannerDriver {
+    async fn delete_absent(
+        &self,
+        calls: &CallSlot,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        self.cleanup_scope_impl(calls, scope, seen).await
+    }
+}
+
+impl SpannerDriver {
     /// Write records as batched mutations, one atomic commit per chunk
     /// (`batch_size` rows and ≤60,000 cells per commit). Append mode uses
     /// `InsertOrUpdate`, so replaying a page whose earlier chunk already
     /// committed (or that committed before a crash) converges instead of
     /// failing every retry on `ALREADY_EXISTS`; upsert/delete are planned via
     /// [`faucet_core::plan_writes`].
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let meta = self.require_meta(records).await?;
+        let meta = self.require_meta(calls, records).await?;
         let (planned, count) = self.plan_page(records, &meta, WriteOp::InsertOrUpdate)?;
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
                 .apply(chunk)
-                .within(&self.calls, "commit")
+                .within(calls, "commit")
                 .await?
                 .map_err(|e| sink_err("commit", e))?;
         }
@@ -1228,16 +1315,17 @@ impl faucet_core::Sink for SpannerSink {
     /// upsert/delete mode the good rows are applied and rows whose key could
     /// not be extracted are reported as per-row `Err` so the pipeline routes
     /// them to the DLQ.
-    async fn write_batch_partial(
+    async fn write_rows(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            self.write_batch(records).await?;
+            self.write_records(calls, records).await?;
             return Ok(records.iter().map(|_| Ok(())).collect());
         }
 
-        let meta = self.require_meta(records).await?;
+        let meta = self.require_meta(calls, records).await?;
         validate_key_matches_pk(&self.config.write.key, &meta.pk, &self.config.table_name)?;
         let plan = faucet_core::plan_writes(records, &self.config.write);
 
@@ -1263,7 +1351,7 @@ impl faucet_core::Sink for SpannerSink {
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
                 .apply(chunk)
-                .within(&self.calls, "commit")
+                .within(calls, "commit")
                 .await?
                 .map_err(|e| sink_err("commit", e))?;
         }
@@ -1278,42 +1366,28 @@ impl faucet_core::Sink for SpannerSink {
         Ok(outcomes)
     }
 
-    async fn flush(&self) -> Result<(), FaucetError> {
-        // Every commit is already durable; nothing is buffered client-side.
-        Ok(())
-    }
-
-    fn supports_idempotent_writes(&self) -> bool {
-        true
-    }
-
-    /// Read the last committed watermark token for `scope` from the
-    /// `faucet_commit_token` table. `Ok(None)` when the table (or row) does
-    /// not exist yet.
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.calls
-            .call_once("query", self.read_committed_token(scope))
-            .await
-    }
-
     /// Commit the page's mutations **and** the `(scope, token)` watermark in
     /// one read-write transaction — on crash either both land or neither
     /// does. The whole page is a single commit here (no re-chunking), so it
     /// is bounded by Spanner's ~80,000-cell commit limit: size the source's
     /// `batch_size` down for very wide tables.
-    async fn write_batch_idempotent(
+    async fn write_idempotent(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        self.calls
-            .call_once("commit", self.commit_idempotent(records, scope, token))
+        calls
+            .call_once(
+                "commit",
+                self.commit_idempotent(calls, records, scope, token),
+            )
             .await
     }
 }
 
-impl SpannerSink {
+impl SpannerDriver {
     /// Read the last committed watermark token for `scope`.
     async fn read_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let mut tx = self
@@ -1351,12 +1425,13 @@ impl SpannerSink {
     /// The transaction behind [`write_batch_idempotent`](faucet_core::Sink::write_batch_idempotent).
     async fn commit_idempotent(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        self.ensure_token_table().await?;
-        let meta = self.require_meta(records).await?;
+        self.ensure_token_table(calls).await?;
+        let meta = self.require_meta(calls, records).await?;
         // Plan before the transaction so planning failures abort cleanly. The
         // page commits atomically with its token and a committed page is never
         // replayed, so append keeps `Insert` and a real duplicate key fails.

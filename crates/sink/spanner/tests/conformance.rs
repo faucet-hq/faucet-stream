@@ -210,3 +210,14 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver with the
+/// commit-token, schema and cleanup groups.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_driver_truthful() {
+    let sink = fresh_sink("conf-driver").await;
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    let conn = support::connection("conf-driver", &support::emulator_host().await);
+    assert_eq!(support::count_rows(&conn, "t").await, 12);
+}
