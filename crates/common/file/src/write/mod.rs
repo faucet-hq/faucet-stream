@@ -52,5 +52,5 @@ pub use remote::{
     BoxFuture, MultipartClient, MultipartUpload, ObjectClient, RemoteBackend, content_type,
     object_layout,
 };
-pub use sink::{FileSink, SinkIdentity, WriterSink};
+pub use sink::{FileDriver, FileSink, ObjectStoreDriver, SinkIdentity, WriterSink};
 pub use writer::{COMMIT_MARKER, FileWriter, SWAP_MARKER, WriteSettings};

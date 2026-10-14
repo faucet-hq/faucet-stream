@@ -1,0 +1,649 @@
+//! The SQL family driver (RFC 0014).
+//!
+//! A [`SqlDriver`] is a backend's I/O over its database driver: open and
+//! commit a write transaction, probe and create tables, read the commit
+//! token, and the few statements whose shape is genuinely the backend's own
+//! (cloning a table into staging, the overwrite swap, the catalog reads).
+//! [`SqlSinkDriver`] drives everything else from those primitives and the
+//! shared [`SqlSinkEngine`]: the create-on-first-write rule, keyed and
+//! chunked writes, per-row outcomes, the exactly-once commit (rows and token
+//! in one transaction), scoped cleanup, the overwrite lifecycle (stage,
+//! first-run publish or swap, discard) and schema evolution. Wrap it in a
+//! [`DriverSink`](faucet_core::driver::DriverSink) for a `Sink`.
+//!
+//! ```text
+//! SqliteSink ─ DriverSink<SqlSinkDriver<SqliteDriver>>
+//!                         │               └ SqlDriver: begin / commit / ddl / table_exists / …
+//!                         └ SinkDriver + StagingDriver + CommitTokenDriver + CleanupDriver + SchemaDriver
+//! ```
+
+use crate::dialect::{SqlDialect, TableTarget};
+use crate::engine::{EvolutionStep, SqlExecutor, SqlSinkEngine};
+use faucet_core::check::{CheckContext, CheckReport};
+use faucet_core::cleanup::SeenKeys;
+use faucet_core::driver::{
+    CleanupDriver, CommitTokenDriver, PageWrite, RollbackDriver, RowPolicy, SchemaDriver,
+    SinkDriver, StagingDriver,
+};
+use faucet_core::{
+    BatchAtomicity, CallContext, CallSlot, FaucetError, SchemaEvolution, WriteMode, WritePlan,
+    WriteReport,
+};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Where a SQL sink writes and how its rows are shaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SqlLayout {
+    /// The destination table.
+    pub table: String,
+    /// `Some(column)`: each record is stored whole, as JSON, in `column`;
+    /// `None`: record fields map onto the table's columns.
+    pub json_column: Option<String>,
+    /// Create a missing table from the first page.
+    pub create_table: bool,
+    /// Rows per append transaction (`0`: the whole page).
+    pub batch_size: usize,
+}
+
+impl SqlLayout {
+    /// A column-mapped layout over `table` that creates it when missing and
+    /// writes each page in one transaction.
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            json_column: None,
+            create_table: true,
+            batch_size: 0,
+        }
+    }
+
+    /// Store each record whole in `column`.
+    pub fn json_column(mut self, column: impl Into<String>) -> Self {
+        self.json_column = Some(column.into());
+        self
+    }
+
+    /// Whether a missing table is created.
+    pub fn create_table(mut self, on: bool) -> Self {
+        self.create_table = on;
+        self
+    }
+
+    /// Rows per append transaction.
+    pub fn batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n;
+        self
+    }
+
+    /// The staging table an overwrite run writes into.
+    pub fn staging_table(&self) -> String {
+        format!(
+            "{}{}",
+            self.table,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
+    }
+}
+
+/// A SQL backend's I/O primitives (RFC 0014). See the [module docs](self).
+///
+/// `Conn` is one connection the engine runs statements on: an open write
+/// transaction ([`begin`](Self::begin)) or a plain connection for catalog
+/// reads ([`connection`](Self::connection)). Errors are worded by the driver
+/// (`"SQLite transaction begin failed: …"`).
+#[faucet_core::async_trait]
+pub trait SqlDriver: Send + Sync {
+    /// The backend's SQL dialect.
+    type Dialect: SqlDialect;
+    /// A connection the engine runs statements on.
+    type Conn<'a>: SqlExecutor + Send
+    where
+        Self: 'a;
+
+    /// The engine planning this sink's writes.
+    fn engine(&self) -> &SqlSinkEngine<Self::Dialect>;
+
+    /// Where the sink writes.
+    fn layout(&self) -> &SqlLayout;
+
+    /// The connector's name.
+    fn connector_name(&self) -> &'static str;
+
+    /// The JSON Schema of the connector's config.
+    fn config_schema(&self) -> Value;
+
+    /// The destination, for lineage (credential-free).
+    fn dataset_uri(&self) -> String;
+
+    /// The connector's own call defaults.
+    fn call_context(&self) -> CallContext {
+        CallContext::new().without_timeout()
+    }
+
+    /// A non-mutating connectivity probe.
+    async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+        let _ = ctx;
+        Ok(CheckReport::not_implemented())
+    }
+
+    /// What a failed write leaves behind.
+    fn batch_atomicity(&self) -> BatchAtomicity {
+        BatchAtomicity::Atomic
+    }
+
+    /// The write modes the backend applies.
+    fn write_modes(&self) -> &'static [WriteMode] {
+        &[
+            WriteMode::Append,
+            WriteMode::Upsert,
+            WriteMode::Delete,
+            WriteMode::Overwrite,
+        ]
+    }
+
+    /// The quoted target of `table`. Default: the dialect's quoting.
+    fn target(&self, table: &str) -> TableTarget {
+        TableTarget::new(table, self.engine().dialect().quote_ident(table))
+    }
+
+    /// Open a write transaction.
+    async fn begin(&self) -> Result<Self::Conn<'_>, FaucetError>;
+
+    /// Commit a transaction [`begin`](Self::begin) opened.
+    async fn commit(&self, conn: Self::Conn<'_>) -> Result<(), FaucetError>;
+
+    /// A connection for catalog reads (no transaction).
+    async fn connection(&self) -> Result<Self::Conn<'_>, FaucetError>;
+
+    /// Whether `table` exists.
+    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError>;
+
+    /// Run one DDL statement outside a transaction; `what` names it in the
+    /// error (`"CREATE TABLE"`).
+    async fn ddl(&self, sql: &str, what: &'static str) -> Result<(), FaucetError>;
+
+    /// The token committed under `scope`, from the commit-token table (which
+    /// exists).
+    async fn read_token(&self, scope: &str) -> Result<Option<String>, FaucetError>;
+
+    /// Create the staging table as a copy of the destination's definition,
+    /// refusing a destination that cannot be replaced safely.
+    async fn create_staging(&self) -> Result<(), FaucetError>;
+
+    /// First run: make the staging table the destination (which does not
+    /// exist).
+    async fn publish_staging(&self) -> Result<(), FaucetError>;
+
+    /// Replace the destination's rows with the staging table's, atomically,
+    /// and drop staging.
+    async fn swap_staging(&self) -> Result<(), FaucetError>;
+
+    /// The live destination schema, or `None` (missing table, JSON layout).
+    async fn current_schema(&self) -> Result<Option<Value>, FaucetError>;
+
+    /// Whether [`apply_evolution`](Self::apply_evolution) is implemented.
+    fn evolvable(&self) -> bool {
+        true
+    }
+
+    /// The destination's column names, for a dialect without `ADD COLUMN IF
+    /// NOT EXISTS`; `None` when every step is idempotent as written.
+    async fn existing_columns(&self) -> Result<Option<HashSet<String>>, FaucetError> {
+        Ok(None)
+    }
+
+    /// Apply the evolution steps, in order.
+    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
+        let _ = steps;
+        Err(FaucetError::Sink(format!(
+            "sink '{}' does not support schema evolution",
+            self.connector_name()
+        )))
+    }
+
+    /// The rollback primitives, when this configuration supports rollback.
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        None
+    }
+
+    /// A `(kind, config)` source that reads the destination back.
+    fn readback_source(&self) -> Option<(String, Value)> {
+        None
+    }
+}
+
+/// A [`SqlDriver`] as a [`SinkDriver`] (RFC 0014). See the [module docs](self).
+pub struct SqlSinkDriver<D> {
+    driver: D,
+    table_ready: AtomicBool,
+}
+
+impl<D: SqlDriver> SqlSinkDriver<D> {
+    /// The sink driver over `driver`.
+    pub fn new(driver: D) -> Self {
+        Self {
+            driver,
+            table_ready: AtomicBool::new(false),
+        }
+    }
+
+    /// The SQL driver.
+    pub fn driver(&self) -> &D {
+        &self.driver
+    }
+
+    fn engine(&self) -> &SqlSinkEngine<D::Dialect> {
+        self.driver.engine()
+    }
+
+    fn layout(&self) -> &SqlLayout {
+        self.driver.layout()
+    }
+
+    /// The table data writes land in: staging while overwriting.
+    fn effective_table(&self) -> String {
+        if self.engine().write_spec().is_overwrite() {
+            self.layout().staging_table()
+        } else {
+            self.layout().table.clone()
+        }
+    }
+
+    /// Make sure the table data writes land in exists before the first write
+    /// (#580, #676): checked once per sink; a missing one is created from the
+    /// page when `create_table` is on, an error otherwise. A column-mapped
+    /// page with nothing to infer from leaves it for the next page.
+    pub async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let layout = self.layout();
+        if !layout.create_table {
+            if !self.driver.table_exists(&layout.table).await? {
+                return Err(faucet_core::missing_target_error(
+                    &format!("{} sink", self.driver.connector_name()),
+                    &layout.table,
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        let target = self.driver.target(&self.effective_table());
+        let Some(sql) =
+            self.engine()
+                .create_table_sql(&target, records, layout.json_column.as_deref())?
+        else {
+            return Ok(());
+        };
+        self.driver.ddl(&sql, "CREATE TABLE").await?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn ensure_token_table(&self) -> Result<(), FaucetError> {
+        self.driver
+            .ddl(
+                &self.engine().dialect().commit_token_table_sql(),
+                "commit-table create",
+            )
+            .await
+    }
+
+    /// Insert `records` (append or overwrite) on `conn`.
+    async fn insert_on(
+        &self,
+        conn: &mut D::Conn<'_>,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
+        let target = self.driver.target(&self.effective_table());
+        match &self.layout().json_column {
+            Some(column) => {
+                self.engine()
+                    .insert_json(conn, &target, column, records)
+                    .await
+            }
+            None => self.engine().insert(conn, &target, records, false).await,
+        }
+    }
+
+    /// Apply keyed write groups in one transaction.
+    async fn apply_plans(&self, plans: &[WritePlan]) -> Result<usize, FaucetError> {
+        let mut conn = self.driver.begin().await?;
+        let target = self.driver.target(&self.layout().table);
+        let n = self.engine().apply_plans(&mut conn, &target, plans).await?;
+        self.driver.commit(conn).await?;
+        Ok(n)
+    }
+
+    /// Write a page and report every row: a keyed page accepts one row per
+    /// planned upsert or delete and coalesces the rest; an append writes each
+    /// `batch_size` chunk in its own transaction.
+    async fn write_rows(&self, records: &[Value]) -> Result<WriteReport, FaucetError> {
+        if records.is_empty() {
+            return Ok(WriteReport::accepted(0));
+        }
+        self.ensure_table_ready(records).await?;
+        if self.engine().is_keyed() {
+            let plans = self.engine().plan_keyed(records)?;
+            let written = self.apply_plans(&plans).await?;
+            return Ok(self.engine().report(records.len(), written, &plans));
+        }
+        let chunk = match self.layout().batch_size {
+            0 => records.len(),
+            n => n,
+        };
+        let mut total = 0;
+        for part in records.chunks(chunk) {
+            let mut conn = self.driver.begin().await?;
+            total += self.insert_on(&mut conn, part).await?;
+            self.driver.commit(conn).await?;
+        }
+        tracing::info!(
+            connector = self.driver.connector_name(),
+            table = %self.layout().table,
+            rows = total,
+            "SQL write complete"
+        );
+        Ok(self.engine().report(records.len(), total, &[]))
+    }
+
+    /// The dead-letter path: write the good rows and fail each bad one alone
+    /// (a record matching no column, a keyed row without its key).
+    async fn write_rows_partial(&self, records: &[Value]) -> Result<PageWrite, FaucetError> {
+        self.ensure_table_ready(records).await?;
+        if !self.engine().is_keyed() {
+            if self.layout().json_column.is_some() {
+                self.write_rows(records).await?;
+                return Ok(PageWrite::accepted(records.len()));
+            }
+            let table = self.driver.target(&self.effective_table());
+            let columns = {
+                let mut conn = self.driver.connection().await?;
+                conn.columns(&table).await?
+            };
+            let split = self
+                .engine()
+                .split_writable(&table, records, &columns, true, |_, _, _| None);
+            self.write_rows(&split.writable).await?;
+            return Ok(PageWrite::from_outcomes(split.outcomes));
+        }
+        let (plans, failed) = self.engine().plan_keyed_partial(records);
+        self.apply_plans(&plans).await?;
+        let ok = records.len() - failed.len();
+        Ok(PageWrite::accepted(ok).with_failures(failed))
+    }
+}
+
+#[faucet_core::async_trait]
+impl<D: SqlDriver> SinkDriver for SqlSinkDriver<D> {
+    fn connector_name(&self) -> &'static str {
+        self.driver.connector_name()
+    }
+
+    fn config_schema(&self) -> Value {
+        self.driver.config_schema()
+    }
+
+    fn dataset_uri(&self) -> String {
+        self.driver.dataset_uri()
+    }
+
+    fn call_context(&self) -> CallContext {
+        self.driver.call_context()
+    }
+
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<CheckReport, FaucetError> {
+        self.driver.check(ctx).await
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => {
+                calls
+                    .call_once("write_batch_partial", self.write_rows_partial(rows))
+                    .await
+            }
+            _ => {
+                calls
+                    .call_once("write_batch", async {
+                        self.write_rows(rows).await.map(PageWrite::reported)
+                    })
+                    .await
+            }
+        }
+    }
+
+    fn write_modes(&self) -> &'static [WriteMode] {
+        self.driver.write_modes()
+    }
+
+    fn dedups_by_key(&self) -> bool {
+        self.engine().write_spec().dedups_by_key()
+    }
+
+    fn batch_atomicity(&self) -> BatchAtomicity {
+        self.driver.batch_atomicity()
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        self.driver
+            .write_modes()
+            .contains(&WriteMode::Overwrite)
+            .then_some(self as &dyn StagingDriver)
+    }
+
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
+    }
+
+    fn cleanup(&self) -> Option<&dyn CleanupDriver> {
+        self.layout()
+            .json_column
+            .is_none()
+            .then_some(self as &dyn CleanupDriver)
+    }
+
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
+    }
+
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        self.driver.rollback()
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.driver.readback_source()
+    }
+}
+
+#[faucet_core::async_trait]
+impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
+    fn active(&self) -> bool {
+        self.engine().write_spec().is_overwrite()
+    }
+
+    /// Drop a stale staging table, then clone the destination into a fresh
+    /// one. A missing destination with `create_table` on (a first run) has
+    /// no shape to clone: the first write creates staging from the page.
+    /// Every step reads the database, never this instance's memory, because
+    /// the CLI runs begin, the writes and the commit on different instances.
+    async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        calls
+            .call_once("begin_overwrite", async {
+                let layout = self.layout();
+                let staging = self.driver.target(&layout.staging_table());
+                self.driver
+                    .ddl(
+                        &format!("DROP TABLE IF EXISTS {}", staging.reference),
+                        "overwrite: drop stale staging",
+                    )
+                    .await?;
+                if layout.create_table && !self.driver.table_exists(&layout.table).await? {
+                    return Ok(());
+                }
+                self.driver.create_staging().await
+            })
+            .await
+    }
+
+    /// Swap staging into place; on a first run (no destination) publish the
+    /// staging table as the destination — and a run that wrote nothing
+    /// leaves no table at all.
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        calls
+            .call_once("commit_overwrite", async {
+                let layout = self.layout();
+                if !self.driver.table_exists(&layout.table).await? {
+                    if self.driver.table_exists(&layout.staging_table()).await? {
+                        self.driver.publish_staging().await?;
+                    }
+                    return Ok(());
+                }
+                self.driver.swap_staging().await
+            })
+            .await
+    }
+
+    async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        calls
+            .call_once("abort_overwrite", async {
+                let staging = self.driver.target(&self.layout().staging_table());
+                self.driver
+                    .ddl(
+                        &format!("DROP TABLE IF EXISTS {}", staging.reference),
+                        "overwrite: drop staging",
+                    )
+                    .await
+            })
+            .await
+    }
+
+    async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
+        calls
+            .call_once(
+                "overwrite_staging_exists",
+                self.driver.table_exists(&self.layout().staging_table()),
+            )
+            .await
+    }
+}
+
+#[faucet_core::async_trait]
+impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        calls
+            .call_once("last_committed_token", async {
+                self.ensure_token_table().await?;
+                self.driver.read_token(scope).await
+            })
+            .await
+    }
+
+    /// The page and its token in one transaction: on a crash both land or
+    /// neither does, which is what lets a replay skip a committed page. A
+    /// keyed page is planned before the transaction opens, so a row without
+    /// its key fails the page without leaving one open.
+    async fn write_with_token(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<WriteReport, FaucetError> {
+        calls
+            .call_once("write_batch_idempotent", async {
+                self.ensure_table_ready(rows).await?;
+                self.ensure_token_table().await?;
+                let plans = if self.engine().write_spec().write_mode == WriteMode::Append {
+                    None
+                } else {
+                    Some(self.engine().plan_keyed(rows)?)
+                };
+                let mut conn = self.driver.begin().await?;
+                let written = match &plans {
+                    Some(plans) => {
+                        let target = self.driver.target(&self.layout().table);
+                        self.engine().apply_plans(&mut conn, &target, plans).await?
+                    }
+                    None => self.insert_on(&mut conn, rows).await?,
+                };
+                self.engine().write_token(&mut conn, scope, token).await?;
+                self.driver.commit(conn).await?;
+                Ok(if self.engine().write_spec().dedups_by_key() {
+                    WriteReport::keyed(rows.len(), written)
+                } else {
+                    WriteReport::accepted(written)
+                })
+            })
+            .await
+    }
+}
+
+#[faucet_core::async_trait]
+impl<D: SqlDriver> CleanupDriver for SqlSinkDriver<D> {
+    /// The written keys go into a key table and a `NOT EXISTS` delete removes
+    /// the rest of the scope, in one transaction.
+    async fn delete_absent(
+        &self,
+        calls: &CallSlot,
+        scope: &BTreeMap<String, Value>,
+        seen: &SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        calls
+            .call_once("cleanup_scope", async {
+                self.engine().check_cleanup_key()?;
+                let mut conn = self.driver.begin().await?;
+                let target = self.driver.target(&self.layout().table);
+                let deleted = self
+                    .engine()
+                    .cleanup(&mut conn, &target, scope, seen)
+                    .await?;
+                self.driver.commit(conn).await?;
+                Ok(deleted)
+            })
+            .await
+    }
+}
+
+#[faucet_core::async_trait]
+impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        calls
+            .call_once("current_schema", self.driver.current_schema())
+            .await
+    }
+
+    fn evolvable(&self) -> bool {
+        self.driver.evolvable()
+    }
+
+    async fn evolve(
+        &self,
+        calls: &CallSlot,
+        evolution: &SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        calls
+            .call_once("evolve_schema", async {
+                let existing = self.driver.existing_columns().await?;
+                let steps = self.engine().evolution_steps(evolution, existing.as_ref());
+                self.driver.apply_evolution(steps).await
+            })
+            .await
+    }
+}

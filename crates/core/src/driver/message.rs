@@ -268,20 +268,25 @@ impl<D: MessageDriver> MessageSinkDriver<D> {
                     fail_open(&mut outcomes[base..], || self.timeout("publish", after));
                     return Ok(outcomes);
                 }
-                Err(FaucetError::Cancelled { operation }) => {
-                    fail_open(&mut outcomes[base..], || FaucetError::Cancelled {
-                        operation: operation.clone(),
-                    });
-                    return Ok(outcomes);
-                }
-                Err(other) => {
-                    let msg = format!("{} publish: {other}", self.driver.connector_name());
-                    fail_open(&mut outcomes[base..], || FaucetError::Sink(msg.clone()));
+                Err(cause) => {
+                    let name = self.driver.connector_name();
+                    fail_open(&mut outcomes[base..], || cut(name, &cause));
                     return Ok(outcomes);
                 }
             }
         }
         Ok(outcomes)
+    }
+}
+
+/// The error a row gets when its group's call was cut short by `cause` (a
+/// cancel, or the call itself failing).
+fn cut(connector: &str, cause: &FaucetError) -> FaucetError {
+    match cause {
+        FaucetError::Cancelled { operation } => FaucetError::Cancelled {
+            operation: operation.clone(),
+        },
+        other => FaucetError::Sink(format!("{connector} publish: {other}")),
     }
 }
 
@@ -568,5 +573,30 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
                 };
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cut_short_group_keeps_a_cancel_and_words_anything_else() {
+        let cancel = FaucetError::Cancelled {
+            operation: "publish call".into(),
+        };
+        assert!(matches!(
+            cut("broker", &cancel),
+            FaucetError::Cancelled { operation } if operation == "publish call"
+        ));
+        let other = cut("broker", &FaucetError::Source("x".into()));
+        assert!(
+            matches!(&other, FaucetError::Sink(m) if m.starts_with("broker publish: ")),
+            "{other}"
+        );
+        let mut outcomes: Vec<RowOutcome> = vec![Err(FaucetError::Sink("own".into())), Ok(())];
+        fail_open(&mut outcomes, || cut("broker", &cancel));
+        assert!(matches!(&outcomes[0], Err(FaucetError::Sink(m)) if m == "own"));
+        assert!(matches!(&outcomes[1], Err(FaucetError::Cancelled { .. })));
     }
 }

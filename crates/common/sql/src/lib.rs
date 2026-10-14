@@ -22,10 +22,17 @@
 //!   multi-row statements, create-table and evolution DDL, scoped cleanup,
 //!   commit tokens, journal ordering and the row report.
 //!
+//! - [`SqlDriver`] / [`SqlSinkDriver`] — the SQL family driver (RFC 0014): a
+//!   backend's I/O primitives (transactions, DDL, the commit-token read, the
+//!   staging clone and swap, catalog reads), from which [`SqlSinkDriver`]
+//!   drives writes, per-row outcomes, the exactly-once commit, cleanup, the
+//!   overwrite lifecycle and schema evolution. Wrap it in a
+//!   [`DriverSink`](faucet_core::driver::DriverSink) for a `Sink`.
+//!
 //! A backend crate implements [`SqlExecutor`] over its driver (binding each
-//! [`Param`] as its column needs, wording its own errors) and keeps only what
-//! is genuinely its own: transactions, bulk-load paths, overwrite swaps and
-//! catalog queries.
+//! [`Param`] as its column needs, wording its own errors) and [`SqlDriver`]
+//! over its pool, and keeps only what is genuinely its own: transactions,
+//! bulk-load paths, overwrite swaps and catalog queries.
 //!
 //! ```
 //! use faucet_common_sql::{SqlDialect, dialects::Postgres};
@@ -40,11 +47,13 @@
 
 pub mod dialect;
 pub mod dialects;
+pub mod driver;
 pub mod engine;
 pub mod mapping;
 pub mod statement;
 
 pub use dialect::{SqlDialect, TableTarget};
+pub use driver::{SqlDriver, SqlLayout, SqlSinkDriver};
 pub use engine::{
     EngineOptions, EvolutionStep, SplitPage, SqlExecutor, SqlSinkEngine, check_cleanup_columns,
     no_match_message, split_page,

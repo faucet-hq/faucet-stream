@@ -9,8 +9,9 @@ use super::backend::StorageBackend;
 use super::layout::NameTemplate;
 use super::writer::{FileWriter, WriteSettings};
 use faucet_core::check::{CheckContext, CheckReport};
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver, StagingDriver};
 use faucet_core::observability::RoundtripRecorder;
-use faucet_core::{Capabilities, FaucetError, FileFormat, SchemaReport, Sink, WriteMode};
+use faucet_core::{CallSlot, Capabilities, FaucetError, FileFormat, SchemaReport, Sink, WriteMode};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -50,6 +51,11 @@ pub trait SinkIdentity: Send + Sync {
 /// sink is a `FileSink<LocalBackend>`; the S3, GCS, Azure Blob and SFTP
 /// sinks are `FileSink`s over their stores' backends.
 ///
+/// It is the object-store family driver's sink (RFC 0014): the backend is an
+/// [`ObjectStoreDriver`] — the store's I/O primitives — and a [`FileDriver`]
+/// drives the writer, the overwrite swap and the columnar path from it,
+/// inside a [`DriverSink`] that derives the capabilities.
+///
 /// Requests the backend makes run through the run's call context and report
 /// to its round-trip recorder ([`StorageBackend::set_call_context`],
 /// [`StorageBackend::set_roundtrip_recorder`]); the preflight probe is the
@@ -58,42 +64,28 @@ pub trait SinkIdentity: Send + Sync {
 /// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
 /// minor release; any change is called out in the changelog.
 pub struct FileSink<B: StorageBackend + ?Sized + 'static = dyn StorageBackend> {
+    inner: DriverSink<FileDriver<B>>,
+}
+
+/// The object-store family driver (RFC 0014): a store's I/O primitives —
+/// publish a finished file, list, fetch, delete, move from the swap area —
+/// with no knowledge of records or formats. Every [`StorageBackend`] is one;
+/// [`FileDriver`] drives everything above it.
+pub trait ObjectStoreDriver: StorageBackend {}
+
+impl<T: StorageBackend + ?Sized> ObjectStoreDriver for T {}
+
+/// A [`FileWriter`] over an [`ObjectStoreDriver`] as a
+/// [`SinkDriver`] (RFC 0014): rows go through the writer, the overwrite swap
+/// is the writer's staging area ([`StagingDriver`]), and Parquet / Avro
+/// outputs take Arrow batches directly.
+pub struct FileDriver<B: ObjectStoreDriver + ?Sized + 'static = dyn StorageBackend> {
     writer: FileWriter,
     backend: Arc<B>,
     identity: Box<dyn SinkIdentity>,
 }
 
-impl<B: StorageBackend + 'static> FileSink<B> {
-    /// A sink writing `settings` / `template` to `backend`, described by
-    /// `identity`.
-    pub fn build(
-        settings: WriteSettings,
-        template: NameTemplate,
-        backend: Arc<B>,
-        identity: impl SinkIdentity + 'static,
-    ) -> Result<Self, FaucetError> {
-        let dynamic: Arc<dyn StorageBackend> = backend.clone();
-        let writer = FileWriter::new(settings, template, dynamic)?;
-        Ok(Self {
-            writer,
-            backend,
-            identity: Box::new(identity),
-        })
-    }
-}
-
-impl FileSink<dyn StorageBackend> {
-    /// A sink over an already-built `writer`, described by `identity`.
-    pub fn from_writer(writer: FileWriter, identity: impl SinkIdentity + 'static) -> Self {
-        Self {
-            backend: writer.backend().clone(),
-            writer,
-            identity: Box::new(identity),
-        }
-    }
-}
-
-impl<B: StorageBackend + ?Sized + 'static> FileSink<B> {
+impl<B: ObjectStoreDriver + ?Sized + 'static> FileDriver<B> {
     /// The writer.
     pub fn writer(&self) -> &FileWriter {
         &self.writer
@@ -110,8 +102,71 @@ impl<B: StorageBackend + ?Sized + 'static> FileSink<B> {
     }
 }
 
+impl<B: StorageBackend + 'static> FileSink<B> {
+    /// A sink writing `settings` / `template` to `backend`, described by
+    /// `identity`.
+    pub fn build(
+        settings: WriteSettings,
+        template: NameTemplate,
+        backend: Arc<B>,
+        identity: impl SinkIdentity + 'static,
+    ) -> Result<Self, FaucetError> {
+        let dynamic: Arc<dyn StorageBackend> = backend.clone();
+        let writer = FileWriter::new(settings, template, dynamic)?;
+        Ok(Self::over(FileDriver {
+            writer,
+            backend,
+            identity: Box::new(identity),
+        }))
+    }
+}
+
+impl FileSink<dyn StorageBackend> {
+    /// A sink over an already-built `writer`, described by `identity`.
+    pub fn from_writer(writer: FileWriter, identity: impl SinkIdentity + 'static) -> Self {
+        Self::over(FileDriver {
+            backend: writer.backend().clone(),
+            writer,
+            identity: Box::new(identity),
+        })
+    }
+}
+
+impl<B: StorageBackend + ?Sized + 'static> FileSink<B> {
+    fn over(driver: FileDriver<B>) -> Self {
+        Self {
+            inner: DriverSink::new(driver),
+        }
+    }
+
+    /// The writer.
+    pub fn writer(&self) -> &FileWriter {
+        self.inner.driver().writer()
+    }
+
+    /// The storage backend.
+    pub fn backend(&self) -> &Arc<B> {
+        self.inner.driver().backend()
+    }
+
+    /// The format the output is written in.
+    pub fn format(&self) -> FileFormat {
+        self.inner.driver().format()
+    }
+
+    /// The driver the sink runs on.
+    pub fn driver(&self) -> &FileDriver<B> {
+        self.inner.driver()
+    }
+}
+
 #[faucet_core::async_trait]
 impl<B: StorageBackend + ?Sized + 'static> Sink for FileSink<B> {
+    faucet_core::forward_sink!(inner);
+}
+
+#[faucet_core::async_trait]
+impl<B: ObjectStoreDriver + ?Sized + 'static> SinkDriver for FileDriver<B> {
     fn connector_name(&self) -> &'static str {
         self.identity.connector_name()
     }
@@ -134,7 +189,11 @@ impl<B: StorageBackend + ?Sized + 'static> Sink for FileSink<B> {
         self.identity.set_call_context(ctx);
     }
 
-    async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<CheckReport, FaucetError> {
         match self.backend.check(ctx).await? {
             Some(report) => Ok(report),
             None => self.identity.check(ctx).await,
@@ -149,77 +208,96 @@ impl<B: StorageBackend + ?Sized + 'static> Sink for FileSink<B> {
         self.writer.settings().batch_atomicity()
     }
 
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
+    fn write_modes(&self) -> &'static [WriteMode] {
         &[WriteMode::Append, WriteMode::Overwrite]
     }
 
     /// Derived, plus [`SchemaReport::DropsUnknownFields`] for CSV under
     /// `csv.on_unknown_field: warn`, whose frozen header drops new fields.
-    fn capabilities(&self) -> Capabilities {
+    fn capabilities(&self, derived: Capabilities) -> Capabilities {
         let settings = self.writer.settings();
-        let base = Capabilities::of_sink(self);
         if crate::capabilities::drops_unknown_fields(
             settings.format,
             settings.opts.csv.on_unknown_field,
         ) {
-            base.to_builder()
+            derived
+                .to_builder()
                 .schema_report(SchemaReport::DropsUnknownFields)
                 .build()
         } else {
-            base
+            derived
         }
     }
 
-    fn is_overwrite(&self) -> bool {
-        self.writer.overwriting()
+    async fn write(
+        &self,
+        _calls: &CallSlot,
+        rows: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        if rows.is_empty() {
+            return Ok(PageWrite::accepted(0));
+        }
+        Ok(PageWrite::accepted(self.writer.write_rows(rows).await?))
     }
 
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.writer.begin_overwrite().await
+    /// Publish the open file (#618): the pipeline calls `flush` at every
+    /// bookmark-carrying page and at the end, so a bookmark never advances
+    /// past records that are not in storage.
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.writer.flush().await
     }
 
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.writer.commit_overwrite().await
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
     }
 
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.writer.abort_overwrite().await
+    #[cfg(feature = "arrow")]
+    fn columnar(&self) -> Option<&dyn faucet_core::driver::ColumnarDriver> {
+        matches!(self.format(), FileFormat::Parquet | FileFormat::Avro)
+            .then_some(self as &dyn faucet_core::driver::ColumnarDriver)
     }
 
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.writer.swap_area_exists().await.map(Some)
-    }
-
-    async fn complete_run(&self) -> Result<(), FaucetError> {
+    async fn complete_run(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
         self.writer.complete().await
     }
 
     async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
         self.writer.local_outputs()
     }
+}
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        self.writer.write_rows(records).await
+#[faucet_core::async_trait]
+impl<B: ObjectStoreDriver + ?Sized + 'static> StagingDriver for FileDriver<B> {
+    fn active(&self) -> bool {
+        self.writer.overwriting()
     }
 
-    /// Publish the open file (#618): the pipeline calls `flush` at every
-    /// bookmark-carrying page and at the end, so a bookmark never advances
-    /// past records that are not in storage.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.writer.flush().await
+    async fn stage(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.writer.begin_overwrite().await
     }
 
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        matches!(self.format(), FileFormat::Parquet | FileFormat::Avro)
+    async fn publish(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.writer.commit_overwrite().await
     }
 
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
+    async fn discard(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.writer.abort_overwrite().await
+    }
+
+    async fn staged(&self, _calls: &CallSlot) -> Result<bool, FaucetError> {
+        self.writer.swap_area_exists().await
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[faucet_core::async_trait]
+impl<B: ObjectStoreDriver + ?Sized + 'static> faucet_core::driver::ColumnarDriver
+    for FileDriver<B>
+{
+    async fn write_columnar(
         &self,
+        _calls: &CallSlot,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
         if batch.num_rows() == 0 {

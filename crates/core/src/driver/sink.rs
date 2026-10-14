@@ -178,6 +178,13 @@ pub trait SchemaDriver: Send + Sync {
 /// The run-rollback primitives of a destination (#706).
 #[async_trait]
 pub trait RollbackDriver: Send + Sync {
+    /// Whether this configuration can roll back (a SQL sink needs mapped
+    /// columns). When it cannot, the primitives are still called, so their
+    /// error can say why. Default: it can.
+    fn enabled(&self) -> bool {
+        true
+    }
+
     /// Undo what `run_id` wrote, per `opts.mode`.
     async fn rollback_run(
         &self,
@@ -678,7 +685,7 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
     }
 
     fn supports_rollback(&self) -> bool {
-        self.driver.rollback().is_some()
+        self.driver.rollback().is_some_and(RollbackDriver::enabled)
     }
 
     async fn rollback_run(
