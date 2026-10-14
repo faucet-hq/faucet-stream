@@ -1507,3 +1507,55 @@ fn sink_guarantee_is_derived_and_a_driver_may_lower_it() {
         SinkGuarantee::AtLeastOnce
     );
 }
+
+#[tokio::test]
+async fn a_staging_driver_that_cannot_look_for_staging_reports_unknown() {
+    struct Versioned;
+    #[async_trait]
+    impl SinkDriver for Versioned {
+        fn connector_name(&self) -> &'static str {
+            "versioned"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            r: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(r.len()))
+        }
+        fn write_modes(&self) -> &'static [WriteMode] {
+            &[WriteMode::Append, WriteMode::Overwrite]
+        }
+        fn staging(&self) -> Option<&dyn StagingDriver> {
+            Some(self)
+        }
+    }
+    #[async_trait]
+    impl StagingDriver for Versioned {
+        fn active(&self) -> bool {
+            true
+        }
+        async fn stage(&self, _: &CallSlot) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn publish(&self, _: &CallSlot) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn discard(&self, _: &CallSlot) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn staged(&self, _: &CallSlot) -> Result<bool, FaucetError> {
+            unreachable!("never probed")
+        }
+        fn reports_staged(&self) -> bool {
+            false
+        }
+    }
+    let sink = DriverSink::new(Versioned);
+    assert!(sink.is_overwrite());
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), None);
+    sink.begin_overwrite().await.unwrap();
+    sink.commit_overwrite().await.unwrap();
+    sink.abort_overwrite().await.unwrap();
+}

@@ -114,6 +114,14 @@ pub trait StagingDriver: Send + Sync {
 
     /// Whether a staging target exists right now (a read-only probe).
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError>;
+
+    /// Whether [`staged`](Self::staged) can answer. A destination whose
+    /// overwrite leaves no staging object it can look for returns `false`,
+    /// and [`Sink::overwrite_staging_exists`] reports "unknown". Default:
+    /// `true`.
+    fn reports_staged(&self) -> bool {
+        true
+    }
 }
 
 /// The exactly-once primitives of a destination: rows and a commit token
@@ -699,8 +707,8 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
 
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
         match self.driver.staging() {
-            Some(s) => s.staged(&self.calls).await.map(Some),
-            None => Ok(None),
+            Some(s) if s.reports_staged() => s.staged(&self.calls).await.map(Some),
+            _ => Ok(None),
         }
     }
 
