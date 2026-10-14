@@ -411,6 +411,21 @@ This sink takes its literal escaping and create-table text from the `Snowflake` 
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. Rows travel as one JSON payload per statement through the SQL API (`PARSE_JSON` + `FLATTEN`) or a staged `COPY INTO`, so there is no per-cell statement for the engine to plan.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `SnowflakeDriver`
+implements `faucet_core::driver::SinkDriver` — the cross-page commit groups
+and their SQL REST API statements — plus `CommitTokenDriver` (the page and
+its watermark `MERGE` in one multi-statement `BEGIN … COMMIT` request) and,
+with the `arrow` feature and a `bulk_load` stage, `ColumnarDriver` (the
+Parquet `COPY INTO`). `SnowflakeSink` wraps it in a `DriverSink`, which
+serves the plain, reported, per-row and exactly-once writes and derives the
+capabilities from those primitives. It does not use the SQL family driver
+(`faucet_common_sql::SqlSinkDriver`): every statement is a stateless HTTP
+request with rows bound as one JSON payload, so there is no connection or
+transaction for that adapter to open and commit. The public type and config
+are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

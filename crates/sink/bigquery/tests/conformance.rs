@@ -371,6 +371,8 @@ async fn conformance_declared_capabilities() {
         async move { bq.len() }
     };
     faucet_conformance::assert_partial_outcomes_truthful(&streaming, count).await;
+    faucet_conformance::assert_driver_declarations_truthful(&streaming).await;
+    faucet_conformance::assert_driver_row_paths_agree(&streaming).await;
 
     let (_s, bq, keyed) = fake_sink(|c| {
         c.write.write_mode = faucet_core::WriteMode::Upsert;

@@ -12,7 +12,8 @@
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
@@ -23,7 +24,16 @@ use crate::copy::{
 };
 
 /// A sink that loads JSON records into an Amazon Redshift table.
+///
+/// Built on the family-neutral sink driver (RFC 0014): [`RedshiftDriver`]
+/// holds the load paths and [`DriverSink`] serves the plain, reported and
+/// per-row writes from them.
 pub struct RedshiftSink {
+    inner: DriverSink<RedshiftDriver>,
+}
+
+/// The Redshift I/O primitives the sink runs on.
+pub(crate) struct RedshiftDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
@@ -39,26 +49,28 @@ pub struct RedshiftSink {
     pool: PgPool,
     /// S3 client, built only for the `copy` strategy.
     s3: Option<S3Client>,
-    /// Backend-call context (#880): every statement and staging request runs
-    /// through it, once.
-    calls: faucet_core::CallSlot,
 }
 
-impl RedshiftSink {
+impl RedshiftDriver {
     /// Run `fut` as the single backend call `op` (#880).
     async fn call<T>(
         &self,
+        calls: &CallSlot,
         op: &'static str,
         fut: impl std::future::Future<Output = Result<T, FaucetError>>,
     ) -> Result<T, FaucetError> {
-        faucet_common_redshift::calls::once(&self.calls.get(), op, fut).await
+        faucet_common_redshift::calls::once(&calls.get(), op, fut).await
     }
 
     /// Load one accumulated group, still re-chunked to `batch_size` so a
     /// single staged object / `INSERT` statement stays a reasonable size
     /// (#617).
     /// On failure, also returns how many leading rows did land.
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
+    async fn commit_group(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+    ) -> Result<(), (usize, FaucetError)> {
         let chunk_len = if self.config.batch_size == 0 {
             rows.len().max(1)
         } else {
@@ -68,8 +80,8 @@ impl RedshiftSink {
         let mut done = 0;
         for chunk in rows.chunks(chunk_len) {
             total += match self.config.write_strategy {
-                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await,
-                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await,
+                RedshiftWriteStrategy::Copy => self.copy_chunk(calls, chunk).await,
+                RedshiftWriteStrategy::Insert => self.insert_chunk(calls, chunk).await,
             }
             .map_err(|e| (done, e))?;
             done += chunk.len();
@@ -88,10 +100,11 @@ impl RedshiftSink {
     /// write or `flush` commits them instead of dropping them (SQL-04).
     async fn commit_or_restore(
         &self,
+        calls: &CallSlot,
         rows: Vec<Value>,
         keep_end: usize,
     ) -> Result<(), FaucetError> {
-        if let Err((done, e)) = self.commit_group(&rows).await {
+        if let Err((done, e)) = self.commit_group(calls, &rows).await {
             if done < keep_end {
                 let mut rows = rows;
                 rows.truncate(keep_end);
@@ -109,14 +122,18 @@ impl RedshiftSink {
     /// missing table — and its schema, when `schema:` is set — is created from
     /// the first page's inferred columns; with `false` a missing table is a
     /// typed failure naming both ways out.
-    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_table_ready(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
         use std::sync::atomic::Ordering;
         if self.table_ready.load(Ordering::Relaxed) {
             return Ok(());
         }
         if !self.config.create_table {
             let exists: Option<i32> = self
-                .call("query", async {
+                .call(calls, "query", async {
                     sqlx::query_scalar(&format!(
                         "SELECT 1 FROM pg_catalog.pg_class c \
                          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -148,7 +165,7 @@ impl RedshiftSink {
                 "CREATE SCHEMA IF NOT EXISTS {}",
                 faucet_core::util::quote_ident(schema)
             );
-            self.call("execute", async {
+            self.call(calls, "execute", async {
                 sqlx::query(&sql)
                     .execute(&self.pool)
                     .await
@@ -157,7 +174,7 @@ impl RedshiftSink {
             .await?;
         }
         let sql = build_create_table_sql(&self.table_ref(), &columns);
-        self.call("execute", async {
+        self.call(calls, "execute", async {
             sqlx::query(&sql)
                 .execute(&self.pool)
                 .await
@@ -173,10 +190,10 @@ impl RedshiftSink {
     /// without it the write fails naming the fields. Loads drop fields with
     /// no column, so a field first seen after the table was created would
     /// otherwise be lost on every page.
-    async fn ensure_columns(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_columns(&self, calls: &CallSlot, records: &[Value]) -> Result<(), FaucetError> {
         let mut known = self.known_columns.lock().await;
         if known.is_none() {
-            *known = Some(self.lowercased_columns().await?);
+            *known = Some(self.lowercased_columns(calls).await?);
         }
         let Some(cols) = known.as_mut() else {
             return Ok(());
@@ -200,7 +217,7 @@ impl RedshiftSink {
             };
             let sql = crate::copy::add_column_sql(&self.table_ref(), col);
             let added = self
-                .call("execute", async {
+                .call(calls, "execute", async {
                     sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
                         FaucetError::Sink(format!("redshift: ALTER TABLE ADD COLUMN failed: {e}"))
                     })
@@ -215,7 +232,7 @@ impl RedshiftSink {
                 }
                 // A concurrent writer may have added it first.
                 if !self
-                    .lowercased_columns()
+                    .lowercased_columns(calls)
                     .await?
                     .contains(&name.to_lowercase())
                 {
@@ -227,18 +244,21 @@ impl RedshiftSink {
         Ok(())
     }
 
-    async fn lowercased_columns(&self) -> Result<std::collections::HashSet<String>, FaucetError> {
+    async fn lowercased_columns(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<std::collections::HashSet<String>, FaucetError> {
         Ok(self
-            .discover_columns()
+            .discover_columns(calls)
             .await?
             .into_iter()
             .map(|c| c.to_lowercase())
             .collect())
     }
 
-    /// Create a new sink. Validates config, builds a lazily-connected pool (no
-    /// DB I/O), and — for the `copy` strategy — an S3 client.
-    pub async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
+    /// Validate the config, build a lazily-connected pool (no DB I/O) and —
+    /// for the `copy` strategy — an S3 client.
+    async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let pool =
             faucet_common_redshift::build_pool_lazy(&config.connection, config.max_connections)?;
@@ -257,11 +277,6 @@ impl RedshiftSink {
             config,
             pool,
             s3,
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
         })
     }
 
@@ -292,9 +307,9 @@ impl RedshiftSink {
     /// Discover the destination table's column names in ordinal order. Used
     /// by the `insert` path and the CSV `copy` path (both need the column
     /// set/order).
-    async fn discover_columns(&self) -> Result<Vec<String>, FaucetError> {
+    async fn discover_columns(&self, calls: &CallSlot) -> Result<Vec<String>, FaucetError> {
         Ok(self
-            .discover_typed_columns()
+            .discover_typed_columns(calls)
             .await?
             .into_iter()
             .map(|(name, _)| name)
@@ -302,9 +317,12 @@ impl RedshiftSink {
     }
 
     /// The table's `(column, declared type)` pairs in declared order.
-    async fn discover_typed_columns(&self) -> Result<Vec<(String, String)>, FaucetError> {
+    async fn discover_typed_columns(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<Vec<(String, String)>, FaucetError> {
         let rows = self
-            .call("query", async {
+            .call(calls, "query", async {
                 sqlx::query(&format!(
                     "SELECT a.attname::text AS column_name, \
                      format_type(a.atttypid, a.atttypmod)::text AS data_type \
@@ -341,7 +359,7 @@ impl RedshiftSink {
     }
 
     /// Load one chunk via the `COPY`-from-S3 fast path.
-    async fn copy_chunk(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn copy_chunk(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -358,7 +376,7 @@ impl RedshiftSink {
 
         // A record sharing no column with the table would load as an all-NULL
         // row, so it is skipped, as on the INSERT path (#862 L-118).
-        let table_columns = self.discover_columns().await?;
+        let table_columns = self.discover_columns(calls).await?;
         let (records, skipped) = loadable_records(records, &table_columns)?;
         if skipped > 0 {
             tracing::warn!(
@@ -387,7 +405,7 @@ impl RedshiftSink {
         let key = self.staging_key(ext);
 
         // 1. Upload the staged object.
-        self.call("stage", async {
+        self.call(calls, "stage", async {
             s3.put_object()
                 .bucket(bucket)
                 .key(&key)
@@ -410,7 +428,7 @@ impl RedshiftSink {
             copy_cfg.format,
         );
         let copy_result = self
-            .call("execute", async {
+            .call(calls, "execute", async {
                 sqlx::query(&sql)
                     .execute(&self.pool)
                     .await
@@ -421,7 +439,7 @@ impl RedshiftSink {
         // 3. Best-effort cleanup of the staged object (regardless of COPY
         //    outcome — a failed COPY still leaves the object behind).
         let deleted = self
-            .call("stage", async {
+            .call(calls, "stage", async {
                 s3.delete_object()
                     .bucket(bucket)
                     .key(&key)
@@ -440,11 +458,15 @@ impl RedshiftSink {
 
     /// Load one chunk via multi-row `INSERT`, sub-chunked to respect the bind
     /// parameter cap.
-    async fn insert_chunk(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn insert_chunk(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let typed = self.discover_typed_columns().await?;
+        let typed = self.discover_typed_columns(calls).await?;
         let table_columns: Vec<String> = typed.iter().map(|(n, _)| n.clone()).collect();
         let present: Vec<String> = columns_present(records, &table_columns)
             .into_iter()
@@ -520,7 +542,7 @@ impl RedshiftSink {
                     };
                 }
             }
-            self.call("execute", async {
+            self.call(calls, "execute", async {
                 q.execute(&self.pool)
                     .await
                     .map_err(|e| FaucetError::Sink(format!("redshift: INSERT failed: {e}")))
@@ -602,72 +624,49 @@ fn bind_json<'q>(
     })
 }
 
+impl RedshiftSink {
+    /// Create a new sink. Validates config, builds a lazily-connected pool (no
+    /// DB I/O), and — for the `copy` strategy — an S3 client.
+    pub async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(RedshiftDriver::new(config).await?),
+        })
+    }
+}
+
 #[async_trait]
 impl faucet_core::Sink for RedshiftSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
+    faucet_core::forward_sink!(inner);
+}
 
-    fn connector_name(&self) -> &'static str {
-        "redshift"
+#[cfg(test)]
+impl RedshiftSink {
+    fn s3(&self) -> &Option<S3Client> {
+        &self.inner.driver().s3
     }
-
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
+    fn table_ref(&self) -> String {
+        self.inner.driver().table_ref()
     }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
+    fn staging_key(&self, ext: &str) -> String {
+        self.inner.driver().staging_key(ext)
     }
+}
 
-    /// Redshift bulk-loads via `COPY … FROM 's3://…'` under `write_strategy: copy`
-    /// (#528). The `staging` capability is advertised so the CLI + tooling can
-    /// surface it.
-    fn supports_staged_load(&self) -> bool {
-        true
-    }
-
-    fn config_schema(&self) -> Value {
-        serde_json::to_value(faucet_core::schema_for!(RedshiftSinkConfig))
-            .expect("schema serialization")
-    }
-
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        // Append-only: Redshift has no ON CONFLICT and COPY cannot upsert.
-        &[faucet_core::WriteMode::Append]
-    }
-
-    fn dataset_uri(&self) -> String {
-        let table = match &self.config.schema {
-            Some(s) => format!("{}.{}", s, self.config.table_name),
-            None => self.config.table_name.clone(),
-        };
-        format!(
-            "redshift://{}:{}/{}?table={}",
-            self.config.connection.host,
-            self.config.connection.port,
-            self.config.connection.database,
-            table
-        )
-    }
-
+impl RedshiftDriver {
     /// Commit whatever the cross-page accumulator holds (#617).
     ///
     /// The pipeline calls `flush` at every bookmark-carrying page and once at
     /// the end, so a buffered group is always loaded before the bookmark
     /// advances — records left in the accumulator after a "successful" run
     /// would be data loss with a green exit code.
-    async fn flush(&self) -> Result<(), FaucetError> {
+    async fn flush_pending(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let group = {
             let mut open = self.pending.lock().await;
             open.finish()
         };
         if let Some(rows) = group {
             let len = rows.len();
-            self.commit_or_restore(rows, len).await?;
+            self.commit_or_restore(calls, rows, len).await?;
         }
         Ok(())
     }
@@ -675,17 +674,18 @@ impl faucet_core::Sink for RedshiftSink {
     /// The DLQ path commits per page (SQL-21): earlier buffered rows are
     /// committed first, then this page alone, so a failed commit names exactly
     /// the rows of *this* page that did not land.
-    async fn write_batch_partial(
+    async fn write_partial(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        self.flush().await?;
-        self.ensure_table_ready(records).await?;
-        self.ensure_columns(records).await?;
-        match self.commit_group(records).await {
+        self.flush_pending(calls).await?;
+        self.ensure_table_ready(calls, records).await?;
+        self.ensure_columns(calls, records).await?;
+        match self.commit_group(calls, records).await {
             Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
             Err((0, e)) => Err(e),
             Err((done, e)) => {
@@ -705,12 +705,12 @@ impl faucet_core::Sink for RedshiftSink {
         }
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        self.ensure_table_ready(records).await?;
-        self.ensure_columns(records).await?;
+        self.ensure_table_ready(calls, records).await?;
+        self.ensure_columns(calls, records).await?;
         // Accumulate across calls and load once per threshold (#617): `COPY`
         // wants millions of rows per load, and `batch_size` could only ever
         // split a page — never merge two small ones.
@@ -720,21 +720,88 @@ impl faucet_core::Sink for RedshiftSink {
         };
         if let Some(rows) = group {
             let keep_end = rows.len() - records.len();
-            self.commit_or_restore(rows, keep_end).await?;
+            self.commit_or_restore(calls, rows, keep_end).await?;
         }
         Ok(records.len())
+    }
+}
+
+#[async_trait]
+impl SinkDriver for RedshiftDriver {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "redshift"
+    }
+
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
+    }
+
+    /// Redshift bulk-loads via `COPY … FROM 's3://…'` under `write_strategy: copy`
+    /// (#528). The `staging` capability is advertised so the CLI + tooling can
+    /// surface it.
+    fn staged_load(&self) -> bool {
+        true
+    }
+
+    fn config_schema(&self) -> Value {
+        serde_json::to_value(faucet_core::schema_for!(RedshiftSinkConfig))
+            .expect("schema serialization")
+    }
+
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
+        // Append-only: Redshift has no ON CONFLICT and COPY cannot upsert.
+        &[faucet_core::WriteMode::Append]
+    }
+
+    fn dataset_uri(&self) -> String {
+        let table = match &self.config.schema {
+            Some(s) => format!("{}.{}", s, self.config.table_name),
+            None => self.config.table_name.clone(),
+        };
+        format!(
+            "redshift://{}:{}/{}?table={}",
+            self.config.connection.host,
+            self.config.connection.port,
+            self.config.connection.database,
+            table
+        )
+    }
+
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.flush_pending(calls).await
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => Ok(PageWrite::accepted(self.write_page(calls, rows).await?)),
+        }
     }
 
     /// Preflight connectivity probe (`faucet doctor`): acquire a connection and
     /// run `SELECT 1`. Non-mutating and idempotent.
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
         let started = std::time::Instant::now();
-        let ping = self.call("query", async {
+        let ping = self.call(calls, "query", async {
             sqlx::query("SELECT 1")
                 .execute(&self.pool)
                 .await
@@ -826,13 +893,13 @@ mod tests {
     #[tokio::test]
     async fn new_insert_has_no_s3_client() {
         let s = sink(insert_config()).await;
-        assert!(s.s3.is_none());
+        assert!(s.s3().is_none());
     }
 
     #[tokio::test]
     async fn new_copy_builds_s3_client() {
         let s = sink(copy_config()).await;
-        assert!(s.s3.is_some());
+        assert!(s.s3().is_some());
     }
 
     #[tokio::test]

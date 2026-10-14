@@ -60,6 +60,18 @@ The six `copy.*` keys are also still accepted flat at the config top level
 `copy:` block is present. They only ever applied to `write_strategy: copy`,
 which is what the block now makes visible.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `RedshiftDriver`
+implements `faucet_core::driver::SinkDriver` — the cross-page commit groups,
+the `COPY`-from-S3 and multi-row `INSERT` load paths, table and column
+creation — and `RedshiftSink` wraps it in a `DriverSink`, which serves the
+plain, reported and per-row writes from that one primitive and derives the
+capabilities from it. It does not use the SQL family driver
+(`faucet_common_sql::SqlSinkDriver`): that adapter writes each page in its
+own transaction, while this sink accumulates pages into commit groups and
+loads them through S3. The public type and config are unchanged.
+
 ## Testing
 
 Redshift has no local container image, and the `copy` path also needs a real S3

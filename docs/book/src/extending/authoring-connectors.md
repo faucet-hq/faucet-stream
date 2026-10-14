@@ -730,7 +730,8 @@ Which built-in sinks use how much of it:
 | postgres, mysql | the engine end to end, over an executor (migrating to `SqlDriver`) |
 | mssql | the dialect (MERGE, `CAST` placeholders, limits) and the shared mapping; its own retry-classified chunk execution |
 | duckdb | the engine's row planning, executed on the blocking driver |
-| redshift, clickhouse, oracle, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; their own row handling (`COPY`/`JSONEachRow` bodies, array DML, JSON-payload statement APIs) |
+| oracle | the dialect for quoting, escaping, types and DDL; its own row handling (array DML) |
+| redshift, clickhouse, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; the family-neutral `SinkDriver` and its lifecycle groups (staging, commit tokens, cleanup, schema) over their own row handling (`COPY`/`JSONEachRow` bodies, JSON-payload statement APIs), because their commit unit — a cross-page commit group, a statement-API request, a load job — is not the per-page client transaction `SqlSinkDriver` opens and commits (RFC 0014) |
 
 ## Make it fast
 
