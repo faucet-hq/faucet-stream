@@ -26,6 +26,9 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
     { id = "RUSTSEC-2026-0099", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
     { id = "RUSTSEC-2026-0104", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
+    # 2026-10-15 — the same legacy connector's rustls 0.21; rustls 0.23 is on 0.23.46 (fixed).
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 only in the unused AWS legacy connector; 0.23 is fixed (2026-10-15)" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 only in the unused AWS legacy connector; 0.23 is fixed (2026-10-15)" },
     # 2026-10-07 — h2 0.3 has no fixed release; same legacy AWS connector as
     # above (the live client uses h2 0.4.20).
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 only in the unused AWS legacy connector; 0.4 is fixed (2026-10-07)" },
