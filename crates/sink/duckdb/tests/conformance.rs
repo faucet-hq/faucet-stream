@@ -83,3 +83,23 @@ async fn descriptor_matches_the_built_sink() {
         );
     }
 }
+
+/// RFC 0014: the sink runs on the core sink driver, so it declares no
+/// lifecycle its driver lacks and its four write paths agree, for an
+/// auto-mapped and a JSON-column table.
+#[tokio::test]
+async fn conformance_driver_declarations_and_row_paths() {
+    let mapped = DuckdbSink::new(
+        DuckdbSinkConfig::new(":memory:", "t").column_mapping(DuckdbColumnMapping::AutoMap),
+    )
+    .await
+    .expect("sink");
+    faucet_conformance::assert_driver_declarations_truthful(&mapped).await;
+    faucet_conformance::assert_driver_row_paths_agree(&mapped).await;
+
+    let json = DuckdbSink::new(DuckdbSinkConfig::new(":memory:", "j"))
+        .await
+        .expect("sink");
+    faucet_conformance::assert_driver_declarations_truthful(&json).await;
+    faucet_conformance::assert_driver_row_paths_agree(&json).await;
+}

@@ -18,7 +18,8 @@
 //! ```
 
 use crate::dialect::{SqlDialect, TableTarget};
-use crate::engine::{EvolutionStep, SqlExecutor, SqlSinkEngine};
+use crate::engine::{EvolutionStep, SplitPage, SqlExecutor, SqlSinkEngine};
+use crate::mapping::TableColumn;
 use faucet_core::check::{CheckContext, CheckReport};
 use faucet_core::cleanup::SeenKeys;
 use faucet_core::driver::{
@@ -26,12 +27,28 @@ use faucet_core::driver::{
     SinkDriver, StagingDriver,
 };
 use faucet_core::{
-    BatchAtomicity, CallContext, CallSlot, FaucetError, SchemaEvolution, WriteMode, WritePlan,
-    WriteReport,
+    BatchAtomicity, CallContext, CallSlot, Capabilities, FaucetError, SchemaEvolution, WriteMode,
+    WritePlan, WriteReport,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A boxed, sendable backend operation, as [`SqlDriver::guard`] wraps it.
+pub type SqlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FaucetError>> + Send + 'a>>;
+
+/// Which write an [`SqlDriver::insert`] call serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InsertPath {
+    /// A plain append or overwrite page.
+    Page,
+    /// The rows of an exactly-once page, inside the transaction that also
+    /// writes its commit token.
+    Token,
+}
 
 /// Where a SQL sink writes and how its rows are shaped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +221,116 @@ pub trait SqlDriver: Send + Sync {
         )))
     }
 
+    /// Bound one sink operation (`what` is its call label: `"write_batch"`,
+    /// `"begin_overwrite"`, …), for a backend with its own per-operation
+    /// timeout. Default: unbounded.
+    fn guard<'a, T: Send + 'a>(
+        &'a self,
+        what: &'static str,
+        fut: SqlFuture<'a, T>,
+    ) -> SqlFuture<'a, T> {
+        let _ = what;
+        fut
+    }
+
+    /// Adjust the capabilities the adapter derived (scoped overwrite, …).
+    fn capabilities(&self, derived: Capabilities) -> Capabilities {
+        derived
+    }
+
+    /// The staging table an overwrite run writes into. Default:
+    /// [`SqlLayout::staging_table`]; a backend with an identifier length
+    /// limit shortens it.
+    fn staging_table(&self) -> String {
+        self.layout().staging_table()
+    }
+
+    /// How an error names `table` (the missing-target refusal). Default: as
+    /// configured.
+    fn table_display(&self, table: &str) -> String {
+        table.to_string()
+    }
+
+    /// Insert `records` into `target` on `conn` (append, overwrite and the
+    /// exactly-once page). Default: the engine's mapped insert, or the JSON
+    /// column insert.
+    async fn insert(
+        &self,
+        conn: &mut Self::Conn<'_>,
+        target: &TableTarget,
+        records: &[Value],
+        path: InsertPath,
+    ) -> Result<usize, FaucetError> {
+        let _ = path;
+        match &self.layout().json_column {
+            Some(column) => {
+                self.engine()
+                    .insert_json(conn, target, column, records)
+                    .await
+            }
+            None => self.engine().insert(conn, target, records, false).await,
+        }
+    }
+
+    /// Record `token` under `scope` on the page's transaction. Default: the
+    /// engine's token upsert.
+    async fn write_token(
+        &self,
+        conn: &mut Self::Conn<'_>,
+        scope: &str,
+        token: &str,
+    ) -> Result<(), FaucetError> {
+        self.engine().write_token(conn, scope, token).await
+    }
+
+    /// Run before a keyed write opens its transaction (a backend whose
+    /// journal DDL commits implicitly creates the journal here). Default:
+    /// nothing.
+    async fn prepare_keyed_write(&self) -> Result<(), FaucetError> {
+        Ok(())
+    }
+
+    /// Drop the overwrite staging table (and anything else a swap leaves
+    /// behind); `stale` marks the drop before a run stages. Default: `DROP
+    /// TABLE IF EXISTS` of the staging table.
+    async fn drop_staging(&self, stale: bool) -> Result<(), FaucetError> {
+        let staging = self.target(&self.staging_table());
+        let what = if stale {
+            "overwrite: drop stale staging"
+        } else {
+            "overwrite: drop staging"
+        };
+        self.ddl(&format!("DROP TABLE IF EXISTS {}", staging.reference), what)
+            .await
+    }
+
+    /// Whether an overwrite left staging behind (a read-only probe).
+    /// Default: the staging table exists.
+    async fn staging_exists(&self) -> Result<bool, FaucetError> {
+        self.table_exists(&self.staging_table()).await
+    }
+
+    /// Split a page on the dead-letter path into the rows to write and
+    /// per-row failures, over the destination's `columns`. Default: a record
+    /// matching no column (when `require_match`) fails its own row.
+    fn split_page(
+        &self,
+        target: &TableTarget,
+        records: &[Value],
+        columns: &[TableColumn],
+        require_match: bool,
+    ) -> SplitPage {
+        self.engine()
+            .split_writable(target, records, columns, require_match, |_, _, _| None)
+    }
+
+    /// Whether a keyed page on the dead-letter path is split by
+    /// [`split_page`](Self::split_page) before it is planned (a backend that
+    /// refuses some values per row). Default: no.
+    fn splits_keyed_pages(&self) -> bool {
+        false
+    }
+
     /// The rollback primitives, when this configuration supports rollback.
     fn rollback(&self) -> Option<&dyn RollbackDriver> {
         None
@@ -243,10 +370,23 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         self.driver.layout()
     }
 
+    /// One sink operation as a backend call: the run's deadline, then the
+    /// driver's own bound.
+    async fn op<'a, T: Send + 'a>(
+        &'a self,
+        calls: &CallSlot,
+        what: &'static str,
+        fut: impl Future<Output = Result<T, FaucetError>> + Send + 'a,
+    ) -> Result<T, FaucetError> {
+        calls
+            .call_once(what, self.driver.guard(what, Box::pin(fut)))
+            .await
+    }
+
     /// The table data writes land in: staging while overwriting.
     fn effective_table(&self) -> String {
         if self.engine().write_spec().is_overwrite() {
-            self.layout().staging_table()
+            self.driver.staging_table()
         } else {
             self.layout().table.clone()
         }
@@ -265,7 +405,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             if !self.driver.table_exists(&layout.table).await? {
                 return Err(faucet_core::missing_target_error(
                     &format!("{} sink", self.driver.connector_name()),
-                    &layout.table,
+                    &self.driver.table_display(&layout.table),
                 ));
             }
             self.table_ready.store(true, Ordering::Relaxed);
@@ -292,25 +432,9 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             .await
     }
 
-    /// Insert `records` (append or overwrite) on `conn`.
-    async fn insert_on(
-        &self,
-        conn: &mut D::Conn<'_>,
-        records: &[Value],
-    ) -> Result<usize, FaucetError> {
-        let target = self.driver.target(&self.effective_table());
-        match &self.layout().json_column {
-            Some(column) => {
-                self.engine()
-                    .insert_json(conn, &target, column, records)
-                    .await
-            }
-            None => self.engine().insert(conn, &target, records, false).await,
-        }
-    }
-
     /// Apply keyed write groups in one transaction.
     async fn apply_plans(&self, plans: &[WritePlan]) -> Result<usize, FaucetError> {
+        self.driver.prepare_keyed_write().await?;
         let mut conn = self.driver.begin().await?;
         let target = self.driver.target(&self.layout().table);
         let n = self.engine().apply_plans(&mut conn, &target, plans).await?;
@@ -335,10 +459,14 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             0 => records.len(),
             n => n,
         };
+        let target = self.driver.target(&self.effective_table());
         let mut total = 0;
         for part in records.chunks(chunk) {
             let mut conn = self.driver.begin().await?;
-            total += self.insert_on(&mut conn, part).await?;
+            total += self
+                .driver
+                .insert(&mut conn, &target, part, InsertPath::Page)
+                .await?;
             self.driver.commit(conn).await?;
         }
         tracing::info!(
@@ -350,25 +478,38 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         Ok(self.engine().report(records.len(), total, &[]))
     }
 
+    /// The destination's live columns, for the dead-letter split.
+    async fn live_columns(&self, table: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        let mut conn = self.driver.connection().await?;
+        conn.columns(table).await
+    }
+
     /// The dead-letter path: write the good rows and fail each bad one alone
-    /// (a record matching no column, a keyed row without its key).
+    /// (a record matching no column, a keyed row without its key, a value
+    /// the backend refuses).
     async fn write_rows_partial(&self, records: &[Value]) -> Result<PageWrite, FaucetError> {
         self.ensure_table_ready(records).await?;
+        let table = self.driver.target(&self.effective_table());
         if !self.engine().is_keyed() {
             if self.layout().json_column.is_some() {
                 self.write_rows(records).await?;
                 return Ok(PageWrite::accepted(records.len()));
             }
-            let table = self.driver.target(&self.effective_table());
-            let columns = {
-                let mut conn = self.driver.connection().await?;
-                conn.columns(&table).await?
-            };
-            let split = self
-                .engine()
-                .split_writable(&table, records, &columns, true, |_, _, _| None);
+            let columns = self.live_columns(&table).await?;
+            let split = self.driver.split_page(&table, records, &columns, true);
             self.write_rows(&split.writable).await?;
             return Ok(PageWrite::from_outcomes(split.outcomes));
+        }
+        if self.driver.splits_keyed_pages() {
+            let columns = self.live_columns(&table).await?;
+            let split = self.driver.split_page(&table, records, &columns, false);
+            let mut outcomes = split.outcomes;
+            let (plans, failed) = self.engine().plan_keyed_partial(&split.writable);
+            self.apply_plans(&plans).await?;
+            for (idx, e) in failed {
+                outcomes[split.positions[idx]] = Err(e);
+            }
+            return Ok(PageWrite::from_outcomes(outcomes));
         }
         let (plans, failed) = self.engine().plan_keyed_partial(records);
         self.apply_plans(&plans).await?;
@@ -411,16 +552,14 @@ impl<D: SqlDriver> SinkDriver for SqlSinkDriver<D> {
     ) -> Result<PageWrite, FaucetError> {
         match policy {
             RowPolicy::PerRow => {
-                calls
-                    .call_once("write_batch_partial", self.write_rows_partial(rows))
+                self.op(calls, "write_batch_partial", self.write_rows_partial(rows))
                     .await
             }
             _ => {
-                calls
-                    .call_once("write_batch", async {
-                        self.write_rows(rows).await.map(PageWrite::reported)
-                    })
-                    .await
+                self.op(calls, "write_batch", async {
+                    self.write_rows(rows).await.map(PageWrite::reported)
+                })
+                .await
             }
         }
     }
@@ -435,6 +574,10 @@ impl<D: SqlDriver> SinkDriver for SqlSinkDriver<D> {
 
     fn batch_atomicity(&self) -> BatchAtomicity {
         self.driver.batch_atomicity()
+    }
+
+    fn capabilities(&self, derived: Capabilities) -> Capabilities {
+        self.driver.capabilities(derived)
     }
 
     fn staging(&self) -> Option<&dyn StagingDriver> {
@@ -480,63 +623,50 @@ impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
     /// Every step reads the database, never this instance's memory, because
     /// the CLI runs begin, the writes and the commit on different instances.
     async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        calls
-            .call_once("begin_overwrite", async {
-                let layout = self.layout();
-                let staging = self.driver.target(&layout.staging_table());
-                self.driver
-                    .ddl(
-                        &format!("DROP TABLE IF EXISTS {}", staging.reference),
-                        "overwrite: drop stale staging",
-                    )
-                    .await?;
-                if layout.create_table && !self.driver.table_exists(&layout.table).await? {
-                    return Ok(());
-                }
-                self.driver.create_staging().await
-            })
-            .await
+        self.op(calls, "begin_overwrite", async {
+            let layout = self.layout();
+            self.driver.drop_staging(true).await?;
+            if layout.create_table && !self.driver.table_exists(&layout.table).await? {
+                return Ok(());
+            }
+            self.driver.create_staging().await
+        })
+        .await
     }
 
     /// Swap staging into place; on a first run (no destination) publish the
     /// staging table as the destination — and a run that wrote nothing
     /// leaves no table at all.
     async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        calls
-            .call_once("commit_overwrite", async {
-                let layout = self.layout();
-                if !self.driver.table_exists(&layout.table).await? {
-                    if self.driver.table_exists(&layout.staging_table()).await? {
-                        self.driver.publish_staging().await?;
-                    }
-                    return Ok(());
+        self.op(calls, "commit_overwrite", async {
+            let layout = self.layout();
+            if !self.driver.table_exists(&layout.table).await? {
+                if self
+                    .driver
+                    .table_exists(&self.driver.staging_table())
+                    .await?
+                {
+                    self.driver.publish_staging().await?;
                 }
-                self.driver.swap_staging().await
-            })
-            .await
+                return Ok(());
+            }
+            self.driver.swap_staging().await
+        })
+        .await
     }
 
     async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        calls
-            .call_once("abort_overwrite", async {
-                let staging = self.driver.target(&self.layout().staging_table());
-                self.driver
-                    .ddl(
-                        &format!("DROP TABLE IF EXISTS {}", staging.reference),
-                        "overwrite: drop staging",
-                    )
-                    .await
-            })
+        self.op(calls, "abort_overwrite", self.driver.drop_staging(false))
             .await
     }
 
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
-        calls
-            .call_once(
-                "overwrite_staging_exists",
-                self.driver.table_exists(&self.layout().staging_table()),
-            )
-            .await
+        self.op(
+            calls,
+            "overwrite_staging_exists",
+            self.driver.staging_exists(),
+        )
+        .await
     }
 }
 
@@ -547,12 +677,11 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
         calls: &CallSlot,
         scope: &str,
     ) -> Result<Option<String>, FaucetError> {
-        calls
-            .call_once("last_committed_token", async {
-                self.ensure_token_table().await?;
-                self.driver.read_token(scope).await
-            })
-            .await
+        self.op(calls, "last_committed_token", async {
+            self.ensure_token_table().await?;
+            self.driver.read_token(scope).await
+        })
+        .await
     }
 
     /// The page and its token in one transaction: on a crash both land or
@@ -566,32 +695,39 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
         scope: &str,
         token: &str,
     ) -> Result<WriteReport, FaucetError> {
-        calls
-            .call_once("write_batch_idempotent", async {
-                self.ensure_table_ready(rows).await?;
-                self.ensure_token_table().await?;
-                let plans = if self.engine().write_spec().write_mode == WriteMode::Append {
-                    None
-                } else {
-                    Some(self.engine().plan_keyed(rows)?)
-                };
-                let mut conn = self.driver.begin().await?;
-                let written = match &plans {
-                    Some(plans) => {
-                        let target = self.driver.target(&self.layout().table);
-                        self.engine().apply_plans(&mut conn, &target, plans).await?
-                    }
-                    None => self.insert_on(&mut conn, rows).await?,
-                };
-                self.engine().write_token(&mut conn, scope, token).await?;
-                self.driver.commit(conn).await?;
-                Ok(if self.engine().write_spec().dedups_by_key() {
-                    WriteReport::keyed(rows.len(), written)
-                } else {
-                    WriteReport::accepted(written)
-                })
+        self.op(calls, "write_batch_idempotent", async {
+            self.ensure_table_ready(rows).await?;
+            self.ensure_token_table().await?;
+            let plans = if self.engine().write_spec().write_mode == WriteMode::Append {
+                None
+            } else {
+                Some(self.engine().plan_keyed(rows)?)
+            };
+            if plans.is_some() {
+                self.driver.prepare_keyed_write().await?;
+            }
+            let mut conn = self.driver.begin().await?;
+            let written = match &plans {
+                Some(plans) => {
+                    let target = self.driver.target(&self.layout().table);
+                    self.engine().apply_plans(&mut conn, &target, plans).await?
+                }
+                None => {
+                    let target = self.driver.target(&self.effective_table());
+                    self.driver
+                        .insert(&mut conn, &target, rows, InsertPath::Token)
+                        .await?
+                }
+            };
+            self.driver.write_token(&mut conn, scope, token).await?;
+            self.driver.commit(conn).await?;
+            Ok(if self.engine().write_spec().dedups_by_key() {
+                WriteReport::keyed(rows.len(), written)
+            } else {
+                WriteReport::accepted(written)
             })
-            .await
+        })
+        .await
     }
 }
 
@@ -605,27 +741,25 @@ impl<D: SqlDriver> CleanupDriver for SqlSinkDriver<D> {
         scope: &BTreeMap<String, Value>,
         seen: &SeenKeys,
     ) -> Result<u64, FaucetError> {
-        calls
-            .call_once("cleanup_scope", async {
-                self.engine().check_cleanup_key()?;
-                let mut conn = self.driver.begin().await?;
-                let target = self.driver.target(&self.layout().table);
-                let deleted = self
-                    .engine()
-                    .cleanup(&mut conn, &target, scope, seen)
-                    .await?;
-                self.driver.commit(conn).await?;
-                Ok(deleted)
-            })
-            .await
+        self.op(calls, "cleanup_scope", async {
+            self.engine().check_cleanup_key()?;
+            let mut conn = self.driver.begin().await?;
+            let target = self.driver.target(&self.layout().table);
+            let deleted = self
+                .engine()
+                .cleanup(&mut conn, &target, scope, seen)
+                .await?;
+            self.driver.commit(conn).await?;
+            Ok(deleted)
+        })
+        .await
     }
 }
 
 #[faucet_core::async_trait]
 impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
     async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
-        calls
-            .call_once("current_schema", self.driver.current_schema())
+        self.op(calls, "current_schema", self.driver.current_schema())
             .await
     }
 
@@ -638,13 +772,12 @@ impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
         calls: &CallSlot,
         evolution: &SchemaEvolution,
     ) -> Result<(), FaucetError> {
-        calls
-            .call_once("evolve_schema", async {
-                let existing = self.driver.existing_columns().await?;
-                let steps = self.engine().evolution_steps(evolution, existing.as_ref());
-                self.driver.apply_evolution(steps).await
-            })
-            .await
+        self.op(calls, "evolve_schema", async {
+            let existing = self.driver.existing_columns().await?;
+            let steps = self.engine().evolution_steps(evolution, existing.as_ref());
+            self.driver.apply_evolution(steps).await
+        })
+        .await
     }
 }
 
@@ -665,6 +798,7 @@ mod tests {
         engine: SqlSinkEngine<Sqlite>,
         layout: SqlLayout,
         exists: bool,
+        split_keyed: bool,
         log: Mutex<Vec<String>>,
     }
 
@@ -674,8 +808,21 @@ mod tests {
                 engine: SqlSinkEngine::new(Sqlite, WriteSpec::default()),
                 layout,
                 exists,
+                split_keyed: false,
                 log: Mutex::new(Vec::new()),
             }
+        }
+        fn keyed(mut self, split: bool) -> Self {
+            self.engine = SqlSinkEngine::new(
+                Sqlite,
+                WriteSpec {
+                    write_mode: WriteMode::Upsert,
+                    key: vec!["id".into()],
+                    ..WriteSpec::default()
+                },
+            );
+            self.split_keyed = split;
+            self
         }
         fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
@@ -744,6 +891,59 @@ mod tests {
         }
         async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
             Ok(None)
+        }
+        fn splits_keyed_pages(&self) -> bool {
+            self.split_keyed
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backend_hooks_default_to_the_generic_lifecycle() {
+        let mem = Mem::new(SqlLayout::new("t"), true);
+        assert_eq!(mem.staging_table(), "t__faucet_ovw");
+        assert_eq!(mem.table_display("t"), "t");
+        assert!(!mem.splits_keyed_pages());
+        mem.prepare_keyed_write().await.unwrap();
+        let guarded = mem.guard("write_batch", Box::pin(async { Ok(7) })).await;
+        assert_eq!(guarded.unwrap(), 7);
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        assert!(sink.capabilities().overwrite());
+        assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(true));
+        sink.abort_overwrite().await.unwrap();
+        assert_eq!(
+            sink.driver().driver().log(),
+            ["DROP TABLE IF EXISTS `t__faucet_ovw`"]
+        );
+        assert_eq!(
+            sink.write_batch_idempotent(&[json!({"id": 1})], "s", "00001")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            sink.driver()
+                .driver()
+                .log()
+                .iter()
+                .any(|s| s.contains(faucet_core::idempotency::COMMIT_TOKEN_TABLE)),
+            "the default token write runs on the page's transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_splitting_backend_maps_keyed_failures_back_to_their_rows() {
+        for split in [true, false] {
+            let sink = DriverSink::new(SqlSinkDriver::new(
+                Mem::new(SqlLayout::new("t"), true).keyed(split),
+            ));
+            let outcomes = sink
+                .write_batch_partial(&[json!({"id": 1}), json!({"x": 2}), json!({"id": 3})])
+                .await
+                .unwrap();
+            assert!(
+                outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok(),
+                "split = {split}: {outcomes:?}"
+            );
         }
     }
 

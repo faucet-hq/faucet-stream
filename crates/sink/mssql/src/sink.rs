@@ -7,7 +7,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use faucet_core::check::{CheckContext, CheckReport, Probe};
-use faucet_core::{FaucetError, RowOutcome, Sink};
+use faucet_core::driver::{
+    CleanupDriver, CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver,
+    StagingDriver,
+};
+use faucet_core::{CallSlot, FaucetError, RowOutcome, Sink, WriteReport};
 use serde_json::Value;
 use tiberius::ToSql;
 
@@ -46,7 +50,31 @@ use crate::statements::{
 };
 
 /// Microsoft SQL Server sink.
+///
+/// Built on the core sink driver (RFC 0014): `MssqlDriver` holds the TDS I/O
+/// with its staging, commit-token, cleanup and schema groups, and a
+/// [`DriverSink`] derives the capabilities and serves the write paths.
 pub struct MssqlSink {
+    inner: DriverSink<MssqlDriver>,
+}
+
+impl MssqlSink {
+    /// Connect, validate, build the pool, and (in `json_column` + `create_table`
+    /// mode) create the table if it doesn't exist.
+    pub async fn new(config: MssqlSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(MssqlDriver::new(config).await?),
+        })
+    }
+}
+
+#[async_trait]
+impl Sink for MssqlSink {
+    faucet_core::forward_sink!(inner);
+}
+
+/// The SQL Server I/O the sink driver runs on.
+pub(crate) struct MssqlDriver {
     pub(crate) config: MssqlSinkConfig,
     pool: MssqlPool,
     pub(crate) table_quoted: String,
@@ -69,14 +97,16 @@ pub struct MssqlSink {
     #[cfg(feature = "staging")]
     pub(crate) stage_seq: std::sync::atomic::AtomicUsize,
     /// Backend-call context (#880): the run's deadline, cancel token and
-    /// round-trip recorder.
+    /// round-trip recorder. Every statement runs on its own connection call
+    /// (`on_conn`), so the driver keeps the run's context here, installed by
+    /// the adapter's `set_call_context`.
     calls: faucet_core::CallSlot,
 }
 
-impl MssqlSink {
+impl MssqlDriver {
     /// Connect, validate, build the pool, and (in `json_column` + `create_table`
     /// mode) create the table if it doesn't exist.
-    pub async fn new(config: MssqlSinkConfig) -> Result<Self, FaucetError> {
+    pub(crate) async fn new(config: MssqlSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         config.write.validate()?;
         if matches!(
@@ -1169,24 +1199,9 @@ const TRANSIENT_RETRIES: usize = 3;
 /// [`faucet_core::retry::backoff_with_jitter`].
 const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(50);
 
-#[async_trait]
-impl Sink for MssqlSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+impl MssqlDriver {
+    /// Write a page as one unit; returns the rows written.
+    async fn write_whole(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -1285,7 +1300,8 @@ impl Sink for MssqlSink {
         Ok(total)
     }
 
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+    /// Write the good rows and report each bad one (the dead-letter path).
+    async fn write_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -1339,7 +1355,7 @@ impl Sink for MssqlSink {
                 let mut written = if writable.is_empty() {
                     Vec::new().into_iter()
                 } else {
-                    self.write_batch_partial(&writable).await?.into_iter()
+                    Box::pin(self.write_partial(&writable)).await?.into_iter()
                 };
                 return Ok((0..records.len())
                     .map(|i| {
@@ -1405,44 +1421,6 @@ impl Sink for MssqlSink {
         Ok(outcomes)
     }
 
-    async fn flush(&self) -> Result<(), FaucetError> {
-        Ok(())
-    }
-
-    fn supports_idempotent_writes(&self) -> bool {
-        true
-    }
-
-    fn supports_cleanup(&self) -> bool {
-        // Column-mapping mode only: the scope + key predicates address real
-        // columns, which a single NVARCHAR(MAX) JSON payload column does not have.
-        matches!(
-            self.config.column_mapping,
-            MssqlColumnMapping::AutoColumns { .. }
-        )
-    }
-
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
-    }
-
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        &[
-            faucet_core::WriteMode::Append,
-            faucet_core::WriteMode::Upsert,
-            faucet_core::WriteMode::Delete,
-            faucet_core::WriteMode::Overwrite,
-        ]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.config.write.is_overwrite()
-    }
-
     /// Create the staging table as an empty structural clone of the target
     /// (`SELECT * INTO staging FROM target WHERE 1=0`), dropping any leftover
     /// staging from a crashed run first. With `create_table: false` a missing
@@ -1453,7 +1431,7 @@ impl Sink for MssqlSink {
     /// renames it into place (#676). Every step reads the database rather than
     /// sink-instance memory, because the CLI runs begin, the writes and the
     /// commit on different sink instances.
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+    async fn stage_impl(&self) -> Result<(), FaucetError> {
         let first_run = self.config.create_table && !self.table_exists(&self.config.table).await?;
         // Read before checking out the DDL connection (a one-connection pool).
         let target_infos = self.discover_column_types().await?;
@@ -1492,7 +1470,7 @@ impl Sink for MssqlSink {
     /// not break the copy), then `DROP TABLE staging`. T-SQL DDL/DML is
     /// transactional, so a failure rolls the whole swap back and the prior rows
     /// survive.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+    async fn publish_impl(&self) -> Result<(), FaucetError> {
         if !self.table_exists(&self.config.table).await? {
             // First run: staging holds everything; publish it as the target.
             // A run that wrote nothing has no staging either, and leaves no table.
@@ -1529,15 +1507,10 @@ impl Sink for MssqlSink {
         Ok(())
     }
 
-    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        Ok(Some(self.table_exists(&self.staging_literal()).await?))
-    }
-
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
     /// behind. Best-effort — the destination was never touched (on a first run
     /// it was never created).
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+    async fn discard_impl(&self) -> Result<(), FaucetError> {
         let staging = &self.staging_table_quoted;
         let staging_lit = self.staging_literal().replace('\'', "''");
         let mut conn = self.checkout().await?;
@@ -1549,18 +1522,10 @@ impl Sink for MssqlSink {
         Ok(())
     }
 
-    fn dedups_by_key(&self) -> bool {
-        self.config.write.dedups_by_key()
-    }
-
-    fn supports_schema_evolution(&self) -> bool {
-        true
-    }
-
     /// Read the live destination schema from `sys.columns` as an
     /// `infer_schema`-shaped object (`{"type":"object","properties":{…}}`), or
     /// `None` when the target table does not exist yet (issue #194).
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+    async fn current_schema_impl(&self) -> Result<Option<Value>, FaucetError> {
         // A JSON column stores each record whole; its physical columns are not
         // the record's fields, so there is nothing to drift against (SQL-20).
         if matches!(
@@ -1589,7 +1554,7 @@ impl Sink for MssqlSink {
     /// nullability relaxations) to the destination table. Idempotent — the
     /// `ADD` is guarded with `IF NOT EXISTS (SELECT 1 FROM sys.columns …)`, and
     /// re-running the same `ALTER COLUMN` type / `… NULL` is a no-op (issue #194).
-    async fn evolve_schema(
+    async fn evolve_impl(
         &self,
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
@@ -1659,7 +1624,7 @@ impl Sink for MssqlSink {
         Ok(())
     }
 
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+    async fn last_token_impl(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let mut conn = self.checkout().await?;
         self.ensure_commit_table(&mut conn).await?;
         for scope_owned in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
@@ -1681,7 +1646,7 @@ impl Sink for MssqlSink {
         Ok(None)
     }
 
-    async fn write_batch_idempotent(
+    async fn write_with_token_impl(
         &self,
         records: &[Value],
         scope: &str,
@@ -1794,6 +1759,90 @@ impl Sink for MssqlSink {
         Ok(written)
     }
 
+    /// A keyed page accepts one row per planned write and coalesces the rest.
+    fn report(&self, offered: usize, written: usize) -> WriteReport {
+        if self.config.write.dedups_by_key() {
+            WriteReport::keyed(offered, written)
+        } else {
+            WriteReport::accepted(written)
+        }
+    }
+}
+
+/// Every statement goes through the driver's own call slot (`on_conn`), which
+/// the adapter keeps in step with the run's context; the slot each primitive
+/// receives carries the same context.
+#[async_trait]
+impl SinkDriver for MssqlDriver {
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_common_mssql::statement_call_context(self.config.statement_timeout_secs)
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    async fn write(
+        &self,
+        _calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(self.write_partial(rows).await?)),
+            _ => {
+                let n = self.write_whole(rows).await?;
+                Ok(PageWrite::reported(self.report(rows.len(), n)))
+            }
+        }
+    }
+
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
+        &[
+            faucet_core::WriteMode::Append,
+            faucet_core::WriteMode::Upsert,
+            faucet_core::WriteMode::Delete,
+            faucet_core::WriteMode::Overwrite,
+        ]
+    }
+
+    fn dedups_by_key(&self) -> bool {
+        self.config.write.dedups_by_key()
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
+    }
+
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
+    }
+
+    /// Column-mapping mode only: the scope + key predicates address real
+    /// columns, which a single NVARCHAR(MAX) JSON payload column does not have.
+    fn cleanup(&self) -> Option<&dyn CleanupDriver> {
+        matches!(
+            self.config.column_mapping,
+            MssqlColumnMapping::AutoColumns { .. }
+        )
+        .then_some(self as &dyn CleanupDriver)
+    }
+
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
+    }
+
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(MssqlSinkConfig))
             .expect("schema serialization")
@@ -1801,7 +1850,7 @@ impl Sink for MssqlSink {
 
     /// Staged bulk load is active only with a `staging:` block and the
     /// `staging` feature compiled in.
-    fn supports_staged_load(&self) -> bool {
+    fn staged_load(&self) -> bool {
         cfg!(feature = "staging") && self.config.staging.is_some()
     }
 
@@ -1824,7 +1873,11 @@ impl Sink for MssqlSink {
         )
     }
 
-    async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+    async fn check(
+        &self,
+        _calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<CheckReport, FaucetError> {
         let started = std::time::Instant::now();
         let probe = match tokio::time::timeout(ctx.timeout, self.pool.get()).await {
             Ok(Ok(_conn)) => Probe::pass("connect", started.elapsed()),
@@ -1842,6 +1895,83 @@ impl Sink for MssqlSink {
             ),
         };
         Ok(CheckReport::single(probe))
+    }
+}
+
+#[async_trait]
+impl StagingDriver for MssqlDriver {
+    fn active(&self) -> bool {
+        self.config.write.is_overwrite()
+    }
+
+    async fn stage(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.stage_impl().await
+    }
+
+    async fn publish(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.publish_impl().await
+    }
+
+    async fn discard(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.discard_impl().await
+    }
+
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn staged(&self, _calls: &CallSlot) -> Result<bool, FaucetError> {
+        self.table_exists(&self.staging_literal()).await
+    }
+}
+
+#[async_trait]
+impl CommitTokenDriver for MssqlDriver {
+    async fn last_token(
+        &self,
+        _calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        self.last_token_impl(scope).await
+    }
+
+    async fn write_with_token(
+        &self,
+        _calls: &CallSlot,
+        rows: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<WriteReport, FaucetError> {
+        let n = self.write_with_token_impl(rows, scope, token).await?;
+        Ok(self.report(rows.len(), n))
+    }
+}
+
+#[async_trait]
+impl CleanupDriver for MssqlDriver {
+    async fn delete_absent(
+        &self,
+        _calls: &CallSlot,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        self.cleanup_scope_impl(scope, seen).await
+    }
+}
+
+#[async_trait]
+impl SchemaDriver for MssqlDriver {
+    async fn current_schema(&self, _calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        self.current_schema_impl().await
+    }
+
+    fn evolvable(&self) -> bool {
+        true
+    }
+
+    async fn evolve(
+        &self,
+        _calls: &CallSlot,
+        evolution: &faucet_core::SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        self.evolve_impl(evolution).await
     }
 }
 

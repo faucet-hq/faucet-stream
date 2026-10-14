@@ -173,6 +173,25 @@ async fn a_hung_insert_replaces_the_connection() {
     assert_eq!(sink.write_batch(&page()).await.unwrap(), 2);
 }
 
+/// RFC 0014: the driver-built sink declares only the lifecycles its driver
+/// implements, and its four write paths agree, keyed and appending.
+#[tokio::test]
+async fn driver_declarations_and_row_paths() {
+    let server = TdsServer::start().await.unwrap();
+    server.on(TABLE_PROBE, table_exists(true)).on(
+        COLUMN_INFO,
+        columns(&[("id", "bigint", false), ("v", "nvarchar", true)]),
+    );
+    for (mode, key) in [(WriteMode::Upsert, &["id"][..]), (WriteMode::Append, &[])] {
+        let sink = MssqlSink::new(auto(&server, mode, key)).await.unwrap();
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+        faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    }
+    let json = MssqlSink::new(cfg(&server)).await.unwrap();
+    assert!(!json.supports_cleanup());
+    faucet_conformance::assert_driver_declarations_truthful(&json).await;
+}
+
 #[tokio::test]
 async fn upserts_and_deletes_run_as_merges() {
     let server = TdsServer::start().await.unwrap();

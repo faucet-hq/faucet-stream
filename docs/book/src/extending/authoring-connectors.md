@@ -150,6 +150,19 @@ pub struct AcmeSqlSink { inner: DriverSink<SqlSinkDriver<AcmeSqlDriver>> }
 
 `faucet-sink-sqlite` is the reference implementation.
 
+A backend whose rules differ overrides a defaulted hook instead of the
+lifecycle: `insert` (a bulk path such as `COPY`, told whether it serves a
+plain page or the exactly-once page), `write_token` and `prepare_keyed_write`
+(token-scope rewriting, DDL that must run before a transaction because it
+commits implicitly), `drop_staging` / `staging_exists` / `staging_table`
+(extra swap leftovers, identifier length limits), `split_page` /
+`splits_keyed_pages` (values refused per row on the dead-letter path), `guard`
+(a per-operation timeout keyed by the call label), `table_display` and
+`capabilities`. `faucet-sink-postgres` and `faucet-sink-mysql` use them. A
+backend whose writes do not fit an async statement executor (a blocking
+driver, array DML, per-chunk failure classification) implements the core
+`SinkDriver` and its groups directly, as duckdb, oracle and mssql do.
+
 ### Prove it
 
 Call the two driver checks from `tests/conformance.rs`; CI requires them for a
@@ -727,10 +740,10 @@ Which built-in sinks use how much of it:
 | Sink | Uses |
 |---|---|
 | sqlite | the SQL family driver: `SqlDriver` + `SqlSinkDriver` drive every write and lifecycle (RFC 0014) |
-| postgres, mysql | the engine end to end, over an executor (migrating to `SqlDriver`) |
-| mssql | the dialect (MERGE, `CAST` placeholders, limits) and the shared mapping; its own retry-classified chunk execution |
-| duckdb | the engine's row planning, executed on the blocking driver |
-| oracle | the dialect for quoting, escaping, types and DDL; its own row handling (array DML) |
+| postgres, mysql | the SQL family driver, with backend hooks: `insert` (postgres `COPY` / JSONB `unnest`), `guard` (`write_timeout_secs`), `staging_table` (postgres's 63-byte names), `drop_staging` / `staging_exists` (mysql's `__faucet_ovw_old`), `write_token` / `prepare_keyed_write` (mysql's fitted scope key, journal before the transaction), `split_page` (binary-value refusals per row), `capabilities` (postgres scoped overwrite) |
+| mssql | the dialect (MERGE, `CAST` placeholders, limits) and the shared mapping; its own retry-classified chunk execution, on the core `SinkDriver` with staging, commit-token, cleanup and schema groups |
+| duckdb | the engine's row planning, executed on the blocking driver; on the core `SinkDriver` |
+| oracle | the dialect; blocking array DML on the core `SinkDriver` with staging, commit-token and schema groups |
 | redshift, clickhouse, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; the family-neutral `SinkDriver` and its lifecycle groups (staging, commit tokens, cleanup, schema) over their own row handling (`COPY`/`JSONEachRow` bodies, JSON-payload statement APIs), because their commit unit — a cross-page commit group, a statement-API request, a load job — is not the per-page client transaction `SqlSinkDriver` opens and commits (RFC 0014) |
 
 ## Make it fast

@@ -97,6 +97,19 @@ This sink takes its row planning — the engine's column mapping (exact first, e
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. The driver is blocking, so the planned statements run on `spawn_blocking` here rather than through the async executor; adding columns for new fields stays sink-specific.
 
+## How it is built
+
+The sink runs on the core sink driver (RFC 0014): `DuckdbDriver` implements
+`faucet_core::driver::SinkDriver` — the one-transaction blocking page write
+(interrupted when the call context ends it) and the per-row split of the
+dead-letter path — and `DuckdbSink` wraps it in a `DriverSink`, which serves
+the plain, reported and per-row write paths with row accounting. It is not on
+the SQL family driver (`faucet_common_sql::SqlDriver`): that adapter runs
+statements through an async executor, and DuckDB's connection is blocking and
+writes a whole page in one task. The sink has no overwrite, exactly-once,
+cleanup or schema lifecycle, so the driver declares no lifecycle group. The
+public type and config are unchanged.
+
 ## Value fidelity
 
 A non-integer JSON number is bound as its shortest decimal text, which DuckDB

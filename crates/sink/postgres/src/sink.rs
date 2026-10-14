@@ -7,10 +7,11 @@ use crate::copy::{build_auto_map_payload, build_jsonb_payload, copy_statement};
 use async_trait::async_trait;
 use faucet_common_sql::dialects::Postgres;
 use faucet_common_sql::{
-    EvolutionStep, SqlDialect, SqlExecutor, SqlSinkEngine, Statement, StatementKind, TableColumn,
-    TableTarget,
+    EvolutionStep, InsertPath, SplitPage, SqlDialect, SqlDriver, SqlExecutor, SqlFuture, SqlLayout,
+    SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
 };
 use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, RollbackDriver};
 use faucet_core::util::quote_ident;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -37,24 +38,35 @@ pub(crate) fn table_columns(columns: &[(String, String)]) -> Vec<TableColumn> {
 /// record's position in `records`. A record whose `bytea` value
 /// `binary_encoding` refuses — or, with `require_match`, that matches no
 /// column — fails on its own row instead of failing the page.
-pub(crate) fn split_writable(
+fn split_columns(
     records: &[Value],
-    columns: &[(String, String)],
+    columns: &[TableColumn],
     binary: BinaryEncoding,
     require_match: bool,
-) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
-    let split = faucet_common_sql::split_page(
+) -> SplitPage {
+    faucet_common_sql::split_page(
         &Postgres,
         "",
         records,
-        &table_columns(columns),
+        columns,
         require_match,
         |idx, col, v| {
             pg_bind_text_with(Some(v), &col.sql_type, binary)
                 .err()
                 .map(|e| format!("row {idx}: column {}: {e}", col.name))
         },
-    );
+    )
+}
+
+/// [`split_columns`] over `(name, udt)` pairs.
+#[cfg(test)]
+pub(crate) fn split_writable(
+    records: &[Value],
+    columns: &[(String, String)],
+    binary: BinaryEncoding,
+    require_match: bool,
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
+    let split = split_columns(records, &table_columns(columns), binary, require_match);
     (split.outcomes, split.writable, split.positions)
 }
 
@@ -585,16 +597,23 @@ fn pg_udt_to_json_schema(udt: &str, nullable: bool) -> serde_json::Value {
 }
 
 /// A sink that writes JSON records to a PostgreSQL table.
+///
+/// Built on the SQL family driver (RFC 0014): `PostgresDriver` holds the
+/// PostgreSQL I/O (the bootstrap-locked DDL, `COPY`, the overwrite swap, the
+/// catalog reads), and [`SqlSinkDriver`] drives writes, per-row outcomes, the
+/// exactly-once commit, cleanup, the overwrite lifecycle and schema evolution
+/// from it.
 pub struct PostgresSink {
+    inner: DriverSink<SqlSinkDriver<PostgresDriver>>,
+}
+
+/// The PostgreSQL I/O primitives the SQL family driver runs on.
+pub(crate) struct PostgresDriver {
     pub(crate) config: PostgresSinkConfig,
     pub(crate) pool: PgPool,
-    /// Whether the target has been confirmed present (created or probed) for
-    /// this sink instance (#580). One check per run, not per page.
-    table_ready: std::sync::atomic::AtomicBool,
     /// The shared SQL planning engine (#884).
     pub(crate) engine: SqlSinkEngine<Postgres>,
-    /// Backend-call context (#880): the run's deadline and recorder.
-    pub(crate) calls: faucet_core::CallSlot,
+    layout: SqlLayout,
 }
 
 /// The engine's view of one PostgreSQL connection (or open transaction).
@@ -602,7 +621,7 @@ pub struct PostgresSink {
 /// destination column's input function parses it (#146 C1).
 pub(crate) struct PgExec<'c> {
     pub(crate) conn: &'c mut sqlx::PgConnection,
-    pub(crate) sink: &'c PostgresSink,
+    pub(crate) sink: &'c PostgresDriver,
 }
 
 #[async_trait]
@@ -685,96 +704,60 @@ impl SqlExecutor for PgExec<'_> {
     }
 }
 
+/// A connection the SQL family driver runs statements on: an open write
+/// transaction, or a pooled connection for catalog reads.
+pub(crate) enum PgConn<'c> {
+    /// A `BEGIN` transaction.
+    Tx(sqlx::Transaction<'c, sqlx::Postgres>, &'c PostgresDriver),
+    /// A plain pooled connection.
+    Pooled(
+        sqlx::pool::PoolConnection<sqlx::Postgres>,
+        &'c PostgresDriver,
+    ),
+}
+
+impl PgConn<'_> {
+    fn parts(&mut self) -> (&mut sqlx::PgConnection, &PostgresDriver) {
+        match self {
+            PgConn::Tx(tx, sink) => (&mut **tx, *sink),
+            PgConn::Pooled(conn, sink) => (&mut **conn, *sink),
+        }
+    }
+
+    fn exec(&mut self) -> PgExec<'_> {
+        let (conn, sink) = self.parts();
+        PgExec { conn, sink }
+    }
+}
+
+#[async_trait]
+impl SqlExecutor for PgConn<'_> {
+    async fn columns(&mut self, target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        self.exec().columns(target).await
+    }
+
+    async fn key_types(
+        &mut self,
+        target: &TableTarget,
+        key: &[String],
+    ) -> Result<Vec<Option<String>>, FaucetError> {
+        self.exec().key_types(target, key).await
+    }
+
+    async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
+        self.exec().execute(stmt).await
+    }
+
+    async fn journal_plan(
+        &mut self,
+        plan: &faucet_core::WritePlan,
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        self.exec().journal_plan(plan, run_id).await
+    }
+}
+
 impl PostgresSink {
-    /// Run `fut` as the sink operation `what`: one backend call (#880) under
-    /// the run's deadline, bounded by `write_timeout_secs`.
-    async fn guarded<T>(
-        &self,
-        what: &'static str,
-        fut: impl std::future::Future<Output = Result<T, FaucetError>>,
-    ) -> Result<T, FaucetError> {
-        self.calls
-            .call_once(what, bounded(self.config.write_timeout_secs, what, fut))
-            .await
-    }
-
-    /// Make sure the target table exists before the first write (#580).
-    ///
-    /// Runs once per sink instance. With `create_table: true` (the default) a
-    /// missing table — and its schema, when `schema:` is set — is created from
-    /// the first page's inferred columns; with `false` a missing table is a
-    /// typed failure naming both ways out, rather than a confusing
-    /// "relation does not exist" from the first INSERT.
-    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
-        use std::sync::atomic::Ordering;
-        if self.table_ready.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-
-        if !self.config.create_table {
-            if !self.table_exists(&self.config.table_name).await? {
-                return Err(faucet_core::missing_target_error(
-                    "postgres sink",
-                    &table_ref,
-                ));
-            }
-            self.table_ready.store(true, Ordering::Relaxed);
-            return Ok(());
-        }
-
-        let json_column = match &self.config.column_mapping {
-            PostgresColumnMapping::AutoMap => None,
-            PostgresColumnMapping::Jsonb { column } => Some(column.as_str()),
-        };
-        // An overwrite writes to staging. On a first run (no target) nothing
-        // else creates staging, so it is created here from the page (#676).
-        // AutoMap needs a page to infer from; a page with nothing inferable
-        // leaves the table uncreated so the next page can try, rather than
-        // emitting a zero-column CREATE.
-        let create_ref =
-            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        let Some(create) =
-            self.engine
-                .create_table_sql(&target_ref(&create_ref), records, json_column)?
-        else {
-            return Ok(());
-        };
-
-        let mut statements = Vec::with_capacity(2);
-        if let Some(schema) = self.config.schema.as_deref() {
-            statements.push(format!(
-                "CREATE SCHEMA IF NOT EXISTS {}",
-                quote_ident(schema)
-            ));
-        }
-        statements.push(create);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-        run_bootstrap_ddl(
-            &mut conn,
-            &bootstrap_lock_key(self.config.schema.as_deref()),
-            &statements,
-        )
-        .await
-        .map_err(|e| FaucetError::Sink(format!("postgres CREATE SCHEMA/TABLE failed: {e}")))?;
-        self.table_ready.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), table);
-        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
-            .bind(&table_ref)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres table probe failed: {e}")))?;
-        Ok(exists.is_some())
-    }
-
     /// Create a new PostgreSQL sink. Establishes a connection pool.
     pub async fn new(config: PostgresSinkConfig) -> Result<Self, FaucetError> {
         config.write.validate()?;
@@ -812,13 +795,38 @@ impl PostgresSink {
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL connection failed: {e}")))?;
 
         let engine = SqlSinkEngine::new(Postgres, config.write.clone());
-        Ok(Self {
+        let mut layout = SqlLayout::new(config.table_name.clone())
+            .create_table(config.create_table)
+            .batch_size(config.batch_size);
+        if let PostgresColumnMapping::Jsonb { column } = &config.column_mapping {
+            layout = layout.json_column(column.clone());
+        }
+        let driver = PostgresDriver {
             config,
             pool,
-            table_ready: std::sync::atomic::AtomicBool::new(false),
             engine,
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+            layout,
+        };
+        Ok(Self {
+            inner: DriverSink::new(SqlSinkDriver::new(driver)),
         })
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for PostgresSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl PostgresDriver {
+    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        let table_ref = qualified_table_ref(self.config.schema.as_deref(), table);
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&table_ref)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres table probe failed: {e}")))?;
+        Ok(exists.is_some())
     }
 
     /// Staging table name used while an overwrite run is in flight (same schema
@@ -827,16 +835,32 @@ impl PostgresSink {
         overwrite_staging_table_name(&self.config.table_name)
     }
 
-    /// The base table name the data-write path targets. For `write_mode:
-    /// overwrite` every write in this sink's lifetime lands in the staging
-    /// table (created by [`begin_overwrite`], swapped by [`commit_overwrite`]);
-    /// otherwise the configured table.
-    fn effective_table_name(&self) -> String {
-        if self.config.write.is_overwrite() {
-            self.staging_table_name()
-        } else {
-            self.config.table_name.clone()
+    async fn acquire(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, FaucetError> {
+        self.pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))
+    }
+
+    /// Create the target (and its schema, when `schema:` is set) under the
+    /// bootstrap lock (#580, #828).
+    async fn create_target(&self, create: &str) -> Result<(), FaucetError> {
+        let mut statements = Vec::with_capacity(2);
+        if let Some(schema) = self.config.schema.as_deref() {
+            statements.push(format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                quote_ident(schema)
+            ));
         }
+        statements.push(create.to_string());
+        let mut conn = self.acquire().await?;
+        run_bootstrap_ddl(
+            &mut conn,
+            &bootstrap_lock_key(self.config.schema.as_deref()),
+            &statements,
+        )
+        .await
+        .map_err(|e| FaucetError::Sink(format!("postgres CREATE SCHEMA/TABLE failed: {e}")))
     }
 
     /// Discover the target relation's column names and underlying types
@@ -886,31 +910,29 @@ impl PostgresSink {
     async fn copy_batch(
         &self,
         conn: &mut sqlx::PgConnection,
+        table_ref: &str,
         records: &[Value],
     ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let table_ref =
-            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-
         let (statement, payload) = match &self.config.column_mapping {
             PostgresColumnMapping::Jsonb { column } => {
                 let payload = build_jsonb_payload(records);
                 (
-                    copy_statement(&table_ref, std::slice::from_ref(column)),
+                    copy_statement(table_ref, std::slice::from_ref(column)),
                     payload,
                 )
             }
             PostgresColumnMapping::AutoMap => {
-                let columns = self.discover_columns(&mut *conn, &table_ref).await?;
+                let columns = self.discover_columns(&mut *conn, table_ref).await?;
                 let Some(payload) =
                     build_auto_map_payload(records, &columns, self.config.binary_encoding)
                         .map_err(FaucetError::Sink)?
                 else {
                     return Ok(0);
                 };
-                (copy_statement(&table_ref, &payload.columns), payload)
+                (copy_statement(table_ref, &payload.columns), payload)
             }
         };
 
@@ -937,45 +959,29 @@ impl PostgresSink {
         Ok(payload.rows)
     }
 
-    /// Insert a batch of records using JSONB column mode, on the given connection.
-    ///
-    /// Accepts `&mut sqlx::PgConnection` so the same logic runs both standalone
-    /// (via a pool-acquired connection, autocommit) and inside the idempotent
-    /// transaction (where `&mut *tx` is passed — `Transaction<'_, Postgres>`
-    /// derefs to `PgConnection`).
+    /// Insert a batch of records using JSONB column mode, on the given
+    /// connection: one `INSERT … SELECT * FROM unnest($1::jsonb[])`.
     async fn insert_jsonb(
         &self,
         conn: &mut sqlx::PgConnection,
+        table_ref: &str,
         records: &[Value],
         column: &str,
     ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-
-        // Use a single INSERT with unnest for efficiency.
         let json_values: Vec<serde_json::Value> = records.to_vec();
         let query = format!(
-            "INSERT INTO {} ({}) SELECT * FROM unnest($1::jsonb[])",
-            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name()),
+            "INSERT INTO {table_ref} ({}) SELECT * FROM unnest($1::jsonb[])",
             quote_ident(column)
         );
-
         sqlx::query(&query)
             .bind(json_values)
             .execute(&mut *conn)
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL insert failed: {e}")))?;
-
         Ok(records.len())
-    }
-
-    /// The engine target of the relation the data writes go to.
-    fn write_target(&self) -> TableTarget {
-        target_ref(&qualified_table_ref(
-            self.config.schema.as_deref(),
-            &self.effective_table_name(),
-        ))
     }
 
     /// The engine target of the configured table itself (keyed writes and
@@ -985,44 +991,6 @@ impl PostgresSink {
             self.config.schema.as_deref(),
             &self.config.table_name,
         ))
-    }
-
-    /// Insert a batch of records using auto-mapped columns, on the given
-    /// connection (a pooled connection under autocommit, or the idempotent
-    /// path's open transaction).
-    ///
-    /// The engine discovers each column's name and underlying type for the
-    /// exact relation the INSERT targets (`to_regclass`, #146 M13), maps
-    /// fields to columns by exact name, refuses a record matching no column
-    /// (#789 SQL-50), and writes the union of carried columns — a row missing
-    /// one binds NULL (#146 H1) — in multi-row INSERTs sub-chunked at the
-    /// 65535-parameter cap. Each placeholder is `$N::<udt>` and the value is
-    /// bound as text (see [`pg_bind_text`]), so the column's input function
-    /// parses it (#146 C1).
-    ///
-    /// With `upsert`, each group of rows carrying the same columns gets an
-    /// `ON CONFLICT (key) DO UPDATE …` tail, so an absent column keeps its
-    /// stored value.
-    pub(crate) async fn insert_auto_map_with_conflict(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        records: &[Value],
-        upsert: bool,
-    ) -> Result<usize, FaucetError> {
-        let mut exec = PgExec { conn, sink: self };
-        self.engine
-            .insert(&mut exec, &self.write_target(), records, upsert)
-            .await
-    }
-
-    /// Auto-mapped append on the given connection (no `ON CONFLICT` tail).
-    async fn insert_auto_map(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        records: &[Value],
-    ) -> Result<usize, FaucetError> {
-        self.insert_auto_map_with_conflict(conn, records, false)
-            .await
     }
 
     /// Delete rows whose key columns match any of `deletes`, using
@@ -1039,89 +1007,10 @@ impl PostgresSink {
             .await
     }
 
-    /// Delete rows in `scope` whose key was not written by this run (#478).
-    ///
-    /// The engine loads the written keys into an `ON COMMIT DROP` temp table
-    /// typed like the key columns and deletes with `NOT EXISTS` — the key set
-    /// routinely exceeds the 65535-parameter limit — in one transaction, so
-    /// the delete is all-or-nothing. An empty `seen` set deletes the whole
-    /// scope: the source reported it empty.
-    async fn cleanup_scope_impl(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.engine.check_cleanup_key()?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL begin failed: {e}")))?;
-        let deleted = {
-            let mut exec = PgExec {
-                conn: &mut tx,
-                sink: self,
-            };
-            self.engine
-                .cleanup(&mut exec, &self.table_target(), scope, seen)
-                .await?
-        };
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("cleanup: commit failed: {e}")))?;
-        Ok(deleted)
-    }
-
-    /// Each plan in page order on one connection: its journal (with
-    /// `rollback.journal`, on the same connection so the caller's transaction
-    /// commits it with the writes, #706), upserts, then deletes. Plans come
-    /// from [`faucet_core::plan_writes_ordered`], so a delete that precedes an
-    /// upsert of a key equal under a nondeterministic collation runs first.
-    async fn apply_plans(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        plans: &[faucet_core::WritePlan],
-    ) -> Result<usize, FaucetError> {
-        let mut exec = PgExec { conn, sink: self };
-        self.engine
-            .apply_plans(&mut exec, &self.table_target(), plans)
-            .await
-    }
-
-    /// Apply plans outside an exactly-once transaction. A journaled write or
-    /// more than one plan opens its own transaction so the groups (and the
-    /// journal rows) commit atomically; a single unjournaled plan keeps the
-    /// autocommit statements.
-    async fn apply_plans_standalone(
-        &self,
-        plans: &[faucet_core::WritePlan],
-    ) -> Result<usize, FaucetError> {
-        if self.config.write.journals() || plans.len() > 1 {
-            let mut tx = self.pool.begin().await.map_err(|e| {
-                FaucetError::Sink(format!("PostgreSQL transaction begin failed: {e}"))
-            })?;
-            let n = self.apply_plans(&mut tx, plans).await?;
-            tx.commit().await.map_err(|e| {
-                FaucetError::Sink(format!("PostgreSQL transaction commit failed: {e}"))
-            })?;
-            return Ok(n);
-        }
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-        self.apply_plans(&mut conn, plans).await
-    }
-
     /// Ensure the commit-token watermark table exists.
     pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         let sql = Postgres.commit_token_table_sql();
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
+        let mut conn = self.acquire().await?;
         // Called per page: probe first so the bootstrap lock is only taken
         // while the table is missing.
         let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
@@ -1141,190 +1030,17 @@ impl PostgresSink {
     }
 }
 
-impl PostgresSink {
-    async fn write_batch_unbounded(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.write_batch_reported_unbounded(records)
-            .await
-            .map(|r| r.accepted)
-    }
-
-    /// Write a page and report what happened to each offered row: a keyed
-    /// page accepts one row per planned upsert/delete and coalesces the rest.
-    async fn write_batch_reported_unbounded(
-        &self,
-        records: &[Value],
-    ) -> Result<faucet_core::WriteReport, FaucetError> {
-        if records.is_empty() {
-            return Ok(faucet_core::WriteReport::accepted(0));
-        }
-        self.ensure_table_ready(records).await?;
-
-        if self.engine.is_keyed() {
-            let plans = self.engine.plan_keyed(records)?;
-            let written = self.apply_plans_standalone(&plans).await?;
-            return Ok(self.engine.report(records.len(), written, &plans));
-        }
-        // Append and overwrite are insert-shaped; overwrite writes land in the
-        // staging table via `effective_table_name`.
-
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            // Sentinel: pass the entire upstream page through in a single
-            // INSERT statement. Subject to Postgres' 65 535 bind-parameter
-            // limit in AutoMap mode; JSONB mode binds a single array.
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
-        };
-
-        // Acquire once; reuse for all chunks (each statement autocommits —
-        // no BEGIN is issued, so behaviour is identical to using the pool).
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-
-        let mut total = 0;
-        for chunk in chunks {
-            total += match self.config.write_method {
-                // Bulk-load fast-path: COPY the chunk instead of a multi-row
-                // INSERT (append-only; validated at construction, #308).
-                PostgresWriteMethod::Copy => self.copy_batch(&mut conn, chunk).await?,
-                PostgresWriteMethod::Insert => match &self.config.column_mapping {
-                    PostgresColumnMapping::Jsonb { column } => {
-                        self.insert_jsonb(&mut conn, chunk, column).await?
-                    }
-                    PostgresColumnMapping::AutoMap => {
-                        self.insert_auto_map(&mut conn, chunk).await?
-                    }
-                },
-            };
-        }
-
-        tracing::info!(
-            table = %self.config.table_name,
-            rows = total,
-            "PostgreSQL write complete"
-        );
-        Ok(self.engine.report(records.len(), total, &[]))
-    }
-
-    async fn write_batch_partial_unbounded(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        // The DLQ and exactly-once paths must create a missing target too (#676).
-        self.ensure_table_ready(records).await?;
-        if !matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            // Append and overwrite: insert-shaped. A record matching no column
-            // is that row's failure, not a silent skip (#789 SQL-50).
-            if !matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap) {
-                self.write_batch_unbounded(records).await?;
-                return Ok(records.iter().map(|_| Ok(())).collect());
-            }
-            let table_ref =
-                qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-            let mut conn = self.pool.acquire().await.map_err(|e| {
-                FaucetError::Sink(format!("PostgreSQL connection acquire failed: {e}"))
-            })?;
-            let columns = self.discover_columns(&mut conn, &table_ref).await?;
-            drop(conn);
-            let (outcomes, writable, _) =
-                split_writable(records, &columns, self.config.binary_encoding, true);
-            self.write_batch_unbounded(&writable).await?;
-            return Ok(outcomes);
-        }
-
-        let table_ref =
-            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        let mut conn =
-            self.pool.acquire().await.map_err(|e| {
-                FaucetError::Sink(format!("PostgreSQL connection acquire failed: {e}"))
-            })?;
-        let columns = self.discover_columns(&mut conn, &table_ref).await?;
-        drop(conn);
-        let (mut outcomes, writable, positions) =
-            split_writable(records, &columns, self.config.binary_encoding, false);
-        let (plans, failed) = self.engine.plan_keyed_partial(&writable);
-        self.apply_plans_standalone(&plans).await?;
-
-        for (idx, e) in failed {
-            outcomes[positions[idx]] = Err(e);
-        }
-        Ok(outcomes)
-    }
-
-    async fn write_batch_idempotent_unbounded(
-        &self,
-        records: &[Value],
-        scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        // The DLQ and exactly-once paths must create a missing target too (#676).
-        self.ensure_table_ready(records).await?;
-        self.ensure_commit_table().await?;
-
-        // For upsert/delete modes, plan the page before opening the transaction
-        // so a key-extraction failure aborts without leaving an open tx.
-        let plans = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            None
-        } else {
-            Some(self.engine.plan_keyed(records)?)
-        };
-
-        let mut tx =
-            self.pool.begin().await.map_err(|e| {
-                FaucetError::Sink(format!("PostgreSQL transaction begin failed: {e}"))
-            })?;
-
-        // Data write(s) and the commit-token upsert share ONE transaction so
-        // the page is committed atomically with its watermark: on crash either
-        // both land or neither does, which is what makes a replay skip-on-resume
-        // produce zero duplicates. For upsert/delete this means the planned
-        // upserts/deletes commit together with the watermark in the same tx.
-        let written = match &plans {
-            Some(plans) => self.apply_plans(&mut tx, plans).await?,
-            None => match &self.config.column_mapping {
-                PostgresColumnMapping::Jsonb { column } => {
-                    self.insert_jsonb(&mut tx, records, column).await?
-                }
-                PostgresColumnMapping::AutoMap => self.insert_auto_map(&mut tx, records).await?,
-            },
-        };
-
-        {
-            let mut exec = PgExec {
-                conn: &mut tx,
-                sink: self,
-            };
-            self.engine.write_token(&mut exec, scope, token).await?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL transaction commit failed: {e}")))?;
-        Ok(written)
-    }
-}
-
 #[async_trait]
-impl faucet_core::Sink for PostgresSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
+impl SqlDriver for PostgresDriver {
+    type Dialect = Postgres;
+    type Conn<'a> = PgConn<'a>;
+
+    fn engine(&self) -> &SqlSinkEngine<Postgres> {
+        &self.engine
     }
 
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
+    fn layout(&self) -> &SqlLayout {
+        &self.layout
     }
 
     fn connector_name(&self) -> &'static str {
@@ -1334,371 +1050,6 @@ impl faucet_core::Sink for PostgresSink {
     fn config_schema(&self) -> serde_json::Value {
         serde_json::to_value(faucet_core::schema_for!(PostgresSinkConfig))
             .expect("schema serialization")
-    }
-
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::of_sink(self)
-            .to_builder()
-            .scoped_overwrite(true)
-            .build()
-    }
-
-    fn supports_cleanup(&self) -> bool {
-        // Column-mapping mode only: the scope + key predicates address real
-        // columns, which a single JSONB payload column does not have.
-        matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap)
-    }
-
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.calls
-            .call_once("cleanup_scope", self.cleanup_scope_impl(scope, seen))
-            .await
-    }
-
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        &[
-            faucet_core::WriteMode::Append,
-            faucet_core::WriteMode::Upsert,
-            faucet_core::WriteMode::Delete,
-            faucet_core::WriteMode::Overwrite,
-        ]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.config.write.is_overwrite()
-    }
-
-    /// Create the staging table as an empty clone of the target's columns
-    /// (`CREATE TABLE staging (LIKE target INCLUDING DEFAULTS)`), dropping any
-    /// leftover staging from a crashed run first.
-    ///
-    /// A missing target with `create_table: true` (a first run) has no shape to
-    /// clone: the first write creates staging from the page, and the commit
-    /// renames it into place (#676). Every step reads the database rather than
-    /// sink-instance memory, because the CLI runs begin, the writes and the
-    /// commit on different sink instances.
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.guarded("begin_overwrite", async {
-            let first_run =
-                self.config.create_table && !self.table_exists(&self.config.table_name).await?;
-            let staging =
-                qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-            let target =
-                qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-            let mut conn =
-                self.pool.acquire().await.map_err(|e| {
-                    FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}"))
-                })?;
-            sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("postgres overwrite: drop stale staging: {e}"))
-                })?;
-            if first_run {
-                return Ok(());
-            }
-            // Fail before the load, not at the commit, when the swap cannot run.
-            let referencing = referencing_foreign_keys(&mut conn, &target).await?;
-            clear_statements(&target, &referencing)?;
-            sqlx::query(&format!(
-                "CREATE TABLE {staging} (LIKE {target} INCLUDING DEFAULTS INCLUDING GENERATED)"
-            ))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!(
-                    "postgres overwrite: create staging from '{}' (does the table exist?): {e}",
-                    self.config.table_name
-                ))
-            })?;
-            // Identity columns are filled by the target's sequence at the swap, so
-            // staging accepts rows that omit them.
-            let roles = column_roles(&mut conn, &target).await?;
-            for (col, _) in &roles.identity {
-                sqlx::query(&format!(
-                    "ALTER TABLE {staging} ALTER COLUMN {} DROP NOT NULL",
-                    quote_ident(col)
-                ))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("postgres overwrite: prepare staging: {e}"))
-                })?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Atomically replace the destination in one transaction. Full overwrite:
-    /// `TRUNCATE target; INSERT INTO target SELECT * FROM staging; DROP staging`.
-    /// Scoped/windowed overwrite (#518): `DELETE FROM target WHERE <scope>;
-    /// INSERT …; DROP staging` — only the in-scope rows are replaced, the rest
-    /// preserved. Postgres runs TRUNCATE and DDL transactionally, so a failure
-    /// rolls the whole swap back and the prior rows survive.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.calls
-            .call_once("commit_overwrite", async {
-                if !self.table_exists(&self.config.table_name).await? {
-                    // First run: staging holds everything; publish it as the target.
-                    // A run that wrote nothing has no staging either, and leaves no table.
-                    if self.table_exists(&self.staging_table_name()).await? {
-                        let staging =
-                            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-                        sqlx::query(&format!(
-                            "ALTER TABLE {staging} RENAME TO {}",
-                            quote_ident(&self.config.table_name)
-                        ))
-                        .execute(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            FaucetError::Sink(format!("postgres overwrite: publish staging: {e}"))
-                        })?;
-                    }
-                    return Ok(());
-                }
-                let staging =
-                    qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-                let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-                let mut tx = self
-                    .pool
-                    .begin()
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("postgres overwrite: begin swap: {e}")))?;
-                // A scope replaces only the matching rows, and only in-scope staged
-                // rows may land: a row outside the window would duplicate one the
-                // delete never touched (#789 SQL-51).
-                let window = self
-                    .config
-                    .scope
-                    .as_ref()
-                    .map(|scope| scope.render_where_literal(&quote_ident(scope.column())));
-                let clear = match &window {
-                    Some(pred) => {
-                        let outside: i64 = sqlx::query_scalar(&format!(
-                            "SELECT count(*) FROM {staging} WHERE ({pred}) IS NOT TRUE"
-                        ))
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(|e| FaucetError::Sink(format!("postgres overwrite: check scope: {e}")))?;
-                        if outside > 0 {
-                            return Err(FaucetError::Sink(format!(
-                                "postgres overwrite: {outside} staged row(s) fall outside the overwrite \
-                                 scope ({pred}); nothing was replaced. Filter the source to the window"
-                            )));
-                        }
-                        vec![format!("DELETE FROM {target} WHERE {pred}")]
-                    }
-                    None => clear_statements(&target, &referencing_foreign_keys(&mut tx, &target).await?)?,
-                };
-                // `rollback.keep_previous`: snapshot the rows about to be replaced, in
-                // the same transaction, so a rollback can swap them back (#706).
-                if self.config.write.keeps_previous() {
-                    self.keep_previous_copy(&mut tx).await?;
-                }
-                let roles = column_roles(&mut tx, &target).await?;
-                let staged: Vec<String> = self
-                    .discover_columns(&mut tx, &staging)
-                    .await?
-                    .into_iter()
-                    .map(|(c, _)| c)
-                    .collect();
-                let copy = roles.copy_statements(&target, &staging, window.as_deref(), |c| {
-                    staged.iter().any(|s| s == c)
-                });
-                let statements = clear
-                    .into_iter()
-                    .chain(copy)
-                    .chain([format!("DROP TABLE {staging}")]);
-                for stmt in statements {
-                    sqlx::query(&stmt)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| FaucetError::Sink(format!("postgres overwrite swap failed: {e}")))?;
-                }
-                tx.commit()
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("postgres overwrite: commit swap: {e}")))?;
-                Ok(())
-            })
-            .await
-    }
-
-    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.guarded("overwrite_staging_exists", async {
-            Ok(Some(self.table_exists(&self.staging_table_name()).await?))
-        })
-        .await
-    }
-
-    /// Drop the staging table so a failed/cancelled overwrite leaves nothing
-    /// behind. Best-effort — the destination was never touched (on a first run
-    /// it was never created).
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.guarded("abort_overwrite", async {
-            let staging =
-                qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
-            let mut conn =
-                self.pool.acquire().await.map_err(|e| {
-                    FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}"))
-                })?;
-            sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("postgres overwrite: drop staging: {e}")))?;
-            Ok(())
-        })
-        .await
-    }
-
-    fn dedups_by_key(&self) -> bool {
-        self.config.write.dedups_by_key()
-    }
-
-    /// Column-mapping mode only: the run-id column, the journaled keys and the
-    /// kept previous table all address real columns (#706).
-    fn supports_rollback(&self) -> bool {
-        self.rollback_supported()
-    }
-
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &faucet_core::rollback::RollbackOptions,
-    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.calls
-            .call_once("rollback_run", self.rollback_run_impl(run_id, opts))
-            .await
-    }
-
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.guarded("forget_run", async { self.forget_run_impl(run_id).await })
-            .await
-    }
-
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.guarded("rewind_commit_token", async {
-            self.rewind_commit_token_impl(scope, token).await
-        })
-        .await
-    }
-
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.readback_source_impl()
-    }
-
-    fn supports_schema_evolution(&self) -> bool {
-        true
-    }
-
-    /// Read the live destination schema from `pg_catalog` as an
-    /// `infer_schema`-shaped object (`{"type":"object","properties":{…}}`), or
-    /// `None` when the target table does not exist yet (issue #194).
-    ///
-    /// Reuses the AutoMap column-discovery query shape (scoped to the exact
-    /// relation via `to_regclass`), additionally reading `a.attnotnull` so
-    /// nullability round-trips through `pg_udt_to_json_schema`.
-    async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
-        self.guarded("current_schema", async {
-            // JSON-column mode stores each record whole; the physical columns are
-            // not the record's fields, so there is nothing to drift against
-            // (#789 SQL-20).
-            if !matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap) {
-                return Ok(None);
-            }
-            let table_ref =
-                qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-            let rows: Vec<(String, String, bool)> = sqlx::query(
-                "SELECT a.attname::text AS column_name, t.typname::text AS udt_name, a.attnotnull \
-                 FROM pg_catalog.pg_attribute a \
-                 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
-                 WHERE a.attrelid = to_regclass($1)::oid \
-                   AND a.attnum > 0 AND NOT a.attisdropped \
-                 ORDER BY a.attnum",
-            )
-            .bind(&table_ref)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres current_schema query failed: {e}")))?
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("column_name"),
-                    row.get::<String, _>("udt_name"),
-                    row.get::<bool, _>("attnotnull"),
-                )
-            })
-            .collect();
-
-            if rows.is_empty() {
-                return Ok(None); // table does not exist yet
-            }
-
-            let mut props = serde_json::Map::new();
-            for (name, udt, notnull) in rows {
-                props.insert(name, pg_udt_to_json_schema(&udt, !notnull));
-            }
-            Ok(Some(
-                serde_json::json!({ "type": "object", "properties": props }),
-            ))
-        })
-        .await
-    }
-
-    /// Apply an additive schema evolution (new columns, lossless widenings,
-    /// nullability relaxations) to the destination table. Idempotent —
-    /// `ADD COLUMN IF NOT EXISTS`, and re-running the same TYPE / DROP NOT NULL
-    /// is a no-op (issue #194).
-    async fn evolve_schema(
-        &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.guarded("evolve_schema", async {
-            let table_ref =
-                qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-            let mut conn =
-                self.pool.acquire().await.map_err(|e| {
-                    FaucetError::Sink(format!("postgres evolve acquire failed: {e}"))
-                })?;
-
-            for step in self.engine.evolution_steps(evolution, None) {
-                let (sql, what, column) = match step {
-                    EvolutionStep::Add { column, base } => (
-                        build_add_column_sql(&table_ref, &column, base),
-                        "ADD COLUMN",
-                        column,
-                    ),
-                    EvolutionStep::Widen {
-                        column, type_name, ..
-                    } => (
-                        build_alter_type_sql(&table_ref, &column, type_name),
-                        "ALTER TYPE",
-                        column,
-                    ),
-                    EvolutionStep::Relax { column } => (
-                        build_drop_not_null_sql(&table_ref, &column),
-                        "DROP NOT NULL",
-                        column,
-                    ),
-                    _ => continue,
-                };
-                sqlx::query(&sql).execute(&mut *conn).await.map_err(|e| {
-                    FaucetError::Sink(format!("postgres {what} {column} failed: {e}"))
-                })?;
-            }
-            Ok(())
-        })
-        .await
     }
 
     fn dataset_uri(&self) -> String {
@@ -1746,81 +1097,412 @@ impl faucet_core::Sink for PostgresSink {
         Ok(CheckReport::single(probe))
     }
 
-    /// Write records to PostgreSQL.
-    ///
-    /// When `config.batch_size > 0` and the input slice is larger than
-    /// `batch_size`, the slice is split into chunks of `batch_size` rows and
-    /// each chunk is sent as a separate multi-row `INSERT`. When
-    /// `config.batch_size == 0`, the entire slice is sent in a single
-    /// `INSERT` — useful when upstream `StreamPage`s are already sized for
-    /// Postgres' per-statement bind-parameter limit (~65 535 / num_columns
-    /// in AutoMap mode).
-    ///
-    /// Acquires one connection from the pool and routes all chunks through it.
-    /// Each INSERT executes as its own autocommit statement — identical
-    /// observable behaviour to executing directly on the pool, while keeping the
-    /// same connection for the entire call (avoids repeated pool-checkout
-    /// overhead on large batches).
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.guarded("write_batch", self.write_batch_unbounded(records))
-            .await
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
     }
 
-    async fn write_batch_reported(
-        &self,
-        records: &[Value],
-    ) -> Result<faucet_core::WriteReport, FaucetError> {
-        self.guarded("write_batch", self.write_batch_reported_unbounded(records))
-            .await
+    /// Every operation but the overwrite commit and the cleanup is bounded by
+    /// `write_timeout_secs` (#789 SQL-109).
+    fn guard<'a, T: Send + 'a>(
+        &'a self,
+        what: &'static str,
+        fut: SqlFuture<'a, T>,
+    ) -> SqlFuture<'a, T> {
+        match what {
+            "commit_overwrite" | "cleanup_scope" => fut,
+            _ => Box::pin(bounded(self.config.write_timeout_secs, what, fut)),
+        }
     }
 
-    /// Write a batch and report per-row outcomes.
-    ///
-    /// In append mode this delegates to [`write_batch`](faucet_core::Sink::write_batch) and
-    /// maps a single success onto an all-`Ok(())` vector (the trait default).
-    /// In upsert/delete mode the good rows are applied (upserts + deletes), and
-    /// only the rows whose key could not be extracted (missing / null key) are
-    /// reported as `Err` so the pipeline routes them to the DLQ per-row instead
-    /// of sending the whole page.
-    async fn write_batch_partial(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        self.guarded(
-            "write_batch_partial",
-            self.write_batch_partial_unbounded(records),
-        )
+    /// A configured `scope` replaces only its window (#518).
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().scoped_overwrite(true).build()
+    }
+
+    fn target(&self, table: &str) -> TableTarget {
+        target_ref(&qualified_table_ref(self.config.schema.as_deref(), table))
+    }
+
+    fn staging_table(&self) -> String {
+        self.staging_table_name()
+    }
+
+    fn table_display(&self, table: &str) -> String {
+        qualified_table_ref(self.config.schema.as_deref(), table)
+    }
+
+    async fn begin(&self) -> Result<PgConn<'_>, FaucetError> {
+        let tx =
+            self.pool.begin().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL transaction begin failed: {e}"))
+            })?;
+        Ok(PgConn::Tx(tx, self))
+    }
+
+    async fn commit(&self, conn: PgConn<'_>) -> Result<(), FaucetError> {
+        match conn {
+            PgConn::Tx(tx, _) => tx.commit().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL transaction commit failed: {e}"))
+            }),
+            PgConn::Pooled(..) => Ok(()),
+        }
+    }
+
+    async fn connection(&self) -> Result<PgConn<'_>, FaucetError> {
+        let conn =
+            self.pool.acquire().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL connection acquire failed: {e}"))
+            })?;
+        Ok(PgConn::Pooled(conn, self))
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        PostgresDriver::table_exists(self, table).await
+    }
+
+    /// The target and the commit-token table are created under the
+    /// bootstrap lock (#828); any other statement runs on a pooled
+    /// connection.
+    async fn ddl(&self, sql: &str, what: &'static str) -> Result<(), FaucetError> {
+        match what {
+            "CREATE TABLE" => self.create_target(sql).await,
+            "commit-table create" => self.ensure_commit_table().await,
+            _ => {
+                let mut conn = self.acquire().await?;
+                sqlx::query(sql)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("postgres {what}: {e}")))?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn read_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+        let row = sqlx::query(&Postgres.commit_token_select_sql())
+            .bind(scope)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("PostgreSQL token read failed: {e}")))?;
+        Ok(row.map(|r| r.get::<String, _>(0)))
+    }
+
+    /// `CREATE TABLE staging (LIKE target INCLUDING DEFAULTS INCLUDING
+    /// GENERATED)`, after refusing a target whose swap cannot run (a foreign
+    /// key the clear would break). Identity columns are filled by the
+    /// target's sequence at the swap, so staging accepts rows that omit them.
+    async fn create_staging(&self) -> Result<(), FaucetError> {
+        let staging =
+            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+        let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+        let mut conn = self.acquire().await?;
+        let referencing = referencing_foreign_keys(&mut conn, &target).await?;
+        clear_statements(&target, &referencing)?;
+        sqlx::query(&format!(
+            "CREATE TABLE {staging} (LIKE {target} INCLUDING DEFAULTS INCLUDING GENERATED)"
+        ))
+        .execute(&mut *conn)
         .await
+        .map_err(|e| {
+            FaucetError::Sink(format!(
+                "postgres overwrite: create staging from '{}' (does the table exist?): {e}",
+                self.config.table_name
+            ))
+        })?;
+        let roles = column_roles(&mut conn, &target).await?;
+        for (col, _) in &roles.identity {
+            sqlx::query(&format!(
+                "ALTER TABLE {staging} ALTER COLUMN {} DROP NOT NULL",
+                quote_ident(col)
+            ))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: prepare staging: {e}")))?;
+        }
+        Ok(())
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
+    /// First run: staging holds everything; rename it into place.
+    async fn publish_staging(&self) -> Result<(), FaucetError> {
+        let staging =
+            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+        sqlx::query(&format!(
+            "ALTER TABLE {staging} RENAME TO {}",
+            quote_ident(&self.config.table_name)
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("postgres overwrite: publish staging: {e}")))?;
+        Ok(())
+    }
+
+    /// Atomically replace the destination in one transaction. Full overwrite:
+    /// `TRUNCATE target; INSERT INTO target SELECT * FROM staging; DROP staging`.
+    /// Scoped/windowed overwrite (#518): `DELETE FROM target WHERE <scope>;
+    /// INSERT …; DROP staging` — only the in-scope rows are replaced, the rest
+    /// preserved. Postgres runs TRUNCATE and DDL transactionally, so a failure
+    /// rolls the whole swap back and the prior rows survive.
+    async fn swap_staging(&self) -> Result<(), FaucetError> {
+        let staging =
+            qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+        let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: begin swap: {e}")))?;
+        // A scope replaces only the matching rows, and only in-scope staged
+        // rows may land: a row outside the window would duplicate one the
+        // delete never touched (#789 SQL-51).
+        let window = self
+            .config
+            .scope
+            .as_ref()
+            .map(|scope| scope.render_where_literal(&quote_ident(scope.column())));
+        let clear = match &window {
+            Some(pred) => {
+                let outside: i64 = sqlx::query_scalar(&format!(
+                    "SELECT count(*) FROM {staging} WHERE ({pred}) IS NOT TRUE"
+                ))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("postgres overwrite: check scope: {e}")))?;
+                if outside > 0 {
+                    return Err(FaucetError::Sink(format!(
+                        "postgres overwrite: {outside} staged row(s) fall outside the overwrite \
+                         scope ({pred}); nothing was replaced. Filter the source to the window"
+                    )));
+                }
+                vec![format!("DELETE FROM {target} WHERE {pred}")]
+            }
+            None => clear_statements(&target, &referencing_foreign_keys(&mut tx, &target).await?)?,
+        };
+        // `rollback.keep_previous`: snapshot the rows about to be replaced, in
+        // the same transaction, so a rollback can swap them back (#706).
+        if self.config.write.keeps_previous() {
+            self.keep_previous_copy(&mut tx).await?;
+        }
+        let roles = column_roles(&mut tx, &target).await?;
+        let staged: Vec<String> = self
+            .discover_columns(&mut tx, &staging)
+            .await?
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        let copy = roles.copy_statements(&target, &staging, window.as_deref(), |c| {
+            staged.iter().any(|s| s == c)
+        });
+        let statements = clear
+            .into_iter()
+            .chain(copy)
+            .chain([format!("DROP TABLE {staging}")]);
+        for stmt in statements {
+            sqlx::query(&stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("postgres overwrite swap failed: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres overwrite: commit swap: {e}")))?;
+        Ok(())
+    }
+
+    /// Read the live destination schema from `pg_catalog` as an
+    /// `infer_schema`-shaped object (`{"type":"object","properties":{…}}`), or
+    /// `None` when the target table does not exist yet (issue #194).
+    ///
+    /// Reuses the AutoMap column-discovery query shape (scoped to the exact
+    /// relation via `to_regclass`), additionally reading `a.attnotnull` so
+    /// nullability round-trips through `pg_udt_to_json_schema`.
+    async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
+        // JSON-column mode stores each record whole; the physical columns are
+        // not the record's fields, so there is nothing to drift against
+        // (#789 SQL-20).
+        if !matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap) {
+            return Ok(None);
+        }
+        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+        let rows: Vec<(String, String, bool)> = sqlx::query(
+            "SELECT a.attname::text AS column_name, t.typname::text AS udt_name, a.attnotnull \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = to_regclass($1)::oid \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+        )
+        .bind(&table_ref)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("postgres current_schema query failed: {e}")))?
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("column_name"),
+                row.get::<String, _>("udt_name"),
+                row.get::<bool, _>("attnotnull"),
+            )
+        })
+        .collect();
+
+        if rows.is_empty() {
+            return Ok(None); // table does not exist yet
+        }
+
+        let mut props = serde_json::Map::new();
+        for (name, udt, notnull) in rows {
+            props.insert(name, pg_udt_to_json_schema(&udt, !notnull));
+        }
+        Ok(Some(
+            serde_json::json!({ "type": "object", "properties": props }),
+        ))
+    }
+
+    /// Apply an additive schema evolution (new columns, lossless widenings,
+    /// nullability relaxations) to the destination table. Idempotent —
+    /// `ADD COLUMN IF NOT EXISTS`, and re-running the same TYPE / DROP NOT NULL
+    /// is a no-op (issue #194).
+    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
+        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres evolve acquire failed: {e}")))?;
+        for step in steps {
+            let (sql, what, column) = match step {
+                EvolutionStep::Add { column, base } => (
+                    build_add_column_sql(&table_ref, &column, base),
+                    "ADD COLUMN",
+                    column,
+                ),
+                EvolutionStep::Widen {
+                    column, type_name, ..
+                } => (
+                    build_alter_type_sql(&table_ref, &column, type_name),
+                    "ALTER TYPE",
+                    column,
+                ),
+                EvolutionStep::Relax { column } => (
+                    build_drop_not_null_sql(&table_ref, &column),
+                    "DROP NOT NULL",
+                    column,
+                ),
+                _ => continue,
+            };
+            sqlx::query(&sql)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("postgres {what} {column} failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// `COPY` serves plain pages under `write_method: copy`; the exactly-once
+    /// page stays a multi-row `INSERT`. JSONB mode is one `unnest` insert.
+    async fn insert(
+        &self,
+        conn: &mut PgConn<'_>,
+        target: &TableTarget,
+        records: &[Value],
+        path: InsertPath,
+    ) -> Result<usize, FaucetError> {
+        let (raw, _) = conn.parts();
+        if path == InsertPath::Page && matches!(self.config.write_method, PostgresWriteMethod::Copy)
+        {
+            return self.copy_batch(raw, &target.reference, records).await;
+        }
+        match &self.config.column_mapping {
+            PostgresColumnMapping::Jsonb { column } => {
+                self.insert_jsonb(raw, &target.reference, records, column)
+                    .await
+            }
+            PostgresColumnMapping::AutoMap => {
+                let mut exec = PgExec {
+                    conn: raw,
+                    sink: self,
+                };
+                self.engine.insert(&mut exec, target, records, false).await
+            }
+        }
+    }
+
+    /// A `bytea` value `binary_encoding` refuses fails only its own row.
+    fn split_page(
+        &self,
+        _target: &TableTarget,
+        records: &[Value],
+        columns: &[TableColumn],
+        require_match: bool,
+    ) -> SplitPage {
+        split_columns(records, columns, self.config.binary_encoding, require_match)
+    }
+
+    fn splits_keyed_pages(&self) -> bool {
         true
     }
 
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.guarded("last_committed_token", async {
-            self.ensure_commit_table().await?;
-            let row = sqlx::query(&Postgres.commit_token_select_sql())
-                .bind(scope)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("PostgreSQL token read failed: {e}")))?;
-            Ok(row.map(|r| r.get::<String, _>(0)))
-        })
-        .await
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        Some(self)
     }
 
-    async fn write_batch_idempotent(
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
+    }
+}
+
+#[async_trait]
+impl RollbackDriver for PostgresDriver {
+    fn enabled(&self) -> bool {
+        self.rollback_supported()
+    }
+
+    async fn rollback_run(
         &self,
-        records: &[Value],
+        calls: &faucet_core::CallSlot,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        calls
+            .call_once("rollback_run", self.rollback_run_impl(run_id, opts))
+            .await
+    }
+
+    async fn forget_run(
+        &self,
+        calls: &faucet_core::CallSlot,
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        calls
+            .call_once(
+                "forget_run",
+                bounded(
+                    self.config.write_timeout_secs,
+                    "forget_run",
+                    self.forget_run_impl(run_id),
+                ),
+            )
+            .await
+    }
+
+    async fn rewind_commit_token(
+        &self,
+        calls: &faucet_core::CallSlot,
         scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        self.guarded(
-            "write_batch_idempotent",
-            self.write_batch_idempotent_unbounded(records, scope, token),
-        )
-        .await
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        calls
+            .call_once(
+                "rewind_commit_token",
+                bounded(
+                    self.config.write_timeout_secs,
+                    "rewind_commit_token",
+                    self.rewind_commit_token_impl(scope, token),
+                ),
+            )
+            .await
     }
 }
 

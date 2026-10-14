@@ -406,7 +406,7 @@ println!("transferred {} records", result.records_written);
 ## How it works
 
 - A `sqlx::PgPool` is created once in `PostgresSink::new()` with the configured `max_connections` and reused for every batch.
-- `write_batch()` slices records into `batch_size` chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT`.
+- `write_batch()` slices records into `batch_size` chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT` in its own transaction.
 - **JSONB mode** inserts via `INSERT INTO table (col) SELECT * FROM unnest($1::jsonb[])` — one bound array, no per-row parameters.
 - **AutoMap mode** queries each column's name **and underlying type** (`udt_name`) from the catalog, scoped via `to_regclass` to exactly the relation the `INSERT` targets (the configured `schema`, else the `search_path`-resolved table). A multi-row `INSERT INTO ... VALUES ($1::int4, $2::timestamptz), ...` is built dynamically with a per-column cast; each value is bound as text so the destination column's input function parses it — numbers, booleans, timestamps, uuids, and `json`/`jsonb` columns all land in their native types. The column set is the **union** of record keys across the batch (in declared table order); on an append a row missing a column binds SQL `NULL`, while an upsert groups rows by the columns they carry and updates only those.
 - All identifiers (table + column names) are quoted with `quote_ident()` to prevent SQL injection.
@@ -464,7 +464,7 @@ catalog. A race lost to a creator outside faucet is retried.
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** for a JSONB-column append with `batch_size: 0`, or `write_mode: upsert|delete` when journaled for rollback; otherwise **best-effort** — appends are autocommit statements (one per chunk), keyed writes are transactional only when journaled for rollback. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** for a JSONB-column append with `batch_size: 0`, or `write_mode: upsert|delete` when journaled for rollback; otherwise **best-effort** — appends commit one transaction per `batch_size` chunk, so a page of several chunks can land in part (the declaration stays best-effort for every configuration it does not list, even where a page happens to fit one transaction). `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
@@ -489,6 +489,20 @@ the scoped-cleanup sequence, the commit-token write and the row report all come
 from the engine, so they behave the same here as in every other SQL sink. The
 sink supplies the connection (an executor over its driver) and keeps its own
 transactions, the `COPY` path and the overwrite swap.
+
+## How it is built
+
+The sink runs on the SQL family driver (RFC 0014): `PostgresDriver` implements
+`faucet_common_sql::SqlDriver` — the transactions, the `to_regclass` probes,
+the target and commit-token DDL under the bootstrap advisory lock, `COPY` and
+the JSONB `unnest` insert, the `LIKE` staging clone and the transactional swap
+(scoped or full), the `pg_catalog` reads, the `bytea` per-row refusal, the
+`write_timeout_secs` bound and the rollback journal — and `SqlSinkDriver`
+drives writes, per-row outcomes, the exactly-once commit, cleanup, the
+overwrite lifecycle and schema evolution from it. `PostgresSink` wraps it in a
+`DriverSink`, so its capabilities follow the driver's primitives. Each append
+chunk and each keyed page is written in its own transaction. The public type
+and config are unchanged.
 
 ## License
 

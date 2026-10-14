@@ -7,7 +7,7 @@
 //! cannot span it — the rename itself is the atomic unit, as in the swap).
 
 use crate::config::MysqlColumnMapping;
-use crate::sink::{MysqlSink, bind_value, legacy_scope_key, quote_ident_mysql, scope_key};
+use crate::sink::{MysqlDriver, bind_value, legacy_scope_key, quote_ident_mysql, scope_key};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
@@ -76,7 +76,7 @@ fn row_json_expr(columns: &[JournalColumn]) -> String {
     format!("CAST(JSON_OBJECT({}) AS CHAR)", parts.join(", "))
 }
 
-impl MysqlSink {
+impl MysqlDriver {
     /// `<table>__faucet_prev` — the replaced table an overwrite keeps.
     pub(crate) fn previous_table_name(&self) -> String {
         format!(
