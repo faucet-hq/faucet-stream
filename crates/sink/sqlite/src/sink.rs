@@ -288,7 +288,7 @@ pub(crate) const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
 
 /// A sink that writes JSON records to a SQLite table.
 ///
-/// Built on the SQL family driver (RFC 0014): [`SqliteDriver`] holds the
+/// Built on the SQL family driver (RFC 0014): `SqliteDriver` holds the
 /// SQLite I/O, and [`SqlSinkDriver`] drives writes, per-row outcomes, the
 /// exactly-once commit, cleanup, the overwrite lifecycle and schema evolution
 /// from it.

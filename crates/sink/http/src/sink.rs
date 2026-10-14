@@ -27,7 +27,7 @@ fn credential_to_auth(cred: Credential) -> HttpSinkAuth {
 
 /// An HTTP sink that sends records to an HTTP endpoint.
 ///
-/// Built on the HTTP family driver (RFC 0014): [`Endpoint`] authenticates a
+/// Built on the HTTP family driver (RFC 0014): `Endpoint` authenticates a
 /// page and sends one body; [`HttpSinkDriver`] drives the batch mode, the
 /// in-flight limit and which rows a failed request leaves undelivered.
 pub struct HttpSink {

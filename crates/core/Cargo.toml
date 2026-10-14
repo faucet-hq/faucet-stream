@@ -242,3 +242,6 @@ enum_marked_non_exhaustive = "allow"
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+# Deprecating a trait method is a minor change (RFC 0014 deprecates the Sink
+# lifecycle hooks the family drivers replace); the removal is the major (#888).
+trait_method_marked_deprecated = "allow"

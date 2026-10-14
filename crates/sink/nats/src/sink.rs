@@ -21,7 +21,7 @@ use tokio::sync::OnceCell;
 /// unreachable server fails on the first `write_batch` rather than at
 /// construction time. The client is reused across batches.
 ///
-/// Built on the messaging family driver (RFC 0014): [`NatsDriver`] encodes and
+/// Built on the messaging family driver (RFC 0014): `NatsDriver` encodes and
 /// publishes; [`MessageSinkDriver`] drives the `batch_size` groups, the
 /// `publish_timeout_secs` bound and the per-row outcomes.
 pub struct NatsSink {
