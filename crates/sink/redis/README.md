@@ -324,6 +324,17 @@ println!("transferred {} records", result.records_written);
 4. Under `delivery: exactly_once`, `write_batch_idempotent` builds the same per-record commands but ships the **whole page** as one Lua script (type check first, then the commands) with a final `SET _faucet_commit_token:<scope> <token>` — see [Effectively-once delivery](#effectively-once-delivery).
 5. A failed pipeline surfaces as `FaucetError::Sink`; a record missing its `key_field` (KeyValue) or a JSON-serialization failure does the same.
 
+### How it is built
+
+The sink runs on the core sink driver (RFC 0014): `RedisDriver` implements
+`faucet_core::driver::SinkDriver` — one write primitive serving the plain,
+reported and per-row paths (the per-row path fails only the records whose
+command cannot be built) — and `CommitTokenDriver` — the exactly-once Lua
+script and the watermark read — and `DriverSink` derives the exactly-once
+capability from that group. Redis is a key-value store rather than a
+message broker with confirmations, so it is not on the messaging family's
+`MessageDriver`. The public type and config are unchanged.
+
 ## Lineage dataset URI
 
 `redis://<host>:<port>?key=<key>` (List/Stream) or `redis://<host>:<port>?key_field=<field>` (KeyValue), with credentials stripped — e.g. `redis://localhost:6379?key=events`.
