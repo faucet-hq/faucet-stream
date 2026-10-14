@@ -90,6 +90,18 @@ Declares no optional capabilities (no exactly-once, discovery, sharding or lag).
 
 The connect, the JetStream stream/consumer lookups and pulls, the core subscription and its polls, and the page acks run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or an idle wait promptly with an error (the pipeline has already stopped reading and flushed what it took). Each call counts as one round trip (`connect`, `query`, `pull`, `subscribe`, `ack`) in `faucet_source_roundtrips_total`. Nothing is retried; an unacked message is redelivered by the server.
 
+## How it is built
+
+The source implements `faucet_core::Source` directly rather than the
+messaging family's `MessageConsumer` (RFC 0014). Core NATS is fire-and-forget
+and its pages carry no bookmark, while JetStream pages carry
+`{stream, consumer, consumed}`, acks are best-effort and flushed, an
+undecodable message is terminated (or skipped under the decode policy),
+in-progress acks keep held messages leased, a page never exceeds the
+consumer's `max_ack_pending`, and idleness is a time window.
+`MessageSourceDriver` always bookmarks `{consumed}`, propagates an ack failure
+and ends on consecutive empty receives, so it would change those semantics.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

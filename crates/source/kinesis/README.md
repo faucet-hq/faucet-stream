@@ -111,6 +111,16 @@ an in-flight read, the poll-interval pause and every backoff, and each is
 metered as a round trip (`list_shards`, `get_shard_iterator`, `get_records`).
 The throttle-aware backoff and the per-shard error budget are unchanged.
 
+## How it is built
+
+The source implements `faucet_core::Source` directly rather than the
+messaging family's `MessageConsumer` (RFC 0014). A Kinesis stream is a
+replayable log: the source resumes from cumulative per-shard sequence
+bookmarks (state key `kinesis:<stream>`), runs per-shard workers and
+reports lag. `MessageSourceDriver` acknowledges each page and bookmarks only a
+consumed count, and `SourceDriver` has no lag hook, so either would change
+those semantics.
+
 ## License
 
 MIT OR Apache-2.0

@@ -497,6 +497,18 @@ Declares exactly-once replay (deterministic from its per-partition offsets bookm
 
 The poll loop, the broker metadata calls (watermarks, partition counts, lag) and the terminal group-offset commit run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a poll on an unreachable or silent cluster promptly with an error (the pipeline has already stopped reading and flushed what it took), and each metadata or commit call counts as one round trip (`metadata`, `commit`) in `faucet_source_roundtrips_total`. Schema Registry requests run under the same context (`schema`). Polls are not round trips of their own; nothing is retried beyond librdkafka's own transient-error handling.
 
+## How it is built
+
+The source implements `faucet_core::Source` directly rather than the
+messaging family's `MessageConsumer` (RFC 0014). A Kafka topic is a
+replayable log, not a destructive queue: the source resumes from per-partition
+offset bookmarks, is exactly-once capable (the pipeline re-anchors it from the
+sink's commit token), reports lag, orders and compares positions for
+`faucet mirror`, shards across consumer-group members and commits offsets to
+the group at durable page boundaries. `MessageSourceDriver` acknowledges each
+page and bookmarks only a consumed count, and `SourceDriver` has no hooks for
+lag, positions or sharding, so either would change those semantics.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

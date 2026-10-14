@@ -98,6 +98,18 @@ Declares no optional capabilities (no exactly-once, discovery, sharding or lag).
 
 The connect (channel, QoS, topology, consumer), the waits for the next delivery, the page acks and rejects run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or an idle wait promptly with an error (the pipeline has already stopped reading and flushed what it took; unacked deliveries are requeued by the broker). Each call counts as one round trip (`connect`, `ack`, `reject`) in `faucet_source_roundtrips_total`; nothing is retried.
 
+## How it is built
+
+The source implements `faucet_core::Source` directly rather than the
+messaging family's `MessageConsumer` (RFC 0014). Under `ack_mode:
+on_sink_confirm` its pages carry `{queue, consumed}` and are acknowledged
+with one `basic.ack(multiple)` once written; under `ack_mode: auto` the
+broker acknowledges on delivery and pages carry no bookmark; idleness is a
+time window that restarts when the pipeline comes back for the next page.
+`MessageSourceDriver` always bookmarks `{consumed}` (forcing a flush per page
+even in `auto` mode) and ends on consecutive empty receives, so it would
+change those semantics.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

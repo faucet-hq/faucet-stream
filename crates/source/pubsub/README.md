@@ -114,3 +114,15 @@ acks, nacks and lease renewals are metered as round trips (`pull`, `ack`,
 `nack`, `renew`). Acks, nacks and renewals never take the cancel token: they
 are how a page already made durable leaves the subscription. The client's own
 RPC deadlines are unchanged.
+
+## How it is built
+
+The source implements `faucet_core::Source` directly rather than the
+messaging family's `MessageConsumer` (RFC 0014). Its ack-after-write semantics
+match `MessageSourceDriver`, but the rest does not: messages that arrive
+after the run stops are nacked for prompt redelivery, held messages have
+their ack deadlines extended, acks and nacks are best-effort (a failed ack is
+logged, the message redelivers), idleness is a time window, and the
+cumulative bookmark has its own shape and state key. `MessageSourceDriver`
+has no nack, propagates an ack failure and bookmarks `{consumed}`, so it
+would change those semantics.
