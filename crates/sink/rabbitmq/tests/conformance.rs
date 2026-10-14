@@ -46,6 +46,9 @@ async fn conformance_capabilities_truthful() {
     faucet_conformance::assert_capabilities_truthful(&sink, count.clone()).await;
     // #878: per-message confirm outcomes are truthful.
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    // RFC 0014: the sink runs on the messaging family driver.
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 }
 
 /// The static descriptor answers exactly what the built sink declares (RFC 0013).

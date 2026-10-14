@@ -6,11 +6,16 @@
 //! unresolvable routing key, an unencodable record, a broker `nack`, or a
 //! `mandatory` return — becomes that row's error in `write_batch_partial`, so
 //! the pipeline can route it to a DLQ. A channel-level failure fails the batch.
+//!
+//! Built on the messaging family driver (RFC 0014): `RabbitMqDriver` routes and
+//! encodes one record and publishes a page's messages; `MessageSinkDriver`
+//! reports each row and serves the plain, reported and per-row write paths.
 
 use crate::config::{RabbitMqSinkConfig, RoutingKey};
 use async_trait::async_trait;
 use faucet_common_rabbitmq::{amqp_error, check_exchange, declare_exchange, encode_payload};
-use faucet_core::{FaucetError, RowOutcome, Sink};
+use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
+use faucet_core::{CallSlot, FaucetError, RowOutcome, Sink};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use jsonpath_rust::JsonPath;
@@ -24,12 +29,17 @@ use tokio::sync::Mutex;
 ///
 /// The connection is opened on the first write and reused; if the channel is
 /// found closed (e.g. after a broker-side error) the next write reconnects.
+///
+/// Built on the messaging family driver (RFC 0014).
 pub struct RabbitMqSink {
+    inner: DriverSink<MessageSinkDriver<RabbitMqDriver>>,
+}
+
+/// The AMQP I/O primitives the messaging driver runs on.
+pub(crate) struct RabbitMqDriver {
     config: RabbitMqSinkConfig,
     routing: RoutingKey,
     state: Mutex<Option<Publisher>>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder.
-    calls: faucet_core::CallSlot,
 }
 
 struct Publisher {
@@ -43,14 +53,27 @@ impl RabbitMqSink {
         config.validate()?;
         let routing = config.routing()?;
         Ok(Self {
-            config,
-            routing,
-            state: Mutex::new(None),
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+            inner: DriverSink::new(MessageSinkDriver::new(RabbitMqDriver {
+                config,
+                routing,
+                state: Mutex::new(None),
+            })),
         })
     }
 
-    async fn channel(&self) -> Result<lapin::Channel, FaucetError> {
+    #[cfg(test)]
+    fn properties(&self) -> BasicProperties {
+        self.inner.driver().driver().properties()
+    }
+}
+
+#[async_trait]
+impl Sink for RabbitMqSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl RabbitMqDriver {
+    async fn channel(&self, calls: &CallSlot) -> Result<lapin::Channel, FaucetError> {
         let mut guard = self.state.lock().await;
         if let Some(p) = guard.as_ref()
             && p.channel.status().connected()
@@ -58,8 +81,7 @@ impl RabbitMqSink {
         {
             return Ok(p.channel.clone());
         }
-        let (conn, channel) = self
-            .calls
+        let (conn, channel) = calls
             .call_once("connect", async {
                 let conn = faucet_common_rabbitmq::connect(&self.config.connection).await?;
                 let channel = conn
@@ -95,31 +117,24 @@ impl RabbitMqSink {
         }
     }
 
-    /// Resolve and encode one record. Pure.
-    fn prepare(&self, record: &Value) -> Result<(String, Vec<u8>), FaucetError> {
-        let key = resolve_routing_key(record, &self.routing)?;
-        let body = encode_payload(record, self.config.value_format)?;
-        Ok((key, body))
-    }
-
-    /// Publish every preparable record; returns one outcome per input row.
-    async fn publish(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(records.len());
-        let mut prepared = Vec::with_capacity(records.len());
-        for (i, record) in records.iter().enumerate() {
-            match self.prepare(record) {
-                Ok(msg) => {
-                    outcomes.push(Ok(()));
-                    prepared.push((i, msg));
-                }
-                Err(e) => outcomes.push(Err(e)),
-            }
-        }
-        if prepared.is_empty() {
+    /// Publish every message in chunks of `batch_size`, awaiting each
+    /// chunk's confirms; returns one outcome per message.
+    async fn publish_messages(
+        &self,
+        calls: &CallSlot,
+        messages: Vec<OutboundMessage>,
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
+        let mut outcomes: Vec<RowOutcome> = messages.iter().map(|_| Ok(())).collect();
+        if messages.is_empty() {
             return Ok(outcomes);
         }
+        let prepared: Vec<(usize, (String, Vec<u8>))> = messages
+            .into_iter()
+            .map(|m| (m.destination, m.payload))
+            .enumerate()
+            .collect();
 
-        let channel = self.channel().await?;
+        let channel = self.channel(calls).await?;
         let props = self.properties();
         let options = BasicPublishOptions {
             mandatory: self.config.effective_mandatory(),
@@ -135,8 +150,7 @@ impl RabbitMqSink {
         for (n, group) in prepared.chunks(chunk).enumerate() {
             // Bounded: a broker resource alarm (`connection.blocked`) holds
             // publishers indefinitely (#789 MSG-84).
-            let done = self
-                .calls
+            let done = calls
                 .call_once("publish", async {
                     Ok(tokio::time::timeout(
                         limit,
@@ -267,51 +281,13 @@ fn sink_error(context: &str, e: lapin::Error) -> FaucetError {
 }
 
 #[async_trait]
-impl Sink for RabbitMqSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let outcomes = self.publish(records).await?;
-        let failed: Vec<&FaucetError> = outcomes.iter().filter_map(|o| o.as_ref().err()).collect();
-        if let Some(first) = failed.first() {
-            return Err(FaucetError::Sink(format!(
-                "rabbitmq sink: {} of {} record(s) failed (first: {first})",
-                failed.len(),
-                records.len()
-            )));
-        }
-        Ok(records.len())
-    }
-
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.publish(records).await
+impl MessageDriver for RabbitMqDriver {
+    fn connector_name(&self) -> &'static str {
+        "rabbitmq"
     }
 
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(RabbitMqSinkConfig)).unwrap_or(Value::Null)
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "rabbitmq"
     }
 
     fn dataset_uri(&self) -> String {
@@ -326,9 +302,47 @@ impl Sink for RabbitMqSink {
         )
     }
 
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new().without_timeout()
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    /// Resolve the routing key and encode the body; a record that cannot be
+    /// routed or encoded fails alone.
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        let key = resolve_routing_key(record, &self.routing)?;
+        let body = encode_payload(record, self.config.value_format)?;
+        Ok(OutboundMessage::new(key, body))
+    }
+
+    /// `publish` opens the channel and bounds each `batch_size` chunk itself.
+    fn publish_is_one_call(&self) -> bool {
+        false
+    }
+
+    async fn publish(
+        &self,
+        calls: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
+        self.publish_messages(calls, group).await
+    }
+
+    fn page_error(&self, offered: usize, failed: &[(usize, FaucetError)]) -> Option<FaucetError> {
+        let (_, first) = failed.first()?;
+        Some(FaucetError::Sink(format!(
+            "rabbitmq sink: {} of {offered} record(s) failed (first: {first})",
+            failed.len()
+        )))
+    }
+
     /// Connect, then passively check the target exchange — nothing is published.
     async fn check(
         &self,
+        _calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
