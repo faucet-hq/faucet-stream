@@ -512,9 +512,7 @@ impl MessageDriver for SqsDriver {
     /// A record that does not serialize, whose body is above the SQS limit, or
     /// whose dedup id cannot be resolved fails alone.
     fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
-        let body = serde_json::to_string(record).map_err(|e| {
-            FaucetError::Sink(format!("sqs: record does not serialize to JSON: {e}"))
-        })?;
+        let body = serde_json::to_string(record).map_err(json_error)?;
         if body.len() > crate::config::MAX_MESSAGE_BYTES {
             return Err(FaucetError::Sink(format!(
                 "sqs: message body is {} bytes, above the SQS {} byte limit — never sent",
@@ -556,9 +554,10 @@ impl MessageDriver for SqsDriver {
         let outcomes: Vec<RowOutcome> = (0..n)
             .map(|i| shipped.remove(&i).unwrap_or(Ok(())))
             .collect();
+        let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
         tracing::info!(
             queue = %self.config.queue_url,
-            records = outcomes.iter().filter(|o| o.is_ok()).count(),
+            records = delivered,
             "sqs sink write complete"
         );
         Ok(outcomes)
@@ -628,6 +627,11 @@ impl MessageDriver for SqsDriver {
     }
 }
 
+/// The error for a record that does not serialize to JSON.
+fn json_error(e: serde_json::Error) -> FaucetError {
+    FaucetError::Sink(format!("sqs: record does not serialize to JSON: {e}"))
+}
+
 /// Why a FIFO queue would reject every message: it needs a deduplication id
 /// per message unless the queue derives one from the body.
 fn fifo_dedup_problem(fifo: bool, content_dedup: bool, dedup_field: bool) -> Option<String> {
@@ -642,6 +646,16 @@ fn fifo_dedup_problem(fifo: bool, content_dedup: bool, dedup_field: bool) -> Opt
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_serialization_failure_names_the_record() {
+        let e = serde_json::from_str::<Value>("{").unwrap_err();
+        assert!(
+            json_error(e)
+                .to_string()
+                .contains("record does not serialize to JSON")
+        );
+    }
 
     #[test]
     fn a_fifo_queue_needs_a_deduplication_source() {

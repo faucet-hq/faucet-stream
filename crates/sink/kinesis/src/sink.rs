@@ -483,9 +483,10 @@ impl MessageDriver for KinesisDriver {
         let outcomes: Vec<RowOutcome> = (0..n)
             .map(|i| shipped.remove(&i).unwrap_or(Ok(())))
             .collect();
+        let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
         tracing::info!(
             stream = %self.config.stream_name,
-            records = outcomes.iter().filter(|o| o.is_ok()).count(),
+            records = delivered,
             "kinesis sink write complete"
         );
         Ok(outcomes)

@@ -408,9 +408,10 @@ impl MessageDriver for PubsubDriver {
         let prepared = group.into_iter().map(prepared_from).enumerate().collect();
         let shipped = self.publish_all(calls, prepared).await;
         let outcomes = assemble_row_outcomes(n, BTreeMap::new(), shipped);
+        let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
         tracing::info!(
             topic = %self.config.topic,
-            records = outcomes.iter().filter(|o| o.is_ok()).count(),
+            records = delivered,
             "pubsub sink write complete"
         );
         Ok(outcomes)

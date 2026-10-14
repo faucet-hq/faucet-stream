@@ -789,6 +789,22 @@ async fn send_with_queue_full_retry(
 
 #[cfg(test)]
 mod tests {
+    use faucet_core::Sink as _;
+
+    /// The sink builds offline (the producer connects lazily) and describes
+    /// its config.
+    #[tokio::test]
+    async fn the_config_schema_describes_the_sink_config() {
+        let cfg: crate::KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "127.0.0.1:1",
+            "topic": {"type": "fixed", "name": "t"}
+        }))
+        .unwrap();
+        let sink = crate::KafkaSink::new(cfg).await.unwrap();
+        assert!(sink.config_schema()["properties"]["brokers"].is_object());
+        assert_eq!(sink.connector_name(), "kafka");
+    }
+
     // dataset_uri test is skipped: KafkaSink::new() requires a live Kafka
     // broker (creates a FutureProducer in new()), and no offline constructor
     // exists.
