@@ -234,3 +234,22 @@ async fn descriptor_matches_the_built_sink() {
         );
     }
 }
+
+/// RFC 0014: the sink runs on the SQL family driver, so its capabilities follow
+/// the driver's primitives and its four write paths agree — for the keyed
+/// mode and for a JSON-column append, where cleanup and rollback are off.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_driver_declarations_and_row_paths() {
+    let (_dir, _url, sink) = fresh_sink().await;
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+
+    let dir = TempDir::new().expect("tempdir");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
+    let json = SqliteSink::new(SqliteSinkConfig::new(url, "j"))
+        .await
+        .expect("sink");
+    assert!(!json.supports_cleanup() && !json.supports_rollback());
+    faucet_conformance::assert_driver_declarations_truthful(&json).await;
+    faucet_conformance::assert_driver_row_paths_agree(&json).await;
+}

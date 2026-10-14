@@ -60,6 +60,9 @@ pub enum Trigger {
     /// The connector's crate declares this `BatchAtomicity` variant
     /// (`Atomic`, `PerRow`) for some configuration.
     Declares(&'static str),
+    /// The connector is built on a family driver (RFC 0014): its crate holds
+    /// a `DriverSink` or implements one of the driver traits.
+    Driver,
 }
 
 impl Trigger {
@@ -71,6 +74,7 @@ impl Trigger {
             Trigger::Overrides(m) => ("overrides", Some(m)),
             Trigger::BufferedFlush => ("buffered_flush", None),
             Trigger::Declares(v) => ("declares", Some(v)),
+            Trigger::Driver => ("driver", None),
         };
         match arg {
             Some(a) => serde_json::json!({ "kind": kind, "arg": a }),
@@ -192,6 +196,20 @@ pub const REQUIREMENTS: &[Requirement] = &[
         summary: "a write to a hung backend ends at the call deadline and on cancel",
     },
     Requirement {
+        id: "driver_declarations",
+        role: Role::Sink,
+        triggers: &[Trigger::Driver],
+        assertions: &["assert_driver_declarations_truthful"],
+        summary: "an undeclared lifecycle is refused by its hook and a declared one answers",
+    },
+    Requirement {
+        id: "driver_row_paths",
+        role: Role::Sink,
+        triggers: &[Trigger::Driver],
+        assertions: &["assert_driver_row_paths_agree"],
+        summary: "the plain, reported, per-row and governed writes of a valid page agree",
+    },
+    Requirement {
         id: "descriptor",
         role: Role::Source,
         triggers: &[Trigger::Always],
@@ -299,6 +317,7 @@ mod tests {
             "overrides",
             "buffered_flush",
             "declares",
+            "driver",
         ] {
             assert!(text.contains(&format!("\"kind\":\"{kind}\"")), "{kind}");
         }

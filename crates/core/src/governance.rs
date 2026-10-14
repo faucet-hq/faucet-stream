@@ -594,10 +594,10 @@ impl Governance {
     /// fresh destination-schema read, so this suits one-off pages (tests,
     /// previews, conformance), not a page loop — use a
     /// [`Pipeline`](crate::Pipeline) for that.
-    pub async fn govern(
+    pub async fn govern<Si: Sink + ?Sized>(
         &self,
         records: Vec<Value>,
-        sink: &dyn Sink,
+        sink: &Si,
     ) -> Result<GovernedOutput, FaucetError> {
         let specs = apply::GovernanceSpecs {
             #[cfg(feature = "masking")]

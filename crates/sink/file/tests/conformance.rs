@@ -118,3 +118,16 @@ fn descriptor_matches_built_sink() {
         );
     }
 }
+
+/// RFC 0014: the sink is a `FileSink` over the local object-store driver, so
+/// its capabilities follow the driver (overwrite through the swap area, no
+/// exactly-once, cleanup or rollback) and its four write paths agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_driver_declarations_and_row_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.jsonl");
+    let s = sink(&path);
+    faucet_conformance::assert_driver_declarations_truthful(&s).await;
+    faucet_conformance::assert_driver_row_paths_agree(&s).await;
+    assert_eq!(count_lines(&path), 12);
+}

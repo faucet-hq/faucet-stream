@@ -162,6 +162,32 @@
       "summary": "a write to a hung backend ends at the call deadline and on cancel"
     },
     {
+      "id": "driver_declarations",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "driver"
+        }
+      ],
+      "assertions": [
+        "assert_driver_declarations_truthful"
+      ],
+      "summary": "an undeclared lifecycle is refused by its hook and a declared one answers"
+    },
+    {
+      "id": "driver_row_paths",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "driver"
+        }
+      ],
+      "assertions": [
+        "assert_driver_row_paths_agree"
+      ],
+      "summary": "the plain, reported, per-row and governed writes of a valid page agree"
+    },
+    {
       "id": "descriptor",
       "role": "source",
       "triggers": [

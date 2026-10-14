@@ -109,6 +109,9 @@ mod docker {
         // flushes the client's buffered publishes.
         faucet_conformance::assert_partial_outcomes_truthful(&sink, count.clone()).await;
         faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+        // RFC 0014: the sink runs on the messaging family driver.
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+        faucet_conformance::assert_driver_row_paths_agree(&sink).await;
     }
 
     /// JetStream mode awaits every publish acknowledgement: a row whose

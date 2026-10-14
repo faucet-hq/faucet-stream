@@ -145,7 +145,8 @@ where
 }
 
 pub use checks::{
-    assert_batch_atomicity_truthful, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
+    assert_batch_atomicity_truthful, assert_driver_declarations_truthful,
+    assert_driver_row_paths_agree, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
     assert_replay_safe, assert_reported_rows_truthful,
 };
 

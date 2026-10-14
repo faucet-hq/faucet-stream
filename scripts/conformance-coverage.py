@@ -21,6 +21,9 @@ A requirement applies to a connector when any of its triggers holds:
   buffered_flush         the crate defines an `async fn flush` whose body is
                          more than `Ok(())`, or uses `faucet_common_file::delegate_sink!`
   declares <variant>     the crate's non-test `src/` names `BatchAtomicity::<variant>`
+  driver                 the crate is built on a family driver (RFC 0014): its
+                         non-test `src/` holds a `DriverSink<` or implements
+                         `SinkDriver`, `SqlDriver`, `MessageDriver` or `HttpDriver`
 and is met when one of those test files calls any of its assertions.
 
 Exemptions: `crates/conformance/conformance-coverage-exempt.txt`, one
@@ -86,6 +89,15 @@ def buffers(src):
     return False
 
 
+DRIVER_IMPL = re.compile(
+    r"\bimpl\b[^{;]*\b(SinkDriver|SqlDriver|MessageDriver|HttpDriver)\s+for\b"
+)
+
+
+def uses_driver(src):
+    return "DriverSink<" in src or DRIVER_IMPL.search(src) is not None
+
+
 def applies(trigger, caps, src):
     kind, arg = trigger["kind"], trigger.get("arg")
     if kind == "always":
@@ -100,6 +112,8 @@ def applies(trigger, caps, src):
         return buffers(src)
     if kind == "declares":
         return re.search(r"\bBatchAtomicity::" + re.escape(arg) + r"\b", src) is not None
+    if kind == "driver":
+        return uses_driver(src)
     raise ValueError(f"unknown trigger kind {kind!r}")
 
 

@@ -202,6 +202,17 @@ class CoverageTest(unittest.TestCase):
         self.assertIn("no crate at crates/source/ghost", errors[0])
         self.assertIn("discover", errors[1])
 
+    def test_driver_trigger(self):
+        caps = sink_caps()
+        req = {"kind": "driver"}
+        self.assertTrue(cc.applies(req, caps, "inner: DriverSink<SqlSinkDriver<D>>,"))
+        self.assertTrue(cc.applies(req, caps, "impl SqlDriver for SqliteDriver {"))
+        self.assertTrue(cc.applies(req, caps, "impl<B: X> SinkDriver for FileDriver<B> {"))
+        self.assertTrue(cc.applies(req, caps, "impl MessageDriver for NatsDriver {}"))
+        self.assertTrue(cc.applies(req, caps, "impl HttpDriver for Endpoint {}"))
+        self.assertFalse(cc.applies(req, caps, "impl Sink for Plain { }"))
+        self.assertFalse(cc.applies(req, caps, "use faucet_core::driver::SinkDriver;"))
+
     def test_unknown_trigger_kind_raises(self):
         with self.assertRaises(ValueError):
             cc.applies({"kind": "nope"}, {}, "")

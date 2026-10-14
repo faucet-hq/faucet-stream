@@ -276,6 +276,141 @@ pub async fn assert_batch_atomicity_truthful<S, F, Fut>(
     }
 }
 
+/// **Check 20 (RFC 0014).** A sink's declared capabilities match the
+/// lifecycle hooks that answer: every capability it does not declare —
+/// overwrite, exactly-once, cleanup, schema evolution, rollback — is refused by
+/// its hook rather than silently accepted, the non-destructive hooks of the
+/// ones it does declare answer, and keyed dedup comes with a keyed write mode.
+/// A sink built on a family driver ([`faucet_core::driver`]) passes by
+/// construction; the check guards that construction for every connector.
+#[allow(deprecated)] // probes the lifecycle hooks the family drivers replace
+pub async fn assert_driver_declarations_truthful<S: Sink + ?Sized>(sink: &S) {
+    use faucet_core::WriteMode;
+    let label = sink.connector_name();
+    let caps = sink.capabilities();
+    let modes = sink.supported_write_modes();
+    assert_eq!(
+        caps.overwrite(),
+        modes.contains(&WriteMode::Overwrite),
+        "[{label}] the overwrite capability disagrees with supported_write_modes"
+    );
+    if caps.keyed_dedup() {
+        assert!(
+            modes
+                .iter()
+                .any(|m| matches!(m, WriteMode::Upsert | WriteMode::Delete)),
+            "[{label}] dedups by key but declares no keyed write mode"
+        );
+    }
+    let scope = "conformance::driver";
+    if caps.overwrite() {
+        assert!(
+            sink.overwrite_staging_exists().await.is_ok(),
+            "[{label}] declares overwrite but its staging probe errored"
+        );
+    } else {
+        assert!(
+            !sink.is_overwrite() && sink.begin_overwrite().await.is_err(),
+            "[{label}] does not declare overwrite but begin_overwrite answered"
+        );
+    }
+    let token = sink.last_committed_token(scope).await;
+    if caps.idempotent_writes() {
+        assert!(
+            token.is_ok(),
+            "[{label}] declares exactly-once but its watermark read errored: {:?}",
+            token.err()
+        );
+    } else {
+        assert!(
+            matches!(token, Ok(None)),
+            "[{label}] does not declare exactly-once but reported a watermark"
+        );
+    }
+    if !caps.cleanup() {
+        assert!(
+            sink.cleanup_scope(
+                &std::collections::BTreeMap::new(),
+                &faucet_core::SeenKeys::new()
+            )
+            .await
+            .is_err(),
+            "[{label}] does not declare cleanup but cleanup_scope answered"
+        );
+    }
+    let evolved = sink
+        .evolve_schema(&faucet_core::SchemaEvolution::default())
+        .await;
+    assert_eq!(
+        evolved.is_ok(),
+        caps.schema_evolution(),
+        "[{label}] schema evolution is declared {} but an empty evolution {}",
+        caps.schema_evolution(),
+        if evolved.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        }
+    );
+    if !caps.rollback() {
+        let opts = faucet_core::rollback::RollbackOptions {
+            run_id_column: "_faucet_run_id".into(),
+            mode: faucet_core::rollback::RollbackMode::Append,
+            force: false,
+            dry_run: true,
+            later_runs: false,
+        };
+        assert!(
+            sink.rollback_run("conformance", &opts).await.is_err(),
+            "[{label}] does not declare rollback but rollback_run answered"
+        );
+    }
+}
+
+/// **Check 21 (RFC 0014).** The four ways the engine writes a valid page —
+/// plain, reported, per-row and governed — agree: each accepts every row, the
+/// report accounts for the page, and every per-row outcome is `Ok`. A family
+/// driver serves all four from one write primitive; this proves the
+/// connector's primitive behaves the same under each.
+pub async fn assert_driver_row_paths_agree<S: Sink + ?Sized>(sink: &S) {
+    let label = sink.connector_name();
+    let n = sink
+        .write_batch(&rows(941..=943))
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] plain write errored: {e}"));
+    assert_eq!(n, 3, "[{label}] plain write accepted {n} of 3 rows");
+    let report = sink
+        .write_batch_reported(&rows(944..=946))
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] reported write errored: {e}"));
+    assert!(
+        report.check(3).is_ok(),
+        "[{label}] reported write left rows unaccounted: {report:?}"
+    );
+    let outcomes = sink
+        .write_batch_partial(&rows(947..=949))
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] per-row write errored: {e}"));
+    assert_eq!(outcomes.len(), 3, "[{label}] one outcome per row");
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "[{label}] a valid row failed on the per-row path: {outcomes:?}"
+    );
+    let governed = faucet_core::governance::Governance::new()
+        .govern(rows(950..=952), sink)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] governing a page errored: {e}"));
+    let report = sink
+        .write_governed(&governed.page)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] governed write errored: {e}"));
+    assert!(
+        report.check(3).is_ok(),
+        "[{label}] governed write left rows unaccounted: {report:?}"
+    );
+    flush(sink, "the row-path writes").await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +605,288 @@ mod tests {
     async fn check19_fails_for_a_best_effort_sink() {
         let sink = TestSink::new();
         assert_batch_atomicity_truthful(&sink, counter(&sink, TestSink::len), &poison()).await;
+    }
+
+    /// An append-only driver: every lifecycle it lacks is refused by the adapter.
+    #[derive(Default)]
+    struct Mem(std::sync::Mutex<Vec<Value>>);
+
+    #[faucet_core::async_trait]
+    impl faucet_core::driver::SinkDriver for Mem {
+        fn connector_name(&self) -> &'static str {
+            "mem"
+        }
+        async fn write(
+            &self,
+            _: &faucet_core::CallSlot,
+            rows: &[Value],
+            _: faucet_core::driver::RowPolicy,
+        ) -> Result<faucet_core::driver::PageWrite, faucet_core::FaucetError> {
+            self.0.lock().unwrap().extend_from_slice(rows);
+            Ok(faucet_core::driver::PageWrite::accepted(rows.len()))
+        }
+    }
+
+    #[tokio::test]
+    async fn check20_and_21_pass_for_a_driver_sink() {
+        let sink = faucet_core::driver::DriverSink::new(Mem::default());
+        assert_driver_declarations_truthful(&sink).await;
+        assert_driver_row_paths_agree(&sink).await;
+        assert_eq!(sink.driver().0.lock().unwrap().len(), 12);
+    }
+
+    /// A hand-written sink whose hooks answer what its capabilities deny.
+    #[derive(Default)]
+    struct Liar {
+        lie: &'static str,
+    }
+
+    #[faucet_core::async_trait]
+    #[allow(deprecated)]
+    impl Sink for Liar {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+            Ok(match self.lie {
+                "short_plain" => records.len() - 1,
+                _ => records.len(),
+            })
+        }
+        async fn write_batch_partial(
+            &self,
+            records: &[Value],
+        ) -> Result<Vec<faucet_core::RowOutcome>, faucet_core::FaucetError> {
+            Ok(records
+                .iter()
+                .map(|_| match self.lie {
+                    "bad_row" => Err(faucet_core::FaucetError::Sink("x".into())),
+                    _ => Ok(()),
+                })
+                .collect())
+        }
+        async fn write_governed(
+            &self,
+            page: &faucet_core::governance::GovernedPage<'_>,
+        ) -> Result<faucet_core::WriteReport, faucet_core::FaucetError> {
+            Ok(faucet_core::WriteReport::accepted(match self.lie {
+                "short_governed" => 0,
+                _ => page.len(),
+            }))
+        }
+        async fn write_batch_reported(
+            &self,
+            records: &[Value],
+        ) -> Result<faucet_core::WriteReport, faucet_core::FaucetError> {
+            Ok(faucet_core::WriteReport::accepted(match self.lie {
+                "short_reported" => 1,
+                _ => records.len(),
+            }))
+        }
+        fn dedups_by_key(&self) -> bool {
+            self.lie == "dedup"
+        }
+        fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+            match self.lie {
+                "modes" => &[
+                    faucet_core::WriteMode::Append,
+                    faucet_core::WriteMode::Overwrite,
+                ],
+                _ => &[faucet_core::WriteMode::Append],
+            }
+        }
+        fn capabilities(&self) -> faucet_core::Capabilities {
+            let base = faucet_core::Capabilities::of_sink(self);
+            match self.lie {
+                "modes" => base
+                    .to_builder()
+                    .write_modes([faucet_core::WriteMode::Append])
+                    .build(),
+                "idem_broken" => base.to_builder().idempotent_writes(true).build(),
+                _ => base,
+            }
+        }
+        async fn begin_overwrite(&self) -> Result<(), faucet_core::FaucetError> {
+            if self.lie == "overwrite" {
+                Ok(())
+            } else {
+                Err(faucet_core::FaucetError::Sink("no".into()))
+            }
+        }
+        async fn last_committed_token(
+            &self,
+            _: &str,
+        ) -> Result<Option<String>, faucet_core::FaucetError> {
+            match self.lie {
+                "token" => Ok(Some("t".into())),
+                "idem_broken" => Err(faucet_core::FaucetError::Sink("down".into())),
+                _ => Ok(None),
+            }
+        }
+        async fn cleanup_scope(
+            &self,
+            _: &std::collections::BTreeMap<String, Value>,
+            _: &faucet_core::SeenKeys,
+        ) -> Result<u64, faucet_core::FaucetError> {
+            if self.lie == "cleanup" {
+                Ok(0)
+            } else {
+                Err(faucet_core::FaucetError::Sink("no".into()))
+            }
+        }
+        async fn evolve_schema(
+            &self,
+            _: &faucet_core::SchemaEvolution,
+        ) -> Result<(), faucet_core::FaucetError> {
+            if self.lie == "evolve" {
+                Ok(())
+            } else {
+                Err(faucet_core::FaucetError::Sink("no".into()))
+            }
+        }
+        async fn rollback_run(
+            &self,
+            _: &str,
+            _: &faucet_core::rollback::RollbackOptions,
+        ) -> Result<faucet_core::rollback::RollbackOutcome, faucet_core::FaucetError> {
+            if self.lie == "rollback" {
+                Ok(Default::default())
+            } else {
+                Err(faucet_core::FaucetError::Sink("no".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn check20_passes_for_an_honest_hand_written_sink() {
+        assert_driver_declarations_truthful(&Liar::default()).await;
+        assert_driver_row_paths_agree(&Liar::default()).await;
+    }
+
+    macro_rules! lies {
+        ($($name:ident: $lie:literal => $msg:literal;)*) => {$(
+            #[tokio::test]
+            #[should_panic(expected = $msg)]
+            async fn $name() {
+                let sink = Liar { lie: $lie };
+                assert_driver_declarations_truthful(&sink).await;
+                assert_driver_row_paths_agree(&sink).await;
+            }
+        )*};
+    }
+
+    lies! {
+        check20_fails_on_disagreeing_modes: "modes" => "disagrees with supported_write_modes";
+        check20_fails_on_dedup_without_a_keyed_mode: "dedup" => "declares no keyed write mode";
+        check20_fails_on_an_undeclared_overwrite: "overwrite" => "begin_overwrite answered";
+        check20_fails_on_an_undeclared_watermark: "token" => "reported a watermark";
+        check20_fails_on_a_broken_declared_watermark: "idem_broken" => "watermark read errored";
+        check20_fails_on_an_undeclared_cleanup: "cleanup" => "cleanup_scope answered";
+        check20_fails_on_an_undeclared_evolution: "evolve" => "an empty evolution succeeded";
+        check20_fails_on_an_undeclared_rollback: "rollback" => "rollback_run answered";
+        check21_fails_on_a_short_plain_write: "short_plain" => "plain write accepted 2 of 3";
+        check21_fails_on_a_short_report: "short_reported" => "reported write left rows";
+        check21_fails_on_a_failed_valid_row: "bad_row" => "a valid row failed";
+        check21_fails_on_a_short_governed_write: "short_governed" => "governed write left rows";
+    }
+
+    /// A driver with staging, a watermark and an evolvable schema.
+    #[derive(Default)]
+    struct Lifecycle(Mem);
+
+    #[faucet_core::async_trait]
+    impl faucet_core::driver::SinkDriver for Lifecycle {
+        fn connector_name(&self) -> &'static str {
+            "lifecycle"
+        }
+        async fn write(
+            &self,
+            calls: &faucet_core::CallSlot,
+            rows: &[Value],
+            policy: faucet_core::driver::RowPolicy,
+        ) -> Result<faucet_core::driver::PageWrite, faucet_core::FaucetError> {
+            self.0.write(calls, rows, policy).await
+        }
+        fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        }
+        fn staging(&self) -> Option<&dyn faucet_core::driver::StagingDriver> {
+            Some(self)
+        }
+        fn commit_tokens(&self) -> Option<&dyn faucet_core::driver::CommitTokenDriver> {
+            Some(self)
+        }
+        fn schema(&self) -> Option<&dyn faucet_core::driver::SchemaDriver> {
+            Some(self)
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl faucet_core::driver::StagingDriver for Lifecycle {
+        fn active(&self) -> bool {
+            false
+        }
+        async fn stage(&self, _: &faucet_core::CallSlot) -> Result<(), faucet_core::FaucetError> {
+            Ok(())
+        }
+        async fn publish(&self, _: &faucet_core::CallSlot) -> Result<(), faucet_core::FaucetError> {
+            Ok(())
+        }
+        async fn discard(&self, _: &faucet_core::CallSlot) -> Result<(), faucet_core::FaucetError> {
+            Ok(())
+        }
+        async fn staged(
+            &self,
+            _: &faucet_core::CallSlot,
+        ) -> Result<bool, faucet_core::FaucetError> {
+            Ok(false)
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl faucet_core::driver::CommitTokenDriver for Lifecycle {
+        async fn last_token(
+            &self,
+            _: &faucet_core::CallSlot,
+            _: &str,
+        ) -> Result<Option<String>, faucet_core::FaucetError> {
+            Ok(None)
+        }
+        async fn write_with_token(
+            &self,
+            _: &faucet_core::CallSlot,
+            rows: &[Value],
+            _: &str,
+            _: &str,
+        ) -> Result<faucet_core::WriteReport, faucet_core::FaucetError> {
+            Ok(faucet_core::WriteReport::accepted(rows.len()))
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl faucet_core::driver::SchemaDriver for Lifecycle {
+        async fn current_schema(
+            &self,
+            _: &faucet_core::CallSlot,
+        ) -> Result<Option<Value>, faucet_core::FaucetError> {
+            Ok(None)
+        }
+        fn evolvable(&self) -> bool {
+            true
+        }
+        async fn evolve(
+            &self,
+            _: &faucet_core::CallSlot,
+            _: &faucet_core::SchemaEvolution,
+        ) -> Result<(), faucet_core::FaucetError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn check20_probes_a_declared_overwrite_watermark_and_evolution() {
+        let sink = faucet_core::driver::DriverSink::new(Lifecycle::default());
+        assert_driver_declarations_truthful(&sink).await;
+        assert_driver_row_paths_agree(&sink).await;
     }
 }

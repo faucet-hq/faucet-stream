@@ -130,3 +130,22 @@ async fn conformance_roundtrips_recorded() {
     )
     .await;
 }
+
+/// RFC 0014: the sink runs on the HTTP family driver; its capabilities follow
+/// the driver (no lifecycle beyond append) and its four write paths agree in
+/// both batch modes.
+#[tokio::test]
+async fn conformance_driver_declarations_and_row_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    for mode in [HttpBatchMode::Individual, HttpBatchMode::Array] {
+        let sink =
+            HttpSink::new(HttpSinkConfig::new(format!("{}/ingest", server.uri())).batch_mode(mode));
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+        faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    }
+}
