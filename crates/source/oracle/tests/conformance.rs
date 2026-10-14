@@ -88,7 +88,7 @@ async fn conformance_call_deadline() {
     for _ in 0..2 {
         let mut cfg = OracleSourceConfig::new(
             conn.clone(),
-            "SELECT COUNT(*) AS N FROM DUAL A CONNECT BY LEVEL <= 100000000000",
+            "SELECT COUNT(*) AS N FROM ALL_OBJECTS A, ALL_OBJECTS B, ALL_OBJECTS C",
         );
         // Bounds the abandoned statement on the server after the call returns.
         cfg.statement_timeout_secs = 20;
