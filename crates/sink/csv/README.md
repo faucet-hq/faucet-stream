@@ -342,6 +342,17 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## How it is built
+
+The (deprecated) sink runs on the family-neutral sink driver (RFC 0014):
+`CsvDriver` implements `faucet_core::driver::SinkDriver` — open the file,
+freeze the header, encode and write a page, finalise and fsync on flush,
+truncate on an empty `append: false` run — and `CsvSink` wraps it in a
+`DriverSink`, which derives the capabilities (append only; unknown fields
+dropped under `on_unknown_field: warn`) and serves the plain, reported and
+per-row write paths with row accounting. The public type and config are
+unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
