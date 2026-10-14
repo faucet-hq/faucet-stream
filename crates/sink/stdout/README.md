@@ -236,6 +236,16 @@ already landed a second time). See
 
 The crate exports `DESCRIPTOR` (RFC 0013): append only, with no idempotent writes, upsert, cleanup, rollback or schema evolution. `faucet list --json` prints the declaration.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `StdoutDriver`
+implements `faucet_core::driver::SinkDriver` — encode a page in the configured
+format, write it to the stream, flush — and `StdoutSink` wraps it in a
+`DriverSink`, which derives the capabilities (append only) and serves the
+plain, reported and per-row write paths with row accounting. Rows past
+`max_records`, or after the consumer closed the pipe, are reported as skipped.
+The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
