@@ -116,6 +116,7 @@ pub fn prepare_boxed<'a>(
 /// undoable one; until then it is capped at `2 * retain + 1`. Never fails the
 /// run: a marker that could not be written is logged and the run proceeds —
 /// it is then simply not undoable.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub async fn prepare(
     store: &dyn StateStore,
     sink: &dyn Sink,

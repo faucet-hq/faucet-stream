@@ -1,6 +1,7 @@
 //! The MSSQL sink against a scripted TDS endpoint: every write path, its
 //! error mapping and its cut-short connection repair, without a server.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::collections::BTreeMap;
 use std::time::Duration;
 

@@ -704,6 +704,7 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         }
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -718,6 +719,7 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         .await
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -1260,6 +1262,7 @@ pub(crate) mod source_tests {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod sink_tests {
     use super::source_tests::{LOCK, labels, snapshotter};

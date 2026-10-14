@@ -948,6 +948,7 @@ impl RollbackDriver for SqliteDriver {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

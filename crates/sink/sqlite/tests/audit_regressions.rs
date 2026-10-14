@@ -1,5 +1,6 @@
 //! Regressions for the #789 SQLite sink findings. Tempfile databases only.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::rollback::{RollbackMode, RollbackOptions, RollbackWriteSpec};
 use faucet_core::{SeenKeys, Sink, WriteMode, WriteSpec};
 use faucet_sink_sqlite::{SqliteColumnMapping, SqliteSink, SqliteSinkConfig};

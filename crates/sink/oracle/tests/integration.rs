@@ -1,6 +1,7 @@
 //! End-to-end tests against Oracle Free 23ai (`gvenzl/oracle-free:23-slim`).
 //! Skips cleanly without Docker or Oracle Instant Client.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 mod common;
 
 use faucet_common_oracle::OracleConnectionConfig;

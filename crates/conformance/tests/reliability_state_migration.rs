@@ -6,6 +6,7 @@
 //! where the last run on the source backend left off — nothing re-read, nothing
 //! skipped — in both at-least-once and exactly-once delivery.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;

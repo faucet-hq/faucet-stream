@@ -8,6 +8,7 @@
 //! run land in a staging table, so the destination keeps its old rows until the
 //! atomic swap — and an aborted run leaves the previous rows fully intact.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{OverwriteScope, Sink, WriteMode, WriteSpec};
 use faucet_sink_postgres::{PostgresColumnMapping, PostgresSink, PostgresSinkConfig};
 use serde_json::json;

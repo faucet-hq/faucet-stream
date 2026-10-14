@@ -3,7 +3,7 @@
 //! it, naming the operation and the path. The last tests need no server.
 //! The server tests require Docker.
 #![cfg(not(target_os = "windows"))]
-
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_common_sftp::{SftpConnectionConfig, SftpSession, connect};
 use faucet_core::Sink;
 use faucet_sink_sftp::{SftpSink, SftpSinkConfig};

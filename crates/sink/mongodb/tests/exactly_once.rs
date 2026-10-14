@@ -6,6 +6,7 @@
 //! with `directConnection=true`). The final test boots the plain standalone
 //! container to assert the typed "requires a replica set" error.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::pipeline::{StreamPage, run_stream};
 use faucet_core::state::{MemoryStateStore, StateStore};
 use faucet_core::{DeliveryMode, FaucetError, RunStreamOptions, Sink, Value, WriteMode, WriteSpec};

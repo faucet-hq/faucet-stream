@@ -3,6 +3,7 @@
 //! swap. Driven against a wiremock BigQuery so the DDL/query bodies can be
 //! asserted without a real project.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{OverwriteScope, Sink, WriteMode};
 use faucet_sink_bigquery::{BigQueryCredentials, BigQuerySink, BigQuerySinkConfig};
 use gcp_bigquery_client::client_builder::ClientBuilder;

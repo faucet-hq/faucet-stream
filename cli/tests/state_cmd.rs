@@ -5,7 +5,7 @@
 //! Docker daemon is reachable).
 #![cfg(all(feature = "source-csv", feature = "sink-sqlite"))]
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
-
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use clap::Parser;
 use faucet_cli::cli::Cli;
 use faucet_cli::error::CliError;

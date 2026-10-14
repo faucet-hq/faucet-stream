@@ -5,6 +5,7 @@
 //!
 //! Requires Docker; each test boots its own container.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::rollback::{RollbackMode, RollbackOptions, RollbackWriteSpec};
 use faucet_core::{DeleteMarker, Sink, WriteMode, WriteSpec};
 use faucet_sink_postgres::{PostgresColumnMapping, PostgresSink, PostgresSinkConfig};

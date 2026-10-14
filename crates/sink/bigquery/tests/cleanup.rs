@@ -3,6 +3,7 @@
 //! EXISTS (… UNNEST(JSON_QUERY_ARRAY(@keys)) …)` job and reporting the row
 //! count from the job's DML statistics.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_sink_bigquery::{BigQueryCredentials, BigQuerySink, BigQuerySinkConfig};
 use gcp_bigquery_client::client_builder::ClientBuilder;

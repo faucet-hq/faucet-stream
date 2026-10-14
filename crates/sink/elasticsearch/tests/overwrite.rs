@@ -3,6 +3,7 @@
 //! writes and the commit each run on their own sink instance, the way the CLI
 //! executor drives them, so every step must find its state in the cluster.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[path = "support/fake_cluster.rs"]
 mod fake_cluster;
 

@@ -33,7 +33,7 @@
 //! warehouses (S3/GCS) for the SQL catalog.
 
 #![cfg(feature = "catalog-sql")]
-
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::sync::Arc;
 
 use faucet_core::Sink;

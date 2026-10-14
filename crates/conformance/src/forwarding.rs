@@ -435,6 +435,7 @@ impl Sink for HookSink {
 /// Call every [`Sink`] hook on `sink`, then panic naming each hook in
 /// [`SINK_HOOKS`] (outside `skip`) that did not reach `probe`, the inner
 /// [`HookSink`] the wrapper holds.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, skip: &[&str]) {
     let page = [json!({"id": 1})];
     let _ = sink.write_batch(&page).await;

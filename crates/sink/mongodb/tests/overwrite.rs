@@ -7,6 +7,7 @@
 //! writes stage until the swap, a successful commit fully replaces the target,
 //! and an abort leaves the previous target completely intact.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{Sink, WriteMode, WriteSpec};
 use faucet_sink_mongodb::{MongoSink, MongoSinkConfig};
 use mongodb::Client;

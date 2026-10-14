@@ -2,6 +2,7 @@
 //! `write_batch_idempotent` / `last_committed_token` hooks driving `jobs.query`
 //! and verifying success via `get_job`.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_sink_bigquery::BigQuerySink;
 use faucet_sink_bigquery::{BigQueryCredentials, BigQuerySinkConfig};

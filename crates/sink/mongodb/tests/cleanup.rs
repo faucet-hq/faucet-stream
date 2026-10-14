@@ -10,6 +10,7 @@
 //! uses a single `delete_many` with no session, so unlike the exactly-once tests
 //! these need no replica set.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{CleanupPolicy, Sink, WriteMode, WriteSpec};
 use faucet_sink_mongodb::{MongoSink, MongoSinkConfig};
 use mongodb::Client;

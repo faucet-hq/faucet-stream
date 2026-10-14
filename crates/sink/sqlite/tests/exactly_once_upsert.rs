@@ -7,6 +7,7 @@
 //!
 //! Runs against a tempfile SQLite database — no Docker required.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{Sink, WriteMode, WriteSpec, format_token};
 use faucet_sink_sqlite::{SqliteColumnMapping, SqliteSink, SqliteSinkConfig};
 use serde_json::json;

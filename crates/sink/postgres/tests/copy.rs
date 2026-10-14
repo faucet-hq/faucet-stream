@@ -5,6 +5,7 @@
 //! and via `copy` must land byte-identical rows — COPY changes the wire
 //! encoding, never the data. These tests require Docker.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_sink_postgres::{
     PostgresColumnMapping, PostgresSink, PostgresSinkConfig, PostgresWriteMethod,

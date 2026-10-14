@@ -516,6 +516,7 @@ pub struct WatermarkProbe {
 }
 
 /// Read the sink's committed watermark for `scope` (read-only).
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub async fn probe_watermark(
     row: &RowTarget,
     scope: &str,

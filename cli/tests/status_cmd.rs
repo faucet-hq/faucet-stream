@@ -2,6 +2,7 @@
 //! jsonl DLQ and a SQLite sink produce the health screen and its exit codes;
 //! a topology config reports per sink node; `--probe` catches a state-store
 //! vs sink-watermark disagreement and says which side the next run trusts.
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #![cfg(all(
     feature = "source-csv",
     feature = "sink-sqlite",

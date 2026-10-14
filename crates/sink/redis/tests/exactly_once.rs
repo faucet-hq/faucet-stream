@@ -6,7 +6,7 @@
 //!
 //! These tests require Docker.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
-
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -1,6 +1,7 @@
 //! #828: concurrent first writes — backfill windows, matrix rows — bootstrap
 //! the target schema and tables at the same time. Requires Docker.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{Sink, WriteMode, WriteSpec};
 use faucet_sink_postgres::{PostgresColumnMapping, PostgresSink, PostgresSinkConfig};
 use serde_json::json;

@@ -11,6 +11,7 @@
 //! Require Docker. Each test boots its own container, so they are isolated and
 //! parallel-safe.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{CleanupPolicy, Sink, WriteMode, WriteSpec};
 use faucet_sink_postgres::{PostgresColumnMapping, PostgresSink, PostgresSinkConfig};
 use serde_json::{Value, json};

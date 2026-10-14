@@ -2,6 +2,7 @@
 //! testcontainers). One shared emulator per test binary; one database per
 //! test.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 mod support;
 
 use faucet_core::{DeleteMarker, FaucetError, Sink, WriteMode, WriteSpec};

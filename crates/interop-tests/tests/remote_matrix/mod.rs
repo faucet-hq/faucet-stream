@@ -6,6 +6,7 @@
 //! reads it back with the file source — the records must match, or the case
 //! must be refused where the refusal is intrinsic.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{FaucetError, Sink, Source};
 use serde_json::{Value, json};
 use std::future::Future;

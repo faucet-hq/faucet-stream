@@ -8,6 +8,7 @@
 //! the swap, a successful commit replaces the whole destination, and an abort
 //! leaves the previous rows completely intact.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_common_mssql::{MssqlConnectionConfig, MssqlPool, MssqlTls, MssqlTlsMode, build_pool};
 use faucet_core::{Sink, WriteMode, WriteSpec};
 use faucet_sink_mssql::{MssqlColumnMapping, MssqlSink, MssqlSinkConfig, OnUnknownField};

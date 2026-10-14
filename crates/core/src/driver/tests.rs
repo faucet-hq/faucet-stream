@@ -1,4 +1,5 @@
 #![allow(deprecated)] // these tests drive the deprecated hooks DriverSink implements
+#![allow(clippy::disallowed_methods)] // the tests drive time directly
 
 use super::*;
 use crate::accounting::WriteReport;
@@ -746,6 +747,7 @@ struct Broker {
     hang_group: Mutex<Option<usize>>,
     groups: AtomicUsize,
     transport_down: AtomicBool,
+    hang_flush: AtomicBool,
     timeout: Option<Duration>,
     size: usize,
     tx: Option<Tx>,
@@ -804,6 +806,12 @@ impl MessageDriver for Broker {
             }
         }
         Ok(out)
+    }
+    async fn flush(&self, _: &CallSlot) -> Result<(), FaucetError> {
+        if self.hang_flush.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        Ok(())
     }
     fn transactions(&self) -> Option<&dyn MessageTransactions> {
         self.tx.as_ref().map(|t| t as &dyn MessageTransactions)
@@ -908,6 +916,78 @@ async fn a_group_timeout_fails_the_unconfirmed_rows_and_every_row_after() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flush_past_the_group_timeout_is_a_typed_timeout() {
+    let broker = Broker {
+        timeout: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    broker.hang_flush.store(true, Ordering::SeqCst);
+    let sink = DriverSink::new(MessageSinkDriver::new(broker));
+    let err = sink.flush().await.unwrap_err();
+    assert!(
+        matches!(&err, FaucetError::Timeout { operation, after }
+            if operation == "broker flush" && *after == Duration::from_secs(1)),
+        "{err:?}"
+    );
+    assert!(err.is_retriable());
+}
+
+/// A configuration that cannot roll back still answers through its driver,
+/// so the error can say why — but does not declare the capability.
+#[tokio::test]
+async fn a_disabled_rollback_driver_explains_itself() {
+    struct NoRollback;
+    #[async_trait]
+    impl SinkDriver for NoRollback {
+        fn connector_name(&self) -> &'static str {
+            "norb"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            rows: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(rows.len()))
+        }
+        fn rollback(&self) -> Option<&dyn RollbackDriver> {
+            Some(self)
+        }
+    }
+    #[async_trait]
+    impl RollbackDriver for NoRollback {
+        fn enabled(&self) -> bool {
+            false
+        }
+        async fn rollback_run(
+            &self,
+            _: &CallSlot,
+            _: &str,
+            _: &RollbackOptions,
+        ) -> Result<RollbackOutcome, FaucetError> {
+            Err(FaucetError::Sink("needs mapped columns".into()))
+        }
+        async fn forget_run(&self, _: &CallSlot, _: &str) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn rewind_commit_token(
+            &self,
+            _: &CallSlot,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), FaucetError> {
+            Ok(())
+        }
+    }
+    let sink = DriverSink::new(NoRollback);
+    assert!(!sink.supports_rollback() && !sink.capabilities().rollback());
+    let err = sink.rollback_run("r", &opts()).await.unwrap_err();
+    assert!(err.to_string().contains("mapped columns"), "{err}");
+    sink.forget_run("r").await.unwrap();
+    sink.rewind_commit_token("s", None).await.unwrap();
 }
 
 #[tokio::test]

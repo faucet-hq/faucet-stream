@@ -258,6 +258,7 @@ impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
 
     /// Run the scoped delete against the wrapped sink. Call **only** after a
     /// fully successful, uncancelled run — see the module docs.
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     pub async fn finish(&self, policy: &CleanupPolicy) -> Result<u64, FaucetError> {
         // Take the set out and drop the guard *before* awaiting: holding a
         // `MutexGuard` across an await makes the whole run future non-`Send`,
@@ -334,6 +335,7 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
         out
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -348,6 +350,7 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
         Ok(n)
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -363,6 +366,7 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

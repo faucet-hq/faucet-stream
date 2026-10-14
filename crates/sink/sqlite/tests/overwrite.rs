@@ -9,6 +9,7 @@
 //!   * a successful commit replaces the destination with exactly this run's rows;
 //!   * an aborted run leaves the previous destination completely intact.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{Sink, WriteMode, WriteSpec};
 use faucet_sink_sqlite::{SqliteColumnMapping, SqliteSink, SqliteSinkConfig};
 use serde_json::{Value, json};

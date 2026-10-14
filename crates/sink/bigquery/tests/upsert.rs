@@ -2,6 +2,7 @@
 //! in-place `MERGE … USING (SELECT … FROM UNNEST(@payload))` driven by
 //! `write_batch` / `write_batch_partial` / `write_batch_idempotent`.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_sink_bigquery::{BigQueryCredentials, BigQuerySink, BigQuerySinkConfig};
 use gcp_bigquery_client::client_builder::ClientBuilder;

@@ -4,6 +4,7 @@
 //! watermark-table DDL must run as its own request exactly once per sink
 //! instance, and `last_committed_token` must read the stored token back.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_sink_snowflake::{SnowflakeAuth, SnowflakeSink, SnowflakeSinkConfig};
 use serde_json::{Value, json};

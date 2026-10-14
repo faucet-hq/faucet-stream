@@ -842,6 +842,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(cleanup_scope [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn cleanup_scope<'life0, 'life1, 'life2, 'async_trait>(
                 &'life0 self,
                 scope: &'life1 ::std::collections::BTreeMap<::std::string::String, $crate::Value>,
@@ -859,6 +860,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(write_batch_idempotent [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn write_batch_idempotent<'life0, 'life1, 'life2, 'life3, 'async_trait>(
                 &'life0 self,
                 records: &'life1 [$crate::Value],
@@ -878,6 +880,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(write_batch_idempotent_reported [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn write_batch_idempotent_reported<'life0, 'life1, 'life2, 'life3, 'async_trait>(
                 &'life0 self,
                 records: &'life1 [$crate::Value],
@@ -897,6 +900,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(last_committed_token [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn last_committed_token<'life0, 'life1, 'async_trait>(
                 &'life0 self,
                 scope: &'life1 str,
@@ -920,6 +924,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(begin_overwrite [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn begin_overwrite<'life0, 'async_trait>(
                 &'life0 self,
             ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
@@ -933,6 +938,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(commit_overwrite [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn commit_overwrite<'life0, 'async_trait>(
                 &'life0 self,
             ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
@@ -1013,6 +1019,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(abort_overwrite [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn abort_overwrite<'life0, 'async_trait>(
                 &'life0 self,
             ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<()>>
@@ -1039,6 +1046,7 @@ macro_rules! forward_sink {
             }
         });
         $crate::__faucet_forward_filter!(overwrite_staging_exists [$($skip)*] {
+            #[allow(deprecated)] // forwards a hook the family drivers replace (RFC 0014)
             fn overwrite_staging_exists<'life0, 'async_trait>(
                 &'life0 self,
             ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<bool>>>

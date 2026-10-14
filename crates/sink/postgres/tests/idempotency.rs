@@ -5,6 +5,7 @@
 //! These tests require Docker. Each test boots its own container so they are
 //! fully isolated and safe to run in parallel.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_core::check::ProbeStatus;
 use faucet_core::idempotency::{

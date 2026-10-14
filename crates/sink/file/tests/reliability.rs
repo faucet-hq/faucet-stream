@@ -3,7 +3,7 @@
 //! overwrite is finished by the next run, and storage I/O never blocks a
 //! caller's timeout.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
-
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_sink_file::FileSink;
 use serde_json::{Value, json};

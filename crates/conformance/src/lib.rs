@@ -392,6 +392,7 @@ fn rows(ids: &[i64]) -> Vec<Value> {
         .collect()
 }
 
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn assert_watermark_idempotent<S, F, Fut>(sink: &S, count: &F, label: &str)
 where
     S: Sink + ?Sized,
@@ -510,6 +511,7 @@ async fn write_and_flush<S: Sink + ?Sized>(sink: &S, page: &[Value], what: &str)
 }
 
 /// `distinct_count` reports the destination's current distinct-row count.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub async fn assert_capabilities_truthful<S, F, Fut>(sink: &S, distinct_count: F)
 where
     S: Sink + ?Sized,

@@ -1,6 +1,7 @@
 //! Column handling (later fields, TIMESTAMP_NTZ offsets), session settings,
 //! statement cancel and size-bounded payloads, against a wiremock server.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::time::Duration;
 
 use faucet_core::Sink;

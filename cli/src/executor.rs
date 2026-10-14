@@ -521,6 +521,7 @@ fn redact_summary(mut summary: RunSummary) -> RunSummary {
     summary
 }
 
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn run_expanded_unredacted(
     nodes: Vec<ExpandedNode>,
     opts: ExecuteOptions,
@@ -4008,6 +4009,7 @@ impl Sink for CapturingSink {
         );
         Ok(outcomes)
     }
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -4028,6 +4030,7 @@ impl Sink for CapturingSink {
         );
         Ok(written)
     }
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -4098,6 +4101,7 @@ impl Sink for LimitedSink {
     }
     // A capped sample must never replace the destination, whoever drives the
     // overwrite lifecycle (#862 H-06): the swap becomes a discard.
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         tracing::warn!(
             connector = self.inner.connector_name(),
@@ -4213,6 +4217,7 @@ impl ExecuteOptions {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

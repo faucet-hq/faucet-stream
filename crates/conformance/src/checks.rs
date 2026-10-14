@@ -137,6 +137,7 @@ where
 /// was, and a commit replaces the destination with exactly the run's rows.
 ///
 /// Seed the destination with a few rows first so "untouched" is observable.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub async fn assert_overwrite_lifecycle<S, F, Fut>(sink: &S, distinct_count: F)
 where
     S: Sink + ?Sized,

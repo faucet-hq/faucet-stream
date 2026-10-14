@@ -627,6 +627,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
     /// 4. Flushes the sink one final time after the stream completes.
     /// 5. Returns a [`PipelineResult`] with the total count and the last
     ///    bookmark observed.
+    #[allow(deprecated)] // drives the overwrite lifecycle and the watermark read through `Sink` until faucet-core 2.0 (RFC 0014)
     pub async fn run(&self) -> Result<PipelineResult, FaucetError> {
         use crate::observability::{
             DurationGuard, InstrumentedSink, InstrumentedSource, InstrumentedStateStore, Labels,
@@ -1612,6 +1613,7 @@ pub(crate) struct StreamExtras {
     pub(crate) row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
 }
 
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub(crate) async fn run_stream_with<S, Si>(
     mut pages: S,
     sink: &Si,
@@ -2765,6 +2767,7 @@ fn maybe_warn_noop_sink(sink_name: &str, warned: &mut bool) {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {

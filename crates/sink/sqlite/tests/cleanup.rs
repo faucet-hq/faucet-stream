@@ -7,6 +7,7 @@
 //! removed. The rows of the other scope are the canary for an over-broad
 //! predicate.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{SeenKeys, Sink, WriteMode, WriteSpec};
 use faucet_sink_sqlite::{SqliteColumnMapping, SqliteSink, SqliteSinkConfig};
 use serde_json::{Value, json};

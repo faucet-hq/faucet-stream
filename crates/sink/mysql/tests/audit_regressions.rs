@@ -1,6 +1,7 @@
 //! Regressions for the #789 MySQL sink findings, against one MySQL container.
 //! Requires Docker.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::rollback::{RollbackMode, RollbackOptions, RollbackWriteSpec};
 use faucet_core::{ColumnChange, SchemaEvolution, Sink, WriteMode, WriteSpec};
 use faucet_sink_mysql::{MysqlColumnMapping, MysqlSink, MysqlSinkConfig};

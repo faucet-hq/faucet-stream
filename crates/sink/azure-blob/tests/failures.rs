@@ -2,6 +2,7 @@
 //! a refused listing fails the overwrite abort and the preflight, and a slow
 //! endpoint times the preflight out.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_core::check::{CheckContext, ProbeStatus};
 use faucet_sink_azure_blob::{AzureBlobSink, AzureBlobSinkConfig, AzureCredentials};

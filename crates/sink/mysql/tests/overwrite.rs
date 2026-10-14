@@ -8,6 +8,7 @@
 //! table (`t__faucet_ovw`); the destination keeps its old rows until the atomic
 //! `RENAME TABLE` swap, and an aborted run leaves the previous rows intact.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{Sink, WriteMode, WriteSpec};
 use faucet_sink_mysql::{MysqlColumnMapping, MysqlSink, MysqlSinkConfig};
 use serde_json::json;

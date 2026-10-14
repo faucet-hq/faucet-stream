@@ -2,6 +2,7 @@
 //! each call the sink makes is refused in turn, and the error must name the
 //! call and the object.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_core::check::{CheckContext, ProbeStatus};
 use faucet_sink_gcs::{GcsCredentials, GcsSink, GcsSinkConfig};

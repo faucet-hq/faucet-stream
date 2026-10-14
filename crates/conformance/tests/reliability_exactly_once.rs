@@ -13,6 +13,7 @@
 //! The tests below inject a failure in exactly that window and assert the
 //! stronger property: **zero duplicates**, not merely "the run recovered".
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::sync::Arc;
 
 use faucet_conformance::scripted::{

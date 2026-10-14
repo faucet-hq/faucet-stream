@@ -10,6 +10,7 @@
 //! Requires Docker. The SQL Server image does not boot on Apple-Silicon hosts
 //! (QEMU); CI runs this test. Locally, `--no-run` confirms it compiles.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_common_mssql::{MssqlConnectionConfig, MssqlPool, MssqlTls, MssqlTlsMode, build_pool};
 use faucet_core::{Sink, WriteMode, WriteSpec, format_token};
 use faucet_sink_mssql::{MssqlColumnMapping, MssqlSink, MssqlSinkConfig, OnUnknownField};

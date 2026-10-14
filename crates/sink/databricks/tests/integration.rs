@@ -1,6 +1,7 @@
 //! Wiremock-backed integration tests for the Databricks sink against a
 //! scripted Statement Execution API (and the Files API for volume staging).
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 mod common;
 
 use std::sync::Arc;

@@ -13,6 +13,7 @@
 //!
 //! Requires Docker; boots its own MinIO container.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::{Client, Config as S3Config};

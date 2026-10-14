@@ -7,6 +7,7 @@
 //! intrinsic (appending to one whole-document file). A format that silently
 //! lacks an option fails here.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{FaucetError, Sink, Source};
 use faucet_sink_file::FileSink;
 use faucet_source_file::FileSource;

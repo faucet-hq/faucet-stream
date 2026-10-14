@@ -480,6 +480,7 @@ fn staging_object(kind: &str, table: &str) -> String {
 }
 
 /// Probe (with `--probe`) or infer the row's overwrite staging state.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn staging_status(
     row: &RowTarget,
     failing: bool,

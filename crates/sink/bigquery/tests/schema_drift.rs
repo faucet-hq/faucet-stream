@@ -2,6 +2,7 @@
 //! `current_schema` (via a schema-only `tables.get`) and `evolve_schema` (via
 //! `ALTER TABLE` DDL run through `jobs.query`).
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_core::drift::{ColumnChange, SchemaEvolution};
 use faucet_sink_bigquery::BigQuerySink;

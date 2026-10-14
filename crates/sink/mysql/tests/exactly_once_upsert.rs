@@ -8,6 +8,7 @@
 //!
 //! Requires Docker. Boots its own container so it is isolated.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{Sink, WriteMode, WriteSpec, format_token};
 use faucet_sink_mysql::{MysqlColumnMapping, MysqlSink, MysqlSinkConfig};
 use serde_json::json;

@@ -3,6 +3,7 @@
 //! staging index, scoped-cleanup `keyword` targeting, upsert re-chunking and
 //! request timeouts.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::{SeenKeys, Sink, WriteMode, WriteSpec};
 use faucet_sink_elasticsearch::{ElasticsearchSink, ElasticsearchSinkConfig};
 use serde_json::{Value, json};

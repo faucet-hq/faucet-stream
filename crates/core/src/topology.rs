@@ -1515,6 +1515,7 @@ fn reports(
 ///   subset in.
 /// - **Otherwise:** every overwrite sink discards its staging, leaving its
 ///   destination as it was (#789 CORE-14).
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn finish_sinks(outcomes: &[NodeOutcome], complete: bool) -> Result<(), FaucetError> {
     struct Finish<'a> {
         sink: &'a dyn Sink,
@@ -1567,6 +1568,7 @@ async fn finish_sinks(outcomes: &[NodeOutcome], complete: bool) -> Result<(), Fa
     Ok(())
 }
 
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn abort_quietly(sink: &dyn Sink) {
     if let Err(e) = sink.abort_overwrite().await {
         tracing::warn!(
@@ -1712,6 +1714,7 @@ async fn compute_start_bookmark(
 ///
 /// A sink with no committed position forces a full replay, each sink ahead
 /// skipping by position; with no positions at all every sink starts from zero.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn compute_resume(
     opts: &TopologyOptions,
     sinks: &[(String, Option<&dyn Sink>)],
@@ -2363,6 +2366,7 @@ fn trim_covered(
     Ok(())
 }
 
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 async fn run_sink_node(
     node_id: String,
     sink: Box<dyn Sink>,

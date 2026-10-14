@@ -897,6 +897,10 @@ pub trait Sink: Send + Sync {
     ///
     /// The default is a typed "unsupported" error, so no existing or third-party
     /// connector breaks.
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::CleanupDriver` on a family driver; see RFC 0014"
+    )]
     async fn cleanup_scope(
         &self,
         scope: &std::collections::BTreeMap<String, Value>,
@@ -918,6 +922,10 @@ pub trait Sink: Send + Sync {
     /// The default is **not** idempotent: it ignores the token and delegates to
     /// [`write_batch`](Self::write_batch). Override only when the commit is
     /// genuinely atomic (and return `true` from `supports_idempotent_writes`).
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::CommitTokenDriver` on a family driver; see RFC 0014"
+    )]
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -939,6 +947,11 @@ pub trait Sink: Send + Sync {
     /// The default credits the rows `write_batch_idempotent` returns — as
     /// coalesced-by-key when [`dedups_by_key`](Self::dedups_by_key) — so a
     /// sink that silently writes fewer rows than it was offered fails the page.
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::CommitTokenDriver` on a family driver; see RFC 0014"
+    )]
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -955,6 +968,10 @@ pub trait Sink: Send + Sync {
 
     /// The last token durably committed for `scope`, or `None` if this sink has
     /// never committed under that scope. Default: `None`.
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::CommitTokenDriver` on a family driver; see RFC 0014"
+    )]
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let _ = scope;
         Ok(None)
@@ -985,6 +1002,10 @@ pub trait Sink: Send + Sync {
     /// `WriteMode::Overwrite` but forgets to implement the lifecycle fails
     /// loudly rather than silently appending. Never called for sinks whose
     /// `is_overwrite()` is false.
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::StagingDriver` on a family driver; see RFC 0014"
+    )]
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         Err(FaucetError::Sink(format!(
             "sink '{}' does not support write_mode: overwrite",
@@ -1002,6 +1023,10 @@ pub trait Sink: Send + Sync {
     ///
     /// Default: a typed "unsupported" error (unreachable for a correct sink
     /// whose `is_overwrite()` is false).
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::StagingDriver` on a family driver; see RFC 0014"
+    )]
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         Err(FaucetError::Sink(format!(
             "sink '{}' does not support write_mode: overwrite",
@@ -1073,6 +1098,10 @@ pub trait Sink: Send + Sync {
     /// [`commit_overwrite`](Self::commit_overwrite). The destination must be
     /// left exactly as it was before the run. Default: no-op — a leftover
     /// staging object is untidy but never data loss, so a sink may skip it.
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::StagingDriver` on a family driver; see RFC 0014"
+    )]
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         Ok(())
     }
@@ -1099,6 +1128,10 @@ pub trait Sink: Send + Sync {
     ///
     /// `Ok(None)` means the sink cannot tell (the default); overwrite-capable
     /// sinks return `Ok(Some(_))`.
+    #[deprecated(
+        since = "1.14.0",
+        note = "implement `faucet_core::driver::StagingDriver` on a family driver; see RFC 0014"
+    )]
     async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
         Ok(None)
     }
@@ -1191,6 +1224,7 @@ pub trait Sink: Send + Sync {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;
