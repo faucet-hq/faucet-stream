@@ -152,3 +152,14 @@ fn conformance_descriptor_matches_built_sink() {
         );
     }
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver.
+#[tokio::test]
+async fn conformance_driver_truthful() {
+    let capture = CaptureWriter::default();
+    let sink = StdoutSink::with_writer(StdoutSinkConfig::new(), Box::new(capture.clone()));
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    sink.flush().await.expect("flush");
+    assert_eq!(capture.line_count(), 12);
+}
