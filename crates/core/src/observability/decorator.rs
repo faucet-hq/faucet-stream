@@ -417,6 +417,7 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
         &self,
         records: &[Value],
         reported: bool,
+        governed: Option<&crate::governance::GovernedPage<'_>>,
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
         let span = info_span!(
             "faucet.sink.write",
@@ -443,7 +444,9 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
             DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
 
         let write = async {
-            if reported {
+            if let Some(page) = governed {
+                self.inner.write_governed(page).await
+            } else if reported {
                 self.inner.write_batch_reported(records).await
             } else {
                 self.inner
@@ -507,8 +510,8 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     // unchanged: identity, capabilities, lifecycle and provenance must look
     // through the decorator, or the feature behind each one goes inert.
     crate::forward_sink!(inner; except connector_name, write_batch_columnar,
-        load_native, write_batch, write_batch_reported, write_batch_partial, flush,
-        write_batch_idempotent, write_batch_idempotent_reported);
+        load_native, write_batch, write_batch_reported, write_governed, write_batch_partial,
+        flush, write_batch_idempotent, write_batch_idempotent_reported);
 
     fn connector_name(&self) -> &'static str {
         // Return the guarded name so an inner connector that returns "" maps to
@@ -571,7 +574,7 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        self.write_instrumented(records, false)
+        self.write_instrumented(records, false, None)
             .await
             .map(|r| r.accepted)
     }
@@ -580,7 +583,15 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         &self,
         records: &[Value],
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
-        self.write_instrumented(records, true).await
+        self.write_instrumented(records, true, None).await
+    }
+
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.write_instrumented(page.records(), true, Some(page))
+            .await
     }
 
     async fn write_batch_partial(

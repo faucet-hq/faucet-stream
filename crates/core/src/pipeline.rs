@@ -41,6 +41,12 @@
 
 use crate::dlq::{DlqConfig, DlqStats};
 use crate::error::FaucetError;
+#[cfg(test)]
+use crate::governance::apply::quarantine_drift_rows;
+use crate::governance::apply::{
+    GovernanceSpecs, GovernanceState, abort_with_envelopes, apply_governance, dlq_write_error,
+};
+use crate::governance::write as gate;
 use crate::observability::RunStreamOptions;
 use crate::state::{StateStore, validate_state_key};
 use crate::traits::{Sink, Source};
@@ -469,6 +475,30 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         features
     }
 
+    /// This run's per-page passes, as the governance gateway reads them.
+    fn governance_specs<'s>(
+        &'s self,
+        pipeline: &'s str,
+        row: &'s str,
+        run_id: &'s str,
+        sink_name: &'s str,
+    ) -> GovernanceSpecs<'s> {
+        GovernanceSpecs {
+            #[cfg(feature = "masking")]
+            masking: self.masking.as_ref(),
+            #[cfg(feature = "quality")]
+            quality: self.quality.as_ref(),
+            #[cfg(feature = "contract")]
+            contract: self.contract.as_ref(),
+            schema_drift: self.schema_drift.as_ref(),
+            pipeline,
+            row,
+            run_id,
+            sink_name,
+            has_dlq: self.dlq.is_some(),
+        }
+    }
+
     /// A masking rule that re-types values page by page would change a
     /// column's Arrow type mid-run, so such a run takes the row path.
     #[cfg(feature = "arrow")]
@@ -831,22 +861,12 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         ),
                     );
                 // Governance passes need `Value`; the planner rejects them
-                // unconditionally, so surface them as `has_governance`.
-                // `mut` is used only when a governance feature is enabled.
-                #[allow(unused_mut)]
-                let mut has_governance = false;
-                #[cfg(feature = "quality")]
-                {
-                    has_governance = has_governance || self.quality.is_some();
-                }
-                #[cfg(feature = "contract")]
-                {
-                    has_governance = has_governance || self.contract.is_some();
-                }
-                #[cfg(feature = "masking")]
-                {
-                    has_governance = has_governance || self.masking.is_some();
-                }
+                // unconditionally. With none configured the batches pass
+                // through under the clearance the gateway requires.
+                let clearance = self
+                    .governance_specs(&name, &row, &run_id, wrapped_sink.connector_name())
+                    .clearance();
+                let has_governance = clearance.is_none();
                 if native_mechanics_ok {
                     let sink_caps = wrapped_sink.native_load_capabilities();
                     let write_mode = if wrapped_sink.is_overwrite() {
@@ -866,7 +886,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             write_mode,
                             has_dlq: self.dlq.is_some(),
                         });
-                    if let Some(plan) = plan {
+                    if let (Some(plan), Some(clearance)) = (plan, clearance) {
                         let state = match (wrapped_state_store.clone(), state_key.clone()) {
                             (Some(store), Some(key)) => Some((store, key)),
                             _ => None,
@@ -878,6 +898,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             &wrapped_source,
                             &wrapped_sink,
                             plan,
+                            clearance,
                             write_mode,
                             state,
                             scope,
@@ -923,36 +944,9 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         (Some(store), Some(key)) => Some((store, key)),
                         _ => None,
                     };
-                    #[allow(unused_mut)]
-                    let mut has_governance = self.schema_drift.is_some();
-                    #[cfg(feature = "quality")]
-                    {
-                        has_governance = has_governance || self.quality.is_some();
-                    }
-                    #[cfg(feature = "contract")]
-                    {
-                        has_governance = has_governance || self.contract.is_some();
-                    }
-                    #[cfg(feature = "masking")]
-                    {
-                        has_governance = has_governance || self.masking.is_some();
-                    }
                     let sink_name = wrapped_sink.connector_name();
                     let row_accounts = self.row_accounts.clone();
-                    let specs = GovernanceSpecs {
-                        #[cfg(feature = "masking")]
-                        masking: self.masking.as_ref(),
-                        #[cfg(feature = "quality")]
-                        quality: self.quality.as_ref(),
-                        #[cfg(feature = "contract")]
-                        contract: self.contract.as_ref(),
-                        schema_drift: self.schema_drift.as_ref(),
-                        pipeline: &name,
-                        row: &row,
-                        run_id: &run_id,
-                        sink_name,
-                        has_dlq: self.dlq.is_some(),
-                    };
+                    let specs = self.governance_specs(&name, &row, &run_id, sink_name);
                     return Box::pin(run_stream_columnar(
                         &wrapped_source,
                         &wrapped_sink,
@@ -962,7 +956,6 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         &row,
                         &run_id,
                         specs,
-                        has_governance,
                         dlq_effective.clone(),
                         row_accounts,
                         crate::dlq::BatchOutcomeSink::new(
@@ -1240,7 +1233,6 @@ async fn run_stream_columnar<S, Si>(
     row: &str,
     run_id: &str,
     specs: GovernanceSpecs<'_>,
-    has_governance: bool,
     dlq: Option<crate::dlq::DlqConfig>,
     row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
     outcomes: crate::dlq::BatchOutcomeSink,
@@ -1308,7 +1300,8 @@ where
         // on the way out (#146 M4).
         let mut deferred: Option<FaucetError> = None;
         let mut account = crate::accounting::PageAccount::new(rows);
-        let batch = if has_governance && rows > 0 {
+        let clearance = specs.clearance();
+        let batch = if clearance.is_none() && rows > 0 {
             let records = crate::columnar::record_batch_to_values(&page.batch)?;
             let schema = page.batch.schema();
             let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
@@ -1348,9 +1341,7 @@ where
                         "DLQ total budget exceeded: {new_total} > {limit}"
                     )));
                 }
-                dlq_cfg
-                    .sink
-                    .write_batch(&gov.envelopes)
+                gate::dlq(dlq_cfg.sink.as_ref(), &gov.envelopes)
                     .await
                     .map_err(|e| dlq_write_error("DLQ write failed", e))?;
                 account.quarantined += page_failures;
@@ -1366,19 +1357,19 @@ where
             if let Some(m) = specs.masking {
                 widened.extend(crate::columnar::masked_string_columns(
                     &schema,
-                    &gov.records,
+                    gov.records.records(),
                     |name| m.rewrites_name(name),
                 ));
             }
             let schema = crate::columnar::widen_to_utf8(&schema, &widened);
-            crate::columnar::values_to_record_batch(&gov.records, schema)?
+            crate::governance::GovernedBatch::encode(&gov.records, schema)?
         } else {
-            page.batch
+            crate::governance::GovernedBatch::passthrough(page.batch, clearance.as_ref())?
         };
         let rows = batch.num_rows();
 
         if rows > 0 {
-            let n = outcomes.observe(sink.write_batch_columnar(&batch).await)?;
+            let n = outcomes.observe(gate::columnar(sink, &batch).await)?;
             records_written += n;
             account.accepted += n;
             counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
@@ -1445,6 +1436,7 @@ async fn run_stream_native<S, Si>(
     source: &S,
     sink: &Si,
     plan: crate::native::NativePlan,
+    clearance: crate::governance::Clearance,
     write_mode: crate::write_mode::WriteMode,
     state: Option<(Arc<dyn StateStore>, String)>,
     scope: String,
@@ -1512,7 +1504,8 @@ where
             first_batch,
         };
         let offered = batch.records;
-        let n = outcomes.observe(sink.load_native(batch, &scope, load_ctx).await)?;
+        let batch = crate::governance::GovernedNative::passthrough(batch, &clearance);
+        let n = outcomes.observe(gate::native(sink, batch, &scope, load_ctx).await)?;
         first_batch = false;
         match offered {
             Some(offered) if (n as u64) < offered => {
@@ -1942,6 +1935,7 @@ where
                     let gov =
                         apply_governance(page.records, &specs, &mut gov_state, sink).await?;
                     let quality_envelopes = gov.envelopes;
+                    let governed = gov.records;
                     account.quarantined = quality_envelopes.len();
                     // A drift `fail` stops the run before anything from this
                     // page is written or bookmarked: only the page's quarantine
@@ -1954,10 +1948,7 @@ where
                         return Err(e);
                     }
 
-                    let page = StreamPage {
-                        records: gov.records,
-                        bookmark: page.bookmark,
-                    };
+                    let bookmark = page.bookmark;
 
                     if let Some(ref dlq_cfg) = dlq {
                         // ── DLQ-enabled path ───────────────────────────────────
@@ -1988,7 +1979,7 @@ where
                         // Reslice the page into sub-batches driven by the
                         // adaptive controller (or write the whole page in one
                         // shot when adaptive is disabled — same as before).
-                        let mut envelopes: Vec<Value> = Vec::new();
+                        let mut envelopes = crate::governance::GovernedEnvelopes::new();
                         let mut page_success = 0usize;
                         let mut outer_err_recovered = false;
                         // True if any chunk reported genuine per-row sink `Err`s
@@ -1996,9 +1987,9 @@ where
                         // error under `DlqAll`). Drives the `partial` label when a
                         // resliced page mixes the two failure modes.
                         let mut had_per_row_sink_failure = false;
-                        let records_len = page.records.len();
+                        let records_len = governed.len();
                         if adaptive_cfg.is_some() && records_len > 0 {
-                            sink.admit_page(&page.records).await?;
+                            gate::admit(sink, &governed).await?;
                         }
                         let mut offset = 0usize;
                         while offset < records_len {
@@ -2014,7 +2005,7 @@ where
                             if adaptive_cfg.is_some() {
                                 maybe_warn_noop_sink(sink_name, &mut warned_noop_sink);
                             }
-                            let chunk = &page.records[offset..offset + size];
+                            let chunk = governed.slice(offset..offset + size);
                             let t0 = std::time::Instant::now();
                             // Wrap the partial write with the retry policy so a
                             // whole-batch transient `Err` (a 5xx / connection
@@ -2022,7 +2013,7 @@ where
                             // retried before the `on_batch_error` decision.
                             // Inert when no policy is attached.
                             let chunk_outcomes_result =
-                                with_retry_write!("sink_write", sink.write_batch_partial(chunk));
+                                with_retry_write!("sink_write", gate::partial(sink, &chunk));
                             let latency = t0.elapsed();
                             // `chunk_synthesized` is true only when this chunk's
                             // outcomes were fabricated from a single outer
@@ -2103,8 +2094,7 @@ where
                                     if failing.is_empty() {
                                         break;
                                     }
-                                    let subset: Vec<Value> =
-                                        failing.iter().map(|&j| chunk[j].clone()).collect();
+                                    let subset = chunk.select(&failing);
                                     // Bare resubmit — NOT through `with_retry_write!`.
                                     // The poison loop's `max_row_attempts` is the
                                     // sole bound on per-row resubmission; nesting the
@@ -2112,7 +2102,7 @@ where
                                     // to a non-idempotent partial sink up to
                                     // `(max_row_attempts - 1) * max_attempts`,
                                     // amplifying duplicate writes (F47).
-                                    let retried = match sink.write_batch_partial(&subset).await {
+                                    let retried = match gate::partial(sink, &subset).await {
                                         Ok(r) if r.len() != subset.len() => {
                                             outcomes.record(BatchOutcome::Failed);
                                             return Err(crate::dlq::outcome_count_mismatch(
@@ -2187,19 +2177,21 @@ where
                                                 if !chunk_synthesized {
                                                     had_per_row_sink_failure = true;
                                                 }
-                                                envelopes.push(build_envelope(
-                                                    &chunk[j],
-                                                    err,
-                                                    if chunk_synthesized {
-                                                        DlqReason::DlqAll
-                                                    } else {
-                                                        DlqReason::Partial
-                                                    },
-                                                    sink_name,
-                                                    &pipeline_name,
-                                                    &row,
-                                                    offset + j,
-                                                ));
+                                                envelopes.push_failure(&chunk, j, |record| {
+                                                    build_envelope(
+                                                        record,
+                                                        err,
+                                                        if chunk_synthesized {
+                                                            DlqReason::DlqAll
+                                                        } else {
+                                                            DlqReason::Partial
+                                                        },
+                                                        sink_name,
+                                                        &pipeline_name,
+                                                        &row,
+                                                        offset + j,
+                                                    )
+                                                });
                                             }
                                         }
                                     }
@@ -2249,7 +2241,7 @@ where
                         let quality_count = quality_envelopes.len();
                         #[cfg(not(feature = "quality"))]
                         let quality_count = 0usize;
-                        envelopes.splice(0..0, quality_envelopes);
+                        envelopes.prepend(quality_envelopes);
                         let page_failures = envelopes.len();
 
                         // Budget checks. `write_batch_partial` above already
@@ -2329,9 +2321,9 @@ where
                             let written = if retry_policy.is_some()
                                 && dlq_sink.write_batch_is_replay_safe()
                             {
-                                with_retry!("dlq_write", dlq_sink.write_batch(&envelopes))
+                                with_retry!("dlq_write", gate::dlq(dlq_sink.as_ref(), &envelopes))
                             } else {
-                                dlq_sink.write_batch(&envelopes).await
+                                gate::dlq(dlq_sink.as_ref(), &envelopes).await
                             };
                             written.map_err(|e| {
                                 let mut lbl = metric_labels.clone();
@@ -2389,7 +2381,7 @@ where
                             (&pipeline_name, &row, sink_name),
                         )?;
 
-                        if let Some(bookmark) = page.bookmark {
+                        if let Some(bookmark) = bookmark {
                             // Retry-wrap the main-sink flush, the DLQ-sink flush,
                             // and the state write so a transient failure on any of
                             // them is retried before aborting — same as the default
@@ -2446,7 +2438,7 @@ where
                         // ── Exactly-once path ──────────────────────────────────
                         // A token is issued only for bookmark-carrying pages, so
                         // (seq, bookmark) advance together and realign on resume.
-                        if let Some(bookmark) = page.bookmark {
+                        if let Some(bookmark) = bookmark {
                             next_seq += 1;
                             // Embed the page's resume bookmark in the token so
                             // the committed watermark doubles as a durable
@@ -2472,7 +2464,7 @@ where
                                 ];
                                 counter!("faucet_pipeline_pages_skipped_total", skip_labels)
                                     .increment(1);
-                                account.accepted += page.records.len();
+                                account.accepted += governed.len();
                             } else {
                                 // A retry after an ambiguous failure first asks the
                                 // sink whether the page already committed: replaying
@@ -2481,7 +2473,7 @@ where
                                 // A short report fails the page in `settle`, before its bookmark is persisted (#879).
                                 let report = outcomes.observe(with_retry!(
                                     "sink_write",
-                                    eo_write_once(sink, &page.records, &scope, &token, next_seq, &attempt)
+                                    eo_write_once(sink, &governed, &scope, &token, next_seq, &attempt)
                                 ))?;
                                 records_written += report.accepted;
                                 account.add_report(report);
@@ -2502,13 +2494,13 @@ where
                                 with_retry!("state_put", store.put(key, &wrapped))?;
                             }
                             last_bookmark = Some(bookmark);
-                        } else if !page.records.is_empty() {
+                        } else if !governed.is_empty() {
                             // No bookmark → not individually checkpointed; write
                             // as-is (rare for EO sources, which bookmark every
                             // page). Stays at-least-once for this page.
                             let report = outcomes.observe(with_retry_write!(
                                 "sink_write",
-                                sink.write_batch_reported(&page.records)
+                                gate::reported(sink, &governed)
                             ))?;
                             records_written += report.accepted;
                             account.add_report(report);
@@ -2523,22 +2515,21 @@ where
                             quality_envelopes.is_empty(),
                             "quality quarantine without DLQ should have been rejected at run start"
                         );
-                        if !page.records.is_empty() {
+                        if !governed.is_empty() {
                             if let Some(cfg) = adaptive_cfg.as_ref() {
-                                sink.admit_page(&page.records).await?;
+                                gate::admit(sink, &governed).await?;
                                 let ctrl = controller.get_or_insert_with(|| {
-                                    crate::adaptive::AimdController::new(cfg, page.records.len())
+                                    crate::adaptive::AimdController::new(cfg, governed.len())
                                 });
                                 maybe_warn_noop_sink(sink_name, &mut warned_noop_sink);
                                 let mut offset = 0;
-                                while offset < page.records.len() {
-                                    let size =
-                                        ctrl.current().max(1).min(page.records.len() - offset);
-                                    let chunk = &page.records[offset..offset + size];
+                                while offset < governed.len() {
+                                    let size = ctrl.current().max(1).min(governed.len() - offset);
+                                    let chunk = governed.slice(offset..offset + size);
                                     let t0 = std::time::Instant::now();
                                     let report = outcomes.observe(with_retry_write!(
                                         "sink_write",
-                                        sink.write_batch_reported(chunk)
+                                        gate::reported(sink, &chunk)
                                     ))?;
                                     let latency = t0.elapsed();
                                     let n = report.accepted;
@@ -2555,7 +2546,7 @@ where
                             } else {
                                 let report = outcomes.observe(with_retry_write!(
                                     "sink_write",
-                                    sink.write_batch_reported(&page.records)
+                                    gate::reported(sink, &governed)
                                 ))?;
                                 records_written += report.accepted;
                                 account.add_report(report);
@@ -2565,7 +2556,7 @@ where
                             row_accounts.as_deref(),
                             (&pipeline_name, &row, sink_name),
                         )?;
-                        if let Some(bookmark) = page.bookmark {
+                        if let Some(bookmark) = bookmark {
                             if !defer_bookmarks {
                                 with_retry!("flush", sink.flush())?;
                             }
@@ -2699,20 +2690,27 @@ where
 /// token already covers `seq`.
 async fn eo_write_once<Si: Sink + ?Sized>(
     sink: &Si,
-    records: &[Value],
+    page: &crate::governance::GovernedPage<'_>,
     scope: &str,
     token: &str,
     seq: u64,
     attempt: &std::sync::atomic::AtomicU32,
 ) -> Result<crate::accounting::WriteReport, FaucetError> {
-    if attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
-        && let Some(committed) = sink.last_committed_token(scope).await?
-        && crate::idempotency::parse_token(&committed).is_some_and(|c| c >= seq)
+    // The engine reads the watermark through `Sink` for every sink until 3b.
+    #[allow(deprecated)]
+    let committed = if attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+        sink.last_committed_token(scope).await?
+    } else {
+        None
+    };
+    if committed
+        .as_deref()
+        .and_then(crate::idempotency::parse_token)
+        .is_some_and(|c| c >= seq)
     {
-        return Ok(crate::accounting::WriteReport::accepted(records.len()));
+        return Ok(crate::accounting::WriteReport::accepted(page.len()));
     }
-    sink.write_batch_idempotent_reported(records, scope, token)
-        .await
+    gate::idempotent(sink, page, scope, token).await
 }
 
 /// Emit the adaptive controller's current state + any adjustment as metrics.
@@ -2765,565 +2763,6 @@ fn maybe_warn_noop_sink(sink_name: &str, warned: &mut bool) {
         );
         *warned = true;
     }
-}
-
-/// Compiled governance specs for one run, borrowed per page.
-///
-/// Bundled into a struct rather than passed as loose arguments because the set
-/// is feature-gated: a `#[cfg]` on a function parameter is not expressible, and
-/// threading five `Option`s through two call sites invites them being passed in
-/// the wrong order.
-pub(crate) struct GovernanceSpecs<'a> {
-    #[cfg(feature = "masking")]
-    pub masking: Option<&'a Arc<crate::masking::CompiledMasking>>,
-    #[cfg(feature = "quality")]
-    pub quality: Option<&'a Arc<crate::quality::CompiledQuality>>,
-    #[cfg(feature = "contract")]
-    pub contract: Option<&'a Arc<crate::contract::CompiledContract>>,
-    pub schema_drift: Option<&'a crate::drift::SchemaDriftPolicy>,
-    pub pipeline: &'a str,
-    pub row: &'a str,
-    /// Only read by the masking/quality/contract label builders, so it is
-    /// dead under a build with none of those features.
-    #[cfg_attr(
-        not(any(feature = "masking", feature = "quality", feature = "contract")),
-        allow(dead_code)
-    )]
-    pub run_id: &'a str,
-    pub sink_name: &'a str,
-    /// Whether a DLQ is configured. A drift/incompatible `fail` is **deferred**
-    /// when it is, so this page's already-built quarantine envelopes still
-    /// reach the DLQ before the run stops (#146 M4); the page's survivors and
-    /// bookmark are never written (CORE-20).
-    pub has_dlq: bool,
-}
-
-/// State the governance passes carry **across** pages of one run: the lazily
-/// fetched destination schema and the one-shot warning latches.
-#[derive(Default)]
-pub(crate) struct GovernanceState {
-    pub dest_schema_cache: Option<Option<Value>>,
-    pub warned_drift_inert: bool,
-    #[cfg(feature = "contract")]
-    pub warned_contract_breach: bool,
-}
-
-/// What one page's governance passes produced.
-pub(crate) struct GovernanceOutcome {
-    /// Records that survived every pass and should be written.
-    pub records: Vec<Value>,
-    /// DLQ envelopes from quality + contract + drift quarantine, merged in that
-    /// order so the caller writes them as one batch.
-    pub envelopes: Vec<Value>,
-    /// A drift `fail` / incompatible-`fail` abort to raise once the envelopes
-    /// are durable, without writing `records` or the page's bookmark. `None`
-    /// when there is nothing to defer; with no DLQ configured the error is
-    /// returned directly instead.
-    pub deferred_abort: Option<FaucetError>,
-}
-
-/// Run the per-page governance passes in their load-bearing order —
-/// **masking → quality → contract → schema drift** — and return the survivors
-/// plus any DLQ envelopes.
-///
-/// Extracted from `run_stream` so the columnar loop runs the *same* code rather
-/// than a second copy (#636). The ordering and the page-index bookkeeping are
-/// the subtle parts and must not be duplicated: masking runs first so PII never
-/// reaches a sink, the DLQ, or a lineage sample; quality and contract each
-/// remove rows, and `page_indices` is carried in lockstep so a later drift
-/// quarantine annotates an envelope with the record's **true** page position
-/// rather than a survivor-relative one (#321 L6, #466 M1).
-pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
-    records: Vec<Value>,
-    specs: &GovernanceSpecs<'_>,
-    state: &mut GovernanceState,
-    sink: &Si,
-) -> Result<GovernanceOutcome, FaucetError> {
-    // Envelope construction is entirely feature-gated (quality/contract), so
-    // this import is too — otherwise a bare `arrow` build warns.
-    #[cfg(any(feature = "quality", feature = "contract"))]
-    use crate::dlq::{DlqReason, build_envelope};
-
-    let pipeline_name = specs.pipeline;
-    let row = specs.row;
-    let sink_name = specs.sink_name;
-
-    // ── Masking pass (FIRST — before quality/contract/drift and every sink
-    // write) ────────────────────────────────────────────────────────────────
-    // Runs ahead of everything so PII never reaches a sink, the DLQ (quarantine
-    // envelopes are built downstream from these already-masked records), or the
-    // sink-side lineage sample.
-    #[cfg(feature = "masking")]
-    let records = if let Some(m) = specs.masking {
-        let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
-        crate::observability::instrumented_apply_masking(records, m, &labels).records
-    } else {
-        records
-    };
-
-    // True page positions of the records currently flowing, kept in lockstep as
-    // quality/contract remove rows.
-    let page_len = records.len();
-
-    // ── Quality pass ────────────────────────────────────────────────────────
-    #[cfg(feature = "quality")]
-    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-        if let Some(q) = specs.quality {
-            let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
-            let outcome = crate::observability::instrumented_apply_quality(records, q, &labels)?;
-            let quarantined_idx: std::collections::HashSet<usize> =
-                outcome.quarantined.iter().map(|qr| qr.page_index).collect();
-            let envelopes: Vec<Value> = outcome
-                .quarantined
-                .iter()
-                .map(|qr| {
-                    let err = FaucetError::QualityFailure {
-                        check: qr.check.to_string(),
-                        message: qr.message.clone(),
-                    };
-                    // `record_index` is the position within the PAGE (the frozen
-                    // envelope contract), not the index in the quarantine list.
-                    build_envelope(
-                        &qr.record,
-                        &err,
-                        DlqReason::Quality,
-                        sink_name,
-                        pipeline_name,
-                        row,
-                        qr.page_index,
-                    )
-                })
-                .collect();
-            let survivor_idx: Vec<usize> = (0..page_len)
-                .filter(|i| !quarantined_idx.contains(i))
-                .collect();
-            (outcome.survivors, envelopes, survivor_idx)
-        } else {
-            (records, Vec::new(), (0..page_len).collect())
-        };
-    #[cfg(not(feature = "quality"))]
-    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-        (records, Vec::new(), (0..page_len).collect());
-
-    // ── Contract pass ───────────────────────────────────────────────────────
-    // `fail` mirrors a quality `abort`: the breach error propagates immediately
-    // and nothing from this page is written.
-    #[cfg(feature = "contract")]
-    let (records, contract_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-        if let Some(c) = specs.contract {
-            let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
-            let outcome = crate::observability::instrumented_apply_contract(records, c, &labels)?;
-            if !outcome.warned.is_empty() && !state.warned_contract_breach {
-                tracing::warn!(
-                    version = %c.version,
-                    breaches = outcome.warned.len(),
-                    first = %outcome.warned[0].describe(),
-                    "contract: breaching records written unchanged (on_breach=warn); \
-                     this warning fires once per run"
-                );
-                state.warned_contract_breach = true;
-            }
-            let envelopes: Vec<Value> = outcome
-                .quarantined
-                .iter()
-                .map(|vr| {
-                    let err = FaucetError::ContractViolation {
-                        version: c.version.clone(),
-                        message: vr.violation.describe(),
-                    };
-                    // `vr.violation.page_index` is the position within *this
-                    // pass's input* — the quality survivors — which is aligned
-                    // with `page_indices`, so translate through it (#466 M1).
-                    let page_index = page_indices
-                        .get(vr.violation.page_index)
-                        .copied()
-                        .unwrap_or(vr.violation.page_index);
-                    build_envelope(
-                        &vr.record,
-                        &err,
-                        DlqReason::Contract,
-                        sink_name,
-                        pipeline_name,
-                        row,
-                        page_index,
-                    )
-                })
-                .collect();
-            let contract_quarantined: std::collections::HashSet<usize> = outcome
-                .quarantined
-                .iter()
-                .map(|vr| vr.violation.page_index)
-                .collect();
-            let survivor_idx: Vec<usize> = page_indices
-                .iter()
-                .enumerate()
-                .filter(|(pos, _)| !contract_quarantined.contains(pos))
-                .map(|(_, orig)| *orig)
-                .collect();
-            (outcome.survivors, envelopes, survivor_idx)
-        } else {
-            (records, Vec::new(), page_indices)
-        };
-
-    // ── Schema-drift pass ───────────────────────────────────────────────────
-    let mut drift_envelopes: Vec<Value> = Vec::new();
-    let (records, drift_abort): (Vec<Value>, Option<FaucetError>) =
-        if let Some(policy) = specs.schema_drift.filter(|_| !records.is_empty()) {
-            // Re-ask while the sink reports none: a target the sink creates on
-            // the first page has a schema from the second page on, and a
-            // cached `None` would leave drift inert for the rest of a first
-            // run (#862 M-054).
-            if !matches!(state.dest_schema_cache, Some(Some(_))) {
-                state.dest_schema_cache = Some(sink.current_schema().await?);
-            }
-            let dest = state.dest_schema_cache.as_ref().and_then(|o| o.as_ref());
-            match dest {
-                None => {
-                    if !state.warned_drift_inert {
-                        tracing::info!(
-                            connector = sink_name,
-                            "schema-drift: sink reports no destination schema yet; \
-                             drift handling is inert until it does"
-                        );
-                        state.warned_drift_inert = true;
-                    }
-                    (records, None)
-                }
-                Some(dest) => {
-                    let inferred = crate::schema::infer_schema(&records);
-                    let diff = crate::drift::diff_schema(dest, &inferred, policy.allow_widening);
-                    if diff.is_empty() {
-                        (records, None)
-                    } else {
-                        // The cache may be replaced inside the evolve arm; `dest`
-                        // borrows it, so re-clone before the call to drop the borrow.
-                        let dest_owned = dest.clone();
-                        apply_drift_policy(
-                            policy,
-                            &diff,
-                            &dest_owned,
-                            records,
-                            &page_indices,
-                            sink,
-                            sink_name,
-                            pipeline_name,
-                            row,
-                            &mut state.dest_schema_cache,
-                            &mut drift_envelopes,
-                        )
-                        .await?
-                    }
-                }
-            }
-        } else {
-            (records, None)
-        };
-
-    // Merge quality + contract + drift envelopes so the caller writes one batch.
-    let mut envelopes = quality_envelopes;
-    #[cfg(feature = "contract")]
-    envelopes.extend(contract_envelopes);
-    envelopes.append(&mut drift_envelopes);
-
-    // With no DLQ there are no envelopes to strand (a no-DLQ quarantine config
-    // is rejected at run start), so a drift abort is raised immediately.
-    let mut drift_abort = drift_abort;
-    if !specs.has_dlq
-        && let Some(e) = drift_abort.take()
-    {
-        return Err(e);
-    }
-
-    Ok(GovernanceOutcome {
-        records,
-        envelopes,
-        deferred_abort: drift_abort,
-    })
-}
-
-/// Make a page's quarantine envelopes durable ahead of a drift `fail` abort, so
-/// the run stops without writing the page's survivors or its bookmark while the
-/// rows already routed to the DLQ are not lost.
-async fn abort_with_envelopes(
-    dlq_cfg: &crate::dlq::DlqConfig,
-    envelopes: &[Value],
-    dlq_stats: &mut DlqStats,
-) -> Result<(), FaucetError> {
-    if envelopes.is_empty() {
-        return Ok(());
-    }
-    dlq_cfg
-        .sink
-        .write_batch(envelopes)
-        .await
-        .map_err(|e| dlq_write_error("DLQ sink write failed", e))?;
-    dlq_cfg
-        .sink
-        .flush()
-        .await
-        .map_err(|e| FaucetError::Sink(format!("DLQ sink flush failed: {e}")))?;
-    dlq_stats.records_dlq += envelopes.len();
-    dlq_stats.pages_with_failures += 1;
-    Ok(())
-}
-
-/// A failed DLQ write. A refusal by the DLQ's own governance — its policy, the
-/// run budget, or row accounting (#870, #879) — keeps its type so the run fails
-/// with the real reason; anything else is a DLQ sink failure.
-fn dlq_write_error(context: &str, e: FaucetError) -> FaucetError {
-    match e {
-        e @ (FaucetError::PolicyViolation { .. }
-        | FaucetError::BudgetExceeded { .. }
-        | FaucetError::RowsUnaccounted { .. }) => e,
-        e => FaucetError::Sink(format!("{context}: {e}")),
-    }
-}
-
-/// Apply the schema-drift policy to a page (#194). Returns the (possibly
-/// trimmed) records and an optional deferred abort error. The page is never
-/// written when it is set: with a DLQ the caller first makes the page's
-/// quality/drift quarantine envelopes durable, then raises it; with no DLQ —
-/// where no envelopes can exist — it is raised immediately.
-/// Appends drift quarantine envelopes to `drift_envelopes`.
-#[allow(clippy::too_many_arguments)]
-async fn apply_drift_policy<Si: Sink + ?Sized>(
-    policy: &crate::drift::SchemaDriftPolicy,
-    diff: &crate::drift::SchemaDiff,
-    dest: &Value,
-    records: Vec<Value>,
-    page_indices: &[usize],
-    sink: &Si,
-    sink_name: &str,
-    pipeline_name: &str,
-    row: &str,
-    dest_schema_cache: &mut Option<Option<Value>>,
-    drift_envelopes: &mut Vec<Value>,
-) -> Result<(Vec<Value>, Option<FaucetError>), FaucetError> {
-    use crate::drift::{OnDrift, OnIncompatible};
-    use crate::observability::schema_drift as emit_drift;
-
-    let mode = match policy.on_drift {
-        OnDrift::Warn => "warn",
-        OnDrift::Ignore => "ignore",
-        OnDrift::Quarantine => "quarantine",
-        OnDrift::Fail => "fail",
-        OnDrift::Evolve => "evolve",
-    };
-    emit_drift(
-        pipeline_name,
-        row,
-        sink_name,
-        mode,
-        "added",
-        diff.additions.len() as u64,
-    );
-    emit_drift(
-        pipeline_name,
-        row,
-        sink_name,
-        mode,
-        "widened",
-        diff.widenings.len() as u64,
-    );
-    emit_drift(
-        pipeline_name,
-        row,
-        sink_name,
-        mode,
-        "narrowed",
-        diff.incompatible.len() as u64,
-    );
-    emit_drift(
-        pipeline_name,
-        row,
-        sink_name,
-        mode,
-        "dropped",
-        diff.droppable_required.len() as u64,
-    );
-
-    match policy.on_drift {
-        OnDrift::Warn => {
-            tracing::warn!(
-                connector = sink_name,
-                columns = ?diff.changed_columns(),
-                "schema-drift detected (on_drift=warn); writing page unchanged"
-            );
-            Ok((records, None))
-        }
-        OnDrift::Fail => Ok((
-            records,
-            Some(FaucetError::SchemaDrift {
-                columns: diff.changed_columns(),
-                message: "schema drift detected (on_drift=fail)".to_string(),
-            }),
-        )),
-        OnDrift::Ignore => {
-            // Drop fields not present in the destination schema.
-            let allowed: std::collections::HashSet<String> = dest
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
-            let trimmed = records
-                .into_iter()
-                .map(|r| match r {
-                    Value::Object(map) => Value::Object(
-                        map.into_iter()
-                            .filter(|(k, _)| allowed.contains(k))
-                            .collect(),
-                    ),
-                    other => other,
-                })
-                .collect();
-            Ok((trimmed, None))
-        }
-        OnDrift::Quarantine => {
-            let (kept, env) =
-                quarantine_drift_rows(diff, records, page_indices, sink_name, pipeline_name, row);
-            drift_envelopes.extend(env);
-            Ok((kept, None))
-        }
-        OnDrift::Evolve => {
-            let evolution = crate::drift::SchemaEvolution {
-                additions: diff.additions.clone(),
-                widenings: diff
-                    .widenings
-                    .iter()
-                    .filter(|c| {
-                        c.from
-                            .as_ref()
-                            .map(|f| crate::drift::base_widened(f, &c.to))
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect(),
-                relax_nullability: diff
-                    .droppable_required
-                    .iter()
-                    // A column merely *absent* from this page only relaxes its
-                    // NOT NULL constraint when explicitly opted in — otherwise a
-                    // transient/partial page would silently and irreversibly
-                    // weaken the destination schema (F28).
-                    .filter(|_| policy.relax_nullability_on_missing)
-                    .cloned()
-                    .chain(
-                        diff.widenings
-                            .iter()
-                            .filter(|c| {
-                                c.from
-                                    .as_ref()
-                                    .map(|f| crate::drift::adds_null(f, &c.to))
-                                    .unwrap_or(false)
-                            })
-                            .map(|c| c.name.clone()),
-                    )
-                    .collect(),
-            };
-            if !evolution.is_empty() {
-                sink.evolve_schema(&evolution).await?;
-                // Refresh the cached destination schema so later pages diff
-                // against the evolved shape (re-introspect authoritatively).
-                *dest_schema_cache = Some(sink.current_schema().await?);
-            }
-            // Handle the incompatible residue.
-            if diff.incompatible.is_empty() {
-                Ok((records, None))
-            } else {
-                match policy.on_incompatible {
-                    OnIncompatible::Fail => Ok((
-                        records,
-                        Some(FaucetError::SchemaDrift {
-                            columns: diff.incompatible.iter().map(|c| c.name.clone()).collect(),
-                            message: "incompatible type change cannot be auto-evolved \
-                                      (on_incompatible=fail)"
-                                .into(),
-                        }),
-                    )),
-                    OnIncompatible::Quarantine => {
-                        // Build a diff carrying only the incompatible columns.
-                        let incompat_only = crate::drift::SchemaDiff {
-                            incompatible: diff.incompatible.clone(),
-                            ..Default::default()
-                        };
-                        let (kept, env) = quarantine_drift_rows(
-                            &incompat_only,
-                            records,
-                            page_indices,
-                            sink_name,
-                            pipeline_name,
-                            row,
-                        );
-                        drift_envelopes.extend(env);
-                        Ok((kept, None))
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Partition records: those exhibiting any drift column go to the DLQ; the rest
-/// are kept. Returns `(kept, envelopes)`.
-///
-/// A row "exhibits drift" if it either **contains** a column whose shape diverges
-/// from the destination — an addition, a type widening, or an incompatible type
-/// change — or **omits** a `droppable_required` column (a destination NOT NULL
-/// column absent from the page). All four buckets must be covered: a widening or
-/// droppable-required column written to a *non-evolved* destination is exactly
-/// the silent corruption `quarantine` exists to prevent.
-fn quarantine_drift_rows(
-    diff: &crate::drift::SchemaDiff,
-    records: Vec<Value>,
-    page_indices: &[usize],
-    sink_name: &str,
-    pipeline_name: &str,
-    row: &str,
-) -> (Vec<Value>, Vec<Value>) {
-    use crate::dlq::{DlqReason, build_envelope};
-    // Columns that taint a row by their PRESENCE in the record.
-    let present_cols: std::collections::HashSet<&str> = diff
-        .additions
-        .iter()
-        .chain(&diff.widenings)
-        .chain(&diff.incompatible)
-        .map(|c| c.name.as_str())
-        .collect();
-    // Required destination columns that taint a row by their ABSENCE.
-    let required_cols: std::collections::HashSet<&str> =
-        diff.droppable_required.iter().map(|s| s.as_str()).collect();
-    let mut kept = Vec::new();
-    let mut envelopes = Vec::new();
-    for (idx, rec) in records.into_iter().enumerate() {
-        let exhibits = rec
-            .as_object()
-            .map(|m| {
-                m.keys().any(|k| present_cols.contains(k.as_str()))
-                    || required_cols.iter().any(|c| !m.contains_key(*c))
-            })
-            .unwrap_or(false);
-        if exhibits {
-            let err = FaucetError::SchemaDrift {
-                columns: diff.changed_columns(),
-                message: "row exhibits schema drift (on_drift=quarantine)".into(),
-            };
-            // Map the survivor-relative position back to the record's true page
-            // index so the envelope annotation matches quality/contract (#321 L6).
-            let page_index = page_indices.get(idx).copied().unwrap_or(idx);
-            envelopes.push(build_envelope(
-                &rec,
-                &err,
-                DlqReason::SchemaDrift,
-                sink_name,
-                pipeline_name,
-                row,
-                page_index,
-            ));
-        } else {
-            kept.push(rec);
-        }
-    }
-    (kept, envelopes)
 }
 
 #[cfg(test)]

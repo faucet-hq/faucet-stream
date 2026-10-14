@@ -294,8 +294,8 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     // The columnar and native paths carry no keys to record, so they stay at the
     // trait default (off); everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported,
+        write_batch, write_batch_reported, write_governed, write_batch_partial,
+        write_batch_idempotent, write_batch_idempotent_reported,
         supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -310,6 +310,15 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
         let r = self.inner.write_batch_reported(records).await?;
         self.record(records);
+        Ok(r)
+    }
+
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let r = self.inner.write_governed(page).await?;
+        self.record(page.records());
         Ok(r)
     }
 

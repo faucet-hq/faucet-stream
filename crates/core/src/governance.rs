@@ -44,6 +44,15 @@
 //! [`UsageSnapshot`](crate::usage::UsageSnapshot); DLQ writes are retried under
 //! `resilience:` when the DLQ sink's write is replay-safe.
 
+pub(crate) mod apply;
+mod page;
+pub(crate) mod write;
+
+#[cfg(feature = "arrow")]
+pub(crate) use page::GovernedBatch;
+pub(crate) use page::{Clearance, GovernedNative};
+pub use page::{GovernedEnvelopes, GovernedPage};
+
 use crate::budget::{BudgetSink, BudgetSpec, BudgetState, BudgetTimer};
 use crate::dlq::DlqConfig;
 use crate::error::FaucetError;
@@ -575,6 +584,43 @@ impl Governance {
         }
     }
 
+    /// Run the per-page passes — masking → quality → contract → schema drift
+    /// (against `sink`'s live schema) — over one page, outside a pipeline run.
+    ///
+    /// The returned [`GovernedOutput`] holds the governed survivors and the
+    /// quarantine envelopes the passes built; write the page with
+    /// [`Sink::write_governed`]. A pass that aborts (a quality `abort`, a
+    /// contract `fail`, a drift `fail`) is the error. Each call starts from a
+    /// fresh destination-schema read, so this suits one-off pages (tests,
+    /// previews, conformance), not a page loop — use a
+    /// [`Pipeline`](crate::Pipeline) for that.
+    pub async fn govern(
+        &self,
+        records: Vec<Value>,
+        sink: &dyn Sink,
+    ) -> Result<GovernedOutput, FaucetError> {
+        let specs = apply::GovernanceSpecs {
+            #[cfg(feature = "masking")]
+            masking: self.masking.as_ref(),
+            #[cfg(feature = "quality")]
+            quality: self.quality.as_ref(),
+            #[cfg(feature = "contract")]
+            contract: self.contract.as_ref(),
+            schema_drift: self.schema_drift.as_ref(),
+            pipeline: "unnamed",
+            row: "",
+            run_id: "",
+            sink_name: sink.connector_name(),
+            has_dlq: false,
+        };
+        let mut state = apply::GovernanceState::default();
+        let out = apply::apply_governance(records, &specs, &mut state, sink).await?;
+        Ok(GovernedOutput {
+            page: out.records,
+            envelopes: out.envelopes,
+        })
+    }
+
     /// The compat features this governance contributes to path selection.
     pub(crate) fn compat_features(&self) -> Vec<crate::compat::Feature> {
         use crate::compat::Feature as F;
@@ -611,6 +657,16 @@ impl Governance {
             self.policy.as_ref(),
         ))
     }
+}
+
+/// What [`Governance::govern`] produced for one page.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct GovernedOutput {
+    /// The records that survived every pass.
+    pub page: GovernedPage<'static>,
+    /// Dead-letter envelopes for the records a pass quarantined.
+    pub envelopes: GovernedEnvelopes,
 }
 
 /// Wrap a DLQ's sink in the governed stack: masking → policy → budget →
@@ -1150,6 +1206,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.records_written, 1);
+    }
+
+    /// Counts governed writes; the default forwards to the reported write.
+    struct GovernedOnly {
+        governed: std::sync::atomic::AtomicUsize,
+        rows: Seen,
+    }
+
+    #[async_trait]
+    impl Sink for GovernedOnly {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            for r in records {
+                self.rows.lock().unwrap().push(("plain", r.clone()));
+            }
+            Ok(records.len())
+        }
+        async fn write_governed(
+            &self,
+            page: &GovernedPage<'_>,
+        ) -> Result<crate::accounting::WriteReport, FaucetError> {
+            self.governed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.write_batch_reported(page.records()).await
+        }
+    }
+
+    /// RFC 0014: the engine's plain write path hands the sink a governed page.
+    #[tokio::test]
+    async fn the_plain_write_path_writes_through_write_governed() {
+        let source = Rows(vec![json!({"a": 1}), json!({"a": 2})]);
+        let sink = GovernedOnly {
+            governed: Default::default(),
+            rows: Arc::default(),
+        };
+        let r = crate::Pipeline::new(&source, &sink).run().await.unwrap();
+        assert_eq!(r.records_written, 2);
+        assert_eq!(sink.governed.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(sink.rows.lock().unwrap().len(), 2);
+    }
+
+    /// A wrapper that changes the plain write keeps its change on the
+    /// governed path: `write_governed` is not forwarded past it.
+    #[tokio::test]
+    async fn a_wrapper_changing_write_batch_keeps_the_governed_write_its_own() {
+        let seen: Seen = Arc::default();
+        let wrapped = Tap {
+            name: "tap",
+            inner: Box::new(Dest(Arc::clone(&seen))),
+            seen: Arc::clone(&seen),
+        };
+        let page = Governance::new()
+            .govern(vec![json!({"k": 1})], &wrapped)
+            .await
+            .unwrap();
+        assert!(page.envelopes.is_empty());
+        let report = wrapped.write_governed(&page.page).await.unwrap();
+        assert_eq!(report.accepted, 1);
+        let names: Vec<&str> = seen.lock().unwrap().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["tap", "dest"]);
+    }
+
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn govern_runs_the_passes_and_returns_a_governed_page() {
+        let spec: crate::masking::MaskingSpec = serde_json::from_value(json!({
+            "rules": [{"match": {"fields": ["email"]}, "action": {"type": "redact"}}]
+        }))
+        .unwrap();
+        let g = Governance::new().with_masking(Arc::new(
+            crate::masking::CompiledMasking::compile(&spec).unwrap(),
+        ));
+        let out = g
+            .govern(vec![json!({"email": "a@b.co"})], &Dest(Arc::default()))
+            .await
+            .unwrap();
+        assert_eq!(out.page.records()[0]["email"], "***");
+    }
+
+    #[cfg(feature = "quality")]
+    #[tokio::test]
+    async fn govern_fails_on_an_aborting_pass() {
+        let spec: crate::quality::QualitySpec = serde_json::from_value(json!({
+            "record": [{"type": "not_null", "field": "id", "on_failure": "abort"}]
+        }))
+        .unwrap();
+        let g = Governance::new().with_quality(Arc::new(
+            crate::quality::CompiledQuality::compile(&spec).unwrap(),
+        ));
+        let err = g
+            .govern(vec![json!({"id": null})], &Dest(Arc::default()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::QualityFailure { .. }), "{err}");
     }
 
     #[test]

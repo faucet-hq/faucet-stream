@@ -633,6 +633,22 @@ pub trait Sink: Send + Sync {
         })
     }
 
+    /// Write a page the engine governed (RFC 0014): it went through masking,
+    /// quality, contract and schema drift, so the records are exactly what
+    /// may reach the destination. The engine's plain write path calls this.
+    ///
+    /// The default delegates to [`write_batch_reported`](Self::write_batch_reported)
+    /// with the page's records, so existing sinks behave as before. A
+    /// [`GovernedPage`](crate::governance::GovernedPage) cannot be built
+    /// outside [`governance`](crate::governance), so a sink that overrides
+    /// this receives only governed data. Decorators forward it.
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.write_batch_reported(page.records()).await
+    }
+
     /// What a failed batch write leaves behind (#737): nothing
     /// ([`Atomic`](crate::BatchAtomicity::Atomic)), per-row outcomes with
     /// nothing committed on an outer `Err`

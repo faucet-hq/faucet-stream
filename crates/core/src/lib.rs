@@ -37,6 +37,7 @@ pub mod diff;
 pub mod discover;
 pub mod dlq;
 pub mod drift;
+pub mod driver;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;

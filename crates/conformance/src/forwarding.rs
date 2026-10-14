@@ -106,6 +106,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
 pub const SINK_HOOKS: &[&str] = &[
     "write_batch",
     "write_batch_reported",
+    "write_governed",
     "flush",
     "write_batch_partial",
     "batch_atomicity",
@@ -215,6 +216,13 @@ impl Sink for HookSink {
     async fn write_batch_reported(&self, records: &[Value]) -> Result<WriteReport, FaucetError> {
         self.hit("write_batch_reported");
         Ok(WriteReport::accepted(records.len()))
+    }
+    async fn write_governed(
+        &self,
+        page: &faucet_core::governance::GovernedPage<'_>,
+    ) -> Result<WriteReport, FaucetError> {
+        self.hit("write_governed");
+        Ok(WriteReport::accepted(page.len()))
     }
     async fn flush(&self) -> Result<(), FaucetError> {
         self.hit("flush");
@@ -431,6 +439,12 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
     let page = [json!({"id": 1})];
     let _ = sink.write_batch(&page).await;
     let _ = sink.write_batch_reported(&page).await;
+    if let Ok(governed) = faucet_core::governance::Governance::new()
+        .govern(page.to_vec(), sink)
+        .await
+    {
+        let _ = sink.write_governed(&governed.page).await;
+    }
     let _ = sink.flush().await;
     let _ = sink.write_batch_partial(&page).await;
     let _ = sink.batch_atomicity();
