@@ -2,6 +2,9 @@
 
 use crate::config::{ElasticsearchAuth, ElasticsearchSinkConfig};
 use async_trait::async_trait;
+use faucet_core::driver::{
+    CleanupDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver, StagingDriver,
+};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
@@ -25,6 +28,11 @@ fn resume_dup_risk(chunk_count: usize, has_id_field: bool) -> bool {
 
 /// A sink that writes JSON records to an Elasticsearch index using the bulk API.
 pub struct ElasticsearchSink {
+    inner: DriverSink<EsDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct EsDriver {
     config: ElasticsearchSinkConfig,
     client: Client,
     /// Optional shared auth provider. When set it takes precedence over inline
@@ -38,10 +46,6 @@ pub struct ElasticsearchSink {
     /// log emitted by [`evolve_schema`](faucet_core::Sink::evolve_schema) when an
     /// evolution carries widenings / nullability relaxations (no-ops on ES).
     evolve_noop_warned: AtomicBool,
-    /// Backend-call context (#880): `request_timeout_secs` per attempt over
-    /// the run's recorder and deadline. One attempt per `_bulk` request — an
-    /// append without `_id` must not be re-sent — metered as `bulk`.
-    calls: CallSlot,
 }
 
 /// The alias that marks an overwrite run's staging index. `begin_overwrite`
@@ -79,6 +83,38 @@ impl ElasticsearchSink {
     /// Returns [`FaucetError::Config`] if `batch_size` exceeds
     /// `MAX_BATCH_SIZE` (#78/#44).
     pub fn new(config: ElasticsearchSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(EsDriver::new(config)?),
+        })
+    }
+
+    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set,
+    /// the provider supplies the credential for every request (taking precedence
+    /// over inline auth). Used by the CLI to resolve `auth: { ref }`, and by
+    /// library callers who inject one provider into many sinks.
+    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
+        self.inner.driver_mut().auth_provider = Some(provider);
+        self
+    }
+
+    #[cfg(test)]
+    fn append_entry(&self, record: &Value) -> Result<String, FaucetError> {
+        self.inner.driver().append_entry(record)
+    }
+
+    #[cfg(test)]
+    fn plan_entry(&self, action: &PlannedAction) -> Result<String, FaucetError> {
+        self.inner.driver().plan_entry(action)
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for ElasticsearchSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl EsDriver {
+    fn new(config: ElasticsearchSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         // Schemaless target: upsert/delete only need a non-empty `key` (no
         // column-mapping guard like the SQL sinks).
@@ -98,7 +134,6 @@ impl ElasticsearchSink {
             auth_provider: None,
             resume_dup_warned: AtomicBool::new(false),
             evolve_noop_warned: AtomicBool::new(false),
-            calls: CallSlot::new(CallContext::new().with_timeout(request_timeout)),
         })
     }
 
@@ -115,12 +150,14 @@ impl ElasticsearchSink {
     /// Physical indices `alias` points at; empty when no such alias exists.
     async fn alias_targets(
         &self,
+        calls: &CallSlot,
         alias: &str,
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Vec<String>>, FaucetError> {
         let url = format!("{}/_alias/{}", self.config.base_url, alias);
         let resp = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.get(&url), auth),
             )
@@ -138,9 +175,13 @@ impl ElasticsearchSink {
     }
 
     /// The overwrite run's staging index, resolved through [`staging_alias`].
-    async fn overwrite_staging(&self, auth: &ElasticsearchAuth) -> Result<String, FaucetError> {
+    async fn overwrite_staging(
+        &self,
+        calls: &CallSlot,
+        auth: &ElasticsearchAuth,
+    ) -> Result<String, FaucetError> {
         let marker = staging_alias(&self.config.index);
-        match self.alias_targets(&marker, auth).await?.as_deref() {
+        match self.alias_targets(calls, &marker, auth).await?.as_deref() {
             Some([staging]) => Ok(staging.clone()),
             Some(many) if !many.is_empty() => Err(FaucetError::Sink(format!(
                 "elasticsearch overwrite: `{marker}` points at {} indices ({}); expected the \
@@ -160,10 +201,11 @@ impl ElasticsearchSink {
     /// names a **concrete index** — overwrite requires an alias (#494).
     async fn overwrite_alias_targets(
         &self,
+        calls: &CallSlot,
         alias: &str,
         auth: &ElasticsearchAuth,
     ) -> Result<Vec<String>, FaucetError> {
-        if let Some(targets) = self.alias_targets(alias, auth).await? {
+        if let Some(targets) = self.alias_targets(calls, alias, auth).await? {
             return Ok(targets);
         }
         // No alias of that name. If a concrete index owns the name, refuse —
@@ -171,6 +213,7 @@ impl ElasticsearchSink {
         let head_url = format!("{}/{}", self.config.base_url, alias);
         let head = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.head(&head_url), auth),
             )
@@ -189,12 +232,14 @@ impl ElasticsearchSink {
     /// index or its mappings can't be read (staging then relies on dynamic mapping).
     async fn overwrite_read_mappings(
         &self,
+        calls: &CallSlot,
         index: &str,
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Value>, FaucetError> {
         let url = format!("{}/{}/_mapping", self.config.base_url, index);
         let resp = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.get(&url), auth),
             )
@@ -214,12 +259,14 @@ impl ElasticsearchSink {
     /// keep ([`copyable_settings`]); `None` when they can't be read.
     async fn overwrite_read_settings(
         &self,
+        calls: &CallSlot,
         index: &str,
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Value>, FaucetError> {
         let url = format!("{}/{}/_settings", self.config.base_url, index);
         let resp = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.get(&url), auth),
             )
@@ -240,6 +287,7 @@ impl ElasticsearchSink {
     /// and settings when known.
     async fn overwrite_create_index(
         &self,
+        calls: &CallSlot,
         index: &str,
         marker: &str,
         mappings: Option<Value>,
@@ -263,7 +311,7 @@ impl ElasticsearchSink {
                 FaucetError::Sink(format!("overwrite: serialize create-index body: {e}"))
             })?);
         let resp = self
-            .send_once("request", Self::apply_auth_value(req, auth))
+            .send_once(calls, "request", Self::apply_auth_value(req, auth))
             .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
@@ -272,12 +320,14 @@ impl ElasticsearchSink {
     /// `POST /<index>/_refresh` so freshly-staged docs are searchable pre-swap.
     async fn overwrite_refresh(
         &self,
+        calls: &CallSlot,
         index: &str,
         auth: &ElasticsearchAuth,
     ) -> Result<(), FaucetError> {
         let url = format!("{}/{}/_refresh", self.config.base_url, index);
         let resp = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.post(&url), auth),
             )
@@ -289,27 +339,20 @@ impl ElasticsearchSink {
     /// `DELETE /<index>`.
     async fn overwrite_delete_index(
         &self,
+        calls: &CallSlot,
         index: &str,
         auth: &ElasticsearchAuth,
     ) -> Result<(), FaucetError> {
         let url = format!("{}/{}", self.config.base_url, index);
         let resp = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.delete(&url), auth),
             )
             .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
-    }
-
-    /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set,
-    /// the provider supplies the credential for every request (taking precedence
-    /// over inline auth). Used by the CLI to resolve `auth: { ref }`, and by
-    /// library callers who inject one provider into many sinks.
-    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
-        self
     }
 
     /// Resolve the effective [`ElasticsearchAuth`] for the current batch.
@@ -352,10 +395,11 @@ impl ElasticsearchSink {
     /// attempt timeout and the run's deadline, metered as `op`, never re-sent.
     async fn send_once(
         &self,
+        calls: &CallSlot,
         op: &'static str,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, FaucetError> {
-        self.client.call(&self.calls.get(), op, req).await
+        self.client.call(&calls.get(), op, req).await
     }
 
     /// Send a pre-built NDJSON `_bulk` body and return the parsed response.
@@ -363,6 +407,7 @@ impl ElasticsearchSink {
     /// The transport under [`bulk_items`](Self::bulk_items).
     async fn send_bulk_body(
         &self,
+        calls: &CallSlot,
         body: String,
         auth: &ElasticsearchAuth,
     ) -> Result<Value, FaucetError> {
@@ -376,7 +421,7 @@ impl ElasticsearchSink {
             .header("Content-Type", "application/x-ndjson")
             .body(body);
         let resp = self
-            .send_once("bulk", Self::apply_auth_value(req, auth))
+            .send_once(calls, "bulk", Self::apply_auth_value(req, auth))
             .await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         self.client.json::<Value>(resp).await
@@ -392,6 +437,7 @@ impl ElasticsearchSink {
     /// re-index the items that already succeeded (#789 MSG-43).
     async fn bulk_items(
         &self,
+        calls: &CallSlot,
         entries: &[String],
         auth: &ElasticsearchAuth,
     ) -> Result<Vec<Value>, FaucetError> {
@@ -400,7 +446,7 @@ impl ElasticsearchSink {
         let mut attempt: u32 = 0;
         while !pending.is_empty() {
             let body: String = pending.iter().map(|&i| entries[i].as_str()).collect();
-            let resp = self.send_bulk_body(body, auth).await?;
+            let resp = self.send_bulk_body(calls, body, auth).await?;
             let items = resp
                 .get("items")
                 .and_then(Value::as_array)
@@ -433,7 +479,7 @@ impl ElasticsearchSink {
                 attempt,
                 "Elasticsearch bulk items rejected as overloaded; retrying them"
             );
-            self.calls.wait(item_retry_delay(attempt)).await?;
+            calls.wait(item_retry_delay(attempt)).await?;
             pending = retry;
         }
         Ok(results)
@@ -526,11 +572,13 @@ impl ElasticsearchSink {
     /// The index's mapped `properties`, or `None` when the index is missing.
     async fn index_properties(
         &self,
+        calls: &CallSlot,
         auth: &ElasticsearchAuth,
     ) -> Result<Option<Value>, FaucetError> {
         let url = format!("{}/{}/_mapping", self.config.base_url, self.config.index);
         let resp = self
             .send_once(
+                calls,
                 "request",
                 Self::apply_auth_value(self.client.get(&url), auth),
             )
@@ -579,6 +627,7 @@ impl ElasticsearchSink {
     /// case this feature exists for.
     async fn cleanup_scope_impl(
         &self,
+        calls: &CallSlot,
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
@@ -608,7 +657,7 @@ impl ElasticsearchSink {
         // analyzed `text` (the dynamic-mapping default for strings) matches
         // nothing and the cleanup silently deletes nothing (#789 MSG-29).
         // Query its `keyword` sub-field instead, or refuse.
-        let properties = match self.index_properties(&auth).await? {
+        let properties = match self.index_properties(calls, &auth).await? {
             Some(p) => p,
             None => {
                 tracing::debug!(
@@ -641,7 +690,7 @@ impl ElasticsearchSink {
                 FaucetError::Sink(format!("cleanup: failed to serialize delete query: {e}"))
             })?);
         let resp = self
-            .send_once("request", Self::apply_auth_value(req, &auth))
+            .send_once(calls, "request", Self::apply_auth_value(req, &auth))
             .await?;
 
         // A missing index holds no stale documents. Detect the 404 before
@@ -1261,7 +1310,16 @@ fn field_mapping(fragment: &Value) -> Value {
 const KEYWORD_IGNORE_ABOVE: u64 = 8191;
 
 #[async_trait]
-impl faucet_core::Sink for ElasticsearchSink {
+impl SinkDriver for EsDriver {
+    /// `request_timeout_secs` per attempt over the run's recorder and
+    /// deadline (#880). One attempt per `_bulk` request — an append without
+    /// `_id` must not be re-sent — metered as `bulk`.
+    fn call_context(&self) -> CallContext {
+        CallContext::new().with_timeout(std::time::Duration::from_secs(
+            self.config.request_timeout_secs,
+        ))
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -1279,29 +1337,11 @@ impl faucet_core::Sink for ElasticsearchSink {
         )
     }
 
-    fn supports_cleanup(&self) -> bool {
-        // Unconditional: Elasticsearch addresses documents by `_id`, which every
-        // index has, so the cleanup needs nothing declared up front (there is no
-        // column-mapping mode to exclude, as on the SQL sinks). The remaining
-        // requirement — a non-empty `key`, so the written `_id`s can be derived
-        // — is enforced by `WriteSpec::validate` at config-load time (cleanup
-        // implies `write_mode: upsert`) and again in `cleanup_scope`.
-        true
-    }
-
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
-    }
-
     /// Elasticsearch is schemaless and `_id`-addressable, so all three write
     /// modes are supported: upsert and delete derive the document `_id` from
     /// the configured `key`, and the `_bulk` `index` / `delete` actions are
     /// idempotent overwrites / removals by `_id`.
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
         &[
             faucet_core::WriteMode::Append,
             faucet_core::WriteMode::Upsert,
@@ -1314,7 +1354,139 @@ impl faucet_core::Sink for ElasticsearchSink {
         self.config.write.dedups_by_key()
     }
 
-    fn is_overwrite(&self) -> bool {
+    /// Non-mutating preflight probe.
+    ///
+    /// Runs `GET /_cluster/health` over the existing reqwest client (probe
+    /// name `"health"`). When an index is configured, a second probe
+    /// (`"schema"`) issues `HEAD /<index>`: a `404` is reported as a
+    /// [`Skip`](faucet_core::check::ProbeStatus::Skip) ("index not found"),
+    /// any other HTTP response is a pass, and a transport error is a failure.
+    async fn check(
+        &self,
+        calls: &CallSlot,
+        ctx: &faucet_core::check::CheckContext,
+    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
+        use faucet_core::check::{CheckReport, Probe};
+
+        // Auth is shared by both probes; if it can't be resolved the whole
+        // check fails on the `health` probe.
+        let auth = match self.resolve_auth().await {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(CheckReport::single(Probe::fail_hint(
+                    "health",
+                    std::time::Duration::ZERO,
+                    e.to_string(),
+                    "check the configured auth / that a shared auth provider is wired up",
+                )));
+            }
+        };
+
+        let mut probes = Vec::new();
+        let health_hint =
+            "check base_url / auth / that the Elasticsearch cluster is reachable and healthy";
+
+        // ── Probe 1: GET /_cluster/health ───────────────────────────────────
+        // The per-request `.timeout(ctx.timeout)` bounds the call; this crate
+        // has no direct `tokio` dependency so we rely on reqwest's own timeout.
+        let started = std::time::Instant::now();
+        let health_url = format!("{}/_cluster/health", self.config.base_url);
+        let req = Self::apply_auth_value(self.client.get(&health_url), &auth).timeout(ctx.timeout);
+        let health_probe = match self.send_once(calls, "request", req).await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    Probe::pass("health", started.elapsed())
+                } else {
+                    Probe::fail_hint(
+                        "health",
+                        started.elapsed(),
+                        format!("cluster health returned HTTP {}", resp.status().as_u16()),
+                        health_hint,
+                    )
+                }
+            }
+            Err(e) if faucet_core::classify(&e) == Some(faucet_core::RetryClass::Timeout) => {
+                Probe::fail_hint("health", started.elapsed(), "timed out", health_hint)
+            }
+            Err(e) => Probe::fail_hint("health", started.elapsed(), e.to_string(), health_hint),
+        };
+        let health_failed = matches!(
+            health_probe.status,
+            faucet_core::check::ProbeStatus::Fail { .. }
+        );
+        probes.push(health_probe);
+
+        // ── Probe 2 (optional): HEAD /<index> ───────────────────────────────
+        // Only run when the cluster itself is reachable — a transport failure
+        // on the index HEAD would just duplicate the health failure.
+        if !health_failed && !self.config.index.is_empty() {
+            let started = std::time::Instant::now();
+            let index_hint = "check that the index exists / base_url is correct";
+            let index_url = format!("{}/{}", self.config.base_url, self.config.index);
+            let req =
+                Self::apply_auth_value(self.client.head(&index_url), &auth).timeout(ctx.timeout);
+            let schema_probe = match self.send_once(calls, "request", req).await {
+                // 404 → index absent: report as Skip, not a failure (it may be
+                // auto-created on first write).
+                Ok(resp) if resp.status().as_u16() == 404 => {
+                    Probe::skip("schema", format!("index '{}' not found", self.config.index))
+                }
+                // Any other HTTP response means the host answered — the index
+                // exists (2xx) or the request was rejected for some non-404
+                // reason; either way the endpoint is reachable.
+                Ok(_) => Probe::pass("schema", started.elapsed()),
+                Err(e) if faucet_core::classify(&e) == Some(faucet_core::RetryClass::Timeout) => {
+                    Probe::fail_hint("schema", started.elapsed(), "timed out", index_hint)
+                }
+                Err(e) => Probe::fail_hint("schema", started.elapsed(), e.to_string(), index_hint),
+            };
+            probes.push(schema_probe);
+        }
+
+        Ok(CheckReport { probes })
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_rows(calls, records).await?,
+            )),
+            _ => {
+                let n = self.write_records(calls, records).await?;
+                Ok(PageWrite::reported(if self.dedups_by_key() {
+                    faucet_core::WriteReport::keyed(records.len(), n)
+                } else {
+                    faucet_core::WriteReport::accepted(n)
+                }))
+            }
+        }
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "elasticsearch"
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
+    }
+
+    fn cleanup(&self) -> Option<&dyn CleanupDriver> {
+        Some(self)
+    }
+
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl StagingDriver for EsDriver {
+    fn active(&self) -> bool {
         self.config.write.is_overwrite()
     }
 
@@ -1324,18 +1496,18 @@ impl faucet_core::Sink for ElasticsearchSink {
     /// run's writes are indexed into it, and `commit_overwrite` atomically moves
     /// the alias. Refusing a *concrete* index named `index` is what keeps the swap
     /// safe — there is no atomic replace of a concrete index in Elasticsearch.
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+    async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let auth = self.resolve_auth().await?;
         let alias = self.config.index.clone();
         let marker = staging_alias(&alias);
 
         // Discover the alias's current physical targets (if any) and reject a
         // concrete index of the same name.
-        let previous = self.overwrite_alias_targets(&alias, &auth).await?;
+        let previous = self.overwrite_alias_targets(calls, &alias, &auth).await?;
         let (mappings, settings) = match previous.first() {
             Some(idx) => (
-                self.overwrite_read_mappings(idx, &auth).await?,
-                self.overwrite_read_settings(idx, &auth).await?,
+                self.overwrite_read_mappings(calls, idx, &auth).await?,
+                self.overwrite_read_settings(calls, idx, &auth).await?,
             ),
             None => (None, None),
         };
@@ -1343,13 +1515,13 @@ impl faucet_core::Sink for ElasticsearchSink {
         // A run that crashed before commit or abort left its staging index
         // behind the marker; it was never live, so drop it.
         for stale in self
-            .alias_targets(&marker, &auth)
+            .alias_targets(calls, &marker, &auth)
             .await?
             .unwrap_or_default()
         {
             if !previous.contains(&stale) {
                 tracing::warn!(index = %stale, "overwrite: dropping a staging index left by an earlier run");
-                self.overwrite_delete_index(&stale, &auth).await?;
+                self.overwrite_delete_index(calls, &stale, &auth).await?;
             }
         }
 
@@ -1358,7 +1530,7 @@ impl faucet_core::Sink for ElasticsearchSink {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let staging = staging_index_name(&alias, nonce);
-        self.overwrite_create_index(&staging, &marker, mappings, settings, &auth)
+        self.overwrite_create_index(calls, &staging, &marker, mappings, settings, &auth)
             .await
     }
 
@@ -1367,19 +1539,19 @@ impl faucet_core::Sink for ElasticsearchSink {
     /// Elasticsearch, so a reader never sees the alias unbound or pointing at two
     /// generations at once. Both indices are read from the cluster, so this runs
     /// on any sink instance.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let auth = self.resolve_auth().await?;
         let alias = self.config.index.clone();
-        let staging = self.overwrite_staging(&auth).await?;
+        let staging = self.overwrite_staging(calls, &auth).await?;
         let previous: Vec<String> = self
-            .overwrite_alias_targets(&alias, &auth)
+            .overwrite_alias_targets(calls, &alias, &auth)
             .await?
             .into_iter()
             .filter(|idx| idx != &staging)
             .collect();
 
         // Make the staged docs searchable before the swap.
-        self.overwrite_refresh(&staging, &auth).await?;
+        self.overwrite_refresh(calls, &staging, &auth).await?;
 
         let body = build_alias_swap_actions(&alias, &staging, &previous);
         let url = format!("{}/_aliases", self.config.base_url);
@@ -1391,13 +1563,13 @@ impl faucet_core::Sink for ElasticsearchSink {
                 FaucetError::Sink(format!("overwrite: serialize alias actions: {e}"))
             })?);
         let resp = self
-            .send_once("request", Self::apply_auth_value(req, &auth))
+            .send_once(calls, "request", Self::apply_auth_value(req, &auth))
             .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
 
         // Best-effort drop of the now-detached old physical indices.
         for old in &previous {
-            if let Err(e) = self.overwrite_delete_index(old, &auth).await {
+            if let Err(e) = self.overwrite_delete_index(calls, old, &auth).await {
                 tracing::warn!(index = %old, error = %e, "overwrite: could not delete old index after swap");
             }
         }
@@ -1407,44 +1579,49 @@ impl faucet_core::Sink for ElasticsearchSink {
 
     /// Discard the staging index after a failed/cancelled overwrite — the alias
     /// and its current target are left untouched.
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+    async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let auth = self.resolve_auth().await?;
         let marker = staging_alias(&self.config.index);
         let live = self
-            .alias_targets(&self.config.index, &auth)
+            .alias_targets(calls, &self.config.index, &auth)
             .await?
             .unwrap_or_default();
         for staging in self
-            .alias_targets(&marker, &auth)
+            .alias_targets(calls, &marker, &auth)
             .await?
             .unwrap_or_default()
         {
             if !live.contains(&staging) {
-                self.overwrite_delete_index(&staging, &auth).await?;
+                self.overwrite_delete_index(calls, &staging, &auth).await?;
             }
         }
         Ok(())
     }
 
-    /// Elasticsearch can add new fields to an existing index in place via
-    /// `PUT /<index>/_mapping`, so additive schema evolution is supported.
-    /// (Changing an existing field's mapping type is *not* possible — see
-    /// [`evolve_schema`](faucet_core::Sink::evolve_schema).)
-    fn supports_schema_evolution(&self) -> bool {
-        true
+    async fn staged(&self, _calls: &CallSlot) -> Result<bool, FaucetError> {
+        Ok(false)
     }
 
+    /// The staging index is found through an alias at commit time; the
+    /// sink does not report whether one is left behind.
+    fn reports_staged(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+impl SchemaDriver for EsDriver {
     /// Read the index's live field mappings via `GET /<index>/_mapping`.
     ///
     /// Returns an `infer_schema`-shaped object schema with every field marked
     /// nullable (Elasticsearch has no NOT NULL concept). A `404` (index does not
     /// exist) yields `Ok(None)`; an index that exists with no explicit
     /// `properties` yields an empty `{"type":"object","properties":{}}`.
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
         let auth = self.resolve_auth().await?;
         let url = format!("{}/{}/_mapping", self.config.base_url, self.config.index);
         let req = Self::apply_auth_value(self.client.get(&url), &auth);
-        let resp = self.send_once("request", req).await?;
+        let resp = self.send_once(calls, "request", req).await?;
 
         // A missing index is reported as drift-inert (Ok(None)), not an error.
         // Detect the 404 *before* check_http_response, which treats it as an error.
@@ -1482,6 +1659,14 @@ impl faucet_core::Sink for ElasticsearchSink {
         })))
     }
 
+    /// Elasticsearch can add new fields to an existing index in place via
+    /// `PUT /<index>/_mapping`, so additive schema evolution is supported.
+    /// (Changing an existing field's mapping type is *not* possible — see
+    /// [`evolve_schema`](faucet_core::Sink::evolve_schema).)
+    fn evolvable(&self) -> bool {
+        true
+    }
+
     /// Apply an additive schema evolution to the index via
     /// `PUT /<index>/_mapping`.
     ///
@@ -1492,7 +1677,11 @@ impl faucet_core::Sink for ElasticsearchSink {
     /// [`relax_nullability`](faucet_core::SchemaEvolution::relax_nullability) are
     /// no-ops (a one-shot `debug` log notes the limitation). A `PUT` is only
     /// issued when there is at least one addition.
-    async fn evolve_schema(&self, evolution: &SchemaEvolution) -> Result<(), FaucetError> {
+    async fn evolve(
+        &self,
+        calls: &CallSlot,
+        evolution: &SchemaEvolution,
+    ) -> Result<(), FaucetError> {
         if (!evolution.widenings.is_empty() || !evolution.relax_nullability.is_empty())
             && !self.evolve_noop_warned.swap(true, Ordering::Relaxed)
         {
@@ -1523,7 +1712,7 @@ impl faucet_core::Sink for ElasticsearchSink {
                 FaucetError::Sink(format!("failed to serialize mapping update: {e}"))
             })?);
         let req = Self::apply_auth_value(req, &auth);
-        let resp = self.send_once("request", req).await?;
+        let resp = self.send_once(calls, "request", req).await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         tracing::debug!(
             index = %self.config.index,
@@ -1532,98 +1721,21 @@ impl faucet_core::Sink for ElasticsearchSink {
         );
         Ok(())
     }
+}
 
-    /// Non-mutating preflight probe.
-    ///
-    /// Runs `GET /_cluster/health` over the existing reqwest client (probe
-    /// name `"health"`). When an index is configured, a second probe
-    /// (`"schema"`) issues `HEAD /<index>`: a `404` is reported as a
-    /// [`Skip`](faucet_core::check::ProbeStatus::Skip) ("index not found"),
-    /// any other HTTP response is a pass, and a transport error is a failure.
-    async fn check(
+#[async_trait]
+impl CleanupDriver for EsDriver {
+    async fn delete_absent(
         &self,
-        ctx: &faucet_core::check::CheckContext,
-    ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::{CheckReport, Probe};
-
-        // Auth is shared by both probes; if it can't be resolved the whole
-        // check fails on the `health` probe.
-        let auth = match self.resolve_auth().await {
-            Ok(a) => a,
-            Err(e) => {
-                return Ok(CheckReport::single(Probe::fail_hint(
-                    "health",
-                    std::time::Duration::ZERO,
-                    e.to_string(),
-                    "check the configured auth / that a shared auth provider is wired up",
-                )));
-            }
-        };
-
-        let mut probes = Vec::new();
-        let health_hint =
-            "check base_url / auth / that the Elasticsearch cluster is reachable and healthy";
-
-        // ── Probe 1: GET /_cluster/health ───────────────────────────────────
-        // The per-request `.timeout(ctx.timeout)` bounds the call; this crate
-        // has no direct `tokio` dependency so we rely on reqwest's own timeout.
-        let started = std::time::Instant::now();
-        let health_url = format!("{}/_cluster/health", self.config.base_url);
-        let req = Self::apply_auth_value(self.client.get(&health_url), &auth).timeout(ctx.timeout);
-        let health_probe = match self.send_once("request", req).await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    Probe::pass("health", started.elapsed())
-                } else {
-                    Probe::fail_hint(
-                        "health",
-                        started.elapsed(),
-                        format!("cluster health returned HTTP {}", resp.status().as_u16()),
-                        health_hint,
-                    )
-                }
-            }
-            Err(e) if faucet_core::classify(&e) == Some(faucet_core::RetryClass::Timeout) => {
-                Probe::fail_hint("health", started.elapsed(), "timed out", health_hint)
-            }
-            Err(e) => Probe::fail_hint("health", started.elapsed(), e.to_string(), health_hint),
-        };
-        let health_failed = matches!(
-            health_probe.status,
-            faucet_core::check::ProbeStatus::Fail { .. }
-        );
-        probes.push(health_probe);
-
-        // ── Probe 2 (optional): HEAD /<index> ───────────────────────────────
-        // Only run when the cluster itself is reachable — a transport failure
-        // on the index HEAD would just duplicate the health failure.
-        if !health_failed && !self.config.index.is_empty() {
-            let started = std::time::Instant::now();
-            let index_hint = "check that the index exists / base_url is correct";
-            let index_url = format!("{}/{}", self.config.base_url, self.config.index);
-            let req =
-                Self::apply_auth_value(self.client.head(&index_url), &auth).timeout(ctx.timeout);
-            let schema_probe = match self.send_once("request", req).await {
-                // 404 → index absent: report as Skip, not a failure (it may be
-                // auto-created on first write).
-                Ok(resp) if resp.status().as_u16() == 404 => {
-                    Probe::skip("schema", format!("index '{}' not found", self.config.index))
-                }
-                // Any other HTTP response means the host answered — the index
-                // exists (2xx) or the request was rejected for some non-404
-                // reason; either way the endpoint is reachable.
-                Ok(_) => Probe::pass("schema", started.elapsed()),
-                Err(e) if faucet_core::classify(&e) == Some(faucet_core::RetryClass::Timeout) => {
-                    Probe::fail_hint("schema", started.elapsed(), "timed out", index_hint)
-                }
-                Err(e) => Probe::fail_hint("schema", started.elapsed(), e.to_string(), index_hint),
-            };
-            probes.push(schema_probe);
-        }
-
-        Ok(CheckReport { probes })
+        calls: &CallSlot,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        self.cleanup_scope_impl(calls, scope, seen).await
     }
+}
 
+impl EsDriver {
     /// Write records to Elasticsearch using the `_bulk` API.
     ///
     /// When `config.batch_size > 0` and the input slice is larger than
@@ -1633,7 +1745,11 @@ impl faucet_core::Sink for ElasticsearchSink {
     /// [`StreamPage`](faucet_core::StreamPage) is sent in a single bulk
     /// request — useful when the source already sizes pages for
     /// Elasticsearch's `_bulk` sweet spot (5–15 MB NDJSON per call).
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -1665,7 +1781,7 @@ impl faucet_core::Sink for ElasticsearchSink {
             let auth = self.resolve_auth().await?;
             // Re-chunked by `batch_size` like the append path (#789 MSG-90).
             for chunk in self.chunked(&entries) {
-                first_failure(&self.bulk_items(chunk, &auth).await?)?;
+                first_failure(&self.bulk_items(calls, chunk, &auth).await?)?;
             }
             tracing::debug!(
                 upserts = planned.upserts,
@@ -1705,7 +1821,7 @@ impl faucet_core::Sink for ElasticsearchSink {
         for chunk in chunks {
             // `errors: true` with no extractable per-item error is a failure
             // too (a missing item reads as truncated), never a silent drop.
-            first_failure(&self.bulk_items(chunk, &auth).await?)?;
+            first_failure(&self.bulk_items(calls, chunk, &auth).await?)?;
             total_written += chunk.len();
             tracing::debug!(records = chunk.len(), "Elasticsearch bulk batch written");
         }
@@ -1720,8 +1836,9 @@ impl faucet_core::Sink for ElasticsearchSink {
     /// transient `429`/`503` per-item retries), when its response item is
     /// missing, or when the record could not be turned into an action (a
     /// missing/`null` key, an unusable `id_field` value). Only a transport/HTTP failure is an outer `Err`.
-    async fn write_batch_partial(
+    async fn write_rows(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         if records.is_empty() {
@@ -1763,7 +1880,7 @@ impl faucet_core::Sink for ElasticsearchSink {
         let auth = self.resolve_auth().await?;
         for chunk in self.chunked(&sendable) {
             let entries: Vec<String> = chunk.iter().map(|(e, _)| e.clone()).collect();
-            let items = self.bulk_items(&entries, &auth).await?;
+            let items = self.bulk_items(calls, &entries, &auth).await?;
             for ((_, origins), item) in chunk.iter().zip(&items) {
                 if let Some(msg) = item_failure(item) {
                     for &orig in origins {
@@ -1775,21 +1892,6 @@ impl faucet_core::Sink for ElasticsearchSink {
             }
         }
         Ok(outcomes)
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "elasticsearch"
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
     }
 }
 
@@ -2377,7 +2479,7 @@ mod tests {
             json!({"id": 1, "v": "a"}),
             json!({"id": 2, "v": "x", "__op": "d"}),
         ];
-        let planned = plan_origins(&records, &sink.config.write);
+        let planned = plan_origins(&records, &sink.inner.driver().config.write);
         let body: String = planned
             .actions
             .iter()

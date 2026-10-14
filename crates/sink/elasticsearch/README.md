@@ -399,6 +399,20 @@ Redirects are followed by `faucet_core::http::Client`: a hop to another
 origin drops `Authorization`, cookies and every credential header, and a request
 body is never replayed to another origin.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `EsDriver`
+implements `faucet_core::driver::SinkDriver` (`_bulk` writes with per-item
+outcomes and the item retry) plus the lifecycle groups — `StagingDriver` (a
+fresh staging index behind a marker alias, the atomic `_aliases` swap, the
+discard), `SchemaDriver` (`_mapping` reads and additive mapping updates) and
+`CleanupDriver` (`_delete_by_query`). The staging index is found through its
+alias, so the staging probe answers "unknown". `ElasticsearchSink` wraps it
+in a `DriverSink`, which derives every capability from those groups and
+serves the write paths with row accounting. Every request is a call through
+the run's call context with the same op labels as before. The public type and
+config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
