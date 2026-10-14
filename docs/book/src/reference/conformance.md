@@ -120,6 +120,15 @@ Five more prove a sink behaves as a capability it declares says it does
 | `assert_overwrite_lifecycle` | `write_mode: overwrite` keeps staged rows out of the destination until commit, and an abort leaves it as it was |
 | `assert_batch_atomicity_truthful` | a failed write of a batch declared `atomic` lands no row; a `per_row` batch lands exactly its `Ok` rows |
 
+Two more prove a sink's declarations match its lifecycle hooks (RFC 0014). A
+sink built on a [family driver](../extending/authoring-connectors.md#start-from-a-family-driver)
+passes them by construction; they run on any sink:
+
+| Check | Proves |
+|---|---|
+| `assert_driver_declarations_truthful` | every lifecycle the sink does not declare (overwrite, exactly-once, cleanup, schema evolution, rollback) is refused by its hook; the declared ones' non-destructive probes answer; keyed dedup comes with a keyed write mode |
+| `assert_driver_row_paths_agree` | the plain, reported, per-row and governed (`write_governed`) writes of a valid page each account for every row |
+
 ### A declared capability requires its check
 
 `faucet_conformance::required::REQUIREMENTS` maps each declared capability to
@@ -137,6 +146,8 @@ the assertions that prove it:
 | `partial_outcomes` | overrides `write_batch_partial` | `assert_partial_outcomes_truthful` |
 | `row_accounting` | overrides `write_batch_reported` | `assert_reported_rows_truthful` |
 | `atomic_batches` | declares `BatchAtomicity::Atomic` for some config | `assert_batch_atomicity_truthful` |
+| `driver_declarations` | is built on a family driver (holds a `DriverSink<`, or implements `SinkDriver`, `SqlDriver`, `MessageDriver` or `HttpDriver`) | `assert_driver_declarations_truthful` |
+| `driver_row_paths` | is built on a family driver | `assert_driver_row_paths_agree` |
 | `call_deadline` | (every source and sink) | `assert_source_call_deadline` / `assert_sink_call_deadline` |
 | `exactly_once` *(source)* | declares `exactly_once` | `assert_bookmark_roundtrip` |
 | `discover` *(source)* | declares `discover` | `assert_discover_roundtrips` |

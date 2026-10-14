@@ -112,6 +112,19 @@ The full authoring walkthrough is in
 - **`serde_json::Value` records** maximise author ergonomics at an allocation cost —
   see [ADR 0004](../adr/0004-json-record-model.md).
 
+## Family drivers (RFC 0014)
+
+A connector can implement a small, I/O-only **driver** instead of the full
+trait: `SinkDriver` / `SourceDriver` (core), `SqlDriver`
+(`faucet-common-sql`), `ObjectStoreDriver` (= `StorageBackend`,
+`faucet-common-file`), `MessageDriver` / `MessageConsumer` and `HttpDriver`
+(core). An adapter (`DriverSink`, `DriverSource`, or the family's) implements
+`Sink` / `Source`, derives the capabilities from the primitives the driver
+has, and drives overwrite staging, the exactly-once commit, cleanup, rollback,
+per-row outcomes and row accounting. The lifecycle hooks the drivers replace
+are deprecated on `Sink` and removed in 2.0 (#888). See
+[RFC 0014](../../rfcs/0014-phase-3a-family-drivers.md).
+
 ## Future evolution
 
 - Typed capability traits ([RFC 0001](../../rfcs/0001-capability-traits.md)).

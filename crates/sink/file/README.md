@@ -201,6 +201,11 @@ and the file sink and compare the output.
 
 ## Shared writer
 
+The sink is a `FileSink<LocalBackend>`: the local `StorageBackend` is its
+object-store driver and `FileSink` runs the writer, the swap area and the
+columnar path on it through a `DriverSink` (RFC 0014), so its capabilities
+follow the driver.
+
 The encoding, compression, encryption, rollover and the overwrite swap live in
 `faucet_common_file::write`: this sink maps its config through the shared
 `WriteConfig` and is the shared `FileSink<LocalBackend>` — the one `Sink`

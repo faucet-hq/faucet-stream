@@ -287,6 +287,17 @@ Incompatible changes (narrowing / type swaps) are never auto-applied — they ar
 
 The sink reports per-row outcomes via `write_batch_partial`, so when a `dlq:` block is configured, rows that fail (e.g. a missing/null key column in upsert/delete mode) are wrapped in a DLQ envelope and routed to the configured DLQ sink while the rest of the batch still commits. Without a DLQ, a failing row fails the whole batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html).
 
+## How it is built
+
+The sink runs on the SQL family driver (RFC 0014): `SqliteDriver` implements
+`faucet_common_sql::SqlDriver` — the `BEGIN IMMEDIATE` transactions, the
+`sqlite_master` probes, the staging clone from the target's own `CREATE TABLE`
+text, the swap, `PRAGMA table_info` reads and the rollback journal — and
+`SqlSinkDriver` drives writes, per-row outcomes, the exactly-once commit,
+cleanup, the overwrite lifecycle and schema evolution from it. `SqliteSink`
+wraps it in a `DriverSink`, so its capabilities follow the driver's
+primitives. The public type and config are unchanged.
+
 ## Config loading & schema introspection
 
 Load from YAML/JSON or environment:

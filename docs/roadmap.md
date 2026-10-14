@@ -52,7 +52,10 @@ runtime surface.
   point, mandatory I/O primitives, row accounting, one trust resolver, typed
   state keys and per-family engines (SQL, remote files, value fidelity), so a
   connector cannot bypass masking, policy, budgets or exactly-once by omission.
-  Design and phasing in [RFC 0013](../rfcs/0013-structural-core-guarantees.md).
+  Design and phasing in [RFC 0013](../rfcs/0013-structural-core-guarantees.md);
+  its third phase is split by [RFC 0014](../rfcs/0014-phase-3a-family-drivers.md)
+  into 3a (family drivers, the governed-page typestate and the deprecations, on
+  1.x — #895) and 3b (the removals, `faucet-core` 2.0 — #888).
 - **Connector SDK ergonomics.** Reduce the boilerplate checklist a new connector
   must satisfy (feature flags in three places, `cli/connectors/registry.json`, the CI
   matrix, the docs capability table). Candidate direction: a proc-macro or code

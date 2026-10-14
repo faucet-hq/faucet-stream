@@ -77,6 +77,16 @@ Declares `write_mode: append` only; no idempotent writes. `faucet list --json` p
 
 The connect, each publish group and `flush` run through the pipeline's `CallContext` (#880): the run's deadline ends them promptly, `publish_timeout_secs` still bounds each, and the rows of a group cut short fail per row (DLQ-routable). Each counts as one round trip (`connect`, `publish`, `flush`) in `faucet_sink_roundtrips_total`. The sink never re-publishes itself.
 
+## How it is built
+
+The sink runs on the messaging family driver (RFC 0014): `NatsDriver`
+implements `faucet_core::driver::MessageDriver` — resolve the subject and
+encode a record, publish a group (Core NATS: publishes then a flush;
+JetStream: publishes then each acknowledgement) — and `MessageSinkDriver`
+drives the `batch_size` groups, the `publish_timeout_secs` bound, which rows a
+timeout or a cancel leaves unconfirmed, and the per-row outcomes. The public
+type and config are unchanged.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

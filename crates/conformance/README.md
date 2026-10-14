@@ -41,6 +41,11 @@ Each proves a sink behaves as a capability it declares says it does:
 | 17 | `assert_replay_safe` | a replay-safe plain write, retried after a lost response, does not duplicate rows |
 | 18 | `assert_overwrite_lifecycle` | `write_mode: overwrite` stages until commit; an abort leaves the destination as it was |
 | 19 | `assert_batch_atomicity_truthful` | a failed write of a batch declared atomic lands no row; a per-row batch lands exactly its `Ok` rows |
+| 20 | `assert_driver_declarations_truthful` | every lifecycle the sink does not declare is refused by its hook, the declared ones' probes answer (RFC 0014) |
+| 21 | `assert_driver_row_paths_agree` | the plain, reported, per-row and governed writes of a valid page agree (RFC 0014) |
+
+Checks 20 and 21 are required for a sink built on a family driver
+(`faucet_core::driver`, `faucet_common_sql::SqlDriver`); they run on any sink.
 
 ### Which checks a connector must run
 

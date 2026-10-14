@@ -8,7 +8,7 @@
 | **Title** | Structural core guarantees |
 | **Status** | Discussion |
 | **Authors** | faucet-stream maintainers |
-| **Related issues** | Phase 1: #875 · #876 · #877 · #878 · #879 · #880 · #881 · #882 · #883 — Phase 2: #884 · #885 · #886 · #887 — Phase 3: #888 — open gaps: #870 · #871 · #872 · #873 · #874 — evidence: #78 · #146 · #264 · #321 · #456 · #466 · #654 · #783 · #789 · #862 — epic #38 |
+| **Related issues** | Phase 1: #875 · #876 · #877 · #878 · #879 · #880 · #881 · #882 · #883 — Phase 2: #884 · #885 · #886 · #887 — Phase 3: #895 (3a, [RFC 0014](./0014-phase-3a-family-drivers.md)) · #888 (3b) — open gaps: #870 · #871 · #872 · #873 · #874 — evidence: #78 · #146 · #264 · #321 · #456 · #466 · #654 · #783 · #789 · #862 — epic #38 |
 | **Related ADRs** | [0002 checkpoint ordering](../docs/adr/0002-checkpoint-ordering.md), [0004 JSON record model](../docs/adr/0004-json-record-model.md), [0007 retries](../docs/adr/0007-retries.md), [0010 pipeline runtime](../docs/adr/0010-pipeline-runtime.md) |
 | **Supersedes** | [RFC 0001](./0001-capability-traits.md) (draft), [RFC 0005](./0005-async-connector-runtime.md) (draft) |
 
@@ -190,7 +190,16 @@ Design invariants ([invariants.md](../docs/architecture/invariants.md)):
 
 Public config types are unchanged; deprecated fields stay as aliases.
 
-### Phase 3 — next major (`faucet-core` 2.0), #888
+### Phase 3 — split into 3a (#895) and 3b (#888)
+
+[RFC 0014](./0014-phase-3a-family-drivers.md) splits this phase. **3a (#895,
+additive, 1.x)** ships the `GovernedPage` typestate inside core, the family
+driver traits and adapters, conformance checks for driver-built sinks, the
+deprecation of the `Sink` hooks the drivers replace, a warning for plugins
+without a descriptor, and one reference connector per family on its driver.
+**3b (#888, `faucet-core` 2.0)** is only the removals: delete the deprecated
+hooks, seal the traits, require `capabilities()`, change the public write
+signatures, ship the 1.x shim. The design as originally scoped:
 
 - **Sealed lifecycle.** `Source` (34 methods today) and `Sink` (39) split into a
   small connector-facing trait of I/O primitives plus a sealed `SourceExt` /

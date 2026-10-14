@@ -44,6 +44,12 @@ lifecycle, the end-of-run prune, the columnar path), and forwards its own
 `faucet_core::forward_sink!`. The connector supplies only its name, config
 schema, dataset URI and readback source through `SinkIdentity`.
 
+`FileSink` is the object-store family driver's sink (RFC 0014): the backend
+is an `ObjectStoreDriver` (every `StorageBackend` is one) and `FileDriver<B>`
+— a `faucet_core::driver::SinkDriver` with the swap area as its
+`StagingDriver` and a `ColumnarDriver` for Parquet / Avro — runs inside a
+`DriverSink`, which derives the sink's capabilities from it.
+
 Every file sink is a `FileSink` (RFC 0013, #886):
 
 | Sink | Is | Backend from |

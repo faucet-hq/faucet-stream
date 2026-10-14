@@ -389,6 +389,49 @@ masking rules naming it, the policy with its own attributes, the shared budget
 and metering. A pass that does not apply is turned off with
 `without(pass, reason)`, which is recorded (`opt_outs()`) and logged.
 
+### Governed pages (RFC 0014)
+
+The engine writes only `GovernedPage`s — pages that went through masking →
+quality → contract → drift. Nothing outside `governance` can construct one,
+and every write path inside the engine (row, columnar, native, exactly-once,
+the DLQ writer) takes a governed value, so an ungoverned write inside core does
+not compile. A sink receives one through `Sink::write_governed` (defaulted to
+`write_batch_reported`). To govern a page outside a pipeline:
+
+```rust,ignore
+let out = governance.govern(records, &sink).await?;   // masking → quality → contract → drift
+sink.write_governed(&out.page).await?;
+```
+
+## Family drivers (RFC 0014)
+
+`faucet_core::driver` holds the small, I/O-only traits a connector implements
+instead of the full `Sink` / `Source` lifecycle, and the adapters that turn
+them into a `Sink` / `Source`:
+
+| Trait | Adapter | The adapter drives |
+|---|---|---|
+| `SinkDriver` + `StagingDriver` / `CommitTokenDriver` / `CleanupDriver` / `SchemaDriver` / `RollbackDriver` / `ColumnarDriver` | `DriverSink` | capabilities derived from the groups present, the plain / reported / per-row write paths from one `write`, row accounting, the run's call context |
+| `SourceDriver` | `DriverSource` | fetch, incremental fetch, page streaming, resume, the preflight probe |
+| `MessageDriver` (+ `MessageTransactions`) | `MessageSinkDriver` → `DriverSink` | publish groups, the per-group deadline, rows a timeout or cancel leaves unconfirmed, the transactional exactly-once commit |
+| `MessageConsumer` | `MessageSourceDriver` → `DriverSource` | acknowledging a page only after the pipeline wrote it |
+| `HttpDriver` | `HttpSinkDriver` → `DriverSink` | per-record concurrency, array chunks, never reporting a delivered row failed |
+
+The SQL and object-store families live in their common crates
+(`faucet_common_sql::SqlDriver`, `faucet_common_file::ObjectStoreDriver`).
+
+```rust,ignore
+pub struct AcmeSink { inner: DriverSink<AcmeDriver> }
+#[async_trait] impl Sink for AcmeSink { forward_sink!(inner); }
+```
+
+The `Sink` hooks the drivers replace are deprecated since 1.14.0
+(`begin_overwrite`, `commit_overwrite`, `abort_overwrite`,
+`overwrite_staging_exists`, `write_batch_idempotent`,
+`write_batch_idempotent_reported`, `last_committed_token`, `cleanup_scope`);
+they keep working until 2.0 (#888). See
+[Authoring connectors](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#start-from-a-family-driver).
+
 ## Row accounting
 
 Every row offered to a sink is accounted for: `offered = accepted + coalesced +
@@ -704,7 +747,8 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `stage` | `TransformStage`, `FilterSpec`, `ExplodeSpec`, `CdcUnwrapSpec`, `compile_stage` |
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
-| `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870) |
+| `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870); `GovernedPage`, `GovernedEnvelopes`, `GovernedOutput` — the governed-page typestate (RFC 0014) |
+| `driver` | `SinkDriver` (+ `StagingDriver`, `CommitTokenDriver`, `CleanupDriver`, `SchemaDriver`, `RollbackDriver`, `ColumnarDriver`), `DriverSink`, `SourceDriver`, `DriverSource`, `MessageDriver`, `MessageSinkDriver`, `MessageConsumer`, `MessageSourceDriver`, `HttpDriver`, `HttpSinkDriver` — family drivers (RFC 0014) |
 | `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
 | `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
 | `json_numbers` | `parse_json_exact` / `JsonBigNumbers` — exactness of numbers in JSON text a database stored |

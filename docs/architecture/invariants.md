@@ -93,6 +93,12 @@ which is recorded and logged, never by leaving the field unset. Masking rules
 whose `applies_to` names the DLQ (`dlq` or its kind) are applied to the
 envelope payloads by the governed DLQ stack (#870).
 
+Inside `faucet-core` the guarantee is a type property (RFC 0014): the passes
+run in `crates/core/src/governance/apply.rs`, whose output is a
+`GovernedPage` that nothing outside `governance` can construct, and every
+engine write path takes a governed value through `governance/write.rs`. A unit
+test there scans `pipeline.rs` and `topology.rs` for a direct sink write.
+
 **If violated.** PII would leak to a sink, a DLQ envelope, or a lineage sample —
 a security/compliance defect. See [masking](./masking.md).
 

@@ -30,7 +30,27 @@ used to carry its own copy of.
   temporary table, `NOT EXISTS` delete), the commit-token write and the row
   report (`WriteReport`).
 
-## Using it in a sink
+## The SQL family driver (RFC 0014)
+
+Implement `SqlDriver` — the backend's primitives: `begin` / `commit` /
+`connection`, `table_exists`, `ddl`, `read_token`, `create_staging` /
+`publish_staging` / `swap_staging`, `current_schema`, `existing_columns` /
+`apply_evolution`, and optionally `rollback()` — and `SqlSinkDriver` drives the
+whole sink from it and the engine: create-on-first-write, keyed and chunked
+writes in transactions, per-row splits for the dead-letter path, rows and the
+commit token in one transaction, the key-table cleanup, the overwrite
+lifecycle (drop stale staging, clone, first-run publish or swap, discard) and
+schema-evolution steps. Wrap it in `faucet_core::driver::DriverSink`:
+
+```rust,ignore
+pub struct AcmeSink { inner: DriverSink<SqlSinkDriver<AcmeDriver>> }
+#[async_trait] impl Sink for AcmeSink { forward_sink!(inner); }
+```
+
+`SqlLayout` says where the sink writes (table, JSON column, `create_table`,
+`batch_size`). `faucet-sink-sqlite` is the reference implementation.
+
+## Using the engine directly
 
 ```rust,ignore
 use faucet_common_sql::dialects::Postgres;
@@ -60,7 +80,8 @@ catalog queries, and words its own errors per `StatementKind`.
 
 | Sink | Uses |
 |---|---|
-| postgres, mysql, sqlite | the engine end to end, over an executor |
+| sqlite | the SQL family driver (`SqlDriver` + `SqlSinkDriver`) |
+| postgres, mysql | the engine end to end, over an executor |
 | mssql | the dialect and the shared mapping; its own retry-classified chunk execution over `tiberius` |
 | duckdb | the engine's row planning, executed on the blocking driver |
 | redshift, clickhouse, oracle, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; their own row handling |

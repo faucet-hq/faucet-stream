@@ -34,9 +34,156 @@ To make your published connector usable from a `faucet.yaml` config (not just
 from Rust), see
 [Custom binaries with third-party connectors](https://github.com/faucet-hq/faucet-stream/blob/main/cli/README.md#custom-binaries-with-third-party-connectors).
 
-## The traits
+## Start from a family driver
 
-Implement `Source` or `Sink`. Both are object-safe (`Box<dyn Source>` works) and
+Write the connector's I/O as a **driver** and let the engine drive everything
+else ([RFC 0014](https://github.com/faucet-hq/faucet-stream/blob/main/rfcs/0014-phase-3a-family-drivers.md)).
+A driver is a small trait of primitives — write a page, publish a message,
+send a request, open a transaction — with no lifecycle in it. An adapter turns
+it into a `Sink` (or `Source`), derives the connector's capabilities from the
+primitives it has, and drives overwrite staging, the exactly-once commit,
+cleanup, rollback, per-row outcomes and row accounting. Your public type holds
+the adapter and forwards to it, so its users see an ordinary connector.
+
+Pick the family your backend belongs to:
+
+| Your backend | Implement | Wrap it in | From |
+|---|---|---|---|
+| a SQL database | `SqlDriver` (transactions, DDL, the commit-token read, the staging clone and swap, catalog reads) | `DriverSink<SqlSinkDriver<_>>` | `faucet-common-sql` |
+| object or file storage | `StorageBackend` — it is the `ObjectStoreDriver` | `FileSink<_>` (`delegate_sink!`) | `faucet-common-file` |
+| a message broker (produce) | `MessageDriver` (`encode`, `publish` a group, `connect`, `flush`; `MessageTransactions` for exactly-once) | `DriverSink<MessageSinkDriver<_>>` | `faucet_core::driver` |
+| a message broker (consume) | `MessageConsumer` (`receive`, `ack`, `decode`) | `DriverSource<MessageSourceDriver<_>>` | `faucet_core::driver` |
+| an HTTP endpoint | `HttpDriver` (`session` per page, `send` one body, `batching`) | `DriverSink<HttpSinkDriver<_>>` | `faucet_core::driver` |
+| anything else | `SinkDriver` (+ the lifecycle groups you support) / `SourceDriver` | `DriverSink<_>` / `DriverSource<_>` | `faucet_core::driver` |
+
+Every async primitive receives the run's `CallSlot`; make each backend request
+through `calls.call(..)` / `calls.call_once(..)` so the run's deadline, cancel
+token and round-trip metering apply (see [Backend calls](#backend-calls-callcontext-httpclient-batching)).
+A driver never stores a call context of its own.
+
+### A sink driver
+
+The family-neutral contract is one write primitive plus optional groups. A
+group you return turns its capability on; one you leave at `None` turns it off,
+and the hook refuses — a declaration cannot disagree with the code:
+
+```rust,ignore
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver, StagingDriver};
+use faucet_core::{async_trait, forward_sink, CallSlot, FaucetError, Sink, Value, WriteMode};
+
+struct AcmeDriver { /* client, config */ }
+
+#[async_trait]
+impl SinkDriver for AcmeDriver {
+    fn connector_name(&self) -> &'static str { "acme" }
+
+    // `RowPolicy::WholePage` (plain and reported writes): a bad row fails the page.
+    // `RowPolicy::PerRow` (the dead-letter path): write the good rows, report each bad one.
+    async fn write(&self, calls: &CallSlot, rows: &[Value], policy: RowPolicy)
+        -> Result<PageWrite, FaucetError>
+    {
+        let outcomes = calls.call_once("insert", self.insert(rows, policy)).await?;
+        Ok(PageWrite::from_outcomes(outcomes))
+    }
+
+    fn write_modes(&self) -> &'static [WriteMode] { &[WriteMode::Append, WriteMode::Overwrite] }
+    fn staging(&self) -> Option<&dyn StagingDriver> { Some(self) }  // overwrite: on
+}
+
+#[async_trait]
+impl StagingDriver for AcmeDriver {
+    fn active(&self) -> bool { self.config.write.is_overwrite() }
+    async fn stage(&self, c: &CallSlot) -> Result<(), FaucetError> { c.call_once("begin_overwrite", self.create_staging()).await }
+    async fn publish(&self, c: &CallSlot) -> Result<(), FaucetError> { c.call_once("commit_overwrite", self.swap()).await }
+    async fn discard(&self, c: &CallSlot) -> Result<(), FaucetError> { c.call_once("abort_overwrite", self.drop_staging()).await }
+    async fn staged(&self, c: &CallSlot) -> Result<bool, FaucetError> { c.call_once("overwrite_staging_exists", self.staging_exists()).await }
+}
+
+/// The public connector type: unchanged for its users.
+pub struct AcmeSink { inner: DriverSink<AcmeDriver> }
+
+#[async_trait]
+impl Sink for AcmeSink { forward_sink!(inner); }
+```
+
+The groups are `StagingDriver` (overwrite), `CommitTokenDriver`
+(exactly-once: `write_with_token` commits the rows and the token as one unit,
+`last_token` reads it back), `CleanupDriver` (scoped cleanup), `SchemaDriver`
+(the live schema and, if `evolvable`, additive evolution), `RollbackDriver`
+(run rollback) and, with the `arrow` feature, `ColumnarDriver` (write Arrow
+batches directly). `DriverSink` serves the plain, reported and per-row write
+paths from `write`, checks every result against the rows offered (a write that
+loses rows fails with `RowsUnaccounted`), and `DriverSink::check_declarations`
+refuses write modes that disagree with the groups.
+
+A source is the same shape: `SourceDriver::read` streams `StreamPage`s (each
+with the bookmark to resume after it), and `DriverSource` provides the fetch,
+stream, resume and probe hooks from it.
+
+### A SQL sink
+
+Implement `SqlDriver` and the whole sink comes from `SqlSinkDriver`: the
+create-on-first-write rule, keyed and chunked writes in transactions, per-row
+splits, rows and token in one transaction, the key-table cleanup, the
+overwrite sequence (drop stale staging, clone, first-run publish or swap,
+discard) and the evolution steps. The backend supplies only what is its own:
+
+```rust,ignore
+use faucet_common_sql::{SqlDriver, SqlLayout, SqlSinkDriver, SqlSinkEngine};
+use faucet_core::driver::DriverSink;
+
+#[faucet_core::async_trait]
+impl SqlDriver for AcmeSqlDriver {
+    type Dialect = AcmeDialect;
+    type Conn<'a> = AcmeConn<'a>;            // a transaction or a pooled connection, as an SqlExecutor
+    fn engine(&self) -> &SqlSinkEngine<AcmeDialect> { &self.engine }
+    fn layout(&self) -> &SqlLayout { &self.layout } // table, JSON column, create_table, batch_size
+    fn connector_name(&self) -> &'static str { "acme" }
+    // begin / commit / connection, table_exists, ddl, read_token,
+    // create_staging / publish_staging / swap_staging, current_schema,
+    // existing_columns / apply_evolution, and optionally rollback()
+    // …
+}
+
+pub struct AcmeSqlSink { inner: DriverSink<SqlSinkDriver<AcmeSqlDriver>> }
+```
+
+`faucet-sink-sqlite` is the reference implementation.
+
+### Prove it
+
+Call the two driver checks from `tests/conformance.rs`; CI requires them for a
+crate built on a driver:
+
+```rust,ignore
+faucet_conformance::assert_driver_declarations_truthful(&sink).await; // undeclared lifecycles refuse
+faucet_conformance::assert_driver_row_paths_agree(&sink).await;       // plain, reported, per-row, governed agree
+```
+
+### Hooks the drivers replace
+
+These `Sink` methods are deprecated since `faucet-core` 1.14.0 and are removed
+in 2.0 (#888): `begin_overwrite`, `commit_overwrite`, `abort_overwrite`,
+`overwrite_staging_exists` (→ `StagingDriver`), `write_batch_idempotent`,
+`write_batch_idempotent_reported`, `last_committed_token`
+(→ `CommitTokenDriver`), `cleanup_scope` (→ `CleanupDriver`). A connector that
+still implements them keeps working on 1.x and compiles without a warning —
+implementing a deprecated method does not warn, calling one does. RFC 0014 has
+a before/after migration.
+
+### Governed pages
+
+The engine writes only pages that went through masking, quality, contract and
+schema drift: a `GovernedPage`, which nothing outside
+`faucet_core::governance` can construct. A sink receives one through the new
+`Sink::write_governed` (its default calls `write_batch_reported`, so you need
+not implement it). To write a page outside a pipeline — a test, a preview —
+run the passes with `Governance::govern(records, &sink)`.
+
+## The traits underneath
+
+A driver adapter implements `Source` or `Sink` for you; a connector that
+does not fit a family can implement them directly. Both are object-safe (`Box<dyn Source>` works) and
 all newer methods have defaults, so a minimal connector is small.
 
 ```rust,ignore
@@ -512,7 +659,8 @@ is listed with its reason in `crates/conformance/call-deadline-exempt.txt`.
 ## SQL sinks: the shared dialect and engine
 
 A sink that writes rows into a SQL database does not plan its own SQL. The
-`faucet-common-sql` crate holds the planning every SQL sink used to copy:
+`faucet-common-sql` crate holds the planning every SQL sink used to copy, and
+the [`SqlDriver`](#a-sql-sink) family driver that runs it:
 
 - **`SqlDialect`** answers "how is this spelled here": identifier quoting
   (`check_ident` refuses what cannot be quoted), literal escaping,
@@ -578,7 +726,8 @@ Which built-in sinks use how much of it:
 
 | Sink | Uses |
 |---|---|
-| postgres, mysql, sqlite | the engine end to end, over an executor |
+| sqlite | the SQL family driver: `SqlDriver` + `SqlSinkDriver` drive every write and lifecycle (RFC 0014) |
+| postgres, mysql | the engine end to end, over an executor (migrating to `SqlDriver`) |
 | mssql | the dialect (MERGE, `CAST` placeholders, limits) and the shared mapping; its own retry-classified chunk execution |
 | duckdb | the engine's row planning, executed on the blocking driver |
 | redshift, clickhouse, oracle, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; their own row handling (`COPY`/`JSONEachRow` bodies, array DML, JSON-payload statement APIs) |

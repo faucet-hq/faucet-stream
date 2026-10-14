@@ -241,6 +241,12 @@ Attach a shared `AuthProvider` (so several sinks share one token with single-fli
 - `Array` mode collects each `batch_size` chunk into a `Value::Array` and POSTs it as one request body.
 - Every response runs through `faucet_core::util::check_http_response`, which maps non-2xx statuses to typed `FaucetError`s; retriable ones (network, 5xx, 429) are retried up to `max_retries`.
 
+The sink runs on the HTTP family driver (RFC 0014): its `Endpoint` implements
+`faucet_core::driver::HttpDriver` — resolve credentials once per page, send
+one body with the `max_retries` policy and the one-shot re-authentication —
+and `HttpSinkDriver` drives the batch modes, the in-flight limit and the
+per-row outcomes (a delivered row is never reported failed).
+
 ## Lineage dataset URI
 
 `https://<host><path>` with credentials stripped — e.g. `https://api.example.com/ingest` (a `user:pass@` prefix in the URL is redacted).

@@ -82,6 +82,25 @@ RFCs are numbered sequentially, zero-padded to four digits, in filename order.
 `0000` is the template. Pick the next free number when you open the draft PR;
 if two drafts collide, the second to merge renumbers.
 
+## Index
+
+| RFC | Title | Status |
+|---|---|---|
+| [0001](./0001-capability-traits.md) | Capability descriptors for connectors | Superseded by 0013 |
+| [0002](./0002-arrow-support.md) | Optional Apache Arrow record path | Accepted, partially implemented |
+| [0003](./0003-plugin-system.md) | Plugin system evolution | Draft |
+| [0004](./0004-streaming-improvements.md) | Streaming pipeline improvements | Draft |
+| [0005](./0005-async-connector-runtime.md) | Shared async connector-runtime primitives | Superseded by 0013 |
+| [0006](./0006-template-hosting-sync.md) | Template hosting and sync | Accepted |
+| [0007](./0007-remote-dataset-preview.md) | Remote dataset preview | Accepted |
+| [0008](./0008-kind-aware-template-registry.md) | A kind-aware template registry | Accepted |
+| [0009](./0009-vocabulary-renames.md) | One meaning per word: `partition` and `replication` | Accepted |
+| [0010](./0010-policies-and-impact.md) | Data-flow policies and change impact analysis | Accepted |
+| [0011](./0011-approvals-budgets-usage.md) | Change approvals, run budgets, and cost & usage accounting | Accepted |
+| [0012](./0012-multi-tenant-embedded-integrations.md) | Multi-tenant embedded integrations | Accepted |
+| [0013](./0013-structural-core-guarantees.md) | Structural core guarantees | Discussion |
+| [0014](./0014-phase-3a-family-drivers.md) | Phase 3a: family drivers and the governed-page typestate | Accepted, implemented (foundation) |
+
 ## RFCs, ADRs, and issues
 
 These three records answer different questions and should not be conflated:
