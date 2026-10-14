@@ -7,28 +7,33 @@
 //! and excluded from patch-coverage — the same treatment the GCS connectors'
 //! data-plane I/O gets. All the *pure* logic it depends on (SQL/URL generation
 //! in [`crate::staged`] and the upload-and-build step
-//! [`ClickHouseSink::stage_and_build_sql`]) stays unit-tested and inside the
+//! `ClickHouseDriver::stage_and_build_sql`) stays unit-tested and inside the
 //! coverage denominator.
 
 use faucet_core::FaucetError;
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use serde_json::Value;
 
-use crate::sink::ClickHouseSink;
+use crate::sink::ClickHouseDriver;
+use faucet_core::CallSlot;
 
-impl ClickHouseSink {
+impl ClickHouseDriver {
     /// Send the staged-load `INSERT … SELECT FROM s3(…)` over the HTTP
     /// interface. The statement (which may carry storage credentials) rides the
     /// request body, never the URL: a body-less POST is rejected with HTTP 411,
     /// and a URL lands in proxy and access logs.
-    pub(crate) async fn send_query(&self, statement: &str) -> Result<(), FaucetError> {
+    pub(crate) async fn send_query(
+        &self,
+        calls: &CallSlot,
+        statement: &str,
+    ) -> Result<(), FaucetError> {
         let req = crate::sink::staged_request(
             self.client.inner(),
             &self.base_url,
             &self.config.connection,
             statement,
         );
-        let resp = self.client.call(&self.calls.get(), "insert", req).await?;
+        let resp = self.client.call(&calls.get(), "insert", req).await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
     }
@@ -37,6 +42,7 @@ impl ClickHouseSink {
     /// the ClickHouse server pull it with `s3()` / `gcs()`.
     pub(crate) async fn write_batch_staged(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         staging: &crate::config::ClickHouseStagingConfig,
     ) -> Result<usize, FaucetError> {
@@ -51,7 +57,7 @@ impl ClickHouseSink {
         let (staged, sql) = self
             .stage_and_build_sql(&uploader, records, staging)
             .await?;
-        let result = self.send_query(&sql).await;
+        let result = self.send_query(calls, &sql).await;
         uploader
             .cleanup(&[staged], staging.spec.cleanup, result.is_ok())
             .await;

@@ -6,14 +6,24 @@ use faucet_common_clickhouse::{apply_auth, build_json_each_row, query_params};
 use faucet_common_sql::dialects::ClickHouse;
 use faucet_common_sql::{SqlDialect, TableTarget};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
-use faucet_core::{FaucetError, Sink};
+use faucet_core::{CallSlot, FaucetError, Sink};
 use serde_json::Value;
 
 use crate::config::ClickHouseSinkConfig;
 
 /// ClickHouse sink (HTTP interface, `INSERT … FORMAT JSONEachRow`).
+///
+/// Built on the family-neutral sink driver (RFC 0014): [`ClickHouseDriver`]
+/// holds the insert paths and [`DriverSink`] serves the plain, reported and
+/// per-row writes from them.
 pub struct ClickHouseSink {
+    inner: DriverSink<ClickHouseDriver>,
+}
+
+/// The ClickHouse I/O primitives the sink runs on.
+pub(crate) struct ClickHouseDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     pub(crate) table_ready: std::sync::atomic::AtomicBool,
@@ -30,8 +40,6 @@ pub struct ClickHouseSink {
     pub(crate) client: faucet_core::http::Client,
     /// Resolved once in [`ClickHouseSink::new`] so the hot path never re-parses.
     pub(crate) base_url: String,
-    /// Backend-call context (#880): every request runs through it, once.
-    pub(crate) calls: faucet_core::CallSlot,
     /// Per-sink run id for staged-object keys (avoids cross-run collisions).
     #[cfg(feature = "staging")]
     stage_run_id: String,
@@ -165,10 +173,14 @@ fn add_column_sql(table: &str, column: &faucet_core::PlannedColumn) -> String {
         .expect("clickhouse ADD COLUMN")
 }
 
-impl ClickHouseSink {
+impl ClickHouseDriver {
     /// Insert one accumulated group, still re-chunked to `batch_size` so a
     /// single HTTP request stays a reasonable size (#617).
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
+    async fn commit_group(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+    ) -> Result<(), (usize, FaucetError)> {
         let chunk_len = if self.config.batch_size == 0 {
             rows.len().max(1)
         } else {
@@ -176,7 +188,9 @@ impl ClickHouseSink {
         };
         let mut done = 0;
         for chunk in rows.chunks(chunk_len) {
-            self.send_insert(chunk).await.map_err(|e| (done, e))?;
+            self.send_insert(calls, chunk)
+                .await
+                .map_err(|e| (done, e))?;
             done += chunk.len();
             tracing::debug!(records = chunk.len(), "ClickHouse insert chunk written");
         }
@@ -188,10 +202,11 @@ impl ClickHouseSink {
     /// write or `flush` commits them instead of dropping them.
     async fn commit_or_restore(
         &self,
+        calls: &CallSlot,
         rows: Vec<Value>,
         keep_end: usize,
     ) -> Result<(), FaucetError> {
-        if let Err((done, e)) = self.commit_group(&rows).await {
+        if let Err((done, e)) = self.commit_group(calls, &rows).await {
             if done < keep_end {
                 let mut rows = rows;
                 rows.truncate(keep_end);
@@ -204,7 +219,11 @@ impl ClickHouseSink {
     }
 
     /// Make sure the target table exists before the first write (#580).
-    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_table_ready(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
         use std::sync::atomic::Ordering;
         if self.table_ready.load(Ordering::Relaxed) {
             return Ok(());
@@ -223,7 +242,7 @@ impl ClickHouseSink {
             return Ok(());
         };
         let sql = build_create_table_sql(&self.config.table, &columns);
-        self.execute_statement(&sql).await?;
+        self.execute_statement(calls, &sql).await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -231,10 +250,12 @@ impl ClickHouseSink {
     /// Make every field of `records` a column before the page is buffered:
     /// with `create_table` a missing one is added (typed from the page),
     /// without it the write fails naming the fields.
-    async fn ensure_columns(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_columns(&self, calls: &CallSlot, records: &[Value]) -> Result<(), FaucetError> {
         let mut known = self.known_columns.lock().await;
         if known.is_none() {
-            let body = self.query_text(&columns_query(&self.config.table)).await?;
+            let body = self
+                .query_text(calls, &columns_query(&self.config.table))
+                .await?;
             let cols = parse_columns(&body);
             *known = Some((!cols.is_empty()).then_some(cols));
         }
@@ -255,7 +276,7 @@ impl ClickHouseSink {
         }
         let planned = faucet_core::plan_columns(records).unwrap_or_default();
         for column in planned.iter().filter(|c| missing.contains(&c.name)) {
-            self.execute_statement(&add_column_sql(&self.config.table, column))
+            self.execute_statement(calls, &add_column_sql(&self.config.table, column))
                 .await?;
             cols.insert(column.name.clone());
         }
@@ -268,7 +289,7 @@ impl ClickHouseSink {
     /// no body has neither `Content-Length` nor chunked encoding, which
     /// ClickHouse rejects with HTTP 411. Sending the SQL as the body is also
     /// the shape that avoids URL-length limits on a long statement.
-    async fn query_text(&self, sql: &str) -> Result<String, FaucetError> {
+    async fn query_text(&self, calls: &CallSlot, sql: &str) -> Result<String, FaucetError> {
         let params: Vec<(String, String)> =
             vec![("database".into(), self.config.connection.database.clone())];
         let req = self
@@ -277,27 +298,22 @@ impl ClickHouseSink {
             .query(&params)
             .body(sql.to_string());
         let req = apply_auth(req, &self.config.connection);
-        let resp = self.client.call(&self.calls.get(), "query", req).await?;
+        let resp = self.client.call(&calls.get(), "query", req).await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         resp.text().await.map_err(FaucetError::Http)
     }
 
     /// Run one DDL/DML statement through the HTTP interface.
-    async fn execute_statement(&self, sql: &str) -> Result<(), FaucetError> {
-        self.query_text(sql).await.map(|_| ())
+    async fn execute_statement(&self, calls: &CallSlot, sql: &str) -> Result<(), FaucetError> {
+        self.query_text(calls, sql).await.map(|_| ())
     }
 
     /// Validate the config and build the reusable HTTP client.
-    pub fn new(config: ClickHouseSinkConfig) -> Result<Self, FaucetError> {
+    fn new(config: ClickHouseSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let base_url = config.connection.base_url()?;
         let client = faucet_common_clickhouse::http_client(&config.connection)?;
         Ok(Self {
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
             table_ready: std::sync::atomic::AtomicBool::new(false),
             known_columns: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
@@ -315,7 +331,7 @@ impl ClickHouseSink {
     }
 
     /// Stage the page to `uploader`'s store and build the `INSERT … SELECT FROM
-    /// s3()/gcs()` statement. Split out from [`Self::write_batch_staged`] so it
+    /// s3()/gcs()` statement. Split out from `write_batch_staged` so it
     /// can be tested against an in-memory object store (the network execution is
     /// the only untested part).
     #[cfg(feature = "staging")]
@@ -363,7 +379,7 @@ impl ClickHouseSink {
     }
 
     /// Send one `INSERT … FORMAT JSONEachRow` request for a slice of records.
-    async fn send_insert(&self, records: &[Value]) -> Result<(), FaucetError> {
+    async fn send_insert(&self, calls: &CallSlot, records: &[Value]) -> Result<(), FaucetError> {
         let body = build_json_each_row(records)?;
         let statement = insert_statement(&self.config.table);
         let params = insert_params(
@@ -374,37 +390,54 @@ impl ClickHouseSink {
         );
         let req = self.client.post(&self.base_url).query(&params).body(body);
         let req = apply_auth(req, &self.config.connection);
-        let resp = self.client.call(&self.calls.get(), "insert", req).await?;
+        let resp = self.client.call(&calls.get(), "insert", req).await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())
     }
 }
 
-#[async_trait]
-impl Sink for ClickHouseSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
+impl ClickHouseSink {
+    /// Validate the config and build the reusable HTTP client.
+    pub fn new(config: ClickHouseSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(ClickHouseDriver::new(config)?),
+        })
     }
 
-    /// Insert records via `INSERT … FORMAT JSONEachRow`.
-    ///
-    /// When `batch_size > 0` and the page is larger, it is split into
-    /// `batch_size`-row chunks, each sent as its own request. `batch_size = 0`
-    /// forwards the whole page as a single request.
+    #[cfg(all(test, feature = "staging"))]
+    pub(crate) async fn stage_and_build_sql(
+        &self,
+        uploader: &faucet_core::staging::StageUploader,
+        records: &[Value],
+        staging: &crate::config::ClickHouseStagingConfig,
+    ) -> Result<(faucet_core::staging::StagedFile, String), FaucetError> {
+        self.inner
+            .driver()
+            .stage_and_build_sql(uploader, records, staging)
+            .await
+    }
+}
+
+#[async_trait]
+impl Sink for ClickHouseSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl ClickHouseDriver {
     /// Commit whatever the cross-page accumulator holds (#617).
     ///
     /// The pipeline calls `flush` at every bookmark-carrying page and once at
     /// the end, so a buffered group is always committed before the bookmark
     /// advances — records left in the accumulator after a "successful" run
     /// would be data loss with a green exit code.
-    async fn flush(&self) -> Result<(), FaucetError> {
+    async fn flush_pending(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let group = {
             let mut open = self.pending.lock().await;
             open.finish()
         };
         if let Some(rows) = group {
             let len = rows.len();
-            self.commit_or_restore(rows, len).await?;
+            self.commit_or_restore(calls, rows, len).await?;
         }
         Ok(())
     }
@@ -412,21 +445,22 @@ impl Sink for ClickHouseSink {
     /// The DLQ path commits per page (#789 SQL-21): earlier buffered rows are
     /// committed first, then this page alone, so a failed commit can name
     /// exactly the rows of *this* page that did not land.
-    async fn write_batch_partial(
+    async fn write_partial(
         &self,
+        calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        self.flush().await?;
-        self.ensure_table_ready(records).await?;
-        self.ensure_columns(records).await?;
+        self.flush_pending(calls).await?;
+        self.ensure_table_ready(calls, records).await?;
+        self.ensure_columns(calls, records).await?;
         if self.config.staging.is_some() {
-            self.write_batch(records).await?;
+            self.write_page(calls, records).await?;
             return Ok(records.iter().map(|_| Ok(())).collect());
         }
-        match self.commit_group(records).await {
+        match self.commit_group(calls, records).await {
             Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
             Err((0, e)) => Err(e),
             Err((done, e)) => {
@@ -446,18 +480,23 @@ impl Sink for ClickHouseSink {
         }
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    /// Insert records via `INSERT … FORMAT JSONEachRow`.
+    ///
+    /// When `batch_size > 0` and the page is larger, it is split into
+    /// `batch_size`-row chunks, each sent as its own request. `batch_size = 0`
+    /// forwards the whole page as a single request.
+    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        self.ensure_table_ready(records).await?;
-        self.ensure_columns(records).await?;
+        self.ensure_table_ready(calls, records).await?;
+        self.ensure_columns(calls, records).await?;
 
         // Staged bulk load (#528): stage the whole page and let the server pull
         // it — no row body, no `batch_size` re-chunking.
         #[cfg(feature = "staging")]
         if let Some(staging) = &self.config.staging {
-            return self.write_batch_staged(records, staging).await;
+            return self.write_batch_staged(calls, records, staging).await;
         }
         #[cfg(not(feature = "staging"))]
         if self.config.staging.is_some() {
@@ -477,9 +516,40 @@ impl Sink for ClickHouseSink {
         };
         if let Some(rows) = group {
             let keep_end = rows.len() - records.len();
-            self.commit_or_restore(rows, keep_end).await?;
+            self.commit_or_restore(calls, rows, keep_end).await?;
         }
         Ok(records.len())
+    }
+}
+
+#[async_trait]
+impl SinkDriver for ClickHouseDriver {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
+    }
+
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.flush_pending(calls).await
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => Ok(PageWrite::accepted(self.write_page(calls, rows).await?)),
+        }
     }
 
     fn config_schema(&self) -> Value {
@@ -491,20 +561,9 @@ impl Sink for ClickHouseSink {
         "clickhouse"
     }
 
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
     /// Staged bulk load is active only when a `staging:` block is configured
     /// and the `staging` feature is compiled in.
-    fn supports_staged_load(&self) -> bool {
+    fn staged_load(&self) -> bool {
         cfg!(feature = "staging") && self.config.staging.is_some()
     }
 
@@ -519,7 +578,11 @@ impl Sink for ClickHouseSink {
     /// Non-mutating preflight probe (`connect`): runs `SELECT 1` over the HTTP
     /// interface. Deliberately does **not** touch the target table (no inserts,
     /// no residual rows).
-    async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+    async fn check(
+        &self,
+        calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<CheckReport, FaucetError> {
         let started = std::time::Instant::now();
         let hint = "check url / host / database / credentials / that the server is reachable";
         let params = query_params(&self.config.connection.database, &[]);
@@ -529,7 +592,7 @@ impl Sink for ClickHouseSink {
             .query(&params)
             .body("SELECT 1");
         let req = apply_auth(req, &self.config.connection);
-        let calls = self.calls.get();
+        let calls = calls.get();
         let probe =
             match tokio::time::timeout(ctx.timeout, self.client.call(&calls, "query", req)).await {
                 Ok(Ok(resp)) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {

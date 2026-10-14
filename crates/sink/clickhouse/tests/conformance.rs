@@ -129,6 +129,7 @@ async fn conformance_declared_capabilities() {
     let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "cap")).expect("sink");
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
     faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 
     // One INSERT per page: a page with a row ClickHouse cannot parse lands
     // nothing.
@@ -167,6 +168,14 @@ fn descriptor_matches_the_built_sink() {
             &built,
         );
     }
+}
+
+// ── RFC 0014: the sink runs on a family driver (offline) ─────────────────────
+#[tokio::test]
+async fn conformance_driver_declarations() {
+    let sink =
+        ClickHouseSink::new(ClickHouseSinkConfig::new("http://127.0.0.1:1", "t")).expect("sink");
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
 }
 
 // ── Check: backend calls honour the call deadline and cancel (#880) ──────────

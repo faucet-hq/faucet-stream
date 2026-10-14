@@ -173,6 +173,19 @@ This sink takes its identifier and literal escaping (backslash escapes), `Nullab
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. Rows travel as `INSERT … FORMAT JSONEachRow` request bodies that the server maps by key, so there is no per-cell statement for the engine to plan.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `ClickHouseDriver`
+implements `faucet_core::driver::SinkDriver` — the cross-page commit groups,
+the `JSONEachRow` inserts, the staged `INSERT … SELECT FROM s3()/gcs()` load
+and table and column creation — and `ClickHouseSink` wraps it in a
+`DriverSink`, which serves the plain, reported and per-row writes from that
+one primitive and derives the capabilities from it. It does not use the SQL
+family driver (`faucet_common_sql::SqlSinkDriver`): ClickHouse has no
+transactions to open and commit, rows travel as a `JSONEachRow` HTTP body
+rather than bound statements, and pages are merged into commit groups. The
+public type and config are unchanged.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your
