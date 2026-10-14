@@ -104,3 +104,15 @@ Every publish and its confirmation is awaited through the pipeline's
 confirmed by then fails as a per-row error. The 120 s per-message confirmation
 bound is unchanged; the SDK bundles messages into RPCs itself, so waits are not
 counted as round trips.
+
+## How it is built
+
+The sink runs on the messaging family driver (RFC 0014): `PubsubDriver`
+implements `faucet_core::driver::MessageDriver` — encode a record (payload,
+ordering key, attributes) and publish a page's messages (count- and
+byte-bounded chunks, every confirmation awaited, later messages of a failed
+ordering key failed or held back) — and `MessageSinkDriver` reports each row
+and serves the plain, reported and per-row write paths. The driver awaits its
+own confirmations through the call slot (`publish_is_one_call` is `false`), so
+the round-trip count (one `publish` per chunk) is unchanged. The public type
+and config are unchanged.
