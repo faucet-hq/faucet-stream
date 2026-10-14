@@ -128,4 +128,31 @@ async fn conformance_declared_capabilities() {
         .expect("sink");
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
     faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+}
+
+// ── RFC 0014: the sink runs on a family driver ───────────────────────────────
+
+#[tokio::test]
+async fn conformance_driver_declarations() {
+    for strategy in ["insert", "copy"] {
+        let v = serde_json::json!({
+            "host": "127.0.0.1",
+            "database": "db",
+            "user": "u",
+            "credentials": {"type": "password", "config": {"password": "pw"}},
+            "table_name": "t",
+            "write_strategy": strategy,
+            "copy": {
+                "staging_bucket": "bucket",
+                "iam_role": "arn:aws:iam::123456789012:role/r",
+                "region": "us-east-1"
+            }
+        });
+        let cfg: faucet_sink_redshift::RedshiftSinkConfig = serde_json::from_value(v).unwrap();
+        let sink = faucet_sink_redshift::RedshiftSink::new(cfg)
+            .await
+            .expect("sink");
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    }
 }
