@@ -107,6 +107,47 @@ async fn partition_values_come_from_the_add_action_not_the_path() {
     );
 }
 
+/// Float partition values decode as the numbers the log spells, and a
+/// non-finite one is null.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn float_partition_values_decode_as_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parquet(&dir.path().join("a.parquet"), &ids(1), 1_000);
+    write_parquet(&dir.path().join("b.parquet"), &ids(1), 1_000);
+    write_log(
+        dir.path(),
+        json!([
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "ratio", "type": "double", "nullable": true, "metadata": {}},
+            {"name": "weight", "type": "float", "nullable": true, "metadata": {}}
+        ]),
+        &["ratio", "weight"],
+        json!({}),
+        &[
+            ("a.parquet".into(), json!({"ratio": "0.1", "weight": "0.5"})),
+            (
+                "b.parquet".into(),
+                json!({"ratio": "-2.25", "weight": "NaN"}),
+            ),
+        ],
+        plain_protocol(),
+    );
+    let mut rows = DeltaSource::new(source(dir.path()))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    rows.sort_by_key(|r| r["weight"].is_null());
+    assert_eq!(
+        rows,
+        vec![
+            json!({"id": 0, "ratio": 0.1, "weight": 0.5}),
+            json!({"id": 0, "ratio": -2.25, "weight": null})
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_column_mapped_table_is_refused() {
     let dir = tempfile::tempdir().unwrap();
