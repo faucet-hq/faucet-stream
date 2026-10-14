@@ -90,12 +90,17 @@ def buffers(src):
 
 
 DRIVER_IMPL = re.compile(
-    r"\bimpl\b[^{;]*\b(SinkDriver|SqlDriver|MessageDriver|HttpDriver)\s+for\b"
+    r"\bimpl\b[^{;]*\b(SinkDriver|SourceDriver|SqlDriver|MessageDriver|MessageConsumer|HttpDriver)\s+for\b"
 )
 
 
 def uses_driver(src):
-    return "DriverSink<" in src or DRIVER_IMPL.search(src) is not None
+    return (
+        "DriverSink<" in src
+        or "DriverSource<" in src
+        or re.search(r"\bFileSink<", src) is not None
+        or DRIVER_IMPL.search(src) is not None
+    )
 
 
 def applies(trigger, caps, src):

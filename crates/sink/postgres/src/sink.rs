@@ -6,6 +6,7 @@ use crate::config::{
 use crate::copy::{build_auto_map_payload, build_jsonb_payload, copy_statement};
 use async_trait::async_trait;
 use faucet_common_sql::dialects::Postgres;
+use faucet_common_sql::driver::label;
 use faucet_common_sql::{
     EvolutionStep, InsertPath, SplitPage, SqlDialect, SqlDriver, SqlExecutor, SqlFuture, SqlLayout,
     SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
@@ -1109,7 +1110,7 @@ impl SqlDriver for PostgresDriver {
         fut: SqlFuture<'a, T>,
     ) -> SqlFuture<'a, T> {
         match what {
-            "commit_overwrite" | "cleanup_scope" => fut,
+            label::COMMIT_OVERWRITE | label::CLEANUP_SCOPE => fut,
             _ => Box::pin(bounded(self.config.write_timeout_secs, what, fut)),
         }
     }
@@ -1165,8 +1166,8 @@ impl SqlDriver for PostgresDriver {
     /// connection.
     async fn ddl(&self, sql: &str, what: &'static str) -> Result<(), FaucetError> {
         match what {
-            "CREATE TABLE" => self.create_target(sql).await,
-            "commit-table create" => self.ensure_commit_table().await,
+            label::CREATE_TABLE => self.create_target(sql).await,
+            label::CREATE_TOKEN_TABLE => self.ensure_commit_table().await,
             _ => {
                 let mut conn = self.acquire().await?;
                 sqlx::query(sql)
@@ -1362,6 +1363,10 @@ impl SqlDriver for PostgresDriver {
     /// nullability relaxations) to the destination table. Idempotent —
     /// `ADD COLUMN IF NOT EXISTS`, and re-running the same TYPE / DROP NOT NULL
     /// is a no-op (issue #194).
+    fn evolvable(&self) -> bool {
+        true
+    }
+
     async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
         let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
         let mut conn = self

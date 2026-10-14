@@ -3,6 +3,7 @@
 use crate::config::{BinaryEncoding, BinaryValue, MysqlColumnMapping, MysqlSinkConfig};
 use async_trait::async_trait;
 use faucet_common_sql::dialects::{Mysql, mysql};
+use faucet_common_sql::driver::label;
 use faucet_common_sql::{
     EvolutionStep, SplitPage, SqlDialect, SqlDriver, SqlExecutor, SqlFuture, SqlLayout,
     SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
@@ -1416,7 +1417,7 @@ impl SqlDriver for MysqlDriver {
         fut: SqlFuture<'a, T>,
     ) -> SqlFuture<'a, T> {
         match what {
-            "cleanup_scope" => fut,
+            label::CLEANUP_SCOPE => fut,
             _ => Box::pin(bounded(self.config.write_timeout_secs, what, fut)),
         }
     }
@@ -1715,6 +1716,10 @@ impl SqlDriver for MysqlDriver {
     /// Widenings use `MODIFY COLUMN` (re-running the same MODIFY is a no-op);
     /// nullability relaxations re-emit the column as its current definition
     /// with an explicit `NULL`.
+    fn evolvable(&self) -> bool {
+        true
+    }
+
     async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
         let table_ref = quote_ident_mysql(&self.config.table_name);
         let mut conn = self

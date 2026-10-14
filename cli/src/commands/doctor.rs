@@ -308,10 +308,6 @@ async fn stateful_probes(
     probes
 }
 
-/// One `persist` probe per `oauth2_refresh` provider with a `persist:` block:
-/// it fails when the provider's refresh token is still stored only under the
-/// shared key earlier versions used (#862 M-077). `None` when there is no such
-/// provider.
 /// One probe per connector plugin registered without a descriptor (RFC 0014):
 /// its capabilities are not checked at load time. A skip, so it informs
 /// without failing the run.
@@ -341,6 +337,10 @@ pub fn probe_undescribed_plugins(plugins: &[String]) -> Option<InvocationOut> {
     })
 }
 
+/// One `persist` probe per `oauth2_refresh` provider with a `persist:` block:
+/// it fails when the provider's refresh token is still stored only under the
+/// shared key earlier versions used (#862 M-077). `None` when there is no such
+/// provider.
 pub async fn probe_auth_persist(
     specs: Option<&std::collections::HashMap<String, serde_json::Value>>,
 ) -> Option<InvocationOut> {

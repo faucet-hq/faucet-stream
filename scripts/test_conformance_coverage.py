@@ -210,6 +210,9 @@ class CoverageTest(unittest.TestCase):
         self.assertTrue(cc.applies(req, caps, "impl<B: X> SinkDriver for FileDriver<B> {"))
         self.assertTrue(cc.applies(req, caps, "impl MessageDriver for NatsDriver {}"))
         self.assertTrue(cc.applies(req, caps, "impl HttpDriver for Endpoint {}"))
+        self.assertTrue(cc.applies(req, caps, "inner: FileSink<S3Backend>,"))
+        self.assertTrue(cc.applies(req, caps, "inner: DriverSource<RestDriver>,"))
+        self.assertFalse(cc.applies(req, caps, "struct NotAFileSinkWrapper;"))
         self.assertFalse(cc.applies(req, caps, "impl Sink for Plain { }"))
         self.assertFalse(cc.applies(req, caps, "use faucet_core::driver::SinkDriver;"))
 

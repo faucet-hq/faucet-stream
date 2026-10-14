@@ -215,8 +215,7 @@ async fn conformance_declared_capabilities() {
     let overwrite = MssqlSink::new(scfg).await.expect("overwrite sink");
     faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
 
-    // RFC 0014: the driver-built sink declares only the lifecycles its
-    // driver implements, and its four write paths agree.
+    // RFC 0014: declarations match the driver and the write paths agree.
     faucet_conformance::assert_driver_declarations_truthful(&sink).await;
     faucet_conformance::assert_driver_row_paths_agree(&sink).await;
     faucet_conformance::assert_driver_declarations_truthful(&overwrite).await;

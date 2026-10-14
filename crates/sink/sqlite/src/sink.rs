@@ -864,6 +864,10 @@ impl SqlDriver for SqliteDriver {
     /// - **Nullability relaxations** — a no-op: SQLite cannot drop a `NOT NULL`
     ///   constraint in place (it requires a full table rebuild, which is out of
     ///   scope here). Logged at `debug`; the column is left as-is.
+    fn evolvable(&self) -> bool {
+        true
+    }
+
     async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
         let mut widened = false;
         for step in steps {

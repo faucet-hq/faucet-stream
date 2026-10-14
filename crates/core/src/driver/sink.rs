@@ -443,7 +443,25 @@ pub struct DriverSink<D> {
 
 impl<D: SinkDriver> DriverSink<D> {
     /// The sink over `driver`.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, when the driver's declarations disagree with its
+    /// primitives ([`check_declarations`](Self::check_declarations)) — a
+    /// driver that lists `overwrite` without a staging driver, or the
+    /// reverse, is a programming error every connector test then catches.
     pub fn new(driver: D) -> Self {
+        let sink = Self::new_unchecked(driver);
+        if let Err(e) = sink.check_declarations() {
+            debug_assert!(false, "{e}");
+            tracing::error!(error = %e, "sink driver declarations disagree with its primitives");
+        }
+        sink
+    }
+
+    /// The sink over `driver`, without checking its declarations.
+    #[doc(hidden)]
+    pub fn new_unchecked(driver: D) -> Self {
         let calls = CallSlot::new(driver.call_context());
         Self { driver, calls }
     }

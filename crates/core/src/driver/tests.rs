@@ -546,14 +546,14 @@ impl SinkDriver for Inconsistent {
 
 #[test]
 fn declarations_that_disagree_with_the_primitives_are_refused() {
-    let err = DriverSink::new(Inconsistent { dedup: false })
+    let err = DriverSink::new_unchecked(Inconsistent { dedup: false })
         .check_declarations()
         .unwrap_err();
     assert!(
         err.to_string().contains("overwrite is declared on"),
         "{err}"
     );
-    let err = DriverSink::new(Inconsistent { dedup: true })
+    let err = DriverSink::new_unchecked(Inconsistent { dedup: true })
         .check_declarations()
         .unwrap_err();
     assert!(err.to_string().contains("no keyed write mode"), "{err}");
@@ -575,10 +575,12 @@ fn declarations_that_disagree_with_the_primitives_are_refused() {
             Some(&self.0)
         }
     }
-    let err = DriverSink::new(StagingWithoutMode(Full::default()))
+    let err = DriverSink::new_unchecked(StagingWithoutMode(Full::default()))
         .check_declarations()
         .unwrap_err();
     assert!(err.to_string().contains("declared off"), "{err}");
+    let built = std::panic::catch_unwind(|| DriverSink::new(Inconsistent { dedup: false }));
+    assert_eq!(built.is_err(), cfg!(debug_assertions));
     let mut s = DriverSink::new(Bare);
     let _ = s.driver_mut();
     let _ = s.calls();
@@ -1289,9 +1291,32 @@ async fn a_consumer_stops_at_its_message_limit() {
     let source = DriverSource::new(MessageSourceDriver::new(Queue::of(10, Some(3))));
     let rows = source.fetch_all().await.unwrap();
     assert_eq!(rows.len(), 3);
-    assert_eq!(source.driver().consumer().acked.lock().unwrap().len(), 3);
     assert_eq!(source.dataset_uri(), "queue://unknown");
     assert_eq!(source.config_schema()["type"], "object");
+    use futures::StreamExt;
+    let ctx = HashMap::new();
+    let pages: Vec<_> = source.stream_pages(&ctx, 0).collect().await;
+    assert_eq!(pages.len(), 1);
+    assert_eq!(source.driver().consumer().acked.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_buffered_read_never_acknowledges_what_nobody_wrote() {
+    let source = DriverSource::new(MessageSourceDriver::new(Queue::of(5, None)));
+    let rows = source.fetch_all().await.unwrap();
+    assert_eq!(rows.len(), 5);
+    assert!(source.driver().consumer().acked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_preflight_probe_consumes_nothing() {
+    let source = DriverSource::new(MessageSourceDriver::new(Queue::of(2, None)));
+    let report = source.check(&CheckContext::default()).await.unwrap();
+    assert!(matches!(
+        report.probes[0].status,
+        crate::check::ProbeStatus::Skip { .. }
+    ));
+    assert_eq!(source.fetch_all().await.unwrap().len(), 2);
 }
 
 // ── HTTP ───────────────────────────────────────────────────────────────────

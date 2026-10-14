@@ -50,6 +50,19 @@ pub enum InsertPath {
     Token,
 }
 
+/// The `what` labels [`SqlSinkDriver`] passes to [`SqlDriver::ddl`] and
+/// [`SqlDriver::guard`], for a backend that treats one of them specially.
+pub mod label {
+    /// Creating the destination table.
+    pub const CREATE_TABLE: &str = "CREATE TABLE";
+    /// Creating the commit-token table.
+    pub const CREATE_TOKEN_TABLE: &str = "commit-table create";
+    /// The overwrite swap.
+    pub const COMMIT_OVERWRITE: &str = "commit_overwrite";
+    /// The scoped cleanup delete.
+    pub const CLEANUP_SCOPE: &str = "cleanup_scope";
+}
+
 /// Where a SQL sink writes and how its rows are shaped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -201,9 +214,10 @@ pub trait SqlDriver: Send + Sync {
     /// The live destination schema, or `None` (missing table, JSON layout).
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError>;
 
-    /// Whether [`apply_evolution`](Self::apply_evolution) is implemented.
+    /// Whether [`apply_evolution`](Self::apply_evolution) is implemented;
+    /// override both together.
     fn evolvable(&self) -> bool {
-        true
+        false
     }
 
     /// The destination's column names, for a dialect without `ADD COLUMN IF
@@ -418,7 +432,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         else {
             return Ok(());
         };
-        self.driver.ddl(&sql, "CREATE TABLE").await?;
+        self.driver.ddl(&sql, label::CREATE_TABLE).await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -427,7 +441,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         self.driver
             .ddl(
                 &self.engine().dialect().commit_token_table_sql(),
-                "commit-table create",
+                label::CREATE_TOKEN_TABLE,
             )
             .await
     }
@@ -638,7 +652,7 @@ impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
     /// staging table as the destination — and a run that wrote nothing
     /// leaves no table at all.
     async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        self.op(calls, "commit_overwrite", async {
+        self.op(calls, label::COMMIT_OVERWRITE, async {
             let layout = self.layout();
             if !self.driver.table_exists(&layout.table).await? {
                 if self
@@ -698,10 +712,10 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
         self.op(calls, "write_batch_idempotent", async {
             self.ensure_table_ready(rows).await?;
             self.ensure_token_table().await?;
-            let plans = if self.engine().write_spec().write_mode == WriteMode::Append {
-                None
-            } else {
+            let plans = if self.engine().is_keyed() {
                 Some(self.engine().plan_keyed(rows)?)
+            } else {
+                None
             };
             if plans.is_some() {
                 self.driver.prepare_keyed_write().await?;
@@ -741,7 +755,7 @@ impl<D: SqlDriver> CleanupDriver for SqlSinkDriver<D> {
         scope: &BTreeMap<String, Value>,
         seen: &SeenKeys,
     ) -> Result<u64, FaucetError> {
-        self.op(calls, "cleanup_scope", async {
+        self.op(calls, label::CLEANUP_SCOPE, async {
             self.engine().check_cleanup_key()?;
             let mut conn = self.driver.begin().await?;
             let target = self.driver.target(&self.layout().table);
@@ -956,6 +970,10 @@ mod tests {
         assert_eq!(sink.batch_atomicity(), BatchAtomicity::Atomic);
         assert_eq!(sink.supported_write_modes().len(), 4);
         assert!(sink.readback_source().is_none() && !sink.supports_rollback());
+        assert!(
+            !sink.supports_schema_evolution(),
+            "a driver without apply_evolution declares no evolution"
+        );
         assert_eq!(sink.connector_name(), "mem");
         assert_eq!(sink.dataset_uri(), "mem://t");
         assert!(sink.config_schema().is_object());
@@ -1005,5 +1023,33 @@ mod tests {
             .await
             .unwrap();
         assert!(created.driver().driver().log()[0].starts_with("CREATE TABLE"));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)] // the exactly-once hook the engine still drives (#888)
+    async fn an_overwrite_page_with_a_token_is_inserted_not_planned_by_key() {
+        let mut mem = Mem::new(SqlLayout::new("t").create_table(false), true);
+        mem.engine = SqlSinkEngine::new(
+            Sqlite,
+            WriteSpec {
+                write_mode: WriteMode::Overwrite,
+                ..WriteSpec::default()
+            },
+        );
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        let n = sink
+            .write_batch_idempotent(&[json!({"id": 1}), json!({"id": 2})], "scope", "0000001")
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(
+            sink.driver()
+                .driver()
+                .log()
+                .iter()
+                .any(|q| q.starts_with("INSERT")),
+            "{:?}",
+            sink.driver().driver().log()
+        );
     }
 }

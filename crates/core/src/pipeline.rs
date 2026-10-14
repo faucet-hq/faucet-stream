@@ -861,9 +861,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             wrapped_sink.dedups_by_key(),
                         ),
                     );
-                // Governance passes need `Value`; the planner rejects them
-                // unconditionally. With none configured the batches pass
-                // through under the clearance the gateway requires.
+                // No record pass is configured here (the planner refuses them), hence the clearance.
                 let clearance = self
                     .governance_specs(&name, &row, &run_id, wrapped_sink.connector_name())
                     .clearance();

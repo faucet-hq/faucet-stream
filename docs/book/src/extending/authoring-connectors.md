@@ -59,7 +59,12 @@ Pick the family your backend belongs to:
 Every async primitive receives the run's `CallSlot`; make each backend request
 through `calls.call(..)` / `calls.call_once(..)` so the run's deadline, cancel
 token and round-trip metering apply (see [Backend calls](#backend-calls-callcontext-httpclient-batching)).
-A driver never stores a call context of its own.
+Use the slot you are handed. The exception is a driver whose own per-request
+policy sits over the run's context (the REST source's 429 budget, the MSSQL
+sink's per-statement retry classification): it keeps its own `CallSlot` and
+installs the run's context and recorder into it through `set_call_context` /
+`set_roundtrip_recorder`, so the run's deadline, cancel token and metering
+still reach every request.
 
 ### A sink driver
 

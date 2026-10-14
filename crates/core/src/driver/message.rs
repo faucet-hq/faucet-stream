@@ -12,13 +12,14 @@
 use super::sink::{CommitTokenDriver, PageWrite, RowPolicy, SinkDriver};
 use super::source::{PageStream, SourceDriver};
 use crate::accounting::WriteReport;
-use crate::check::{CheckContext, CheckReport};
+use crate::check::{CheckContext, CheckReport, Probe};
 use crate::dlq::BatchAtomicity;
 use crate::error::FaucetError;
 use crate::io::{CallContext, CallSlot};
 use crate::pipeline::StreamPage;
 use crate::traits::RowOutcome;
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -502,6 +503,18 @@ pub trait MessageConsumer: Send + Sync {
     fn idle_receives_to_stop(&self) -> u32 {
         1
     }
+
+    /// A preflight probe that consumes nothing (connect, look up the queue).
+    /// `None` (the default): the probe is skipped, because reading a page
+    /// would take messages off the queue.
+    async fn check(
+        &self,
+        calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<Option<CheckReport>, FaucetError> {
+        let _ = (calls, ctx);
+        Ok(None)
+    }
 }
 
 /// A [`MessageConsumer`] as a [`SourceDriver`].
@@ -567,6 +580,48 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
         _context: &'a HashMap<String, Value>,
         batch_size: usize,
     ) -> PageStream<'a> {
+        self.pages(calls, batch_size, true)
+    }
+
+    async fn fetch(
+        &self,
+        calls: &CallSlot,
+        _context: &HashMap<String, Value>,
+    ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+        let mut pages = self.pages(calls, 0, false);
+        let mut rows = Vec::new();
+        let mut bookmark = None;
+        while let Some(page) = pages.next().await {
+            match page {
+                Ok(page) => {
+                    rows.extend(page.records);
+                    bookmark = page.bookmark;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok((rows, bookmark)))
+    }
+
+    async fn check(
+        &self,
+        calls: &CallSlot,
+        ctx: &CheckContext,
+    ) -> Result<Option<CheckReport>, FaucetError> {
+        if let Some(report) = self.consumer.check(calls, ctx).await? {
+            return Ok(Some(report));
+        }
+        Ok(Some(CheckReport::single(Probe::skip(
+            "read",
+            "reading a page would consume messages; no consumer probe is defined",
+        ))))
+    }
+}
+
+impl<C: MessageConsumer> MessageSourceDriver<C> {
+    /// The page stream; `ack: false` never acknowledges, so a buffered read
+    /// leaves every message for the broker to redeliver.
+    fn pages<'a>(&'a self, calls: &'a CallSlot, batch_size: usize, ack: bool) -> PageStream<'a> {
         let per_page = if batch_size == 0 {
             crate::pipeline::DEFAULT_BATCH_SIZE
         } else {
@@ -576,7 +631,9 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
             let mut consumed = 0usize;
             let mut idle = 0u32;
             loop {
-                self.ack_pending(calls).await?;
+                if ack {
+                    self.ack_pending(calls).await?;
+                }
                 let room = match self.consumer.max_messages() {
                     Some(max) if consumed >= max => break,
                     Some(max) => per_page.min(max - consumed),
@@ -598,7 +655,9 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
                     tokens.push(m.ack.clone());
                 }
                 consumed += records.len();
-                *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
+                if ack {
+                    *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
+                }
                 yield StreamPage {
                     records,
                     bookmark: Some(serde_json::json!({ "consumed": consumed })),

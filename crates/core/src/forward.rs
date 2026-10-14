@@ -1179,8 +1179,7 @@ macro_rules! __faucet_forward_filter {
     // reported write, which goes through its own `write_batch` (#879).
     (write_batch_reported [write_batch $($rest:ident)*] $item:tt) => {};
     (write_governed [write_governed $($rest:ident)*] $item:tt) => {};
-    // A wrapper that changes the plain or the reported write takes the trait
-    // default for the governed write, which goes through that change.
+    // A wrapper changing the plain or reported write keeps the default governed write.
     (write_governed [write_batch $($rest:ident)*] $item:tt) => {};
     (write_governed [write_batch_reported $($rest:ident)*] $item:tt) => {};
     (flush [flush $($rest:ident)*] $item:tt) => {};
