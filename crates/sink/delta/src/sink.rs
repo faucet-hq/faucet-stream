@@ -27,7 +27,8 @@ use deltalake::operations::create::CreateBuilder;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
 use faucet_common_delta::convert::infer_delta_schema;
 use faucet_core::CallExt as _;
-use faucet_core::{FaucetError, WriteMode};
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError, WriteMode};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -35,11 +36,13 @@ use crate::config::DeltaSinkConfig;
 
 /// A sink that appends JSON records to an Apache Delta Lake table.
 pub struct DeltaSink {
+    inner: DriverSink<DeltaDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct DeltaDriver {
     config: DeltaSinkConfig,
     state: Mutex<SinkState>,
-    /// Backend-call context (#880): the table open, buffered writes and the
-    /// commit run through it, once.
-    calls: faucet_core::CallSlot,
 }
 
 /// Mutable per-run state, guarded by a `Mutex` so `write_batch(&self, …)` can
@@ -103,6 +106,19 @@ impl DeltaSink {
     /// Build a new Delta sink. Validates config eagerly; the table is opened
     /// lazily on the first write.
     pub async fn new(config: DeltaSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(DeltaDriver::new(config)?),
+        })
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for DeltaSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl DeltaDriver {
+    fn new(config: DeltaSinkConfig) -> Result<Self, FaucetError> {
         config
             .validate()
             .map_err(|e| FaucetError::Config(format!("invalid delta sink config: {e}")))?;
@@ -112,11 +128,6 @@ impl DeltaSink {
         Ok(Self {
             config,
             state: Mutex::new(SinkState::new()),
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
         })
     }
 
@@ -125,13 +136,13 @@ impl DeltaSink {
     /// table is created.
     async fn ensure_open(
         &self,
+        calls: &CallSlot,
         state: &mut SinkState,
         records: &[Value],
     ) -> Result<(), FaucetError> {
         if state.schema.is_none() {
             if state.table.is_none() {
-                state.table = self
-                    .calls
+                state.table = calls
                     .call_once("open", self.config.connection.open_optional())
                     .await?;
             }
@@ -155,7 +166,7 @@ impl DeltaSink {
         }
         let schema = state.schema.clone().expect("schema set above");
         let creating = state.table.is_none();
-        self.ensure_table_writer(state, &schema).await?;
+        self.ensure_table_writer(calls, state, &schema).await?;
         if creating {
             // The created table names list elements as Delta does (`element`),
             // not as the inferred schema did (`item`); encode against it.
@@ -185,14 +196,12 @@ impl DeltaSink {
     /// takes it from the incoming `RecordBatch`).
     async fn ensure_table_writer(
         &self,
+        calls: &CallSlot,
         state: &mut SinkState,
         schema: &SchemaRef,
     ) -> Result<(), FaucetError> {
         if state.table.is_none() {
-            let table = self
-                .calls
-                .call_once("open", self.open_or_create(schema))
-                .await?;
+            let table = calls.call_once("open", self.open_or_create(schema)).await?;
             state.table = Some(table);
         }
         if state.writer.is_none() {
@@ -280,6 +289,7 @@ impl DeltaSink {
     /// buffered — the page is all-or-nothing, as `batch_atomicity` reports.
     async fn write_page(
         &self,
+        calls: &CallSlot,
         state: &mut SinkState,
         records: &[Value],
         chunk: usize,
@@ -288,7 +298,7 @@ impl DeltaSink {
         if records.is_empty() {
             return Ok(0);
         }
-        self.ensure_open(state, records).await?;
+        self.ensure_open(calls, state, records).await?;
         if let Some(integral) = &state.integral {
             faucet_core::check_integral(records, integral)
                 .map_err(|e| FaucetError::Sink(format!("delta: {e}")))?;
@@ -301,7 +311,7 @@ impl DeltaSink {
             .collect::<Result<Vec<_>, _>>()?;
         let mut total = 0;
         for batch in batches {
-            total += self.write_encoded(state, batch).await?;
+            total += self.write_encoded(calls, state, batch).await?;
         }
         Ok(total)
     }
@@ -309,14 +319,15 @@ impl DeltaSink {
     /// Write one decoded batch into the buffered writer.
     async fn write_encoded(
         &self,
+        calls: &CallSlot,
         state: &mut SinkState,
         batch: RecordBatch,
     ) -> Result<usize, FaucetError> {
         let rows = batch.num_rows();
         let schema = state.schema.clone().expect("schema set");
-        self.ensure_table_writer(state, &schema).await?;
+        self.ensure_table_writer(calls, state, &schema).await?;
         let writer = state.writer.as_mut().expect("writer set");
-        let written = match writer.write(batch).within(&self.calls, "write").await {
+        let written = match writer.write(batch).within(calls, "write").await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(FaucetError::Sink(format!("delta: write failed: {e}"))),
             Err(spent) => Err(spent),
@@ -326,7 +337,7 @@ impl DeltaSink {
             return Err(e);
         }
         state.pending = true;
-        self.roll_if_over_target(state).await?;
+        self.roll_if_over_target(calls, state).await?;
         Ok(rows)
     }
 
@@ -335,7 +346,11 @@ impl DeltaSink {
     ///
     /// Shared by `flush` and [`roll_if_over_target`](Self::roll_if_over_target)
     /// — the two differ only in *when* they fire, not in what a commit is.
-    async fn commit_buffered(&self, state: &mut SinkState) -> Result<(), FaucetError> {
+    async fn commit_buffered(
+        &self,
+        calls: &CallSlot,
+        state: &mut SinkState,
+    ) -> Result<(), FaucetError> {
         if !state.pending {
             return Ok(());
         }
@@ -352,7 +367,7 @@ impl DeltaSink {
             .ok_or_else(|| FaucetError::Sink("delta: flush without an open table".to_string()))?;
         let committed = match writer
             .flush_and_commit(&mut table)
-            .within(&self.calls, "commit")
+            .within(calls, "commit")
             .await
         {
             Ok(Ok(version)) => Ok(version),
@@ -385,7 +400,11 @@ impl DeltaSink {
     ///
     /// Unset means unbounded, preserving the previous single-commit behaviour
     /// for anyone relying on it.
-    async fn roll_if_over_target(&self, state: &mut SinkState) -> Result<(), FaucetError> {
+    async fn roll_if_over_target(
+        &self,
+        calls: &CallSlot,
+        state: &mut SinkState,
+    ) -> Result<(), FaucetError> {
         let Some(target) = self.config.target_file_size else {
             return Ok(());
         };
@@ -399,14 +418,14 @@ impl DeltaSink {
                 target,
                 "delta: buffered parquet reached target_file_size; committing early"
             );
-            self.commit_buffered(state).await?;
+            self.commit_buffered(calls, state).await?;
         }
         Ok(())
     }
 }
 
 #[async_trait]
-impl faucet_core::Sink for DeltaSink {
+impl SinkDriver for DeltaDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -420,22 +439,19 @@ impl faucet_core::Sink for DeltaSink {
         "delta"
     }
 
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
+    /// Backend-call context (#880): the table open, buffered writes and the
+    /// commit run through it, once.
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
     }
 
     fn dataset_uri(&self) -> String {
         self.config.connection.redacted_uri()
     }
 
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
+    fn write_modes(&self) -> &'static [WriteMode] {
         // Append-only in v1 (mirrors the Iceberg sink). MERGE/upsert is a
         // version-gated follow-up (#317 "Out of scope").
         &[WriteMode::Append]
@@ -443,8 +459,8 @@ impl faucet_core::Sink for DeltaSink {
 
     /// Fields the table schema lacks are warned about and dropped, and no
     /// `current_schema` is reported, so a drift policy cannot see them.
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::of_sink(self)
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived
             .to_builder()
             .schema_report(faucet_core::SchemaReport::DropsUnknownFields)
             .build()
@@ -452,6 +468,7 @@ impl faucet_core::Sink for DeltaSink {
 
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
@@ -459,9 +476,7 @@ impl faucet_core::Sink for DeltaSink {
         // Metadata-only open (no data scan). A reachable store passes whether
         // or not the table exists yet — `create_if_not_missing` handles an
         // absent table at write time.
-        let open = self
-            .calls
-            .call_once("open", self.config.connection.open_optional());
+        let open = calls.call_once("open", self.config.connection.open_optional());
         let probe = match tokio::time::timeout(ctx.timeout, open).await {
             Ok(Ok(_)) => Probe::pass("table", started.elapsed()),
             Ok(Err(e)) => Probe::fail_hint(
@@ -480,31 +495,43 @@ impl faucet_core::Sink for DeltaSink {
         Ok(CheckReport::single(probe))
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let mut state = self.state.lock().await;
-        self.write_page(&mut state, records, self.config.batch_size)
-            .await
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        Ok(PageWrite::accepted(
+            self.write_records(calls, records).await?,
+        ))
     }
 
     /// delta-rs writes via `RecordBatchWriter`, so the sink consumes Arrow
     /// batches natively (#375): a `parquet → delta` / `delta → delta` chain
     /// never materializes `Value`.
     #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        true
+    fn columnar(&self) -> Option<&dyn faucet_core::driver::ColumnarDriver> {
+        Some(self)
     }
 
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let mut state = self.state.lock().await;
+        state.check_poisoned()?;
+        self.commit_buffered(calls, &mut state).await
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[async_trait]
+impl faucet_core::driver::ColumnarDriver for DeltaDriver {
     /// Write an Arrow batch straight into the buffered `RecordBatchWriter`,
     /// skipping the `Value → RecordBatch` encode. The schema is locked from the
     /// first batch's own schema (the columnar analogue of inferring it from the
     /// first records); partition columns must be present in the batch (the Delta
     /// source appends them), matching the JSON path's create-table contract.
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
+    async fn write_columnar(
         &self,
+        calls: &CallSlot,
         batch: &arrow::record_batch::RecordBatch,
     ) -> Result<usize, FaucetError> {
         if batch.num_rows() == 0 {
@@ -517,10 +544,10 @@ impl faucet_core::Sink for DeltaSink {
             state.schema = Some(batch.schema());
         }
         let schema = state.schema.clone().expect("schema set above");
-        self.ensure_table_writer(&mut state, &schema).await?;
+        self.ensure_table_writer(calls, &mut state, &schema).await?;
         let rows = batch.num_rows();
         let writer = state.writer.as_mut().expect("writer set");
-        let written = match writer.write(batch).within(&self.calls, "write").await {
+        let written = match writer.write(batch).within(calls, "write").await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(FaucetError::Sink(format!(
                 "delta: columnar write failed: {e}"
@@ -532,14 +559,23 @@ impl faucet_core::Sink for DeltaSink {
             return Err(e);
         }
         state.pending = true;
-        self.roll_if_over_target(&mut state).await?;
+        self.roll_if_over_target(calls, &mut state).await?;
         Ok(rows)
     }
+}
 
-    async fn flush(&self) -> Result<(), FaucetError> {
+impl DeltaDriver {
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
         let mut state = self.state.lock().await;
-        state.check_poisoned()?;
-        self.commit_buffered(&mut state).await
+        self.write_page(calls, &mut state, records, self.config.batch_size)
+            .await
     }
 }
 
