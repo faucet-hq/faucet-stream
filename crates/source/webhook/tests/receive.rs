@@ -279,3 +279,34 @@ async fn partial_segment_placeholders_resolve_and_unfilled_ones_fail() {
     assert_eq!(resp.status(), 200);
     assert_eq!(run.await.unwrap().unwrap().len(), 1);
 }
+
+/// RFC 0014: the pipeline's page stream serves what the window collected,
+/// `batch_size` records per page, with no bookmark.
+#[tokio::test]
+async fn the_page_stream_chunks_the_collected_payloads() {
+    let addr = free_addr();
+    let cfg = WebhookSourceConfig::new()
+        .listen_addr(addr.clone())
+        .max_payloads(3)
+        .timeout_secs(10);
+    let source = WebhookSource::new(cfg);
+    let run = tokio::spawn(async move {
+        let ctx = HashMap::new();
+        let mut stream = source.stream_pages(&ctx, 2);
+        let mut pages = Vec::new();
+        while let Some(page) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            let page = page?;
+            pages.push((page.records.len(), page.bookmark));
+        }
+        Ok::<_, faucet_core::FaucetError>(pages)
+    });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    for i in 0..3 {
+        let body = format!(r#"{{"id":{i}}}"#);
+        let r = post_until_up(&client, &url, || client.post(&url).body(body.clone())).await;
+        assert!(r.status().is_success());
+    }
+    let pages = run.await.unwrap().unwrap();
+    assert_eq!(pages, vec![(2, None), (1, None)]);
+}
