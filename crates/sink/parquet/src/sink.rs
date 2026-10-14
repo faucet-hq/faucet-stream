@@ -9,7 +9,8 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use faucet_common_file::write::{FileSink, SinkIdentity, WriteConfig};
 use faucet_common_s3::S3Backend;
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError, Sink as _};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, local::LocalFileSystem};
 use parquet::arrow::AsyncArrowWriter;
@@ -51,6 +52,11 @@ use crate::schema::infer_schema;
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
 )]
 pub struct ParquetSink {
+    inner: DriverSink<ParquetDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct ParquetDriver {
     config: ParquetSinkConfig,
     /// The local file system a `LocalPath` destination writes through, or
     /// `None` for S3.
@@ -124,6 +130,24 @@ impl ParquetSink {
     /// Create a new Parquet sink. The underlying object store is built eagerly
     /// so that bad configuration fails fast rather than on first write.
     pub async fn new(config: ParquetSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(ParquetDriver::new(config).await?),
+        })
+    }
+
+    #[cfg(test)]
+    fn d(&self) -> &ParquetDriver {
+        self.inner.driver()
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for ParquetSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl ParquetDriver {
+    async fn new(config: ParquetSinkConfig) -> Result<Self, FaucetError> {
         config
             .validate()
             .map_err(|e| FaucetError::Config(format!("invalid parquet sink config: {e}")))?;
@@ -519,7 +543,7 @@ fn sync_file_and_dir(path: &FsPath) -> Result<(), FaucetError> {
 }
 
 #[async_trait]
-impl faucet_core::Sink for ParquetSink {
+impl SinkDriver for ParquetDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         match &self.remote {
             Some(remote) => remote.batch_atomicity(),
@@ -530,7 +554,7 @@ impl faucet_core::Sink for ParquetSink {
     /// Derived, plus [`SchemaReport::DropsUnknownFields`](faucet_core::SchemaReport)
     /// for a local destination: fields outside a file's schema are dropped
     /// with a warning. An S3 destination widens the schema instead.
-    fn capabilities(&self) -> faucet_core::Capabilities {
+    fn capabilities(&self, _derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         crate::descriptor::DESCRIPTOR
             .capabilities(&serde_json::to_value(&self.config).unwrap_or(Value::Null))
     }
@@ -568,32 +592,13 @@ impl faucet_core::Sink for ParquetSink {
         self.outputs.snapshot()
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if let Some(remote) = &self.remote {
-            return remote.write_batch(records).await;
-        }
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        let mut state = self.state.lock().await;
-
-        // Re-chunk the incoming page when the config asks for it. `batch_size
-        // = 0` is the "no batching" sentinel: pass the page straight through.
-        // Otherwise we slice into `batch_size`-sized windows and run the
-        // existing write path once per chunk. Row/byte rollover logic is
-        // applied per chunk and remains independent of `batch_size`.
-        let chunk_size = self.config.batch_size;
-        let mut total_rows = 0;
-        if chunk_size == 0 || records.len() <= chunk_size {
-            total_rows += self.write_chunk(&mut state, records).await?;
-        } else {
-            for chunk in records.chunks(chunk_size) {
-                total_rows += self.write_chunk(&mut state, chunk).await?;
-            }
-        }
-
-        Ok(total_rows)
+    async fn write(
+        &self,
+        _calls: &CallSlot,
+        records: &[Value],
+        _policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        Ok(PageWrite::accepted(self.write_records(records).await?))
     }
 
     /// The Parquet sink writes Arrow `RecordBatch`es natively, so it opts into
@@ -601,30 +606,11 @@ impl faucet_core::Sink for ParquetSink {
     /// can hand batches straight through without materializing
     /// `serde_json::Value` rows.
     #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.remote.as_ref().is_none_or(|r| r.supports_columnar())
-    }
-
-    /// Write an Arrow `RecordBatch` directly, bypassing the
-    /// `Value` → `RecordBatch` conversion `write_batch` performs. Routes
-    /// through the same `write_record_batch` tail (the private writer path)
-    /// so schema inference (from the batch's own schema on first use), lazy
-    /// writer open, and row/byte rollover all behave identically to the JSON
-    /// path. Returns the number of rows written.
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
-        &self,
-        batch: &arrow::record_batch::RecordBatch,
-    ) -> Result<usize, FaucetError> {
-        if let Some(remote) = &self.remote {
-            return remote.write_batch_columnar(batch).await;
-        }
-        if batch.num_rows() == 0 {
-            return Ok(0);
-        }
-        let mut state = self.state.lock().await;
-        self.continue_published(&mut state).await?;
-        self.write_record_batch(&mut state, batch).await
+    fn columnar(&self) -> Option<&dyn faucet_core::driver::ColumnarDriver> {
+        self.remote
+            .as_ref()
+            .is_none_or(|r| r.supports_columnar())
+            .then_some(self as &dyn faucet_core::driver::ColumnarDriver)
     }
 
     /// Make buffered output durable.
@@ -635,7 +621,7 @@ impl faucet_core::Sink for ParquetSink {
     /// (writing the footer / completing the S3 multipart) — the next page
     /// opens a fresh file. Rows written after the last `flush()` are not
     /// persisted.
-    async fn flush(&self) -> Result<(), FaucetError> {
+    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
         if let Some(remote) = &self.remote {
             return remote.flush().await;
         }
@@ -656,7 +642,7 @@ impl faucet_core::Sink for ParquetSink {
     /// directory and S3 destinations write a new UUID-named object per file and
     /// have nothing stale at a fixed name. Only reached after a successful,
     /// uncancelled run.
-    async fn complete_run(&self) -> Result<(), FaucetError> {
+    async fn complete_run(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
         if let Some(remote) = &self.remote {
             return remote.complete_run().await;
         }
@@ -680,6 +666,7 @@ impl faucet_core::Sink for ParquetSink {
     /// destination it is the S3 backend's non-mutating `HeadBucket`.
     async fn check(
         &self,
+        _calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
@@ -741,6 +728,62 @@ impl faucet_core::Sink for ParquetSink {
             ),
         };
         Ok(CheckReport::single(probe))
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[async_trait]
+impl faucet_core::driver::ColumnarDriver for ParquetDriver {
+    /// Write an Arrow `RecordBatch` directly, bypassing the
+    /// `Value` → `RecordBatch` conversion `write_batch` performs. Routes
+    /// through the same `write_record_batch` tail (the private writer path)
+    /// so schema inference (from the batch's own schema on first use), lazy
+    /// writer open, and row/byte rollover all behave identically to the JSON
+    /// path. Returns the number of rows written.
+    async fn write_columnar(
+        &self,
+        _calls: &CallSlot,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        if let Some(remote) = &self.remote {
+            return remote.write_batch_columnar(batch).await;
+        }
+        if batch.num_rows() == 0 {
+            return Ok(0);
+        }
+        let mut state = self.state.lock().await;
+        self.continue_published(&mut state).await?;
+        self.write_record_batch(&mut state, batch).await
+    }
+}
+
+impl ParquetDriver {
+    async fn write_records(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        if let Some(remote) = &self.remote {
+            return remote.write_batch(records).await;
+        }
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let mut state = self.state.lock().await;
+
+        // Re-chunk the incoming page when the config asks for it. `batch_size
+        // = 0` is the "no batching" sentinel: pass the page straight through.
+        // Otherwise we slice into `batch_size`-sized windows and run the
+        // existing write path once per chunk. Row/byte rollover logic is
+        // applied per chunk and remains independent of `batch_size`.
+        let chunk_size = self.config.batch_size;
+        let mut total_rows = 0;
+        if chunk_size == 0 || records.len() <= chunk_size {
+            total_rows += self.write_chunk(&mut state, records).await?;
+        } else {
+            for chunk in records.chunks(chunk_size) {
+                total_rows += self.write_chunk(&mut state, chunk).await?;
+            }
+        }
+
+        Ok(total_rows)
     }
 }
 
@@ -1377,7 +1420,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg(tmp.path()).compression(ParquetCompression::Zstd);
         let sink = ParquetSink::new(cfg).await.unwrap();
-        let props = sink.writer_properties();
+        let props = sink.d().writer_properties();
         assert!(matches!(
             props.compression(&parquet::schema::types::ColumnPath::new(vec![
                 "any".to_string(),
@@ -1718,10 +1761,11 @@ mod tests {
         let sink = ParquetSink::new(cfg).await.unwrap();
 
         {
-            let mut state = sink.state.lock().await;
+            let mut state = sink.d().state.lock().await;
             // Simulate a written-into file: schema locked, a row counted, and a
             // dropped field warned-about.
-            sink.write_chunk(&mut state, &[json!({"id": 1})])
+            sink.d()
+                .write_chunk(&mut state, &[json!({"id": 1})])
                 .await
                 .unwrap();
             assert!(
@@ -1731,7 +1775,7 @@ mod tests {
             state.warned_fields.insert("ghost".to_string());
             assert_eq!(state.rows_in_current_file, 1);
 
-            sink.close_current(&mut state).await.unwrap();
+            sink.d().close_current(&mut state).await.unwrap();
 
             assert!(
                 state.schema.is_none(),

@@ -145,3 +145,19 @@ async fn descriptor_matches_built_sink() {
         &built,
     );
 }
+
+/// RFC 0014: the sink runs on the family-neutral sink driver (a local
+/// destination; an S3 one is the shared file sink, itself driver-built).
+#[tokio::test]
+async fn conformance_driver_truthful() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = ParquetSink::new(ParquetSinkConfig::local(
+        dir.path().to_string_lossy().to_string(),
+    ))
+    .await
+    .unwrap();
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    sink.flush().await.unwrap();
+    assert_eq!(count_rows(dir.path()).await, 12);
+}

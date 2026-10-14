@@ -373,6 +373,17 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## How it is built
+
+The (deprecated) sink runs on the family-neutral sink driver (RFC 0014):
+`ParquetDriver` implements `faucet_core::driver::SinkDriver` (plus
+`ColumnarDriver`, so Arrow batches go straight to the writer) — encode and
+write a page, roll files over, publish or close on flush, clear a stale
+single file on an empty run — and `ParquetSink` wraps it in a `DriverSink`,
+which serves the plain, reported and per-row write paths with row accounting.
+An S3 destination is handed to the shared file sink over the S3 backend, which
+is itself driver-built. The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
