@@ -39,6 +39,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// A boxed, sendable backend operation, as [`SqlDriver::guard`] wraps it.
 pub type SqlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FaucetError>> + Send + 'a>>;
 
+/// A backend's schema evolution (RFC 0014), returned by
+/// [`SqlDriver::evolution`]: implementing it and declaring it are one step.
+#[faucet_core::async_trait]
+pub trait SqlEvolution: Send + Sync {
+    /// The destination's column names, for a dialect without `ADD COLUMN IF
+    /// NOT EXISTS`; `None` when every step is idempotent as written.
+    async fn existing_columns(&self) -> Result<Option<HashSet<String>>, FaucetError> {
+        Ok(None)
+    }
+
+    /// Apply the evolution steps, in order.
+    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError>;
+}
+
 /// Which write an [`SqlDriver::insert`] call serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -214,25 +228,10 @@ pub trait SqlDriver: Send + Sync {
     /// The live destination schema, or `None` (missing table, JSON layout).
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError>;
 
-    /// Whether [`apply_evolution`](Self::apply_evolution) is implemented;
-    /// override both together.
-    fn evolvable(&self) -> bool {
-        false
-    }
-
-    /// The destination's column names, for a dialect without `ADD COLUMN IF
-    /// NOT EXISTS`; `None` when every step is idempotent as written.
-    async fn existing_columns(&self) -> Result<Option<HashSet<String>>, FaucetError> {
-        Ok(None)
-    }
-
-    /// Apply the evolution steps, in order.
-    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
-        let _ = steps;
-        Err(FaucetError::Sink(format!(
-            "sink '{}' does not support schema evolution",
-            self.connector_name()
-        )))
+    /// The backend's schema evolution, or `None` when it cannot evolve:
+    /// returning the group is what declares the capability.
+    fn evolution(&self) -> Option<&dyn SqlEvolution> {
+        None
     }
 
     /// Bound one sink operation (`what` is its call label: `"write_batch"`,
@@ -360,6 +359,7 @@ pub trait SqlDriver: Send + Sync {
 pub struct SqlSinkDriver<D> {
     driver: D,
     table_ready: AtomicBool,
+    token_table_ready: AtomicBool,
 }
 
 impl<D: SqlDriver> SqlSinkDriver<D> {
@@ -368,6 +368,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         Self {
             driver,
             table_ready: AtomicBool::new(false),
+            token_table_ready: AtomicBool::new(false),
         }
     }
 
@@ -438,12 +439,17 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
     }
 
     async fn ensure_token_table(&self) -> Result<(), FaucetError> {
+        if self.token_table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.driver
             .ddl(
                 &self.engine().dialect().commit_token_table_sql(),
                 label::CREATE_TOKEN_TABLE,
             )
-            .await
+            .await?;
+        self.token_table_ready.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Apply keyed write groups in one transaction.
@@ -735,11 +741,9 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
             };
             self.driver.write_token(&mut conn, scope, token).await?;
             self.driver.commit(conn).await?;
-            Ok(if self.engine().write_spec().dedups_by_key() {
-                WriteReport::keyed(rows.len(), written)
-            } else {
-                WriteReport::accepted(written)
-            })
+            Ok(self
+                .engine()
+                .report(rows.len(), written, plans.as_deref().unwrap_or(&[])))
         })
         .await
     }
@@ -778,7 +782,7 @@ impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
     }
 
     fn evolvable(&self) -> bool {
-        self.driver.evolvable()
+        self.driver.evolution().is_some()
     }
 
     async fn evolve(
@@ -787,9 +791,15 @@ impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
         evolution: &SchemaEvolution,
     ) -> Result<(), FaucetError> {
         self.op(calls, "evolve_schema", async {
-            let existing = self.driver.existing_columns().await?;
+            let evolve = self.driver.evolution().ok_or_else(|| {
+                FaucetError::Sink(format!(
+                    "sink '{}' does not support schema evolution",
+                    self.driver.connector_name()
+                ))
+            })?;
+            let existing = evolve.existing_columns().await?;
             let steps = self.engine().evolution_steps(evolution, existing.as_ref());
-            self.driver.apply_evolution(steps).await
+            evolve.apply_evolution(steps).await
         })
         .await
     }
@@ -1051,5 +1061,43 @@ mod tests {
             "{:?}",
             sink.driver().driver().log()
         );
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)] // the exactly-once hook the engine still drives (#888)
+    async fn an_exactly_once_keyed_page_reports_planned_rows_not_affected_rows() {
+        let sink = DriverSink::new(SqlSinkDriver::new(
+            Mem::new(SqlLayout::new("t").create_table(false), true).keyed(false),
+        ));
+        let report = sink
+            .write_batch_idempotent_reported(
+                &[json!({"id": 1}), json!({"id": 1}), json!({"id": 2})],
+                "scope",
+                "0000001",
+            )
+            .await
+            .unwrap();
+        assert_eq!((report.accepted, report.coalesced), (2, 1));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)] // the exactly-once hooks the engine still drives (#888)
+    async fn the_token_table_is_created_once_per_sink() {
+        let sink = DriverSink::new(SqlSinkDriver::new(Mem::new(
+            SqlLayout::new("t").create_table(false),
+            true,
+        )));
+        for token in ["0000001", "0000002"] {
+            sink.last_committed_token("scope").await.unwrap();
+            sink.write_batch_idempotent(&[json!({"id": 1})], "scope", token)
+                .await
+                .unwrap();
+        }
+        let ddl = sink.driver().driver().log();
+        let creates = ddl
+            .iter()
+            .filter(|q| q.contains("_faucet_commit_token") && q.starts_with("CREATE"))
+            .count();
+        assert_eq!(creates, 1, "{ddl:?}");
     }
 }

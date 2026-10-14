@@ -129,9 +129,9 @@ impl<'a> GovernedPage<'a> {
 /// Dead-letter envelopes built from governed records — the only thing the
 /// engine's DLQ writer accepts.
 ///
-/// The governance passes produce the quarantine envelopes; a sink failure adds
-/// one per failed row with [`push_failure`](Self::push_failure), which takes
-/// the governed page the row came from.
+/// The governance passes produce the quarantine envelopes, and the engine adds
+/// one per failed sink row from the governed page the row came from; only
+/// `faucet-core` can build or extend them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GovernedEnvelopes {
     envelopes: Vec<Value>,
@@ -139,7 +139,7 @@ pub struct GovernedEnvelopes {
 
 impl GovernedEnvelopes {
     /// No envelope.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -149,7 +149,7 @@ impl GovernedEnvelopes {
 
     /// Add the envelope `build` makes from record `index` of `page`. Panics
     /// when `index` is out of bounds.
-    pub fn push_failure(
+    pub(crate) fn push_failure(
         &mut self,
         page: &GovernedPage<'_>,
         index: usize,
@@ -159,7 +159,7 @@ impl GovernedEnvelopes {
     }
 
     /// Put `earlier`'s envelopes ahead of these, keeping both orders.
-    pub fn prepend(&mut self, earlier: GovernedEnvelopes) {
+    pub(crate) fn prepend(&mut self, earlier: GovernedEnvelopes) {
         self.envelopes.splice(0..0, earlier.envelopes);
     }
 

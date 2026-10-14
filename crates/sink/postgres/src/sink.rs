@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use faucet_common_sql::dialects::Postgres;
 use faucet_common_sql::driver::label;
 use faucet_common_sql::{
-    EvolutionStep, InsertPath, SplitPage, SqlDialect, SqlDriver, SqlExecutor, SqlFuture, SqlLayout,
-    SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
+    EvolutionStep, InsertPath, SplitPage, SqlDialect, SqlDriver, SqlEvolution, SqlExecutor,
+    SqlFuture, SqlLayout, SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn,
+    TableTarget,
 };
 use faucet_core::FaucetError;
 use faucet_core::driver::{DriverSink, RollbackDriver};
@@ -1359,48 +1360,8 @@ impl SqlDriver for PostgresDriver {
         ))
     }
 
-    /// Apply an additive schema evolution (new columns, lossless widenings,
-    /// nullability relaxations) to the destination table. Idempotent —
-    /// `ADD COLUMN IF NOT EXISTS`, and re-running the same TYPE / DROP NOT NULL
-    /// is a no-op (issue #194).
-    fn evolvable(&self) -> bool {
-        true
-    }
-
-    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
-        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres evolve acquire failed: {e}")))?;
-        for step in steps {
-            let (sql, what, column) = match step {
-                EvolutionStep::Add { column, base } => (
-                    build_add_column_sql(&table_ref, &column, base),
-                    "ADD COLUMN",
-                    column,
-                ),
-                EvolutionStep::Widen {
-                    column, type_name, ..
-                } => (
-                    build_alter_type_sql(&table_ref, &column, type_name),
-                    "ALTER TYPE",
-                    column,
-                ),
-                EvolutionStep::Relax { column } => (
-                    build_drop_not_null_sql(&table_ref, &column),
-                    "DROP NOT NULL",
-                    column,
-                ),
-                _ => continue,
-            };
-            sqlx::query(&sql)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("postgres {what} {column} failed: {e}")))?;
-        }
-        Ok(())
+    fn evolution(&self) -> Option<&dyn SqlEvolution> {
+        Some(self)
     }
 
     /// `COPY` serves plain pages under `write_method: copy`; the exactly-once
@@ -1455,6 +1416,49 @@ impl SqlDriver for PostgresDriver {
 
     fn readback_source(&self) -> Option<(String, Value)> {
         self.readback_source_impl()
+    }
+}
+
+#[async_trait]
+impl SqlEvolution for PostgresDriver {
+    /// Apply an additive schema evolution (new columns, lossless widenings,
+    /// nullability relaxations) to the destination table. Idempotent —
+    /// `ADD COLUMN IF NOT EXISTS`, and re-running the same TYPE / DROP NOT NULL
+    /// is a no-op (issue #194).
+    async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
+        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres evolve acquire failed: {e}")))?;
+        for step in steps {
+            let (sql, what, column) = match step {
+                EvolutionStep::Add { column, base } => (
+                    build_add_column_sql(&table_ref, &column, base),
+                    "ADD COLUMN",
+                    column,
+                ),
+                EvolutionStep::Widen {
+                    column, type_name, ..
+                } => (
+                    build_alter_type_sql(&table_ref, &column, type_name),
+                    "ALTER TYPE",
+                    column,
+                ),
+                EvolutionStep::Relax { column } => (
+                    build_drop_not_null_sql(&table_ref, &column),
+                    "DROP NOT NULL",
+                    column,
+                ),
+                _ => continue,
+            };
+            sqlx::query(&sql)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("postgres {what} {column} failed: {e}")))?;
+        }
+        Ok(())
     }
 }
 

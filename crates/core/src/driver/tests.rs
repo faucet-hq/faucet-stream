@@ -749,6 +749,7 @@ struct Broker {
     hang_group: Mutex<Option<usize>>,
     groups: AtomicUsize,
     transport_down: AtomicBool,
+    down_from_group: Mutex<Option<usize>>,
     hang_flush: AtomicBool,
     timeout: Option<Duration>,
     size: usize,
@@ -790,7 +791,13 @@ impl MessageDriver for Broker {
         group: Vec<OutboundMessage>,
     ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
         let g = self.groups.fetch_add(1, Ordering::SeqCst);
-        if self.transport_down.load(Ordering::SeqCst) {
+        if self.transport_down.load(Ordering::SeqCst)
+            || self
+                .down_from_group
+                .lock()
+                .unwrap()
+                .is_some_and(|from| g >= from)
+        {
             return Err(FaucetError::Sink("transport down".into()));
         }
         if *self.hang_group.lock().unwrap() == Some(g) {
@@ -1788,4 +1795,60 @@ fn pages_of_chunks_and_puts_the_bookmark_last() {
     assert_eq!(empty.len(), 1);
     assert!(empty[0].records.is_empty());
     assert_eq!(pages_of(Vec::new(), None, 10).count(), 0);
+}
+
+#[tokio::test]
+async fn a_later_group_lost_to_the_transport_fails_only_its_own_rows() {
+    let broker = Broker {
+        size: 2,
+        ..Broker::default()
+    };
+    *broker.down_from_group.lock().unwrap() = Some(1);
+    let sink = DriverSink::new(MessageSinkDriver::new(broker));
+    let rows: Vec<Value> = (0..5).map(|i| json!({"to": format!("s{i}")})).collect();
+    let out = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(out[0].is_ok() && out[1].is_ok(), "{out:?}");
+    assert!(out[2..].iter().all(|o| matches!(
+        o,
+        Err(FaucetError::Sink(m)) if m.contains("broker publish") && m.contains("transport down")
+    )));
+    assert_eq!(sink.driver().driver().published.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_buffered_read_without_a_limit_stops_after_one_default_page() {
+    let n = crate::pipeline::DEFAULT_BATCH_SIZE + 5;
+    let source = DriverSource::new(MessageSourceDriver::new(Queue::of(n, None)));
+    let rows = source.fetch_all().await.unwrap();
+    assert_eq!(rows.len(), crate::pipeline::DEFAULT_BATCH_SIZE);
+    assert!(source.driver().consumer().acked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_whole_page_write_that_loses_rows_fails() {
+    struct Short;
+    #[async_trait]
+    impl SinkDriver for Short {
+        fn connector_name(&self) -> &'static str {
+            "short"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            _: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(2))
+        }
+    }
+    let sink = DriverSink::new(Short);
+    let rows = [json!({}), json!({}), json!({})];
+    assert!(matches!(
+        sink.write_batch(&rows).await,
+        Err(FaucetError::RowsUnaccounted {
+            offered: 3,
+            accepted: 2
+        })
+    ));
+    assert!(sink.write_batch_reported(&rows).await.is_err());
 }

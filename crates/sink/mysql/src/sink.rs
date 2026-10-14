@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use faucet_common_sql::dialects::{Mysql, mysql};
 use faucet_common_sql::driver::label;
 use faucet_common_sql::{
-    EvolutionStep, SplitPage, SqlDialect, SqlDriver, SqlExecutor, SqlFuture, SqlLayout,
-    SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
+    EvolutionStep, SplitPage, SqlDialect, SqlDriver, SqlEvolution, SqlExecutor, SqlFuture,
+    SqlLayout, SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
 };
 use faucet_core::driver::{DriverSink, RollbackDriver};
 use faucet_core::{FaucetError, SqlBaseType};
@@ -1697,6 +1697,38 @@ impl SqlDriver for MysqlDriver {
         ))
     }
 
+    fn evolution(&self) -> Option<&dyn SqlEvolution> {
+        Some(self)
+    }
+
+    /// A binary value `binary_encoding` refuses fails only its own row.
+    fn split_page(
+        &self,
+        _target: &TableTarget,
+        records: &[Value],
+        columns: &[TableColumn],
+        require_match: bool,
+    ) -> SplitPage {
+        split_columns(records, columns, self.config.binary_encoding, require_match)
+    }
+
+    fn splits_keyed_pages(&self) -> bool {
+        true
+    }
+
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        Some(self)
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
+    }
+}
+
+#[async_trait]
+impl SqlEvolution for MysqlDriver {
     /// MySQL has no `ADD COLUMN IF NOT EXISTS` (pre-8.0.x), so the current
     /// column set is read first and an addition already present is skipped.
     async fn existing_columns(
@@ -1716,10 +1748,6 @@ impl SqlDriver for MysqlDriver {
     /// Widenings use `MODIFY COLUMN` (re-running the same MODIFY is a no-op);
     /// nullability relaxations re-emit the column as its current definition
     /// with an explicit `NULL`.
-    fn evolvable(&self) -> bool {
-        true
-    }
-
     async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
         let table_ref = quote_ident_mysql(&self.config.table_name);
         let mut conn = self
@@ -1787,31 +1815,6 @@ impl SqlDriver for MysqlDriver {
             }
         }
         Ok(())
-    }
-
-    /// A binary value `binary_encoding` refuses fails only its own row.
-    fn split_page(
-        &self,
-        _target: &TableTarget,
-        records: &[Value],
-        columns: &[TableColumn],
-        require_match: bool,
-    ) -> SplitPage {
-        split_columns(records, columns, self.config.binary_encoding, require_match)
-    }
-
-    fn splits_keyed_pages(&self) -> bool {
-        true
-    }
-
-    /// Column-mapping mode only: the run-id column, the journaled keys and the
-    /// kept previous table all address real columns (#706).
-    fn rollback(&self) -> Option<&dyn RollbackDriver> {
-        Some(self)
-    }
-
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.readback_source_impl()
     }
 }
 

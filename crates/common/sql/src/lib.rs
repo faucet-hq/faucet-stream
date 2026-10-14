@@ -53,7 +53,7 @@ pub mod mapping;
 pub mod statement;
 
 pub use dialect::{SqlDialect, TableTarget};
-pub use driver::{InsertPath, SqlDriver, SqlFuture, SqlLayout, SqlSinkDriver};
+pub use driver::{InsertPath, SqlDriver, SqlEvolution, SqlFuture, SqlLayout, SqlSinkDriver};
 pub use engine::{
     EngineOptions, EvolutionStep, SplitPage, SqlExecutor, SqlSinkEngine, check_cleanup_columns,
     no_match_message, split_page,

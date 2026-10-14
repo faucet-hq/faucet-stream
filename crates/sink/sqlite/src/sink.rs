@@ -4,8 +4,8 @@ use crate::config::{SqliteColumnMapping, SqliteSinkConfig};
 use async_trait::async_trait;
 use faucet_common_sql::dialects::{Sqlite, sqlite};
 use faucet_common_sql::{
-    EngineOptions, EvolutionStep, SqlDialect, SqlDriver, SqlExecutor, SqlLayout, SqlSinkDriver,
-    SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
+    EngineOptions, EvolutionStep, SqlDialect, SqlDriver, SqlEvolution, SqlExecutor, SqlLayout,
+    SqlSinkDriver, SqlSinkEngine, Statement, StatementKind, TableColumn, TableTarget,
 };
 #[cfg(test)]
 use faucet_core::SchemaEvolution;
@@ -836,6 +836,23 @@ impl SqlDriver for SqliteDriver {
         ))
     }
 
+    fn evolution(&self) -> Option<&dyn SqlEvolution> {
+        Some(self)
+    }
+
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        Some(self)
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
+    }
+}
+
+#[async_trait]
+impl SqlEvolution for SqliteDriver {
     /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the current columns are
     /// read first and an addition already present is skipped.
     async fn existing_columns(
@@ -864,10 +881,6 @@ impl SqlDriver for SqliteDriver {
     /// - **Nullability relaxations** — a no-op: SQLite cannot drop a `NOT NULL`
     ///   constraint in place (it requires a full table rebuild, which is out of
     ///   scope here). Logged at `debug`; the column is left as-is.
-    fn evolvable(&self) -> bool {
-        true
-    }
-
     async fn apply_evolution(&self, steps: Vec<EvolutionStep>) -> Result<(), FaucetError> {
         let mut widened = false;
         for step in steps {
@@ -897,16 +910,6 @@ impl SqlDriver for SqliteDriver {
             }
         }
         Ok(())
-    }
-
-    /// Column-mapping mode only: the run-id column, the journaled keys and the
-    /// kept previous table all address real columns (#706).
-    fn rollback(&self) -> Option<&dyn RollbackDriver> {
-        Some(self)
-    }
-
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.readback_source_impl()
     }
 }
 

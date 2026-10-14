@@ -3939,6 +3939,18 @@ struct CapturingSink {
 }
 
 impl CapturingSink {
+    /// Record the rows `report` says landed (a capped inner sink may drop some).
+    async fn capture(&self, records: &[Value], report: &faucet_core::WriteReport) {
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+    }
+
     fn wrap(
         inner: Box<dyn Sink>,
         captured: Arc<Mutex<Vec<Value>>>,
@@ -3967,14 +3979,7 @@ impl Sink for CapturingSink {
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let report = self.inner.write_batch_reported(records).await?;
-        let n = (report.accepted + report.coalesced).min(records.len());
-        let mut buf = self.captured.lock().await;
-        buf.extend(
-            records
-                .iter()
-                .take(n)
-                .map(|r| project_record(r, &self.projection)),
-        );
+        self.capture(records, &report).await;
         Ok(report)
     }
 
@@ -3982,16 +3987,8 @@ impl Sink for CapturingSink {
         &self,
         page: &faucet_core::governance::GovernedPage<'_>,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
-        let records = page.records();
         let report = self.inner.write_governed(page).await?;
-        let n = (report.accepted + report.coalesced).min(records.len());
-        let mut buf = self.captured.lock().await;
-        buf.extend(
-            records
-                .iter()
-                .take(n)
-                .map(|r| project_record(r, &self.projection)),
-        );
+        self.capture(page.records(), &report).await;
         Ok(report)
     }
 
@@ -4078,6 +4075,29 @@ pub(crate) struct LimitedSink {
 }
 
 impl LimitedSink {
+    /// Write the first rows of a `len`-row page that fit under the cap through
+    /// `write(take)`; the rest are reported as skipped.
+    async fn capped<F, Fut>(
+        &self,
+        len: usize,
+        write: F,
+    ) -> Result<faucet_core::WriteReport, FaucetError>
+    where
+        F: FnOnce(usize) -> Fut,
+        Fut: std::future::Future<Output = Result<faucet_core::WriteReport, FaucetError>>,
+    {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let take = remaining.min(len);
+        let report = if take == 0 {
+            faucet_core::WriteReport::default()
+        } else {
+            write(take).await?
+        };
+        self.remaining
+            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
+        Ok(report.with_skipped(report.skipped + (len - take)))
+    }
+
     pub(crate) fn wrap(inner: Box<dyn Sink>, cap: usize) -> Self {
         Self {
             inner,
@@ -4133,32 +4153,20 @@ impl Sink for LimitedSink {
         &self,
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
-        let remaining = self.remaining.load(Ordering::Relaxed);
-        let take = remaining.min(records.len());
-        let report = if take == 0 {
-            faucet_core::WriteReport::default()
-        } else {
-            self.inner.write_batch_reported(&records[..take]).await?
-        };
-        self.remaining
-            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
-        Ok(report.with_skipped(report.skipped + (records.len() - take)))
+        self.capped(records.len(), |take| {
+            self.inner.write_batch_reported(&records[..take])
+        })
+        .await
     }
 
     async fn write_governed(
         &self,
         page: &faucet_core::governance::GovernedPage<'_>,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
-        let remaining = self.remaining.load(Ordering::Relaxed);
-        let take = remaining.min(page.len());
-        let report = if take == 0 {
-            faucet_core::WriteReport::default()
-        } else {
-            self.inner.write_governed(&page.slice(0..take)).await?
-        };
-        self.remaining
-            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
-        Ok(report.with_skipped(report.skipped + (page.len() - take)))
+        self.capped(page.len(), |take| async move {
+            self.inner.write_governed(&page.slice(0..take)).await
+        })
+        .await
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);

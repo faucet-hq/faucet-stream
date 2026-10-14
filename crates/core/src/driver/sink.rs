@@ -530,6 +530,7 @@ impl<D: SinkDriver> DriverSink<D> {
         if let Some((_, e)) = w.failed.into_iter().min_by_key(|(i, _)| *i) {
             return Err(e);
         }
+        w.report.check(records.len())?;
         Ok(w.report)
     }
 }

@@ -290,7 +290,12 @@ impl<D: MessageDriver> MessageSinkDriver<D> {
                         results.len()
                     )));
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) if g == 0 => return Err(e),
+                Ok(Err(e)) => {
+                    let name = self.driver.connector_name();
+                    fail_open(&mut outcomes[base..], || cut(name, &e));
+                    return Ok(outcomes);
+                }
                 Err(FaucetError::Timeout { after, .. }) => {
                     let after = self.driver.group_timeout().unwrap_or(after);
                     fail_open(&mut outcomes[base..], || self.timeout("publish", after));
@@ -580,7 +585,7 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
         _context: &'a HashMap<String, Value>,
         batch_size: usize,
     ) -> PageStream<'a> {
-        self.pages(calls, batch_size, true)
+        self.pages(calls, batch_size, true, self.consumer.max_messages())
     }
 
     async fn fetch(
@@ -588,7 +593,11 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
         calls: &CallSlot,
         _context: &HashMap<String, Value>,
     ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
-        let mut pages = self.pages(calls, 0, false);
+        let cap = self
+            .consumer
+            .max_messages()
+            .unwrap_or(crate::pipeline::DEFAULT_BATCH_SIZE);
+        let mut pages = self.pages(calls, 0, false, Some(cap));
         let mut rows = Vec::new();
         let mut bookmark = None;
         while let Some(page) = pages.next().await {
@@ -619,9 +628,18 @@ impl<C: MessageConsumer> SourceDriver for MessageSourceDriver<C> {
 }
 
 impl<C: MessageConsumer> MessageSourceDriver<C> {
-    /// The page stream; `ack: false` never acknowledges, so a buffered read
-    /// leaves every message for the broker to redeliver.
-    fn pages<'a>(&'a self, calls: &'a CallSlot, batch_size: usize, ack: bool) -> PageStream<'a> {
+    /// The page stream, ending after `limit` messages. A queue has no end, so
+    /// `batch_size` 0 pages by the default size rather than meaning one page.
+    /// `ack: false` never acknowledges, so a buffered read leaves every message
+    /// for the broker to redeliver; its `limit` keeps a redelivered message
+    /// from extending the read forever.
+    fn pages<'a>(
+        &'a self,
+        calls: &'a CallSlot,
+        batch_size: usize,
+        ack: bool,
+        limit: Option<usize>,
+    ) -> PageStream<'a> {
         let per_page = if batch_size == 0 {
             crate::pipeline::DEFAULT_BATCH_SIZE
         } else {
@@ -634,7 +652,7 @@ impl<C: MessageConsumer> MessageSourceDriver<C> {
                 if ack {
                     self.ack_pending(calls).await?;
                 }
-                let room = match self.consumer.max_messages() {
+                let room = match limit {
                     Some(max) if consumed >= max => break,
                     Some(max) => per_page.min(max - consumed),
                     None => per_page,
