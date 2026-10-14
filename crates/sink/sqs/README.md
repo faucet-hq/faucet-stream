@@ -97,6 +97,18 @@ metered as a `put` round trip. The per-entry partial-failure retry and its
 backoff (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`) are unchanged;
 the backoff waits through the same context, so a deadline ends it.
 
+## How it is built
+
+The sink runs on the messaging family driver (RFC 0014): `SqsDriver`
+implements `faucet_core::driver::MessageDriver` — encode a record (JSON body,
+the 1 MiB limit, the FIFO group and deduplication id) and publish a page's
+messages (size-aware `SendMessageBatch` chunks, bounded concurrency or one
+request at a time on a FIFO queue, per-entry retry) — and `MessageSinkDriver`
+reports each row and serves the plain, reported and per-row write paths. The
+driver makes its own `put` calls (`publish_is_one_call` is `false`), so the
+round-trip labels and retry behaviour are unchanged. The public type and
+config are unchanged.
+
 ## License
 
 MIT OR Apache-2.0

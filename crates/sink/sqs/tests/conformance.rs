@@ -130,6 +130,9 @@ async fn conformance_capabilities_truthful() {
     // The honest branch must have left the append-only sink non-idempotent.
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
+    // RFC 0014: the sink runs on the messaging family driver.
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 }
 
 /// Records up to the 1 MiB SQS limit are sent (the old 256 KiB cap refused
