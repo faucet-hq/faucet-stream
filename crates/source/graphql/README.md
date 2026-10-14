@@ -485,6 +485,17 @@ Redirects are followed by `faucet_core::http::Client`: a hop to another
 origin drops `Authorization`, cookies and every credential header, and a request
 body is never replayed to another origin.
 
+## How it is built
+
+The source runs on the family-neutral source driver (RFC 0014):
+`GraphqlDriver` implements `faucet_core::driver::SourceDriver` — `read`
+streams one page per response (cursor / offset pagination, incremental
+binding, bookmark on the final page), `resume_from` restores the bookmark,
+and `fetch` keeps the buffered path — and `GraphqlStream` wraps it in a
+`DriverSource`, which owns the run's call context and hands it to every
+request (op label `request`, this source's retry policy as its local
+default). The public type and config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
