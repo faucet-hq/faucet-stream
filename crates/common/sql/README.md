@@ -50,6 +50,21 @@ pub struct AcmeSink { inner: DriverSink<SqlSinkDriver<AcmeDriver>> }
 `SqlLayout` says where the sink writes (table, JSON column, `create_table`,
 `batch_size`). `faucet-sink-sqlite` is the reference implementation.
 
+A backend whose rules differ overrides a defaulted hook rather than the
+lifecycle; every default reproduces the generic behaviour:
+
+| Hook | Default | Overridden by |
+|---|---|---|
+| `insert(conn, target, rows, InsertPath)` | the engine's mapped or JSON-column insert | postgres: `COPY` for a plain page, JSONB `unnest` |
+| `write_token(conn, scope, token)` | the engine's token upsert | mysql: the fitted scope key, retiring the pre-1.13 key |
+| `prepare_keyed_write()` | nothing | mysql: create the rollback journal before the transaction (DDL commits) |
+| `drop_staging(stale)` / `staging_exists()` | the staging table only | mysql: also the swap's `__faucet_ovw_old` table |
+| `staging_table()` | `SqlLayout::staging_table` | postgres: the name shortened to 63 bytes |
+| `split_page(..)` / `splits_keyed_pages()` | no-matching-column refusals, keyed pages unsplit | postgres, mysql: binary values the encoding refuses fail their row, keyed pages too |
+| `guard(what, fut)` | unbounded | postgres, mysql: `write_timeout_secs` per operation |
+| `table_display(table)` | as configured | postgres: the schema-qualified name |
+| `capabilities(derived)` | unchanged | postgres: scoped overwrite |
+
 ## Using the engine directly
 
 ```rust,ignore
@@ -80,10 +95,9 @@ catalog queries, and words its own errors per `StatementKind`.
 
 | Sink | Uses |
 |---|---|
-| sqlite | the SQL family driver (`SqlDriver` + `SqlSinkDriver`) |
-| postgres, mysql | the engine end to end, over an executor |
-| mssql | the dialect and the shared mapping; its own retry-classified chunk execution over `tiberius` |
-| duckdb | the engine's row planning, executed on the blocking driver |
+| sqlite, postgres, mysql | the SQL family driver (`SqlDriver` + `SqlSinkDriver`); postgres and mysql override the backend hooks |
+| mssql | the dialect and the shared mapping; its own retry-classified chunk execution over `tiberius`, on the core `SinkDriver` |
+| duckdb | the engine's row planning, executed on the blocking driver, on the core `SinkDriver` |
 | redshift, clickhouse, oracle, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; their own row handling |
 
 ## The planning matrix

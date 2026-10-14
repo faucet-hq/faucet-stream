@@ -798,6 +798,7 @@ mod tests {
         engine: SqlSinkEngine<Sqlite>,
         layout: SqlLayout,
         exists: bool,
+        split_keyed: bool,
         log: Mutex<Vec<String>>,
     }
 
@@ -807,8 +808,21 @@ mod tests {
                 engine: SqlSinkEngine::new(Sqlite, WriteSpec::default()),
                 layout,
                 exists,
+                split_keyed: false,
                 log: Mutex::new(Vec::new()),
             }
+        }
+        fn keyed(mut self, split: bool) -> Self {
+            self.engine = SqlSinkEngine::new(
+                Sqlite,
+                WriteSpec {
+                    write_mode: WriteMode::Upsert,
+                    key: vec!["id".into()],
+                    ..WriteSpec::default()
+                },
+            );
+            self.split_keyed = split;
+            self
         }
         fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
@@ -877,6 +891,59 @@ mod tests {
         }
         async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
             Ok(None)
+        }
+        fn splits_keyed_pages(&self) -> bool {
+            self.split_keyed
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backend_hooks_default_to_the_generic_lifecycle() {
+        let mem = Mem::new(SqlLayout::new("t"), true);
+        assert_eq!(mem.staging_table(), "t__faucet_ovw");
+        assert_eq!(mem.table_display("t"), "t");
+        assert!(!mem.splits_keyed_pages());
+        mem.prepare_keyed_write().await.unwrap();
+        let guarded = mem.guard("write_batch", Box::pin(async { Ok(7) })).await;
+        assert_eq!(guarded.unwrap(), 7);
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        assert!(sink.capabilities().overwrite());
+        assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(true));
+        sink.abort_overwrite().await.unwrap();
+        assert_eq!(
+            sink.driver().driver().log(),
+            ["DROP TABLE IF EXISTS `t__faucet_ovw`"]
+        );
+        assert_eq!(
+            sink.write_batch_idempotent(&[json!({"id": 1})], "s", "00001")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            sink.driver()
+                .driver()
+                .log()
+                .iter()
+                .any(|s| s.contains(faucet_core::idempotency::COMMIT_TOKEN_TABLE)),
+            "the default token write runs on the page's transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_splitting_backend_maps_keyed_failures_back_to_their_rows() {
+        for split in [true, false] {
+            let sink = DriverSink::new(SqlSinkDriver::new(
+                Mem::new(SqlLayout::new("t"), true).keyed(split),
+            ));
+            let outcomes = sink
+                .write_batch_partial(&[json!({"id": 1}), json!({"x": 2}), json!({"id": 3})])
+                .await
+                .unwrap();
+            assert!(
+                outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok(),
+                "split = {split}: {outcomes:?}"
+            );
         }
     }
 
