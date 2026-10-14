@@ -191,3 +191,24 @@ async fn conformance_declared_capabilities() {
     let overwrite = MysqlSink::new(cfg).await.expect("overwrite sink");
     faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
 }
+
+/// RFC 0014: the sink runs on the SQL family driver, so its capabilities follow
+/// the driver's primitives and its four write paths agree — for the keyed
+/// mode and for a JSON-column append, where cleanup and rollback are off.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_driver_declarations_and_row_paths() {
+    let (_container, _permit, url, sink) = fresh_sink().await;
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+
+    let json = MysqlSink::new(MysqlSinkConfig::new(&url, "jd").column_mapping(
+        MysqlColumnMapping::Json {
+            column: "data".into(),
+        },
+    ))
+    .await
+    .expect("json sink");
+    assert!(!json.supports_cleanup() && !json.supports_rollback());
+    faucet_conformance::assert_driver_declarations_truthful(&json).await;
+    faucet_conformance::assert_driver_row_paths_agree(&json).await;
+}

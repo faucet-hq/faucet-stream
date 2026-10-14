@@ -375,7 +375,7 @@ Drive it end-to-end via `Pipeline::new(source, sink).run()`.
 ## How it works
 
 1. `MysqlSink::new()` builds a `sqlx::MySqlPool` **once** with the configured `max_connections`.
-2. `write_batch()` slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT`.
+2. `write_batch()` slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT` in its own transaction.
 3. **JSON mode** — each record is serialized to a JSON string: `INSERT INTO t (col) VALUES (?), (?), ...`.
 4. **AutoMap mode** — column names are read from `INFORMATION_SCHEMA.COLUMNS` for the current database; a multi-row INSERT is built dynamically with `?` placeholders, bound as native MySQL types. The column set is the union of record keys across the batch; the INSERT is sub-chunked so `rows × columns` stays under the 65,535-placeholder limit.
 5. **Upsert/delete** — `plan_writes` partitions the page (last-write-wins) and the resulting upserts/deletes are applied in one transaction.
@@ -427,7 +427,7 @@ fails fast with the same error every table sink raises, naming both ways out.
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|delete`, otherwise **best-effort** — keyed writes run in one transaction; appends are autocommit statements. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|delete`, otherwise **best-effort** — keyed writes run in one transaction; appends commit one transaction per `batch_size` chunk, so a page of several chunks can land in part. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
@@ -452,6 +452,22 @@ the scoped-cleanup sequence, the commit-token write and the row report all come
 from the engine, so they behave the same here as in every other SQL sink. The
 sink supplies the connection (an executor over its driver) and keeps its own
 transactions, the unique-index check and the `RENAME TABLE` overwrite swap.
+
+## How it is built
+
+The sink runs on the SQL family driver (RFC 0014): `MysqlDriver` implements
+`faucet_common_sql::SqlDriver` — the transactions, the `information_schema`
+probes, the `LIKE` staging clone, the first-run `RENAME` publish and the swap
+(`RENAME TABLE`, or an in-place refill for a target with foreign keys or
+triggers), the cleanup of a swap's `__faucet_ovw_old` table, the fitted
+commit-token scope key, the rollback journal created before a keyed write
+opens its transaction (MySQL commits on DDL), the binary-column per-row
+refusal and the `write_timeout_secs` bound — and `SqlSinkDriver` drives
+writes, per-row outcomes, the exactly-once commit, cleanup, the overwrite
+lifecycle and schema evolution from it. `MysqlSink` wraps it in a
+`DriverSink`, so its capabilities follow the driver's primitives. Each append
+chunk is written in its own transaction. The public type and config are
+unchanged.
 
 ## License
 
