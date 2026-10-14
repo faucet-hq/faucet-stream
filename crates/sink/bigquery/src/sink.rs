@@ -5,9 +5,13 @@ use crate::idempotent;
 use crate::merge;
 use async_trait::async_trait;
 use faucet_common_bigquery::build_client;
-use faucet_core::FaucetError;
+use faucet_core::driver::{
+    CleanupDriver, CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver,
+    StagingDriver,
+};
 use faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL;
 use faucet_core::io::{CallContext, CallSlot};
+use faucet_core::{FaucetError, WriteReport};
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::error::BQError;
 use gcp_bigquery_client::model::get_query_results_parameters::GetQueryResultsParameters;
@@ -105,14 +109,12 @@ where
     }
 }
 
-/// The sink's call slot: the default attempt timeout, one attempt, and no
-/// round-trip metering (the `roundtrips` slot counts them).
-fn call_slot() -> CallSlot {
-    CallSlot::new(
-        CallContext::new()
-            .without_retry()
-            .with_roundtrip_metering(false),
-    )
+/// The sink's own call settings: the default attempt timeout, one attempt,
+/// and no round-trip metering (the `roundtrips` slot counts them).
+fn local_call_context() -> CallContext {
+    CallContext::new()
+        .without_retry()
+        .with_roundtrip_metering(false)
 }
 
 /// Request `jobs.cancel` for a job that outlived `job_timeout`, then poll it
@@ -865,7 +867,17 @@ impl UploadSession {
 
 /// A sink that writes JSON records to a BigQuery table using the streaming
 /// insert API (`tabledata.insertAll`).
+///
+/// Built on the family-neutral sink driver (RFC 0014): [`BigQueryDriver`]
+/// holds the load, `insertAll`, `MERGE` and transaction paths, and
+/// [`DriverSink`] drives the row writes, exactly-once, overwrite, cleanup and
+/// schema evolution from them. Native byte loading stays on this type.
 pub struct BigQuerySink {
+    inner: DriverSink<BigQueryDriver>,
+}
+
+/// The BigQuery I/O primitives the sink runs on.
+pub(crate) struct BigQueryDriver {
     config: BigQuerySinkConfig,
     client: Client,
     /// Target table schema, fetched lazily on the first exactly-once / upsert
@@ -910,10 +922,6 @@ pub struct BigQuerySink {
     /// `bytes_streamed` (estimated insertAll payload), `bytes_loaded` (media
     /// upload size), `bytes_billed` (a query job's `totalBytesBilled`).
     roundtrips: faucet_core::observability::RecorderSlot,
-    /// Backend-call context (#880): every request runs through it for the
-    /// run's timeout and deadline, once — writes are never re-sent here.
-    /// Round trips stay counted by `roundtrips`.
-    calls: CallSlot,
 }
 
 /// Connect timeout of the upload clients.
@@ -942,6 +950,86 @@ impl BigQuerySink {
     /// This initialises the BigQuery client and authenticates with GCP.
     /// Returns a [`FaucetError::Auth`] if authentication fails.
     pub async fn new(config: BigQuerySinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(BigQueryDriver::new(config).await?),
+        })
+    }
+
+    /// Construct a sink from a pre-built BigQuery client.
+    ///
+    /// This is a low-level escape hatch for callers that build their own
+    /// [`gcp_bigquery_client::Client`] — for example to target the
+    /// [`bigquery-emulator`](https://github.com/goccy/bigquery-emulator) via
+    /// [`ClientBuilder::with_v2_base_url`](gcp_bigquery_client::client_builder::ClientBuilder::with_v2_base_url),
+    /// or to drive a wiremock-backed test fixture. Production code should
+    /// prefer [`BigQuerySink::new`], which handles credential loading.
+    #[doc(hidden)]
+    pub fn from_parts(config: BigQuerySinkConfig, client: Client) -> Self {
+        Self {
+            inner: DriverSink::new(BigQueryDriver::from_parts(config, client)),
+        }
+    }
+}
+
+#[async_trait]
+impl faucet_core::Sink for BigQuerySink {
+    #[cfg(feature = "arrow")]
+    faucet_core::forward_sink!(
+        inner;
+        except capabilities,
+        native_load_capabilities,
+        load_native,
+        write_batch_columnar
+    );
+    #[cfg(not(feature = "arrow"))]
+    faucet_core::forward_sink!(
+        inner;
+        except capabilities,
+        native_load_capabilities,
+        load_native
+    );
+
+    /// The driver's capabilities, with native loading (which stays on this
+    /// type) included.
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        self.inner
+            .driver()
+            .capabilities(faucet_core::Capabilities::of_sink(self))
+    }
+
+    fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
+        self.inner.driver().native_load_capabilities()
+    }
+
+    async fn load_native(
+        &self,
+        batch: faucet_core::NativeBatch,
+        scope: &str,
+        ctx: faucet_core::NativeLoadContext,
+    ) -> Result<usize, FaucetError> {
+        self.inner
+            .driver()
+            .load_native(self.inner.calls(), batch, scope, ctx)
+            .await
+    }
+
+    /// A Parquet load job whatever the write mode, as before the driver: the
+    /// pipeline only negotiates it for `append` and `overwrite`.
+    #[cfg(feature = "arrow")]
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        use faucet_core::driver::ColumnarDriver as _;
+        self.inner
+            .driver()
+            .write_columnar(self.inner.calls(), batch)
+            .await
+    }
+}
+
+impl BigQueryDriver {
+    async fn new(config: BigQuerySinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         config.write.validate()?;
         #[cfg(feature = "arrow")]
@@ -961,7 +1049,6 @@ impl BigQuerySink {
             client,
             schema_cache: RwLock::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
-            calls: call_slot(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
@@ -973,22 +1060,12 @@ impl BigQuerySink {
         })
     }
 
-    /// Construct a sink from a pre-built BigQuery client.
-    ///
-    /// This is a low-level escape hatch for callers that build their own
-    /// [`gcp_bigquery_client::Client`] — for example to target the
-    /// [`bigquery-emulator`](https://github.com/goccy/bigquery-emulator) via
-    /// [`ClientBuilder::with_v2_base_url`](gcp_bigquery_client::client_builder::ClientBuilder::with_v2_base_url),
-    /// or to drive a wiremock-backed test fixture. Production code should
-    /// prefer [`BigQuerySink::new`], which handles credential loading.
-    #[doc(hidden)]
-    pub fn from_parts(config: BigQuerySinkConfig, client: Client) -> Self {
+    fn from_parts(config: BigQuerySinkConfig, client: Client) -> Self {
         Self {
             config,
             client,
             schema_cache: RwLock::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
-            calls: call_slot(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
@@ -1018,6 +1095,7 @@ impl BigQuerySink {
     /// [`write_batch_partial`]: faucet_core::Sink::write_batch_partial
     async fn insert_chunk_raw(
         &self,
+        calls: &CallSlot,
         rows: &[Value],
         skip_invalid_rows: bool,
     ) -> Result<TableDataInsertAllResponse, FaucetError> {
@@ -1045,7 +1123,7 @@ impl BigQuerySink {
             "bytes",
             faucet_core::usage::estimate_page_bytes(rows) as f64,
         );
-        call_once(&self.calls.get(), "insert", async {
+        call_once(&calls.get(), "insert", async {
             self.client
                 .tabledata()
                 .insert_all(
@@ -1067,7 +1145,7 @@ impl BigQuerySink {
     /// error granularity should use
     /// [`write_batch_partial`](faucet_core::Sink::write_batch_partial) instead,
     /// which calls [`insert_chunk_raw`](Self::insert_chunk_raw) directly.
-    async fn insert_batch(&self, rows: &[Value]) -> Result<usize, FaucetError> {
+    async fn insert_batch(&self, calls: &CallSlot, rows: &[Value]) -> Result<usize, FaucetError> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1076,7 +1154,7 @@ impl BigQuerySink {
         // whole chunk or nothing. Any `insertErrors` below becomes an outer
         // `Err`, so the pipeline aborts before the bookmark advances — no
         // partial commit to resume past.
-        let response = self.insert_chunk_raw(rows, false).await?;
+        let response = self.insert_chunk_raw(calls, rows, false).await?;
 
         // Check for per-row errors.
         if let Some(errors) = response.insert_errors
@@ -1122,8 +1200,11 @@ impl BigQuerySink {
     /// Fetch the target table's schema fields directly via `tables.get`, with no
     /// caching. Returns the raw [`idempotent::FieldSpec`]s (possibly empty for a
     /// schemaless table); a missing table surfaces as the client's `BQError`.
-    async fn fetch_schema_fields(&self) -> Result<Vec<idempotent::FieldSpec>, BQError> {
-        let table = retry_control_plane(&self.calls.get(), "tables.get (schema)", || {
+    async fn fetch_schema_fields(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<Vec<idempotent::FieldSpec>, BQError> {
+        let table = retry_control_plane(&calls.get(), "tables.get (schema)", || {
             faucet_common_bigquery::raw::tolerant_get_table(
                 &self.client,
                 self.raw_target(),
@@ -1153,20 +1234,20 @@ impl BigQuerySink {
     /// missing or schemaless table falls back to `infer` (the first page).
     async fn truncate_schema(
         &self,
+        calls: &CallSlot,
         table_id: &str,
         infer: impl FnOnce() -> Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
-        let existing =
-            retry_control_plane(&self.calls.get(), "tables.get (truncate schema)", || {
-                faucet_common_bigquery::raw::tolerant_get_table(
-                    &self.client,
-                    self.raw_target(),
-                    &self.config.project_id,
-                    &self.config.dataset_id,
-                    table_id,
-                )
-            })
-            .await;
+        let existing = retry_control_plane(&calls.get(), "tables.get (truncate schema)", || {
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                &self.config.dataset_id,
+                table_id,
+            )
+        })
+        .await;
         match existing {
             Ok(table) => Ok(existing_load_schema(&table.schema)?.or_else(infer)),
             Err(e) if is_table_not_found(&e) => Ok(infer()),
@@ -1182,6 +1263,7 @@ impl BigQuerySink {
     /// schema), else `infer` (the payload's columns, all `STRING`).
     async fn native_load_schema(
         &self,
+        calls: &CallSlot,
         table_id: &str,
         infer: impl FnOnce() -> Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
@@ -1193,7 +1275,7 @@ impl BigQuerySink {
         {
             return Ok(Some(explicit));
         }
-        self.truncate_schema(table_id, infer).await
+        self.truncate_schema(calls, table_id, infer).await
     }
 
     /// `CREATE_NEVER` on a load job when `create_table` is off, so a load
@@ -1212,7 +1294,10 @@ impl BigQuerySink {
     ///
     /// The cache is reset by [`evolve_schema`](faucet_core::Sink::evolve_schema)
     /// so a later page re-fetches the evolved schema.
-    async fn target_schema(&self) -> Result<Vec<idempotent::FieldSpec>, FaucetError> {
+    async fn target_schema(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<Vec<idempotent::FieldSpec>, FaucetError> {
         if let Some(fields) = self.schema_cache.read().await.as_ref() {
             return Ok(fields.clone());
         }
@@ -1224,7 +1309,7 @@ impl BigQuerySink {
             return Ok(fields.clone());
         }
         let fields = self
-            .fetch_schema_fields()
+            .fetch_schema_fields(calls)
             .await
             .map_err(|e| FaucetError::Sink(format!("BigQuery tables.get (schema) failed: {e}")))?;
         if fields.is_empty() {
@@ -1272,7 +1357,11 @@ impl BigQuerySink {
     /// same generator the exactly-once write uses). Streaming `insertAll` is
     /// avoided deliberately: its rows sit in a streaming buffer that the commit
     /// swap's `SELECT` might not see yet.
-    async fn insert_overwrite_page(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn insert_overwrite_page(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         let first_page = !self.overwrite_setup.swap(true, Ordering::AcqRel);
 
         // Direct mode (solo whole-table overwrite via media load): load straight
@@ -1284,7 +1373,7 @@ impl BigQuerySink {
         // fan-outs (several writers → one table) set `_overwrite_staging` and
         // take the staging path below; a scoped/windowed overwrite also stages.
         if self.direct_overwrite() {
-            if first_page && !self.target_has_schema().await? {
+            if first_page && !self.target_has_schema(calls).await? {
                 if !self.config.create_table {
                     return Err(FaucetError::Sink(format!(
                         "BigQuery overwrite target {}.{}.{} does not exist (or has no \
@@ -1292,7 +1381,7 @@ impl BigQuerySink {
                         self.config.project_id, self.config.dataset_id, self.config.table_id
                     )));
                 }
-                self.create_target_from_sample(records).await?;
+                self.create_target_from_sample(calls, records).await?;
                 self.table_ready.store(true, Ordering::Release);
             }
             // Stream the whole overwrite as ONE `WRITE_TRUNCATE` resumable load
@@ -1302,7 +1391,7 @@ impl BigQuerySink {
             // leaves the prior data intact, and peak memory is O(chunk + page)
             // rather than O(table). (Overwrite sources are full-refresh with an
             // end-of-run bookmark, so `flush` finalizes exactly once.)
-            self.feed_session(&self.config.table_id, "WRITE_TRUNCATE", records)
+            self.feed_session(calls, &self.config.table_id, "WRITE_TRUNCATE", records)
                 .await?;
             return Ok(records.len());
         }
@@ -1315,7 +1404,7 @@ impl BigQuerySink {
         // clone created by `begin_overwrite`; a missing/schemaless one is created
         // here from this page's sample (the schema `CREATE … LIKE` needs),
         // followed by its staging clone.
-        if first_page && !self.target_has_schema().await? {
+        if first_page && !self.target_has_schema(calls).await? {
             if !self.config.create_table {
                 return Err(FaucetError::Sink(format!(
                     "BigQuery overwrite target {}.{}.{} does not exist (or has no \
@@ -1323,13 +1412,16 @@ impl BigQuerySink {
                     self.config.project_id, self.config.dataset_id, self.config.table_id
                 )));
             }
-            self.create_target_from_sample(records).await?;
+            self.create_target_from_sample(calls, records).await?;
             self.table_ready.store(true, Ordering::Release);
-            self.run_ddl(format!(
-                "CREATE OR REPLACE TABLE {} LIKE {}",
-                self.overwrite_temp_ref(),
-                self.table_ref()
-            ))
+            self.run_ddl(
+                calls,
+                format!(
+                    "CREATE OR REPLACE TABLE {} LIKE {}",
+                    self.overwrite_temp_ref(),
+                    self.table_ref()
+                ),
+            )
             .await?;
         }
         // Fast path: stream the page straight into staging with one bucket-free
@@ -1338,11 +1430,11 @@ impl BigQuerySink {
         // `begin_overwrite`); WRITE_APPEND accumulates pages, and the atomic
         // swap still runs in `commit_overwrite`.
         if self.config.media_load {
-            self.load_ndjson(&self.overwrite_temp_id(), records, "WRITE_APPEND")
+            self.load_ndjson(calls, &self.overwrite_temp_id(), records, "WRITE_APPEND")
                 .await?;
             return Ok(records.len());
         }
-        let columns = self.target_schema().await?;
+        let columns = self.target_schema(calls).await?;
         self.reject_unknown_fields(&columns, records)?;
         let payload = serde_json::to_string(records).map_err(|e| {
             FaucetError::Sink(format!("BigQuery overwrite: serialize page payload: {e}"))
@@ -1358,7 +1450,7 @@ impl BigQuerySink {
         req.parameter_mode = Some("NAMED".to_string());
         req.query_parameters = Some(vec![Self::string_param("payload", &payload)]);
         self.roundtrips.record("query");
-        let resp = call_once(&self.calls.get(), "query", async {
+        let resp = call_once(&calls.get(), "query", async {
             self.client
                 .job()
                 .query(&self.config.project_id, req)
@@ -1368,7 +1460,7 @@ impl BigQuerySink {
                 })
         })
         .await?;
-        self.await_query_complete(resp).await?;
+        self.await_query_complete(calls, resp).await?;
         Ok(records.len())
     }
 
@@ -1388,6 +1480,7 @@ impl BigQuerySink {
     /// job per page instead of one `jobs.query` `INSERT … SELECT` per page.
     async fn load_ndjson(
         &self,
+        calls: &CallSlot,
         table_id: &str,
         records: &[Value],
         write_disposition: &str,
@@ -1406,7 +1499,7 @@ impl BigQuerySink {
             ))
             .to_string();
         let media = gzip(ndjson.as_bytes())?;
-        self.load_media(&job_json, &media).await.map(|_| ())
+        self.load_media(calls, &job_json, &media).await.map(|_| ())
     }
 
     /// Shared media-upload core: POST a `multipart/related` load-job request
@@ -1414,7 +1507,12 @@ impl BigQuerySink {
     /// job to completion. Reused by [`load_ndjson`](Self::load_ndjson) (which
     /// serializes `Value` rows) and by [`load_native`](faucet_core::Sink::load_native)
     /// (which forwards the source's raw wire bytes, #633).
-    async fn load_media(&self, job_json: &str, media_gzipped: &[u8]) -> Result<u64, FaucetError> {
+    async fn load_media(
+        &self,
+        calls: &CallSlot,
+        job_json: &str,
+        media_gzipped: &[u8],
+    ) -> Result<u64, FaucetError> {
         self.roundtrips.record("load");
         self.roundtrips
             .signal("bytes_loaded", "bytes", media_gzipped.len() as f64);
@@ -1428,7 +1526,7 @@ impl BigQuerySink {
             self.config.project_id
         );
         let client = upload_client()?;
-        let (status, text) = call_once(&self.calls.get(), "load", async {
+        let (status, text) = call_once(&calls.get(), "load", async {
             let resp = client
                 .post(&url)
                 .bearer_auth(&token)
@@ -1464,7 +1562,8 @@ impl BigQuerySink {
             FaucetError::Sink("BigQuery media load jobReference missing jobId".to_string())
         })?;
         let location = job_ref.location.clone();
-        self.await_load_job(&job_id, location.as_deref()).await
+        self.await_load_job(calls, &job_id, location.as_deref())
+            .await
     }
 
     /// Poll a load job by id until it reaches a terminal `DONE` state, then
@@ -1474,13 +1573,14 @@ impl BigQuerySink {
     /// table.
     async fn await_load_job(
         &self,
+        calls: &CallSlot,
         job_id: &str,
         location: Option<&str>,
     ) -> Result<u64, FaucetError> {
         let started = std::time::Instant::now();
         loop {
             self.roundtrips.record("job");
-            let job = call_once(&self.calls.get(), "job", async {
+            let job = call_once(&calls.get(), "job", async {
                 faucet_common_bigquery::raw::tolerant_get_job(
                     &self.client,
                     self.raw_target(),
@@ -1512,12 +1612,15 @@ impl BigQuerySink {
                 return Ok(load_output_rows(&job));
             }
             if self.job_timed_out(started) {
-                match self.cancel_timed_out_job("load", job_id, location).await {
+                match self
+                    .cancel_timed_out_job(calls, "load", job_id, location)
+                    .await
+                {
                     CancelOutcome::Succeeded => continue,
                     CancelOutcome::Failed { error, .. } => return Err(error),
                 }
             }
-            self.calls.wait(Duration::from_millis(500)).await?;
+            calls.wait(Duration::from_millis(500)).await?;
         }
     }
 
@@ -1565,12 +1668,13 @@ impl BigQuerySink {
     /// it to stop (SQL-96).
     async fn cancel_timed_out_job(
         &self,
+        calls: &CallSlot,
         kind: &str,
         job_id: &str,
         location: Option<&str>,
     ) -> CancelOutcome {
         cancel_timed_out_job(
-            &self.calls.get(),
+            &calls.get(),
             &self.client,
             &self.config,
             kind,
@@ -1596,6 +1700,7 @@ impl BigQuerySink {
     /// per-chunk PUTs address the returned URI without re-auth.
     async fn initiate_session(
         &self,
+        calls: &CallSlot,
         table_id: &str,
         write_disposition: &str,
         schema: Option<Value>,
@@ -1624,7 +1729,7 @@ impl BigQuerySink {
             .max_redirects(0)
             .build_reqwest()
             .map_err(|e| FaucetError::Sink(format!("resumable HTTP client: {e}")))?;
-        let calls = self.calls.get();
+        let calls = calls.get();
         let resp = call_once(&calls, "load", async {
             http.post(&url)
                 .bearer_auth(&token)
@@ -1675,6 +1780,7 @@ impl BigQuerySink {
     /// the destination untouched, matching the non-streaming path).
     async fn feed_session(
         &self,
+        calls: &CallSlot,
         table_id: &str,
         write_disposition: &str,
         records: &[Value],
@@ -1699,7 +1805,7 @@ impl BigQuerySink {
             {
                 Some(explicit) => Some(explicit),
                 None if write_disposition == "WRITE_TRUNCATE" => {
-                    self.truncate_schema(table_id, || {
+                    self.truncate_schema(calls, table_id, || {
                         json_schema_to_load_schema(&faucet_core::schema::infer_schema(records))
                     })
                     .await?
@@ -1707,7 +1813,7 @@ impl BigQuerySink {
                 None => None,
             };
             let sess = self
-                .initiate_session(table_id, write_disposition, schema)
+                .initiate_session(calls, table_id, write_disposition, schema)
                 .await?;
             let mut guard = self.upload_session.lock().await;
             *guard = Some(sess);
@@ -1729,6 +1835,7 @@ impl BigQuerySink {
     /// schema). Empty input is a no-op.
     async fn feed_session_bytes(
         &self,
+        calls: &CallSlot,
         table_id: &str,
         write_disposition: &str,
         schema: Option<Value>,
@@ -1743,7 +1850,7 @@ impl BigQuerySink {
         };
         if need_open {
             let sess = self
-                .initiate_session(table_id, write_disposition, schema)
+                .initiate_session(calls, table_id, write_disposition, schema)
                 .await?;
             let mut guard = self.upload_session.lock().await;
             *guard = Some(sess);
@@ -1761,7 +1868,7 @@ impl BigQuerySink {
     /// A no-op when no session is open or it is already finalized, so it is safe
     /// to call from `flush` on every path. Runs on the writer sink instance,
     /// which is the one that holds the session.
-    async fn finalize_session(&self) -> Result<(), FaucetError> {
+    async fn finalize_session(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let (job_id, location) = {
             let mut guard = self.upload_session.lock().await;
             let Some(sess) = guard.as_mut() else {
@@ -1805,7 +1912,7 @@ impl BigQuerySink {
             })?;
             (job_id, job_ref.location.clone())
         };
-        self.await_load_job(&job_id, location.as_deref())
+        self.await_load_job(calls, &job_id, location.as_deref())
             .await
             .map(|_| ())
     }
@@ -1817,12 +1924,12 @@ impl BigQuerySink {
     /// mid-run flush has committed such a load, the source bookmarks every page
     /// and a load job per page would collapse throughput and exhaust the
     /// per-table load-job quota (SQL-36), so later appends use `insertAll`.
-    async fn append_rows(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    async fn append_rows(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
         if appends_via_media_load(&self.config) && !self.stream_appends.load(Ordering::Acquire) {
-            self.feed_session(&self.config.table_id, "WRITE_APPEND", records)
+            self.feed_session(calls, &self.config.table_id, "WRITE_APPEND", records)
                 .await?;
             return Ok(records.len());
         }
@@ -1837,7 +1944,7 @@ impl BigQuerySink {
 
         let mut total = 0;
         for chunk in chunks {
-            total += self.insert_batch(chunk).await?;
+            total += self.insert_batch(calls, chunk).await?;
         }
 
         let table = format!(
@@ -1879,8 +1986,8 @@ impl BigQuerySink {
     /// authoritative job-status-verify path the data writes use, mapping any
     /// failure to [`FaucetError::Sink`]. The configured `location` (if any) is
     /// applied so dataset/table creation lands in the intended region.
-    async fn run_ddl(&self, sql: String) -> Result<(), FaucetError> {
-        let resp = retry_control_plane(&self.calls.get(), "jobs.query (DDL)", || {
+    async fn run_ddl(&self, calls: &CallSlot, sql: String) -> Result<(), FaucetError> {
+        let resp = retry_control_plane(&calls.get(), "jobs.query (DDL)", || {
             let mut req = QueryRequest::new(sql.clone());
             req.use_legacy_sql = false;
             req.location = self.config.location.clone();
@@ -1889,7 +1996,7 @@ impl BigQuerySink {
         })
         .await
         .map_err(|e| FaucetError::Sink(format!("BigQuery schema-evolution DDL failed: {e}")))?;
-        self.await_query_complete(resp).await
+        self.await_query_complete(calls, resp).await
     }
 
     /// Is the target table present **with a usable schema** (≥1 field)? A
@@ -1897,8 +2004,8 @@ impl BigQuerySink {
     /// → `Ok(false)` (schemaless, e.g. created by a bare `bq mk` — `CREATE …
     /// LIKE` / typed inserts fail against it, so it must be (re)created); any
     /// other error is surfaced.
-    async fn target_has_schema(&self) -> Result<bool, FaucetError> {
-        match self.fetch_schema_fields().await {
+    async fn target_has_schema(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
+        match self.fetch_schema_fields(calls).await {
             Ok(fields) => Ok(!fields.is_empty()),
             Err(e) if is_table_not_found(&e) => Ok(false),
             Err(e) => Err(FaucetError::Sink(format!(
@@ -1912,11 +2019,11 @@ impl BigQuerySink {
     /// [`commit_overwrite`](faucet_core::Sink::commit_overwrite) to decide whether
     /// there is anything staged to swap — keyed off the real table, not an
     /// in-memory flag, since begin/write/commit run on different sink instances.
-    async fn table_exists(&self, table_id: &str) -> Result<bool, FaucetError> {
+    async fn table_exists(&self, calls: &CallSlot, table_id: &str) -> Result<bool, FaucetError> {
         // Request the `schema` field (as `fetch_schema_fields` does): the client's
         // `Table` type has a non-optional `schema`, so a narrower field mask would
         // yield a response it can't deserialize.
-        match retry_control_plane(&self.calls.get(), "tables.get (exists)", || {
+        match retry_control_plane(&calls.get(), "tables.get (exists)", || {
             faucet_common_bigquery::raw::tolerant_get_table(
                 &self.client,
                 self.raw_target(),
@@ -1937,16 +2044,20 @@ impl BigQuerySink {
 
     /// Best-effort `CREATE SCHEMA IF NOT EXISTS` so `create_table` can target a
     /// dataset that does not exist yet. Idempotent; runs in `config.location`.
-    async fn ensure_dataset(&self) -> Result<(), FaucetError> {
+    async fn ensure_dataset(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let sql =
             idempotent::build_ensure_dataset_ddl(&self.config.project_id, &self.config.dataset_id);
-        self.run_ddl(sql).await
+        self.run_ddl(calls, sql).await
     }
 
     /// Create the target dataset (if missing) and table, inferring the table's
     /// schema from `sample`. Invalidates the schema cache so the freshly-created
     /// schema is fetched on the next read.
-    async fn create_target_from_sample(&self, sample: &[Value]) -> Result<(), FaucetError> {
+    async fn create_target_from_sample(
+        &self,
+        calls: &CallSlot,
+        sample: &[Value],
+    ) -> Result<(), FaucetError> {
         // Prefer an explicit configured schema (authoritative column types, e.g.
         // from OData `$metadata`) over inferring from the first page.
         let ddl = match &self.config.schema {
@@ -1970,13 +2081,13 @@ impl BigQuerySink {
                 self.config.project_id, self.config.dataset_id, self.config.table_id
             ))
         })?;
-        self.ensure_dataset().await?;
+        self.ensure_dataset(calls).await?;
         // Re-probe right before the DDL (the dataset job above takes seconds):
         // a concurrent first writer may have created the table — with a schema
         // — and started streaming into it. Such a table is used as-is; only a
         // table still without a schema is replaced, and a missing one is
         // created IF NOT EXISTS (#862 M-053).
-        let ddl = match self.fetch_schema_fields().await {
+        let ddl = match self.fetch_schema_fields(calls).await {
             Ok(fields) if !fields.is_empty() => {
                 *self.schema_cache.write().await = None;
                 return Ok(());
@@ -1989,7 +2100,7 @@ impl BigQuerySink {
                 )));
             }
         };
-        self.run_ddl(ddl).await?;
+        self.run_ddl(calls, ddl).await?;
         *self.schema_cache.write().await = None;
         Ok(())
     }
@@ -1998,11 +2109,15 @@ impl BigQuerySink {
     /// `create_table` is on and the table is missing, create it (and its
     /// dataset) from `sample`; when off, surface a clear error. The probe /
     /// create runs at most once per run.
-    async fn ensure_table_ready(&self, sample: &[Value]) -> Result<(), FaucetError> {
+    async fn ensure_table_ready(
+        &self,
+        calls: &CallSlot,
+        sample: &[Value],
+    ) -> Result<(), FaucetError> {
         if self.table_ready.load(Ordering::Acquire) {
             return Ok(());
         }
-        if self.target_has_schema().await? {
+        if self.target_has_schema(calls).await? {
             self.table_ready.store(true, Ordering::Release);
             return Ok(());
         }
@@ -2013,19 +2128,19 @@ impl BigQuerySink {
                 self.config.project_id, self.config.dataset_id, self.config.table_id
             )));
         }
-        self.create_target_from_sample(sample).await?;
+        self.create_target_from_sample(calls, sample).await?;
         self.table_ready.store(true, Ordering::Release);
         Ok(())
     }
 
     /// Create the commit-token watermark table if it does not exist.
-    async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
+    async fn ensure_commit_table(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let sql =
             idempotent::build_create_commit_table(&self.config.project_id, &self.config.dataset_id);
         let mut req = QueryRequest::new(sql);
         req.use_legacy_sql = false;
         self.roundtrips.record("query");
-        let resp = call_once(&self.calls.get(), "query", async {
+        let resp = call_once(&calls.get(), "query", async {
             self.client
                 .job()
                 .query(&self.config.project_id, req)
@@ -2033,13 +2148,17 @@ impl BigQuerySink {
                 .map_err(|e| FaucetError::Sink(format!("BigQuery commit-table create failed: {e}")))
         })
         .await?;
-        self.await_query_complete(resp).await
+        self.await_query_complete(calls, resp).await
     }
 
     /// [`await_query_job`](Self::await_query_job), discarding the job body —
     /// the shape every caller that only needs "did it commit?" wants.
-    async fn await_query_complete(&self, initial: QueryResponse) -> Result<(), FaucetError> {
-        self.await_query_job(initial).await.map(|_| ())
+    async fn await_query_complete(
+        &self,
+        calls: &CallSlot,
+        initial: QueryResponse,
+    ) -> Result<(), FaucetError> {
+        self.await_query_job(calls, initial).await.map(|_| ())
     }
 
     /// Wait for a query/script job to finish, then authoritatively verify it
@@ -2053,8 +2172,12 @@ impl BigQuerySink {
     /// failure recorded in the job body. `Job.status.error_result` is the
     /// authoritative terminal-failure signal; the `errors` array can also carry
     /// non-fatal warnings, so it must not be treated as failure on its own.
-    async fn await_query_job(&self, initial: QueryResponse) -> Result<Job, FaucetError> {
-        self.await_query_job_classified(initial)
+    async fn await_query_job(
+        &self,
+        calls: &CallSlot,
+        initial: QueryResponse,
+    ) -> Result<Job, FaucetError> {
+        self.await_query_job_classified(calls, initial)
             .await
             .map_err(|(e, _)| e)
     }
@@ -2063,6 +2186,7 @@ impl BigQuerySink {
     /// failed job was a transaction BigQuery aborted for a concurrent update.
     async fn await_query_job_classified(
         &self,
+        calls: &CallSlot,
         initial: QueryResponse,
     ) -> Result<Job, (FaucetError, bool)> {
         let (job_id, location) = Self::job_reference(&initial).map_err(|e| (e, false))?;
@@ -2077,7 +2201,7 @@ impl BigQuerySink {
                     max_results: Some(0),
                     ..Default::default()
                 };
-                let resp = call_once(&self.calls.get(), "poll", async {
+                let resp = call_once(&calls.get(), "poll", async {
                     self.client
                         .job()
                         .get_query_results(&self.config.project_id, &job_id, params)
@@ -2093,7 +2217,7 @@ impl BigQuerySink {
                 }
                 if self.job_timed_out(started) {
                     match self
-                        .cancel_timed_out_job("query", &job_id, location.as_deref())
+                        .cancel_timed_out_job(calls, "query", &job_id, location.as_deref())
                         .await
                     {
                         CancelOutcome::Succeeded => break,
@@ -2103,7 +2227,7 @@ impl BigQuerySink {
                 // The server long-poll normally blocks until completion, but if
                 // it returns early, back off so a still-running job can't turn
                 // this into a tight request-hammering loop.
-                self.calls
+                calls
                     .wait(Duration::from_millis(250))
                     .await
                     .map_err(|e| (e, false))?;
@@ -2118,7 +2242,7 @@ impl BigQuerySink {
         // (returning `Ok` here would advance the bookmark over data that may
         // never have landed, the silent-data-loss failure mode).
         self.roundtrips.record("job");
-        let job = call_once(&self.calls.get(), "job", async {
+        let job = call_once(&calls.get(), "job", async {
             faucet_common_bigquery::raw::tolerant_get_job(
                 &self.client,
                 self.raw_target(),
@@ -2175,7 +2299,12 @@ impl BigQuerySink {
     /// table (SQL-95): an aborted transaction committed nothing, so running it
     /// again is safe. A retry gets a fresh `requestId`, or BigQuery would hand
     /// back the aborted job.
-    async fn run_transaction(&self, mut req: QueryRequest, what: &str) -> Result<Job, FaucetError> {
+    async fn run_transaction(
+        &self,
+        calls: &CallSlot,
+        mut req: QueryRequest,
+        what: &str,
+    ) -> Result<Job, FaucetError> {
         let base_id = req.request_id.clone();
         let mut delay = Duration::from_millis(200);
         for attempt in 1..=TXN_CONFLICT_ATTEMPTS {
@@ -2184,7 +2313,7 @@ impl BigQuerySink {
             // back as an HTTP error rather than a failed job; it committed
             // nothing either, so it is retried the same way.
             let sent = call_once_bq(
-                &self.calls.get(),
+                &calls.get(),
                 "query",
                 self.client
                     .job()
@@ -2192,7 +2321,7 @@ impl BigQuerySink {
             )
             .await;
             let outcome = match sent {
-                Ok(resp) => self.await_query_job_classified(resp).await,
+                Ok(resp) => self.await_query_job_classified(calls, resp).await,
                 Err(e) => {
                     let text = e.to_string();
                     Err((
@@ -2208,7 +2337,7 @@ impl BigQuerySink {
                         what, attempt, error = %e,
                         "BigQuery aborted the transaction for a concurrent update; retrying"
                     );
-                    self.calls.wait(delay + txn_jitter(delay)).await?;
+                    calls.wait(delay + txn_jitter(delay)).await?;
                     delay = (delay * 2).min(Duration::from_secs(10));
                     req.request_id = base_id.as_ref().map(|id| format!("{id}-r{attempt}"));
                 }
@@ -2239,10 +2368,11 @@ impl BigQuerySink {
     /// number of rows applied (upserts + deletes).
     async fn run_upsert_script(
         &self,
+        calls: &CallSlot,
         plan: &faucet_core::WritePlan,
         token: Option<(&str, &str)>,
     ) -> Result<usize, FaucetError> {
-        let columns = self.target_schema().await?;
+        let columns = self.target_schema(calls).await?;
         merge::validate_keys_present(&columns, &self.config.write.key)?;
         self.reject_unknown_fields(&columns, &plan.upserts)?;
 
@@ -2310,7 +2440,8 @@ impl BigQuerySink {
         }
         req.query_parameters = Some(params);
 
-        self.run_transaction(req, "bigquery upsert write").await?;
+        self.run_transaction(calls, req, "bigquery upsert write")
+            .await?;
 
         Ok(plan.upserts.len() + plan.deletes.len())
     }
@@ -2331,6 +2462,7 @@ impl BigQuerySink {
     /// `UNNEST` expresses it directly.
     async fn cleanup_scope_impl(
         &self,
+        calls: &CallSlot,
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
@@ -2340,7 +2472,7 @@ impl BigQuerySink {
                 "bigquery cleanup requires a non-empty `key`".to_string(),
             ));
         }
-        let columns = self.target_schema().await?;
+        let columns = self.target_schema(calls).await?;
         let scope_cols: Vec<String> = scope.keys().cloned().collect();
         merge::validate_cleanup_columns(&columns, &scope_cols, key)?;
 
@@ -2363,7 +2495,9 @@ impl BigQuerySink {
             Self::string_param("keys", &keys_payload),
         ]);
 
-        let job = self.run_transaction(req, "bigquery cleanup delete").await?;
+        let job = self
+            .run_transaction(calls, req, "bigquery cleanup delete")
+            .await?;
         let deleted = dml_affected_rows(&job);
 
         tracing::info!(
@@ -2379,8 +2513,412 @@ impl BigQuerySink {
     }
 }
 
+impl BigQueryDriver {
+    /// Write records to BigQuery.
+    ///
+    /// When `config.batch_size > 0` and the input slice is larger than
+    /// `batch_size`, the slice is split into chunks of `batch_size` rows and
+    /// each chunk is sent as a separate `tabledata.insertAll` call. When
+    /// `config.batch_size == 0`, the entire slice is sent in a single
+    /// `insertAll` request — useful when upstream `StreamPage`s are already
+    /// sized for BigQuery's per-request limits.
+    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        if matches!(
+            self.config.write.write_mode,
+            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
+        ) {
+            self.ensure_table_ready(calls, records).await?;
+            let plan = faucet_core::plan_writes(records, &self.config.write);
+            if let Some((idx, msg)) = plan.failed.first() {
+                return Err(FaucetError::Sink(format!(
+                    "bigquery {}: row {idx}: {msg}",
+                    self.config.write.write_mode.as_str()
+                )));
+            }
+            return self.run_upsert_script(calls, &plan, None).await;
+        }
+
+        // Overwrite: load the page into the staging table via the buffer-free
+        // query path (not streaming `insertAll`); the atomic swap runs in
+        // `commit_overwrite`. Table/staging creation is handled by
+        // `begin_overwrite` + the deferred create in `insert_overwrite_page`.
+        if self.config.write.is_overwrite() {
+            return self.insert_overwrite_page(calls, records).await;
+        }
+
+        self.ensure_table_ready(calls, records).await?;
+        self.append_rows(calls, records).await
+    }
+
+    /// Write records to BigQuery, returning a per-row outcome vector.
+    ///
+    /// Unlike [`write_batch`](faucet_core::Sink::write_batch), which collapses all
+    /// `insertErrors` into a single `FaucetError`, this method maps each row
+    /// to `Ok(())` if BigQuery accepted it or `Err(FaucetError::Sink(...))` if
+    /// BigQuery reported a per-row error for it. This allows the pipeline's DLQ
+    /// router to quarantine only the rows that BigQuery actually rejected while
+    /// keeping already-committed siblings out of the dead-letter queue.
+    ///
+    /// Transport-level or HTTP-level failures (e.g. network errors, 4xx/5xx
+    /// responses) are still returned as an outer `Err` because no rows can be
+    /// considered committed in that case.
+    ///
+    /// Chunking follows the same `batch_size` semantics as `write_batch`:
+    /// `batch_size == 0` sends the entire slice in one call; `batch_size > 0`
+    /// splits the slice into chunks and concatenates the per-row outcomes in
+    /// input order.
+    async fn write_partial(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        use std::collections::HashMap;
+
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.config.write.is_overwrite() {
+            // Overwrite is insert-shaped with no per-row key failures.
+            self.insert_overwrite_page(calls, records).await?;
+            return Ok(records.iter().map(|_| Ok(())).collect());
+        }
+
+        if !matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+            self.ensure_table_ready(calls, records).await?;
+            let plan = faucet_core::plan_writes(records, &self.config.write);
+            self.run_upsert_script(calls, &plan, None).await?;
+            let mut outcomes: Vec<faucet_core::RowOutcome> =
+                records.iter().map(|_| Ok(())).collect();
+            for (idx, msg) in &plan.failed {
+                outcomes[*idx] = Err(FaucetError::Sink(format!(
+                    "bigquery {}: {msg}",
+                    self.config.write.write_mode.as_str()
+                )));
+            }
+            return Ok(outcomes);
+        }
+
+        self.ensure_table_ready(calls, records).await?;
+
+        // NOTE: no `media_load` branch here, deliberately. This method is only
+        // called when a **DLQ is configured**, and a BigQuery load job is
+        // all-or-nothing: it cannot say *which* rows were rejected. Taking it
+        // here would silently convert "three bad rows quarantined, the rest
+        // written" into "the whole page failed" (or, worse, "all rows reported
+        // OK") — the operator asked for row isolation by configuring a DLQ, so
+        // the per-row `insertAll` path is what they get, whatever `media_load`
+        // says. Runs without a DLQ go through `write_batch`, which does take
+        // the load path (#612).
+
+        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
+            vec![records]
+        } else {
+            records.chunks(self.config.batch_size).collect()
+        };
+
+        let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
+
+        for chunk in chunks {
+            // `skipInvalidRows=true`: BigQuery commits every valid row and
+            // returns `insertErrors` only for the rejected ones. This is what
+            // makes mapping the flagged indices to `Err` and the rest to
+            // `Ok(())` correct — the unflagged rows really were committed, so
+            // the DLQ router quarantines only the bad rows and the bookmark
+            // advances over genuinely-persisted data.
+            let response = self.insert_chunk_raw(calls, chunk, true).await?;
+
+            // Build a set of failed row indices → first error message.
+            let failed: HashMap<usize, String> = response
+                .insert_errors
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|e| {
+                    let idx = e.index? as usize;
+                    let msg = e
+                        .errors
+                        .as_ref()
+                        .and_then(|v| v.first())
+                        .map(|er| er.message.clone().unwrap_or_default())
+                        .unwrap_or_default();
+                    Some((idx, msg))
+                })
+                .collect();
+
+            for i in 0..chunk.len() {
+                match failed.get(&i) {
+                    Some(msg) => outcomes.push(Err(FaucetError::Sink(format!(
+                        "BigQuery row rejected: {msg}"
+                    )))),
+                    None => outcomes.push(Ok(())),
+                }
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    /// Atomically write `records` and record `token` for `scope` in one BigQuery
+    /// multi-statement transaction: a typed `INSERT … SELECT FROM
+    /// UNNEST(JSON_QUERY_ARRAY(@payload))` plus a watermark `MERGE`. Either both
+    /// the rows and the token commit, or neither does — so a crash/resume skips
+    /// the already-committed page (zero duplicates) and a failed page replays
+    /// cleanly.
+    ///
+    /// The entire page is one atomic unit (no `batch_size` re-chunking — core
+    /// issues exactly one token per page), so the page must serialize within
+    /// BigQuery's ~10 MB `jobs.query` request limit.
+    async fn write_idempotent(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<usize, FaucetError> {
+        self.ensure_commit_table(calls).await?;
+        self.ensure_table_ready(calls, records).await?;
+
+        if !matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+            let plan = faucet_core::plan_writes(records, &self.config.write);
+            if let Some((idx, msg)) = plan.failed.first() {
+                return Err(FaucetError::Sink(format!(
+                    "bigquery {}: row {idx}: {msg}",
+                    self.config.write.write_mode.as_str()
+                )));
+            }
+            return self
+                .run_upsert_script(calls, &plan, Some((scope, token)))
+                .await;
+        }
+
+        let columns = self.target_schema(calls).await?;
+        self.reject_unknown_fields(&columns, records)?;
+
+        let payload = serde_json::to_string(records).map_err(|e| {
+            FaucetError::Sink(format!(
+                "BigQuery exactly-once: serialize page payload: {e}"
+            ))
+        })?;
+
+        let sql = idempotent::build_transaction_sql(
+            &columns,
+            &self.config.project_id,
+            &self.config.dataset_id,
+            &self.config.table_id,
+        );
+        let mut req = QueryRequest::new(sql);
+        req.use_legacy_sql = false;
+        req.parameter_mode = Some("NAMED".to_string());
+        req.request_id = Some(idempotent::build_request_id(scope, token));
+        req.query_parameters = Some(vec![
+            Self::string_param("payload", &payload),
+            Self::string_param("scope", scope),
+            Self::string_param("token", token),
+        ]);
+
+        self.run_transaction(calls, req, "BigQuery idempotent write")
+            .await?;
+
+        tracing::info!(
+            table = %format!(
+                "{}.{}.{}",
+                self.config.project_id, self.config.dataset_id, self.config.table_id
+            ),
+            rows = records.len(),
+            token = %token,
+            "BigQuery exactly-once page committed"
+        );
+        Ok(records.len())
+    }
+
+    /// Native byte-passthrough load (#633): BigQuery can bulk-load NDJSON or CSV
+    /// bytes directly via a load job, so a source that emits either format
+    /// streams straight in without ever building `Value` rows. The pipeline's
+    /// own gates already exclude transforms/governance/DLQ/exactly-once and
+    /// upsert/delete write modes (defense in depth: the upsert check below
+    /// stays so this sink never advertises a path it can't honor even if
+    /// called outside the pipeline).
+    pub(crate) fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
+        // Upsert/delete need per-row keys, so they are not passthrough-eligible.
+        if matches!(
+            self.config.write.write_mode,
+            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
+        ) {
+            return Vec::new();
+        }
+        vec![
+            // NDJSON feeds one resumable session finalized only by the terminal
+            // `flush`, so it satisfies the all-or-nothing overwrite contract:
+            // nothing is visible until the single WRITE_TRUNCATE load commits.
+            faucet_core::NativeLoadCapability {
+                format: faucet_core::NativeFormat::NdJson,
+                mechanism: "bigquery-load-job",
+                write_modes: &[
+                    faucet_core::WriteMode::Append,
+                    faucet_core::WriteMode::Overwrite,
+                ],
+            },
+            // CSV runs a discrete load job per batch, each committing on its
+            // own — a multi-batch overwrite would be truncate + partial appends
+            // rather than one atomic replace, so CSV is append-only here.
+            // (CSV + overwrite falls through to the Value path's staging swap.)
+            faucet_core::NativeLoadCapability {
+                format: faucet_core::NativeFormat::Csv,
+                mechanism: "bigquery-load-job",
+                write_modes: &[faucet_core::WriteMode::Append],
+            },
+        ]
+    }
+
+    pub(crate) async fn load_native(
+        &self,
+        calls: &CallSlot,
+        batch: faucet_core::NativeBatch,
+        scope: &str,
+        ctx: faucet_core::NativeLoadContext,
+    ) -> Result<usize, FaucetError> {
+        let _ = scope; // v1: no per-scope isolation on the native load path.
+        // Overwrite truncates on the first batch (which opens the session), appends
+        // thereafter. Because every page of an object feeds ONE resumable session
+        // finalized in `flush`, this is one atomic WRITE_TRUNCATE load per object —
+        // not a truncate-then-append across pages.
+        let write_disposition =
+            if ctx.write_mode == faucet_core::WriteMode::Overwrite && ctx.first_batch {
+                "WRITE_TRUNCATE"
+            } else {
+                "WRITE_APPEND"
+            };
+        let table = self.config.table_id.clone();
+        let csv = batch.csv;
+
+        match (batch.format, batch.payload) {
+            // NDJSON **streaming** — the memory-optimal path (#633). Feed each
+            // ~256 KiB chunk into the per-object resumable session as it arrives;
+            // the full page is never buffered on either side. Schema is derived
+            // from the first chunk; the row count is the NDJSON line count.
+            (faucet_core::NativeFormat::NdJson, faucet_core::NativePayload::Stream(mut s)) => {
+                use futures::StreamExt;
+                if self.streams_native_appends(write_disposition) {
+                    let mut rows = 0usize;
+                    let mut carry: Vec<u8> = Vec::new();
+                    while let Some(chunk) = s.next().await {
+                        carry.extend_from_slice(&chunk?);
+                        let complete = carry.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                        let values = parse_ndjson(&carry[..complete])?;
+                        carry.drain(..complete);
+                        rows += self.append_rows(calls, &values).await?;
+                    }
+                    rows += self.append_rows(calls, &parse_ndjson(&carry)?).await?;
+                    return Ok(rows);
+                }
+                let mut rows = 0usize;
+                let mut first = true;
+                while let Some(chunk) = s.next().await {
+                    let chunk = chunk?;
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    // The explicit all-STRING schema (from the first chunk) opens the
+                    // session; later chunks pass `None` (session already open).
+                    let schema = if first {
+                        self.native_load_schema(calls, &table, || {
+                            native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
+                                .and_then(all_string_schema)
+                        })
+                        .await?
+                    } else {
+                        None
+                    };
+                    rows += chunk.iter().filter(|&&b| b == b'\n').count();
+                    self.feed_session_bytes(calls, &table, write_disposition, schema, &chunk)
+                        .await?;
+                    first = false;
+                }
+                Ok(rows)
+            }
+            // NDJSON already buffered — feed the whole batch into the same resumable
+            // session (used by tests / any source that emits `Bytes`).
+            (faucet_core::NativeFormat::NdJson, faucet_core::NativePayload::Bytes(raw)) => {
+                if raw.is_empty() {
+                    return Ok(0);
+                }
+                if self.streams_native_appends(write_disposition) {
+                    return self.append_rows(calls, &parse_ndjson(&raw)?).await;
+                }
+                let rows = batch
+                    .records
+                    .map(|r| r as usize)
+                    .unwrap_or_else(|| raw.iter().filter(|&&b| b == b'\n').count());
+                let inferred = || {
+                    native_batch_columns(&raw, faucet_core::NativeFormat::NdJson, b',')
+                        .and_then(all_string_schema)
+                };
+                let schema = self.native_load_schema(calls, &table, inferred).await?;
+                self.feed_session_bytes(calls, &table, write_disposition, schema, &raw)
+                    .await?;
+                Ok(rows)
+            }
+            // CSV isn't NDJSON-shaped for the resumable session, so it takes a
+            // discrete CSV load job per batch (no built-in source emits this today).
+            (faucet_core::NativeFormat::Csv, faucet_core::NativePayload::Bytes(raw)) => {
+                if raw.is_empty() {
+                    return Ok(0);
+                }
+                let rows = batch.records.unwrap_or(0) as usize;
+                let skip_rows = if csv.has_header { Some(1) } else { None };
+                let header =
+                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter);
+                let inferred = || header.clone().and_then(all_string_schema);
+                let schema = self.native_load_schema(calls, &table, inferred).await?;
+                let schema = match (schema, csv.has_header, &header) {
+                    (Some(s), true, Some(cols)) => Some(schema_in_column_order(&s, cols)),
+                    (s, _, _) => s,
+                };
+                let autodetect_fallback = schema.is_none();
+                let media = gzip(&raw)?;
+                let job_json = self
+                    .apply_create_disposition(build_load_job_json_full(
+                        &self.config.project_id,
+                        &self.config.dataset_id,
+                        &table,
+                        write_disposition,
+                        self.config.location.as_deref(),
+                        "CSV",
+                        skip_rows,
+                        schema,
+                        autodetect_fallback,
+                    ))
+                    .to_string();
+                self.load_media(calls, &job_json, &media).await?;
+                Ok(rows)
+            }
+            (other, _) => Err(FaucetError::Sink(format!(
+                "bigquery load_native: unsupported format {other:?} for this payload"
+            ))),
+        }
+    }
+
+    /// The report for `n` rows written out of `offered`, as the row paths
+    /// account for a keyed write.
+    fn report(&self, offered: usize, n: usize) -> WriteReport {
+        if self.config.write.dedups_by_key() {
+            WriteReport::keyed(offered, n)
+        } else {
+            WriteReport::accepted(n)
+        }
+    }
+}
+
 #[async_trait]
-impl faucet_core::Sink for BigQuerySink {
+impl SinkDriver for BigQueryDriver {
+    fn call_context(&self) -> CallContext {
+        local_call_context()
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
@@ -2389,12 +2927,7 @@ impl faucet_core::Sink for BigQuerySink {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder.clone());
-        self.calls.install_recorder(recorder);
-    }
-
-    fn set_call_context(&self, ctx: CallContext) {
-        self.calls.install(ctx);
+        self.roundtrips.install(recorder);
     }
 
     fn connector_name(&self) -> &'static str {
@@ -2403,14 +2936,14 @@ impl faucet_core::Sink for BigQuerySink {
 
     /// BigQuery bulk-loads via a GCS-staged Parquet load job under `bulk_load`
     /// (#528). Advertise the `staging` capability.
-    fn supports_staged_load(&self) -> bool {
+    fn staged_load(&self) -> bool {
         true
     }
 
     /// Adds what no trait method expresses: a windowed `overwrite.scope`
     /// (#518) and a staging-free overwrite driven by `_overwrite_staging`.
-    fn capabilities(&self) -> faucet_core::Capabilities {
-        faucet_core::Capabilities::of_sink(self)
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived
             .to_builder()
             .scoped_overwrite(true)
             .direct_overwrite(true)
@@ -2441,6 +2974,7 @@ impl faucet_core::Sink for BigQuerySink {
     /// reason or hint.
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
@@ -2454,7 +2988,7 @@ impl faucet_core::Sink for BigQuerySink {
         let result = tokio::time::timeout(
             ctx.timeout,
             call_once_bq(
-                &self.calls.get(),
+                &calls.get(),
                 "control",
                 self.client.table().get(
                     &self.config.project_id,
@@ -2496,153 +3030,6 @@ impl faucet_core::Sink for BigQuerySink {
         Ok(CheckReport::single(probe))
     }
 
-    /// Write records to BigQuery.
-    ///
-    /// When `config.batch_size > 0` and the input slice is larger than
-    /// `batch_size`, the slice is split into chunks of `batch_size` rows and
-    /// each chunk is sent as a separate `tabledata.insertAll` call. When
-    /// `config.batch_size == 0`, the entire slice is sent in a single
-    /// `insertAll` request — useful when upstream `StreamPage`s are already
-    /// sized for BigQuery's per-request limits.
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        if matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            self.ensure_table_ready(records).await?;
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "bigquery {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return self.run_upsert_script(&plan, None).await;
-        }
-
-        // Overwrite: load the page into the staging table via the buffer-free
-        // query path (not streaming `insertAll`); the atomic swap runs in
-        // `commit_overwrite`. Table/staging creation is handled by
-        // `begin_overwrite` + the deferred create in `insert_overwrite_page`.
-        if self.config.write.is_overwrite() {
-            return self.insert_overwrite_page(records).await;
-        }
-
-        self.ensure_table_ready(records).await?;
-        self.append_rows(records).await
-    }
-
-    /// Write records to BigQuery, returning a per-row outcome vector.
-    ///
-    /// Unlike [`write_batch`](faucet_core::Sink::write_batch), which collapses all
-    /// `insertErrors` into a single `FaucetError`, this method maps each row
-    /// to `Ok(())` if BigQuery accepted it or `Err(FaucetError::Sink(...))` if
-    /// BigQuery reported a per-row error for it. This allows the pipeline's DLQ
-    /// router to quarantine only the rows that BigQuery actually rejected while
-    /// keeping already-committed siblings out of the dead-letter queue.
-    ///
-    /// Transport-level or HTTP-level failures (e.g. network errors, 4xx/5xx
-    /// responses) are still returned as an outer `Err` because no rows can be
-    /// considered committed in that case.
-    ///
-    /// Chunking follows the same `batch_size` semantics as `write_batch`:
-    /// `batch_size == 0` sends the entire slice in one call; `batch_size > 0`
-    /// splits the slice into chunks and concatenates the per-row outcomes in
-    /// input order.
-    async fn write_batch_partial(
-        &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        use std::collections::HashMap;
-
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if self.config.write.is_overwrite() {
-            // Overwrite is insert-shaped with no per-row key failures.
-            self.insert_overwrite_page(records).await?;
-            return Ok(records.iter().map(|_| Ok(())).collect());
-        }
-
-        if !matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            self.ensure_table_ready(records).await?;
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.run_upsert_script(&plan, None).await?;
-            let mut outcomes: Vec<faucet_core::RowOutcome> =
-                records.iter().map(|_| Ok(())).collect();
-            for (idx, msg) in &plan.failed {
-                outcomes[*idx] = Err(FaucetError::Sink(format!(
-                    "bigquery {}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return Ok(outcomes);
-        }
-
-        self.ensure_table_ready(records).await?;
-
-        // NOTE: no `media_load` branch here, deliberately. This method is only
-        // called when a **DLQ is configured**, and a BigQuery load job is
-        // all-or-nothing: it cannot say *which* rows were rejected. Taking it
-        // here would silently convert "three bad rows quarantined, the rest
-        // written" into "the whole page failed" (or, worse, "all rows reported
-        // OK") — the operator asked for row isolation by configuring a DLQ, so
-        // the per-row `insertAll` path is what they get, whatever `media_load`
-        // says. Runs without a DLQ go through `write_batch`, which does take
-        // the load path (#612).
-
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
-        };
-
-        let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
-
-        for chunk in chunks {
-            // `skipInvalidRows=true`: BigQuery commits every valid row and
-            // returns `insertErrors` only for the rejected ones. This is what
-            // makes mapping the flagged indices to `Err` and the rest to
-            // `Ok(())` correct — the unflagged rows really were committed, so
-            // the DLQ router quarantines only the bad rows and the bookmark
-            // advances over genuinely-persisted data.
-            let response = self.insert_chunk_raw(chunk, true).await?;
-
-            // Build a set of failed row indices → first error message.
-            let failed: HashMap<usize, String> = response
-                .insert_errors
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|e| {
-                    let idx = e.index? as usize;
-                    let msg = e
-                        .errors
-                        .as_ref()
-                        .and_then(|v| v.first())
-                        .map(|er| er.message.clone().unwrap_or_default())
-                        .unwrap_or_default();
-                    Some((idx, msg))
-                })
-                .collect();
-
-            for i in 0..chunk.len() {
-                match failed.get(&i) {
-                    Some(msg) => outcomes.push(Err(FaucetError::Sink(format!(
-                        "BigQuery row rejected: {msg}"
-                    )))),
-                    None => outcomes.push(Ok(())),
-                }
-            }
-        }
-
-        Ok(outcomes)
-    }
-
     /// Finalize a streaming `media_load` resumable session, if one is open
     /// (append or solo-direct overwrite). Runs on the writer sink instance that
     /// holds the session — the reliable place to finalize, since the executor
@@ -2650,177 +3037,28 @@ impl faucet_core::Sink for BigQuerySink {
     /// overwrite this commits the single `WRITE_TRUNCATE` load atomically at
     /// end-of-stream (so `commit_overwrite` is a no-op); a no-op on every
     /// non-streaming path.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.finalize_session().await
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.finalize_session(calls).await
     }
 
-    /// Native byte-passthrough load (#633): BigQuery can bulk-load NDJSON or CSV
-    /// bytes directly via a load job, so a source that emits either format
-    /// streams straight in without ever building `Value` rows. The pipeline's
-    /// own gates already exclude transforms/governance/DLQ/exactly-once and
-    /// upsert/delete write modes (defense in depth: the upsert check below
-    /// stays so this sink never advertises a path it can't honor even if
-    /// called outside the pipeline).
-    fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
-        // Upsert/delete need per-row keys, so they are not passthrough-eligible.
-        if matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            return Vec::new();
-        }
-        vec![
-            // NDJSON feeds one resumable session finalized only by the terminal
-            // `flush`, so it satisfies the all-or-nothing overwrite contract:
-            // nothing is visible until the single WRITE_TRUNCATE load commits.
-            faucet_core::NativeLoadCapability {
-                format: faucet_core::NativeFormat::NdJson,
-                mechanism: "bigquery-load-job",
-                write_modes: &[
-                    faucet_core::WriteMode::Append,
-                    faucet_core::WriteMode::Overwrite,
-                ],
-            },
-            // CSV runs a discrete load job per batch, each committing on its
-            // own — a multi-batch overwrite would be truncate + partial appends
-            // rather than one atomic replace, so CSV is append-only here.
-            // (CSV + overwrite falls through to the Value path's staging swap.)
-            faucet_core::NativeLoadCapability {
-                format: faucet_core::NativeFormat::Csv,
-                mechanism: "bigquery-load-job",
-                write_modes: &[faucet_core::WriteMode::Append],
-            },
-        ]
-    }
-
-    async fn load_native(
+    async fn write(
         &self,
-        batch: faucet_core::NativeBatch,
-        scope: &str,
-        ctx: faucet_core::NativeLoadContext,
-    ) -> Result<usize, FaucetError> {
-        let _ = scope; // v1: no per-scope isolation on the native load path.
-        // Overwrite truncates on the first batch (which opens the session), appends
-        // thereafter. Because every page of an object feeds ONE resumable session
-        // finalized in `flush`, this is one atomic WRITE_TRUNCATE load per object —
-        // not a truncate-then-append across pages.
-        let write_disposition =
-            if ctx.write_mode == faucet_core::WriteMode::Overwrite && ctx.first_batch {
-                "WRITE_TRUNCATE"
-            } else {
-                "WRITE_APPEND"
-            };
-        let table = self.config.table_id.clone();
-        let csv = batch.csv;
-
-        match (batch.format, batch.payload) {
-            // NDJSON **streaming** — the memory-optimal path (#633). Feed each
-            // ~256 KiB chunk into the per-object resumable session as it arrives;
-            // the full page is never buffered on either side. Schema is derived
-            // from the first chunk; the row count is the NDJSON line count.
-            (faucet_core::NativeFormat::NdJson, faucet_core::NativePayload::Stream(mut s)) => {
-                use futures::StreamExt;
-                if self.streams_native_appends(write_disposition) {
-                    let mut rows = 0usize;
-                    let mut carry: Vec<u8> = Vec::new();
-                    while let Some(chunk) = s.next().await {
-                        carry.extend_from_slice(&chunk?);
-                        let complete = carry.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-                        let values = parse_ndjson(&carry[..complete])?;
-                        carry.drain(..complete);
-                        rows += self.append_rows(&values).await?;
-                    }
-                    rows += self.append_rows(&parse_ndjson(&carry)?).await?;
-                    return Ok(rows);
-                }
-                let mut rows = 0usize;
-                let mut first = true;
-                while let Some(chunk) = s.next().await {
-                    let chunk = chunk?;
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    // The explicit all-STRING schema (from the first chunk) opens the
-                    // session; later chunks pass `None` (session already open).
-                    let schema = if first {
-                        self.native_load_schema(&table, || {
-                            native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
-                                .and_then(all_string_schema)
-                        })
-                        .await?
-                    } else {
-                        None
-                    };
-                    rows += chunk.iter().filter(|&&b| b == b'\n').count();
-                    self.feed_session_bytes(&table, write_disposition, schema, &chunk)
-                        .await?;
-                    first = false;
-                }
-                Ok(rows)
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => {
+                let n = self.write_page(calls, rows).await?;
+                Ok(PageWrite::reported(self.report(rows.len(), n)))
             }
-            // NDJSON already buffered — feed the whole batch into the same resumable
-            // session (used by tests / any source that emits `Bytes`).
-            (faucet_core::NativeFormat::NdJson, faucet_core::NativePayload::Bytes(raw)) => {
-                if raw.is_empty() {
-                    return Ok(0);
-                }
-                if self.streams_native_appends(write_disposition) {
-                    return self.append_rows(&parse_ndjson(&raw)?).await;
-                }
-                let rows = batch
-                    .records
-                    .map(|r| r as usize)
-                    .unwrap_or_else(|| raw.iter().filter(|&&b| b == b'\n').count());
-                let inferred = || {
-                    native_batch_columns(&raw, faucet_core::NativeFormat::NdJson, b',')
-                        .and_then(all_string_schema)
-                };
-                let schema = self.native_load_schema(&table, inferred).await?;
-                self.feed_session_bytes(&table, write_disposition, schema, &raw)
-                    .await?;
-                Ok(rows)
-            }
-            // CSV isn't NDJSON-shaped for the resumable session, so it takes a
-            // discrete CSV load job per batch (no built-in source emits this today).
-            (faucet_core::NativeFormat::Csv, faucet_core::NativePayload::Bytes(raw)) => {
-                if raw.is_empty() {
-                    return Ok(0);
-                }
-                let rows = batch.records.unwrap_or(0) as usize;
-                let skip_rows = if csv.has_header { Some(1) } else { None };
-                let header =
-                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter);
-                let inferred = || header.clone().and_then(all_string_schema);
-                let schema = self.native_load_schema(&table, inferred).await?;
-                let schema = match (schema, csv.has_header, &header) {
-                    (Some(s), true, Some(cols)) => Some(schema_in_column_order(&s, cols)),
-                    (s, _, _) => s,
-                };
-                let autodetect_fallback = schema.is_none();
-                let media = gzip(&raw)?;
-                let job_json = self
-                    .apply_create_disposition(build_load_job_json_full(
-                        &self.config.project_id,
-                        &self.config.dataset_id,
-                        &table,
-                        write_disposition,
-                        self.config.location.as_deref(),
-                        "CSV",
-                        skip_rows,
-                        schema,
-                        autodetect_fallback,
-                    ))
-                    .to_string();
-                self.load_media(&job_json, &media).await?;
-                Ok(rows)
-            }
-            (other, _) => Err(FaucetError::Sink(format!(
-                "bigquery load_native: unsupported format {other:?} for this payload"
-            ))),
         }
     }
 
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
         &[
             faucet_core::WriteMode::Append,
             faucet_core::WriteMode::Upsert,
@@ -2829,7 +3067,50 @@ impl faucet_core::Sink for BigQuerySink {
         ]
     }
 
-    fn is_overwrite(&self) -> bool {
+    fn dedups_by_key(&self) -> bool {
+        self.config.write.dedups_by_key()
+    }
+
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
+    }
+
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
+    }
+
+    /// Scoped cleanup is always available: a BigQuery table's scope and key
+    /// predicates address real columns, and the exactly-once/upsert paths
+    /// already require the target table to carry a defined schema.
+    fn cleanup(&self) -> Option<&dyn CleanupDriver> {
+        Some(self)
+    }
+
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
+    }
+
+    /// Columnar Parquet loads are available for `append` and `overwrite`
+    /// (#380, #635). A `bulk_load` bucket is no longer required: without one
+    /// the batch is uploaded with the job itself (bucket-free media load), so
+    /// the only thing a bucket buys now is staging for very large batches.
+    ///
+    /// Load jobs are append/truncate only, so upsert/delete stay on the
+    /// `Value` MERGE path and the pipeline never negotiates the columnar loop
+    /// for them.
+    #[cfg(feature = "arrow")]
+    fn columnar(&self) -> Option<&dyn faucet_core::driver::ColumnarDriver> {
+        matches!(
+            self.config.write.write_mode,
+            faucet_core::WriteMode::Append | faucet_core::WriteMode::Overwrite
+        )
+        .then_some(self as &dyn faucet_core::driver::ColumnarDriver)
+    }
+}
+
+#[async_trait]
+impl StagingDriver for BigQueryDriver {
+    fn active(&self) -> bool {
         self.config.write.is_overwrite()
     }
 
@@ -2838,24 +3119,27 @@ impl faucet_core::Sink for BigQuerySink {
     /// partitioning/clustering), dropping any leftover staging from a crashed
     /// run. Bucket-free: no GCS staging is involved. The target must already
     /// exist (LIKE requires it) — overwrite replaces its rows, not its schema.
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+    async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         // Direct mode: no staging table to prepare. The first write truncates the
         // target (or creates it from the sample), so all begin has to do is make
         // sure the dataset exists when we're allowed to create it.
         if self.direct_overwrite() {
             if self.config.create_table {
-                self.ensure_dataset().await?;
+                self.ensure_dataset(calls).await?;
             }
             return Ok(());
         }
-        if self.target_has_schema().await? {
+        if self.target_has_schema(calls).await? {
             self.table_ready.store(true, Ordering::Release);
             return self
-                .run_ddl(format!(
-                    "CREATE OR REPLACE TABLE {} LIKE {}",
-                    self.overwrite_temp_ref(),
-                    self.table_ref()
-                ))
+                .run_ddl(
+                    calls,
+                    format!(
+                        "CREATE OR REPLACE TABLE {} LIKE {}",
+                        self.overwrite_temp_ref(),
+                        self.table_ref()
+                    ),
+                )
                 .await;
         }
         if self.config.create_table {
@@ -2865,7 +3149,7 @@ impl faucet_core::Sink for BigQuerySink {
             // `CREATE … LIKE` needs), on whichever sink instance handles it — see
             // `insert_overwrite_page`'s self-heal. No in-memory flag is set here
             // because begin and write run on different instances.
-            self.ensure_dataset().await?;
+            self.ensure_dataset(calls).await?;
             return Ok(());
         }
         Err(FaucetError::Sink(format!(
@@ -2882,7 +3166,7 @@ impl faucet_core::Sink for BigQuerySink {
     /// preserves the target's own partitioning, clustering, and description. The
     /// staging table is dropped afterwards. Staging was loaded via the query
     /// path, so there is no streaming buffer to miss.
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         // Direct mode loads straight into the target with one WRITE_TRUNCATE
         // job finalized by the terminal flush, so there is nothing to swap or drop.
         if self.direct_overwrite() {
@@ -2894,7 +3178,7 @@ impl faucet_core::Sink for BigQuerySink {
         // No staging table means no page was ever written (empty source) — for a
         // previously-missing target there is nothing to create or swap, so leave
         // the destination exactly as it was rather than failing the run.
-        if !self.table_exists(&self.overwrite_temp_id()).await? {
+        if !self.table_exists(calls, &self.overwrite_temp_id()).await? {
             tracing::warn!(
                 table = %format!(
                     "{}.{}.{}",
@@ -2920,18 +3204,14 @@ impl faucet_core::Sink for BigQuerySink {
             }
             None => idempotent::build_overwrite_commit_sql(&self.table_ref(), &temp),
         };
-        self.run_ddl(sql).await?;
-        self.run_ddl(format!("DROP TABLE IF EXISTS {temp}")).await
-    }
-
-    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        Ok(Some(self.table_exists(&self.overwrite_temp_id()).await?))
+        self.run_ddl(calls, sql).await?;
+        self.run_ddl(calls, format!("DROP TABLE IF EXISTS {temp}"))
+            .await
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
     /// behind. Best-effort — the destination was never touched.
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+    async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         // Direct mode has no staging table to drop. The pipeline never flushes
         // a failed or cancelled overwrite, so the single WRITE_TRUNCATE load is
         // still open here and cancelling it leaves the target untouched.
@@ -2945,40 +3225,41 @@ impl faucet_core::Sink for BigQuerySink {
             );
             return Ok(());
         }
-        self.run_ddl(format!(
-            "DROP TABLE IF EXISTS {}",
-            self.overwrite_temp_ref()
-        ))
+        self.run_ddl(
+            calls,
+            format!("DROP TABLE IF EXISTS {}", self.overwrite_temp_ref()),
+        )
         .await
     }
 
-    fn dedups_by_key(&self) -> bool {
-        self.config.write.dedups_by_key()
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
+        Ok(self.table_exists(calls, &self.overwrite_temp_id()).await?)
     }
+}
 
-    /// Scoped cleanup is always available: a BigQuery table's scope and key
-    /// predicates address real columns, and the exactly-once/upsert paths
-    /// already require the target table to carry a defined schema.
-    fn supports_cleanup(&self) -> bool {
-        true
-    }
-
-    async fn cleanup_scope(
+#[async_trait]
+impl CleanupDriver for BigQueryDriver {
+    async fn delete_absent(
         &self,
+        calls: &CallSlot,
         scope: &std::collections::BTreeMap<String, Value>,
         seen: &faucet_core::SeenKeys,
     ) -> Result<u64, FaucetError> {
-        self.cleanup_scope_impl(scope, seen).await
+        self.cleanup_scope_impl(calls, scope, seen).await
     }
+}
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
-    }
-
+#[async_trait]
+impl CommitTokenDriver for BigQueryDriver {
     /// Read the last durably-committed token for `scope` from the watermark
     /// table, so the pipeline can skip already-committed pages on resume.
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.ensure_commit_table().await?;
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        self.ensure_commit_table(calls).await?;
         let mut req = QueryRequest::new(idempotent::build_select_token(
             &self.config.project_id,
             &self.config.dataset_id,
@@ -2989,7 +3270,7 @@ impl faucet_core::Sink for BigQuerySink {
 
         self.roundtrips.record("query");
 
-        let resp = call_once(&self.calls.get(), "query", async {
+        let resp = call_once(&calls.get(), "query", async {
             self.client
                 .job()
                 .query(&self.config.project_id, req)
@@ -3027,81 +3308,21 @@ impl faucet_core::Sink for BigQuerySink {
         }
     }
 
-    /// Atomically write `records` and record `token` for `scope` in one BigQuery
-    /// multi-statement transaction: a typed `INSERT … SELECT FROM
-    /// UNNEST(JSON_QUERY_ARRAY(@payload))` plus a watermark `MERGE`. Either both
-    /// the rows and the token commit, or neither does — so a crash/resume skips
-    /// the already-committed page (zero duplicates) and a failed page replays
-    /// cleanly.
-    ///
-    /// The entire page is one atomic unit (no `batch_size` re-chunking — core
-    /// issues exactly one token per page), so the page must serialize within
-    /// BigQuery's ~10 MB `jobs.query` request limit.
-    async fn write_batch_idempotent(
+    async fn write_with_token(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         scope: &str,
         token: &str,
-    ) -> Result<usize, FaucetError> {
-        self.ensure_commit_table().await?;
-        self.ensure_table_ready(records).await?;
-
-        if !matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "bigquery {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return self.run_upsert_script(&plan, Some((scope, token))).await;
-        }
-
-        let columns = self.target_schema().await?;
-        self.reject_unknown_fields(&columns, records)?;
-
-        let payload = serde_json::to_string(records).map_err(|e| {
-            FaucetError::Sink(format!(
-                "BigQuery exactly-once: serialize page payload: {e}"
-            ))
-        })?;
-
-        let sql = idempotent::build_transaction_sql(
-            &columns,
-            &self.config.project_id,
-            &self.config.dataset_id,
-            &self.config.table_id,
-        );
-        let mut req = QueryRequest::new(sql);
-        req.use_legacy_sql = false;
-        req.parameter_mode = Some("NAMED".to_string());
-        req.request_id = Some(idempotent::build_request_id(scope, token));
-        req.query_parameters = Some(vec![
-            Self::string_param("payload", &payload),
-            Self::string_param("scope", scope),
-            Self::string_param("token", token),
-        ]);
-
-        self.run_transaction(req, "BigQuery idempotent write")
-            .await?;
-
-        tracing::info!(
-            table = %format!(
-                "{}.{}.{}",
-                self.config.project_id, self.config.dataset_id, self.config.table_id
-            ),
-            rows = records.len(),
-            token = %token,
-            "BigQuery exactly-once page committed"
-        );
-        Ok(records.len())
+    ) -> Result<WriteReport, FaucetError> {
+        let n = self.write_idempotent(calls, records, scope, token).await?;
+        Ok(self.report(records.len(), n))
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Schema drift (issue #194)
-    // -----------------------------------------------------------------------
-
-    fn supports_schema_evolution(&self) -> bool {
+#[async_trait]
+impl SchemaDriver for BigQueryDriver {
+    fn evolvable(&self) -> bool {
         true
     }
 
@@ -3112,8 +3333,8 @@ impl faucet_core::Sink for BigQuerySink {
     /// Returns `Ok(None)` when the target table does not exist yet (404) or
     /// carries no field definitions — both mean "no schema to diff against",
     /// so the drift pass treats every page column as new.
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        match self.fetch_schema_fields().await {
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        match self.fetch_schema_fields(calls).await {
             Ok(fields) if fields.is_empty() => Ok(None),
             Ok(fields) => Ok(Some(idempotent::fieldspecs_to_json_schema(&fields))),
             Err(e) if is_table_not_found(&e) => Ok(None),
@@ -3134,8 +3355,9 @@ impl faucet_core::Sink for BigQuerySink {
     /// via the authoritative job-status check. Every statement is idempotent so
     /// concurrent runs converge. The cached schema is invalidated afterwards so
     /// the next page re-fetches the evolved table.
-    async fn evolve_schema(
+    async fn evolve(
         &self,
+        calls: &CallSlot,
         evolution: &faucet_core::SchemaEvolution,
     ) -> Result<(), FaucetError> {
         let table_ref = self.table_ref();
@@ -3144,19 +3366,25 @@ impl faucet_core::Sink for BigQuerySink {
             let bq = idempotent::base_to_bq(
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text),
             );
-            self.run_ddl(idempotent::build_add_column_ddl(&table_ref, &c.name, bq))
-                .await?;
+            self.run_ddl(
+                calls,
+                idempotent::build_add_column_ddl(&table_ref, &c.name, bq),
+            )
+            .await?;
         }
         for c in &evolution.widenings {
             let bq = idempotent::widened_bq_type(
                 c.from.as_ref().and_then(faucet_core::json_schema_base_type),
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text),
             );
-            self.run_ddl(idempotent::build_alter_type_ddl(&table_ref, &c.name, bq))
-                .await?;
+            self.run_ddl(
+                calls,
+                idempotent::build_alter_type_ddl(&table_ref, &c.name, bq),
+            )
+            .await?;
         }
         for col in &evolution.relax_nullability {
-            self.run_ddl(idempotent::build_drop_not_null_ddl(&table_ref, col))
+            self.run_ddl(calls, idempotent::build_drop_not_null_ddl(&table_ref, col))
                 .await?;
         }
 
@@ -3165,23 +3393,11 @@ impl faucet_core::Sink for BigQuerySink {
         *self.schema_cache.write().await = None;
         Ok(())
     }
+}
 
-    /// Columnar Parquet loads are available for `append` and `overwrite`
-    /// (#380, #635). A `bulk_load` bucket is no longer required: without one
-    /// the batch is uploaded with the job itself (bucket-free media load), so
-    /// the only thing a bucket buys now is staging for very large batches.
-    ///
-    /// Load jobs are append/truncate only, so upsert/delete stay on the
-    /// `Value` MERGE path and the pipeline never negotiates the columnar loop
-    /// for them.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Append | faucet_core::WriteMode::Overwrite
-        )
-    }
-
+#[cfg(feature = "arrow")]
+#[async_trait]
+impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
     /// Write one Arrow `RecordBatch` as a BigQuery `PARQUET` load job.
     ///
     /// Two routes, chosen by whether a staging bucket is configured:
@@ -3194,9 +3410,9 @@ impl faucet_core::Sink for BigQuerySink {
     /// rest append, the same single-load-refresh shape the media NDJSON path
     /// uses: a `WRITE_TRUNCATE` load is atomic on its own, so a mid-run
     /// failure leaves the prior table intact.
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
+    async fn write_columnar(
         &self,
+        calls: &CallSlot,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
         let overwrite = self.config.write.write_mode == faucet_core::WriteMode::Overwrite;
@@ -3218,7 +3434,7 @@ impl faucet_core::Sink for BigQuerySink {
             }
             self.roundtrips.record("load");
             return crate::load::write_columnar_in(
-                &self.calls.get(),
+                &calls.get(),
                 &self.client,
                 &self.config,
                 &self.gcs_store,
@@ -3230,21 +3446,22 @@ impl faucet_core::Sink for BigQuerySink {
         if self.columnar_loaded.swap(true, Ordering::AcqRel) {
             let rows = faucet_core::record_batch_to_values(batch)?;
             if overwrite {
-                self.feed_session(&self.config.table_id, "WRITE_APPEND", &rows)
+                self.feed_session(calls, &self.config.table_id, "WRITE_APPEND", &rows)
                     .await?;
                 return Ok(rows.len());
             }
-            return self.append_rows(&rows).await;
+            return self.append_rows(calls, &rows).await;
         }
         let token = self.access_token().await?;
         self.roundtrips.record("load");
         let schema = if disposition == "WRITE_TRUNCATE" {
-            self.truncate_schema(&self.config.table_id, || None).await?
+            self.truncate_schema(calls, &self.config.table_id, || None)
+                .await?
         } else {
             None
         };
         crate::load::write_columnar_media_in(
-            &self.calls.get(),
+            &calls.get(),
             &self.client,
             &self.config,
             self.upload_base(),

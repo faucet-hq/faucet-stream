@@ -466,6 +466,23 @@ This sink takes its identifier and literal escaping, column types and exact wide
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. Rows travel as one JSON payload (`UNNEST(JSON_QUERY_ARRAY(@payload))`) through the jobs API, with a presence-flag `MERGE` for upserts, so there is no per-cell statement for the engine to plan.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `BigQueryDriver`
+implements `faucet_core::driver::SinkDriver` (load jobs, the resumable media
+session, `insertAll` and the keyed `MERGE`) with its lifecycle groups —
+`StagingDriver` (the `__faucet_ovw` staging clone and transactional swap, or
+the direct `WRITE_TRUNCATE` load), `CommitTokenDriver` (rows and watermark in
+one multi-statement transaction), `CleanupDriver`, `SchemaDriver` and, with
+`arrow`, `ColumnarDriver`. `BigQuerySink` wraps it in a `DriverSink`, which
+drives those lifecycles and derives the capabilities from the groups present;
+native byte loading stays on `BigQuerySink` (the driver contract has no
+native primitive yet). It does not use the SQL family driver
+(`faucet_common_sql::SqlSinkDriver`): BigQuery has no client-held
+transaction, and rows travel as load-job media, `insertAll` bodies or one
+JSON payload parameter rather than bound statements. The public type and
+config are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
