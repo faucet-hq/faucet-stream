@@ -296,4 +296,6 @@ async fn conformance_declared_capabilities() {
     };
     faucet_conformance::assert_idempotent_replay(&sink, count).await;
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+    faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 }

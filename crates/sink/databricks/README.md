@@ -223,6 +223,24 @@ HTTP client's connect / idle-read timeouts, `statement_timeout_secs`, the
 `429` / `503` retry and the concurrent-commit re-submit (`max_retries`,
 `retry_backoff_ms`) are unchanged; their pauses wait through the same context.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `DatabricksDriver`
+implements `faucet_core::driver::SinkDriver` (the inline / staged appends and
+the presence-flag `MERGE`) with its lifecycle groups — `StagingDriver` (the
+`CREATE TABLE … LIKE` staging table, `INSERT OVERWRITE` swap and first-run
+rename), `CommitTokenDriver` (the idempotent `REPLACE WHERE` page write and the
+`_faucet_commit_token` table), `SchemaDriver` (describe and evolve) and a
+`RollbackDriver` that only rewinds the watermark (rollback itself stays off).
+`DatabricksSink` wraps it in a `DriverSink`, which drives those lifecycles and
+derives the capabilities from the groups present. It does not use the SQL
+family driver (`faucet_common_sql::SqlSinkDriver`): the Statement Execution
+API has no client-held transaction to open and commit, rows travel as literal
+`VALUES` or staged Parquet, and exactly-once rests on idempotent page writes
+instead of rows and token in one transaction. The public type and config are
+unchanged; `faucet status --probe` now reports whether the overwrite staging
+table exists.
+
 ## Shared SQL layer
 
 This sink takes its identifier quoting, literal escaping and column types from the `Databricks` dialect of

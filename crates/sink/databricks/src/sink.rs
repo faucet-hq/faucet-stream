@@ -10,8 +10,15 @@ use faucet_common_databricks::{
     StatementResponse, backoff_delay,
 };
 use faucet_core::drift::SchemaEvolution;
+use faucet_core::driver::{
+    CommitTokenDriver, DriverSink, PageWrite, RollbackDriver, RowPolicy, SchemaDriver, SinkDriver,
+    StagingDriver,
+};
+use faucet_core::rollback::{RollbackOptions, RollbackOutcome};
 use faucet_core::write_mode::{KeyTuple, WritePlan, plan_writes};
-use faucet_core::{FaucetError, RowOutcome, SharedAuthProvider, Sink, WriteMode};
+use faucet_core::{
+    CallSlot, FaucetError, RowOutcome, SharedAuthProvider, Sink, WriteMode, WriteReport,
+};
 use serde_json::{Map, Value, json};
 
 use crate::config::{DatabricksLoadMethod, DatabricksSinkConfig, OVW_SUFFIX};
@@ -34,7 +41,17 @@ enum Replay {
 }
 
 /// Databricks SQL warehouse sink.
+///
+/// Built on the family-neutral sink driver (RFC 0014): [`DatabricksDriver`]
+/// holds the statement paths and [`DriverSink`] drives the row writes, the
+/// exactly-once commit, the overwrite lifecycle and schema evolution from
+/// them.
 pub struct DatabricksSink {
+    inner: DriverSink<DatabricksDriver>,
+}
+
+/// The Databricks I/O primitives the sink runs on.
+pub(crate) struct DatabricksDriver {
     config: DatabricksSinkConfig,
     http: reqwest::Client,
     endpoint_base: Option<String>,
@@ -45,14 +62,72 @@ pub struct DatabricksSink {
     stage_seq: AtomicU64,
     columns: tokio::sync::Mutex<Option<Vec<TableColumn>>>,
     token_table_ready: AtomicBool,
-    /// Backend-call context (#880): bounded by the run's deadline, one attempt
-    /// per request — the statement client's own retry rules stay in charge.
-    calls: faucet_core::CallSlot,
 }
 
 impl DatabricksSink {
     /// Create the sink. Validates config; does no I/O.
     pub fn new(config: DatabricksSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(DatabricksDriver::new(config)?),
+        })
+    }
+
+    /// Attach a shared auth provider (takes precedence over inline auth).
+    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
+        self.inner.driver_mut().auth_provider = Some(provider);
+        self
+    }
+
+    /// Override the base URL (e.g. a mock server).
+    pub fn with_endpoint_base(mut self, base: impl Into<String>) -> Self {
+        self.inner.driver_mut().endpoint_base = Some(base.into());
+        self
+    }
+
+    /// Upload cloud-location staged files through this store instead of one
+    /// built from ambient credentials.
+    #[cfg(feature = "staging")]
+    pub fn with_object_store(mut self, store: Arc<dyn object_store::ObjectStore>) -> Self {
+        self.inner.driver_mut().stager_override =
+            Some(Arc::new(stage::ObjectStoreStager::new(store)));
+        self
+    }
+}
+
+#[cfg(test)]
+impl DatabricksSink {
+    fn target(&self) -> TableRef {
+        self.inner.driver().target()
+    }
+    fn final_target(&self) -> TableRef {
+        self.inner.driver().final_target()
+    }
+    fn use_staging(&self, bytes: usize) -> bool {
+        self.inner.driver().use_staging(bytes)
+    }
+    fn first_failure(plan: &WritePlan) -> Option<FaucetError> {
+        DatabricksDriver::first_failure(plan)
+    }
+    async fn write_keyed(
+        &self,
+        plan: &WritePlan,
+        cols: &[TableColumn],
+        eo: Option<(&str, u64)>,
+    ) -> Result<(), FaucetError> {
+        self.inner
+            .driver()
+            .write_keyed(self.inner.calls(), plan, cols, eo)
+            .await
+    }
+}
+
+#[async_trait]
+impl Sink for DatabricksSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl DatabricksDriver {
+    fn new(config: DatabricksSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let stage = config
             .staging
@@ -84,35 +159,10 @@ impl DatabricksSink {
             stage_seq: AtomicU64::new(0),
             columns: tokio::sync::Mutex::new(None),
             token_table_ready: AtomicBool::new(false),
-            calls: faucet_core::CallSlot::new(
-                faucet_core::CallContext::new()
-                    .without_timeout()
-                    .without_retry(),
-            ),
         })
     }
 
-    /// Attach a shared auth provider (takes precedence over inline auth).
-    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
-        self.auth_provider = Some(provider);
-        self
-    }
-
-    /// Override the base URL (e.g. a mock server).
-    pub fn with_endpoint_base(mut self, base: impl Into<String>) -> Self {
-        self.endpoint_base = Some(base.into());
-        self
-    }
-
-    /// Upload cloud-location staged files through this store instead of one
-    /// built from ambient credentials.
-    #[cfg(feature = "staging")]
-    pub fn with_object_store(mut self, store: Arc<dyn object_store::ObjectStore>) -> Self {
-        self.stager_override = Some(Arc::new(stage::ObjectStoreStager::new(store)));
-        self
-    }
-
-    fn client(&self) -> StatementClient {
+    fn client(&self, calls: &CallSlot) -> StatementClient {
         let c = &self.config;
         StatementClient::new(
             self.http.clone(),
@@ -132,7 +182,7 @@ impl DatabricksSink {
             },
             ErrorSide::Sink,
         )
-        .with_call_context(self.calls.get())
+        .with_call_context(calls.get())
     }
 
     fn final_target(&self) -> TableRef {
@@ -157,10 +207,11 @@ impl DatabricksSink {
 
     async fn run(
         &self,
+        calls: &CallSlot,
         req: StatementRequest,
         replay: Replay,
     ) -> Result<StatementResponse, FaucetError> {
-        let client = self.client();
+        let client = self.client(calls);
         let mut req = req;
         req.catalog = self.config.catalog.clone();
         let mut attempt = 0u32;
@@ -194,15 +245,24 @@ impl DatabricksSink {
         }
     }
 
-    async fn exec(&self, sql: String, replay: Replay) -> Result<StatementResponse, FaucetError> {
-        self.run(StatementRequest::new(sql), replay).await
+    async fn exec(
+        &self,
+        calls: &CallSlot,
+        sql: String,
+        replay: Replay,
+    ) -> Result<StatementResponse, FaucetError> {
+        self.run(calls, StatementRequest::new(sql), replay).await
     }
 
-    async fn describe(&self, table: &TableRef) -> Result<Vec<TableColumn>, FaucetError> {
+    async fn describe(
+        &self,
+        calls: &CallSlot,
+        table: &TableRef,
+    ) -> Result<Vec<TableColumn>, FaucetError> {
         let req = StatementRequest::new(sql::describe_sql(table.catalog.as_deref()))
             .param(StatementParam::string("faucet_schema", &table.schema))
             .param(StatementParam::string("faucet_table", &table.table));
-        let resp = self.run(req, Replay::Safe).await?;
+        let resp = self.run(calls, req, Replay::Safe).await?;
         Ok(sql::columns_from_rows(resp.string_rows()))
     }
 
@@ -214,6 +274,7 @@ impl DatabricksSink {
     /// is missing (and allowed). `None`: no table and nothing to infer from.
     async fn ensure_table(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         eo: bool,
     ) -> Result<Option<Vec<TableColumn>>, FaucetError> {
@@ -226,7 +287,7 @@ impl DatabricksSink {
         let target = self.target();
         let mut cols = match cache.take() {
             Some(c) => c,
-            None => self.describe(&target).await?,
+            None => self.describe(calls, &target).await?,
         };
         if cols.is_empty() {
             if !self.config.create_table {
@@ -243,19 +304,27 @@ impl DatabricksSink {
             let Some(planned) = planned else {
                 return Ok(None);
             };
-            self.exec(sql::create_table_sql(&target, &planned, eo), Replay::Safe)
-                .await?;
+            self.exec(
+                calls,
+                sql::create_table_sql(&target, &planned, eo),
+                Replay::Safe,
+            )
+            .await?;
             cols = sql::planned_table_columns(&planned, eo);
         } else if eo {
             let missing = missing_eo_columns(&cols);
             if !missing.is_empty() {
                 match self
-                    .exec(sql::add_columns_sql(&target, &missing), Replay::Unsafe)
+                    .exec(
+                        calls,
+                        sql::add_columns_sql(&target, &missing),
+                        Replay::Unsafe,
+                    )
                     .await
                 {
                     Ok(_) => cols.extend(missing),
                     Err(e) => {
-                        let now = self.describe(&target).await?;
+                        let now = self.describe(calls, &target).await?;
                         if !missing_eo_columns(&now).is_empty() {
                             return Err(e);
                         }
@@ -278,12 +347,16 @@ impl DatabricksSink {
         }
     }
 
-    fn stager(&self, loc: &StageLocation) -> Result<Arc<dyn Stager>, FaucetError> {
+    fn stager(
+        &self,
+        calls: &CallSlot,
+        loc: &StageLocation,
+    ) -> Result<Arc<dyn Stager>, FaucetError> {
         if let Some(s) = &self.stager_override {
             return Ok(Arc::clone(s));
         }
         if loc.is_volume() {
-            return Ok(Arc::new(FilesApiStager::new(self.client())));
+            return Ok(Arc::new(FilesApiStager::new(self.client(calls))));
         }
         #[cfg(feature = "staging")]
         {
@@ -303,6 +376,7 @@ impl DatabricksSink {
     /// per policy (best-effort, logged).
     async fn staged<F>(
         &self,
+        calls: &CallSlot,
         m: &Matrix,
         eo: Option<(&str, u64)>,
         make_sql: F,
@@ -325,15 +399,15 @@ impl DatabricksSink {
                 &body,
             ),
         };
-        let stager = self.stager(loc)?;
+        let stager = self.stager(calls, loc)?;
         let path = loc.object_path(&name.rel());
-        self.calls
+        calls
             .get()
             .with_roundtrip_metering(false)
             .call_once("stage", stager.put(&path, body))
             .await?;
         let (sql, replay) = make_sql(loc, &name);
-        let result = self.exec(sql, replay).await;
+        let result = self.exec(calls, sql, replay).await;
         let cleanup = self
             .config
             .staging
@@ -352,6 +426,7 @@ impl DatabricksSink {
     /// form keyed on `(scope, seq)`.
     async fn write_rows(
         &self,
+        calls: &CallSlot,
         records: &[Value],
         cols: &[TableColumn],
         eo: Option<(&str, u64)>,
@@ -365,7 +440,7 @@ impl DatabricksSink {
                 .as_ref()
                 .and_then(|s| s.copy_options.clone());
             return self
-                .staged(&m, eo, |loc, name| match eo {
+                .staged(calls, &m, eo, |loc, name| match eo {
                     Some((scope, seq)) => (
                         sql::replace_where_sql(
                             &target,
@@ -408,7 +483,7 @@ impl DatabricksSink {
                     Replay::Unsafe,
                 ),
             };
-            self.exec(sql, replay).await?;
+            self.exec(calls, sql, replay).await?;
         }
         Ok(())
     }
@@ -416,6 +491,7 @@ impl DatabricksSink {
     /// Apply an upsert/delete plan with `MERGE`.
     async fn write_keyed(
         &self,
+        calls: &CallSlot,
         plan: &WritePlan,
         cols: &[TableColumn],
         eo: Option<(&str, u64)>,
@@ -440,7 +516,7 @@ impl DatabricksSink {
         let target = self.target();
         if self.use_staging(m.estimated_bytes()) {
             return self
-                .staged(&m, eo, |loc, name| {
+                .staged(calls, &m, eo, |loc, name| {
                     (
                         sql::merge_sql(
                             &target,
@@ -461,26 +537,35 @@ impl DatabricksSink {
         );
         for r in ranges {
             let sql = sql::merge_sql(&target, &merge_cols, key, Relation::Values(&m.rows[r]));
-            self.exec(sql, Replay::Safe).await?;
+            self.exec(calls, sql, Replay::Safe).await?;
         }
         Ok(())
     }
 
-    async fn ensure_token_table(&self) -> Result<(), FaucetError> {
+    async fn ensure_token_table(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         if self.token_table_ready.load(Ordering::Relaxed) {
             return Ok(());
         }
-        self.exec(sql::token_table_ddl(&self.final_target()), Replay::Safe)
-            .await?;
+        self.exec(
+            calls,
+            sql::token_table_ddl(&self.final_target()),
+            Replay::Safe,
+        )
+        .await?;
         self.token_table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn put_token(&self, scope: &str, token: &str) -> Result<(), FaucetError> {
+    async fn put_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+        token: &str,
+    ) -> Result<(), FaucetError> {
         let req = StatementRequest::new(sql::token_merge_sql(&self.final_target()))
             .param(StatementParam::string("scope", scope))
             .param(StatementParam::string("token", token));
-        self.run(req, Replay::Safe).await.map(|_| ())
+        self.run(calls, req, Replay::Safe).await.map(|_| ())
     }
 
     fn first_failure(plan: &WritePlan) -> Option<FaucetError> {
@@ -498,17 +583,12 @@ fn key_object(k: &KeyTuple) -> Value {
     Value::Object(m)
 }
 
-#[async_trait]
-impl Sink for DatabricksSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+impl DatabricksDriver {
+    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let Some(cols) = self.ensure_table(records, false).await? else {
+        let Some(cols) = self.ensure_table(calls, records, false).await? else {
             return Ok(0);
         };
         if self.config.write.dedups_by_key() {
@@ -516,16 +596,20 @@ impl Sink for DatabricksSink {
             if let Some(e) = Self::first_failure(&plan) {
                 return Err(e);
             }
-            self.write_keyed(&plan, &cols, None).await?;
+            self.write_keyed(calls, &plan, &cols, None).await?;
         } else {
-            self.write_rows(records, &cols, None).await?;
+            self.write_rows(calls, records, &cols, None).await?;
         }
         Ok(records.len())
     }
 
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+    async fn write_partial(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
         if !self.config.write.dedups_by_key() {
-            self.write_batch(records).await?;
+            self.write_page(calls, records).await?;
             return Ok(records.iter().map(|_| Ok(())).collect());
         }
         if records.is_empty() {
@@ -533,9 +617,9 @@ impl Sink for DatabricksSink {
         }
         let plan = plan_writes(records, &self.config.write);
         if plan.failed.len() < records.len()
-            && let Some(cols) = self.ensure_table(records, false).await?
+            && let Some(cols) = self.ensure_table(calls, records, false).await?
         {
-            self.write_keyed(&plan, &cols, None).await?;
+            self.write_keyed(calls, &plan, &cols, None).await?;
         }
         let mut out: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (i, msg) in &plan.failed {
@@ -544,81 +628,42 @@ impl Sink for DatabricksSink {
         Ok(out)
     }
 
-    fn supports_idempotent_writes(&self) -> bool {
-        true
-    }
-
-    async fn write_batch_idempotent(
-        &self,
-        records: &[Value],
-        scope: &str,
-        token: &str,
-    ) -> Result<usize, FaucetError> {
-        let seq = faucet_core::parse_token(token).ok_or_else(|| {
-            FaucetError::Sink(format!(
-                "databricks sink: unparseable commit token `{token}`"
-            ))
-        })?;
-        match self.config.write.write_mode {
-            WriteMode::Upsert | WriteMode::Delete => {
-                if !records.is_empty() {
-                    let plan = plan_writes(records, &self.config.write);
-                    if let Some(e) = Self::first_failure(&plan) {
-                        return Err(e);
-                    }
-                    if let Some(cols) = self.ensure_table(records, false).await? {
-                        self.write_keyed(&plan, &cols, Some((scope, seq))).await?;
-                    }
-                }
-            }
-            WriteMode::Append => {
-                if records.is_empty() {
-                    let cols = self.describe(&self.target()).await?;
-                    if !cols.is_empty() && missing_eo_columns(&cols).is_empty() {
-                        self.exec(sql::delete_eo_sql(&self.target(), scope, seq), Replay::Safe)
-                            .await?;
-                    }
-                } else if let Some(cols) = self.ensure_table(records, true).await? {
-                    self.write_rows(records, &cols, Some((scope, seq))).await?;
-                }
-            }
-            _ => {
-                return Err(FaucetError::Config(
-                    "databricks sink: write_mode: overwrite cannot be combined with \
-                     delivery: exactly_once"
-                        .into(),
-                ));
-            }
+    /// The report for `n` rows written out of `offered`, as the row paths
+    /// account for a keyed write.
+    fn report(&self, offered: usize, n: usize) -> WriteReport {
+        if self.config.write.dedups_by_key() {
+            WriteReport::keyed(offered, n)
+        } else {
+            WriteReport::accepted(n)
         }
-        self.ensure_token_table().await?;
-        self.put_token(scope, token).await?;
-        Ok(records.len())
+    }
+}
+
+#[async_trait]
+impl SinkDriver for DatabricksDriver {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
     }
 
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.ensure_token_table().await?;
-        let req = StatementRequest::new(sql::token_select_sql(&self.final_target()))
-            .param(StatementParam::string("scope", scope));
-        let resp = self.run(req, Replay::Safe).await?;
-        Ok(resp
-            .string_rows()
-            .into_iter()
-            .next()
-            .and_then(|r| r.into_iter().next().flatten()))
+    fn call_context(&self) -> faucet_core::CallContext {
+        faucet_core::CallContext::new()
+            .without_timeout()
+            .without_retry()
     }
 
-    async fn rewind_commit_token(
+    async fn write(
         &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.ensure_token_table().await?;
-        match token {
-            Some(t) => self.put_token(scope, t).await,
-            None => {
-                let req = StatementRequest::new(sql::token_delete_sql(&self.final_target()))
-                    .param(StatementParam::string("scope", scope));
-                self.run(req, Replay::Safe).await.map(|_| ())
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => {
+                let n = self.write_page(calls, rows).await?;
+                Ok(PageWrite::reported(self.report(rows.len(), n)))
             }
         }
     }
@@ -627,7 +672,7 @@ impl Sink for DatabricksSink {
         self.config.write.dedups_by_key()
     }
 
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
+    fn write_modes(&self) -> &'static [WriteMode] {
         &[
             WriteMode::Append,
             WriteMode::Upsert,
@@ -636,90 +681,24 @@ impl Sink for DatabricksSink {
         ]
     }
 
-    fn supports_staged_load(&self) -> bool {
+    fn staged_load(&self) -> bool {
         true
     }
 
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        let cols = self.describe(&self.target()).await?;
-        Ok((!cols.is_empty()).then(|| sql::schema_from_columns(&cols)))
+    fn staging(&self) -> Option<&dyn StagingDriver> {
+        Some(self)
     }
 
-    fn supports_schema_evolution(&self) -> bool {
-        true
+    fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
+        Some(self)
     }
 
-    async fn evolve_schema(&self, evolution: &SchemaEvolution) -> Result<(), FaucetError> {
-        let target = self.target();
-        let current = self.describe(&target).await?;
-        for stmt in sql::plan_evolution(&target, evolution, &current)? {
-            self.exec(stmt, Replay::Unsafe).await?;
-        }
-        self.invalidate_columns().await;
-        Ok(())
+    fn schema(&self) -> Option<&dyn SchemaDriver> {
+        Some(self)
     }
 
-    fn is_overwrite(&self) -> bool {
-        self.config.write.is_overwrite()
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        let target = self.final_target();
-        let staging = self.target();
-        self.exec(sql::drop_table_sql(&staging), Replay::Safe)
-            .await?;
-        if self.describe(&target).await?.is_empty() {
-            if !self.config.create_table {
-                return Err(faucet_core::missing_target_error(
-                    "databricks sink",
-                    &target.display(),
-                ));
-            }
-        } else {
-            self.exec(sql::create_like_sql(&staging, &target), Replay::Unsafe)
-                .await?;
-        }
-        self.invalidate_columns().await;
-        Ok(())
-    }
-
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        let target = self.final_target();
-        let staging = self.target();
-        let target_exists = !self.describe(&target).await?.is_empty();
-        let staging_exists = !self.describe(&staging).await?.is_empty();
-        match (target_exists, staging_exists) {
-            (true, true) => {
-                let target_cols = self.describe(&target).await?;
-                self.exec(
-                    sql::insert_overwrite_sql(&target, &staging, &target_cols),
-                    Replay::Safe,
-                )
-                .await?;
-                self.exec(sql::drop_table_sql(&staging), Replay::Safe)
-                    .await?;
-            }
-            (true, false) => {
-                return Err(FaucetError::Sink(format!(
-                    "databricks sink: overwrite staging table {} is missing; refusing to \
-                     replace {}",
-                    staging.display(),
-                    target.display()
-                )));
-            }
-            (false, true) => {
-                self.exec(sql::rename_sql(&staging, &target), Replay::Unsafe)
-                    .await?;
-            }
-            (false, false) => {}
-        }
-        Ok(())
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.exec(sql::drop_table_sql(&self.target()), Replay::Safe)
-            .await
-            .map(|_| ())
+    fn rollback(&self) -> Option<&dyn RollbackDriver> {
+        Some(self)
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
@@ -744,17 +723,6 @@ impl Sink for DatabricksSink {
         "databricks"
     }
 
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
     fn dataset_uri(&self) -> String {
         format!(
             "databricks://{}/{}",
@@ -769,13 +737,14 @@ impl Sink for DatabricksSink {
 
     async fn check(
         &self,
+        calls: &CallSlot,
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
         let started = std::time::Instant::now();
         let warehouse = match tokio::time::timeout(
             ctx.timeout,
-            self.run(StatementRequest::new("SELECT 1"), Replay::Safe),
+            self.run(calls, StatementRequest::new("SELECT 1"), Replay::Safe),
         )
         .await
         {
@@ -795,7 +764,7 @@ impl Sink for DatabricksSink {
         };
         let target = self.final_target();
         let started = std::time::Instant::now();
-        let table = match tokio::time::timeout(ctx.timeout, self.describe(&target)).await {
+        let table = match tokio::time::timeout(ctx.timeout, self.describe(calls, &target)).await {
             Ok(Ok(cols)) if !cols.is_empty() => Probe::pass("table", started.elapsed()),
             Ok(Ok(_)) if self.config.create_table => Probe::skip(
                 "table",
@@ -820,6 +789,225 @@ impl Sink for DatabricksSink {
         Ok(CheckReport {
             probes: vec![warehouse, table],
         })
+    }
+}
+
+#[async_trait]
+impl CommitTokenDriver for DatabricksDriver {
+    async fn last_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        self.ensure_token_table(calls).await?;
+        let req = StatementRequest::new(sql::token_select_sql(&self.final_target()))
+            .param(StatementParam::string("scope", scope));
+        let resp = self.run(calls, req, Replay::Safe).await?;
+        Ok(resp
+            .string_rows()
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten()))
+    }
+
+    async fn write_with_token(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<WriteReport, FaucetError> {
+        let seq = faucet_core::parse_token(token).ok_or_else(|| {
+            FaucetError::Sink(format!(
+                "databricks sink: unparseable commit token `{token}`"
+            ))
+        })?;
+        match self.config.write.write_mode {
+            WriteMode::Upsert | WriteMode::Delete => {
+                if !records.is_empty() {
+                    let plan = plan_writes(records, &self.config.write);
+                    if let Some(e) = Self::first_failure(&plan) {
+                        return Err(e);
+                    }
+                    if let Some(cols) = self.ensure_table(calls, records, false).await? {
+                        self.write_keyed(calls, &plan, &cols, Some((scope, seq)))
+                            .await?;
+                    }
+                }
+            }
+            WriteMode::Append => {
+                if records.is_empty() {
+                    let cols = self.describe(calls, &self.target()).await?;
+                    if !cols.is_empty() && missing_eo_columns(&cols).is_empty() {
+                        self.exec(
+                            calls,
+                            sql::delete_eo_sql(&self.target(), scope, seq),
+                            Replay::Safe,
+                        )
+                        .await?;
+                    }
+                } else if let Some(cols) = self.ensure_table(calls, records, true).await? {
+                    self.write_rows(calls, records, &cols, Some((scope, seq)))
+                        .await?;
+                }
+            }
+            _ => {
+                return Err(FaucetError::Config(
+                    "databricks sink: write_mode: overwrite cannot be combined with \
+                     delivery: exactly_once"
+                        .into(),
+                ));
+            }
+        }
+        self.ensure_token_table(calls).await?;
+        self.put_token(calls, scope, token).await?;
+        Ok(self.report(records.len(), records.len()))
+    }
+}
+
+/// Rollback is not supported (`supports_rollback` is false); the driver only
+/// rewinds the exactly-once watermark.
+#[async_trait]
+impl RollbackDriver for DatabricksDriver {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    async fn rollback_run(
+        &self,
+        _calls: &CallSlot,
+        _run_id: &str,
+        _opts: &RollbackOptions,
+    ) -> Result<RollbackOutcome, FaucetError> {
+        Err(FaucetError::Sink(
+            "sink 'databricks' does not support rollback".into(),
+        ))
+    }
+
+    async fn forget_run(&self, _calls: &CallSlot, _run_id: &str) -> Result<(), FaucetError> {
+        Ok(())
+    }
+
+    async fn rewind_commit_token(
+        &self,
+        calls: &CallSlot,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.ensure_token_table(calls).await?;
+        match token {
+            Some(t) => self.put_token(calls, scope, t).await,
+            None => {
+                let req = StatementRequest::new(sql::token_delete_sql(&self.final_target()))
+                    .param(StatementParam::string("scope", scope));
+                self.run(calls, req, Replay::Safe).await.map(|_| ())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SchemaDriver for DatabricksDriver {
+    async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
+        let cols = self.describe(calls, &self.target()).await?;
+        Ok((!cols.is_empty()).then(|| sql::schema_from_columns(&cols)))
+    }
+
+    fn evolvable(&self) -> bool {
+        true
+    }
+
+    async fn evolve(
+        &self,
+        calls: &CallSlot,
+        evolution: &SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        let target = self.target();
+        let current = self.describe(calls, &target).await?;
+        for stmt in sql::plan_evolution(&target, evolution, &current)? {
+            self.exec(calls, stmt, Replay::Unsafe).await?;
+        }
+        self.invalidate_columns().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StagingDriver for DatabricksDriver {
+    fn active(&self) -> bool {
+        self.config.write.is_overwrite()
+    }
+
+    async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let target = self.final_target();
+        let staging = self.target();
+        self.exec(calls, sql::drop_table_sql(&staging), Replay::Safe)
+            .await?;
+        if self.describe(calls, &target).await?.is_empty() {
+            if !self.config.create_table {
+                return Err(faucet_core::missing_target_error(
+                    "databricks sink",
+                    &target.display(),
+                ));
+            }
+        } else {
+            self.exec(
+                calls,
+                sql::create_like_sql(&staging, &target),
+                Replay::Unsafe,
+            )
+            .await?;
+        }
+        self.invalidate_columns().await;
+        Ok(())
+    }
+
+    async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let target = self.final_target();
+        let staging = self.target();
+        let target_exists = !self.describe(calls, &target).await?.is_empty();
+        let staging_exists = !self.describe(calls, &staging).await?.is_empty();
+        match (target_exists, staging_exists) {
+            (true, true) => {
+                let target_cols = self.describe(calls, &target).await?;
+                self.exec(
+                    calls,
+                    sql::insert_overwrite_sql(&target, &staging, &target_cols),
+                    Replay::Safe,
+                )
+                .await?;
+                self.exec(calls, sql::drop_table_sql(&staging), Replay::Safe)
+                    .await?;
+            }
+            (true, false) => {
+                return Err(FaucetError::Sink(format!(
+                    "databricks sink: overwrite staging table {} is missing; refusing to \
+                     replace {}",
+                    staging.display(),
+                    target.display()
+                )));
+            }
+            (false, true) => {
+                self.exec(calls, sql::rename_sql(&staging, &target), Replay::Unsafe)
+                    .await?;
+            }
+            (false, false) => {}
+        }
+        Ok(())
+    }
+
+    async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.exec(calls, sql::drop_table_sql(&self.target()), Replay::Safe)
+            .await
+            .map(|_| ())
+    }
+
+    /// Whether the overwrite staging table exists: a read-only describe.
+    async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
+        let staging = self
+            .final_target()
+            .sibling(&format!("{}{OVW_SUFFIX}", self.config.table));
+        Ok(!self.describe(calls, &staging).await?.is_empty())
     }
 }
 
