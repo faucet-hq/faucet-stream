@@ -10,7 +10,7 @@
 
 use crate::config::PostgresColumnMapping;
 use crate::sink::{
-    PostgresSink, bootstrap_lock_key, pg_bind_text, qualified_table_ref, run_bootstrap_ddl,
+    PostgresDriver, bootstrap_lock_key, pg_bind_text, qualified_table_ref, run_bootstrap_ddl,
 };
 use faucet_common_sql::SqlDialect;
 use faucet_common_sql::dialects::Postgres;
@@ -35,7 +35,7 @@ fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Sink(format!("postgres rollback: {context}: {e}"))
 }
 
-impl PostgresSink {
+impl PostgresDriver {
     /// `<table>__faucet_prev` — the replaced table an overwrite keeps.
     pub(crate) fn previous_table_name(&self) -> String {
         crate::sink::derived_table_name(
