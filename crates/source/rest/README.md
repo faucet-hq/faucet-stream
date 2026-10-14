@@ -1120,6 +1120,21 @@ Redirects are followed by `faucet_core::http::Client`: a hop to another
 origin drops `Authorization`, cookies and every credential header, and a request
 body is never replayed to another origin.
 
+## How it is built
+
+The source runs on the family-neutral source driver (RFC 0014): `RestDriver`
+implements `faucet_core::driver::SourceDriver` — `read` streams the HTTP pages
+(pagination, partitions, key-range tiles, async jobs, bookmarks),
+`resume_from` restores the bookmark, `fetch` keeps the buffered
+`fetch_all` path, and the native-bytes (`read_native`), columnar
+(`read_columnar`) and discovery primitives keep the CSV async-job passthrough,
+the Arrow path and OData / recipe discovery. `RestStream` wraps it in a
+`DriverSource`. The driver keeps its own call slot — each request layers the
+per-call retry budget (429 / `Retry-After` included) over the run's context —
+so the run's call context and round-trip recorder are forwarded to it. The
+public type, its builder and convenience methods, and the config are
+unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
