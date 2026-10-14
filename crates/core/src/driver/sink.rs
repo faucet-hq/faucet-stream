@@ -18,6 +18,7 @@ use crate::cleanup::SeenKeys;
 use crate::dlq::BatchAtomicity;
 use crate::drift::SchemaEvolution;
 use crate::error::FaucetError;
+use crate::idempotency::SinkGuarantee;
 use crate::io::{CallContext, CallSlot};
 use crate::local_outputs::LocalOutput;
 use crate::observability::RoundtripRecorder;
@@ -344,6 +345,13 @@ pub trait SinkDriver: Send + Sync {
         derived
     }
 
+    /// Adjust the delivery guarantee [`DriverSink`] derived (an external
+    /// target whose keyed convergence faucet cannot vouch for). Default:
+    /// unchanged.
+    fn sink_guarantee(&self, derived: SinkGuarantee) -> SinkGuarantee {
+        derived
+    }
+
     /// The overwrite primitives.
     fn staging(&self) -> Option<&dyn StagingDriver> {
         None
@@ -566,6 +574,17 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
 
     fn capabilities(&self) -> Capabilities {
         self.driver.capabilities(Capabilities::of_sink(self))
+    }
+
+    fn sink_guarantee(&self) -> SinkGuarantee {
+        let derived = if self.supports_idempotent_writes() {
+            SinkGuarantee::AtomicWatermark
+        } else if self.driver.write_modes().contains(&WriteMode::Upsert) {
+            SinkGuarantee::KeyedUpsert
+        } else {
+            SinkGuarantee::AtLeastOnce
+        };
+        self.driver.sink_guarantee(derived)
     }
 
     fn write_batch_is_replay_safe(&self) -> bool {

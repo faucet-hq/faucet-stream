@@ -1450,3 +1450,60 @@ async fn the_remaining_defaults_answer() {
         crate::BatchAtomicity::BestEffort
     );
 }
+
+#[test]
+fn sink_guarantee_is_derived_and_a_driver_may_lower_it() {
+    use crate::idempotency::SinkGuarantee;
+    struct Keyed(bool);
+    #[async_trait]
+    impl SinkDriver for Keyed {
+        fn connector_name(&self) -> &'static str {
+            "keyed"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            r: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(r.len()))
+        }
+        fn write_modes(&self) -> &'static [WriteMode] {
+            &[WriteMode::Append, WriteMode::Upsert]
+        }
+        fn sink_guarantee(&self, derived: SinkGuarantee) -> SinkGuarantee {
+            if self.0 {
+                SinkGuarantee::AtLeastOnce
+            } else {
+                derived
+            }
+        }
+    }
+    assert_eq!(
+        DriverSink::new(Keyed(false)).sink_guarantee(),
+        SinkGuarantee::KeyedUpsert
+    );
+    assert_eq!(
+        DriverSink::new(Keyed(true)).sink_guarantee(),
+        SinkGuarantee::AtLeastOnce
+    );
+    struct Plain;
+    #[async_trait]
+    impl SinkDriver for Plain {
+        fn connector_name(&self) -> &'static str {
+            "plain"
+        }
+        async fn write(
+            &self,
+            _: &CallSlot,
+            r: &[Value],
+            _: RowPolicy,
+        ) -> Result<PageWrite, FaucetError> {
+            Ok(PageWrite::accepted(r.len()))
+        }
+    }
+    assert_eq!(
+        DriverSink::new(Plain).sink_guarantee(),
+        SinkGuarantee::AtLeastOnce
+    );
+}
