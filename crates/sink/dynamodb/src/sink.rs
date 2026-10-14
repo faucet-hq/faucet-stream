@@ -9,6 +9,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use faucet_common_dynamodb::{
     ErrorClass, KeyAttribute, classify_error, json_to_attribute, key_schema, sdk_error_parts,
 };
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome, WriteMode};
 use serde_json::Value;
@@ -79,18 +80,35 @@ fn fail_all(mut outcomes: Vec<OpOutcome>, pending: Vec<Op>, error: &FaucetError)
 
 /// Amazon DynamoDB sink. See the crate README for semantics.
 pub struct DynamoDbSink {
+    inner: DriverSink<DynamoDbDriver>,
+}
+
+/// The connector's I/O primitives (RFC 0014).
+pub(crate) struct DynamoDbDriver {
     config: DynamoDbSinkConfig,
     client: Client,
     keys: tokio::sync::OnceCell<(Vec<KeyAttribute>, Vec<String>)>,
     names: Option<HashMap<String, String>>,
     values: Option<HashMap<String, AttributeValue>>,
-    calls: CallSlot,
 }
 
 impl DynamoDbSink {
     /// Create a new DynamoDB sink. Validates the config and builds the client
     /// (no network I/O; the table key schema is read on first write).
     pub async fn new(config: DynamoDbSinkConfig) -> Result<Self, FaucetError> {
+        Ok(Self {
+            inner: DriverSink::new(DynamoDbDriver::new(config).await?),
+        })
+    }
+}
+
+#[faucet_core::async_trait]
+impl faucet_core::Sink for DynamoDbSink {
+    faucet_core::forward_sink!(inner);
+}
+
+impl DynamoDbDriver {
+    async fn new(config: DynamoDbSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let client = faucet_common_dynamodb::build_client(
             config.region.as_deref(),
@@ -118,17 +136,19 @@ impl DynamoDbSink {
             keys: tokio::sync::OnceCell::new(),
             names,
             values,
-            calls: CallSlot::new(CallContext::new()),
         })
     }
 
-    async fn describe(&self) -> Result<aws_sdk_dynamodb::types::TableDescription, FaucetError> {
+    async fn describe(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<aws_sdk_dynamodb::types::TableDescription, FaucetError> {
         let what = format!("DescribeTable '{}'", self.config.table_name);
         let out = self
             .config
             .retry
             .run_in(
-                &self.calls.get(),
+                &calls.get(),
                 "describe_table",
                 &what,
                 FaucetError::Sink,
@@ -151,11 +171,14 @@ impl DynamoDbSink {
     }
 
     /// The table key (partition key first) with its declared types, plus the names; read once.
-    async fn table_keys(&self) -> Result<(&[KeyAttribute], &[String]), FaucetError> {
+    async fn table_keys(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<(&[KeyAttribute], &[String]), FaucetError> {
         let (keys, names) = self
             .keys
             .get_or_try_init(|| async {
-                let desc = Box::pin(self.describe()).await?;
+                let desc = Box::pin(self.describe(calls)).await?;
                 let keys = key_schema(&desc)?;
                 let names: Vec<String> = keys.iter().map(|k| k.name.clone()).collect();
                 if matches!(
@@ -172,8 +195,8 @@ impl DynamoDbSink {
 
     /// [`Self::single_write`] with a request failure reported against the op's
     /// rows, so a page never loses the outcomes of rows that already landed.
-    async fn single_write_outcome(&self, op: &Op) -> Result<(), String> {
-        match Box::pin(self.single_write(op)).await {
+    async fn single_write_outcome(&self, calls: &CallSlot, op: &Op) -> Result<(), String> {
+        match Box::pin(self.single_write(calls, op)).await {
             Ok(result) => result,
             Err(e) => Err(e.to_string()),
         }
@@ -181,14 +204,18 @@ impl DynamoDbSink {
 
     /// Write one op item-by-item (conditional writes, validation isolation).
     /// `Ok(Err)` is a per-row failure; the outer `Err` a request failure.
-    async fn single_write(&self, op: &Op) -> Result<Result<(), String>, FaucetError> {
+    async fn single_write(
+        &self,
+        calls: &CallSlot,
+        op: &Op,
+    ) -> Result<Result<(), String>, FaucetError> {
         let table = &self.config.table_name;
         let what = format!("write to '{table}'");
         let on_fail = self.config.on_condition_failure;
         self.config
             .retry
             .run_in(
-                &self.calls.get(),
+                &calls.get(),
                 "write",
                 &what,
                 FaucetError::Sink,
@@ -229,6 +256,7 @@ impl DynamoDbSink {
     /// back to item-by-item writes so only the bad rows fail.
     async fn batch_chunk(
         &self,
+        calls: &CallSlot,
         ops: Vec<Op>,
         keys: &[String],
     ) -> Result<Vec<OpOutcome>, FaucetError> {
@@ -237,10 +265,10 @@ impl DynamoDbSink {
         let mut pending = ops;
         let mut outcomes: Vec<OpOutcome> = Vec::new();
         let mut attempt = 0u32;
-        let calls = self.calls.get();
+        let ctx = calls.get();
         loop {
             let requests: Vec<_> = pending.iter().map(Op::write_request).collect();
-            let sent = calls
+            let sent = ctx
                 .call("batch_write", || async {
                     Ok(self
                         .client
@@ -277,7 +305,7 @@ impl DynamoDbSink {
                     }
                     tracing::debug!(table = %table, unprocessed = left.len(), attempt,
                         "dynamodb: retrying unprocessed items");
-                    if let Err(spent) = calls.wait(retry.delay(attempt)).await {
+                    if let Err(spent) = ctx.wait(retry.delay(attempt)).await {
                         return Ok(fail_all(outcomes, left, &spent));
                     }
                     attempt += 1;
@@ -289,7 +317,7 @@ impl DynamoDbSink {
                         tracing::debug!(table = %table, error = %message,
                             "dynamodb: batch rejected; isolating rows");
                         for op in pending {
-                            let result = Box::pin(self.single_write_outcome(&op)).await;
+                            let result = Box::pin(self.single_write_outcome(calls, &op)).await;
                             outcomes.push((op.rows, result));
                         }
                         return Ok(outcomes);
@@ -304,7 +332,7 @@ impl DynamoDbSink {
                         outcomes.extend(pending.into_iter().map(|op| (op.rows, Err(msg.clone()))));
                         return Ok(outcomes);
                     }
-                    if let Err(spent) = calls.wait(retry.delay(attempt)).await {
+                    if let Err(spent) = ctx.wait(retry.delay(attempt)).await {
                         return Ok(fail_all(outcomes, pending, &spent));
                     }
                     attempt += 1;
@@ -314,12 +342,17 @@ impl DynamoDbSink {
     }
 
     /// Apply planned ops with bounded concurrency.
-    async fn execute(&self, ops: Vec<Op>, keys: &[String]) -> Result<Vec<OpOutcome>, FaucetError> {
+    async fn execute(
+        &self,
+        calls: &CallSlot,
+        ops: Vec<Op>,
+        keys: &[String],
+    ) -> Result<Vec<OpOutcome>, FaucetError> {
         use futures::StreamExt;
         let mut outcomes = Vec::with_capacity(ops.len());
         if self.config.condition_expression.is_some() {
             let mut stream = futures::stream::iter(ops.into_iter().map(|op| async move {
-                let result = self.single_write_outcome(&op).await;
+                let result = self.single_write_outcome(calls, &op).await;
                 (op.rows, result)
             }))
             .buffer_unordered(self.config.concurrency);
@@ -332,7 +365,7 @@ impl DynamoDbSink {
         let mut stream = futures::stream::iter(
             chunks
                 .into_iter()
-                .map(|c| Box::pin(self.batch_chunk(c, keys))),
+                .map(|c| Box::pin(self.batch_chunk(calls, c, keys))),
         )
         .buffer_unordered(self.config.concurrency);
         while let Some(r) = stream.next().await {
@@ -367,16 +400,89 @@ pub(crate) fn classify_single(
 }
 
 #[faucet_core::async_trait]
-impl faucet_core::Sink for DynamoDbSink {
+impl SinkDriver for DynamoDbDriver {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    fn call_context(&self) -> CallContext {
+        CallContext::new()
+    }
+
+    async fn write(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_rows(calls, records).await?,
+            )),
+            _ => {
+                let n = self.write_records(calls, records).await?;
+                Ok(PageWrite::reported(if self.dedups_by_key() {
+                    faucet_core::WriteReport::keyed(records.len(), n)
+                } else {
+                    faucet_core::WriteReport::accepted(n)
+                }))
+            }
+        }
+    }
+
+    fn write_modes(&self) -> &'static [WriteMode] {
+        WRITE_MODES
+    }
+
+    fn dedups_by_key(&self) -> bool {
+        self.config.write.dedups_by_key()
+    }
+
+    fn config_schema(&self) -> Value {
+        serde_json::to_value(faucet_core::schema_for!(DynamoDbSinkConfig))
+            .expect("schema serialization")
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "dynamodb"
+    }
+
+    fn dataset_uri(&self) -> String {
+        format!(
+            "dynamodb://{}/{}",
+            self.config.region.as_deref().unwrap_or("default"),
+            self.config.table_name
+        )
+    }
+
+    /// Side-effect-free probe: `DescribeTable` (and the key check for keyed
+    /// write modes). Nothing is written.
+    async fn check(
+        &self,
+        calls: &CallSlot,
+        ctx: &faucet_core::CheckContext,
+    ) -> Result<faucet_core::CheckReport, FaucetError> {
+        use faucet_core::{CheckReport, Probe};
+        let start = std::time::Instant::now();
+        let probe = match tokio::time::timeout(ctx.timeout, self.table_keys(calls)).await {
+            Err(_) => Probe::fail("describe_table", start.elapsed(), "timed out"),
+            Ok(Ok(_)) => Probe::pass("describe_table", start.elapsed()),
+            Ok(Err(e)) => Probe::fail("describe_table", start.elapsed(), e.to_string()),
+        };
+        Ok(CheckReport::single(probe))
+    }
+}
+
+impl DynamoDbDriver {
+    async fn write_records(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let (keys, names) = self.table_keys().await?;
+        let (keys, names) = self.table_keys(calls).await?;
         let planned = plan_as(records, &self.config.write, keys, self.config.value_format);
         if let Some((row, e)) = planned.failures.iter().next() {
             return Err(FaucetError::Sink(format!(
@@ -384,7 +490,7 @@ impl faucet_core::Sink for DynamoDbSink {
                 records.len()
             )));
         }
-        let outcomes = self.execute(planned.ops, names).await?;
+        let outcomes = self.execute(calls, planned.ops, names).await?;
         let failed: Vec<&String> = outcomes
             .iter()
             .filter_map(|(_, r)| r.as_ref().err())
@@ -406,66 +512,18 @@ impl faucet_core::Sink for DynamoDbSink {
     /// back as `Err` rows for the DLQ, and so does a request that fails for
     /// good — its rows only, so rows another request committed stay `Ok`. The
     /// outer `Err` means nothing was sent.
-    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+    async fn write_rows(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Vec<RowOutcome>, FaucetError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let (keys, names) = self.table_keys().await?;
+        let (keys, names) = self.table_keys(calls).await?;
         let planned = plan_as(records, &self.config.write, keys, self.config.value_format);
-        let outcomes = self.execute(planned.ops, names).await?;
+        let outcomes = self.execute(calls, planned.ops, names).await?;
         Ok(row_outcomes(records.len(), planned.failures, outcomes))
-    }
-
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        WRITE_MODES
-    }
-
-    fn dedups_by_key(&self) -> bool {
-        self.config.write.dedups_by_key()
-    }
-
-    fn config_schema(&self) -> Value {
-        serde_json::to_value(faucet_core::schema_for!(DynamoDbSinkConfig))
-            .expect("schema serialization")
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "dynamodb"
-    }
-
-    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
-        self.calls.install(ctx);
-    }
-
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn dataset_uri(&self) -> String {
-        format!(
-            "dynamodb://{}/{}",
-            self.config.region.as_deref().unwrap_or("default"),
-            self.config.table_name
-        )
-    }
-
-    /// Side-effect-free probe: `DescribeTable` (and the key check for keyed
-    /// write modes). Nothing is written.
-    async fn check(
-        &self,
-        ctx: &faucet_core::CheckContext,
-    ) -> Result<faucet_core::CheckReport, FaucetError> {
-        use faucet_core::{CheckReport, Probe};
-        let start = std::time::Instant::now();
-        let probe = match tokio::time::timeout(ctx.timeout, self.table_keys()).await {
-            Err(_) => Probe::fail("describe_table", start.elapsed(), "timed out"),
-            Ok(Ok(_)) => Probe::pass("describe_table", start.elapsed()),
-            Ok(Err(e)) => Probe::fail("describe_table", start.elapsed(), e.to_string()),
-        };
-        Ok(CheckReport::single(probe))
     }
 }
 
@@ -650,12 +708,13 @@ mod tests {
         ))
         .unwrap();
         DynamoDbSink {
-            config,
-            client: dynamo(uri),
-            keys,
-            names: None,
-            values: None,
-            calls: CallSlot::default(),
+            inner: DriverSink::new(DynamoDbDriver {
+                config,
+                client: dynamo(uri),
+                keys,
+                names: None,
+                values: None,
+            }),
         }
     }
 
@@ -786,7 +845,7 @@ mod tests {
         let server = MockServer::start().await;
         on(&server, "DynamoDB_20120810.DescribeTable", ok(json!({})), 1).await;
         let mut sink = mock_sink(&server.uri(), DynamoDbSinkConfig::new("t"));
-        sink.keys = tokio::sync::OnceCell::new();
+        sink.inner.driver_mut().keys = tokio::sync::OnceCell::new();
         let e = sink.write_batch(&rows()).await.unwrap_err().to_string();
         assert!(e.contains("returned no table"), "{e}");
     }

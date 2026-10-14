@@ -96,6 +96,18 @@ a round trip (`batch_write`, `write`, `describe_table`). The unprocessed-item an
 throttle retry (the `retry:` block) is unchanged; its backoffs wait through the
 same context, so a deadline ends them and the rows not yet confirmed fail.
 
+## How it is built
+
+The sink runs on the family-neutral sink driver (RFC 0014): `DynamoDbDriver`
+implements `faucet_core::driver::SinkDriver` — read the table key schema,
+plan a page into put / delete operations, send `BatchWriteItem` chunks with
+the unprocessed-item retry (or item-by-item conditional writes) — and
+`DynamoDbSink` wraps it in a `DriverSink`, which derives the capabilities
+(append / upsert / delete) and serves the plain, reported and per-row write
+paths with row accounting. Every request is a call through the run's call
+context with the same op labels as before (`describe_table`, `batch_write`,
+`write`). The public type and config are unchanged.
+
 ## License
 
 MIT OR Apache-2.0
