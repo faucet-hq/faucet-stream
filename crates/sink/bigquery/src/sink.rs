@@ -868,7 +868,7 @@ impl UploadSession {
 /// A sink that writes JSON records to a BigQuery table using the streaming
 /// insert API (`tabledata.insertAll`).
 ///
-/// Built on the family-neutral sink driver (RFC 0014): [`BigQueryDriver`]
+/// Built on the family-neutral sink driver (RFC 0014): `BigQueryDriver`
 /// holds the load, `insertAll`, `MERGE` and transaction paths, and
 /// [`DriverSink`] drives the row writes, exactly-once, overwrite, cleanup and
 /// schema evolution from them. Native byte loading stays on this type.

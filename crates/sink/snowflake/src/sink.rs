@@ -18,7 +18,7 @@ use tokio::sync::OnceCell;
 /// A sink that writes JSON records to a Snowflake table using the
 /// SQL REST API.
 ///
-/// Built on the family-neutral sink driver (RFC 0014): [`SnowflakeDriver`]
+/// Built on the family-neutral sink driver (RFC 0014): `SnowflakeDriver`
 /// holds the statement paths and [`DriverSink`] serves the plain, reported,
 /// per-row and exactly-once writes from them.
 pub struct SnowflakeSink {

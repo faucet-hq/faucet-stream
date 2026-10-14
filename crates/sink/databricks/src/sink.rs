@@ -42,7 +42,7 @@ enum Replay {
 
 /// Databricks SQL warehouse sink.
 ///
-/// Built on the family-neutral sink driver (RFC 0014): [`DatabricksDriver`]
+/// Built on the family-neutral sink driver (RFC 0014): `DatabricksDriver`
 /// holds the statement paths and [`DriverSink`] drives the row writes, the
 /// exactly-once commit, the overwrite lifecycle and schema evolution from
 /// them.

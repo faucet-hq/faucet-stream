@@ -15,7 +15,7 @@ use crate::config::ClickHouseSinkConfig;
 
 /// ClickHouse sink (HTTP interface, `INSERT … FORMAT JSONEachRow`).
 ///
-/// Built on the family-neutral sink driver (RFC 0014): [`ClickHouseDriver`]
+/// Built on the family-neutral sink driver (RFC 0014): `ClickHouseDriver`
 /// holds the insert paths and [`DriverSink`] serves the plain, reported and
 /// per-row writes from them.
 pub struct ClickHouseSink {

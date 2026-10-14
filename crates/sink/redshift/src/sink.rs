@@ -25,7 +25,7 @@ use crate::copy::{
 
 /// A sink that loads JSON records into an Amazon Redshift table.
 ///
-/// Built on the family-neutral sink driver (RFC 0014): [`RedshiftDriver`]
+/// Built on the family-neutral sink driver (RFC 0014): `RedshiftDriver`
 /// holds the load paths and [`DriverSink`] serves the plain, reported and
 /// per-row writes from them.
 pub struct RedshiftSink {
