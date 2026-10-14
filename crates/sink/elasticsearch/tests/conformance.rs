@@ -323,6 +323,7 @@ async fn conformance_roundtrips_recorded() {
 /// RFC 0014: the sink runs on the family-neutral sink driver with the
 /// staging, schema and cleanup groups.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)] // probes the 1.x staging hook the driver answers until faucet-core 2.0 (RFC 0014)
 async fn conformance_driver_truthful() {
     let server = MockServer::start().await;
     let store = BulkDocStore::new();

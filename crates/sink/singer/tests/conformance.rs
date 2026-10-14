@@ -81,6 +81,7 @@ async fn conformance_cancellation_flushes() {
 /// is a table version, so the staging probe answers "unknown".
 #[cfg(unix)]
 #[tokio::test]
+#[allow(deprecated)] // probes the 1.x staging hook the driver answers until faucet-core 2.0 (RFC 0014)
 async fn conformance_driver_truthful() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.jsonl");
