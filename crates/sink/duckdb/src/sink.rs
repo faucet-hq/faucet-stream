@@ -12,7 +12,8 @@ use duckdb::types::Value as DuckValue;
 use duckdb::{AccessMode, Config, Connection};
 use faucet_common_sql::dialects::Duckdb;
 use faucet_common_sql::{SqlDialect, SqlSinkEngine, Statement, TableColumn, TableTarget};
-use faucet_core::FaucetError;
+use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
+use faucet_core::{CallSlot, FaucetError};
 
 use serde_json::Value;
 use std::collections::HashSet;
@@ -165,7 +166,18 @@ fn missing_columns_message(table: &str, missing: &[String]) -> String {
 }
 
 /// A sink that writes JSON records to a DuckDB table.
+///
+/// Built on the core sink driver (RFC 0014): `DuckdbDriver` holds the
+/// blocking DuckDB I/O, and a [`DriverSink`] serves the plain, reported and
+/// per-row write paths from it.
 pub struct DuckdbSink {
+    /// The connection (shared with the driver), for setup and inspection.
+    pub(crate) conn: Arc<Mutex<Connection>>,
+    inner: DriverSink<DuckdbDriver>,
+}
+
+/// The DuckDB I/O the sink driver runs on.
+pub(crate) struct DuckdbDriver {
     config: DuckdbSinkConfig,
     conn: Arc<Mutex<Connection>>,
     /// The process-wide database instance this sink's connection belongs to,
@@ -177,8 +189,6 @@ pub struct DuckdbSink {
     /// Interrupts a write the call context cuts short, so the blocking task
     /// stops (and its transaction rolls back) instead of running on.
     interrupt: Arc<duckdb::InterruptHandle>,
-    /// Backend-call context (#880): the run's deadline and round-trip recorder.
-    calls: faucet_core::CallSlot,
 }
 
 /// One DuckDB database instance per file in this process (#789 SQL-07).
@@ -494,7 +504,7 @@ fn write_all_blocking(
     }
 }
 
-impl DuckdbSink {
+impl DuckdbDriver {
     /// Make sure the target table exists before the first write (#580).
     ///
     /// Synchronous: the DuckDB connection is already behind a `Mutex` and the
@@ -543,6 +553,76 @@ impl DuckdbSink {
         Ok(())
     }
 
+    /// Write the whole page in one transaction on the blocking pool, as one
+    /// backend call named `write`. A call the context cuts short interrupts
+    /// the connection so the blocking task stops and rolls back.
+    async fn write_all(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_table_ready(records)?;
+        let conn = self.conn.clone();
+        let config = self.config.clone();
+        let owned = records.to_vec();
+        let task = tokio::task::spawn_blocking(move || write_all_blocking(&conn, &config, &owned));
+        let n = calls
+            .call_once("write", async {
+                task.await
+                    .map_err(|e| FaucetError::Sink(format!("duckdb write task panicked: {e}")))?
+            })
+            .await
+            .inspect_err(|e| {
+                if matches!(
+                    e,
+                    FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
+                ) {
+                    self.interrupt.interrupt();
+                }
+            })?;
+        tracing::info!(
+            table = %self.config.table_name,
+            rows = n,
+            "DuckDB write complete"
+        );
+        Ok(n)
+    }
+
+    /// In `auto_map` mode a record that matches no column of the target fails
+    /// on its own row (DLQ-routable) and the rest of the page is written.
+    async fn write_partial(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !matches!(self.config.column_mapping, DuckdbColumnMapping::AutoMap) {
+            self.write_all(calls, records).await?;
+            return Ok(records.iter().map(|_| Ok(())).collect());
+        }
+        self.ensure_table_ready(records)?;
+        let cols = {
+            let guard = self
+                .conn
+                .lock()
+                .map_err(|_| FaucetError::Sink("duckdb connection mutex poisoned".into()))?;
+            table_columns(&guard, &self.config.table_name)?.0
+        };
+        let (outcomes, writable) = split_unmatched(
+            records,
+            &self.config.table_name,
+            &cols,
+            self.config.create_table,
+        );
+        if !writable.is_empty() {
+            self.write_all(calls, &writable).await?;
+        }
+        Ok(outcomes)
+    }
+}
+
+impl DuckdbSink {
     /// Create a new DuckDB sink, opening (and reusing) one read-write connection.
     pub async fn new(config: DuckdbSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
@@ -558,13 +638,16 @@ impl DuckdbSink {
         .await
         .map_err(|e| FaucetError::Sink(format!("duckdb open task panicked: {e}")))??;
         let interrupt = conn.interrupt_handle();
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            config,
-            conn: Arc::new(Mutex::new(conn)),
-            _instance: instance,
-            table_ready: std::sync::atomic::AtomicBool::new(false),
-            interrupt,
-            calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
+            conn: conn.clone(),
+            inner: DriverSink::new(DuckdbDriver {
+                config,
+                conn,
+                _instance: instance,
+                table_ready: std::sync::atomic::AtomicBool::new(false),
+                interrupt,
+            }),
         })
     }
 
@@ -609,28 +692,18 @@ impl DuckdbSink {
 
 #[async_trait]
 impl faucet_core::Sink for DuckdbSink {
-    fn set_call_context(&self, ctx: faucet_core::CallContext) {
-        self.calls.install(ctx);
-    }
+    faucet_core::forward_sink!(inner);
+}
 
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.calls.install_recorder(recorder);
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
+#[async_trait]
+impl SinkDriver for DuckdbDriver {
+    fn connector_name(&self) -> &'static str {
+        "duckdb"
     }
 
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(DuckdbSinkConfig))
             .expect("schema serialization")
-    }
-
-    fn connector_name(&self) -> &'static str {
-        "duckdb"
     }
 
     fn dataset_uri(&self) -> String {
@@ -641,69 +714,22 @@ impl faucet_core::Sink for DuckdbSink {
         )
     }
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        self.ensure_table_ready(records)?;
-        let conn = self.conn.clone();
-        let config = self.config.clone();
-        let owned = records.to_vec();
-        let task = tokio::task::spawn_blocking(move || write_all_blocking(&conn, &config, &owned));
-        let n = self
-            .calls
-            .call_once("write", async {
-                task.await
-                    .map_err(|e| FaucetError::Sink(format!("duckdb write task panicked: {e}")))?
-            })
-            .await
-            .inspect_err(|e| {
-                if matches!(
-                    e,
-                    FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
-                ) {
-                    self.interrupt.interrupt();
-                }
-            })?;
-        tracing::info!(
-            table = %self.config.table_name,
-            rows = n,
-            "DuckDB write complete"
-        );
-        Ok(n)
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
     }
 
-    /// In `auto_map` mode a record that matches no column of the target fails
-    /// on its own row (DLQ-routable) and the rest of the page is written.
-    async fn write_batch_partial(
+    async fn write(
         &self,
-        records: &[Value],
-    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        if records.is_empty() {
-            return Ok(Vec::new());
+        calls: &CallSlot,
+        rows: &[Value],
+        policy: RowPolicy,
+    ) -> Result<PageWrite, FaucetError> {
+        match policy {
+            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
+                self.write_partial(calls, rows).await?,
+            )),
+            _ => Ok(PageWrite::accepted(self.write_all(calls, rows).await?)),
         }
-        if !matches!(self.config.column_mapping, DuckdbColumnMapping::AutoMap) {
-            self.write_batch(records).await?;
-            return Ok(records.iter().map(|_| Ok(())).collect());
-        }
-        self.ensure_table_ready(records)?;
-        let cols = {
-            let guard = self
-                .conn
-                .lock()
-                .map_err(|_| FaucetError::Sink("duckdb connection mutex poisoned".into()))?;
-            table_columns(&guard, &self.config.table_name)?.0
-        };
-        let (outcomes, writable) = split_unmatched(
-            records,
-            &self.config.table_name,
-            &cols,
-            self.config.create_table,
-        );
-        if !writable.is_empty() {
-            self.write_batch(&writable).await?;
-        }
-        Ok(outcomes)
     }
 }
 
