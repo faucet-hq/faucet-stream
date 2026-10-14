@@ -41,8 +41,8 @@ struct MockSink;
 
 #[async_trait]
 impl Sink for MockSink {
-    async fn write_batch(&self, _: &[Value]) -> Result<usize, FaucetError> {
-        Ok(0)
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        Ok(records.len())
     }
 
     fn connector_name(&self) -> &'static str {
