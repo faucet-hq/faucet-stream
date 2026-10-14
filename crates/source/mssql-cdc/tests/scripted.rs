@@ -141,6 +141,50 @@ async fn each_transaction_is_its_own_page() {
     assert_eq!(source.fetch_all().await.unwrap().len(), 2);
 }
 
+/// REAL, FLOAT and DECIMAL change cells keep their values exactly: a REAL
+/// renders its shortest decimal, a DECIMAL its digits at the column's scale.
+#[tokio::test]
+async fn float_and_decimal_change_cells_decode_exactly() {
+    let server = TdsServer::start().await.unwrap();
+    preflight(&server, 1);
+    server.on(
+        CHANGES,
+        Reply::rows(
+            &[
+                ("__faucet_lsn", TdsType::NVarChar),
+                ("__faucet_seqval", TdsType::NVarChar),
+                ("__$operation", TdsType::Int),
+                ("weight", TdsType::Real),
+                ("ratio", TdsType::Float),
+                ("amount", TdsType::Decimal { scale: 4 }),
+                ("big", TdsType::Decimal { scale: 0 }),
+            ],
+            vec![vec![
+                LSN1.into(),
+                LSN1.into(),
+                TdsValue::Int(2),
+                TdsValue::Float(0.1),
+                TdsValue::Float(0.1),
+                TdsValue::Decimal(-1_234_567_890_123_450),
+                TdsValue::Decimal(123_456_789_012_345_678_901_234_567_890),
+            ]],
+        ),
+    );
+    let source = MssqlCdcSource::new(cfg(&server, json!({}))).await.unwrap();
+    let records: Vec<Value> = pages(&source)
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|p| p.records)
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let row = records[0].get("after").unwrap_or(&records[0]);
+    assert_eq!(row["weight"], json!(0.1), "{records:?}");
+    assert_eq!(row["ratio"], json!(0.1));
+    assert_eq!(row["amount"], json!("-123456789012.3450"));
+    assert_eq!(row["big"], json!("123456789012345678901234567890"));
+}
+
 #[tokio::test]
 async fn a_failed_change_query_replaces_every_connection() {
     let server = TdsServer::start().await.unwrap();

@@ -32,6 +32,13 @@ pub enum TdsType {
     Bit,
     /// `FLOAT`.
     Float,
+    /// `REAL` (a single-precision float), for a `Float` value.
+    Real,
+    /// `DECIMAL(38, scale)`, for a `Decimal` value.
+    Decimal {
+        /// Digits after the decimal point.
+        scale: u8,
+    },
 }
 
 /// One cell of a result row.
@@ -46,8 +53,10 @@ pub enum TdsValue {
     Str(String),
     /// A boolean, for a `Bit` column.
     Bool(bool),
-    /// A float, for a `Float` column.
+    /// A float, for a `Float` or `Real` column.
     Float(f64),
+    /// An unscaled decimal (`value × 10^-scale`), for a `Decimal` column.
+    Decimal(i128),
 }
 
 impl From<i64> for TdsValue {
@@ -365,6 +374,8 @@ fn type_info(t: TdsType) -> Vec<u8> {
         TdsType::BigInt => vec![0x26, 8],
         TdsType::Bit => vec![0x68, 1],
         TdsType::Float => vec![0x6D, 8],
+        TdsType::Real => vec![0x6D, 4],
+        TdsType::Decimal { scale } => vec![0x6C, 17, 38, scale],
         TdsType::NVarChar => vec![0xE7, 0x40, 0x1F, 0x09, 0x04, 0xD0, 0x00, 0x34],
     }
 }
@@ -393,6 +404,16 @@ fn cell(t: TdsType, v: &TdsValue) -> Vec<u8> {
         (TdsType::Float, TdsValue::Float(f)) => {
             let mut out = vec![8];
             out.extend_from_slice(&f.to_le_bytes());
+            out
+        }
+        (TdsType::Real, TdsValue::Float(f)) => {
+            let mut out = vec![4];
+            out.extend_from_slice(&(*f as f32).to_le_bytes());
+            out
+        }
+        (TdsType::Decimal { .. }, TdsValue::Decimal(d)) => {
+            let mut out = vec![17, u8::from(*d >= 0)];
+            out.extend_from_slice(&d.unsigned_abs().to_le_bytes());
             out
         }
         (TdsType::NVarChar, TdsValue::Str(s)) => {
@@ -485,6 +506,17 @@ mod tests {
         assert_eq!(type_info(TdsType::Int), vec![0x26, 4]);
         assert_eq!(type_info(TdsType::Bit), vec![0x68, 1]);
         assert_eq!(type_info(TdsType::Float), vec![0x6D, 8]);
+        assert_eq!(type_info(TdsType::Real), vec![0x6D, 4]);
+        assert_eq!(
+            type_info(TdsType::Decimal { scale: 2 }),
+            vec![0x6C, 17, 38, 2]
+        );
+        assert_eq!(
+            cell(TdsType::Real, &TdsValue::Float(1.0)),
+            vec![4, 0, 0, 0x80, 0x3F]
+        );
+        let neg = cell(TdsType::Decimal { scale: 2 }, &TdsValue::Decimal(-5));
+        assert_eq!((neg.len(), neg[0], neg[1], neg[2]), (18, 17, 0, 5));
         assert!(encode_reply(&Reply::Hang).is_empty());
         assert_eq!(type_info(TdsType::TinyInt), vec![0x26, 1]);
         assert_eq!(type_info(TdsType::SmallInt), vec![0x26, 2]);
