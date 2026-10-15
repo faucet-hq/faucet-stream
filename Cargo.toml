@@ -408,6 +408,8 @@ urlencoding = "2"
 protox = "0.9"
 arrow = "58"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Pinned exactly: `gungraun-runner` must be installed at the same version (#900).
+gungraun = "=0.20.0"
 arrow-json = "58"
 parquet = { version = "58", features = ["async", "object_store"] }
 object_store = "0.13"

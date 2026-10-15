@@ -204,10 +204,15 @@ futures.workspace = true
 tempfile = "3"
 metrics-util.workspace = true
 criterion = { workspace = true, features = ["async_tokio"] }
+gungraun.workspace = true
 axum = { workspace = true }
 
 [[bench]]
 name = "observability"
+harness = false
+
+[[bench]]
+name = "pipeline_instructions"
 harness = false
 
 [[bench]]

@@ -56,16 +56,33 @@ and `faucet_source_page_duration_seconds` tell you where time goes.
 
 ## Benchmarks
 
-`faucet-core` ships a [criterion](https://github.com/bheisler/criterion.rs)
-benchmark of the observability hot path, and CI guards it against a 5% regression
-on every PR. Run it locally with:
+`faucet-core` ships two benchmarks of the pipeline's own overhead: the work it
+does around a source and a sink, measured with a source and sink that do no I/O.
 
-```bash
-cargo bench -p faucet-core --bench observability
-```
+- **`pipeline_instructions`** counts CPU instructions with Valgrind's callgrind
+  (through [gungraun](https://github.com/gungraun/gungraun)). Instruction counts do not move between runs, so
+  CI compares every PR against its base commit and fails if the pipeline's
+  instruction count grows by more than 5%. It needs Linux, `valgrind` and
+  `gungraun-runner` at the library's version:
 
-Numbers are hardware-dependent, so run the benchmark on your target machine
-rather than relying on published figures.
+  ```bash
+  cargo install --version 0.20.0 --locked gungraun-runner
+  cargo bench -p faucet-core --bench pipeline_instructions -- --save-baseline=main
+  # …make your change…
+  cargo bench -p faucet-core --bench pipeline_instructions -- --baseline=main --callgrind-limits='ir=5%'
+  ```
+
+- **`observability`** measures wall-clock time with
+  [criterion](https://github.com/bheisler/criterion.rs). Use it to profile on
+  your own machine. It is not a CI gate, because wall-clock differences of a
+  few percent are within the noise of a shared runner:
+
+  ```bash
+  cargo bench -p faucet-core --bench observability
+  ```
+
+Wall-clock numbers are hardware-dependent, so run that benchmark on your target
+machine rather than relying on published figures.
 
 For the end-to-end throughput comparison against Meltano (Singer) — charted per
 scenario, with the full methodology and caveats — see
