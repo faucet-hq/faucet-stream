@@ -17,7 +17,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "json"] }
+sqlx = { workspace = true, features = ["sqlite", "json"] }
 libsqlite3-sys.workspace = true
 base64.workspace = true
 async-stream = { workspace = true }

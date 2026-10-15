@@ -277,7 +277,7 @@ tonic = { version = "0.13", features = ["transport", "tls-ring"] }
 prost = "0.13"
 prost-reflect = { version = "0.15", features = ["serde"] }
 prost-types = "0.13"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls"] }
 # The SQLite C library sqlx links; a direct dep only for connection limits (#862).
 libsqlite3-sys = { version = "0.30", default-features = false }
 # MSSQL stack. tiberius default features (native-tls, winauth) are off so the
