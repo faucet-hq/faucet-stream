@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mongodb-v1.6.1...faucet-source-mongodb-v1.7.0) - 2026-10-15
+
+### Bug Fixes
+
+- Resolve the LOW and INFO findings of the #785–#861 review ([#869](https://github.com/faucet-hq/faucet-stream/pull/869))
+
+### Features
+
+- RFC 0013 phase 2 — shared SQL engine, fidelity model, FileSink backends, runtime API ([#894](https://github.com/faucet-hq/faucet-stream/pull/894))
+- RFC 0013 phase 1 — structural core guarantees ([#891](https://github.com/faucet-hq/faucet-stream/pull/891))
+- Template test bundles with test-gated labels; one container start helper; refuse --no-auth on a network address ([#859](https://github.com/faucet-hq/faucet-stream/pull/859))
+
 ## [1.6.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mongodb-v1.6.0...faucet-source-mongodb-v1.6.1) - 2026-10-08
 
 ### Bug Fixes

@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-cdc-v1.4.2...faucet-source-postgres-cdc-v1.5.0) - 2026-10-15
+
+### Bug Fixes
+
+- Resolve the LOW and INFO findings of the #785–#861 review ([#869](https://github.com/faucet-hq/faucet-stream/pull/869))
+- Resolve the HIGH and MEDIUM findings of the #785–#861 review ([#868](https://github.com/faucet-hq/faucet-stream/pull/868))
+- Per-change mirror replay skip, duckdb 1.10506; agent skills with requires_faucet; Helm values for every serve feature ([#858](https://github.com/faucet-hq/faucet-stream/pull/858))
+
+### Documentation
+
+- Correct cdc_unwrap TOAST marker note and list keys_case `dot` mode ([#848](https://github.com/faucet-hq/faucet-stream/pull/848))
+
+### Features
+
+- RFC 0013 phase 2 — shared SQL engine, fidelity model, FileSink backends, runtime API ([#894](https://github.com/faucet-hq/faucet-stream/pull/894))
+- RFC 0013 phase 1 — structural core guarantees ([#891](https://github.com/faucet-hq/faucet-stream/pull/891))
+- Template test bundles with test-gated labels; one container start helper; refuse --no-auth on a network address ([#859](https://github.com/faucet-hq/faucet-stream/pull/859))
+
 ## [1.4.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-cdc-v1.4.1...faucet-source-postgres-cdc-v1.4.2) - 2026-10-08
 
 ### Bug Fixes

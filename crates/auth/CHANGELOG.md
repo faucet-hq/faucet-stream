@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-auth-v1.3.1...faucet-auth-v1.4.0) - 2026-10-15
+
+### Bug Fixes
+
+- Resolve the LOW and INFO findings of the #785–#861 review ([#869](https://github.com/faucet-hq/faucet-stream/pull/869))
+- Resolve the HIGH and MEDIUM findings of the #785–#861 review ([#868](https://github.com/faucet-hq/faucet-stream/pull/868))
+
+### Features
+
+- RFC 0013 phase 1 — structural core guarantees ([#891](https://github.com/faucet-hq/faucet-stream/pull/891))
+
 ## [1.3.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-auth-v1.3.0...faucet-auth-v1.3.1) - 2026-10-08
 
 ### Bug Fixes

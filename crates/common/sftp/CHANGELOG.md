@@ -7,6 +7,17 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.1.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sftp-v1.0.8...faucet-common-sftp-v1.1.0) - 2026-10-15
+
+### Bug Fixes
+
+- Resolve the LOW and INFO findings of the #785–#861 review ([#869](https://github.com/faucet-hq/faucet-stream/pull/869))
+
+### Features
+
+- RFC 0013 phase 2 — shared SQL engine, fidelity model, FileSink backends, runtime API ([#894](https://github.com/faucet-hq/faucet-stream/pull/894))
+- RFC 0013 phase 1 — structural core guarantees ([#891](https://github.com/faucet-hq/faucet-stream/pull/891))
+
 ## [1.0.8](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sftp-v1.0.7...faucet-common-sftp-v1.0.8) - 2026-10-08
 
 ### Bug Fixes

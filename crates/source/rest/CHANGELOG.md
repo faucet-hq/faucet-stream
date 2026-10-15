@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-rest-v1.7.2...faucet-source-rest-v1.8.0) - 2026-10-15
+
+### Bug Fixes
+
+- Resolve the LOW and INFO findings of the #785–#861 review ([#869](https://github.com/faucet-hq/faucet-stream/pull/869))
+- Resolve the HIGH and MEDIUM findings of the #785–#861 review ([#868](https://github.com/faucet-hq/faucet-stream/pull/868))
+
+### Documentation
+
+- Correct cdc_unwrap TOAST marker note and list keys_case `dot` mode ([#848](https://github.com/faucet-hq/faucet-stream/pull/848))
+
+### Features
+
+- *(core)* RFC 0013 phase 3a — family drivers, governed-page typestate, deprecations (RFC 0014) ([#896](https://github.com/faucet-hq/faucet-stream/pull/896))
+- RFC 0013 phase 2 — shared SQL engine, fidelity model, FileSink backends, runtime API ([#894](https://github.com/faucet-hq/faucet-stream/pull/894))
+- RFC 0013 phase 1 — structural core guarantees ([#891](https://github.com/faucet-hq/faucet-stream/pull/891))
+
 ## [1.7.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-rest-v1.7.1...faucet-source-rest-v1.7.2) - 2026-10-08
 
 ### Bug Fixes
