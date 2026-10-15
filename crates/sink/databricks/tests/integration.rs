@@ -154,7 +154,17 @@ async fn unknown_columns_and_missing_table_are_typed_errors() {
 
     let wh = Warehouse::start().await;
     let s = sink(&wh, |_| {});
-    assert_eq!(s.write_batch(&[json!(1)]).await.unwrap(), 0);
+    let err = s.write_batch(&[json!(1)]).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FaucetError::RowsUnaccounted {
+                offered: 1,
+                accepted: 0
+            }
+        ),
+        "a record that is not an object is refused, not dropped: {err}"
+    );
     assert!(wh.writes().is_empty());
 }
 
