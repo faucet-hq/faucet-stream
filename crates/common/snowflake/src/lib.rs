@@ -228,26 +228,66 @@ impl Drop for CancelOnDrop {
 /// `openssl rsa -pubout -outform DER | openssl dgst -sha256 -binary | base64`
 /// produces, and what Snowflake expects in the JWT `iss` claim.
 fn public_key_fingerprint(private_key_pem: &str) -> Result<String, FaucetError> {
+    use aws_lc_rs::signature::{KeyPair, RsaKeyPair};
     use base64::Engine as _;
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
-    use rsa::{RsaPrivateKey, RsaPublicKey};
     use sha2::{Digest, Sha256};
 
+    let invalid =
+        |e: &dyn std::fmt::Display| FaucetError::Auth(format!("invalid RSA private key: {e}"));
     // Accept either PKCS#8 (`BEGIN PRIVATE KEY`) or PKCS#1
     // (`BEGIN RSA PRIVATE KEY`) PEM — both are common for Snowflake keys.
-    let private = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_key_pem))
-        .map_err(|e| FaucetError::Auth(format!("invalid RSA private key: {e}")))?;
+    let (label, der) = pem_block(private_key_pem).ok_or_else(|| invalid(&"not a PEM key"))?;
+    let pair = match label.as_str() {
+        "PRIVATE KEY" => RsaKeyPair::from_pkcs8(&der),
+        "RSA PRIVATE KEY" => RsaKeyPair::from_der(&der),
+        other => return Err(invalid(&format!("unsupported PEM block `{other}`"))),
+    }
+    .map_err(|e| invalid(&e))?;
 
-    let public = RsaPublicKey::from(&private);
-    let der = public
-        .to_public_key_der()
-        .map_err(|e| FaucetError::Auth(format!("failed to DER-encode public key: {e}")))?;
-
-    let digest = Sha256::digest(der.as_bytes());
+    let digest = Sha256::digest(rsa_spki_der(pair.public_key().as_ref()));
     let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
     Ok(format!("SHA256:{b64}"))
+}
+
+/// The label and decoded body of the first PEM block in `pem`.
+fn pem_block(pem: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine as _;
+    let rest = pem.split_once("-----BEGIN ")?.1;
+    let (label, rest) = rest.split_once("-----")?;
+    let body = rest.split_once(&format!("-----END {label}-----"))?.0;
+    let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let der = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    Some((label.to_string(), der))
+}
+
+/// Wrap a PKCS#1 `RSAPublicKey` in a DER `SubjectPublicKeyInfo` (rsaEncryption).
+fn rsa_spki_der(pkcs1: &[u8]) -> Vec<u8> {
+    const RSA_ALGORITHM: [u8; 15] = [
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    let mut bits = vec![0x03];
+    bits.extend(der_length(pkcs1.len() + 1));
+    bits.push(0x00);
+    bits.extend_from_slice(pkcs1);
+    let mut spki = vec![0x30];
+    spki.extend(der_length(RSA_ALGORITHM.len() + bits.len()));
+    spki.extend_from_slice(&RSA_ALGORITHM);
+    spki.extend(bits);
+    spki
+}
+
+fn der_length(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        return vec![len as u8];
+    }
+    let bytes: Vec<u8> = len
+        .to_be_bytes()
+        .into_iter()
+        .skip_while(|b| *b == 0)
+        .collect();
+    let mut out = vec![0x80 | bytes.len() as u8];
+    out.extend(bytes);
+    out
 }
 
 /// The `X-Snowflake-Authorization-Token-Type` header value that pairs with the
@@ -442,6 +482,63 @@ yCkue9tat7y9DS8+VR5D6cM9oQpKbrfG+PfTdlkCgYBf/pUWO94VgZvpV5Ui7MHb
     fn public_key_fingerprint_matches_openssl() {
         let fp = public_key_fingerprint(TEST_RSA_PKCS8_PEM).unwrap();
         assert_eq!(fp, "SHA256:NiQ5G+9Hr4ZBmdBscIoTOgx2SM6aWPG0/Q9Y6NuFtpI=");
+    }
+
+    const TEST_RSA_PKCS1_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEogIBAAKCAQEAw5nkheYw+SzBsCDQdYRMVNlMfahEPQ1zVHlsaw7+yt0BwPlJ
+Am3VKRw2XRUmyK/278JTZ9eh6oaovW/FssAM42oGTYNHEXl7kO5yiK+XPc2JdhCX
+vkWU6Ns9ixNtR60ikYUwJpTpN1ydTcXO2oWHCssPJXIbk3GWmFmjU2L66JzqR1AB
+ktF6U9MvDoIM6dQ72TWDnmWyQj2cH5qRhgkopZzgzWJ8E9Nj3OGl1wcyT+0z+e/r
+3v2c6r7CggYjSVDC7I1GXBlp6kB50QPvAfO7oOwsoYRImJ7JKdHdWZVk/5FO6yGb
++fCjGzCYnQHYswOO40Y3pbFnqHnUXyZogPfWYQIDAQABAoIBAADq8m8MZvNsWdZN
+OR0sCz2krV6zkOpma0Gctj0EW36xLcZthQGtaUAhoUGrjTyI0tRKKaEFmn1it1z4
+LsnJa+YPQ8tOT+GNm95QuBnbFQ8VrUzwA/5BDlNPYAkMhMk+zzg2k0TDExsO5LAO
+Owu8b6dFz6Lh165H7Kh3VzRXdQztWXQQs5F+HYOGOH34ebbfyC3krDZZqqqVEJh0
+Gf19yR5D/f/jaQHuouJPUCrKpiwxg+/m6/7J1WGxAgYJjdUCKH00r55ZpkYioKBv
+cG2S5hrwolvcVY22Pq8ibP5bC6DO8FtU1LjpZN2qaCM0OziBs58mcxOUbpnUKtda
+zSge2mkCgYEA6MLHHhEM9pC2/d3/CUGgQ3Hm6m2xkyROvoatpPA/xs72QHQRxrhL
+ezYgwBSsvxiLcMyUhhnYytuIkbWextoCJaGUobvu5psV+jo7sbp/BDEWSmc03nTC
+VkCTMANR5NX8M7BDNPvfsmXU3MpT/cGAzBSm78Pmr+7A3MkhDTRIbIUCgYEA1yFV
+/mb5X9j6C5EcddZpNQgbT346j0zHLEFYyEsL5IBkovIoavpsLCFi14TmV9/Pi+Ih
+n3SIKkkp8Kgf34E248ELGtA6pMoLeiAX290Jlq+9fenPsbLOYfHlExYgjFsPxAGv
+Ufo5Fh9HFaSVW8kyu3ASZWl8T3F8d8aayNdKpy0CgYAZfzSmo4GDBOk2t/m2/txa
+ZwC/j1KTZrfFgSVGWxbxZTxuZQiJdyi1j4FY6SrfKAYmThK6+dvYpOG57GY/LCRu
+ENwiN179HeHzbiuZ1W8Se3oQnmuZLrsXDa3R5Zsz8QjWdKl4BVtExIjjwroeovLD
+6EM9In2DqiiwRsv7EU4ZrQKBgBk3fR7+7wg/JMAqWE2vvlFLC/h7cV3OwCH93uxL
+b69vJVy8SeSQShG6MB3XJDD0uR1Kemp4fGWIgfQFoQbP3KFBxY11Dwq17DZ6gJFz
+DWauXuXdfEz2Cp8Mfa+JDnOlUOnG0MgpLnvbWre8vQ0vPlUeQ+nDPaEKSm63xvj3
+03ZZAoGAX/6VFjveFYGb6VeVIuzB2+maB9datICIZk+9hUPthK8Pe+6oIc7Nfgux
+zuEO5DXwvLAPblUuFogNRMxOkHiVrfhZJRIp1vgEdms4Av/oBFAb2UllNb+JnmHQ
+EHDRHpPC+FbQbhnOGcG1W4aN4Yi5sevGN6nqCsTsgSqOo9jYmc4=
+-----END RSA PRIVATE KEY-----";
+
+    #[test]
+    fn pkcs1_and_pkcs8_forms_of_one_key_share_a_fingerprint() {
+        let fp = public_key_fingerprint(TEST_RSA_PKCS1_PEM).unwrap();
+        assert_eq!(fp, "SHA256:NiQ5G+9Hr4ZBmdBscIoTOgx2SM6aWPG0/Q9Y6NuFtpI=");
+    }
+
+    #[test]
+    fn a_non_rsa_or_malformed_pem_is_an_auth_error() {
+        for pem in [
+            "not a pem",
+            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----",
+            "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\n!!!\n-----END PRIVATE KEY-----",
+        ] {
+            let err = public_key_fingerprint(pem).unwrap_err();
+            assert!(
+                matches!(err, FaucetError::Auth(ref m) if m.starts_with("invalid RSA private key")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn der_lengths_use_the_long_form_above_127() {
+        assert_eq!(der_length(5), vec![5]);
+        assert_eq!(der_length(200), vec![0x81, 200]);
+        assert_eq!(der_length(270), vec![0x82, 0x01, 0x0e]);
     }
 
     #[test]

@@ -292,9 +292,9 @@ byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
 croner = "3"
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 base64 = "0.22"
-rsa = "0.9"
+aws-lc-rs = "1"
 sha2 = "0.10"
 # BLAKE3 cryptographic hash — used by the `hash` transform (#403) as an
 # alternative to SHA-256.
@@ -315,10 +315,10 @@ google-cloud-auth = "1.10"
 google-cloud-gax = "1.10"
 # Cloud Spanner stack: the mature community client (yoshidan/google-cloud-rust,
 # renamed gcloud-*). The official `google-cloud-spanner` is still `-preview`, so
-# per the dependency policy the stable community client is the pick. Default
-# features are off to swap `jwt-aws-lc-rs` for the pure-Rust `jwt-rust-crypto`
-# signer (no aws-lc build dep for JWT signing).
-gcloud-spanner = { version = "1.8", default-features = false, features = ["auth", "rustls-tls", "jwt-rust-crypto"] }
+# per the dependency policy the stable community client is the pick. JWT signing
+# uses the constant-time aws-lc-rs backend, not the `rsa` crate (#818); every
+# jsonwebtoken user must pick the same backend, the two cannot coexist.
+gcloud-spanner = { version = "1.8", default-features = false, features = ["auth", "rustls-tls", "jwt-aws-lc-rs"] }
 # Raw protobuf types (Mutation, TypeCode, Field, …) used by the Spanner pair;
 # not re-exported from gcloud-spanner's root.
 gcloud-googleapis = { version = "1.3", features = ["spanner"] }
@@ -326,10 +326,10 @@ gcloud-googleapis = { version = "1.3", features = ["spanner"] }
 # `google_cloud_gax::conn::Environment` (the emulator-endpoint override).
 gcloud-gax = "1.4"
 # Cloud Pub/Sub client from the same yoshidan gcloud-* stack (source/sink pubsub,
-# #347). default-features off + jwt-rust-crypto to stay coherent with the Spanner
-# stack (avoids the dual-jwt compile_error in gcloud-auth).
-gcloud-pubsub = { version = "1", default-features = false, features = ["auth", "rustls-tls", "jwt-rust-crypto"] }
-gcloud-auth = { version = "1", default-features = false, features = ["rustls-tls", "jwt-rust-crypto"] }
+# #347). Same JWT backend as the Spanner stack (avoids the dual-jwt
+# compile_error in gcloud-auth).
+gcloud-pubsub = { version = "1", default-features = false, features = ["auth", "rustls-tls", "jwt-aws-lc-rs"] }
+gcloud-auth = { version = "1", default-features = false, features = ["rustls-tls", "jwt-aws-lc-rs"] }
 # 1.125: `Record::partition_key()` returns `Option<&str>`.
 # Default features minus the legacy `rustls` (rustls 0.21 / webpki 0.101).
 aws-sdk-kinesis = { version = "1.125", default-features = false, features = ["default-https-client", "rt-tokio"] }

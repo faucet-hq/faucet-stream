@@ -15,11 +15,13 @@ version = 2
 # Re-triage every entry when its dependency moves; drop it once fixed.
 unmaintained = "workspace"
 ignore = [
-    # 2026-10-07 — no fixed release (Marvin timing side channel). Reached by
-    # local key-pair JWT signing (snowflake key-pair auth, jsonwebtoken via
-    # gcloud-auth) and russh client auth; an attacker needs precise timing of
-    # many signatures on the signing host.
-    { id = "RUSTSEC-2023-0071", reason = "no fix; signing-host timing only (2026-10-07)" },
+    # 2026-10-16 — no fixed release (Marvin timing side channel). Our own JWT
+    # signing moved to aws-lc-rs (#818); `rsa` is left only upstream: opendal's
+    # reqsign (Google service-account signing for Iceberg warehouses), russh
+    # client auth (rsa 0.10 rc), and sqlx-mysql's public-key password
+    # encryption (not a private-key operation). An attacker needs precise
+    # timing of many signatures on the signing host.
+    { id = "RUSTSEC-2023-0071", reason = "no fix; upstream signers only (reqsign, russh) (2026-10-16)" },
     # 2026-10-07 — rustls 0.21 / rustls-webpki 0.101 are compiled into the AWS
     # SDK's legacy hyper-0.14 connector; the SDK runs on its hyper-1 / rustls
     # 0.23 client, so this stack is never used for a connection.
