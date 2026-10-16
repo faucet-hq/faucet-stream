@@ -6,11 +6,11 @@ Honest, reproducible evidence for the "built for throughput" claim. This compare
 machine.
 
 **Headline: on single-machine batch throughput, faucet-stream is roughly
-1–2 orders of magnitude faster than a Python Singer runtime** — and the size of
-the gap depends heavily on how much of the run is per-row work vs I/O:
+10–80× faster than a Python Singer runtime** — and the size of the gap depends
+heavily on how much of the run is per-row work vs I/O:
 
 - **CSV → JSONL is a *best case*** that maximally exposes Python's per-row
-  interpreter + Singer-over-pipe overhead (faucet was ~96× faster here). Quote
+  interpreter + Singer-over-pipe overhead (faucet was ~80× faster here). Quote
   this as the upper bound, not the typical case.
 - **Sink-bound moves narrow the gap.** When the destination write dominates
   (Postgres → Postgres, Scenario C), both tools are bounded by the *same* database
@@ -82,21 +82,29 @@ scripts/run-bench.sh --postgres # also Scenarios B & C (needs Docker)
 ```
 
 Tool versions and hardware are captured per run in
-`benchmarks/results/versions.txt`. The run reported below used:
+`benchmarks/results/versions.txt`, including the full package list of Meltano and
+of every plugin environment. Meltano itself is pinned in the harness
+(`BENCH_MELTANO_VERSION`, default `4.4.1`). The run reported below used:
 
 | | |
 |---|---|
 | Hardware | Apple M3 Pro, 12 cores, 18 GiB RAM |
-| OS | macOS 26.5 (arm64) |
+| OS | macOS 26.7.1 (arm64) |
 | Rust | rustc 1.96.0 |
-| faucet | 1.2.0 (release: `source-csv,sink-jsonl,source-postgres`) |
-| hyperfine | 1.19.0 |
-| Meltano | 4.2.1 (Python 3.12.11) |
-| Meltano plugins | `tap-csv` v1.3.2 (git, MeltanoLabs), `target-jsonl` 0.1.4 |
-| Date | 2026-07-09 |
+| faucet | 1.14.0 (release: `source-file,sink-file,file-format-csv,source-postgres,sink-postgres`) |
+| hyperfine | 1.20.0 |
+| Meltano | 4.4.1 (Python 3.12.14) |
+| Meltano plugins | `tap-csv` v1.3.2, `tap-postgres` 0.9.0, `target-jsonl` 0.1.4, `target-postgres` 0.8.0 (`singer-sdk` 0.53.7–0.54.8, SQLAlchemy 2.0–2.1) |
+| Date | 2026-10-16 |
 
-_See `benchmarks/results/versions.txt` for the exact `pip freeze` and dataset size
-of the run reported below._
+The harness now defaults to the newest Python Meltano supports (3.14 at the
+time of writing); this run used 3.12.14. A 100k-row check of all three scenarios
+on Python 3.14.7 gave the same faucet-to-Meltano ratios within noise (Scenario A:
+73× on both).
+
+The host was not idle: managed endpoint-security agents ran throughout (load
+average ~5–7), which slows both tools. Absolute times on a quiet machine will be
+lower; the ratios are the useful part.
 
 ## Results
 
@@ -106,22 +114,22 @@ of the run reported below._
 
 | Tool | Median wall-clock (s) | Stddev (s) | Throughput (rows/s) | Peak RSS (MiB) | Rows out |
 |---|---|---|---|---|---|
-| **faucet-stream** | **1.40** | 0.015 | **712,403** | **11.8** | 1,000,000 |
-| Meltano (Singer) | 135.46 | 6.03 | 7,383 | 724.5 | 1,000,000 |
+| **faucet-stream** | **1.43** | 0.052 | **700,574** | **20.1** | 1,000,000 |
+| Meltano (Singer) | 114.97 | 4.51 | 8,698 | 818.8 | 1,000,000 |
 
-On this workload and hardware, faucet-stream was **~96× faster** (712k vs 7.4k
-rows/s) and used **~62× less peak memory** (11.8 vs 724 MiB), with **exact
+On this workload and hardware, faucet-stream was **~80× faster** (701k vs 8.7k
+rows/s) and used **~40× less peak memory** (20.1 vs 819 MiB), with **exact
 row-count parity** (1,000,000 = 1,000,000).
 
 **Smoke run — 100,000 rows** (11.5 MiB CSV, seed 42, 1 warmup + 5 timed runs):
 
 | Tool | Median wall-clock (s) | Stddev (s) | Throughput (rows/s) | Peak RSS (MiB) | Rows out |
 |---|---|---|---|---|---|
-| **faucet-stream** | **0.18** | 0.011 | **548,246** | **11.8** | 100,000 |
-| Meltano (Singer) | 18.92 | 1.78 | 5,286 | 306.4 | 100,000 |
+| **faucet-stream** | **0.18** | 0.010 | **552,792** | **19.5** | 100,000 |
+| Meltano (Singer) | 13.20 | 0.19 | 7,578 | 360.3 | 100,000 |
 
-Note how faucet's throughput *rises* from the 100k to the 1M run (548k → 712k
-rows/s) as fixed startup cost amortizes, while Meltano's stays flat (~5–7k rows/s)
+Note how faucet's throughput *rises* from the 100k to the 1M run (553k → 701k
+rows/s) as fixed startup cost amortizes, while Meltano's stays flat (~7.5–8.7k rows/s)
 — consistent with a fixed Python/subprocess startup cost plus a per-record
 Singer-over-pipe overhead. This is why the 1M run is the meaningful one.
 
@@ -129,14 +137,14 @@ Singer-over-pipe overhead. This is why the 1M run is the meaningful one.
 
 **1,000,000 rows** (`bench` table, seed 42, 1 warmup + 5 timed runs). Postgres 16
 in Docker (colima); the same machine as Scenario A. faucet `source-postgres` →
-`sink-jsonl` (streamed via `sqlx`) vs Meltano `tap-postgres` → `target-jsonl`.
+`sink-file` (streamed via `sqlx`) vs Meltano `tap-postgres` → `target-jsonl`.
 
 | Tool | Median wall-clock (s) | Stddev (s) | Throughput (rows/s) | Peak RSS (MiB) | Rows out |
 |---|---|---|---|---|---|
-| **faucet-stream** | **5.56** | 0.110 | **179,700** | **13.9** | 1,000,000 |
-| Meltano (Singer) | 139.19 | 1.595 | 7,184 | 743.0 | 1,000,000 |
+| **faucet-stream** | **5.23** | 0.053 | **191,124** | **21.7** | 1,000,000 |
+| Meltano (Singer) | 126.08 | 3.45 | 7,931 | 621.0 | 1,000,000 |
 
-On this workload/hardware, faucet-stream was **~25× faster** and used **~53× less
+On this workload/hardware, faucet-stream was **~24× faster** and used **~29× less
 peak memory**, with **exact row-count parity** (1,000,000 = 1,000,000). The gap is
 narrower than Scenario A because both tools are now bounded by real typed row
 decoding from Postgres (Scenario A was all-string CSV) — faucet still streams
@@ -150,16 +158,15 @@ where the destination write dominates.** faucet `source-postgres` →
 `sink-postgres` (multi-row `INSERT`s via `sqlx`) vs Meltano `tap-postgres` →
 `target-postgres`. Because both tools are now bounded by the *same* Postgres write
 path, this is where the CSV→JSONL best-case gap shrinks toward the low end of the
-1–2 orders-of-magnitude range — and it is the number to quote for "move a table
-between two Postgres databases."
+10–80× range — and it is the number to quote for "move a table between two
+Postgres databases."
 
-**1,000,000 rows** (`bench` → `bench_dest`, seed 42, 1 warmup + 3 timed runs).
+**1,000,000 rows** (`bench` → `bench_dest`, seed 42, 1 warmup + 5 timed runs).
 Postgres 16 in Docker (colima) on an Apple M3 Pro; faucet `source-postgres` →
 `sink-postgres` (AutoMap columns) vs Meltano `tap-postgres` →
-`target-postgres` 0.8.0. faucet is measured on both of its append write paths:
-multi-row `INSERT`s and the `write_method: copy` bulk-load fast-path (#308,
-`COPY … FROM STDIN` — the benchmark config's default since it is the best
-append path).
+`target-postgres` 0.8.0. faucet uses its `write_method: copy` bulk-load
+fast-path (#308, `COPY … FROM STDIN`), the benchmark config's default since it is
+the best append path.
 
 **Batch parity (both sides write 5,000-row batches).** So the gap below cannot be
 dismissed as a Meltano batch-size misconfiguration: both loaders are pinned to the
@@ -175,51 +182,36 @@ and [`benchmarks/meltano/meltano.yml`](benchmarks/meltano/meltano.yml).
 
 | Tool | Median wall-clock (s) | Stddev (s) | Throughput (rows/s) | Peak RSS (MiB) | Rows out |
 |---|---|---|---|---|---|
-| **faucet-stream (`write_method: copy`)** | **8.12** | 0.142 | **123,200** | **35.9** | 1,000,000 |
-| faucet-stream (multi-row `INSERT`) | 10.10 | 0.112 | 99,000 | 35.9 | 1,000,000 |
-| Meltano (Singer)† | 129.8 | 34.347 | 7,706 | 485.7 | 1,000,000 |
+| **faucet-stream (`write_method: copy`)** | **8.54** | 0.246 | **117,147** | **33.8** | 1,000,000 |
+| Meltano (Singer) | 82.06 | 1.18 | 12,186 | 690.3 | 1,000,000 |
 
-On this workload/hardware faucet's COPY path was **~16× faster** than Meltano
-(and its INSERT path ~12.9×), with **~13.5× less peak memory** (35.9 vs 485.7
-MiB) and **exact row-count parity** (1,000,000 = 1,000,000). Note also the
-stddev: faucet is tight (±0.1s) while Meltano's Python/pipe runtime jitters
-badly at scale (±34s). (The Meltano row is from the same-machine PR #307 run;
-the faucet rows were re-measured when the COPY fast-path landed. faucet's
-INSERT number improved slightly between runs — 11.17s → 10.10s — normal
-machine-load drift.)
-
-> **† The Meltano row predates the `batch_size_rows: 5000` pin.** It was captured
-> on the same-machine PR #307 run, *before* the explicit batch pin was added to
-> `meltano.yml` (it used `target-postgres`'s prior default). The config is now
-> pinned so both sides write 5,000-row batches, but **this specific Meltano number
-> has not been re-measured under the pin** — read it as pre-pin. In this regime
-> batch size is not the lever (faucet's throughput is flat 500→5000 rows/`INSERT`),
-> so it is not expected to move materially. Re-measuring needs Docker + a Meltano
-> venv on the bench host: run `scripts/run-bench.sh --postgres --rows 1000000` and
-> refresh this table + `benchmarks/results/results_pg_1m.md` when that environment
-> is available (tracked in [#336](https://github.com/faucet-hq/faucet-stream/issues/336)).
+On this workload/hardware faucet's COPY path was **~10× faster** than Meltano,
+with **~20× less peak memory** (33.8 vs 690 MiB) and **exact row-count parity**
+(1,000,000 = 1,000,000). Both rows are from the same session, with both loaders
+pinned to 5,000-row batches. (An earlier run measured faucet's multi-row
+`INSERT` path at ~1.24× slower than its COPY path; the harness times COPY only.)
 
 This is the whole point of the scenario: **the gap
-collapses from ~96× to ~16× as the workload moves from parse-bound to
+collapses from ~80× to ~10× as the workload moves from parse-bound to
 sink-bound**, because both tools become bounded by the same Postgres write
 path. The narrowing, all at 1M rows on the same machine:
 
 | Scenario | Bottleneck | faucet (rows/s) | Meltano (rows/s) | Gap |
 |---|---|---|---|---|
-| A — CSV → JSONL | parse/serialize (best case) | 712,403 | 7,383 | **~96×** |
-| B — Postgres → JSONL | typed row decode | 179,700 | 7,184 | **~25×** |
-| C — Postgres → Postgres | **destination write (sink-bound)** | 123,200 (`copy`) / 99,000 (`insert`) | 7,706 | **~16× / ~13×** |
+| A — CSV → JSONL | parse/serialize (best case) | 700,574 | 8,698 | **~80×** |
+| B — Postgres → JSONL | typed row decode | 191,124 | 7,931 | **~24×** |
+| C — Postgres → Postgres | **destination write (sink-bound)** | 117,147 (`copy`) | 12,186 | **~10×** |
 
-So quote **~16×** for a realistic DB→DB move (with `write_method: copy`), and
-treat the ~96× CSV→JSONL figure as the upper bound, not the typical case.
+So quote **~10×** for a realistic DB→DB move (with `write_method: copy`), and
+treat the ~80× CSV→JSONL figure as the upper bound, not the typical case.
 
-**Why ~16× and not more?** It is near the ceiling for this shape, and the
+**Why ~10× and not more?** It is near the ceiling for this shape, and the
 profile proves it: at 1M, faucet spends ~62% of its wall on CPU (decode
 Postgres rows → JSON → re-encode) and the rest blocked on the destination
 write. `COPY` roughly halves the write step vs multi-row `INSERT` (the 5–10×
 folk number applies to the write step in isolation, and Amdahl caps the
 end-to-end gain at ~1.6× when 62% of the time is decode) — measured end-to-end
-it bought **1.24×** (10.10s → 8.12s). This benchmark runs Meltano's
+it bought **1.24×** (10.10s → 8.12s in the July 2026 run). This benchmark runs Meltano's
 `target-postgres` on its default `INSERT` loader (its opt-in `use_copy: true`
 COPY path is left off), so only the faucet-`insert` row is a method-matched
 comparison; against faucet's COPY row the difference is partly write-method, not
@@ -249,10 +241,10 @@ in `versions.txt`.
 
 0. **CSV → JSONL is a best case, not the typical case.** It is almost pure
    parse-and-reserialize, which maximally exposes Python's per-row interpreter and
-   Singer-over-pipe overhead — so the ~96× there is the *upper bound*. The
+   Singer-over-pipe overhead — so the ~80× there is the *upper bound*. The
    sink-bound Postgres→Postgres move (Scenario C) is the realistic "move a table
    between two databases" number, and the gap there is smaller because both tools
-   share the same database write path. Quote the range (1–2 orders of magnitude),
+   share the same database write path. Quote the range (10–80×),
    and prefer the scenario closest to your actual workload.
 
 **What it does not prove / honest boundaries:**
@@ -278,10 +270,31 @@ in `versions.txt`.
    reserialize. Scenario B (Postgres) exercises real typed decoding on both sides.
 5. **Hardware-dependent.** Absolute numbers only mean something relative to the
    `versions.txt` machine. Re-run on your own hardware before quoting.
-6. **One workload.** A different shape (wide rows, deeply nested JSON, many small
+6. **Peak RSS includes faucet's own code.** `maximum resident set size` counts the
+   binary's resident code pages, so faucet's ~20 MiB is mostly fixed startup cost
+   (on the same runs, macOS's private "peak memory footprint" is ~7 MiB). Per-row
+   memory is flat: a 1-row run and a 1M-row run differ by ~2 MiB.
+7. **One workload.** A different shape (wide rows, deeply nested JSON, many small
    files, network-bound APIs) could move the ratio. This is not a general
    "faucet is Nx faster" claim — it is one reproducible data point.
 
 **Bottom line:** the comparison is designed to be *fair and falsifiable*, not
 flattering. If faucet does not win on the 1M-row run on your hardware, the harness
 will say so.
+
+## History
+
+Results move as both tools change. Earlier published runs, for comparison:
+
+| Run | faucet | Meltano | A: CSV → JSONL | B: Postgres → JSONL | C: Postgres → Postgres |
+|---|---|---|---|---|---|
+| 2026-10-16 (current) | 1.14.0 | 4.4.1 | ~80× (1.43 s vs 115.0 s) | ~24× (5.23 s vs 126.1 s) | ~10× (8.54 s vs 82.1 s) |
+| 2026-07-09 | 1.2.0 | 4.2.1 | ~96× (1.40 s vs 135.5 s) | ~25× (5.56 s vs 139.2 s) | ~16× (8.12 s vs 129.8 s†) |
+
+The gap narrowed mainly because **Meltano got faster** (Scenario C: 130 s → 82 s),
+not because faucet slowed: on the same machine and load, faucet's times are within
+noise of July. † The July Scenario C Meltano row came from a separate session
+before the 5,000-row batch pin and had a ±34 s stddev; the October row is
+same-session and pinned (±1.2 s). July's peak RSS (11.8 MiB) was a smaller binary;
+the October figure (20.1 MiB) is fixed startup overhead from a larger build — see
+[#910](https://github.com/faucet-hq/faucet-stream/issues/910).

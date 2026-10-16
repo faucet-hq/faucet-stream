@@ -45,9 +45,9 @@ pipeline from Rust with typed `Source`/`Sink` traits.
   delivery, dead-letter queues, automatic retries, and built-in Prometheus
   metrics + `tracing` spans — with zero per-connector code.
 - **Fast, and honest about it.** On a reproducible 1M-row CSV→JSONL move faucet
-  sustains 712k rows/s in 11.8 MiB of RAM (~96× faster, ~62× less memory than
+  sustains 701k rows/s in 20 MiB of RAM (~80× faster, ~40× less memory than
   Meltano, exact row parity); sink-bound moves like Postgres→Postgres narrow the
-  gap toward ~16×. The harness is `make bench` — see
+  gap toward ~10×. The harness is `make bench` — see
   [`BENCHMARKS.md`](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md)
   for the methodology and the caveats.
 - **A connector marketplace you can trust.** Every connector is graded against the

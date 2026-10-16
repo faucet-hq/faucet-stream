@@ -14,7 +14,7 @@
 
 ## Where faucet-stream is different
 
-- **No inter-process serialization tax.** Singer pipes JSON between a tap process and a target process; faucet moves typed records inside one binary. That, plus native Rust and no Python, is why a 1M-row move runs at **712k rows/s in 11.8 MiB** ([benchmarks](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md)).
+- **No inter-process serialization tax.** Singer pipes JSON between a tap process and a target process; faucet moves typed records inside one binary. That, plus native Rust and no Python, is why a 1M-row move runs at **701k rows/s in 20 MiB** ([benchmarks](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md)).
 - **One artifact, not a pipeline of processes.** A single static binary vs. a tap + target (+ a runner + Python envs).
 - **Governance & delivery guarantees in-path.** Quality, contracts, masking, drift, lineage, SLAs, and effectively-once delivery are part of the engine — the Singer spec covers extract/load messaging, not these.
 - **A typed connector contract.** faucet's [FCP protocol](../spec/faucet-connector-spec-v0.md) + SDK give connector authors a documented, versioned surface.

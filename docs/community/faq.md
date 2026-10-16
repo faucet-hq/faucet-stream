@@ -13,7 +13,7 @@ Different layer, honest trade-offs:
   [bridges to Singer taps](https://faucet-hq.github.io/faucet-stream/) (v0,
   experimental) so you can run an existing tap through faucet.
 - **Throughput & footprint:** on single-machine batch throughput faucet is
-  roughly **1–2 orders of magnitude** faster than a Python Singer runtime with a
+  roughly **10–80×** faster than a Python Singer runtime with a
   fraction of the memory (see [BENCHMARKS.md](../../BENCHMARKS.md) — CSV→JSONL is
   a best case; sink-bound DB→DB narrows the gap). It's a compiled Rust binary, not
   a Python + subprocess pipeline.

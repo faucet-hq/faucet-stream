@@ -31,9 +31,15 @@ benchmarks/
     --no-default-features --features "source-file,sink-file,file-format-csv,source-postgres,sink-postgres"
   ```
 - [`hyperfine`](https://github.com/sharkdp/hyperfine) for wall-clock timing.
-- A Meltano-compatible Python (3.9–3.12; the harness defaults to `python3.12`,
-  override with `BENCH_PYTHON`). Meltano does **not** yet support Python 3.13/3.14,
-  so a system whose only `python3` is 3.13+ must install 3.12.
+- Python 3.10–3.14, the range Meltano 4.4 supports. The harness picks the newest
+  one installed (`python3.14`, then 3.13, 3.12, 3.11, 3.10); set `BENCH_PYTHON`
+  to choose another. Switching interpreters rebuilds `.bench-venv` and every
+  plugin environment, so a run never mixes Python versions.
+- Meltano itself is pinned (`4.4.1`; override with `BENCH_MELTANO_VERSION`) so a
+  re-run compares against the same orchestrator. Plugin versions are pinned in
+  `meltano.yml`; their transitive dependencies are not, so each plugin's
+  `pip freeze` is written to `versions.txt` to explain any change in Meltano's
+  numbers between runs.
 - Docker (only for the optional Postgres scenario).
 
 ## Run it
@@ -66,7 +72,7 @@ make bench-smoke    # 100k rows
 ```
 
 Outputs land in `benchmarks/results/`:
-- `versions.txt` — hardware, OS, Rust/faucet/Meltano versions, `pip freeze`, dataset size.
+- `versions.txt` — hardware, OS, Rust/faucet/Meltano versions, `pip freeze` of Meltano and of every plugin venv, dataset size.
 - `results.md` — the results table fragment (copied into `BENCHMARKS.md`).
 - `raw/*.json` — the raw hyperfine exports (median/mean/stddev/min/max per run set).
 
@@ -87,7 +93,7 @@ docker run -d --name faucet-bench-pg -e POSTGRES_PASSWORD=bench \
 export BENCH_PG_URL="postgres://postgres:bench@localhost:55432/postgres"
 
 # 2. Generate + load the dataset
-python3.12 scripts/gen_bench_data.py --rows 1000000 --seed 42 --out benchmarks/data/bench.csv
+python3 scripts/gen_bench_data.py --rows 1000000 --seed 42 --out benchmarks/data/bench.csv
 psql "$BENCH_PG_URL" -c "CREATE TABLE bench (
   id bigint, first_name text, country text, amount double precision,
   created_at timestamptz, active boolean, attributes jsonb);"

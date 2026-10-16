@@ -23,7 +23,16 @@ SEED=42
 RUNS=5
 DO_PG=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${BENCH_PYTHON:-python3.12}"
+# Newest interpreter Meltano supports, unless BENCH_PYTHON picks one.
+SUPPORTED_PYTHONS="3.14 3.13 3.12 3.11 3.10"
+PYTHON="${BENCH_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for v in $SUPPORTED_PYTHONS; do
+    if command -v "python$v" >/dev/null 2>&1; then PYTHON="python$v"; break; fi
+  done
+  PYTHON="${PYTHON:-python3}"
+fi
+MELTANO_VERSION="${BENCH_MELTANO_VERSION:-4.4.1}"
 FAUCET_BIN="${FAUCET_BIN:-$REPO_ROOT/target/release/faucet}"
 
 while [ $# -gt 0 ]; do
@@ -102,10 +111,14 @@ VENV="$REPO_ROOT/.bench-venv"
 MELTANO_OK=0
 log "Setting up Meltano venv ($PYTHON) at .bench-venv"
 if have "$PYTHON"; then
-  if [ ! -x "$VENV/bin/meltano" ]; then
-    "$PYTHON" -m venv "$VENV" \
+  py_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null; }
+  if [ ! -x "$VENV/bin/meltano" ] \
+      || ! "$VENV/bin/pip" show meltano 2>/dev/null | grep -qx "Version: $MELTANO_VERSION" \
+      || [ "$(py_version "$VENV/bin/python")" != "$(py_version "$PYTHON")" ]; then
+    rm -rf benchmarks/meltano/.meltano/extractors benchmarks/meltano/.meltano/loaders
+    "$PYTHON" -m venv --clear "$VENV" \
       && "$VENV/bin/pip" -q install --upgrade pip \
-      && "$VENV/bin/pip" -q install "meltano" \
+      && "$VENV/bin/pip" -q install "meltano==$MELTANO_VERSION" \
       || echo "meltano pip install failed (will skip Meltano side)" >&2
   fi
   if [ -x "$VENV/bin/meltano" ]; then
@@ -315,6 +328,15 @@ SQL
 
 if [ "$DO_PG" = 1 ]; then
   run_pg_scenarios
+fi
+
+if [ "$MELTANO_OK" = 1 ]; then
+  for plugin_venv in benchmarks/meltano/.meltano/*/*/venv; do
+    [ -x "$plugin_venv/bin/python" ] || continue
+    { echo; echo "# plugin $(basename "$(dirname "$plugin_venv")")"
+      "$plugin_venv/bin/python" -c 'import importlib.metadata as m; print("\n".join(sorted(d.metadata["Name"] + "==" + d.version for d in m.distributions())))'
+    } >> "$RES_DIR/versions.txt"
+  done
 fi
 
 log "Done. Raw hyperfine JSON in $RAW_DIR/, env in $RES_DIR/versions.txt"

@@ -60,8 +60,8 @@ Front-load the high-signal, low-effort channels; do the rest as time allows.
 ## Copy templates
 
 Reuse verbatim; swap `vX.Y.Z` and the highlights. All counts are **58**; all benchmark
-figures come from [`BENCHMARKS.md`](../../BENCHMARKS.md) (quote **~16×** for a realistic
-DB→DB move, **~96×** as the CSV→JSONL upper bound — never the ~96× alone).
+figures come from [`BENCHMARKS.md`](../../BENCHMARKS.md) (quote **~10×** for a realistic
+DB→DB move, **~80×** as the CSV→JSONL upper bound — never the ~80× alone).
 
 ### Elevator pitch (one-liner — use everywhere)
 

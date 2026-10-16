@@ -20,9 +20,9 @@ gotcha below — so "no native connector" isn't necessarily a dealbreaker.)
 
 **Move to faucet if** you feel the cost of the Python plugin runtime and want:
 
-- **Throughput.** On a reproducible 1M-row CSV→JSONL move, faucet does 712k
-  rows/s in 11.8 MiB vs Meltano's 7.4k rows/s in 724 MiB — output identical
-  row-for-row. Sink-bound moves narrow the gap (the benchmarks show that too,
+- **Throughput.** On a reproducible 1M-row CSV→JSONL move, faucet does 701k
+  rows/s in 20 MiB vs Meltano's 8.7k rows/s in 819 MiB (~80×), with the same
+  row count. Sink-bound moves narrow the gap (the benchmarks show that too,
   honestly), but the structural win — no per-row Python overhead, bounded
   streaming memory — is real.
 - **Operational simplicity.** faucet is one static binary. No virtualenv, no
