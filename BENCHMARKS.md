@@ -97,6 +97,11 @@ of every plugin environment. Meltano itself is pinned in the harness
 | Meltano plugins | `tap-csv` v1.3.2, `tap-postgres` 0.9.0, `target-jsonl` 0.1.4, `target-postgres` 0.8.0 (`singer-sdk` 0.53.7–0.54.8, SQLAlchemy 2.0–2.1) |
 | Date | 2026-10-16 |
 
+The harness now defaults to the newest Python Meltano supports (3.14 at the
+time of writing); this run used 3.12.14. A 100k-row check of all three scenarios
+on Python 3.14.7 gave the same faucet-to-Meltano ratios within noise (Scenario A:
+73× on both).
+
 The host was not idle: managed endpoint-security agents ran throughout (load
 average ~5–7), which slows both tools. Absolute times on a quiet machine will be
 lower; the ratios are the useful part.
