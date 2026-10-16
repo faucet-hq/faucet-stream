@@ -280,7 +280,13 @@ install() { # cluster|single
 
 # ------------------------------------------------------------------- API ---
 
-pods() { k get pod -l app.kubernetes.io/component=serve --field-selector=status.phase=Running -o name | sed 's#pod/##' | sort; }
+# Ready serve pods that are not being deleted: a terminating pod still reads
+# as Running, and a port-forward to it dies mid-scenario.
+pods() {
+  k get pod -l app.kubernetes.io/component=serve -o json \
+    | jq -r '.items[] | select(.metadata.deletionTimestamp == null)
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | sort
+}
 
 NEXT_PORT=19100
 port_for() { # pod -> local port with a live port-forward
@@ -314,14 +320,17 @@ owner_of() { # run id -> pod that last started it
 
 wait_owner() { local id="$1" o; for _ in $(seq 1 60); do o="$(owner_of "$id")"; [ -n "$o" ] && { echo "$o"; return 0; }; sleep 1; done; return 1; }
 
-wait_terminal() { # port id timeout_secs
-  local s
+wait_terminal() { # port id timeout_secs; re-picks a pod if the port-forward dies
+  local port="$1" s
   for _ in $(seq 1 "$3"); do
-    s="$(field "$1" "$2" status 2>/dev/null)"
-    case "$s" in completed|failed|cancelled) echo "$s"; return 0 ;; esac
+    s="$(field "$port" "$2" status 2>/dev/null)"
+    case "$s" in
+      completed|failed|cancelled) echo "$s"; return 0 ;;
+      ""|null) port="$(any_port)" ;;
+    esac
     sleep 1
   done
-  echo "timeout"; return 1
+  echo "timeout (last status: ${s:-none})"; return 1
 }
 
 any_port() { port_for "$(pods | head -1)"; }
