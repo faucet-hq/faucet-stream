@@ -33,6 +33,7 @@ testing = ["dep:base64", "dep:chrono", "dep:hmac", "dep:sha2", "dep:url"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
 tempfile.workspace = true
 
 [package.metadata.docs.rs]

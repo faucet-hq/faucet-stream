@@ -89,6 +89,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_a_container_and_accepts_an_existing_one() {
+        use wiremock::matchers::{header, header_exists, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/acct/made"))
+            .and(query_param("restype", "container"))
+            .and(header("x-ms-version", API_VERSION))
+            .and(header_exists("x-ms-date"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/acct/there"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/acct/denied"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("AuthenticationFailed"))
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/acct/", server.uri());
+        create_container(&endpoint, "acct", "a2V5", "made")
+            .await
+            .unwrap();
+        create_container(&endpoint, "acct", "a2V5", "there")
+            .await
+            .unwrap();
+        let err = create_container(&endpoint, "acct", "a2V5", "denied")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("HTTP 403: AuthenticationFailed"),
+            "{err}"
+        );
+        let auth = server.received_requests().await.unwrap()[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(auth.starts_with("SharedKey acct:"), "{auth}");
+    }
+
+    #[tokio::test]
     async fn a_bad_endpoint_is_a_config_error() {
         let err = create_container("not a url", "a", "a2V5", "c")
             .await
