@@ -49,6 +49,9 @@ ARG SINKS=""
 # `full` feature, which enables every feature in its manifest. Keep it exactly
 # `full` — scripts/full-feature-coverage.py fails CI otherwise (#845).
 ARG DEFAULT_FEATURES="full"
+# Cargo profile of the binary: `release`, or `release-lto` (fat LTO, about a
+# quarter smaller; linking a full build that way needs more than 16 GB).
+ARG CARGO_PROFILE="release"
 # Raw override — when set, wins over everything above.
 ARG FEATURES=""
 
@@ -58,6 +61,7 @@ FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
 ARG SOURCES
 ARG SINKS
 ARG DEFAULT_FEATURES
+ARG CARGO_PROFILE
 ARG FEATURES
 # Non-connector features always compiled in for a selective (SOURCES/SINKS) build.
 # Deliberately excludes the `source`/`sink`/`default` aggregates so a lean build
@@ -97,9 +101,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         for s in $(echo "${SINKS}"  | tr ',' ' '); do [ -n "$s" ] && feats="${feats},sink-${s}"; done; \
     fi; \
     echo "==> building faucet with features: ${feats}"; \
-    cargo build --profile dist --locked -p faucet-cli \
+    cargo build --profile "${CARGO_PROFILE}" --locked -p faucet-cli \
         --no-default-features --features "${feats}"; \
-    cp /build/target/dist/faucet /usr/local/bin/faucet; \
+    cp "/build/target/${CARGO_PROFILE}/faucet" /usr/local/bin/faucet; \
     # Strip debug symbols — on a full build (DuckDB + Kafka + every connector
     # statically linked) this removes 50-150MB from the shipped binary.
     strip --strip-all /usr/local/bin/faucet; \

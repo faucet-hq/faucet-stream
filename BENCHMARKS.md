@@ -69,9 +69,9 @@ the 1M CSV is ~10× that).
 ### Exact reproduction
 
 ```bash
-# 1. Build the binary the harness uses, with the profile shipped binaries use
-#    (`dist`: fat LTO, one codegen unit)
-cargo build -p faucet-cli --profile dist \
+# 1. Build the binary the harness uses (`release-lto`: fat LTO, one codegen
+#    unit, as in the core / analytics / cdc images)
+cargo build -p faucet-cli --profile release-lto \
   --no-default-features --features "source-file,sink-file,file-format-csv,source-postgres,sink-postgres"
 
 # 2. Run (installs an isolated Meltano venv on first run)

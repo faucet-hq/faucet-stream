@@ -79,19 +79,24 @@ jobs:
             sources: ""
             sinks: ""
             oracle: "auto"
+            # Fat LTO runs out of memory linking every feature (#911).
+            cargo_profile: release
           # Lean, common analytics/ELT set.
           - profile: core
             sources: "rest,postgres,s3,csv"
             sinks: "postgres,s3,jsonl,stdout"
             oracle: "false"
+            cargo_profile: release-lto
           - profile: analytics
             sources: "rest,postgres,s3,bigquery,snowflake"
             sinks: "bigquery,snowflake,s3,jsonl"
             oracle: "false"
+            cargo_profile: release-lto
           - profile: cdc
             sources: "postgres-cdc,mysql-cdc,mongodb-cdc"
             sinks: "postgres,kafka,s3"
             oracle: "false"
+            cargo_profile: release-lto
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -159,6 +164,7 @@ jobs:
             SOURCES=${{ matrix.sources }}
             SINKS=${{ matrix.sinks }}
             ORACLE_CLIENT=${{ matrix.oracle }}
+            CARGO_PROFILE=${{ matrix.cargo_profile }}
           tags: faucet-smoke:${{ matrix.profile }}
           cache-from: type=gha,scope=faucet-${{ matrix.profile }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=faucet-${{ matrix.profile }}-${{ matrix.arch }}
@@ -217,6 +223,7 @@ jobs:
             SOURCES=${{ matrix.sources }}
             SINKS=${{ matrix.sinks }}
             ORACLE_CLIENT=${{ matrix.oracle }}
+            CARGO_PROFILE=${{ matrix.cargo_profile }}
           outputs: type=image,name=${{ steps.img.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=faucet-${{ matrix.profile }}-${{ matrix.arch }}
           # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
