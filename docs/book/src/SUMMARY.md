@@ -107,6 +107,7 @@
 - [Running a cluster](./cookbook/cluster.md)
 - [Observability](./operations/observability.md)
 - [Reliability testing](./operations/reliability-testing.md)
+  - [Chaos testing `faucet serve`](./operations/chaos-testing.md)
 - [Pinning the faucet version](./operations/pinning.md)
 - [Upgrading faucet safely](./operations/upgrading.md)
 - [Migrating from Meltano, Singer or Airbyte](./operations/migrating.md)

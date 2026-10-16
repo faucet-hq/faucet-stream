@@ -44,9 +44,9 @@ deploy/                       — container + Kubernetes assets
   helm/faucet-stream/examples/ — example values (everything.yaml: every serve feature on)
   helm/test-chart.sh          — renders the chart test values and checks their expectations
   otel/                       — log-shipping recipes (Alloy → Loki, OTel Collector → S3/GCS/Azure)
-scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, …)
+scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, chaos/run.sh, …)
 docs/book/                    — mdBook documentation site (source under docs/book/src)
 rfcs/                         — design RFCs
-.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, …
+.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, …
 .github/assets/               — brand assets: logo, wordmark, social-preview banner, favicon
 ```

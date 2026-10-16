@@ -38,6 +38,7 @@ docs/superpowers/
 !/scripts/gen_bench_data.py
 !/scripts/run-bench.sh
 !/scripts/build-image.sh
+!/scripts/chaos/
 # CI-invoked docs helpers (tracked; must not be ignored or cargo/release-plz's
 # working-tree dirty check fails on "tracked but ignored" files).
 !/scripts/check-doc-counts.sh
@@ -104,3 +105,4 @@ faucet-local-demo/
 # One-off scratch working logs / proposals — must never be committed
 /*_LOG.md
 /SCOPE_PROPOSAL.md
+chaos-report/

@@ -34,6 +34,7 @@ test checks and which stays green through a real regression.
 | **Containerized integration** | Real databases, Kafka, object stores; CDC replication | Yes | Every PR, reported |
 | **Fidelity round-trip** | The shared corpus lands type-exact through every connector — a source↔sink pair, a one-sided run against the backend, or the connector's value converter; every connector runs it (`scripts/fidelity-coverage.py`) and none converts a decimal through a float (`scripts/decimal-f64.py`). See [value fidelity](../reference/value-fidelity.md) | Per connector | Every PR, reported |
 | **Container fault injection** | A real connection cut mid-cursor | Yes | Every PR, reported |
+| **Deployment chaos** | `faucet serve` from the Helm chart on a 3-node kind cluster: pod and node kills, a full outage, a history-database outage, rolling restarts, a burst, a poison run, single-pod upgrades. See [chaos testing](./chaos-testing.md) | Yes (kind) | Nightly and on demand |
 
 The first two tiers are deliberately Docker-free and run in seconds. They are
 the required gate because a regression in them corrupts data *silently* — the

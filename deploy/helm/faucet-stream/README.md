@@ -304,6 +304,13 @@ volume an `extraInitContainers` fetcher fills.
 - `POST|PUT /v1/triggers/{name}` (webhook triggers) is bearer-authenticated
   like every `/v1` route, so the calling system sends a token.
 
+### Chaos testing
+
+`scripts/chaos/run.sh` installs this chart on a throwaway kind cluster, clustered
+and single-pod, and kills pods and nodes, cuts off the history database, rolls
+upgrades and floods it with runs, then reports what held. See
+[chaos testing](https://faucet-hq.github.io/faucet-stream/operations/chaos-testing.html).
+
 ### Render-time checks
 
 The render fails on: a feature block enabled with zero or several file sources;
