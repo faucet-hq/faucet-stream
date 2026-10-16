@@ -162,7 +162,9 @@ mod tests {
     async fn readyz_is_not_ready_while_the_history_is_unreachable() {
         let st = state(true);
         st.cluster().set_history_reachable(false);
-        let resp = readyz(axum::extract::State(st.clone())).await.into_response();
+        let resp = readyz(axum::extract::State(st.clone()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await

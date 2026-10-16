@@ -340,7 +340,10 @@ async fn concurrent_connects_on_a_fresh_database_all_succeed() {
     let Some((_pg, url)) = postgres().await else {
         return;
     };
-    let db = format!("faucet_race_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let db = format!(
+        "faucet_race_{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
     let admin = sqlx::PgPool::connect(&url).await.expect("admin connection");
     sqlx::query(&format!("CREATE DATABASE {db}"))
         .execute(&admin)
