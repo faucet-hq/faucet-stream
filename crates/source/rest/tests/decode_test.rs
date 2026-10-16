@@ -3,6 +3,7 @@
 
 use faucet_source_rest::{
     DecodeStep, PaginationStyle, ParseFormat, ParseSpec, RestStream, RestStreamConfig, SimpleStep,
+    UnzipSpec,
 };
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -58,6 +59,49 @@ async fn decodes_base64_gzip_csv_from_a_json_envelope() {
     let records = stream.fetch_all().await.unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0]["id"], "1");
+    assert_eq!(records[1]["name"], "bob");
+}
+
+/// A zip export downloaded over HTTP: the member is picked by glob and parsed.
+#[tokio::test]
+async fn unzips_the_matching_member_of_a_downloaded_archive() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let mut cur = std::io::Cursor::new(Vec::new());
+    {
+        let mut zw = zip::ZipWriter::new(&mut cur);
+        let opts = SimpleFileOptions::default();
+        zw.start_file("README.txt", opts).unwrap();
+        zw.write_all(b"not data").unwrap();
+        zw.start_file("export/users.csv", opts).unwrap();
+        zw.write_all(b"id,name\n1,alice\n2,bob\n").unwrap();
+        zw.finish().unwrap();
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/export.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(cur.into_inner()))
+        .mount(&server)
+        .await;
+
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/export.zip").decode(vec![
+            DecodeStep::Unzip {
+                unzip: UnzipSpec {
+                    member: Some("*.csv".into()),
+                },
+            },
+            DecodeStep::Parse {
+                parse: parse(ParseFormat::Csv),
+            },
+        ]),
+    )
+    .unwrap();
+
+    let records = stream.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 2);
     assert_eq!(records[1]["name"], "bob");
 }
 
