@@ -413,3 +413,29 @@ fn post_run_verify_is_refused_on_overwrite_and_shared_destinations() {
     let cfg = PipelineConfig::from_text(&off, Path::new("t.yaml")).unwrap();
     assert_eq!(expand(&cfg).unwrap().len(), 2);
 }
+
+/// #907: a run asked to stop before its first page ends Ok with partial
+/// output, not as a failure (and is not logged as a completed invocation).
+#[tokio::test]
+async fn a_cancelled_run_ends_ok_with_partial_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write(dir.path(), "in.csv", "id\n1\n2\n3\n");
+    let out = dir.path().join("out.jsonl");
+    let yaml = format!(
+        "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: '{input}' }} }}\n  sink: {{ type: jsonl, config: {{ path: '{}' }} }}\n",
+        out.to_str().unwrap().replace('\\', "/")
+    );
+    let cfg = PipelineConfig::from_text(&yaml, Path::new("t.yaml")).unwrap();
+    let nodes = expand(&cfg).unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    let mut o = opts("cancelled");
+    o.cancel = Some(token);
+    let summary: RunSummary = run_expanded(nodes, o).await.unwrap();
+    assert_eq!(summary.invocations.len(), 1);
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert!(
+        lines(&out).len() < 3,
+        "the run stopped before reading everything"
+    );
+}
