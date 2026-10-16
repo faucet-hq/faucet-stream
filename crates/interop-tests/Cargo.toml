@@ -83,8 +83,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
-azure_storage = "0.21"
-azure_storage_blobs = "0.21"
+faucet-common-azure = { workspace = true, features = ["testing"] }
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true

@@ -9,7 +9,7 @@
 //! what exercises the object-listing / download / decode / batching lines in
 //! `src/stream.rs`.
 //!
-//! Container creation goes through the Azure SDK (`object_store` cannot create a
+//! Container creation goes through `faucet_common_azure::testing` (`object_store` cannot create a
 //! container); every other blob operation goes through `object_store` so the
 //! seed path mirrors the connector's own client.
 
@@ -72,22 +72,16 @@ fn endpoint(port: u16) -> String {
     format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}")
 }
 
-/// Create the destination blob container via the Azure SDK (`object_store` has
-/// no container-management API). Uses the emulator credentials, so it targets
+/// Create the destination blob container (`object_store` has no
+/// container-management API). Uses the emulator credentials, so it targets
 /// the same `devstoreaccount1` container the connector reads.
 async fn create_container(port: u16) {
-    use azure_storage::{CloudLocation, prelude::*};
-    use azure_storage_blobs::prelude::*;
-
-    ClientBuilder::with_location(
-        CloudLocation::Emulator {
-            address: "127.0.0.1".to_owned(),
-            port,
-        },
-        StorageCredentials::emulator(),
+    faucet_common_azure::testing::create_container(
+        &format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"),
+        AZURITE_ACCOUNT,
+        AZURITE_KEY,
+        CONTAINER,
     )
-    .container_client(CONTAINER)
-    .create()
     .await
     .expect("create azurite blob container");
 }

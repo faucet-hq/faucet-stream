@@ -10,6 +10,9 @@
 //! `MicrosoftAzureBuilder`, so a single code path serves both.
 
 mod backend;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub mod testing;
 
 pub use backend::{AzureBackend, AzureBackendBuilder, PART_BYTES};
 

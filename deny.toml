@@ -22,36 +22,23 @@ ignore = [
     # encryption (not a private-key operation). An attacker needs precise
     # timing of many signatures on the signing host.
     { id = "RUSTSEC-2023-0071", reason = "no fix; upstream signers only (reqsign, russh) (2026-10-16)" },
-    # 2026-10-07 — rustls 0.21 / rustls-webpki 0.101 are compiled into the AWS
-    # SDK's legacy hyper-0.14 connector; the SDK runs on its hyper-1 / rustls
-    # 0.23 client, so this stack is never used for a connection.
-    { id = "RUSTSEC-2026-0098", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
-    { id = "RUSTSEC-2026-0099", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
-    { id = "RUSTSEC-2026-0104", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
-    # 2026-10-15 — the same legacy connector's rustls 0.21; rustls 0.23 is on 0.23.46 (fixed).
-    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 only in the unused AWS legacy connector; 0.23 is fixed (2026-10-15)" },
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 only in the unused AWS legacy connector; 0.23 is fixed (2026-10-15)" },
-    # 2026-10-07 — h2 0.3 has no fixed release; same legacy AWS connector as
-    # above (the live client uses h2 0.4.20).
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 only in the unused AWS legacy connector; 0.4 is fixed (2026-10-07)" },
-    # 2026-10-07 — azure_core 0.21 / http-types / quick-xml 0.31 come only from
-    # azure_storage_blobs, a dev-dependency of the azure-blob sink tests.
-    { id = "RUSTSEC-2026-0275", reason = "dev-dependency only (azure-blob tests) (2026-10-07)" },
-    { id = "RUSTSEC-2026-0174", reason = "dev-dependency only (azure-blob tests) (2026-10-07)" },
-    # 2026-10-07 — tokio-postgres / postgres-protocol are dev-dependencies of
-    # the postgres-cdc tests and the CLI tests only.
-    { id = "RUSTSEC-2026-0178", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
-    { id = "RUSTSEC-2026-0179", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
-    { id = "RUSTSEC-2026-0180", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
+    # 2026-10-16 — rustls 0.21 / rustls-webpki 0.101 come only from tiberius
+    # 0.12 (the MSSQL connectors' TLS). The AWS SDK's legacy connector that also
+    # carried them is no longer compiled. No 0.101.x fix exists; clearing these
+    # needs tiberius 0.13, a public-dependency change of faucet-common-mssql.
+    { id = "RUSTSEC-2026-0098", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
+    { id = "RUSTSEC-2026-0099", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
+    { id = "RUSTSEC-2026-0104", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
+    { id = "RUSTSEC-2026-0346", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
+    { id = "RUSTSEC-2026-0349", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
     # 2026-10-07 — quick-xml: faucet's own parsers and calamine are on >= 0.41
     # (RUSTSEC-2026-0194/0195 fixed). Two older copies remain transitively and
     # cannot move until their parents do: 0.39 from object_store 0.13 (pinned by
     # parquet 58) and opendal 0.57 (pinned by iceberg 0.10), which parse only
-    # the configured storage endpoint's list responses and never use NsReader;
-    # 0.31 from azure_core 0.21, a dev-dependency of the azure-blob sink tests.
+    # the configured storage endpoint's list responses and never use NsReader.
     # cargo-deny cannot scope an advisory ignore to one version, so
     # scripts/advisory-scope.py (CI) fails on any other affected quick-xml copy;
-    # drop these two ids once object_store/opendal/azure_core move past 0.41.
+    # drop these two ids once object_store/opendal move past 0.41.
     { id = "RUSTSEC-2026-0194", reason = "only transitive quick-xml 0.39 (object_store/opendal) and 0.31 (azure dev-dep) remain (2026-10-07)" },
     { id = "RUSTSEC-2026-0195", reason = "only transitive quick-xml 0.39 / 0.31 remain; NsReader unused (2026-10-07)" },
 ]

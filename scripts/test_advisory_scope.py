@@ -22,7 +22,12 @@ def lock(*versions):
 
 class Violations(unittest.TestCase):
     def test_triaged_and_fixed_versions_pass(self):
-        self.assertEqual(asc.violations(lock("0.31.0", "0.39.4", "0.41.0", "0.42.0"), DENY), [])
+        self.assertEqual(asc.violations(lock("0.39.4", "0.41.0", "0.42.0"), DENY), [])
+
+    def test_a_copy_no_longer_triaged_fails(self):
+        found = asc.violations(lock("0.31.0", "0.39.4"), DENY)
+        self.assertEqual(len(found), 1)
+        self.assertIn("quick-xml 0.31.0", found[0])
 
     def test_an_untriaged_affected_copy_fails(self):
         found = asc.violations(lock("0.39.4", "0.38.1"), DENY)

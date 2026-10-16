@@ -58,21 +58,15 @@ fn endpoint(port: u16) -> String {
     format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}")
 }
 
-/// Create the destination blob container via the Azure SDK (`object_store` has
-/// no container-management API).
+/// Create the destination blob container (`object_store` has no
+/// container-management API).
 async fn create_container(port: u16) {
-    use azure_storage::{CloudLocation, prelude::*};
-    use azure_storage_blobs::prelude::*;
-
-    ClientBuilder::with_location(
-        CloudLocation::Emulator {
-            address: "127.0.0.1".to_owned(),
-            port,
-        },
-        StorageCredentials::emulator(),
+    faucet_common_azure::testing::create_container(
+        &format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"),
+        AZURITE_ACCOUNT,
+        AZURITE_KEY,
+        CONTAINER,
     )
-    .container_client(CONTAINER)
-    .create()
     .await
     .expect("create azurite blob container");
 }

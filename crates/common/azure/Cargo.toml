@@ -21,6 +21,15 @@ async-trait.workspace = true
 futures.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[features]
+# Test helpers for the Azurite emulator (container creation); dev-dependency use only.
+testing = ["dep:base64", "dep:chrono", "dep:hmac", "dep:sha2", "dep:url"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

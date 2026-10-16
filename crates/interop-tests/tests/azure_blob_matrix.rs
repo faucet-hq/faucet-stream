@@ -109,17 +109,12 @@ async fn every_writable_format_takes_every_option_on_azure_blob() {
     .await;
     let port = container.get_host_port_ipv4(BLOB_PORT).await.expect("port");
     {
-        use azure_storage::{CloudLocation, prelude::*};
-        use azure_storage_blobs::prelude::*;
-        ClientBuilder::with_location(
-            CloudLocation::Emulator {
-                address: "127.0.0.1".to_owned(),
-                port,
-            },
-            StorageCredentials::emulator(),
+        faucet_common_azure::testing::create_container(
+            &format!("http://127.0.0.1:{port}/{ACCOUNT}"),
+            ACCOUNT,
+            KEY,
+            CONTAINER,
         )
-        .container_client(CONTAINER)
-        .create()
         .await
         .expect("create container");
     }

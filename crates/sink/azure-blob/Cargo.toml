@@ -54,8 +54,7 @@ testcontainers-modules = { version = "0.15", features = ["azurite"] }
 object_store = { workspace = true, features = ["azure"] }
 # `object_store` cannot create a blob container; the Azure SDK does (this is the
 # proven Azurite path used by `testcontainers-modules`' own tests).
-azure_storage = "0.21"
-azure_storage_blobs = "0.21"
+faucet-common-azure = { workspace = true, features = ["testing"] }
 
 [package.metadata.docs.rs]
 all-features = true

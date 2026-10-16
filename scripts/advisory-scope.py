@@ -14,7 +14,7 @@ import tomllib
 
 # advisory ids -> (package, versions triaged, first fixed version)
 SCOPED = {
-    ("RUSTSEC-2026-0194", "RUSTSEC-2026-0195"): ("quick-xml", {"0.31.0", "0.39.4"}, (0, 41, 0)),
+    ("RUSTSEC-2026-0194", "RUSTSEC-2026-0195"): ("quick-xml", {"0.39.4"}, (0, 41, 0)),
 }
 
 
