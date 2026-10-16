@@ -219,10 +219,13 @@ serve:
   auth: { mode: token }
   extraArgs: [--allow-env=PGPASSWORD, "--lease-ttl-secs=${LEASE_TTL}"]
   podDisruptionBudget: { enabled: true }
+  # Soft: a hard spread rule leaves a rolling update's surge pod with no
+  # allowed node, and it stays Pending.
   topologySpreadConstraints:
     - maxSkew: 1
       topologyKey: kubernetes.io/hostname
-      whenUnsatisfiable: DoNotSchedule
+      whenUnsatisfiable: ScheduleAnyway
+      nodeTaintsPolicy: Honor
       labelSelector: { matchLabels: { app.kubernetes.io/component: serve } }
   triggers:
     enabled: true
@@ -387,6 +390,11 @@ s_node_stop() {
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
   node="$(k get pod "$owner" -o jsonpath='{.spec.nodeName}')"
+  for p in $(pods); do
+    [ "$p" = "$owner" ] && continue
+    [ "$(k get pod "$p" -o jsonpath='{.spec.nodeName}')" != "$node" ] && break
+    fail "every replica is on ${node}; stopping it leaves no survivor"; return 1
+  done
   sleep 8
   docker stop "$node" >/dev/null; t0=$(date +%s)
   local survivor; survivor="$(pods | grep -v "$owner" | head -1)"; port="$(port_for "$survivor")"
