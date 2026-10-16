@@ -19,7 +19,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
 base64.workspace = true
 
 [dev-dependencies]

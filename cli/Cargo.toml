@@ -509,8 +509,8 @@ schedule = ["dep:croner"]
 # `serve` itself rather than relying on another feature (e.g. `notify`) pulling
 # it in; the feature-isolation CI matrix builds `serve` alone.
 serve = ["observability", "tokio/net", "tokio/time", "tokio/io-util", "dep:axum", "dep:tower-http", "dep:subtle", "dep:dashmap", "dep:sha2", "dep:async-stream", "dep:reqwest"]
-serve-history-postgres = ["serve", "dep:sqlx"]
-serve-history-sqlite = ["serve", "dep:sqlx"]
+serve-history-postgres = ["serve", "dep:sqlx", "sqlx/postgres"]
+serve-history-sqlite = ["serve", "dep:sqlx", "sqlx/sqlite"]
 # Embedded web console (single-page UI) served by `faucet serve` at `/`.
 # Vanilla assets embedded via rust-embed; no JS build step. Implies `serve`.
 serve-ui = ["serve", "dep:rust-embed"]
@@ -753,7 +753,7 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "mysql", "mongo"] }
 # faucet backfill end-to-end tests (#282): seed/inspect the SQLite source and
 # destination DBs directly (offline — no Docker).
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "mysql"] }
 tokio-postgres = "0.7"
 # Mock OTLP/gRPC log collector for the log-shipping tests (#806).
 tonic-otlp = { workspace = true, features = ["server", "router"] }
