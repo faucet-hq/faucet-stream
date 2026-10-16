@@ -65,6 +65,14 @@ function wireChrome() {
     tzSel.value = getTz();
     tzSel.onchange = () => { setTz(tzSel.value); refresh(); };
   }
+  // Sticky table headers sit just under the top bar, which wraps onto a second
+  // row in a narrow window, so they follow its real height.
+  const topbar = document.querySelector(".topbar");
+  if (topbar && "ResizeObserver" in window) {
+    new ResizeObserver(() => {
+      document.documentElement.style.setProperty("--topbar-h", `${topbar.offsetHeight}px`);
+    }).observe(topbar);
+  }
   document.getElementById("token-btn").onclick = openTokenModal;
   document.getElementById("token-save").onclick = () => {
     const v = document.getElementById("token-input").value.trim();

@@ -12,10 +12,16 @@ export const whoami = () => me;
 
 /** Whether the caller holds `perm`. Unknown identity allows everything: the
  *  server still refuses what the caller may not do. */
-export const can = (perm) => !me || me.permissions.includes(perm);
+export const can = (perm) => {
+  if (!me) return true;
+  // A tenant-scoped principal runs registered templates only: the server
+  // refuses a config of its own (403), so config submit controls are hidden.
+  if (perm === "config_submit") return me.permissions.includes("run_write") && !me.tenant;
+  return me.permissions.includes(perm);
+};
 
 const ALL = [
-  "run_write", "doctor", "dlq_manage", "template_admin", "local_output_manage", "audit_read", "reload",
+  "run_write", "config_submit", "doctor", "dlq_manage", "template_admin", "local_output_manage", "audit_read", "reload",
   "change_request", "change_approve", "status_read", "state_admin",
   "tenant_admin", "connection_manage",
 ];

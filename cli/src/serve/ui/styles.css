@@ -172,9 +172,10 @@ button { font-family: inherit; }
   top: 0;
   z-index: 20;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 18px;
-  height: 56px;
+  gap: 6px 18px;
+  min-height: 56px;
   padding: 0 20px;
   /* Opaque so content scrolling underneath never bleeds through the bar (which
      otherwise reads as a stray row floating above a sticky table header). */
@@ -201,6 +202,7 @@ button { font-family: inherit; }
 .brand-name { color: var(--brand); font-weight: 400; }
 .brand-name b { color: var(--ink); }
 
+.brand, .topbar > select, .topbar > .icon-btn, .whoami, .nav button { flex-shrink: 0; }
 .nav { display: flex; gap: 2px; }
 .nav button {
   appearance: none;
@@ -216,7 +218,25 @@ button { font-family: inherit; }
 }
 .nav button:hover { color: var(--ink); background: var(--surface-2); }
 
-.spacer { flex: 1; }
+.spacer { flex: 1; min-width: 0; }
+/* Narrower windows compact the bar; when even that does not fit, it wraps onto
+   a second row rather than pushing the identity and token controls off-screen
+   or hiding tabs. */
+@media (max-width: 1500px) {
+  .topbar { column-gap: 12px; }
+  .nav button { padding: 7px 9px; }
+  .topbar .tz-select { max-width: 180px; }
+}
+@media (max-width: 1400px) {
+  .topbar .brand-name { display: none; }
+  .topbar .tz-select { max-width: 170px; }
+  .whoami-name { max-width: 10ch; }
+}
+@media (max-width: 1340px) {
+  .topbar { padding-top: 8px; padding-bottom: 8px; }
+  .nav { order: 1; flex-basis: 100%; overflow-x: auto; }
+}
+.run-tenant { display: inline-block; margin-left: 8px; padding: 0 7px; border: 1px solid var(--border); border-radius: 999px; font-size: 0.72rem; font-weight: 550; color: var(--ink-dim); background: var(--surface-2); vertical-align: 1px; white-space: nowrap; }
 
 .icon-btn {
   appearance: none;
@@ -485,7 +505,7 @@ select {
 .ds-table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
 /* Sticky header so the column labels stay visible while scrolling the list. */
 .ds-table thead th {
-  position: sticky; top: 56px; z-index: 15; background: var(--surface);
+  position: sticky; top: var(--topbar-h, 56px); z-index: 15; background: var(--surface);
   text-align: left; font-size: 0.68rem; letter-spacing: 0.07em; text-transform: uppercase;
   color: var(--ink-faint); font-weight: 600; padding: 10px 18px; border-bottom: 1px solid var(--border);
 }
@@ -966,7 +986,7 @@ select {
    responsive
    ========================================================================== */
 @media (max-width: 760px) {
-  .topbar { gap: 10px; padding: 0 12px; }
+  .topbar { column-gap: 10px; padding-left: 12px; padding-right: 12px; }
   .brand-name { display: none; }
   .page { padding: 18px 14px 48px; }
   .run-row { grid-template-columns: auto 1fr; row-gap: 4px; }
@@ -1215,7 +1235,7 @@ select {
   align-items: center;
   gap: 14px;
   position: sticky;
-  top: 56px;
+  top: var(--topbar-h, 56px);
   z-index: 15;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -1794,7 +1814,7 @@ select {
 .usage-summary .usage-stat b { color: var(--ink); font-variant-numeric: tabular-nums; }
 .usage-table { width: 100%; border-collapse: separate; border-spacing: 0; }
 .usage-table thead th {
-  position: sticky; top: 56px; z-index: 15; background: var(--surface);
+  position: sticky; top: var(--topbar-h, 56px); z-index: 15; background: var(--surface);
   text-align: right; font-size: 0.68rem; letter-spacing: 0.07em; text-transform: uppercase;
   color: var(--ink-faint); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--border);
   white-space: nowrap;
@@ -1815,7 +1835,7 @@ select {
 /* ── Changes (#703) ───────────────────────────────────────────────────────── */
 .chg-table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 12px; }
 .chg-table thead th {
-  position: sticky; top: 56px; z-index: 15; background: var(--surface);
+  position: sticky; top: var(--topbar-h, 56px); z-index: 15; background: var(--surface);
   text-align: left; font-size: 0.68rem; letter-spacing: 0.07em; text-transform: uppercase;
   color: var(--ink-faint); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--border);
 }

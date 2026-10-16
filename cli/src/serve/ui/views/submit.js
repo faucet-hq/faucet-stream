@@ -50,7 +50,7 @@ pipeline:
       </fieldset>
       <div class="submit-actions">
         <button id="btn-check" class="btn-ghost" data-perm="doctor">Check (doctor)</button>
-        <button id="btn-run" class="btn-primary" data-perm="run_write">Run</button>
+        <button id="btn-run" class="btn-primary" data-perm="config_submit">Run</button>
       </div>
       <pre id="submit-out" class="submit-out" hidden></pre>
     </div>`;

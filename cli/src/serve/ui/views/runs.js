@@ -3,7 +3,7 @@ import { navigate } from "../router.js";
 import { escapeHtml, fmtInt, fmtDuration, fmtCompact } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
-import { withTenant } from "../tenant.js";
+import { currentTenant, tenantList, withTenant } from "../tenant.js";
 
 // Every RunStatus the API accepts — pending/sharded appear in cluster mode.
 const STATUSES = ["queued", "pending", "running", "sharded", "completed", "failed", "cancelled"];
@@ -18,7 +18,7 @@ export async function renderRuns(container) {
     <div class="page">
       <div class="page-head">
         <h1>Runs</h1>
-        <button class="btn-primary" id="r-submit" data-perm="run_write">+ Submit run</button>
+        <button class="btn-primary" id="r-submit" data-perm="config_submit">+ Submit run</button>
       </div>
       <div class="filters">
         <details class="dd" id="f-status-dd">
@@ -119,6 +119,14 @@ export async function renderRuns(container) {
   }; // teardown
 }
 
+// Which tenant a run belongs to, shown while the list is not scoped to one.
+function tenantTag(r) {
+  if (!r.tenant || currentTenant()) return "";
+  const t = (tenantList() || []).find((x) => x.id === r.tenant);
+  const label = t?.name || r.tenant;
+  return ` <span class="run-tenant" title="tenant ${escapeHtml(r.tenant)}">${escapeHtml(label)}</span>`;
+}
+
 function row(r) {
   const el = document.createElement("tr");
   el.className = "ds-tr";
@@ -129,7 +137,7 @@ function row(r) {
   const recs = r.records_written ?? 0;
   el.innerHTML = `
     <td><span class="pill pill-${r.status}">${r.status}</span></td>
-    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}</div></td>
+    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}${tenantTag(r)}</div></td>
     <td class="ds-meta ds-num" title="${elapsedExact}">${elapsed}</td>
     <td class="ds-meta ds-num" title="${fmtInt(recs)}">${fmtCompact(recs)}</td>
     <td class="ds-meta ds-time">${fmtTime(r.submitted_at)}</td>`;

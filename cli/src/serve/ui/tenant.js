@@ -29,6 +29,8 @@ export function setTenant(id) {
   } catch {
     /* storage unavailable: the choice lasts for this page only */
   }
+  const sel = document.getElementById("tenant-select");
+  if (sel && !sel.disabled) sel.value = id || "";
 }
 
 /** Add the current tenant to a query. */
