@@ -332,3 +332,46 @@ async fn postgres_template_test_results_and_launch_notes() {
             .is_empty()
     );
 }
+
+/// #914: instances that start together all migrate a fresh database; none
+/// loses the `CREATE TABLE IF NOT EXISTS` race and starts degraded.
+#[tokio::test]
+async fn concurrent_connects_on_a_fresh_database_all_succeed() {
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let db = format!("faucet_race_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let admin = sqlx::PgPool::connect(&url).await.expect("admin connection");
+    sqlx::query(&format!("CREATE DATABASE {db}"))
+        .execute(&admin)
+        .await
+        .expect("create the scratch database");
+    let fresh = match url.rsplit_once('/') {
+        Some((base, _)) => format!("{base}/{db}"),
+        None => panic!("no database in {url}"),
+    };
+    let connects = (0..8).map(|i| {
+        let fresh = fresh.clone();
+        tokio::spawn(async move {
+            PostgresHistory::connect(
+                &fresh,
+                Duration::from_secs(3600),
+                Duration::from_secs(30),
+                format!("race-{i}"),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+    });
+    let results = futures::future::join_all(connects).await;
+    let failures: Vec<String> = results
+        .into_iter()
+        .map(|r| r.expect("connect task"))
+        .filter_map(Result::err)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "every instance migrates the fresh database: {failures:?}"
+    );
+}

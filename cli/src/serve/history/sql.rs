@@ -140,9 +140,9 @@ pub fn readable_by_this_binary(min_readable: Option<u32>) -> bool {
 
 /// Bring a database up to [`SCHEMA_VERSION`]: create every table, add the
 /// columns later versions introduced, backfill the tenant columns from each
-/// row's body, create their indexes and stamp the version. Idempotent and
-/// safe to run from several instances at once (a lost `ALTER TABLE` race is
-/// re-probed).
+/// row's body, create their indexes and stamp the version. Idempotent; a lost
+/// `ALTER TABLE` race is re-probed, and on Postgres the caller serializes the
+/// whole migration across instances (`postgres::migrate_serialized`, #914).
 macro_rules! migrate {
     ($pool:expr) => {{
         use sqlx::Row as _;

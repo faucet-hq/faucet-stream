@@ -23,7 +23,7 @@ impl PostgresHistory {
             .connect(url)
             .await
             .map_err(|e| classify_backend_error_with_context("Postgres connection failed", e))?;
-        super::sql::migrate!(&pool)?;
+        migrate_serialized(&pool).await?;
         Ok(Self::from_parts(
             pool,
             idem_retention,
@@ -32,4 +32,33 @@ impl PostgresHistory {
             Stmts::new(Dialect::Postgres),
         ))
     }
+}
+
+/// Advisory-lock key the migration holds ("faucet" in ASCII).
+const MIGRATION_LOCK: i64 = 0x0066_6175_6365_74;
+
+/// Run the migration under a session advisory lock, so instances starting
+/// together take turns: Postgres does not make concurrent `CREATE TABLE IF NOT
+/// EXISTS` of one table safe, and the loser would start degraded (#914).
+async fn migrate_serialized(pool: &sqlx::PgPool) -> Result<(), HistoryError> {
+    let mut lock = pool.acquire().await.map_err(|e| {
+        classify_backend_error_with_context("taking the run-history migration lock", e)
+    })?;
+    sqlx::query("SET lock_timeout = '120s'")
+        .execute(&mut *lock)
+        .await
+        .and(
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(MIGRATION_LOCK)
+                .execute(&mut *lock)
+                .await,
+        )
+        .map_err(|e| {
+            classify_backend_error_with_context("taking the run-history migration lock", e)
+        })?;
+    let migrated = super::sql::migrate!(pool);
+    // Ending the session releases its advisory lock, and the connection never
+    // goes back to the pool still holding it.
+    let _ = sqlx::Connection::close(lock.detach()).await;
+    migrated
 }
