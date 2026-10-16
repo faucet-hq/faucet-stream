@@ -954,6 +954,19 @@ jobs:
           # so this gate fails only on real breaks.
           # Use the 1.96.0 toolchain installed above, not the action's default.
           rust-toolchain: manual
+      # #918: crates whose optional Excel support needs a yanked zip cannot
+      # resolve with every feature on; check them with default features.
+      - name: Crates checked with default features (#918)
+        id: semver-default
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        run: echo "list=$(python3 scripts/semver-exclude.py --default-features)" >> "$GITHUB_OUTPUT"
+      - name: Check their public API with default features (#918)
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          package: ${{ steps.semver-default.outputs.list }}
+          feature-group: default-features
+          rust-toolchain: manual
 
   coverage:
     name: Coverage

@@ -339,8 +339,11 @@ fn unzip_member(bytes: &[u8], member: Option<&str>) -> Result<Vec<u8>, FaucetErr
         let f = archive
             .by_index(i)
             .map_err(|e| FaucetError::Source(format!("decode `unzip`: {e}")))?;
-        if f.is_file() && member.is_none_or(|pat| glob_match(pat, f.name())) {
-            matched.push((i, f.name().to_string()));
+        let name = f
+            .name()
+            .map_err(|e| FaucetError::Source(format!("decode `unzip`: {e}")))?;
+        if f.is_file() && member.is_none_or(|pat| glob_match(pat, &name)) {
+            matched.push((i, name.into_owned()));
         }
     }
     let selector = member
