@@ -96,7 +96,7 @@ jobs:
 
       - name: Run release-plz
         id: release-plz
-        uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
+        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.5.141
         with:
           command: release-pr
           config: release-plz.toml
@@ -204,7 +204,7 @@ jobs:
       - name: Publish to crates.io (first attempt)
         id: publish1
         continue-on-error: true
-        uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
+        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.5.141
         with:
           command: release
           config: release-plz.toml
