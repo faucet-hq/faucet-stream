@@ -41,9 +41,9 @@ const MIGRATION_LOCK: i64 = 0x6661_7563_6574;
 /// together take turns: Postgres does not make concurrent `CREATE TABLE IF NOT
 /// EXISTS` of one table safe, and the loser would start degraded (#914).
 async fn migrate_serialized(pool: &sqlx::PgPool) -> Result<(), HistoryError> {
-    let mut lock = pool.acquire().await.map_err(|e| {
-        classify_backend_error_with_context("taking the run-history migration lock", e)
-    })?;
+    let lock_error =
+        |e| classify_backend_error_with_context("taking the run-history migration lock", e);
+    let mut lock = pool.acquire().await.map_err(lock_error)?;
     sqlx::query("SET lock_timeout = '120s'")
         .execute(&mut *lock)
         .await
@@ -53,9 +53,7 @@ async fn migrate_serialized(pool: &sqlx::PgPool) -> Result<(), HistoryError> {
                 .execute(&mut *lock)
                 .await,
         )
-        .map_err(|e| {
-            classify_backend_error_with_context("taking the run-history migration lock", e)
-        })?;
+        .map_err(lock_error)?;
     let migrated = super::sql::migrate!(pool);
     // Ending the session releases its advisory lock, and the connection never
     // goes back to the pool still holding it.

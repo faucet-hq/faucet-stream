@@ -1113,6 +1113,7 @@ async fn run_expanded_unredacted(
                 }
             };
 
+            let elapsed_ms = outcome.metrics.as_ref().map_or(0, |m| m.duration_ms);
             if let Some(err) = &outcome.error {
                 tracing::error!(row = %outcome.row_id, error = %err, "pipeline invocation failed");
                 had_level_failure = true;
@@ -1142,14 +1143,14 @@ async fn run_expanded_unredacted(
                 tracing::warn!(
                     row = %outcome.row_id,
                     records_written = outcome.records_written,
-                    elapsed_ms = outcome.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
+                    elapsed_ms,
                     "pipeline invocation finished after a cancel request; its output may be partial"
                 );
             } else {
                 tracing::info!(
                     row = %outcome.row_id,
                     records_written = outcome.records_written,
-                    elapsed_ms = outcome.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
+                    elapsed_ms,
                     "pipeline invocation completed"
                 );
             }
@@ -7494,6 +7495,7 @@ matrix:
         );
         #[cfg(feature = "observability")]
         {
+            std::io::Write::flush(&mut LogBuf(logs.clone())).unwrap();
             let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
             assert!(
                 logs.contains("finished after a cancel request; its output may be partial"),
