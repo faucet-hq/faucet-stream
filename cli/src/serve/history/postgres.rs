@@ -60,3 +60,18 @@ async fn migrate_serialized(pool: &sqlx::PgPool) -> Result<(), HistoryError> {
     let _ = sqlx::Connection::close(lock.detach()).await;
     migrated
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unreachable_database_fails_the_migration_lock() {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://u:p@127.0.0.1:1/x")
+            .unwrap();
+        let err = migrate_serialized(&pool).await.unwrap_err();
+        assert!(err.to_string().contains("migration lock"), "{err}");
+    }
+}

@@ -630,6 +630,32 @@ async fn a_schedule_trigger_runs_one_catch_up_for_ticks_missed_while_down() {
     );
 }
 
+/// A schedule that fails to compile at spawn time marks its watcher
+/// unhealthy instead of running it.
+#[cfg(feature = "schedule")]
+#[tokio::test]
+async fn a_schedule_that_does_not_compile_at_spawn_is_reported_unhealthy() {
+    use faucet_cli::serve::triggers::spec::TriggerKind;
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(
+        "version: 1\ntriggers:\n  - name: hourly\n    type: schedule\n    cron: \"0 * * * *\"\n    config: { version: 1 }\n",
+    )
+    .unwrap();
+    let mut compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    if let TriggerKind::Schedule { cron, .. } = &mut compiled.triggers[0].spec.kind {
+        *cron = "not a cron".into();
+    }
+    let handles = faucet_cli::serve::triggers::spawn_watchers(
+        state.clone(),
+        &compiled,
+        CancellationToken::new(),
+    );
+    assert!(handles.is_empty());
+    let row = state.triggers().snapshot().remove(0);
+    assert!(!row.healthy, "{row:?}");
+    assert!(row.last_error.unwrap_or_default().starts_with("schedule:"));
+}
+
 /// SERVE-11: a queue_depth edge ordinal is durable and shared. After a
 /// restart the next crossing gets a new key (it is not swallowed by the old
 /// claim), and two instances watching the same queue fire a crossing once.

@@ -107,42 +107,33 @@ impl ScheduleWatcher {
     }
 
     fn latest_before(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let mut step = chrono::Duration::minutes(1);
-        while step < chrono::Duration::days(3660) {
-            if let Some(t) = self.schedule.next_after(now - step).filter(|t| *t <= now) {
-                let mut cursor = t;
+        // Look back in doubling windows for any occurrence, then walk to the last.
+        std::iter::successors(Some(chrono::Duration::minutes(1)), |s| Some(*s * 2))
+            .take_while(|s| *s < chrono::Duration::days(3660))
+            .find_map(|step| self.schedule.next_after(now - step).filter(|t| *t <= now))
+            .map(|mut cursor| {
                 while let Some(n) = self.schedule.next_after(cursor).filter(|n| *n <= now) {
                     cursor = n;
                 }
-                return Some(cursor);
-            }
-            step = step * 2;
-        }
-        None
+                cursor
+            })
     }
 
     /// Apply `missed` ticks in `(after, now]` ending at `latest`: run the latest
     /// once (catch-up) or skip to the next future tick.
     fn settle_missed(&mut self, latest: DateTime<Utc>, missed: u64, now: DateTime<Utc>, why: &str) {
         let more = if missed >= MAX_SCAN { "at least " } else { "" };
-        if self.resume.catch_up {
-            tracing::warn!(
-                trigger = self.compiled.name(),
-                missed,
-                catch_up = %latest,
-                "schedule missed {more}{missed} tick(s) {why}; running the latest once"
-            );
-            metrics::missed_ticks(self.compiled.name(), missed - 1);
+        let name = self.compiled.name().to_string();
+        let skipped = if self.resume.catch_up {
             self.next = Some(latest);
+            format!("running the latest ({latest}) once")
         } else {
-            tracing::warn!(
-                trigger = self.compiled.name(),
-                missed,
-                "schedule missed {more}{missed} tick(s) {why}; catch_up is off, skipping them"
-            );
-            metrics::missed_ticks(self.compiled.name(), missed);
             self.next = self.schedule.next_after(now);
-        }
+            "catch_up is off, skipping them".to_string()
+        };
+        let never_ran = missed - u64::from(self.resume.catch_up);
+        metrics::missed_ticks(&name, never_ran);
+        tracing::warn!(trigger = %name, missed, "schedule missed {more}{missed} tick(s) {why}; {skipped}");
     }
 
     /// Advance past a fired tick.
@@ -190,9 +181,7 @@ impl ScheduleWatcher {
             timezone: self.resume.timezone.clone(),
             tick,
         };
-        let Ok(encoded) = serde_json::to_string(&value) else {
-            return;
-        };
+        let encoded = serde_json::json!(value).to_string();
         for _ in 0..RECORD_ATTEMPTS {
             let current = match history.meta_get(&key).await {
                 Ok(c) => c,
@@ -429,9 +418,12 @@ mod tests {
         assert!(raw.contains("2026-09-26T13:00:00Z"), "{raw}");
     }
 
-    /// Only the required methods; `meta_get` fails when `broken`.
+    /// Only the required methods; `meta_get` fails when `broken`, and a
+    /// compare-and-set never wins when `contended`.
+    #[derive(Default)]
     struct Stub {
         broken: bool,
+        contended: bool,
     }
 
     #[async_trait]
@@ -476,19 +468,73 @@ mod tests {
                 Ok(None)
             }
         }
+        async fn meta_compare_and_set(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<bool, HistoryError> {
+            if self.contended {
+                Ok(false)
+            } else {
+                Err(HistoryError::Backend("no settings".into()))
+            }
+        }
     }
 
     #[tokio::test]
     async fn history_failures_are_reported_not_fatal() {
         let now = at("2026-09-26T13:30:00Z");
         let mut w = watcher("0 * * * *", now);
-        let err = w
-            .resume_from(&Stub { broken: true }, now)
-            .await
-            .unwrap_err();
+        let broken = Stub {
+            broken: true,
+            ..Stub::default()
+        };
+        let err = w.resume_from(&broken, now).await.unwrap_err();
         assert!(err.contains("last fired tick"), "{err}");
-        // Neither a failed read nor an unsupported write panics or blocks.
-        w.record(&Stub { broken: true }, now).await;
-        w.record(&Stub { broken: false }, now).await;
+        // A failed read, an unsupported write and a write that keeps losing
+        // its compare-and-set neither panic nor block.
+        w.record(&broken, now).await;
+        w.record(&Stub::default(), now).await;
+        let contended = Stub {
+            contended: true,
+            ..Stub::default()
+        };
+        w.record(&contended, now).await;
+    }
+
+    #[tokio::test]
+    async fn the_stub_backend_answers_the_required_calls() {
+        let s = Stub::default();
+        let d = Duration::from_secs(1);
+        assert!(matches!(
+            s.claim_idempotency("k", "f", "r", d).await.unwrap(),
+            Claim::Fresh
+        ));
+        let rec = RunRecord::queued("r".into(), None, Default::default(), None, Utc::now());
+        s.upsert(&rec).await.unwrap();
+        assert!(s.get("r").await.unwrap().is_none());
+        assert!(
+            s.list(&ListFilter::default())
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+        assert!(matches!(
+            s.delete("r").await.unwrap(),
+            DeleteOutcome::NotFound
+        ));
+        assert_eq!(s.purge_expired(d).await.unwrap(), 0);
+        assert_eq!(s.recover_orphans().await.unwrap(), 0);
+        assert!(!s.degraded());
+    }
+
+    #[test]
+    fn a_huge_backlog_is_reported_as_a_floor() {
+        let mut w = watcher("* * * * * *", at("2026-09-26T00:00:00Z"));
+        let latest = at("2026-09-28T00:00:00Z");
+        w.settle_missed(latest, MAX_SCAN, latest, "while down");
+        assert_eq!(w.next, Some(latest));
     }
 }
