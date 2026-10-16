@@ -81,9 +81,9 @@ html.navy .viz-root, html.coal .viz-root, html.ayu .viz-root {
 <div class="viz-root">
 
 <div class="viz-hero">
-  <div class="viz-tile"><div class="num">~96×</div><div class="cap">faster on CSV → JSONL (best case, parse-bound)</div></div>
-  <div class="viz-tile"><div class="num">~16×</div><div class="cap">faster on a realistic DB → DB move (sink-bound)</div></div>
-  <div class="viz-tile"><div class="num">~62×</div><div class="cap">less peak memory (11.8 vs 724 MiB)</div></div>
+  <div class="viz-tile"><div class="num">~80×</div><div class="cap">faster on CSV → JSONL (best case, parse-bound)</div></div>
+  <div class="viz-tile"><div class="num">~10×</div><div class="cap">faster on a realistic DB → DB move (sink-bound)</div></div>
+  <div class="viz-tile"><div class="num">~40×</div><div class="cap">less peak memory (20 vs 819 MiB)</div></div>
   <div class="viz-tile"><div class="num">1:1</div><div class="cap">exact row-count parity, every scenario</div></div>
 </div>
 
@@ -97,21 +97,20 @@ html.navy .viz-root, html.coal .viz-root, html.ayu .viz-root {
 
 <div class="viz-group">
   <div class="g-label">A — CSV → JSONL · parse-bound (best case)</div>
-  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:100%"></div></div><div class="bar-val">712,403</div></div>
-  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:1.04%"></div></div><div class="bar-val">7,383</div></div>
+  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:100%"></div></div><div class="bar-val">700,574</div></div>
+  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:1.24%"></div></div><div class="bar-val">8,698</div></div>
 </div>
 
 <div class="viz-group">
   <div class="g-label">B — Postgres → JSONL · typed row decode</div>
-  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:25.2%"></div></div><div class="bar-val">179,700</div></div>
-  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:1.01%"></div></div><div class="bar-val">7,184</div></div>
+  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:27.3%"></div></div><div class="bar-val">191,124</div></div>
+  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:1.13%"></div></div><div class="bar-val">7,931</div></div>
 </div>
 
 <div class="viz-group">
   <div class="g-label">C — Postgres → Postgres · sink-bound (the realistic move)</div>
-  <div class="bar-row"><div class="bar-name">faucet (COPY)</div><div class="bar-track"><div class="bar-fill faucet" style="width:17.3%"></div></div><div class="bar-val">123,200</div></div>
-  <div class="bar-row"><div class="bar-name">faucet (INSERT)</div><div class="bar-track"><div class="bar-fill faucet" style="width:13.9%"></div></div><div class="bar-val">99,000</div></div>
-  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:1.08%"></div></div><div class="bar-val">7,706</div></div>
+  <div class="bar-row"><div class="bar-name">faucet (COPY)</div><div class="bar-track"><div class="bar-fill faucet" style="width:16.7%"></div></div><div class="bar-val">117,147</div></div>
+  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:1.74%"></div></div><div class="bar-val">12,186</div></div>
 </div>
 
 <div class="viz-title">Peak memory — MiB (lower is better)</div>
@@ -119,29 +118,29 @@ html.navy .viz-root, html.coal .viz-root, html.ayu .viz-root {
 
 <div class="viz-group">
   <div class="g-label">A — CSV → JSONL</div>
-  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:1.6%"></div></div><div class="bar-val">11.8</div></div>
-  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:97.5%"></div></div><div class="bar-val">724.5</div></div>
+  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:2.45%"></div></div><div class="bar-val">20.1</div></div>
+  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:100%"></div></div><div class="bar-val">818.8</div></div>
 </div>
 
 <div class="viz-group">
   <div class="g-label">B — Postgres → JSONL</div>
-  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:1.9%"></div></div><div class="bar-val">13.9</div></div>
-  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:100%"></div></div><div class="bar-val">743.0</div></div>
+  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:2.65%"></div></div><div class="bar-val">21.7</div></div>
+  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:75.8%"></div></div><div class="bar-val">621.0</div></div>
 </div>
 
 <div class="viz-group">
   <div class="g-label">C — Postgres → Postgres</div>
-  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:4.8%"></div></div><div class="bar-val">35.9</div></div>
-  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:65.4%"></div></div><div class="bar-val">485.7</div></div>
+  <div class="bar-row"><div class="bar-name">faucet</div><div class="bar-track"><div class="bar-fill faucet" style="width:4.13%"></div></div><div class="bar-val">33.8</div></div>
+  <div class="bar-row"><div class="bar-name">Meltano</div><div class="bar-track"><div class="bar-fill meltano" style="width:84.3%"></div></div><div class="bar-val">690.3</div></div>
 </div>
 
 <div class="viz-title">The gap collapses as the workload gets more I/O-bound</div>
 <div class="viz-sub">Speed-up multiplier (faucet ÷ Meltano). The best case is not the typical case.</div>
 
 <div class="viz-group">
-  <div class="bar-row"><div class="bar-name">A · parse-bound</div><div class="bar-track"><div class="bar-fill gap" style="width:100%"></div></div><div class="bar-val">~96×</div></div>
-  <div class="bar-row"><div class="bar-name">B · row decode</div><div class="bar-track"><div class="bar-fill gap" style="width:26%"></div></div><div class="bar-val">~25×</div></div>
-  <div class="bar-row"><div class="bar-name">C · sink-bound</div><div class="bar-track"><div class="bar-fill gap" style="width:16.7%"></div></div><div class="bar-val">~16×</div></div>
+  <div class="bar-row"><div class="bar-name">A · parse-bound</div><div class="bar-track"><div class="bar-fill gap" style="width:100%"></div></div><div class="bar-val">~80×</div></div>
+  <div class="bar-row"><div class="bar-name">B · row decode</div><div class="bar-track"><div class="bar-fill gap" style="width:30%"></div></div><div class="bar-val">~24×</div></div>
+  <div class="bar-row"><div class="bar-name">C · sink-bound</div><div class="bar-track"><div class="bar-fill gap" style="width:12.5%"></div></div><div class="bar-val">~10×</div></div>
 </div>
 
 <details>
@@ -149,11 +148,11 @@ html.navy .viz-root, html.coal .viz-root, html.ayu .viz-root {
 
 | Scenario | Bottleneck | faucet (rows/s) | Meltano (rows/s) | Gap | faucet RSS (MiB) | Meltano RSS (MiB) |
 |---|---|--:|--:|--:|--:|--:|
-| A — CSV → JSONL | parse/serialize (best case) | 712,403 | 7,383 | ~96× | 11.8 | 724.5 |
-| B — Postgres → JSONL | typed row decode | 179,700 | 7,184 | ~25× | 13.9 | 743.0 |
-| C — Postgres → Postgres | destination write (sink-bound) | 123,200 (COPY) / 99,000 (INSERT) | 7,706 | ~16× / ~13× | 35.9 | 485.7 |
+| A — CSV → JSONL | parse/serialize (best case) | 700,574 | 8,698 | ~80× | 20.1 | 818.8 |
+| B — Postgres → JSONL | typed row decode | 191,124 | 7,931 | ~24× | 21.7 | 621.0 |
+| C — Postgres → Postgres | destination write (sink-bound) | 117,147 (COPY) | 12,186 | ~10× | 33.8 | 690.3 |
 
-All runs: 1,000,000 rows, seed 42, exact row-count parity (1,000,000 = 1,000,000).
+All runs: 1,000,000 rows, seed 42, exact row-count parity (1,000,000 = 1,000,000). Measured 2026-10-16 against Meltano 4.4.1; earlier runs are in the History section of [`BENCHMARKS.md`](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md#history).
 
 </details>
 

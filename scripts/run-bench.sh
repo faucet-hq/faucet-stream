@@ -24,6 +24,7 @@ RUNS=5
 DO_PG=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${BENCH_PYTHON:-python3.12}"
+MELTANO_VERSION="${BENCH_MELTANO_VERSION:-4.4.1}"
 FAUCET_BIN="${FAUCET_BIN:-$REPO_ROOT/target/release/faucet}"
 
 while [ $# -gt 0 ]; do
@@ -102,10 +103,10 @@ VENV="$REPO_ROOT/.bench-venv"
 MELTANO_OK=0
 log "Setting up Meltano venv ($PYTHON) at .bench-venv"
 if have "$PYTHON"; then
-  if [ ! -x "$VENV/bin/meltano" ]; then
+  if [ ! -x "$VENV/bin/meltano" ] || ! "$VENV/bin/pip" show meltano 2>/dev/null | grep -qx "Version: $MELTANO_VERSION"; then
     "$PYTHON" -m venv "$VENV" \
       && "$VENV/bin/pip" -q install --upgrade pip \
-      && "$VENV/bin/pip" -q install "meltano" \
+      && "$VENV/bin/pip" -q install "meltano==$MELTANO_VERSION" \
       || echo "meltano pip install failed (will skip Meltano side)" >&2
   fi
   if [ -x "$VENV/bin/meltano" ]; then
@@ -315,6 +316,15 @@ SQL
 
 if [ "$DO_PG" = 1 ]; then
   run_pg_scenarios
+fi
+
+if [ "$MELTANO_OK" = 1 ]; then
+  for plugin_venv in benchmarks/meltano/.meltano/*/*/venv; do
+    [ -x "$plugin_venv/bin/python" ] || continue
+    { echo; echo "# plugin $(basename "$(dirname "$plugin_venv")")"
+      "$plugin_venv/bin/python" -c 'import importlib.metadata as m; print("\n".join(sorted(d.metadata["Name"] + "==" + d.version for d in m.distributions())))'
+    } >> "$RES_DIR/versions.txt"
+  done
 fi
 
 log "Done. Raw hyperfine JSON in $RAW_DIR/, env in $RES_DIR/versions.txt"

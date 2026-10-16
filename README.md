@@ -299,18 +299,18 @@ connector depends only on `faucet-core`, so any source works with any sink.
 ## Performance
 
 These numbers are reproducible, and the [methodology](BENCHMARKS.md) includes the caveats.
-Each workload moves 1M rows on one machine, compared with Meltano running the equivalent
-Singer pipeline. The two JSONL workloads were measured with the `csv` source and `jsonl`
-sink, now deprecated in favour of the `file` connectors, and have not been re-measured:
+Each workload moves 1M rows on one machine, compared with Meltano 4.4.1 running the
+equivalent Singer pipeline (measured 2026-10-16):
 
 | Workload | Bottleneck | faucet | Meltano | Speed-up |
 |---|---|---:|---:|---:|
-| CSV → JSONL | parsing and serialization | 712k rows/s, 11.8 MiB | 7.4k rows/s, 724 MiB | ~96× |
-| Postgres → JSONL | row decoding | 180k rows/s | 7.2k rows/s | ~25× |
-| Postgres → Postgres | destination writes | 123k rows/s (`copy`) | 7.7k rows/s | ~16× |
+| CSV → JSONL | parsing and serialization | 701k rows/s, 20 MiB | 8.7k rows/s, 819 MiB | ~80× |
+| Postgres → JSONL | row decoding | 191k rows/s | 7.9k rows/s | ~24× |
+| Postgres → Postgres | destination writes | 117k rows/s (`copy`) | 12.2k rows/s | ~10× |
 
-For a realistic database-to-database move, quote **~16×**. Treat 96× as the upper bound,
-because once the destination is the bottleneck the gap narrows.
+For a realistic database-to-database move, quote **~10×**. Treat 80× as the upper bound,
+because once the destination is the bottleneck the gap narrows. Run `make bench` to
+reproduce it on your own machine.
 
 ## Run it the way you already run things
 
