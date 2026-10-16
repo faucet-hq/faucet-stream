@@ -186,7 +186,7 @@ impl CompiledTriggers {
                     validate_queue(&t.name, queue)?;
                     None
                 }
-                TriggerKind::Schedule { cron, timezone } => {
+                TriggerKind::Schedule { cron, timezone, .. } => {
                     require_feature(&t.name, "schedule")?;
                     validate_schedule(&t.name, cron, timezone)?;
                     None

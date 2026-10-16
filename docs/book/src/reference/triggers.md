@@ -260,11 +260,23 @@ timezone- and DST-correct). Needs the `schedule` feature.
 type: schedule
 cron: "0 2 * * *"           # 5 fields, or 6 with seconds first
 timezone: Europe/Berlin     # IANA name; default UTC
+catch_up: true              # run the latest missed tick after an outage; default true
 ```
 
 A tick whose fire fails (queue full, a store error) is retried with the
-watcher's backoff until it commits; a server that was down across several
-ticks fires one catch-up run, not a backlog.
+watcher's backoff until it commits.
+
+**Missed ticks.** The last committed tick of each trigger is kept in the run
+history, so a tick that passed while no server was running is noticed when one
+starts. With `catch_up: true` the most recent missed tick runs once, not a
+backlog; with `catch_up: false` missed ticks are skipped (use it for jobs where
+a late run is worse than none). Either way the server logs a warning, and every
+tick that never runs counts in `faucet_serve_trigger_missed_ticks_total`. The
+same rule applies when a running server falls more than one tick behind. A
+first deploy, or a changed `cron` or `timezone`, starts from the next tick and
+never fires a past one. Keeping the record across restarts needs a persistent
+`--history` (SQLite or Postgres); with the in-memory history a restart starts
+from the next tick.
 
 **`${trigger.*}` tokens:**
 
@@ -362,6 +374,7 @@ faucet schema triggers     # print the JSON Schema for the triggers file
 | `faucet_serve_trigger_runs_coalesced_total` | Counter | `trigger` | Fires coalesced — webhook debounce, or an idempotency-conflict no-op |
 | `faucet_serve_trigger_runs_dropped_total` | Counter | `trigger`, `reason` | Fires dropped because the run queue was full (`reason="queue_full"`) |
 | `faucet_serve_trigger_errors_total` | Counter | `trigger`, `type` | Watcher errors (poll failures, etc.) |
+| `faucet_serve_trigger_missed_ticks_total` | Counter | `trigger` | `schedule` ticks that never ran: passed while no server was up, or collapsed into one catch-up |
 | `faucet_serve_trigger_tenant_failures_total` | Counter | `trigger`, `tenant` | Fan-out fires refused for one tenant while the other tenants ran |
 
 ## Cluster note

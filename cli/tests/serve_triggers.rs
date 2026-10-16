@@ -547,6 +547,89 @@ async fn queue_depth_fires_once_on_rising_edge() {
     }
 }
 
+/// #916: a schedule trigger that missed ticks while no server ran fires the
+/// latest one once on start, then records it so the next start does not.
+#[cfg(feature = "schedule")]
+#[tokio::test]
+async fn a_schedule_trigger_runs_one_catch_up_for_ticks_missed_while_down() {
+    use chrono::{Duration as Delta, DurationRound, Utc};
+    use faucet_cli::serve::triggers::compiled::compile_schedule;
+    use faucet_cli::serve::triggers::schedule::{Resume, ScheduleWatcher};
+    use faucet_cli::serve::triggers::watcher::Watcher;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: hourly\n    type: schedule\n    cron: \"0 * * * *\"\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+
+    let latest = Utc::now().duration_trunc(Delta::hours(1)).unwrap();
+    let last = latest - Delta::hours(3);
+    state
+        .history()
+        .meta_put(
+            "trigger_tick:hourly",
+            &serde_json::json!({"cron": "0 * * * *", "timezone": "UTC", "tick": last}).to_string(),
+        )
+        .await
+        .unwrap();
+
+    let watcher = |now| {
+        ScheduleWatcher::new(
+            Arc::new(compiled.triggers[0].clone()),
+            compile_schedule("hourly", "0 * * * *", "UTC").unwrap(),
+            Resume {
+                cron: "0 * * * *".into(),
+                timezone: "UTC".into(),
+                catch_up: true,
+            },
+            now,
+        )
+    };
+    let mut w = watcher(Utc::now());
+    assert!(
+        w.poll(&state).await.unwrap(),
+        "the missed tick fires on start"
+    );
+    assert!(!w.poll(&state).await.unwrap(), "only once");
+    wait_for_runs(&state, 1).await;
+    let runs = state
+        .history()
+        .list(&ListFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].labels["faucet.trigger.tick"],
+        latest.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+
+    // The fire was recorded: a second start has nothing to catch up.
+    let mut again = watcher(Utc::now());
+    assert!(!again.poll(&state).await.unwrap());
+    let stored = state
+        .history()
+        .meta_get("trigger_tick:hourly")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.contains(&latest.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        "{stored}"
+    );
+}
+
 /// SERVE-11: a queue_depth edge ordinal is durable and shared. After a
 /// restart the next crossing gets a new key (it is not swallowed by the old
 /// claim), and two instances watching the same queue fire a crossing once.

@@ -212,6 +212,18 @@ groups:
             fail, this instance cancels its own runs before their leases
             expire, and /readyz is reporting 503 until the database answers.
 
+      - alert: FaucetServeScheduleTicksMissed
+        expr: increase(faucet_serve_trigger_missed_ticks_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "schedule trigger {{ $labels.trigger }} skipped ticks"
+          description: >
+            Scheduled ticks passed without a run, usually because no faucet
+            serve instance was running. With catch_up (the default) only the
+            latest missed tick ran; check whether the skipped windows need a
+            backfill.
+
   - name: faucet-telemetry
     rules:
       - alert: FaucetOtelExportFailures

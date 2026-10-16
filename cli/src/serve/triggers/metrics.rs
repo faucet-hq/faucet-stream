@@ -25,6 +25,10 @@ pub fn describe() {
         "Watcher poll/serve/fire errors"
     );
     describe_counter!(
+        "faucet_serve_trigger_missed_ticks_total",
+        "Schedule ticks that never ran (no instance was up, or collapsed into one catch-up)"
+    );
+    describe_counter!(
         "faucet_serve_trigger_tenant_failures_total",
         "Tenant fan-out fires refused for one tenant while the others ran"
     );
@@ -76,6 +80,10 @@ pub fn enqueued(trigger: &str) {
 pub fn coalesced(trigger: &str) {
     counter!("faucet_serve_trigger_runs_coalesced_total", "trigger" => trigger.to_string())
         .increment(1);
+}
+pub fn missed_ticks(trigger: &str, n: u64) {
+    counter!("faucet_serve_trigger_missed_ticks_total", "trigger" => trigger.to_string())
+        .increment(n);
 }
 pub fn dropped(trigger: &str, reason: &'static str) {
     counter!("faucet_serve_trigger_runs_dropped_total", "trigger" => trigger.to_string(), "reason" => reason).increment(1);

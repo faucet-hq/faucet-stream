@@ -217,28 +217,35 @@ pub fn spawn_watchers(
             #[cfg(not(any(feature = "triggers-redis", feature = "triggers-kafka")))]
             spec::TriggerKind::QueueDepth { .. } => {}
             #[cfg(feature = "schedule")]
-            spec::TriggerKind::Schedule { cron, timezone } => {
-                match compiled::compile_schedule(t.name(), cron, timezone) {
-                    Ok(sched) => {
-                        let w = schedule::ScheduleWatcher::new(
-                            std::sync::Arc::new(t.clone()),
-                            sched,
-                            chrono::Utc::now(),
-                        );
-                        handles.push(tokio::spawn(watcher::run_supervised(
-                            w,
-                            state.clone(),
-                            health.clone(),
-                            shutdown.clone(),
-                        )));
-                        active += 1;
-                    }
-                    Err(e) => {
-                        tracing::error!(trigger = t.name(), error = %e, "invalid schedule; skipping watcher");
-                        mark_unbuildable(&health, t.name(), format!("schedule: {e}"));
-                    }
+            spec::TriggerKind::Schedule {
+                cron,
+                timezone,
+                catch_up,
+            } => match compiled::compile_schedule(t.name(), cron, timezone) {
+                Ok(sched) => {
+                    let w = schedule::ScheduleWatcher::new(
+                        std::sync::Arc::new(t.clone()),
+                        sched,
+                        schedule::Resume {
+                            cron: cron.clone(),
+                            timezone: timezone.clone(),
+                            catch_up: *catch_up,
+                        },
+                        chrono::Utc::now(),
+                    );
+                    handles.push(tokio::spawn(watcher::run_supervised(
+                        w,
+                        state.clone(),
+                        health.clone(),
+                        shutdown.clone(),
+                    )));
+                    active += 1;
                 }
-            }
+                Err(e) => {
+                    tracing::error!(trigger = t.name(), error = %e, "invalid schedule; skipping watcher");
+                    mark_unbuildable(&health, t.name(), format!("schedule: {e}"));
+                }
+            },
             #[cfg(not(feature = "schedule"))]
             spec::TriggerKind::Schedule { .. } => {}
         }

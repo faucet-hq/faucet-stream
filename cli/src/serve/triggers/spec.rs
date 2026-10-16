@@ -98,7 +98,15 @@ pub enum TriggerKind {
         /// IANA timezone the cron is evaluated in. Default `UTC`.
         #[serde(default = "default_timezone")]
         timezone: String,
+        /// After an outage, run the most recent missed tick once when the
+        /// server comes back. `false` skips missed ticks. Default `true`.
+        #[serde(default = "default_catch_up")]
+        catch_up: bool,
     },
+}
+
+fn default_catch_up() -> bool {
+    true
 }
 
 fn default_timezone() -> String {
