@@ -346,7 +346,7 @@ s_membership() { # #914 too: pods started together must not start degraded
     body="$(curl -s "localhost:${port}/readyz")"
     [ "$(jq -r .cluster.instances <<<"$body")" = "$REPLICAS" ] || fail "${p}: ${body}" || return 1
     [ "$(jq -r .history_ok <<<"$body")" = true ] || fail "${p}: ${body}" || return 1
-    if k logs "$p" -c serve | grep -q 'starting DEGRADED'; then fail "${p} started degraded (#914)"; return 1; fi
+    if k logs "$p" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'starting DEGRADED'; then fail "${p} started degraded (#914)"; return 1; fi
   done
   echo "every pod ready, ${REPLICAS} members, none started degraded"
 }
@@ -469,7 +469,7 @@ s_history_outage() { # #905: readiness must see it; no run executes twice
   st="$(wait_terminal "${ports[0]}" "$id" 360)"
   [ "$st" = completed ] || fail "status ${st}" || return 1
   [ "$(sql 'SELECT count(*) FROM slow_out')" = 600 ] || fail "rows" || return 1
-  k logs "$owner" -c serve | grep -q 'could not renew run leases' || fail "the owner never fenced itself" || return 1
+  k logs "$owner" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'could not renew run leases' || fail "the owner never fenced itself" || return 1
   echo "every pod reported history_ok=false within the lease window; owner self-fenced; run completed, 600 rows"
 }
 
@@ -483,7 +483,7 @@ s_burst() {
   done
   [ "$ok" = 40 ] || fail "${ok} of 40 completed" || return 1
   for p in $(pods); do
-    n="$(k logs "$p" -c serve | grep -c 'invocation completed row=row-0 records_written=100')"
+    n="$(k logs "$p" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'invocation completed row=row-0 records_written=100')"
     if [ "$a" -eq 0 ]; then a=$n; else b=$n; fi
   done
   echo "40 accepted, 40 completed once each; split ${a}/${b} across pods"
