@@ -17,7 +17,43 @@ pub async fn run(args: HubArgs) -> CliResult<()> {
         HubCommand::Matrix(a) => matrix(a).await,
         HubCommand::Lint(a) => lint(a).await,
         HubCommand::Rows(a) => rows(a).await,
+        #[cfg(feature = "source-rest")]
+        HubCommand::Import(a) => import(a).await,
     }
+}
+
+/// `faucet hub import openapi <spec> --owner X` (#899).
+#[cfg(feature = "source-rest")]
+async fn import(a: crate::cli::HubImportArgs) -> CliResult<()> {
+    use crate::cli::{HubImportCommand, ImportFormat};
+    use crate::hub::import::{ImportOptions, ImportRequest, import_openapi, render_report};
+    let HubImportCommand::Openapi(o) = a.command;
+    let req = ImportRequest {
+        spec: o.spec,
+        options: ImportOptions {
+            owner: o.owner,
+            name: o.name,
+            include: o.include,
+            exclude: o.exclude,
+            server: o.server,
+            test_sink: o.test_sink,
+        },
+        out: o.out,
+        dry_run: o.dry_run,
+        force: o.force,
+        allow_remote_refs: o.allow_remote_refs,
+    };
+    let out = import_openapi(&req).await?;
+    match o.format {
+        ImportFormat::Json => println!("{}", out.to_json()?),
+        ImportFormat::Yaml => {
+            if o.dry_run {
+                print!("{}---\n{}", out.template_yaml, out.suite_yaml);
+            }
+            eprint!("{}", render_report(&out));
+        }
+    }
+    Ok(())
 }
 
 fn pretty<T: serde::Serialize>(v: &T) -> CliResult<String> {

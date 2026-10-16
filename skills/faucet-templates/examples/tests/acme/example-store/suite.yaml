@@ -1,0 +1,54 @@
+# Draft `faucet template test` suite from `faucet hub import openapi`.
+# Run it from the hub root: faucet template test tests/acme/example-store/suite.yaml
+version: 1
+template: source-templates/acme/example-store.yaml
+sink: sink-templates/faucet-hq/sqlite.yaml
+suite:
+  auto:
+    defaults_baseline: true
+    enum_coverage: false
+    required_omitted: true
+  behavioral:
+  - name: customers-example
+    params:
+      api_token: suite-api-token
+    row: customers
+    expect:
+      records:
+      - address: '{"city":"Paris"}'
+        id: 1
+        name: Ada
+        updated_at: 2026-01-02T00:00:00Z
+      - address: null
+        id: 2
+        name: Bo
+        updated_at: 2026-01-03T00:00:00Z
+    input:
+    - address:
+        city: Paris
+      id: 1
+      name: Ada
+      updated_at: 2026-01-02T00:00:00Z
+    - address: null
+      id: 2
+      name: Bo
+      updated_at: 2026-01-03T00:00:00Z
+  - name: events-example
+    params:
+      api_token: suite-api-token
+    row: events
+    expect:
+      records:
+      - created_at: 2026-01-01T00:00:00Z
+        id: e1
+        type: customer.created
+    input:
+    - created_at: 2026-01-01T00:00:00Z
+      id: e1
+      type: customer.created
+  cases:
+  - name: defaults
+    params:
+      api_token: suite-api-token
+    expect:
+      valid: true

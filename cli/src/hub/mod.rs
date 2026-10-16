@@ -19,6 +19,8 @@
 pub mod bundles;
 pub mod catalog;
 pub mod compose;
+#[cfg(feature = "source-rest")]
+pub mod import;
 #[cfg(feature = "hub-remote")]
 pub mod remote;
 pub mod rows;
@@ -506,7 +508,14 @@ fn read(path: &Path) -> CliResult<String> {
 
 /// Parse + validate a `source-template` file.
 pub fn parse_source_file(path: &Path) -> CliResult<SourceTemplate> {
-    let value = parse_untyped(&read(path)?, path)?;
+    parse_source_text(&read(path)?, path)
+}
+
+/// Parse + validate `source-template` text; `path` names it in messages and
+/// its extension picks JSON or YAML — the path `faucet validate` and
+/// `faucet hub lint` read a template through.
+pub fn parse_source_text(text: &str, path: &Path) -> CliResult<SourceTemplate> {
+    let value = parse_untyped(text, path)?;
     match detect_kind(&value) {
         Some(TemplateKind::SourceTemplate) => {}
         Some(other) => {

@@ -1159,6 +1159,83 @@ pub enum HubCommand {
     /// List a catalog source template's streams (or a pipeline file's rows)
     /// with their metadata; with selection flags, preview a run's rows.
     Rows(HubRowsArgs),
+    /// Create a draft source template (and its test suite) from an API's
+    /// machine-readable description.
+    #[cfg(feature = "source-rest")]
+    Import(HubImportArgs),
+}
+
+/// `faucet hub import <format> …` (#899).
+#[cfg(feature = "source-rest")]
+#[derive(Debug, Parser)]
+pub struct HubImportArgs {
+    #[command(subcommand)]
+    pub command: HubImportCommand,
+}
+
+#[cfg(feature = "source-rest")]
+#[derive(Debug, Subcommand)]
+pub enum HubImportCommand {
+    /// Import an OpenAPI 3.x or Swagger 2.0 document: one stream per GET
+    /// operation that returns a list, with auth, pagination, keys, cursors
+    /// and write preferences mapped where the spec settles them. Anything it
+    /// does not settle is left unset and listed in the report.
+    Openapi(HubImportOpenapiArgs),
+}
+
+/// How `faucet hub import` reports.
+#[cfg(feature = "source-rest")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ImportFormat {
+    /// The report on stderr; with `--dry-run`, the files on stdout.
+    #[default]
+    Yaml,
+    /// One JSON document on stdout: the report, both files' contents and
+    /// their paths.
+    Json,
+}
+
+#[cfg(feature = "source-rest")]
+#[derive(Debug, Parser)]
+pub struct HubImportOpenapiArgs {
+    /// The spec: a file path or an `http(s)://` URL.
+    #[arg(value_name = "URL|PATH")]
+    pub spec: String,
+    /// Publisher namespace: becomes `owner:` and the directory.
+    #[arg(long)]
+    pub owner: String,
+    /// Template name. Default: a slug of the spec's `info.title`.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Hub root to write `source-templates/<owner>/<name>.yaml` and
+    /// `tests/<owner>/<name>/suite.yaml` under.
+    #[arg(long, default_value = ".", value_hint = clap::ValueHint::DirPath)]
+    pub out: PathBuf,
+    /// Only import paths matching this glob (`*`, `?`). Repeatable.
+    #[arg(long)]
+    pub include: Vec<String>,
+    /// Skip paths matching this glob. Repeatable.
+    #[arg(long)]
+    pub exclude: Vec<String>,
+    /// Which `servers[]` entry (an index) or URL becomes the `api_root`
+    /// param's default. Default: the first.
+    #[arg(long)]
+    pub server: Option<String>,
+    /// The sink template the draft suite composes with, as a path from the
+    /// hub root.
+    #[arg(long, default_value = "sink-templates/faucet-hq/sqlite.yaml")]
+    pub test_sink: String,
+    /// Print the files instead of writing them.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Replace existing files that differ (the diff is printed).
+    #[arg(long)]
+    pub force: bool,
+    /// Follow `$ref`s to other hosts and absolute locations.
+    #[arg(long)]
+    pub allow_remote_refs: bool,
+    #[arg(long, value_enum, default_value_t = ImportFormat::Yaml)]
+    pub format: ImportFormat,
 }
 
 /// `faucet hub rows <source>` arguments (#741).

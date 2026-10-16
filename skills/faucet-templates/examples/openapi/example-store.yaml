@@ -1,0 +1,194 @@
+openapi: 3.0.3
+info:
+  title: Example Store
+  description: A synthetic store API used to show what `faucet hub import openapi` maps.
+  version: "1.0"
+externalDocs:
+  url: https://api.example.com/docs
+servers:
+  - url: https://api.example.com/v1
+security:
+  - bearerAuth: []
+paths:
+  /customers:
+    get:
+      summary: List customers
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+        - { name: updated_since, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: A page of customers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Customer" } }
+                  next_cursor: { type: string, nullable: true }
+              example:
+                data:
+                  - { id: 1, name: Ada, address: { city: Paris }, updated_at: "2026-01-02T00:00:00Z" }
+                  - { id: 2, name: Bo, address: null, updated_at: "2026-01-03T00:00:00Z" }
+                next_cursor: null
+        "429":
+          description: Too many requests
+          headers:
+            Retry-After: { schema: { type: integer } }
+            X-RateLimit-Reset:
+              description: Unix epoch seconds when the window resets
+              schema: { type: integer }
+  /customers/{customer_id}:
+    get:
+      summary: Get one customer
+      parameters:
+        - { name: customer_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: One customer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+  /customers/{customer_id}/orders:
+    get:
+      summary: List a customer's orders
+      parameters:
+        - { name: customer_id, in: path, required: true, schema: { type: integer } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        "200":
+          description: Orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    total: { type: number }
+                    lines: { type: array, items: { type: object, properties: { sku: { type: string } } } }
+  /events:
+    get:
+      summary: List events
+      parameters:
+        - { name: offset, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 500 } }
+      responses:
+        "200":
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        type: { type: string }
+                        created_at: { type: string, format: date-time }
+                  total: { type: integer }
+              example:
+                items:
+                  - { id: e1, type: customer.created, created_at: "2026-01-01T00:00:00Z" }
+                total: 1
+  /products:
+    get:
+      summary: List products
+      responses:
+        "200":
+          description: Products
+          headers:
+            Link: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  x-primary-key: sku
+                  required: [sku]
+                  properties:
+                    sku: { type: string }
+                    name: { type: string }
+                    tags: { type: array, items: { type: string } }
+  /invoices:
+    get:
+      summary: List invoices
+      parameters:
+        - { name: modified_after, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Invoices
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results: { type: array, items: { $ref: "#/components/schemas/Invoice" } }
+                  links:
+                    type: object
+                    properties:
+                      next: { type: string, format: uri }
+  /notes:
+    get:
+      summary: List notes
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: marker, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Notes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { type: object, properties: { id: { type: string }, body: { type: string } } } }
+                  next_cursor: { type: string }
+  /reports/summary:
+    get:
+      summary: A summary report
+      responses:
+        "200":
+          description: One report object
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revenue: { type: number }
+                  currency: { type: string }
+    post:
+      summary: Not a read
+      responses:
+        "201": { description: Created }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  schemas:
+    Customer:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        address:
+          type: object
+          nullable: true
+          properties:
+            city: { type: string }
+        updated_at: { type: string, format: date-time }
+    Invoice:
+      allOf:
+        - type: object
+          properties:
+            id: { type: string }
+            amount: { type: number }
+        - type: object
+          properties:
+            modified_at: { type: string, format: date-time }

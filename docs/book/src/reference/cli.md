@@ -1175,6 +1175,7 @@ faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite
 faucet hub matrix    --format table|markdown|json [--out FILE]
 faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint + typed config validation
 faucet hub rows      faucet-hq/example-csv [--sink faucet-hq/jsonl] [--select …] [--state] [--json]  # streams + metadata, or a pipeline file's rows
+faucet hub import    openapi https://api.example.com/openapi.json --owner acme [--out .] [--include '/v1/*'] [--dry-run] [--format json]  # draft source template + suite
 faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
 faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]
 faucet schema source-template | sink-template | deployment
@@ -1197,6 +1198,13 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
 | `rows <source\|pipeline.yaml>` | List a catalog source template's streams (with `--sink`, their write resolution and guarantees against that sink) or a pipeline file's matrix rows — the same report as `GET /v1/templates/{id}/rows`. The selection flags preview a run set (exit≠0 when it would be refused); `--state` also reads each row's status from the composed run's state store. |
 | `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
+| `import openapi <URL\|PATH>` | Create a draft source template from an OpenAPI 3.x / Swagger 2.0 document: `source-templates/<owner>/<name>.yaml` and `tests/<owner>/<name>/suite.yaml` under `--out` (default `.`). Deterministic; refuses to overwrite a changed file without `--force` and prints the diff. What it maps, and the decision report: [Importing a template](../cookbook/template-hub.md#importing-a-template-from-an-openapi-description). |
+| `--owner <login>` / `--name <name>` | *(import)* The namespace (required) and the template name (default: a slug of `info.title`). |
+| `--include <glob>` / `--exclude <glob>` | *(import)* Path filters (`*`, `?`), repeatable. More than 200 `GET` operations need `--include`. |
+| `--server <index\|url>` | *(import)* The `servers[]` entry that becomes the `api_root` default (default: the first). |
+| `--test-sink <path>` | *(import)* The sink template the draft suite composes with, from the hub root (default `sink-templates/faucet-hq/sqlite.yaml`). |
+| `--dry-run` / `--force` / `--allow-remote-refs` | *(import)* Print instead of writing; replace changed files; follow `$ref`s to other hosts or absolute locations (refused by default). |
+| `--format yaml\|json` | *(import)* `yaml`: the report on stderr (and the files on stdout with `--dry-run`); `json`: one document with the report, both files and their paths. |
 | `--json` | Machine-readable output. |
 
 `check` and `lint` exit non-zero on any incompatible stream / finding, so both

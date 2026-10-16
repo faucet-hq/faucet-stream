@@ -677,6 +677,7 @@ ratatui = { workspace = true, optional = true }
 indicatif = { workspace = true, optional = true }
 futures = { workspace = true }
 glob = { workspace = true }
+url = { workspace = true }
 reqwest = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-secretsmanager = { workspace = true, optional = true }
