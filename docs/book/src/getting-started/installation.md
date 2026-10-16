@@ -68,7 +68,9 @@ Every `faucet-cli` release publishes these images to
 `ghcr.io/faucet-hq/faucet-stream` (tags `:<profile>` and `:<version>-<profile>`;
 `:latest` and `:<version>` are `full`). The floating `:<profile>` and
 `:latest` tags only ever point at the newest release; pin `:<version>-<profile>`
-for reproducible deploys:
+for reproducible deploys. Each tag is a multi-arch image for `linux/amd64` and
+`linux/arm64` (Graviton, Ampere, Apple-silicon Docker), so the same tag runs on
+either kind of node; releases up to 1.14.0 were `linux/amd64` only.
 
 | Tag | What is compiled in |
 |---|---|
