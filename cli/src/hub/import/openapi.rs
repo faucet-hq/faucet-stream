@@ -7,7 +7,8 @@
 //! parameters, no detectable key), the field is left unset and the choice is
 //! listed as a [`Decision`]; nothing is guessed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use faucet_core::{
     BackoffFrom, BindFormat, BindTarget, BindValueType, ReplicationBind, ReplicationMethod,
@@ -196,7 +197,7 @@ struct Param {
 #[derive(Debug, Clone)]
 enum Records {
     Body(Loc),
-    At(Vec<String>, Loc),
+    At(Vec<String>, Loc, Vec<String>),
     NotList,
     Ambiguous(Vec<String>),
 }
@@ -208,9 +209,11 @@ struct Candidate {
     params: Vec<Param>,
     records: Option<Vec<String>>,
     records_ambiguous: Vec<String>,
+    records_others: Vec<String>,
     item: Flat,
     envelope: Flat,
     headers: BTreeMap<String, Value>,
+    limit_headers: BTreeMap<String, Value>,
     responses: BTreeMap<String, Loc>,
     example: Option<Value>,
     security: Vec<BTreeMap<String, Vec<String>>>,
@@ -224,6 +227,19 @@ struct Mapper<'a> {
     v2: bool,
     root_key: String,
     report: ImportReport,
+    flat_cache: RefCell<HashMap<(String, String), Flat>>,
+    flat_calls: Cell<usize>,
+    tainted: RefCell<BTreeSet<String>>,
+}
+
+/// Most schema nodes one import may flatten; a spec past this is refused
+/// rather than left to run for hours.
+const MAX_FLATTEN_NODES: usize = 200_000;
+
+/// A spec-derived string that would become an interpolation directive
+/// (`${env:…}`, `${file:…}`) in the generated template.
+fn tainted(s: &str) -> bool {
+    s.contains("${")
 }
 
 /// Import one spec.
@@ -241,6 +257,9 @@ pub fn import(set: &SpecSet, opts: &ImportOptions) -> CliResult<Imported> {
             spec_version: version,
             ..Default::default()
         },
+        flat_cache: RefCell::new(HashMap::new()),
+        flat_calls: Cell::new(0),
+        tainted: RefCell::new(BTreeSet::new()),
     };
     m.run(opts)
 }
@@ -431,15 +450,15 @@ const LIMIT_PARAMS: &[&str] = &[
     "perpage",
     "size",
 ];
+/// Integer fields that are a total in some APIs and the page's own size in
+/// others: never used as `total_path` on their own.
+const MAYBE_TOTAL_FIELDS: &[&str] = &["count", "odatacount", "numfound"];
 const TOTAL_FIELDS: &[&str] = &[
     "total",
     "totalcount",
-    "count",
     "totalresults",
     "totalitems",
-    "odatacount",
     "totalsize",
-    "numfound",
 ];
 const TIMESTAMP_FIELDS: &[&str] = &[
     "updatedat",
@@ -511,6 +530,31 @@ impl Mapper<'_> {
     }
 
     fn flatten(&self, loc: &Loc, depth: usize) -> CliResult<Flat> {
+        let calls = self.flat_calls.get() + 1;
+        self.flat_calls.set(calls);
+        if calls > MAX_FLATTEN_NODES {
+            return Err(CliError::Config(format!(
+                "spec: schemas too complex to import (more than {MAX_FLATTEN_NODES} schema nodes)"
+            )));
+        }
+        let key = loc
+            .v
+            .get("$ref")
+            .and_then(Value::as_str)
+            .map(|r| (loc.base.clone(), r.to_string()));
+        if let Some(k) = &key
+            && let Some(f) = self.flat_cache.borrow().get(k)
+        {
+            return Ok(f.clone());
+        }
+        let f = self.flatten_uncached(loc, depth)?;
+        if let Some(k) = key {
+            self.flat_cache.borrow_mut().insert(k, f.clone());
+        }
+        Ok(f)
+    }
+
+    fn flatten_uncached(&self, loc: &Loc, depth: usize) -> CliResult<Flat> {
         if depth > MAX_SCHEMA_DEPTH {
             return Err(CliError::Config(format!(
                 "spec: schema composition nested deeper than {MAX_SCHEMA_DEPTH} levels (a recursive `allOf`?)"
@@ -556,6 +600,10 @@ impl Mapper<'_> {
         f.maximum = s.get("maximum").cloned();
         if let Some(props) = s.get("properties").and_then(Value::as_object) {
             for (k, p) in props {
+                if tainted(k) {
+                    self.tainted.borrow_mut().insert(k.clone());
+                    continue;
+                }
                 f.props.insert(
                     k.clone(),
                     Loc {
@@ -635,8 +683,12 @@ impl Mapper<'_> {
             .collect();
         let rec = match (cands.len(), wrapped.len()) {
             (0, _) => Records::NotList,
-            (1, _) => Records::At(cands[0].0.clone(), cands[0].1.clone()),
-            (_, 1) => Records::At(wrapped[0].0.clone(), wrapped[0].1.clone()),
+            (1, _) => Records::At(cands[0].0.clone(), cands[0].1.clone(), Vec::new()),
+            (_, 1) => Records::At(
+                wrapped[0].0.clone(),
+                wrapped[0].1.clone(),
+                cands.iter().map(|(s, _)| jsonpath(s, true)).collect(),
+            ),
             _ => Records::Ambiguous(cands.iter().map(|(s, _)| jsonpath(s, true)).collect()),
         };
         Ok((rec, f))
@@ -690,10 +742,24 @@ impl Mapper<'_> {
             .collect();
         let mut gets = Vec::new();
         for p in selected {
-            let item = self.deref(&Loc {
+            if tainted(p) {
+                self.unsupported(
+                    &format!("path {p}"),
+                    "contains `${`, which would become an interpolation directive; not imported"
+                        .into(),
+                );
+                continue;
+            }
+            let item = match self.deref(&Loc {
                 base: self.root_key.clone(),
                 v: paths[p].clone(),
-            })?;
+            }) {
+                Ok(i) => i,
+                Err(e) => {
+                    self.skip(p, e.to_string());
+                    continue;
+                }
+            };
             if let Some(op) = item.v.get("get") {
                 gets.push((p.clone(), item.clone(), op.clone()));
             }
@@ -708,8 +774,10 @@ impl Mapper<'_> {
         let global_security = security_list(root.get("security"));
         let mut cands: Vec<Candidate> = Vec::new();
         for (path, item, op) in gets {
-            if let Some(c) = self.candidate(&path, &item, &op, &global_security)? {
-                cands.push(c);
+            match self.candidate(&path, &item, &op, &global_security) {
+                Ok(Some(c)) => cands.push(c),
+                Ok(None) => {}
+                Err(e) => self.skip(&path, e.to_string()),
             }
         }
         self.resolve_parents(&mut cands);
@@ -808,19 +876,20 @@ impl Mapper<'_> {
             .and_then(|i| i.get("title"))
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .filter(|t| !t.is_empty() && !tainted(t))
             .unwrap_or(&name);
         let description = info
             .and_then(|i| i.get("summary").or_else(|| i.get("description")))
             .and_then(Value::as_str)
             .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()))
+            .filter(|d| !tainted(d))
             .map(|d| format!("{title} — {d}"))
             .unwrap_or_else(|| format!("{title} (imported from its OpenAPI description)"));
         let docs = root
             .get("externalDocs")
             .and_then(|d| d.get("url"))
             .and_then(Value::as_str)
-            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .filter(|u| (u.starts_with("https://") || u.starts_with("http://")) && !tainted(u))
             .map(str::to_string);
         let source: ConnectorSpec =
             serde_json::from_value(json!({ "type": "rest", "config": Value::Object(source_cfg) }))
@@ -853,6 +922,13 @@ impl Mapper<'_> {
         };
         template.validate()?;
         self.report.template = template.id();
+        let names: Vec<String> = self.tainted.borrow().iter().cloned().collect();
+        if !names.is_empty() {
+            self.unsupported(
+                &format!("names {}", names.join(", ")),
+                "fields and parameters whose names contain `${` would become interpolation directives; they are ignored".into(),
+            );
+        }
 
         let suite = SuiteFile {
             version: 1,
@@ -930,14 +1006,14 @@ impl Mapper<'_> {
             return Ok(None);
         };
         let (records, envelope) = self.records_of(&schema)?;
-        let (records, records_ambiguous, item_loc) = match records {
+        let (records, records_ambiguous, records_others, item_loc) = match records {
             Records::NotList => {
                 self.skip(path, "the response is a single object, not a list".into());
                 return Ok(None);
             }
-            Records::Body(i) => (Some(Vec::new()), Vec::new(), Some(i)),
-            Records::At(p, i) => (Some(p), Vec::new(), Some(i)),
-            Records::Ambiguous(c) => (None, c, None),
+            Records::Body(i) => (Some(Vec::new()), Vec::new(), Vec::new(), Some(i)),
+            Records::At(p, i, others) => (Some(p), Vec::new(), others, Some(i)),
+            Records::Ambiguous(c) => (None, c, Vec::new(), None),
         };
         let item = match &item_loc {
             Some(l) => self.flatten(l, 0)?,
@@ -955,16 +1031,11 @@ impl Mapper<'_> {
             );
             return Ok(None);
         }
-        let mut headers = BTreeMap::new();
-        for r in responses.values() {
-            if let Some(h) = r.v.get("headers").and_then(Value::as_object) {
-                for (k, hv) in h {
-                    let d = self.deref(&Loc {
-                        base: r.base.clone(),
-                        v: hv.clone(),
-                    })?;
-                    headers.entry(k.to_ascii_lowercase()).or_insert(d.v);
-                }
+        let headers = self.headers(&resp)?;
+        let mut limit_headers = headers.clone();
+        if let Some(r) = responses.get("429") {
+            for (k, v) in self.headers(r)? {
+                limit_headers.entry(k).or_insert(v);
             }
         }
         let example =
@@ -980,14 +1051,16 @@ impl Mapper<'_> {
                 .get("summary")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !tainted(s))
                 .map(str::to_string),
             params,
             records,
             records_ambiguous,
+            records_others,
             item,
             envelope,
             headers,
+            limit_headers,
             responses,
             example,
             security,
@@ -995,6 +1068,20 @@ impl Mapper<'_> {
             parent: None,
             name: String::new(),
         }))
+    }
+
+    fn headers(&self, resp: &Loc) -> CliResult<BTreeMap<String, Value>> {
+        let mut out = BTreeMap::new();
+        if let Some(h) = resp.v.get("headers").and_then(Value::as_object) {
+            for (k, hv) in h {
+                let d = self.deref(&Loc {
+                    base: resp.base.clone(),
+                    v: hv.clone(),
+                })?;
+                out.entry(k.to_ascii_lowercase()).or_insert(d.v);
+            }
+        }
+        Ok(out)
     }
 
     fn params(&self, item: &Loc, op: &Loc) -> CliResult<Vec<Param>> {
@@ -1019,6 +1106,10 @@ impl Mapper<'_> {
                         .unwrap_or_default()
                         .to_string();
                 if name.is_empty() {
+                    continue;
+                }
+                if tainted(&name) {
+                    self.tainted.borrow_mut().insert(name);
                     continue;
                 }
                 let schema_loc = match p.v.get("schema") {
@@ -1148,6 +1239,14 @@ impl Mapper<'_> {
             let field = if parent_props.contains_key(&p) {
                 Some(p.clone())
             } else if (lp == "id" || lp.ends_with("id")) && parent_props.contains_key("id") {
+                if lp != "id" {
+                    self.decide(
+                        Some(&cands[i].path.clone()),
+                        "parent_key",
+                        format!("path parameter {{{p}}} is taken to hold the parent's `id`"),
+                        Vec::new(),
+                    );
+                }
                 Some("id".to_string())
             } else {
                 None
@@ -1231,9 +1330,30 @@ impl Mapper<'_> {
                 servers.push(url);
             }
         }
+        let (bad, servers): (Vec<String>, Vec<String>) =
+            servers.into_iter().partition(|u| tainted(u));
+        for u in bad {
+            self.unsupported(
+                &format!("server {u}"),
+                "contains `${`, which would become an interpolation directive; not used".into(),
+            );
+        }
         self.report.servers = servers.clone();
         let chosen = match opts.server.as_deref() {
-            None => servers.first().cloned(),
+            None => {
+                if servers.len() > 1 {
+                    self.decide(
+                        None,
+                        "params.api_root",
+                        format!(
+                            "the spec lists {} servers; `api_root` defaults to the first (pick another with --server)",
+                            servers.len()
+                        ),
+                        servers.clone(),
+                    );
+                }
+                servers.first().cloned()
+            }
             Some(s) => match s.parse::<usize>() {
                 Ok(i) => Some(servers.get(i).cloned().ok_or_else(|| {
                     CliError::Config(format!(
@@ -1241,7 +1361,14 @@ impl Mapper<'_> {
                         servers.len()
                     ))
                 })?),
-                Err(_) => Some(s.to_string()),
+                Err(_) => {
+                    if tainted(s) || self.absolute(s)?.is_none() {
+                        return Err(CliError::Config(format!(
+                            "--server {s}: not an absolute URL (give a full https://… URL or an index into the spec's servers)"
+                        )));
+                    }
+                    Some(s.to_string())
+                }
             },
         };
         let chosen = chosen.map(|u| self.absolute(&u)).transpose()?.flatten();
@@ -1321,10 +1448,41 @@ impl Mapper<'_> {
                 *counts.entry(first.clone()).or_default() += 1;
             }
         }
-        let chosen = counts
+        let Some(top) = counts.values().max().copied() else {
+            let mut compound: Vec<String> = cands
+                .iter()
+                .flat_map(|c| c.security.iter())
+                .filter(|r| r.len() > 1)
+                .map(|r| r.keys().cloned().collect::<Vec<_>>().join(" + "))
+                .collect();
+            compound.sort();
+            compound.dedup();
+            if !compound.is_empty() {
+                self.unsupported(
+                    &format!("security {}", compound.join(", ")),
+                    "every requirement combines several schemes, which the REST source cannot send together; auth left unset"
+                        .into(),
+                );
+            }
+            return None;
+        };
+        let tied: Vec<String> = counts
             .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-            .map(|(k, _)| k.clone())?;
+            .filter(|(_, n)| **n == top)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let chosen = tied[0].clone();
+        if tied.len() > 1 {
+            self.decide(
+                None,
+                "source.config.auth",
+                format!(
+                    "{} schemes are used by the same number of operations; `{chosen}` was picked",
+                    tied.len()
+                ),
+                tied.clone(),
+            );
+        }
         for c in cands {
             let anonymous = c.security.iter().any(BTreeMap::is_empty);
             let covered = c.security.is_empty()
@@ -1355,6 +1513,7 @@ impl Mapper<'_> {
             .flat_map(|c| c.security.iter())
             .filter_map(|r| r.get(&chosen))
             .flatten()
+            .filter(|s| !tainted(s))
             .cloned()
             .collect();
         let Some(scheme) = schemes.get(&chosen) else {
@@ -1431,6 +1590,11 @@ impl Mapper<'_> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if tainted(&key_name) {
+                    return Err(format!(
+                        "the API key's name `{key_name}` contains `${{`, which would become an interpolation directive"
+                    ));
+                }
                 match s.get("in").and_then(Value::as_str) {
                     Some("header") => Ok(Auth::ApiKey {
                         header: key_name,
@@ -1464,6 +1628,11 @@ impl Mapper<'_> {
                             .into(),
                     );
                 };
+                if tainted(token_url) {
+                    return Err(format!(
+                        "OAuth2 token URL {token_url} contains `${{`, which would become an interpolation directive"
+                    ));
+                }
                 let token_url = match self.absolute(token_url) {
                     Ok(Some(u)) => u,
                     _ => return Err(format!("OAuth2 token URL {token_url} is not absolute")),
@@ -1486,14 +1655,30 @@ impl Mapper<'_> {
         let throttled = cands.iter().any(|c| c.responses.contains_key("429"));
         let mut headers: BTreeMap<String, Value> = BTreeMap::new();
         for c in cands {
-            for (k, v) in &c.headers {
+            for (k, v) in &c.limit_headers {
                 headers.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
         let retry_after = headers.contains_key("retry-after");
-        let reset = RESET_HEADERS
+        let resets: Vec<String> = RESET_HEADERS
             .iter()
-            .find_map(|h| headers.get(*h).map(|v| (h.to_string(), v.clone())));
+            .filter(|h| headers.contains_key(**h))
+            .map(|h| h.to_string())
+            .collect();
+        if resets.len() > 1 {
+            self.decide(
+                None,
+                "source.config.retry_on_response",
+                format!(
+                    "several rate-limit reset headers are documented; `{}` is read",
+                    resets[0]
+                ),
+                resets.clone(),
+            );
+        }
+        let reset = resets
+            .first()
+            .and_then(|h| headers.get(h).map(|v| (h.clone(), v.clone())));
         let remaining = REMAINING_HEADERS.iter().find(|h| headers.contains_key(**h));
         if !throttled && !retry_after && reset.is_none() {
             return Vec::new();
@@ -1562,7 +1747,7 @@ impl Mapper<'_> {
         let records: Vec<Value> = cur
             .as_array()?
             .iter()
-            .filter(|r| r.is_object())
+            .filter(|r| r.is_object() && !tainted(&faucet_core::util::canonical_json(r)))
             .take(MAX_EXAMPLE_RECORDS)
             .cloned()
             .collect();
@@ -1605,6 +1790,14 @@ impl Mapper<'_> {
         };
         if let Some(rp) = &records_path {
             cfg.insert("records_path".into(), json!(rp));
+            if !c.records_others.is_empty() {
+                self.decide(
+                    Some(&name),
+                    "records_path",
+                    format!("several arrays could hold the records; `{rp}` (a conventional wrapper name) was picked"),
+                    c.records_others.clone(),
+                );
+            }
         }
         let (pagination, label) = self.pagination(c, &name);
         if let Some(p) = pagination {
@@ -1719,17 +1912,25 @@ impl Mapper<'_> {
         let mut links: Vec<String> = Vec::new();
         let mut tokens: Vec<String> = Vec::new();
         let mut totals: Vec<String> = Vec::new();
+        let mut maybe_totals: Vec<String> = Vec::new();
+        let mut ambiguous_next: Vec<String> = Vec::new();
         for (segs, f) in &fields {
             let leaf = leaf_norm(segs);
             let parent_next = segs.len() == 2 && norm(&segs[0]) == "next" && leaf == "href";
+            let under_links = segs.len() == 2 && norm(&segs[0]) == "links";
             let raw = segs
                 .last()
                 .cloned()
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let linkish =
-                f.uri_like() || raw.contains("link") || raw.contains("url") || raw.contains("href");
-            if f.is_string()
+            let linkish = under_links
+                || f.uri_like()
+                || raw.contains("link")
+                || raw.contains("url")
+                || raw.contains("href");
+            if f.is_string() && !f.is_object() && leaf == "next" && !linkish {
+                ambiguous_next.push(jsonpath(segs, false));
+            } else if f.is_string()
                 && !f.is_object()
                 && (parent_next || NEXT_LINK_FIELDS.contains(&leaf.as_str()) && linkish)
             {
@@ -1742,7 +1943,18 @@ impl Mapper<'_> {
                 tokens.push(jsonpath(segs, false));
             } else if f.is_integer() && TOTAL_FIELDS.contains(&leaf.as_str()) {
                 totals.push(jsonpath(segs, false));
+            } else if f.is_integer() && MAYBE_TOTAL_FIELDS.contains(&leaf.as_str()) {
+                maybe_totals.push(jsonpath(segs, false));
             }
+        }
+        if !ambiguous_next.is_empty() {
+            self.decide(
+                Some(stream),
+                "pagination",
+                "a `next` field could be a cursor token or a next-page URL (the spec gives no format)".into(),
+                ambiguous_next,
+            );
+            return (None, None);
         }
         let link_header = c.headers.contains_key("link");
         let cursor_params = find(CURSOR_PARAMS);
@@ -1855,13 +2067,28 @@ impl Mapper<'_> {
                     .find_map(Value::as_u64)
                     .map(|n| if n == 0 { 0 } else { 1 })
                     .unwrap_or(1);
-                let size = find(SIZE_PARAMS).into_iter().find_map(|p| {
-                    p.schema
-                        .default
-                        .as_ref()
-                        .and_then(Value::as_u64)
-                        .map(|d| (p.name.clone(), d as usize))
-                });
+                let sizes: Vec<(String, usize)> = find(SIZE_PARAMS)
+                    .into_iter()
+                    .filter_map(|p| {
+                        p.schema
+                            .default
+                            .as_ref()
+                            .and_then(Value::as_u64)
+                            .map(|d| (p.name.clone(), d as usize))
+                    })
+                    .collect();
+                if sizes.len() > 1 {
+                    self.decide(
+                        Some(stream),
+                        "pagination.page_size_param",
+                        format!(
+                            "several page-size parameters have defaults; `{}` is used",
+                            sizes[0].0
+                        ),
+                        sizes.iter().map(|s| s.0.clone()).collect(),
+                    );
+                }
+                let size = sizes.into_iter().next();
                 (
                     Some(PaginationStyle::PageNumber {
                         param_name: page.name.clone(),
@@ -1873,14 +2100,29 @@ impl Mapper<'_> {
                 )
             }
             (None, Some(off)) => {
-                let limit = find(LIMIT_PARAMS).into_iter().find_map(|p| {
-                    p.schema
-                        .default
-                        .as_ref()
-                        .or(p.schema.maximum.as_ref())
-                        .and_then(Value::as_u64)
-                        .map(|d| (p.name.clone(), d as usize))
-                });
+                let limits: Vec<(String, usize)> = find(LIMIT_PARAMS)
+                    .into_iter()
+                    .filter_map(|p| {
+                        p.schema
+                            .default
+                            .as_ref()
+                            .or(p.schema.maximum.as_ref())
+                            .and_then(Value::as_u64)
+                            .map(|d| (p.name.clone(), d as usize))
+                    })
+                    .collect();
+                if limits.len() > 1 {
+                    self.decide(
+                        Some(stream),
+                        "pagination.limit_param",
+                        format!(
+                            "several limit parameters have a default or maximum; `{}` is used",
+                            limits[0].0
+                        ),
+                        limits.iter().map(|s| s.0.clone()).collect(),
+                    );
+                }
+                let limit = limits.into_iter().next();
                 let Some((limit_param, limit)) = limit else {
                     self.decide(
                         Some(stream),
@@ -1898,7 +2140,7 @@ impl Mapper<'_> {
                         offset_param: off.name.clone(),
                         limit_param,
                         limit,
-                        total_path: (totals.len() == 1).then(|| totals[0].clone()),
+                        total_path: self.total_path(stream, totals, maybe_totals),
                         rows_path: None,
                         stop_when_short: false,
                     }),
@@ -1906,28 +2148,74 @@ impl Mapper<'_> {
                 )
             }
             (None, None) => {
-                let hints: Vec<String> = c
-                    .envelope
-                    .props
-                    .keys()
-                    .filter(|k| {
-                        let n = norm(k);
+                let mut hints: Vec<String> = fields
+                    .iter()
+                    .filter(|(segs, _)| {
+                        let n = leaf_norm(segs);
                         n.starts_with("hasmore")
                             || n.starts_with("next")
                             || n == "paging"
                             || n == "pagination"
                     })
-                    .cloned()
+                    .map(|(segs, _)| jsonpath(segs, false))
+                    .collect();
+                hints.sort();
+                let sizes: Vec<String> = find(SIZE_PARAMS)
+                    .into_iter()
+                    .chain(find(LIMIT_PARAMS))
+                    .map(|p| p.name.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
                     .collect();
                 if !hints.is_empty() {
                     self.decide(
                         Some(stream),
                         "pagination",
                         "the response looks paginated but no documented parameter drives it (paging documented in prose?)".into(),
-                        hints,
+                        hints.into_iter().chain(sizes).collect(),
+                    );
+                } else if !sizes.is_empty() {
+                    self.decide(
+                        Some(stream),
+                        "pagination",
+                        "a page-size parameter is documented but nothing advances to the next page; only the first page would be read".into(),
+                        sizes,
                     );
                 }
                 (None, None)
+            }
+        }
+    }
+
+    /// The offset total: one unambiguous total field, never a `count` that
+    /// may be the page size.
+    fn total_path(
+        &mut self,
+        stream: &str,
+        totals: Vec<String>,
+        maybe: Vec<String>,
+    ) -> Option<String> {
+        match totals.len() {
+            1 => totals.into_iter().next(),
+            0 => {
+                if !maybe.is_empty() {
+                    self.decide(
+                        Some(stream),
+                        "pagination.total_path",
+                        "a count field may be the page size rather than the total; left unset (paging stops on an empty page)".into(),
+                        maybe,
+                    );
+                }
+                None
+            }
+            _ => {
+                self.decide(
+                    Some(stream),
+                    "pagination.total_path",
+                    "several fields could hold the total; left unset (paging stops on an empty page)".into(),
+                    totals,
+                );
+                None
             }
         }
     }
@@ -1991,11 +2279,26 @@ impl Mapper<'_> {
             .filter(|p| p.location == "query")
             .filter(|p| {
                 let l = p.name.to_ascii_lowercase();
-                l == "since"
-                    || words.iter().any(|w| l.contains(w))
-                        && FILTER_WORDS.iter().any(|w| l.contains(w))
+                words.iter().any(|w| l.contains(w)) && FILTER_WORDS.iter().any(|w| l.contains(w))
             })
             .collect();
+        if filters.is_empty()
+            && let Some(p) = c
+                .params
+                .iter()
+                .find(|p| p.location == "query" && p.name.eq_ignore_ascii_case("since"))
+        {
+            self.decide(
+                Some(stream),
+                "replication_bind",
+                format!(
+                    "filter parameter `{}` does not say which field it compares (created or updated)",
+                    p.name
+                ),
+                Vec::new(),
+            );
+            return None;
+        }
         let stamps: Vec<String> = c
             .item
             .props
@@ -2014,8 +2317,29 @@ impl Mapper<'_> {
         match (filters.as_slice(), stamps.as_slice()) {
             ([], _) => None,
             ([f], [s]) => {
+                let text = f
+                    .schema
+                    .description
+                    .clone()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 let format = if f.schema.is_integer() {
-                    BindFormat::EpochS
+                    if text.contains("millisecond") {
+                        BindFormat::EpochMs
+                    } else if text.contains("second") {
+                        BindFormat::EpochS
+                    } else {
+                        self.decide(
+                            Some(stream),
+                            "replication_bind",
+                            format!(
+                                "integer filter parameter `{}` does not say whether it takes epoch seconds or milliseconds",
+                                f.name
+                            ),
+                            Vec::new(),
+                        );
+                        return None;
+                    }
                 } else if f.schema.format.as_deref() == Some("date") {
                     BindFormat::Date
                 } else {
@@ -2868,10 +3192,11 @@ mod tests {
             "/a": list(json!([]), items(json!({"account_id": {}, "region": {}}))),
             "/b": list(json!([]), json!({"type": "array", "items": {"x-primary-key": ["org", "n"], "properties": {"org": {}, "n": {}}}})),
             "/c": list(json!([]), json!({"type": "array", "items": {"required": ["uuid"], "properties": {"uuid": {}, "x": {}}}})),
-            "/d": list(json!([q("updated_since", json!({"type": "integer"}))]), items(json!({"id": {}, "updated_at": {"type": "integer"}}))),
+            "/d": list(json!([q("updated_since", json!({"type": "integer", "description": "Unix time in seconds"}))]), items(json!({"id": {}, "updated_at": {"type": "integer"}}))),
             "/e": list(json!([q("modified_after", json!({"format": "date"}))]), items(json!({"id": {}, "modifiedAt": {"format": "date-time"}}))),
             "/f": list(json!([q("updated_after", json!({}))]), items(json!({"id": {}}))),
             "/g": list(json!([q("since", json!({}))]), items(json!({"id": {}, "updated_at": {}, "modified": {}}))),
+            "/g2": list(json!([q("updated_since", json!({}))]), items(json!({"id": {}, "updated_at": {}, "modified": {}}))),
             "/h": list(json!([q("updated_since", json!({})), q("modified_since", json!({}))]), items(json!({"id": {}, "updated_at": {}}))),
             "/audit/logs": list(json!([q("created_after", json!({"format": "date-time"}))]), items(json!({"id": {}, "created_at": {"format": "date-time"}}))),
             "/req": list(json!([{"name": "account", "in": "query", "required": true}, {"name": "limit", "in": "query", "required": true}]), items(json!({"id": {}}))),
@@ -2910,7 +3235,8 @@ mod tests {
         for want in [
             ("a", "primary_keys"),
             ("f", "replication_key"),
-            ("g", "replication_key"),
+            ("g", "replication_bind"),
+            ("g2", "replication_key"),
             ("h", "replication_bind"),
             ("req", "source.config.query_params"),
         ] {
@@ -2919,7 +3245,12 @@ mod tests {
                 "{want:?} not in {by:?}"
             );
         }
-        assert_eq!(by.iter().filter(|(s, _)| s == "req").count(), 1);
+        assert_eq!(
+            by.iter()
+                .filter(|(s, f)| s == "req" && f == "source.config.query_params")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3099,10 +3430,15 @@ mod tests {
 
     #[test]
     fn deep_compositions_are_refused() {
-        let mut v = base(json!({"/a": list(json!([]), json!({"$ref": "#/components/schemas/L"}))}));
+        let mut v = base(json!({
+            "/a": list(json!([]), json!({"$ref": "#/components/schemas/L"})),
+            "/b": list(json!([]), items(json!({"id": {}}))),
+        }));
         v["components"] =
             json!({"schemas": {"L": {"allOf": [{"$ref": "#/components/schemas/L"}]}}});
-        assert!(err(v).contains("nested deeper"));
+        let i = imp(v);
+        assert_eq!(i.template.stream_names(), vec!["b"]);
+        assert!(i.report.skipped[0].reason.contains("nested deeper"));
     }
 
     #[test]
@@ -3132,6 +3468,364 @@ mod tests {
                 .message
                 .contains("no declared scheme")
         );
+    }
+
+    fn decided<'a>(i: &'a Imported, field: &str) -> Vec<&'a Decision> {
+        i.report
+            .decisions
+            .iter()
+            .filter(|d| d.field == field)
+            .collect()
+    }
+
+    #[test]
+    fn count_fields_are_never_an_offset_total() {
+        let page = json!([q("offset", json!({})), q("limit", json!({"default": 25}))]);
+        let (p, i) = paged(
+            page.clone(),
+            env(json!({"count": {"type": "integer"}})),
+            json!({}),
+        );
+        assert!(p.unwrap()["total_path"].is_null());
+        assert_eq!(
+            decided(&i, "pagination.total_path")[0].candidates,
+            vec!["$.count".to_string()]
+        );
+        let (p, i) = paged(
+            page.clone(),
+            env(json!({"count": {"type": "integer"}, "total": {"type": "integer"}})),
+            json!({}),
+        );
+        assert_eq!(p.unwrap()["total_path"], json!("$.total"));
+        assert!(decided(&i, "pagination.total_path").is_empty());
+        let (p, i) = paged(
+            page,
+            env(
+                json!({"total": {"type": "integer"}, "meta": {"properties": {"total_count": {"type": "integer"}}}}),
+            ),
+            json!({}),
+        );
+        assert!(p.unwrap()["total_path"].is_null());
+        assert_eq!(decided(&i, "pagination.total_path")[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn a_page_size_without_a_driver_is_a_decision() {
+        let (p, i) = paged(
+            json!([q("limit", json!({"default": 25}))]),
+            items(json!({"id": {}})),
+            json!({}),
+        );
+        assert!(p.is_none());
+        let d = decided(&i, "pagination");
+        assert!(d[0].message.contains("only the first page"), "{d:?}");
+        assert_eq!(d[0].candidates, vec!["limit".to_string()]);
+        let (_, i) = paged(
+            json!([q("per_page", json!({}))]),
+            env(json!({"meta": {"properties": {"has_more": {"type": "boolean"}}}})),
+            json!({}),
+        );
+        let d = decided(&i, "pagination");
+        assert_eq!(
+            d[0].candidates,
+            vec!["$.meta.has_more".to_string(), "per_page".to_string()]
+        );
+    }
+
+    #[test]
+    fn interpolation_directives_in_the_spec_are_refused() {
+        let mut v = base(json!({
+            "/${env:SECRET}": list(json!([]), items(json!({"id": {}}))),
+            "/ok": {"get": {"summary": "${file:/etc/passwd}", "parameters": [
+                    {"name": "${env:P}", "in": "query", "required": true}],
+                "responses": {"200": {"content": {"application/json": {
+                    "schema": items(json!({"id": {}, "${env:F}": {"type": "object"}})),
+                    "example": [{"id": 1}, {"id": "${env:X}"}]}}}}}},
+        }));
+        v["servers"] = json!([{"url": "https://${env:HOST}/v1"}]);
+        v["info"] = json!({"title": "${env:T}", "description": "${env:D}"});
+        v["externalDocs"] = json!({"url": "https://example.com/${env:U}"});
+        let i = import(
+            &set(v.clone()),
+            &ImportOptions {
+                name: Some("demo".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(i.template.stream_names(), vec!["ok"]);
+        assert!(i.template.params[API_ROOT].required);
+        assert!(i.template.docs.is_none());
+        assert_eq!(
+            i.template.description.as_deref(),
+            Some("demo (imported from its OpenAPI description)")
+        );
+        assert!(stream(&i, "ok").description.is_none());
+        assert!(i.template.transforms.is_empty());
+        assert_eq!(i.suite.suite.behavioral[0].input, json!([{"id": 1}]));
+        let scopes: Vec<&str> = i
+            .report
+            .unsupported
+            .iter()
+            .map(|u| u.scope.as_str())
+            .collect();
+        assert!(scopes.contains(&"path /${env:SECRET}"), "{scopes:?}");
+        assert!(
+            scopes.contains(&"server https://${env:HOST}/v1"),
+            "{scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|s| s.starts_with("names ")
+                && s.contains("${env:F}")
+                && s.contains("${env:P}")),
+            "{scopes:?}"
+        );
+        assert!(decided(&i, "source.config.query_params").is_empty());
+        for (scheme, needle) in [
+            (
+                json!({"type": "apiKey", "in": "header", "name": "${env:K}"}),
+                "API key's name",
+            ),
+            (
+                json!({"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "https://a.example.com/${env:T}"}}}),
+                "token URL",
+            ),
+        ] {
+            let i = with_auth(json!({"s": scheme}), json!([{"s": ["${env:S}"]}]));
+            assert!(i.template.source.config.get("auth").is_none());
+            assert!(
+                i.report.unsupported[0].message.contains(needle),
+                "{:?}",
+                i.report.unsupported
+            );
+        }
+        let i = with_auth(
+            json!({"s": {"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "https://a.example.com/t"}}}}),
+            json!([{"s": ["read", "${env:S}"]}]),
+        );
+        assert_eq!(
+            i.template.source.config["auth"]["config"]["scopes"],
+            json!(["read"])
+        );
+        let e = import(
+            &set(v),
+            &ImportOptions {
+                server: Some("https://${env:H}".into()),
+                name: Some("demo".into()),
+                ..opts()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("--server"), "{e}");
+    }
+
+    #[test]
+    fn auth_ties_and_compound_requirements_are_reported() {
+        let mut v = base(json!({
+            "/a": {"get": {"security": [{"b": []}], "responses": ok(items(json!({"id": {}})))}},
+            "/c": {"get": {"security": [{"a": []}], "responses": ok(items(json!({"id": {}})))}},
+        }));
+        v["components"] = json!({"securitySchemes": {
+            "a": {"type": "http", "scheme": "bearer"}, "b": {"type": "apiKey", "in": "header", "name": "K"}}});
+        let i = imp(v.clone());
+        assert_eq!(i.template.source.config["auth"]["type"], json!("bearer"));
+        assert_eq!(
+            decided(&i, "source.config.auth")[0].candidates,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        v["security"] = json!([{"a": [], "b": []}]);
+        v["paths"] = json!({"/x": list(json!([]), items(json!({"id": {}})))});
+        let i = imp(v);
+        assert!(i.template.source.config.get("auth").is_none());
+        assert_eq!(i.report.unsupported[0].scope, "security a + b");
+    }
+
+    #[test]
+    fn next_links_under_links_and_ambiguous_next_fields() {
+        let (p, _) = paged(
+            json!([]),
+            env(json!({"links": {"properties": {"next": {"type": "string"}}}})),
+            json!({}),
+        );
+        assert_eq!(p.unwrap()["next_link_path"], json!("$.links.next"));
+        let (p, _) = paged(
+            json!([]),
+            env(json!({"_links": {"properties": {"next": {"type": "string"}}}})),
+            json!({}),
+        );
+        assert_eq!(p.unwrap()["next_link_path"], json!("$._links.next"));
+        let (p, i) = paged(
+            json!([q("cursor", json!({}))]),
+            env(json!({"next": {"type": "string"}})),
+            json!({}),
+        );
+        assert!(p.is_none());
+        assert_eq!(
+            decided(&i, "pagination")[0].candidates,
+            vec!["$.next".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_wrapper_picked_among_several_arrays_is_reported() {
+        let i = one(
+            "/things",
+            list(
+                json!([]),
+                json!({"properties": {
+            "data": items(json!({"id": {}})), "included": items(json!({"id": {}}))}}),
+            ),
+        );
+        assert_eq!(cfg(&i, "things")["records_path"], json!("$.data[*]"));
+        assert_eq!(
+            decided(&i, "records_path")[0].candidates,
+            vec!["$.data[*]".to_string(), "$.included[*]".to_string()]
+        );
+    }
+
+    #[test]
+    fn diamond_compositions_finish_and_the_node_budget_holds() {
+        let mut schemas = Map::new();
+        for n in 0..30 {
+            let next = format!("#/components/schemas/S{}", n + 1);
+            schemas.insert(
+                format!("S{n}"),
+                json!({"allOf": [{"$ref": next}, {"$ref": next}]}),
+            );
+        }
+        schemas.insert("S30".into(), json!({"properties": {"id": {}}}));
+        let mut v = base(
+            json!({"/a": list(json!([]), json!({"type": "array", "items": {"$ref": "#/components/schemas/S0"}}))}),
+        );
+        v["components"] = json!({"schemas": schemas});
+        let started = std::time::Instant::now();
+        let i = imp(v);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(stream(&i, "a").primary_keys, vec!["id".to_string()]);
+        let s = set(json!({"openapi": "3.0.0", "paths": {}}));
+        let m = Mapper {
+            set: &s,
+            v2: false,
+            root_key: s.root_key(),
+            report: ImportReport::default(),
+            flat_cache: RefCell::new(HashMap::new()),
+            flat_calls: Cell::new(MAX_FLATTEN_NODES),
+            tainted: RefCell::new(BTreeSet::new()),
+        };
+        let e = m
+            .flatten(
+                &Loc {
+                    base: s.root_key(),
+                    v: json!({}),
+                },
+                0,
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("too complex"), "{e}");
+    }
+
+    #[test]
+    fn incremental_formats_need_documenting() {
+        let i = imp(base(json!({
+            "/a": list(json!([q("updated_since", json!({"type": "integer"}))]), items(json!({"id": {}, "updated_at": {"type": "integer"}}))),
+            "/b": list(json!([q("updated_since", json!({"type": "integer", "description": "epoch milliseconds"}))]), items(json!({"id": {}, "updated_at": {"type": "integer"}}))),
+        })));
+        assert!(cfg(&i, "a").get("replication_key").is_none());
+        assert!(
+            decided(&i, "replication_bind")[0]
+                .message
+                .contains("seconds or milliseconds")
+        );
+        assert_eq!(
+            cfg(&i, "b")["replication_bind"]["format"],
+            json!("epoch_ms")
+        );
+    }
+
+    #[test]
+    fn first_of_list_picks_are_reported() {
+        let mut v = base(json!({
+            "/p": list(json!([q("page", json!({})), q("per_page", json!({"default": 10})), q("limit", json!({"default": 20}))]), items(json!({"id": {}}))),
+            "/o": list(json!([q("offset", json!({})), q("limit", json!({"default": 20})), q("top", json!({"maximum": 99}))]), items(json!({"id": {}}))),
+            "/p/{p_id}/c": list(json!([]), items(json!({"id": {}}))),
+            "/r": {"get": {"responses": {
+                "200": {"headers": {"X-RateLimit-Reset": {"description": "seconds"}, "RateLimit-Reset": {}}, "content": {"application/json": {"schema": items(json!({"id": {}}))}}},
+            }}},
+        }));
+        v["servers"] = json!([{"url": "https://a.example.com"}, {"url": "https://b.example.com"}]);
+        let i = imp(v);
+        assert_eq!(
+            i.template.params[API_ROOT].default,
+            Some(json!("https://a.example.com"))
+        );
+        assert_eq!(decided(&i, "params.api_root")[0].candidates.len(), 2);
+        assert_eq!(
+            cfg(&i, "p")["pagination"]["page_size_param"],
+            json!("per_page")
+        );
+        assert_eq!(decided(&i, "pagination.page_size_param").len(), 1);
+        assert_eq!(cfg(&i, "o")["pagination"]["limit_param"], json!("limit"));
+        assert_eq!(decided(&i, "pagination.limit_param").len(), 1);
+        assert!(
+            decided(&i, "source.config.retry_on_response")[0]
+                .candidates
+                .len()
+                == 2
+        );
+        assert!(decided(&i, "parent_key")[0].message.contains("{p_id}"));
+    }
+
+    #[test]
+    fn pagination_reads_only_the_success_response() {
+        let i = one(
+            "/a",
+            json!({"get": {"responses": {
+                "200": {"content": {"application/json": {"schema": items(json!({"id": {}}))}}},
+                "404": {"headers": {"Link": {}, "X-RateLimit-Reset": {"description": "seconds"}}},
+            }}}),
+        );
+        assert!(cfg(&i, "a").get("pagination").is_none());
+        assert!(i.template.source.config.get("retry_on_response").is_none());
+        let i = one(
+            "/a",
+            json!({"get": {"responses": {
+                "200": {"content": {"application/json": {"schema": items(json!({"id": {}}))}}},
+                "429": {"headers": {"X-RateLimit-Reset": {"description": "seconds"}}},
+            }}}),
+        );
+        assert_eq!(
+            i.template.source.config["retry_on_response"][0]["backoff_from"]["config"]["unit"],
+            json!("seconds")
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_reference_skips_only_its_operation() {
+        let i = imp(base(json!({
+            "/a": list(json!([]), json!({"$ref": "#/components/schemas/Missing"})),
+            "/b": {"$ref": "#/nope"},
+            "/c": list(json!([]), items(json!({"id": {}}))),
+        })));
+        assert_eq!(i.template.stream_names(), vec!["c"]);
+        let mut reasons: Vec<&str> = i.report.skipped.iter().map(|s| s.path.as_str()).collect();
+        reasons.sort();
+        assert_eq!(reasons, vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn a_relative_server_flag_with_a_local_spec_is_refused() {
+        let v = base(json!({"/a": list(json!([]), items(json!({"id": {}})))}));
+        let e = import(
+            &set(v),
+            &ImportOptions {
+                server: Some("/v2".into()),
+                ..opts()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("--server /v2") && e.contains("absolute"), "{e}");
     }
 
     #[test]

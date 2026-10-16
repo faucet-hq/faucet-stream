@@ -334,11 +334,17 @@ fn output_is_deterministic_and_matches_the_committed_example() {
             .iter()
             .map(|d| format!("{}:{}", d.stream.clone().unwrap_or_default(), d.field))
             .collect();
-        assert_eq!(decisions, vec!["notes:pagination".to_string()]);
+        assert_eq!(
+            decisions,
+            vec![
+                "/customers/{customer_id}/orders:parent_key".to_string(),
+                "notes:pagination".to_string()
+            ]
+        );
 
         let doc: serde_json::Value = serde_json::from_str(&first.to_json().unwrap()).unwrap();
         assert_eq!(doc["template"]["name"], json!("example-store"));
-        assert_eq!(doc["report"]["decisions"][0]["field"], json!("pagination"));
+        assert_eq!(doc["report"]["decisions"][1]["field"], json!("pagination"));
         assert_eq!(doc["report"]["skipped"].as_array().unwrap().len(), 2);
         assert_eq!(
             doc["suite"]["sink"],
@@ -435,6 +441,13 @@ paths:
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(path("/api/escape.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                root.replace("parts/thing.yaml#/Thing", "/\\\\evil.example.com/x.yaml"),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/docs"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -469,6 +482,14 @@ paths:
         .unwrap_err()
         .to_string();
         assert!(remote.contains("--allow-remote-refs"), "{remote}");
+        let escape = import_openapi(&request(
+            &format!("{}/api/escape.yaml", server.uri()),
+            tmp.path(),
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(escape.contains("malformed"), "{escape}");
         let html = import_openapi(&request(&format!("{}/docs", server.uri()), tmp.path()))
             .await
             .unwrap_err()

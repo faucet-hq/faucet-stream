@@ -159,49 +159,142 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Every `$ref` string in a document.
+/// Keys whose value is a map of names (each entry an object of its own kind),
+/// so a member called `example` or `default` is a name, not a keyword.
+const NAME_MAPS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "schemas",
+    "parameters",
+    "responses",
+    "headers",
+    "securitySchemes",
+    "securityDefinitions",
+    "requestBodies",
+    "links",
+    "callbacks",
+    "pathItems",
+    "paths",
+    "content",
+    "variables",
+    "encoding",
+    "dependentSchemas",
+];
+
+/// Keys whose value is literal data in OpenAPI, where a `$ref` key is not a
+/// reference and is never followed.
+fn literal_key(k: &str) -> bool {
+    matches!(
+        k,
+        "example" | "default" | "enum" | "const" | "externalValue"
+    ) || k.starts_with("x-")
+}
+
+/// Every `$ref` string in a document, outside literal data (`example`,
+/// `default`, `enum`, `x-*` extensions, an Example Object's `value`).
 pub fn collect_refs(v: &Value, out: &mut BTreeSet<String>) {
+    walk_refs(v, Ctx::Keyword, out);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ctx {
+    Keyword,
+    Names,
+    Examples,
+    Example,
+}
+
+fn walk_refs(v: &Value, ctx: Ctx, out: &mut BTreeSet<String>) {
     match v {
         Value::Object(m) => {
             for (k, x) in m {
-                if k == "$ref"
-                    && let Some(s) = x.as_str()
-                {
-                    out.insert(s.to_string());
-                } else {
-                    collect_refs(x, out);
-                }
+                let child = match ctx {
+                    Ctx::Names => Ctx::Keyword,
+                    Ctx::Examples => Ctx::Example,
+                    Ctx::Example if k == "value" => continue,
+                    _ if k == "$ref" => {
+                        if let Some(s) = x.as_str() {
+                            out.insert(s.to_string());
+                        }
+                        continue;
+                    }
+                    _ if literal_key(k) => continue,
+                    _ if k == "examples" => {
+                        if x.is_array() {
+                            continue;
+                        }
+                        Ctx::Examples
+                    }
+                    _ if NAME_MAPS.contains(&k.as_str()) => Ctx::Names,
+                    _ => Ctx::Keyword,
+                };
+                walk_refs(x, child, out);
             }
         }
-        Value::Array(a) => a.iter().for_each(|x| collect_refs(x, out)),
+        Value::Array(a) => a.iter().for_each(|x| walk_refs(x, Ctx::Keyword, out)),
         _ => {}
     }
 }
 
 /// The document a reference found in `base` needs loaded, or `None` for a
-/// same-document reference. Absolute and network-path references are refused
-/// unless `allow_remote` is set.
-pub fn ref_target(base: &Url, r: &str, allow_remote: bool) -> CliResult<Option<Url>> {
+/// same-document reference. Without `allow_remote` only relative references
+/// are followed, and only to the root spec's origin (scheme, host and port)
+/// and, for a local spec, inside the root spec's directory. A `file:`
+/// reference is never followed from a remote document.
+pub fn ref_target(root: &Url, base: &Url, r: &str, allow_remote: bool) -> CliResult<Option<Url>> {
     let (doc_part, _) = split_ref(r);
     if doc_part.is_empty() {
         return Ok(None);
     }
-    let absolute = Url::parse(doc_part).is_ok() || doc_part.starts_with("//");
-    if absolute && !allow_remote {
+    let refuse = |why: &str| {
+        Err(CliError::Config(format!(
+            "spec: `$ref: {r}` {why}; only same-document and relative references inside the \
+             spec's location are followed (pass --allow-remote-refs to follow other locations)"
+        )))
+    };
+    if doc_part.trim() != doc_part
+        || doc_part.contains('\\')
+        || doc_part.chars().any(char::is_control)
+    {
         return Err(CliError::Config(format!(
-            "spec: `$ref: {r}` names another location; only same-document and relative \
-             references are followed (pass --allow-remote-refs to follow it)"
+            "spec: `$ref: {r}` is malformed (whitespace or a backslash in the location)"
         )));
     }
     let target = base
         .join(doc_part)
         .map_err(|e| CliError::Config(format!("spec: `$ref: {r}` does not resolve: {e}")))?;
-    if !allow_remote && target.scheme() != base.scheme() {
+    if base.scheme() != "file" && target.scheme() == "file" {
         return Err(CliError::Config(format!(
-            "spec: `$ref: {r}` leaves the spec's location (pass --allow-remote-refs to follow it)"
+            "spec: `$ref: {r}` points a remote document at a local file, which is never followed"
         )));
     }
+    if allow_remote {
+        return Ok(Some(target));
+    }
+    if Url::parse(doc_part).is_ok() || doc_part.starts_with("//") {
+        return refuse("names another location");
+    }
+    if target.scheme() != root.scheme()
+        || target.host_str() != root.host_str()
+        || target.port_or_known_default() != root.port_or_known_default()
+    {
+        return refuse("leaves the spec's origin");
+    }
+    if target.scheme() == "file" && !target.path().starts_with(&root_dir(root)) {
+        return refuse("leaves the spec's directory");
+    }
     Ok(Some(target))
+}
+
+/// The directory part of a URL's path, with its trailing `/`.
+pub fn root_dir(root: &Url) -> String {
+    let p = root.path();
+    match p.rfind('/') {
+        Some(i) => p[..=i].to_string(),
+        None => "/".into(),
+    }
 }
 
 #[cfg(test)]
@@ -303,11 +396,46 @@ mod tests {
     }
 
     #[test]
+    fn refs_in_literal_data_are_not_followed() {
+        let mut out = BTreeSet::new();
+        collect_refs(
+            &json!({
+                "example": {"$ref": "/etc/passwd"},
+                "x-vendor": {"$ref": "secret.yaml"},
+                "default": {"$ref": "d.yaml"},
+                "enum": [{"$ref": "e.yaml"}],
+                "content": {"application/json": {"examples": {
+                    "one": {"$ref": "#/components/examples/A", "value": {"$ref": "v.yaml"}},
+                }}},
+                "schema": {"examples": [{"$ref": "arr.yaml"}], "properties": {
+                    "example": {"$ref": "prop.yaml"},
+                    "default": {"$ref": "#/d"},
+                }},
+            }),
+            &mut out,
+        );
+        assert_eq!(
+            out.into_iter().collect::<Vec<_>>(),
+            vec![
+                "#/components/examples/A".to_string(),
+                "#/d".to_string(),
+                "prop.yaml".to_string()
+            ]
+        );
+    }
+
+    fn refused(root: &str, base: &str, r: &str, remote: bool) -> String {
+        ref_target(&url(root), &url(base), r, remote)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
     fn remote_references_need_an_opt_in() {
         let base = url("file:///spec/api.yaml");
-        assert_eq!(ref_target(&base, "#/a", false).unwrap(), None);
+        assert_eq!(ref_target(&base, &base, "#/a", false).unwrap(), None);
         assert_eq!(
-            ref_target(&base, "parts/c.yaml#/x", false).unwrap(),
+            ref_target(&base, &base, "parts/c.yaml#/x", false).unwrap(),
             Some(url("file:///spec/parts/c.yaml"))
         );
         for r in [
@@ -315,19 +443,65 @@ mod tests {
             "//example.com/s.yaml",
             "file:///etc/x",
         ] {
-            let e = ref_target(&base, r, false).unwrap_err();
-            assert!(e.to_string().contains("--allow-remote-refs"), "{e}");
+            let e = refused("file:///spec/api.yaml", "file:///spec/api.yaml", r, false);
+            assert!(e.contains("--allow-remote-refs"), "{e}");
         }
         assert_eq!(
-            ref_target(&base, "https://example.com/s.yaml", true).unwrap(),
+            ref_target(&base, &base, "https://example.com/s.yaml", true).unwrap(),
             Some(url("https://example.com/s.yaml"))
         );
         let web = url("https://example.com/v1/openapi.yaml");
         assert_eq!(
-            ref_target(&web, "schemas.yaml", false).unwrap(),
+            ref_target(&web, &web, "schemas.yaml", false).unwrap(),
             Some(url("https://example.com/v1/schemas.yaml"))
         );
         let opaque = url("data:text/plain,x");
-        assert!(ref_target(&opaque, "rel.yaml", false).is_err());
+        assert!(ref_target(&opaque, &opaque, "rel.yaml", false).is_err());
+        assert_eq!(root_dir(&url("data:x")), "/");
+    }
+
+    #[test]
+    fn escapes_are_refused() {
+        let web = "https://api.example.com/v1/openapi.yaml";
+        for r in [
+            "\\\\evil.example\\x.yaml",
+            "/\\evil.example/x",
+            " //evil.example/x",
+            "x.yaml\n",
+        ] {
+            assert!(refused(web, web, r, false).contains("malformed"), "{r:?}");
+        }
+        assert!(
+            refused(web, web, "https://api.example.com:8443/x.yaml", false)
+                .contains("another location")
+        );
+        let local = "file:///home/u/spec/api.yaml";
+        assert!(refused(local, local, "/etc/hosts", false).contains("directory"));
+        assert!(refused(local, local, "../../../../etc/x.yaml", false).contains("directory"));
+        assert!(
+            refused(
+                local,
+                "file:///home/u/spec/parts/a.yaml",
+                "../../x.yaml",
+                false
+            )
+            .contains("directory")
+        );
+        assert!(
+            ref_target(
+                &url(local),
+                &url("file:///home/u/spec/parts/a.yaml"),
+                "../b.yaml",
+                false
+            )
+            .unwrap()
+            .is_some()
+        );
+        for remote in [false, true] {
+            assert!(refused(web, web, "file:///etc/passwd", remote).contains("never followed"));
+        }
+        assert!(
+            refused(web, "https://other.example.com/x.yaml", "y.yaml", false).contains("origin")
+        );
     }
 }

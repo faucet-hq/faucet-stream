@@ -112,8 +112,14 @@ pub async fn import_openapi(req: &ImportRequest) -> CliResult<ImportOutput> {
             "hub import: the rendered template does not read back to what was generated".into(),
         ));
     }
+    check_tokens(&template_yaml, t)?;
     let suite_rel = format!("tests/{owner}/{}/suite.yaml", t.name);
     let suite_yaml = render_suite(&imported.suite, &suite_rel)?;
+    if suite_yaml.contains("${") {
+        return Err(CliError::Internal(
+            "hub import: the draft suite would carry an interpolation directive".into(),
+        ));
+    }
     SuiteFile::parse(&suite_yaml)?;
     let template_path = req
         .out
@@ -151,7 +157,13 @@ pub async fn import_openapi(req: &ImportRequest) -> CliResult<ImportOutput> {
                     refused.push(format!("{}:\n{d}", path.display()));
                 }
             }
-            Err(_) => pending.push((path, text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => pending.push((path, text)),
+            Err(e) => {
+                return Err(CliError::Config(format!(
+                    "hub import: cannot read the existing {} to compare it ({e}); fix or remove it",
+                    path.display()
+                )));
+            }
         }
     }
     if !refused.is_empty() {
@@ -173,10 +185,45 @@ pub async fn import_openapi(req: &ImportRequest) -> CliResult<ImportOutput> {
     Ok(out)
 }
 
+/// Every `${…}` in the rendered template must be one the importer wrote: a
+/// declared param, the bind's `${bookmark}`, or a parent stream's field.
+fn check_tokens(text: &str, t: &SourceTemplate) -> CliResult<()> {
+    let mut allowed: BTreeSet<String> = t.params.keys().map(|k| format!("param.{k}")).collect();
+    allowed.insert("bookmark".into());
+    let parents: BTreeSet<&str> = t
+        .streams
+        .iter()
+        .filter_map(|s| s.parent.as_deref())
+        .collect();
+    let mut rest = text;
+    while let Some(i) = rest.find("${") {
+        let after = &rest[i + 2..];
+        let end = after.find('}').unwrap_or(after.len());
+        let tok = &after[..end];
+        let parent_field = tok.split_once('.').is_some_and(|(p, f)| {
+            parents.contains(p)
+                && !f.is_empty()
+                && f.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+        if !allowed.contains(tok) && !parent_field {
+            return Err(CliError::Internal(format!(
+                "hub import: the generated template would carry the directive `${{{tok}}}`"
+            )));
+        }
+        rest = &after[end..];
+    }
+    Ok(())
+}
+
 /// How the spec is named in the generated file's header: a URL without
 /// credentials, or a file's name (so the output does not depend on where the
 /// import ran).
 fn origin_label(spec: &str) -> String {
+    origin_text(spec).replace("${", "$ {")
+}
+
+fn origin_text(spec: &str) -> String {
     if is_url(spec) {
         faucet_core::util::redact_uri_credentials(spec)
     } else {
@@ -220,17 +267,20 @@ pub async fn load_spec(spec: &str, allow_remote_refs: bool) -> CliResult<SpecSet
     let fetcher = Fetcher::new()?;
     let doc = parse_document(&fetcher.read(&root).await?, &root)?;
     let mut set = SpecSet::single(root.clone(), doc);
-    let mut queue = vec![root];
+    let mut queue = vec![root.clone()];
     while let Some(url) = queue.pop() {
         let mut found = BTreeSet::new();
         if let Some(d) = set.get(&url) {
             refs::collect_refs(d, &mut found);
         }
         for r in found {
-            let Some(mut target) = refs::ref_target(&url, &r, allow_remote_refs)? else {
+            let Some(mut target) = refs::ref_target(&root, &url, &r, allow_remote_refs)? else {
                 continue;
             };
             target.set_fragment(None);
+            if !allow_remote_refs {
+                contained(&root, &target, &r)?;
+            }
             if set.contains(&target) {
                 continue;
             }
@@ -245,6 +295,57 @@ pub async fn load_spec(spec: &str, allow_remote_refs: bool) -> CliResult<SpecSet
         }
     }
     Ok(set)
+}
+
+/// A local reference must stay inside the root spec's directory once
+/// symlinks are resolved.
+fn contained(root: &Url, target: &Url, r: &str) -> CliResult<()> {
+    if target.scheme() != "file" {
+        return Ok(());
+    }
+    let resolve = |u: &Url| {
+        u.to_file_path()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+    };
+    let dir = root
+        .to_file_path()
+        .ok()
+        .and_then(|p| p.parent().and_then(|d| std::fs::canonicalize(d).ok()));
+    match (dir, resolve(target)) {
+        (Some(d), Some(t)) if t.starts_with(&d) => Ok(()),
+        (_, None) => Err(CliError::Config(format!(
+            "spec: `$ref: {r}` names a file that does not exist"
+        ))),
+        _ => Err(CliError::Config(format!(
+            "spec: `$ref: {r}` leaves the spec's directory (pass --allow-remote-refs to follow it)"
+        ))),
+    }
+}
+
+/// Read at most `MAX_SPEC_BYTES` of a regular file.
+fn read_local(path: &Path) -> CliResult<String> {
+    use std::io::Read as _;
+    let fail = |e: std::io::Error| CliError::Config(format!("spec {}: {e}", path.display()));
+    let file = std::fs::File::open(path).map_err(fail)?;
+    if !file.metadata().map_err(fail)?.is_file() {
+        return Err(CliError::Config(format!(
+            "spec {}: not a regular file",
+            path.display()
+        )));
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_SPEC_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(fail)?;
+    if buf.len() as u64 > MAX_SPEC_BYTES {
+        return Err(CliError::Config(format!(
+            "spec {}: over the {MAX_SPEC_BYTES}-byte limit",
+            path.display()
+        )));
+    }
+    String::from_utf8(buf)
+        .map_err(|_| CliError::Config(format!("spec {}: not UTF-8 text", path.display())))
 }
 
 /// Reads spec documents: local files directly, URLs through
@@ -271,17 +372,7 @@ impl Fetcher {
                 let path = url
                     .to_file_path()
                     .map_err(|()| CliError::Config(format!("spec {url}: not a local path")))?;
-                let len = std::fs::metadata(&path)
-                    .map_err(|e| CliError::Config(format!("spec {}: {e}", path.display())))?
-                    .len();
-                if len > MAX_SPEC_BYTES {
-                    return Err(CliError::Config(format!(
-                        "spec {}: {len} bytes is over the {MAX_SPEC_BYTES}-byte limit",
-                        path.display()
-                    )));
-                }
-                std::fs::read_to_string(&path)
-                    .map_err(|e| CliError::Config(format!("spec {}: {e}", path.display())))
+                read_local(&path)
             }
             "http" | "https" => self.fetch(url).await,
             other => Err(CliError::Config(format!(
@@ -533,7 +624,7 @@ pub fn render_report(out: &ImportOutput) -> String {
         s.push_str("no open decisions\n");
     } else {
         s.push_str(&format!(
-            "{} open decision(s): the fields above are left unset — fill them in from the docs or a live response\n",
+            "{} open decision(s): fields left unset, or picked among several candidates — settle each from the docs or a live response\n",
             r.decisions.len() + r.unsupported.len()
         ));
     }
@@ -660,7 +751,7 @@ mod tests {
             allow_remote_refs: false,
         };
         let e = import_openapi(&req).await.unwrap_err().to_string();
-        assert!(e.contains("creating"), "{e}");
+        assert!(e.contains("cannot read the existing"), "{e}");
         let out = import_openapi(&ImportRequest {
             dry_run: true,
             ..req
@@ -671,6 +762,114 @@ mod tests {
         assert!(report.contains("decision: params.api_root"), "{report}");
         assert!(report.contains("open decision(s)"), "{report}");
         assert!(!SpecSet::single(Url::parse("file:///x").unwrap(), json!({})).is_empty());
+    }
+
+    fn spec_with_ref(r: &str) -> String {
+        json!({"openapi": "3.0.0", "info": {"title": "R"}, "paths": {"/a": {"get": {"responses": {"200": {
+            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": r}}}}}}}}}})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn local_reads_are_bounded_and_contained() {
+        assert!(
+            read_local(Path::new("/dev/zero"))
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin.yaml");
+        std::fs::write(&bin, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(read_local(&bin).unwrap_err().to_string().contains("UTF-8"));
+        let spec_dir = tmp.path().join("spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(tmp.path().join("outside.yaml"), "type: object\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside.yaml"), spec_dir.join("link.yaml"))
+            .unwrap();
+        std::fs::write(
+            spec_dir.join("inside.yaml"),
+            "type: object\nproperties: { id: {} }\n",
+        )
+        .unwrap();
+        for (r, needle) in [
+            ("link.yaml", "leaves the spec's directory"),
+            ("../outside.yaml", "leaves the spec's directory"),
+            ("/etc/hosts", "leaves the spec's directory"),
+            ("missing.yaml", "does not exist"),
+        ] {
+            let api = spec_dir.join("api.json");
+            std::fs::write(&api, spec_with_ref(r)).unwrap();
+            let e = load_spec(api.to_str().unwrap(), false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(needle), "{r}: {e}");
+        }
+        let api = spec_dir.join("api.json");
+        std::fs::write(&api, spec_with_ref("inside.yaml")).unwrap();
+        assert_eq!(
+            load_spec(api.to_str().unwrap(), false).await.unwrap().len(),
+            2
+        );
+        std::fs::write(&api, spec_with_ref("link.yaml")).unwrap();
+        assert_eq!(
+            load_spec(api.to_str().unwrap(), true).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn only_importer_tokens_survive() {
+        let t: SourceTemplate = serde_json::from_value(json!({
+            "kind": "source-template", "name": "t",
+            "params": {"api_root": {"type": "string"}},
+            "source": {"type": "rest", "config": {}},
+            "streams": [{"name": "p"}, {"name": "c", "parent": "p"}],
+        }))
+        .unwrap();
+        assert!(check_tokens("${param.api_root} ${bookmark} ${p.id} ${p.customer-id}", &t).is_ok());
+        for bad in [
+            "${env:X}",
+            "${param.other}",
+            "${c.id}",
+            "${p.}",
+            "${p.a b}",
+            "${file:/x",
+        ] {
+            assert!(check_tokens(bad, &t).is_err(), "{bad}");
+        }
+        assert_eq!(origin_label("/x/${env:A}.yaml"), "$ {env:A}.yaml");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_existing_file_is_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = tmp.path().join("api.json");
+        std::fs::write(
+            &spec,
+            spec_with_ref("#/components/schemas/T").replace(
+                "\"paths\"",
+                "\"components\":{\"schemas\":{\"T\":{\"properties\":{\"id\":{}}}}},\"paths\"",
+            ),
+        )
+        .unwrap();
+        let out = tmp.path().join("hub");
+        std::fs::create_dir_all(out.join("source-templates/acme/r.yaml")).unwrap();
+        let req = ImportRequest {
+            spec: spec.display().to_string(),
+            options: ImportOptions {
+                owner: "acme".into(),
+                test_sink: "sink-templates/faucet-hq/sqlite.yaml".into(),
+                ..Default::default()
+            },
+            out,
+            dry_run: false,
+            force: true,
+            allow_remote_refs: false,
+        };
+        let e = import_openapi(&req).await.unwrap_err().to_string();
+        assert!(e.contains("cannot read the existing"), "{e}");
     }
 
     #[tokio::test]

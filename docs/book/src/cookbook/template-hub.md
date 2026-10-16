@@ -140,8 +140,13 @@ written.
 | response `example` / `examples` | behavioural cases in the draft suite: the example records in, the transformed records out |
 
 When the spec does not settle a choice — two candidate cursor parameters, no
-detectable key, a reset header without a unit — the field is left unset and the
-choice is listed as an open **decision** in the report (stderr, or `--format
+detectable key, a reset header without a unit, a page-size parameter with nothing
+that advances pages, a `count` field that may be the page size rather than the
+total — the field is left unset and the choice is listed as an open **decision**
+in the report. Where the importer does pick (the first of several servers, a
+conventional wrapper among several arrays, `{customer_id}` taken to be the
+parent's `id`, the alphabetically first of equally used auth schemes), the pick
+is listed as a decision too (stderr, or `--format
 json` for the report and both files as one document). Nothing is guessed, so a
 missing key fails `faucet hub check` for keyed write modes instead of shipping a
 wrong one. Auth schemes and spec features the REST source cannot express
@@ -150,9 +155,20 @@ wrong one. Auth schemes and spec features the REST source cannot express
 reports) are listed as **skipped**. A spec with more than 200 `GET` operations
 needs `--include`.
 
-`$ref`s are followed within the document and into relative files; a reference
-to another host or an absolute location is refused unless
-`--allow-remote-refs`. A URL is fetched with a size limit, like a file.
+`$ref`s are followed within the document and into relative files inside the
+spec's own location: the same scheme, host and port for a URL, the spec's
+directory (symlinks resolved) for a file. An absolute or network-path
+reference, one that leaves that location, or one with a backslash or
+surrounding whitespace is refused unless `--allow-remote-refs`; a remote
+document is never allowed to reference a local file. `$ref`s inside literal
+data (`example`, `default`, `enum`, `x-*` extensions, an Example Object's
+`value`) are not followed. Each document is read with a 32 MiB limit, local
+ones only when they are regular files.
+
+Spec text is untrusted: a path, server URL, parameter or field name, token URL
+or API-key name containing `${` would become an interpolation directive in the
+template, so it is refused (reported as unsupported, the item left out), and
+descriptions and example records containing it are dropped.
 
 Then finish it like any other template: resolve the decisions from the API
 reference or a live response, lint, check against two sinks, run the suite:
