@@ -58,6 +58,8 @@ jobs:
     # not trigger a full image build. Mirrors the `helm` job's guard below.
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'faucet-cli-v')
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # A full build takes about an hour; anything far past that is a hang.
+    timeout-minutes: 180
     env:
       PUSH: ${{ github.event_name == 'release' || inputs.push }}
       RELEASE: ${{ inputs.release }}
@@ -168,13 +170,16 @@ jobs:
         run: |
           set -euo pipefail
           img="faucet-smoke:${PROFILE}"
-          docker run --rm "$img" --version
-          docker run --rm "$img" list > list.txt
+          # Every command is bounded: a hung container fails the step instead
+          # of holding the runner for hours.
+          drun() { timeout --kill-after=10 180 docker run --rm "$@"; }
+          drun "$img" --version
+          drun "$img" list > list.txt
           if [ "$PROFILE" = full ]; then
             # A sample of what #845 found missing from the old :full image.
-            docker run --rm "$img" schema transform sql > /dev/null
-            docker run --rm "$img" schema transform wasm > /dev/null
-            docker run --rm "$img" schema templates-sync > /dev/null
+            drun "$img" schema transform sql > /dev/null
+            drun "$img" schema transform wasm > /dev/null
+            drun "$img" schema templates-sync > /dev/null
             grep -qw oracle list.txt
             mkdir -p smoke
             printf '%s\n' \
@@ -185,7 +190,7 @@ jobs:
               '    type: oracle' \
               '    config: { host: 127.0.0.1, port: 1, service_name: X, username: u, password: p, query: "SELECT 1 FROM DUAL" }' \
               '  sink: { type: stdout, config: {} }' > smoke/oracle.yaml
-            out="$(docker run --rm -v "$PWD/smoke:/smoke:ro" "$img" run --no-env-file /smoke/oracle.yaml 2>&1 || true)"
+            out="$(drun -v "$PWD/smoke:/smoke:ro" "$img" run --no-env-file /smoke/oracle.yaml 2>&1 || true)"
             echo "$out" | tail -5
             if echo "$out" | grep -qE 'DPI-1047|DPI-1072'; then
               echo "::error::the Oracle client did not load in full"; exit 1
