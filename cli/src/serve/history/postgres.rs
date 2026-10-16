@@ -35,7 +35,7 @@ impl PostgresHistory {
 }
 
 /// Advisory-lock key the migration holds ("faucet" in ASCII).
-const MIGRATION_LOCK: i64 = 0x0066_6175_6365_74;
+const MIGRATION_LOCK: i64 = 0x6661_7563_6574;
 
 /// Run the migration under a session advisory lock, so instances starting
 /// together take turns: Postgres does not make concurrent `CREATE TABLE IF NOT
