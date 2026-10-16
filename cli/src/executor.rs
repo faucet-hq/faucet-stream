@@ -1136,6 +1136,15 @@ async fn run_expanded_unredacted(
                     level_cancel.cancel();
                     stop_deadline = Some(tokio::time::Instant::now() + STOP_FLUSH_GRACE);
                 }
+            } else if level_cancel.is_cancelled() || cancel.is_cancelled() {
+                // A cooperative cancel ends the pipeline Ok at a page boundary,
+                // so success alone does not mean it read everything (#907).
+                tracing::warn!(
+                    row = %outcome.row_id,
+                    records_written = outcome.records_written,
+                    elapsed_ms = outcome.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
+                    "pipeline invocation finished after a cancel request; its output may be partial"
+                );
             } else {
                 tracing::info!(
                     row = %outcome.row_id,
@@ -7465,6 +7474,16 @@ matrix:
         token.cancel(); // already cancelled before the run starts
         let mut o = opts("cancel");
         o.cancel = Some(token);
+        #[cfg(feature = "observability")]
+        let (logs, _guard) = {
+            let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let sink = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || LogBuf(sink.clone()))
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        };
         let summary = run_expanded(nodes, o).await.unwrap();
         // The single root invocation completes (Ok) — it is not reported as a
         // failure even though it was cancelled.
@@ -7473,6 +7492,29 @@ matrix:
             !summary.had_failures(),
             "a cooperatively-cancelled run is Ok, not a failure: {summary:?}"
         );
+        #[cfg(feature = "observability")]
+        {
+            let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains("finished after a cancel request; its output may be partial"),
+                "a cancelled invocation is not logged as completed (#907): {logs}"
+            );
+            assert!(!logs.contains("pipeline invocation completed"), "{logs}");
+        }
+    }
+
+    #[cfg(feature = "observability")]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "observability")]
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

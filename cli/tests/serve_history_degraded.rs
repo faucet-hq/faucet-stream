@@ -274,3 +274,71 @@ async fn an_unreachable_backend_degrades_runs_refuses_the_registry_fences_and_re
     );
     assert_eq!(status("/v1/templates").await, 200);
 }
+
+/// #905: a clustered server's backend is strict (it never falls back to
+/// memory, so `degraded()` stays false); `/readyz` must still turn 503 while
+/// the lease heartbeat cannot reach it, and recover on the next one that can.
+#[tokio::test]
+async fn readyz_turns_not_ready_while_a_strict_backend_is_unreachable() {
+    let mode = Arc::new(AtomicU8::new(HEALTHY));
+    let history: Arc<dyn RunHistory> = Arc::new(Flaky {
+        inner: MemoryHistory::new(Duration::from_secs(60)),
+        mode: mode.clone(),
+    });
+    let cfg = config();
+    assert!(cfg.cluster.enabled);
+    let state = ServerState::new(
+        &cfg,
+        None,
+        CancellationToken::new(),
+        history,
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    let app = build_router(state.clone(), &cfg, &Default::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let readyz = || {
+        let url = format!("{base}/readyz");
+        async move {
+            let resp = reqwest::get(url).await.unwrap();
+            let code = resp.status().as_u16();
+            let body: serde_json::Value = resp.json().await.unwrap();
+            (code, body["history_ok"].as_bool().unwrap())
+        }
+    };
+    let mut health = LeaseHealth::new(std::time::Instant::now());
+    let fence_after = Duration::from_secs(3600);
+
+    maintain_leases(&state, &mut health, fence_after).await;
+    assert_eq!(readyz().await, (200, true));
+
+    mode.store(UNREACHABLE, Ordering::SeqCst);
+    assert_eq!(
+        readyz().await,
+        (200, true),
+        "nothing is known until the next heartbeat"
+    );
+    maintain_leases(&state, &mut health, fence_after).await;
+    assert_eq!(
+        readyz().await,
+        (503, false),
+        "a heartbeat that cannot reach the backend makes the server not ready"
+    );
+
+    mode.store(HEALTHY, Ordering::SeqCst);
+    maintain_leases(&state, &mut health, fence_after).await;
+    assert_eq!(
+        readyz().await,
+        (200, true),
+        "the first heartbeat that gets through clears it"
+    );
+}

@@ -154,8 +154,9 @@ Useful alert expressions:
 - `faucet_serve_cluster_instances < N` — fewer nodes alive than expected.
 - `increase(faucet_serve_runs_reclaimed_total{outcome="failed"}[5m]) > 0` — a
   run was poisoned; investigate the per-run error.
-- `faucet_serve_history_degraded == 1` — history backend is down; cluster
-  coordination is impaired (instances continue locally but cannot share runs).
+- `faucet_serve_history_unreachable == 1` — the history database did not
+  answer the last lease heartbeat; `/readyz` returns `503` until it does.
+  A clustered instance never falls back to memory, so submissions fail.
   An instance that cannot renew its run and shard leases for two heartbeats
   (two thirds of `--lease-ttl-secs`) cancels every run and shard it is
   executing, before the leases expire, so a peer that reclaims them never runs

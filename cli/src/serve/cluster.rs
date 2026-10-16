@@ -6,7 +6,7 @@
 use crate::serve::config::ServeConfig;
 use crate::serve::state::ServerState;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,8 @@ struct ClusterInner {
     members: AtomicUsize,
     /// The state format every live member reads (#736).
     state_format: std::sync::atomic::AtomicU32,
+    /// Whether the last lease renewal reached the run-history backend (#905).
+    history_reachable: AtomicBool,
 }
 
 impl ClusterHandle {
@@ -67,6 +69,7 @@ impl ClusterHandle {
                 state_format: std::sync::atomic::AtomicU32::new(
                     faucet_core::state_version::STATE_FORMAT,
                 ),
+                history_reachable: AtomicBool::new(true),
             }),
         }
     }
@@ -105,6 +108,19 @@ impl ClusterHandle {
     }
     pub fn set_members(&self, n: usize) {
         self.inner.members.store(n, Ordering::Release);
+    }
+
+    /// Whether the run-history backend answered the last lease renewal. A
+    /// strict backend (cluster mode) never degrades to memory, so this is how
+    /// `/readyz` sees it go away (#905).
+    pub fn history_reachable(&self) -> bool {
+        self.inner.history_reachable.load(Ordering::Acquire)
+    }
+    pub fn set_history_reachable(&self, reachable: bool) {
+        self.inner
+            .history_reachable
+            .store(reachable, Ordering::Release);
+        crate::serve::metrics::set_history_unreachable(!reachable);
     }
 
     /// The state format every live member reads (#736), refreshed by the

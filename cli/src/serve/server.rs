@@ -575,6 +575,7 @@ pub async fn maintain_leases(
         tracing::warn!(error = %e, "cluster: renew_shard_leases failed");
         renewed = false;
     }
+    state.cluster().set_history_reachable(renewed);
     if !health.observe(renewed, std::time::Instant::now(), fence_after)
         || !state.cluster().enabled()
     {

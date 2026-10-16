@@ -236,6 +236,13 @@ sets the `faucet_serve_history_degraded` gauge, and `/readyz` returns `503`.
 Any other database error (a constraint, a decode failure, lock contention) is
 returned to the request that hit it and never degrades the server.
 
+In cluster mode (`--cluster`) the server never falls back to memory: peers
+must share one store, so requests that need the database fail instead. The
+lease heartbeat (every third of `--lease-ttl-secs`) is the health check there:
+while it cannot reach the database, `/readyz` returns `503` with
+`history_ok: false` and `faucet_serve_history_unreachable` is `1`. Both clear
+on the first heartbeat that gets through.
+
 While degraded, run records, logs, audit, catalog and usage go to an in-memory
 store so runs keep going. Templates, tenants, connections, change requests and
 `queue_depth` trigger edges are **not** served from that empty store: those

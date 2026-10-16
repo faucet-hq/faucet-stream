@@ -1334,7 +1334,10 @@ after it stopped renewing.
 series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_request_duration_seconds{method,path}`, `faucet_serve_runs_queued`,
 `faucet_serve_runs_in_flight`, `faucet_serve_runs_total{status,reason}`,
-`faucet_serve_idempotency_hits_total`, and `faucet_serve_history_degraded`.
+`faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
+backend fell back to memory) and `faucet_serve_history_unreachable` (the last
+lease heartbeat did not reach the history database; `/readyz` is `503` while
+it is `1`).
 With the `tenants` feature: `faucet_serve_tenant_runs_total{tenant,outcome}`,
 `faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
 `faucet_serve_connections{status}` and

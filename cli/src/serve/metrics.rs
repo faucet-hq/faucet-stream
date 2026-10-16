@@ -69,6 +69,12 @@ pub fn set_history_degraded(degraded: bool) {
     metrics::gauge!("faucet_serve_history_degraded").set(if degraded { 1.0 } else { 0.0 });
 }
 
+/// `1` while the run-history backend did not answer the last lease renewal
+/// (#905): the signal for a strict backend that never falls back to memory.
+pub fn set_history_unreachable(unreachable: bool) {
+    metrics::gauge!("faucet_serve_history_unreachable").set(if unreachable { 1.0 } else { 0.0 });
+}
+
 /// Count runs claimed by this instance's claim loop.
 pub fn record_runs_claimed(n: usize) {
     metrics::counter!("faucet_serve_runs_claimed_total").increment(n as u64);

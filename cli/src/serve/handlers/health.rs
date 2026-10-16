@@ -1,7 +1,5 @@
 //! Liveness (`/healthz`), readiness (`/readyz`), and Prometheus (`/metrics`)
-//! endpoints. All three are unauthenticated (probes / scrapers). Phase 1
-//! `/readyz` is always-ready; it gains history-degraded / queue-full checks in
-//! later phases.
+//! endpoints. All three are unauthenticated (probes / scrapers).
 
 use crate::serve::state::ServerState;
 use axum::Json;
@@ -15,10 +13,11 @@ pub async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// Readiness: 503 if the history backend is degraded or the queue is full,
-/// else 200. The JSON body surfaces history/queue health and cluster membership.
+/// Readiness: 503 if the history backend is degraded or did not answer the
+/// last lease renewal, the queue is full, or the server is draining; else 200.
+/// The JSON body surfaces history/queue health and cluster membership.
 pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
-    let history_ok = !state.history().degraded();
+    let history_ok = !state.history().degraded() && state.cluster().history_reachable();
     let queue_ok = !state.registry().is_full();
     let draining = state.is_draining();
     let code = if history_ok && queue_ok && !draining {
@@ -157,6 +156,24 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["draining"], true);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_the_history_is_unreachable() {
+        let st = state(true);
+        st.cluster().set_history_reachable(false);
+        let resp = readyz(axum::extract::State(st.clone())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["history_ok"], false);
+        assert_eq!(v["status"], "not_ready");
+
+        st.cluster().set_history_reachable(true);
+        let resp = readyz(axum::extract::State(st)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

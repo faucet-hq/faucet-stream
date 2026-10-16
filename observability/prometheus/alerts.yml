@@ -199,6 +199,19 @@ groups:
             fallen back to in-memory records — run history and idempotency
             guarantees are not durable. /readyz is reporting 503.
 
+      - alert: FaucetServeHistoryUnreachable
+        expr: faucet_serve_history_unreachable == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "faucet serve cannot reach its run-history database"
+          description: >
+            The last lease renewal did not reach the history database. In
+            cluster mode the server does not fall back to memory: submissions
+            fail, this instance cancels its own runs before their leases
+            expire, and /readyz is reporting 503 until the database answers.
+
   - name: faucet-telemetry
     rules:
       - alert: FaucetOtelExportFailures
