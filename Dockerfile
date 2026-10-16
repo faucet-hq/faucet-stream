@@ -97,9 +97,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         for s in $(echo "${SINKS}"  | tr ',' ' '); do [ -n "$s" ] && feats="${feats},sink-${s}"; done; \
     fi; \
     echo "==> building faucet with features: ${feats}"; \
-    cargo build --release --locked -p faucet-cli \
+    cargo build --profile dist --locked -p faucet-cli \
         --no-default-features --features "${feats}"; \
-    cp /build/target/release/faucet /usr/local/bin/faucet; \
+    cp /build/target/dist/faucet /usr/local/bin/faucet; \
     # Strip debug symbols — on a full build (DuckDB + Kafka + every connector
     # statically linked) this removes 50-150MB from the shipped binary.
     strip --strip-all /usr/local/bin/faucet; \

@@ -442,7 +442,11 @@ ratatui = "0.30"
 # feature). Draws to stderr so piped stdout stays clean.
 indicatif = "0.18"
 
-# The profile that 'dist' will build with
+# The profile every shipped binary is built with: the release archives
+# ('dist'), the container image and the benchmark harness (#911). Fat LTO with
+# one codegen unit shrinks the binary by about a quarter and peak RSS with it;
+# thin LTO does neither. Plain `release` stays fast to link for local builds.
 [profile.dist]
 inherits = "release"
-lto = "thin"
+lto = "fat"
+codegen-units = 1

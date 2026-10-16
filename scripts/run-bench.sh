@@ -33,7 +33,7 @@ if [ -z "$PYTHON" ]; then
   PYTHON="${PYTHON:-python3}"
 fi
 MELTANO_VERSION="${BENCH_MELTANO_VERSION:-4.4.1}"
-FAUCET_BIN="${FAUCET_BIN:-$REPO_ROOT/target/release/faucet}"
+FAUCET_BIN="${FAUCET_BIN:-$REPO_ROOT/target/dist/faucet}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
