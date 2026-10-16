@@ -1,0 +1,9 @@
+# #906: an explicit strategy wins, with a warning for a single pod + volume.
+# expect: type: RollingUpdate
+# expect: WARNING: serve.strategy overrides Recreate
+# expect-not: type: Recreate
+serve:
+  persistence:
+    enabled: true
+  strategy:
+    type: RollingUpdate

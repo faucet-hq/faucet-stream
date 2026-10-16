@@ -22,16 +22,39 @@ Port-forward and probe it:
 Auth: bearer token. Read it with:
   kubectl -n {{ .Release.Namespace }} get secret {{ .Values.serve.auth.existingSecret | default (include "faucet-stream.authSecretName" .) }} -o jsonpath='{.data.{{ .Values.serve.auth.existingSecretKey }}}' | base64 -d; echo
 
-Submit a run:
+Submit a run (the body is JSON: the config text and its format; needs jq):
   TOKEN=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.serve.auth.existingSecret | default (include "faucet-stream.authSecretName" .) }} -o jsonpath='{.data.{{ .Values.serve.auth.existingSecretKey }}}' | base64 -d)
-  curl -sX POST localhost:{{ .Values.service.port }}/v1/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/yaml' --data-binary @pipeline.yaml
+  {{- include "faucet-stream.notesSubmit" (dict "port" .Values.service.port "auth" true) }}
 {{- else if eq .Values.serve.auth.mode "none" }}
 
 Auth: DISABLED (--no-auth --allow-unauthenticated-network): every pod that can reach
 this Service can submit and run pipelines. Do not expose it outside the cluster.
+
+Submit a run (the body is JSON: the config text and its format; needs jq):
+  {{- include "faucet-stream.notesSubmit" (dict "port" .Values.service.port "auth" false) }}
 {{- else }}
 
 Auth: RBAC. Principals are defined in the mounted auth config.
+
+Submit a run as an operator or admin principal (the body is JSON: the config
+text and its format; needs jq):
+  TOKEN=<that principal's token>
+  {{- include "faucet-stream.notesSubmit" (dict "port" .Values.service.port "auth" true) }}
+{{- end }}
+{{- if include "faucet-stream.serveSingleWithVolume" . }}
+{{- if eq (include "faucet-stream.serveStrategy" . | fromYaml).type "Recreate" }}
+
+Upgrades: one replica with a volume, so the Deployment uses the Recreate
+strategy: the old pod stops before the new one starts (a short outage), and
+a run in flight at that moment is marked failed. For no downtime, use
+serve.history.backend=postgres without a volume, or run two replicas.
+{{- else }}
+
+WARNING: serve.strategy overrides Recreate for a single replica with a volume.
+On a ReadWriteOnce disk an upgrade can hang (the new pod cannot attach the
+volume while the old pod holds it), and two servers briefly share one SQLite
+history file.
+{{- end }}
 {{- end }}
 {{- if .Values.serve.ui.enabled }}
 

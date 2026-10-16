@@ -1,0 +1,13 @@
+# #903: the Job's name carries a hash of its pod template, so an upgrade that
+# changes the Job replaces it instead of patching an immutable template.
+# expect: name: t-faucet-stream-run-
+# expect: - /etc/faucet/pipeline.yaml
+job:
+  enabled: true
+pipelineConfig:
+  create: true
+  content: |
+    version: 1
+    pipeline:
+      source: { type: rest, config: { base_url: https://example.com, path: /items } }
+      sink: { type: stdout, config: {} }

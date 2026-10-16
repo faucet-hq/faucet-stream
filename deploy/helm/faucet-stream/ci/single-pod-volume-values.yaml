@@ -1,0 +1,9 @@
+# #906: one replica with a volume upgrades by Recreate, and NOTES say so.
+# expect: type: Recreate
+# expect: Upgrades: one replica with a volume
+# expect-not: WARNING: serve.strategy overrides Recreate
+serve:
+  history:
+    backend: sqlite
+  persistence:
+    enabled: true

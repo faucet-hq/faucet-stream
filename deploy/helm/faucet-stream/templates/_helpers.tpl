@@ -219,3 +219,31 @@ otel: { flag: otel-config, volume: serve-otel, dir: /etc/faucet-serve-otel }
 {{ toYaml . }}
 {{- end }}
 {{- end -}}
+
+{{/*
+The serve Deployment's update strategy (#906): `serve.strategy` when set, else
+Recreate for a single replica with a volume, so the new pod never needs the
+old pod's volume (a ReadWriteOnce disk attaches to one node) and two servers
+never share one SQLite file. Anything else keeps the RollingUpdate default.
+*/}}
+{{- define "faucet-stream.serveStrategy" -}}
+{{- if .Values.serve.strategy -}}
+{{- toYaml .Values.serve.strategy -}}
+{{- else if include "faucet-stream.serveSingleWithVolume" . -}}
+type: Recreate
+{{- end -}}
+{{- end -}}
+
+{{- define "faucet-stream.serveSingleWithVolume" -}}
+{{- if and (eq (int .Values.serve.replicaCount) 1) (not .Values.serve.autoscaling.enabled) (or .Values.serve.persistence.enabled .Values.serve.persistence.existingClaim) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /* The NOTES submit command (#902): POST /v1/runs takes a JSON body. */}}
+{{- define "faucet-stream.notesSubmit" }}
+  jq -Rs '{config: ., config_format: "yaml"}' pipeline.yaml \
+    | curl -sX POST localhost:{{ .port }}/v1/runs{{ if .auth }} -H "Authorization: Bearer $TOKEN"{{ end }} \
+        -H 'Content-Type: application/json' --data-binary @-
+  # → {"run_id": "…"}; follow it at /v1/runs/<run_id>
+{{- end }}

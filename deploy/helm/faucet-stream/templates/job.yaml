@@ -1,8 +1,88 @@
+{{- define "faucet-stream.jobPodTemplate" -}}
+metadata:
+  labels:
+    {{- include "faucet-stream.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: run
+  {{- with .Values.job.podAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  restartPolicy: {{ .Values.job.restartPolicy }}
+  serviceAccountName: {{ include "faucet-stream.serviceAccountName" . }}
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  {{- $verify := include "faucet-stream.verifyInitContainer" . }}
+  {{- if trim $verify }}
+  initContainers:
+    {{- $verify | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: run
+      image: {{ include "faucet-stream.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      args:
+        - run
+        - {{ include "faucet-stream.configFilePath" . }}
+        {{- with .Values.job.extraArgs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      env:
+        {{- include "faucet-stream.env" . | nindent 8 }}
+      {{- $envFrom := include "faucet-stream.envFrom" . }}
+      {{- if trim $envFrom }}
+      envFrom:
+        {{- $envFrom | nindent 8 }}
+      {{- end }}
+      resources:
+        {{- toYaml .Values.job.resources | nindent 8 }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      volumeMounts:
+        - name: scratch
+          mountPath: {{ .Values.serve.persistence.mountPath | trimSuffix "/" }}
+        - name: tmp
+          mountPath: /tmp
+        - name: pipeline-config
+          mountPath: {{ .Values.pipelineConfig.mountPath }}
+          readOnly: true
+        {{- with include "faucet-stream.logSpoolMount" . | trim }}{{ . | nindent 8 }}{{- end }}
+        {{- with include "faucet-stream.extraVolumeMounts" . | trim }}{{ . | nindent 8 }}{{- end }}
+  volumes:
+    - name: tmp
+      emptyDir: {}
+    - name: scratch
+      emptyDir: {}
+    {{- with include "faucet-stream.logSpoolVolume" . | trim }}{{ . | nindent 4 }}{{- end }}
+    - name: pipeline-config
+      configMap:
+        name: {{ include "faucet-stream.configMapName" . }}
+    {{- with include "faucet-stream.extraVolumes" . | trim }}{{ . | nindent 4 }}{{- end }}
+  {{- with .Values.job.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.job.affinity }}
+  affinity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.job.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+
 {{- if .Values.job.enabled -}}
+{{- $pod := include "faucet-stream.jobPodTemplate" . -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "faucet-stream.fullname" . }}-run
+  {{- /* A Job's pod template is immutable, so its hash names the Job (#903). */}}
+  name: {{ include "faucet-stream.fullname" . }}-run-{{ $pod | sha256sum | trunc 8 }}
   labels:
     {{- include "faucet-stream.labels" . | nindent 4 }}
     app.kubernetes.io/component: run
@@ -17,79 +97,5 @@ spec:
   ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
   {{- end }}
   template:
-    metadata:
-      labels:
-        {{- include "faucet-stream.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: run
-      {{- with .Values.job.podAnnotations }}
-      annotations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-    spec:
-      restartPolicy: {{ .Values.job.restartPolicy }}
-      serviceAccountName: {{ include "faucet-stream.serviceAccountName" . }}
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- $verify := include "faucet-stream.verifyInitContainer" . }}
-      {{- if trim $verify }}
-      initContainers:
-        {{- $verify | nindent 8 }}
-      {{- end }}
-      containers:
-        - name: run
-          image: {{ include "faucet-stream.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - run
-            - {{ include "faucet-stream.configFilePath" . }}
-            {{- with .Values.job.extraArgs }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          env:
-            {{- include "faucet-stream.env" . | nindent 12 }}
-          {{- $envFrom := include "faucet-stream.envFrom" . }}
-          {{- if trim $envFrom }}
-          envFrom:
-            {{- $envFrom | nindent 12 }}
-          {{- end }}
-          resources:
-            {{- toYaml .Values.job.resources | nindent 12 }}
-          securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
-          volumeMounts:
-            - name: scratch
-              mountPath: {{ .Values.serve.persistence.mountPath | trimSuffix "/" }}
-            - name: tmp
-              mountPath: /tmp
-            - name: pipeline-config
-              mountPath: {{ .Values.pipelineConfig.mountPath }}
-              readOnly: true
-            {{- with include "faucet-stream.logSpoolMount" . | trim }}{{ . | nindent 12 }}{{- end }}
-            {{- with include "faucet-stream.extraVolumeMounts" . | trim }}{{ . | nindent 12 }}{{- end }}
-      volumes:
-        - name: tmp
-          emptyDir: {}
-        - name: scratch
-          emptyDir: {}
-        {{- with include "faucet-stream.logSpoolVolume" . | trim }}{{ . | nindent 8 }}{{- end }}
-        - name: pipeline-config
-          configMap:
-            name: {{ include "faucet-stream.configMapName" . }}
-        {{- with include "faucet-stream.extraVolumes" . | trim }}{{ . | nindent 8 }}{{- end }}
-      {{- with .Values.job.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.job.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.job.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+    {{- $pod | nindent 4 }}
 {{- end }}

@@ -13,6 +13,10 @@ spec:
   {{- if not .Values.serve.autoscaling.enabled }}
   replicas: {{ .Values.serve.replicaCount }}
   {{- end }}
+  {{- with include "faucet-stream.serveStrategy" . | fromYaml }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "faucet-stream.selectorLabels" . | nindent 6 }}

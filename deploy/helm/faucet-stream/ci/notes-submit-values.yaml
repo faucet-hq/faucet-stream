@@ -1,0 +1,8 @@
+# #902: the NOTES submit command sends the JSON body POST /v1/runs accepts.
+# expect: jq -Rs '{config: ., config_format: "yaml"}' pipeline.yaml
+# expect: -H 'Content-Type: application/json' --data-binary @-
+# expect-not: Content-Type: application/yaml
+# expect-not: type: Recreate
+serve:
+  auth:
+    mode: token

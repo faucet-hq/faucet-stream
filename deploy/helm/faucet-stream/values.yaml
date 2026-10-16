@@ -372,6 +372,14 @@ serve:
       cpu: "1"
       memory: 512Mi
 
+  # Update strategy of the serve Deployment. Empty picks Recreate for a single
+  # replica with a volume (a ReadWriteOnce disk can't attach to the new pod's
+  # node while the old pod holds it, and two servers must not share one SQLite
+  # file), else the RollingUpdate default. Set it to override either way.
+  strategy: {}
+  #   type: RollingUpdate
+  #   rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+
   # A writable scratch dir (root fs is read-only). Also backs sqlite history
   # when persistence.enabled=false (emptyDir) — use persistence for durability.
   persistence:
@@ -486,7 +494,9 @@ job:
     limits:
       cpu: "1"
       memory: 512Mi
-  # Re-run on every `helm upgrade` (Jobs are immutable). "" disables the hook.
+  # The Job's name carries a hash of its pod template, so `helm upgrade`
+  # replaces it whenever the Job changes and leaves it alone otherwise.
+  # A hook re-runs it on every install/upgrade instead. "" = no hook.
   helmHook: ""   # e.g. post-install,post-upgrade
   podAnnotations: {}
   nodeSelector: {}

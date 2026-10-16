@@ -129,6 +129,17 @@ serve:
   with per-pod history each replica has its own runs and idempotency keys, so
   a `GET`/cancel lands on the wrong pod and a retried keyed submission can run
   twice.
+- **Upgrades**: one replica with a volume (`persistence.enabled` or
+  `persistence.existingClaim`) upgrades with the `Recreate` strategy: the old
+  pod stops before the new one starts, a short outage. With a rolling update
+  the new pod would wait for a ReadWriteOnce disk the old pod still holds, and
+  two servers would briefly share one SQLite file. `serve.strategy` overrides
+  it (the install notes then warn). For upgrades without downtime use postgres
+  history with no volume, or two replicas.
+- **Submitting runs**: `POST /v1/runs` takes JSON, the config text plus its
+  format: `jq -Rs '{config: ., config_format: "yaml"}' pipeline.yaml | curl -sX POST
+  …/v1/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json'
+  --data-binary @-`. The install notes print the exact command.
 - **Reusable pipeline definition**: set `pipelineConfig` and it's passed as the
   serve `--default-config` — a workspace default merged under every submitted
   run, so clients only POST overrides. For named, versioned pipelines use the
@@ -148,6 +159,13 @@ pipelineConfig:
       source: { type: postgres, config: { ... } }
       sink:   { type: bigquery, config: { ... } }
 ```
+
+The Job is named `<release>-faucet-stream-run-<hash>`, where the hash covers
+its pod template (image, config, env, resources…). A Job's pod template can't
+be changed after it is created, so a `helm upgrade` that changes the Job
+replaces it with a new one, which runs; an upgrade that leaves it unchanged
+keeps the finished Job and does not re-run it. To re-run it on every install
+and upgrade, set `job.helmHook: post-install,post-upgrade`.
 
 ### 3. Scheduled pipeline (`cronjob`)
 
@@ -396,6 +414,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.mcp.enabled` / `.allowMutations` | `false` / `false` | `/mcp` endpoint / its mutating tools |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
 | `serve.persistence.enabled` | `false` | PVC for sqlite history / bookmarks |
+| `serve.strategy` | `{}` | Deployment update strategy; empty = `Recreate` for one replica with a volume, else `RollingUpdate` |
 | `job.enabled` | `false` | one-shot `faucet run` |
 | `cronjob.enabled` | `false` | scheduled `faucet run` |
 | `cronjob.schedule` | `0 * * * *` | cron expression |
