@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-rest-v1.8.0...faucet-source-rest-v1.8.1) - 2026-10-17
+
+### Bug Fixes
+
+- *(serve)* Deployment and chaos-test follow-ups — readiness, migration race, schedule catch-up, chart upgrades, console, arm64 images, dependency fixes ([#917](https://github.com/faucet-hq/faucet-stream/pull/917))
+
 ## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-rest-v1.7.2...faucet-source-rest-v1.8.0) - 2026-10-15
 
 ### Bug Fixes
