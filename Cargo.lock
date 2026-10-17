@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.14.0"
+version = "1.15.0"
 dependencies = [
  "arrow 58.3.0",
  "assert_cmd",
@@ -4880,7 +4880,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-azure"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5234,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-snowflake"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5481,7 +5481,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-azure-blob"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arrow 58.3.0",
  "faucet-common-azure",
@@ -6211,7 +6211,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-azure-blob"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arrow 58.3.0",
  "async-stream",
@@ -6927,7 +6927,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-rest"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "arrow 58.3.0",
  "async-stream",
@@ -7159,7 +7159,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-xml"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "async-stream",
  "async-trait",
