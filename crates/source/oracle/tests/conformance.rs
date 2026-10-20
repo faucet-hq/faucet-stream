@@ -48,7 +48,7 @@ async fn conformance_live_battery() {
     assert_batch_size_zero_single_page(&OracleSource::new(whole).await.unwrap()).await;
 
     let mut inc =
-        OracleSourceConfig::new(conn.clone(), "SELECT ID FROM EVENTS WHERE ID > :bookmark");
+        OracleSourceConfig::new(conn.clone(), "SELECT ID FROM EVENTS WHERE ID >= :bookmark");
     inc.replication = OracleReplication::Incremental {
         column: "ID".into(),
         initial_value: json!(0),

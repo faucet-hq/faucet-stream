@@ -26,17 +26,23 @@ pub enum OracleReplication {
     /// Every run fetches the full result set (default).
     #[default]
     Full,
-    /// Only rows whose `column` is strictly greater than the stored bookmark
-    /// (or `initial_value` on the first run) are emitted.
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
     ///
-    /// Put the `:bookmark` placeholder in the query to push the cursor down to
-    /// the server (`WHERE UPDATED_AT > :bookmark`); the source also filters
-    /// client-side as a correctness backstop. `column` names the key exactly
-    /// as it appears in the output — Oracle upper-cases unquoted names.
+    /// The source wraps the query as
+    /// `SELECT * FROM (<query>) q WHERE q."COLUMN" >= :bookmark ORDER BY q."COLUMN"`
+    /// and drops the rows it already emitted at the bookmark value, so rows
+    /// that share a cursor value (ties, late commits, `DATE`'s one-second
+    /// resolution) are never skipped. Every page carries a bookmark, so a
+    /// crash replays at most one page. Write `:bookmark` in the query (with
+    /// `>=`) to apply the cursor further inside it; a strict `>` is refused.
+    /// `column` names the key exactly as it appears in the output — Oracle
+    /// upper-cases unquoted names. Rows whose `column` is NULL are never read.
     Incremental {
         /// Output column holding the replication cursor (e.g. `UPDATED_AT`).
         column: String,
-        /// Lower bound used on the first run, before any bookmark is stored.
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
         initial_value: Value,
     },
 }
@@ -132,12 +138,32 @@ impl OracleSourceConfig {
                 "oracle source requires a `query`".into(),
             ));
         }
-        if let OracleReplication::Incremental { column, .. } = &self.replication
-            && column.trim().is_empty()
+        if let OracleReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
         {
-            return Err(FaucetError::Config(
-                "oracle incremental replication requires a non-empty `column`".into(),
-            ));
+            if column.trim().is_empty() {
+                return Err(FaucetError::Config(
+                    "oracle incremental replication requires a non-empty `column`".into(),
+                ));
+            }
+            faucet_common_oracle::quote_ident_oracle(column)?;
+            if initial_value.is_null() {
+                return Err(FaucetError::Config(
+                    "oracle incremental replication requires a non-null `initial_value`".into(),
+                ));
+            }
+            if faucet_core::replication::cursor::strict_comparison(
+                &self.query.to_ascii_lowercase(),
+                BOOKMARK_TOKEN,
+            ) {
+                return Err(FaucetError::Config(format!(
+                    "oracle: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source re-reads \
+                     the bookmark value and drops the rows it already emitted, and a strict \
+                     comparison skips rows that share it"
+                )));
+            }
         }
         if let Some(shard) = &self.shard {
             faucet_common_oracle::quote_ident_oracle(&shard.key)?;
@@ -145,27 +171,13 @@ impl OracleSourceConfig {
         if let Some(key) = &self.state_key {
             faucet_core::state::validate_state_key(key)?;
         }
-        if self.incremental_without_bookmark_pushdown() {
-            tracing::warn!(
-                "oracle incremental replication query has no `:bookmark` placeholder: the \
-                 cursor is applied client-side only, so every run re-reads the whole result \
-                 set. Add `WHERE <column> > :bookmark` to push it down."
-            );
-        }
         Ok(())
     }
-
-    /// Incremental replication whose query cannot push the cursor down.
-    pub(crate) fn incremental_without_bookmark_pushdown(&self) -> bool {
-        matches!(self.replication, OracleReplication::Incremental { .. })
-            && !has_bookmark_placeholder(&self.query)
-    }
 }
 
-/// True when `sql` contains the `:bookmark` placeholder (case-insensitive).
-pub(crate) fn has_bookmark_placeholder(sql: &str) -> bool {
-    sql.to_ascii_lowercase().contains(":bookmark")
-}
+/// The placeholder a query uses to read the incremental bookmark
+/// (`WHERE UPDATED_AT >= :bookmark`, any case).
+pub const BOOKMARK_TOKEN: &str = ":bookmark";
 
 #[cfg(test)]
 mod tests {
@@ -227,17 +239,29 @@ mod tests {
     }
 
     #[test]
-    fn pushdown_detection() {
-        let mut cfg = OracleSourceConfig::new(conn(), "SELECT * FROM T");
-        assert!(!cfg.incremental_without_bookmark_pushdown());
-        cfg.replication = OracleReplication::Incremental {
-            column: "C".into(),
-            initial_value: json!(0),
-        };
-        assert!(cfg.incremental_without_bookmark_pushdown());
-        cfg.validate().unwrap();
-        cfg.query = "SELECT * FROM T WHERE C > :BOOKMARK".into();
-        assert!(!cfg.incremental_without_bookmark_pushdown());
+    fn validate_rejects_bad_incremental_settings() {
+        for (query, column, initial, needle) in [
+            ("SELECT * FROM T", "A\"B", json!(0), "identifier"),
+            ("SELECT * FROM T", "C", json!(null), "initial_value"),
+            ("SELECT * FROM T WHERE C > :BOOKMARK", "C", json!(0), ">="),
+            ("SELECT * FROM T WHERE :bookmark < C", "C", json!(0), ">="),
+        ] {
+            let mut cfg = OracleSourceConfig::new(conn(), query);
+            cfg.replication = OracleReplication::Incremental {
+                column: column.into(),
+                initial_value: initial,
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+        for query in ["SELECT * FROM T", "SELECT * FROM T WHERE C >= :Bookmark"] {
+            let mut cfg = OracleSourceConfig::new(conn(), query);
+            cfg.replication = OracleReplication::Incremental {
+                column: "C".into(),
+                initial_value: json!(0),
+            };
+            cfg.validate().unwrap();
+        }
     }
 
     #[test]
