@@ -185,6 +185,26 @@ impl SqlDialect for Postgres {
         ))
     }
 
+    fn cleanup_absent_keys_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+    ) -> Result<Option<String>, FaucetError> {
+        let pairs = key
+            .iter()
+            .map(|k| format!("{}, t.{}", self.quote_literal(k), quote(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let delete = self.cleanup_delete_sql(target, scope, scope_types, key)?;
+        Ok(Some(delete.replacen(
+            "DELETE FROM ",
+            &format!("SELECT json_build_object({pairs})::text FROM "),
+            1,
+        )))
+    }
+
     fn cleanup_table_display(&self, target: &TableTarget) -> String {
         target.reference.clone()
     }

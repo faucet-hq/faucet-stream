@@ -352,6 +352,21 @@ pub trait SqlDialect: Send + Sync {
         ))
     }
 
+    /// A `SELECT` returning, as JSON object text, the `key` columns of every
+    /// row the [`cleanup_delete_sql`](Self::cleanup_delete_sql) delete would
+    /// remove — bound with the same scope parameters — so a rollback-enabled
+    /// write journals them first. `None` when the dialect does not journal.
+    fn cleanup_absent_keys_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+    ) -> Result<Option<String>, FaucetError> {
+        let _ = (target, scope, scope_types, key);
+        Ok(None)
+    }
+
     /// How a cleanup names its destination in a "column does not exist"
     /// error.
     fn cleanup_table_display(&self, target: &TableTarget) -> String {

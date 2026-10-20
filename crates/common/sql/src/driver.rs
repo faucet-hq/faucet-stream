@@ -761,6 +761,11 @@ impl<D: SqlDriver> CleanupDriver for SqlSinkDriver<D> {
     ) -> Result<u64, FaucetError> {
         self.op(calls, label::CLEANUP_SCOPE, async {
             self.engine().check_cleanup_key()?;
+            // A journaling cleanup records before-images; journal DDL runs
+            // before the transaction, as for a keyed write.
+            if self.engine().write_spec().journals() {
+                self.driver.prepare_keyed_write().await?;
+            }
             let mut conn = self.driver.begin().await?;
             let target = self.driver.target(&self.layout().table);
             let deleted = self

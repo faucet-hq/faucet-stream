@@ -55,6 +55,16 @@ pub trait SqlExecutor: Send {
     /// Bind `stmt`'s parameters and run it, returning the rows it affected.
     async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError>;
 
+    /// Run `stmt` (a [`StatementKind::CleanupJournal`] read) and return its
+    /// one text column per row. Only called when the sink's write spec
+    /// journals.
+    async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
+        let _ = stmt;
+        Err(FaucetError::Sink(
+            "rollback journaling of a scoped cleanup is not supported by this sink".into(),
+        ))
+    }
+
     /// Journal the before-image of every key `plan` touches, on this
     /// connection, before the plan is applied (#706). Only called when the
     /// sink's write spec journals.
@@ -679,11 +689,17 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         let sql = self
             .dialect
             .cleanup_delete_sql(target, &scope_cols, &scope_types_ref, key)?;
-        let params = scope
+        let params: Vec<Param<'_>> = scope
             .iter()
             .zip(&scope_types)
             .map(|((c, v), t)| Param::borrowed(c, t.as_deref(), v))
             .collect();
+        if self.write.journals()
+            && let Some(run_id) = self.write.rollback_run_id()
+        {
+            self.journal_cleanup(exec, target, &scope_cols, &scope_types_ref, &params, run_id)
+                .await?;
+        }
         let deleted = exec
             .execute(&Statement::new(StatementKind::CleanupDelete, sql, params))
             .await?;
@@ -693,6 +709,58 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
                 .await?;
         }
         Ok(deleted)
+    }
+
+    /// Journal the before-image of every row the cleanup delete is about to
+    /// remove, so a rollback of the run restores them (#706): the delete runs
+    /// on the same transaction right after.
+    async fn journal_cleanup<E: SqlExecutor + ?Sized>(
+        &self,
+        exec: &mut E,
+        target: &TableTarget,
+        scope_cols: &[String],
+        scope_types: &[Option<&str>],
+        params: &[Param<'_>],
+        run_id: &str,
+    ) -> Result<(), FaucetError> {
+        let key = &self.write.key;
+        let sql = self
+            .dialect
+            .cleanup_absent_keys_sql(target, scope_cols, scope_types, key)?
+            .ok_or_else(|| {
+                FaucetError::Sink(format!(
+                    "{}: a scoped cleanup cannot be journaled for rollback",
+                    self.dialect.name()
+                ))
+            })?;
+        let rows = exec
+            .fetch_text(&Statement::new(
+                StatementKind::CleanupJournal,
+                sql,
+                params.to_vec(),
+            ))
+            .await?;
+        let deletes = rows
+            .iter()
+            .map(|text| {
+                let row = faucet_core::fidelity::parse_json(text.as_bytes()).map_err(|e| {
+                    FaucetError::Sink(format!("cleanup: reading a key to journal: {e}"))
+                })?;
+                Ok(KeyTuple(
+                    key.iter()
+                        .map(|k| (k.clone(), row.get(k).cloned().unwrap_or(Value::Null)))
+                        .collect(),
+                ))
+            })
+            .collect::<Result<Vec<_>, FaucetError>>()?;
+        if deletes.is_empty() {
+            return Ok(());
+        }
+        let plan = WritePlan {
+            deletes,
+            ..WritePlan::default()
+        };
+        exec.journal_plan(&plan, run_id).await
     }
 
     /// Upsert `scope`'s commit token on the caller's transaction, so it
