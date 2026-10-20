@@ -222,6 +222,102 @@ pub fn adds_null(from: &Value, to: &Value) -> bool {
     tnull && !fnull
 }
 
+/// Is `s` the exact text of a JSON number — the rendering
+/// [`crate::fidelity`] gives an exact decimal or an integer past `i64`?
+fn is_numeric_text(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    if b.first() == Some(&b'-') {
+        i += 1;
+    }
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > start
+    };
+    if !digits(&mut i) {
+        return false;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
+/// Infer a page's shape for [`diff_schema`] against `destination`.
+///
+/// Like [`crate::schema::infer_schema`], except that a top-level column the
+/// destination stores as `number` whose string values on this page are all
+/// exact numeric text (how [`crate::fidelity`] renders exact decimals and
+/// big integers) is typed `number`: those values land in the column exactly,
+/// so they are not drift. A string that is not numeric text keeps the column
+/// `string`.
+pub fn infer_page_schema(destination: &Value, records: &[Value]) -> Value {
+    let mut inferred = crate::schema::infer_schema(records);
+    let Some(dest_props) = destination.get("properties").and_then(Value::as_object) else {
+        return inferred;
+    };
+    let Some(props) = inferred
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return inferred;
+    };
+    for (name, fragment) in props.iter_mut() {
+        let Some(dest) = dest_props.get(name) else {
+            continue;
+        };
+        let (dn, _) = type_set(dest);
+        let (pn, pnull) = type_set(fragment);
+        if !dn.iter().any(|t| t == "number") || !pn.iter().any(|t| t == "string") {
+            continue;
+        }
+        let all_numeric = records
+            .iter()
+            .filter_map(|r| r.get(name))
+            .all(|v| v.as_str().is_none_or(is_numeric_text));
+        if !all_numeric {
+            continue;
+        }
+        let mut names: Vec<String> = pn
+            .into_iter()
+            .map(|t| if t == "string" { "number".into() } else { t })
+            .collect();
+        if names.iter().any(|t| t == "number") {
+            names.retain(|t| t != "integer");
+        }
+        names.sort();
+        names.dedup();
+        let mut ty: Vec<Value> = names.into_iter().map(Value::String).collect();
+        if pnull {
+            ty.push(Value::String("null".into()));
+        }
+        let ty = if ty.len() == 1 {
+            ty.remove(0)
+        } else {
+            Value::Array(ty)
+        };
+        if let Some(obj) = fragment.as_object_mut() {
+            obj.insert("type".into(), ty);
+        }
+    }
+    inferred
+}
+
 /// Diff a page's inferred shape against the destination schema (top-level columns).
 ///
 /// `destination` and `page` are both `infer_schema`-shaped object schemas
@@ -416,6 +512,72 @@ pub fn json_schema_base_type(fragment: &Value) -> Option<SqlBaseType> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_text_matches_exact_number_renderings_only() {
+        for ok in [
+            "0",
+            "-12",
+            "12.50",
+            "1e10",
+            "-1.5E-3",
+            "123456789012345678901234567890",
+        ] {
+            assert!(super::is_numeric_text(ok), "{ok}");
+        }
+        for bad in [
+            "", "-", "1.", ".5", "1e", "abc", "NaN", "1,5", " 1", "+1", "1e+",
+        ] {
+            assert!(!super::is_numeric_text(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn exact_decimal_strings_fit_a_numeric_column() {
+        let dest = json!({"type": "object", "properties": {
+            "amount": {"type": "number"},
+            "n": {"type": ["number", "null"]},
+            "label": {"type": "string"},
+            "count": {"type": "integer"},
+        }});
+        let page = vec![
+            json!({"amount": "12.50", "n": null, "label": "12", "count": "7"}),
+            json!({"amount": 3, "n": "99999999999999999999", "label": "x", "count": 1}),
+        ];
+        let inferred = super::infer_page_schema(&dest, &page);
+        assert_eq!(inferred["properties"]["amount"]["type"], json!("number"));
+        assert_eq!(
+            inferred["properties"]["n"]["type"],
+            json!(["number", "null"])
+        );
+        assert_eq!(inferred["properties"]["label"]["type"], json!("string"));
+        let diff = diff_schema(&dest, &inferred, true);
+        assert!(
+            diff.incompatible
+                .iter()
+                .all(|c| c.name != "amount" && c.name != "n"),
+            "{diff:?}"
+        );
+        // An integer column is not a decimal target: text stays drift.
+        assert!(
+            diff.incompatible.iter().any(|c| c.name == "count"),
+            "{diff:?}"
+        );
+    }
+
+    #[test]
+    fn non_numeric_text_into_a_numeric_column_is_still_drift() {
+        let dest = json!({"type": "object", "properties": {"amount": {"type": "number"}}});
+        let page = vec![json!({"amount": "12.50"}), json!({"amount": "n/a"})];
+        let inferred = super::infer_page_schema(&dest, &page);
+        let diff = diff_schema(&dest, &inferred, true);
+        assert_eq!(diff.incompatible.len(), 1, "{diff:?}");
+        // No destination properties: plain inference.
+        assert_eq!(
+            super::infer_page_schema(&json!({}), &page),
+            crate::schema::infer_schema(&page)
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
