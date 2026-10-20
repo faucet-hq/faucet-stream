@@ -123,7 +123,7 @@ async fn incremental_resume_reads_only_new_rows() {
     let client = support::raw_client(&emu.host, "incr").await;
     support::execute_dml(&client, "INSERT INTO ev (id, v) VALUES (1, 'a'), (2, 'b')").await;
 
-    let mut config = cfg(&emu.host, "incr", "SELECT * FROM ev WHERE id > @bookmark");
+    let mut config = cfg(&emu.host, "incr", "SELECT * FROM ev WHERE id >= @bookmark");
     config.replication = SpannerReplication::Incremental {
         column: "id".into(),
         initial_value: json!(0),
@@ -134,7 +134,7 @@ async fn incremental_resume_reads_only_new_rows() {
     let (first, bookmark) = drain(&source).await;
     assert_eq!(first.len(), 2);
     let bookmark = bookmark.expect("bookmark on final page");
-    assert_eq!(bookmark, json!(2));
+    assert_eq!(bookmark["value"], json!(2));
 
     // New rows land; resume from the bookmark must read only those.
     support::execute_dml(&client, "INSERT INTO ev (id, v) VALUES (3, 'c'), (4, 'd')").await;
@@ -145,7 +145,77 @@ async fn incremental_resume_reads_only_new_rows() {
     let (second, bookmark2) = drain(&source).await;
     let ids: Vec<i64> = second.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![3, 4], "only rows past the bookmark");
-    assert_eq!(bookmark2, Some(json!(4)));
+    assert_eq!(bookmark2.expect("bookmark")["value"], json!(4));
+}
+
+// ── Rows tied at the bookmark value are never lost ──────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_tied_at_the_bookmark_are_not_skipped() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(
+        &emu.host,
+        "ties",
+        &["CREATE TABLE ev (id INT64 NOT NULL, ts TIMESTAMP) PRIMARY KEY (id)"],
+    )
+    .await;
+    let client = support::raw_client(&emu.host, "ties").await;
+    support::execute_dml(
+        &client,
+        "INSERT INTO ev (id, ts) VALUES \
+         (1, TIMESTAMP '2024-01-01T00:00:00Z'), \
+         (2, TIMESTAMP '2024-01-01T00:00:01Z'), \
+         (3, TIMESTAMP '2024-01-01T00:00:01Z')",
+    )
+    .await;
+
+    let mut config = cfg(&emu.host, "ties", "SELECT * FROM ev");
+    config.batch_size = 2;
+    config.replication = SpannerReplication::Incremental {
+        column: "ts".into(),
+        initial_value: json!("2023-01-01T00:00:00Z"),
+    };
+    let source = SpannerSource::new(config).await.expect("source");
+
+    // Stop after the first page, as a crash would: its bookmark sits on a
+    // value another unread row shares.
+    let ctx = HashMap::new();
+    let first = {
+        let mut stream = source.stream_pages(&ctx, 0);
+        stream.try_next().await.expect("page").expect("first page")
+    };
+    let ids: Vec<i64> = first
+        .records
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    let bookmark = first.bookmark.expect("every page carries a bookmark");
+
+    source.apply_start_bookmark(bookmark).await.unwrap();
+    let (rest, bookmark) = drain(&source).await;
+    let mut all: Vec<i64> = ids
+        .into_iter()
+        .chain(rest.iter().map(|r| r["id"].as_i64().unwrap()))
+        .collect();
+    all.sort_unstable();
+    assert_eq!(all, vec![1, 2, 3], "the tied row is read exactly once");
+
+    // A row committed late at the boundary value is still read.
+    support::execute_dml(
+        &client,
+        "INSERT INTO ev (id, ts) VALUES (4, TIMESTAMP '2024-01-01T00:00:01Z')",
+    )
+    .await;
+    source
+        .apply_start_bookmark(bookmark.expect("bookmark"))
+        .await
+        .unwrap();
+    let (late, _) = drain(&source).await;
+    let ids: Vec<i64> = late.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![4]);
 }
 
 // ── Discover ─────────────────────────────────────────────────────────────────
@@ -350,7 +420,7 @@ async fn timestamp_and_numeric_cursors_keep_rows_of_every_fraction_width() {
     let mut ts = cfg(
         &emu.host,
         "cursors",
-        "SELECT * FROM ev WHERE ts > TIMESTAMP(@bookmark)",
+        "SELECT * FROM ev WHERE ts >= TIMESTAMP(@bookmark)",
     );
     ts.replication = SpannerReplication::Incremental {
         column: "ts".into(),
@@ -360,7 +430,8 @@ async fn timestamp_and_numeric_cursors_keep_rows_of_every_fraction_width() {
     let (rows, bookmark) = drain(&source).await;
     assert_eq!(rows.len(), 2, "both widths kept: {rows:?}");
     let bookmark = bookmark.expect("bookmark");
-    let instant = chrono::DateTime::parse_from_rfc3339(bookmark.as_str().unwrap()).unwrap();
+    let instant =
+        chrono::DateTime::parse_from_rfc3339(bookmark["value"].as_str().unwrap()).unwrap();
     assert_eq!(instant.timestamp_subsec_millis(), 500, "{bookmark}");
     support::execute_dml(
         &client,
@@ -375,11 +446,11 @@ async fn timestamp_and_numeric_cursors_keep_rows_of_every_fraction_width() {
     let mut num = cfg(
         &emu.host,
         "cursors",
-        "SELECT * FROM ev WHERE n > CAST(@bookmark AS NUMERIC) ORDER BY id",
+        "SELECT * FROM ev WHERE n >= CAST(@bookmark AS NUMERIC)",
     );
     num.replication = SpannerReplication::Incremental {
         column: "n".into(),
-        initial_value: json!("9"),
+        initial_value: json!("9.5"),
     };
     let source = SpannerSource::new(num)
         .await
@@ -387,5 +458,5 @@ async fn timestamp_and_numeric_cursors_keep_rows_of_every_fraction_width() {
     let (rows, bookmark) = drain(&source).await;
     let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![2, 3]);
-    assert_eq!(bookmark, Some(json!("100")));
+    assert_eq!(bookmark.expect("bookmark")["value"], json!("100"));
 }

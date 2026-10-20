@@ -91,7 +91,7 @@ async fn conformance_bookmark_roundtrip() {
         support::PROJECT,
         support::INSTANCE,
         "resume",
-        "SELECT * FROM nums WHERE id > @bookmark",
+        "SELECT * FROM nums WHERE id >= @bookmark",
     );
     cfg.connection = support::connection(&emu.host, "resume");
     cfg.replication = SpannerReplication::Incremental {

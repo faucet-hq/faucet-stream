@@ -22,21 +22,27 @@ pub enum SpannerReplication {
     /// Every run fetches the full result set (default).
     #[default]
     Full,
-    /// Only rows whose `column` is strictly greater than the stored bookmark
-    /// (or `initial_value` on the first run) are emitted.
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
     ///
-    /// The bookmark is applied two ways: if the query contains the named
-    /// parameter `@bookmark`, it is bound so the server filters (efficient);
-    /// the source *also* filters client-side as a correctness backstop. The
-    /// new maximum of `column` is persisted on the final page.
+    /// The source wraps the query as
+    /// ``SELECT * FROM (<query>) AS q WHERE q.`column` >= CAST(@bookmark AS <type>) ORDER BY q.`column` ``
+    /// (`<type>` is the column's type, read from the query's result metadata)
+    /// and drops the rows it already emitted at the bookmark value, so rows
+    /// that share a cursor value (ties, late commits) are never skipped.
+    /// Every page carries a bookmark, so a crash replays at most one page.
+    /// Write `@bookmark` in the query (with `>=`) to apply the cursor further
+    /// inside it; a strict `>` is refused. Rows whose `column` is NULL are
+    /// never read.
     ///
-    /// Spanner does not implicitly coerce parameter types: a string bookmark
-    /// compared against a `TIMESTAMP` column needs an explicit cast in the
-    /// query, e.g. `WHERE updated_at > TIMESTAMP(@bookmark)`.
+    /// `@bookmark` inside the query is bound by its JSON type (a timestamp
+    /// bookmark is a STRING), and Spanner does not coerce parameter types: cast
+    /// it where you use it, e.g. `WHERE updated_at >= TIMESTAMP(@bookmark)`.
     Incremental {
         /// Column whose value is the replication cursor (e.g. `updated_at`).
         column: String,
-        /// Lower bound used on the first run, before any bookmark is stored.
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
         initial_value: Value,
     },
 }
@@ -193,10 +199,24 @@ impl SpannerSourceConfig {
                 }
             }
         }
-        if let SpannerReplication::Incremental { column, .. } = &self.replication {
+        if let SpannerReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
+        {
             if column.trim().is_empty() {
                 return Err(FaucetError::Config(
                     "spanner: incremental replication requires a non-empty `column`".into(),
+                ));
+            }
+            if !matches!(
+                initial_value,
+                Value::String(_) | Value::Number(_) | Value::Bool(_)
+            ) {
+                return Err(FaucetError::Config(
+                    "spanner: incremental replication requires a scalar `initial_value` \
+                     (string / integer / float / boolean)"
+                        .into(),
                 ));
             }
             if self.params.contains_key("bookmark") {
@@ -206,31 +226,61 @@ impl SpannerSourceConfig {
                         .into(),
                 ));
             }
-        }
-        if self.incremental_without_bookmark_pushdown() {
-            tracing::warn!(
-                "spanner incremental replication query has no `@bookmark` parameter: the \
-                 cursor is applied client-side only, so the server returns the ENTIRE \
-                 table on every run (correctness is preserved, but it is a full re-scan). \
-                 Add `@bookmark` to the WHERE clause to push the cursor down, e.g. \
-                 `... WHERE {column} > @bookmark`",
-                column = match &self.replication {
-                    SpannerReplication::Incremental { column, .. } => column.as_str(),
-                    _ => "<column>",
-                }
-            );
+            if strict_bookmark_comparison(&self.query) {
+                return Err(FaucetError::Config(format!(
+                    "spanner: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source \
+                     re-reads the bookmark value and drops the rows it already emitted, and a \
+                     strict comparison skips rows that share it"
+                )));
+            }
         }
         Ok(())
     }
+}
 
-    /// `true` when replication is `Incremental` but the query omits the
-    /// `@bookmark` parameter, so the cursor cannot be pushed down to the
-    /// server and every run re-scans the whole table. Pure predicate so the
-    /// load-time warning's condition is unit-testable.
-    pub(crate) fn incremental_without_bookmark_pushdown(&self) -> bool {
-        matches!(self.replication, SpannerReplication::Incremental { .. })
-            && !self.query.contains("@bookmark")
+/// The named parameter a query uses to read the incremental bookmark
+/// (`WHERE updated_at >= TIMESTAMP(@bookmark)`).
+pub const BOOKMARK_TOKEN: &str = "@bookmark";
+
+/// `true` when the query compares `@bookmark` strictly (`> @bookmark`,
+/// `> TIMESTAMP(@bookmark)`, `> CAST(@bookmark AS NUMERIC)`, `@bookmark < c`).
+fn strict_bookmark_comparison(query: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut unwrapped = String::with_capacity(query.len());
+    let mut rest = query;
+    while let Some(i) = rest.find(BOOKMARK_TOKEN) {
+        let end = i + BOOKMARK_TOKEN.len();
+        if rest[end..].starts_with(ident) {
+            // Another parameter (`@bookmark_x`): keep it out of the check.
+            unwrapped.push_str(&rest[..i]);
+            unwrapped.push_str("@_param");
+            rest = &rest[end..];
+            continue;
+        }
+        let (mut start, mut stop) = (i, end);
+        let before = rest[..i].trim_end();
+        if let Some(open) = before.strip_suffix('(') {
+            let name = open.trim_end();
+            let fname = name.trim_end_matches(ident);
+            let after = rest[end..].trim_start();
+            let after = match after.get(..3) {
+                Some(kw) if kw.eq_ignore_ascii_case("AS ") => after[3..]
+                    .trim_start()
+                    .trim_start_matches(ident)
+                    .trim_start(),
+                _ => after,
+            };
+            if let Some(tail) = after.strip_prefix(')') {
+                start = fname.len();
+                stop = rest.len() - tail.len();
+            }
+        }
+        unwrapped.push_str(&rest[..start]);
+        unwrapped.push_str(BOOKMARK_TOKEN);
+        rest = &rest[stop..];
     }
+    unwrapped.push_str(rest);
+    faucet_core::replication::cursor::strict_comparison(&unwrapped, BOOKMARK_TOKEN)
 }
 
 #[cfg(test)]
@@ -341,21 +391,55 @@ mod tests {
     }
 
     #[test]
-    fn incremental_without_bookmark_pushdown_flags_missing_token() {
-        let mut missing = base();
-        missing.replication = SpannerReplication::Incremental {
-            column: "updated_at".into(),
-            initial_value: json!("1970-01-01"),
+    fn validate_rejects_bad_incremental_settings() {
+        for (query, column, initial, needle) in [
+            (
+                "SELECT * FROM t",
+                "updated_at",
+                json!(null),
+                "initial_value",
+            ),
+            ("SELECT * FROM t", "updated_at", json!([1]), "initial_value"),
+            ("SELECT * FROM t WHERE c > @bookmark", "c", json!(0), ">="),
+            ("SELECT * FROM t WHERE @bookmark < c", "c", json!(0), ">="),
+            (
+                "SELECT * FROM t WHERE ts > TIMESTAMP(@bookmark)",
+                "ts",
+                json!("1970-01-01T00:00:00Z"),
+                ">=",
+            ),
+            (
+                "SELECT * FROM t WHERE n > CAST( @bookmark AS NUMERIC ) ORDER BY n",
+                "n",
+                json!("0"),
+                ">=",
+            ),
+            ("SELECT * FROM t WHERE c > (@bookmark)", "c", json!(0), ">="),
+        ] {
+            let mut cfg = base();
+            cfg.query = query.into();
+            cfg.replication = SpannerReplication::Incremental {
+                column: column.into(),
+                initial_value: initial,
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+        let mut ok = base();
+        ok.query = "SELECT * FROM t WHERE c >= @bookmark".into();
+        ok.replication = SpannerReplication::Incremental {
+            column: "c".into(),
+            initial_value: json!(0),
         };
-        assert!(missing.incremental_without_bookmark_pushdown());
-        // validate still succeeds (warn, not hard-error).
-        assert!(missing.validate().is_ok());
-
-        let mut with_token = missing.clone();
-        with_token.query = "SELECT * FROM t WHERE updated_at > @bookmark".into();
-        assert!(!with_token.incremental_without_bookmark_pushdown());
-
-        assert!(!base().incremental_without_bookmark_pushdown());
+        assert!(ok.validate().is_ok());
+        for query in [
+            "SELECT * FROM t WHERE ts >= TIMESTAMP(@bookmark)",
+            "SELECT * FROM t WHERE n >= CAST(@bookmark AS NUMERIC)",
+            "SELECT * FROM t WHERE c > @bookmark_other AND c >= @bookmark",
+            "SELECT * FROM t WHERE c > f (x) AND c >= @bookmark",
+        ] {
+            assert!(!strict_bookmark_comparison(query), "{query}");
+        }
     }
 
     #[test]
