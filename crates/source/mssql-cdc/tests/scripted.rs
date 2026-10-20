@@ -301,3 +301,91 @@ async fn a_cut_connection_that_cannot_be_replaced_keeps_the_error() {
     let err = pages(&source).await.unwrap_err();
     assert!(err.contains("mssql-cdc: query timed out"), "{err}");
 }
+
+/// Capture instances planned a moment apart read different database max LSNs;
+/// a transaction above the first instance's bound must not mark that instance
+/// consumed past what its own query covered, or a run stopped at that page
+/// boundary resumes it after changes it never read.
+#[tokio::test]
+async fn no_instance_is_marked_past_the_poll_s_upper_bound() {
+    const X: &str = "00000000000000000020";
+    const Y: &str = "00000000000000000040";
+    let server = TdsServer::start().await.unwrap();
+    preflight(&server, 1);
+    server.on(
+        CHANGE_TABLES,
+        nv(
+            &["ci", "src_schema", "src_table"],
+            vec![
+                vec!["dbo_t".into(), "dbo".into(), "t".into()],
+                vec!["dbo_u".into(), "dbo".into(), "u".into()],
+            ],
+        ),
+    );
+    let cols = [
+        ("__faucet_lsn", TdsType::NVarChar),
+        ("__faucet_seqval", TdsType::NVarChar),
+        ("__$operation", TdsType::Int),
+        ("id", TdsType::BigInt),
+    ];
+    server.on(CHANGES, Reply::rows(&cols, vec![])).on(
+        "fn_cdc_get_all_changes_dbo_u",
+        Reply::rows(
+            &cols,
+            vec![
+                vec![
+                    "00000000000000000030".into(),
+                    "01".into(),
+                    TdsValue::Int(2),
+                    TdsValue::Int(1),
+                ],
+                vec![
+                    "00000000000000000038".into(),
+                    "01".into(),
+                    TdsValue::Int(2),
+                    TdsValue::Int(2),
+                ],
+            ],
+        ),
+    );
+    let source = MssqlCdcSource::new(cfg(
+        &server,
+        json!({"capture_instances": ["dbo_t", "dbo_u"]}),
+    ))
+    .await
+    .unwrap();
+    let bounds = |max: &str| {
+        nv(
+            &["min_lsn", "max_lsn", "start_lsn"],
+            vec![vec![LSN1.into(), max.into(), LSN1.into()]],
+        )
+    };
+    // dbo_t is planned against X, dbo_u a moment later against Y > X.
+    server.on(BOUNDS, bounds(Y)).on_times(BOUNDS, bounds(X), 1);
+    let ctx = HashMap::new();
+    let mut stream = source.stream_pages(&ctx, 1000);
+    let first_poll: Vec<faucet_core::StreamPage> = {
+        let mut out = Vec::new();
+        while let Some(page) = stream.try_next().await.unwrap() {
+            let done = page
+                .bookmark
+                .as_ref()
+                .is_some_and(|b| b["dbo_u"] == json!(X));
+            out.push(page);
+            if done {
+                break;
+            }
+        }
+        out
+    };
+    for page in &first_poll {
+        let bm = page
+            .bookmark
+            .as_ref()
+            .expect("every page carries a bookmark");
+        assert!(
+            bm["dbo_t"].as_str().unwrap() <= X,
+            "dbo_t marked past its own upper bound: {bm}"
+        );
+    }
+}

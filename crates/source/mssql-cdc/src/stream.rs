@@ -620,8 +620,16 @@ impl MssqlCdcSource {
                 let mut queries: Vec<ChangeQuery> = Vec::new();
                 {
                     let mut conn = self.checkout("pool").await?;
+                    let mut all_bounds = Vec::with_capacity(self.config.capture_instances.len());
                     for ci in &self.config.capture_instances {
-                        let bounds = self.query_lsn_bounds(&mut conn, ci).await?;
+                        all_bounds.push(self.query_lsn_bounds(&mut conn, ci).await?);
+                    }
+                    // One upper bound for the whole poll: instances planned
+                    // against different max LSNs would let a transaction read
+                    // from one mark another as consumed past its own range.
+                    let max = poll_upper_bound(&all_bounds);
+                    for (ci, bounds) in self.config.capture_instances.iter().zip(all_bounds) {
+                        let bounds = shared_upper_bound(bounds, max);
                         match plan_instance(ci, &self.tables, bounds, &mut marks, start_position, self.config.on_gap)? {
                             InstanceStep::Idle => {}
                             InstanceStep::Query(q) => queries.push(q),
@@ -915,10 +923,25 @@ impl TxAssembler {
     }
 }
 
-/// Everything up to each queried instance's `to` has been consumed.
+/// The poll's single upper bound: the smallest database max LSN read while
+/// planning (each reading covers every instance's changes up to it). `None`
+/// when any reading saw no changes yet.
+fn poll_upper_bound(bounds: &[LsnBounds]) -> Option<Lsn> {
+    bounds.iter().map(|b| b.max).min().flatten()
+}
+
+/// An instance's bounds with the poll's single database max LSN.
+fn shared_upper_bound(bounds: LsnBounds, max: Option<Lsn>) -> LsnBounds {
+    LsnBounds { max, ..bounds }
+}
+
+/// Everything up to each queried instance's `to` has been consumed. A mark is
+/// never moved backwards: a persisted bookmark only ever advances.
 fn consume_all(marks: &mut Bookmarks, queries: &[ChangeQuery]) {
     for q in queries {
-        marks.set(q.ci.clone(), q.to);
+        if marks.get(&q.ci).is_none_or(|m| m < q.to) {
+            marks.set(q.ci.clone(), q.to);
+        }
     }
 }
 
@@ -938,12 +961,14 @@ fn next_head(heads: &[Option<Change>]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// Mark every queried instance as consumed through commit `lsn`, never moving
-/// one backwards.
+/// Mark every queried instance as consumed through commit `lsn` — capped at
+/// that instance's own upper bound, which is all its query read — never
+/// moving one backwards.
 fn advance_marks(marks: &mut Bookmarks, queries: &[ChangeQuery], lsn: Lsn) {
     for q in queries {
-        if marks.get(&q.ci).is_none_or(|m| m < lsn) {
-            marks.set(q.ci.clone(), lsn);
+        let through = lsn.min(q.to);
+        if marks.get(&q.ci).is_none_or(|m| m < through) {
+            marks.set(q.ci.clone(), through);
         }
     }
 }
@@ -1329,6 +1354,52 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("max_staged_records (2)"), "{err}");
+    }
+
+    #[test]
+    fn marks_never_pass_an_instance_s_own_upper_bound() {
+        let short = ChangeQuery {
+            to: lsn("00000000000000000050"),
+            ..query("dbo_a")
+        };
+        let queries = [short, query("dbo_b")];
+        let mut marks = Bookmarks::new();
+        advance_marks(&mut marks, &queries, lsn("00000000000000000070"));
+        assert_eq!(marks.get("dbo_a"), Some(lsn("00000000000000000050")));
+        assert_eq!(marks.get("dbo_b"), Some(lsn("00000000000000000070")));
+        // The end of the poll never moves a mark back.
+        marks.set("dbo_a", lsn("00000000000000000060"));
+        consume_all(&mut marks, &queries);
+        assert_eq!(marks.get("dbo_a"), Some(lsn("00000000000000000060")));
+        assert_eq!(marks.get("dbo_b"), Some(lsn("00000000000000000100")));
+    }
+
+    #[test]
+    fn every_instance_is_planned_against_one_max_lsn() {
+        let own = LsnBounds {
+            min: Some(lsn("00000000000000000001")),
+            max: Some(lsn("00000000000000000099")),
+            start: Some(lsn("00000000000000000001")),
+        };
+        let shared = shared_upper_bound(own, Some(lsn("00000000000000000040")));
+        assert_eq!(shared.max, Some(lsn("00000000000000000040")));
+        assert_eq!((shared.min, shared.start), (own.min, own.start));
+        assert_eq!(shared_upper_bound(own, None).max, None);
+        let later = LsnBounds {
+            max: Some(lsn("00000000000000000050")),
+            ..own
+        };
+        let earlier = LsnBounds {
+            max: Some(lsn("00000000000000000030")),
+            ..own
+        };
+        assert_eq!(
+            poll_upper_bound(&[later, earlier]),
+            Some(lsn("00000000000000000030"))
+        );
+        let unharvested = LsnBounds { max: None, ..own };
+        assert_eq!(poll_upper_bound(&[later, unharvested]), None);
+        assert_eq!(poll_upper_bound(&[]), None);
     }
 
     #[test]
