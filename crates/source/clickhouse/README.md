@@ -57,35 +57,47 @@ credentials do not leak into request logs).
 
 ## Incremental replication
 
-Set `replication` to track a monotonically increasing column across runs. Only
-rows whose column value is strictly greater than the stored bookmark (or
-`initial_value` on the first run) are emitted, and the new maximum is persisted
-on the final page.
+Set `replication` to read only the rows not yet delivered, in cursor order.
+The source wraps the query as
+`SELECT * FROM (<query>) AS q WHERE q."<column>" >= <bookmark> ORDER BY q."<column>"`,
+so ClickHouse filters and orders by the cursor; `initial_value` is the
+inclusive lower bound for the first run.
 
 ```yaml
     replication:
       type: incremental
       column: updated_at
       initial_value: "1970-01-01T00:00:00Z"
-    query: SELECT * FROM events WHERE updated_at > parseDateTime64BestEffort(@bookmark)
+    query: SELECT * FROM events
 ```
+
+**Rows that share a cursor value are never skipped.** The bookmark stores the
+last cursor value **and** a 128-bit fingerprint of every row already emitted at
+it — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read
+re-reads that value with `>=` and drops only the rows it already emitted, so a
+row inserted later in the same second (a `DateTime` has one-second
+resolution), an async-insert flush or a lagging replica's rows at the boundary
+are delivered. Above 10,000 rows at one value the set is dropped and the value
+is re-read in full: duplicates, never loss. Every page carries the bookmark
+after its last row, so a crash replays at most one page. A bare bookmark stored
+by an earlier release reads as that value with an empty boundary (its rows are
+re-delivered once). Rows whose cursor is `NULL` are never read.
 
 `DateTime` / `DateTime64` values are emitted as RFC 3339 in UTC
 (`2024-01-01T04:30:00Z`, the `date_time_output_format=iso` setting), so a
 non-UTC column zone never shifts them. ClickHouse will not compare a
-`DateTime` column with an RFC 3339 string literal directly, so wrap the
-bookmark in `parseDateTime64BestEffort(@bookmark)` for a `DateTime` cursor, and
-write `initial_value` in the same RFC 3339 form so the client-side filter
-orders it correctly. Float `NaN` / `±Inf` have no JSON number and are emitted as a `null`
-counted in the run summary (`non_finite`); a `Decimal` keeps its declared
-scale (`1.50`).
+`DateTime` column with an RFC 3339 string literal, so the source binds such a
+bookmark as `parseDateTime64BestEffort('…', 9)`; a `String` column holding
+RFC 3339 text refuses that, and the read is retried with the bookmark as
+text. Write `initial_value` in the same RFC 3339 form. Float `NaN` / `±Inf`
+have no JSON number and are emitted as a `null` counted in the run summary
+(`non_finite`); a `Decimal` keeps its declared scale (`1.50`).
 
-Put the literal `@bookmark` token in the `WHERE` clause to push the cursor down
-to the server (efficient); it is substituted as an injection-safe SQL literal.
-The source *also* filters client-side as a correctness backstop. If `@bookmark`
-is omitted the cursor is applied client-side only, so the server returns the
-whole result set on every run (correctness is preserved, but it is a full
-re-scan — a warning is logged).
+To apply the cursor further inside the query (a CTE, a join), write the
+literal `@bookmark` token there with `>=` — for a `DateTime` cursor,
+`WHERE updated_at >= parseDateTime64BestEffort(@bookmark)`. It is substituted
+as an injection-safe SQL literal. A `> @bookmark` is refused at load time
+because it would skip rows that share the bookmark value.
 
 In a matrix child, reference parent-record values with `${parent.field}`
 tokens; they are substituted as injection-safe SQL literals. Library callers

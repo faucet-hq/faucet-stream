@@ -31,7 +31,7 @@ mod config;
 mod decode;
 mod stream;
 
-pub use config::{ClickHouseReplication, ClickHouseSourceConfig};
+pub use config::{BOOKMARK_TOKEN, ClickHouseReplication, ClickHouseSourceConfig};
 pub use stream::ClickHouseSource;
 
 // Re-export the shared connection type so users configure the source without
