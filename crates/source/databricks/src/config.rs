@@ -29,16 +29,22 @@ pub enum DatabricksReplication {
     /// Every run fetches the full result set (default).
     #[default]
     Full,
-    /// Only rows whose `column` is strictly greater than the stored bookmark
-    /// (or `initial_value` on the first run) are emitted. If the SQL contains
-    /// the literal token `${bookmark}`, it is bound as a `:_faucet_bookmark`
-    /// named parameter so the warehouse filters server-side (efficient); the
-    /// source also filters client-side as a correctness backstop. The new
-    /// maximum of `column` is persisted on the final page.
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
+    ///
+    /// The source wraps the SQL as
+    /// ``SELECT * FROM (<sql>) AS q WHERE q.`column` >= :_faucet_bookmark ORDER BY q.`column` ``
+    /// and drops the rows it already emitted at the bookmark value, so rows
+    /// that share a cursor value (ties, late commits) are never skipped.
+    /// Every page carries a bookmark, so a crash replays at most one page.
+    /// Write `${bookmark}` in the SQL (with `>=`) to apply the cursor further
+    /// inside it; a strict `>` is refused. Rows whose `column` is NULL are
+    /// never read.
     Incremental {
         /// Column whose value is the replication cursor (e.g. `updated_at`).
         column: String,
-        /// Lower bound used on the first run, before any bookmark is stored.
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
         initial_value: Value,
     },
 }
@@ -190,7 +196,7 @@ pub struct DatabricksSourceConfig {
     ///
     /// Requires the crate-local `arrow` feature, and (in this release) only
     /// [`DatabricksReplication::Full`] — the columnar path does not run the
-    /// per-row client-side incremental filter. Defaults to `false` (the
+    /// per-row cursor bookmark. Defaults to `false` (the
     /// `INLINE` + `JSON_ARRAY` row path, unchanged). RFC 0002 / #375.
     #[serde(default)]
     pub arrow_native: bool,
@@ -236,6 +242,30 @@ impl DatabricksSourceConfig {
             )));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        if let DatabricksReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
+        {
+            if column.trim().is_empty() {
+                return Err(FaucetError::Config(
+                    "databricks: incremental replication `column` must not be empty".into(),
+                ));
+            }
+            if initial_value.is_null() {
+                return Err(FaucetError::Config(
+                    "databricks: incremental replication requires a non-null `initial_value`"
+                        .into(),
+                ));
+            }
+            if faucet_core::replication::cursor::strict_comparison(&self.sql, BOOKMARK_TOKEN) {
+                return Err(FaucetError::Config(format!(
+                    "databricks: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source \
+                     re-reads the bookmark value and drops the rows it already emitted, and a \
+                     strict comparison skips rows that share it"
+                )));
+            }
+        }
         if self.arrow_native {
             if !cfg!(feature = "arrow") {
                 return Err(FaucetError::Config(
@@ -247,7 +277,7 @@ impl DatabricksSourceConfig {
             if !matches!(self.replication, DatabricksReplication::Full) {
                 return Err(FaucetError::Config(
                     "databricks: `arrow_native` currently supports only `replication: full` — the \
-                     columnar path does not run the client-side incremental filter"
+                     columnar path does not track the cursor bookmark"
                         .into(),
                 ));
             }
@@ -255,6 +285,10 @@ impl DatabricksSourceConfig {
         Ok(())
     }
 }
+
+/// The token SQL uses to read the incremental bookmark
+/// (`WHERE updated_at >= ${bookmark}`).
+pub const BOOKMARK_TOKEN: &str = "${bookmark}";
 
 #[cfg(test)]
 mod tests {
@@ -360,6 +394,29 @@ mod tests {
         assert!(c.validate().is_err());
         c.wait_timeout_secs = 0; // allowed (fully async)
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_incremental_settings() {
+        for (sql, column, initial, needle) in [
+            ("SELECT * FROM t", " ", json!(0), "column"),
+            ("SELECT * FROM t", "ts", json!(null), "initial_value"),
+            (
+                "SELECT * FROM t WHERE ts > ${bookmark}",
+                "ts",
+                json!(0),
+                ">=",
+            ),
+        ] {
+            let mut c = base();
+            c.sql = sql.into();
+            c.replication = DatabricksReplication::Incremental {
+                column: column.into(),
+                initial_value: initial,
+            };
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
     }
 
     #[test]

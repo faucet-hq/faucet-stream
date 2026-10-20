@@ -25,8 +25,9 @@ the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/fauc
   `DECIMAL`/large `LONG` preserved losslessly as strings). A result with two
   columns of the same name (a join's `id`) fails with an error asking you to
   alias them, rather than one silently replacing the other.
-- **Incremental replication** — a bookmark column + a `${bookmark}` token bound
-  as a server-side named parameter, plus a client-side filter backstop.
+- **Incremental replication** — reads only rows not yet delivered, in cursor
+  order, without skipping rows that share a cursor value; a crash replays at
+  most one page (see [Incremental replication](#incremental-replication)).
 - **Bearer auth** (PAT / OAuth M2M), inline or via the shared `auth:` catalog.
   The auth and Statement Execution API client live in
   [`faucet-common-databricks`](https://crates.io/crates/faucet-common-databricks)
@@ -68,10 +69,31 @@ pipeline:
     config:
       workspace_url: https://dbc-xxxx.cloud.databricks.com
       warehouse_id: 0123456789abcdef
-      sql: SELECT id, ts FROM events WHERE ts > ${bookmark}
+      sql: SELECT id, ts FROM events
       auth: { type: pat, config: { token: "${env:DATABRICKS_TOKEN}" } }
       replication: { type: incremental, column: ts, initial_value: "2026-01-01" }
 ```
+
+## Incremental replication
+
+`replication: { type: incremental, column, initial_value }` wraps the SQL as
+``SELECT * FROM (<sql>) AS q WHERE q.`<column>` >= :_faucet_bookmark ORDER BY q.`<column>` ``,
+so the warehouse filters and orders by the cursor; `initial_value` is the
+inclusive lower bound for the first run. To apply the cursor further inside
+the SQL, write `${bookmark}` there with `>=` (it binds the same named
+parameter); a `> ${bookmark}` is refused at load time because it would skip
+rows that share the bookmark value.
+
+**Rows that share a cursor value are never skipped.** The bookmark stores the
+last cursor value **and** a 128-bit fingerprint of every row already emitted at
+it — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read
+re-reads that value with `>=` and drops only the rows it already emitted, so a
+row committed later with the last `updated_at` is delivered. Above 10,000 rows
+at one value the set is dropped and the value is re-read in full: duplicates,
+never loss. Every page carries the bookmark after its last row, so a crash
+replays at most one page. A bare bookmark stored by an earlier release reads
+as that value with an empty boundary (its rows are re-delivered once). Rows
+whose cursor is `NULL` are never read.
 
 ## Arrow columnar (Parquet) mode
 
@@ -90,8 +112,8 @@ IPC stream rather than a `JSON_ARRAY`. This has two effects:
 
 `arrow_native: true` requires the `arrow` feature and only works with
 `replication: full` — config validation rejects `arrow_native` combined with
-incremental replication, because the columnar path does not run the per-row
-client-side incremental filter. The default (`arrow_native: false`) keeps the
+incremental replication, because the columnar path does not track the
+per-row cursor bookmark. The default (`arrow_native: false`) keeps the
 `JSON_ARRAY` row path.
 
 ```yaml

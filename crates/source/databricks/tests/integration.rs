@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use faucet_core::{AuthSpec, Source};
 use faucet_source_databricks::{DatabricksAuth, DatabricksReplication, DatabricksSourceConfig};
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn base_config(uri: &str, sql: &str) -> DatabricksSourceConfig {
@@ -185,7 +185,7 @@ async fn external_link_chunks_stream_without_the_workspace_token() {
 
     let mut cfg = base_config(
         &server.uri(),
-        "SELECT id, name FROM t WHERE id > ${bookmark}",
+        "SELECT id, name FROM t WHERE id >= ${bookmark}",
     );
     cfg.replication = DatabricksReplication::Incremental {
         column: "id".into(),
@@ -337,24 +337,46 @@ async fn http_error_surfaces_status_and_body() {
     assert!(err.to_string().contains("403"), "{}", err);
 }
 
+/// The statement filters with `>=` and orders by the cursor; a resumed read
+/// drops the row it already emitted at the bookmark value and keeps a row
+/// that committed later with the same value.
 #[tokio::test]
 async fn incremental_bookmark_round_trip() {
     let server = MockServer::start().await;
-    // Rows with a `ts` cursor column; source should emit the max as the bookmark.
-    Mock::given(method("POST"))
-        .and(path_regex(r"^/api/2\.0/sql/statements$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "statement_id": "s5",
+    let reply = |id: &str, rows: Value| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": id,
             "status": { "state": "SUCCEEDED" },
             "manifest": manifest(&[("id", "INT"), ("ts", "STRING")]),
-            "result": { "data_array": [
-                ["1", "2026-01-01"], ["2", "2026-03-01"], ["3", "2026-02-01"]
-            ] }
-        })))
+            "result": { "data_array": rows }
+        }))
+    };
+    // Run 2 binds the stored bookmark; run 1 binds `initial_value`.
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/api/2\.0/sql/statements$"))
+        .and(body_string_contains("\"value\":\"2026-03-01\""))
+        .respond_with(reply(
+            "s6",
+            json!([
+                ["2", "2026-03-01"],
+                ["4", "2026-03-01"],
+                ["5", "2026-04-01"]
+            ]),
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/api/2\.0/sql/statements$"))
+        .respond_with(reply(
+            "s5",
+            json!([["3", "2026-02-01"], ["2", "2026-03-01"]]),
+        ))
+        .with_priority(2)
         .mount(&server)
         .await;
 
-    let mut cfg = base_config(&server.uri(), "SELECT id, ts FROM t WHERE ts > ${bookmark}");
+    let mut cfg = base_config(&server.uri(), "SELECT id, ts FROM t");
     cfg.replication = DatabricksReplication::Incremental {
         column: "ts".into(),
         initial_value: json!("2026-01-15"),
@@ -362,28 +384,31 @@ async fn incremental_bookmark_round_trip() {
     let src = DatabricksSource::new(cfg)
         .unwrap()
         .with_endpoint_base(server.uri());
-
-    // state_key derived (incremental).
     assert!(src.state_key().is_some());
 
-    use futures::StreamExt;
-    let ctx = HashMap::new();
-    let mut pages = src.stream_pages(&ctx, 1000);
-    let mut all_rows = Vec::new();
-    let mut final_bookmark: Option<Value> = None;
-    while let Some(p) = pages.next().await {
-        let page = p.unwrap();
-        if page.bookmark.is_some() {
-            final_bookmark = page.bookmark.clone();
-        }
-        all_rows.extend(page.records);
-    }
-    // Client-side filter drops the row at/below the initial bookmark (2026-01-01).
-    let kept_ts: Vec<&str> = all_rows.iter().map(|r| r["ts"].as_str().unwrap()).collect();
-    assert!(kept_ts.contains(&"2026-03-01") && kept_ts.contains(&"2026-02-01"));
-    assert!(!kept_ts.contains(&"2026-01-01"));
-    // Bookmark is the max cursor across the full scan.
-    assert_eq!(final_bookmark, Some(json!("2026-03-01")));
+    let (rows, bookmark) = src.fetch_all_incremental().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    let bookmark = bookmark.expect("bookmark");
+    assert_eq!(bookmark["value"], json!("2026-03-01"));
+    let first = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&first[0].body).unwrap();
+    assert_eq!(
+        body["statement"],
+        json!(
+            "SELECT * FROM (SELECT id, ts FROM t\n) AS q WHERE q.`ts` >= :_faucet_bookmark \
+             ORDER BY q.`ts`"
+        )
+    );
+
+    src.apply_start_bookmark(bookmark).await.unwrap();
+    let (rows, bookmark) = src.fetch_all_incremental().await.unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![4, 5],
+        "the tied row is kept, the emitted one dropped"
+    );
+    assert_eq!(bookmark.unwrap()["value"], json!("2026-04-01"));
 }
 
 #[tokio::test]

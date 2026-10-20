@@ -15,14 +15,14 @@ use async_trait::async_trait;
 use faucet_common_databricks::{
     ErrorSide, StatementClient, StatementOptions, resolve_authorization, value_to_param_string,
 };
-use faucet_core::replication::{filter_incremental, max_value};
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::{FaucetError, SharedAuthProvider, Source, Stream, StreamPage};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::{
-    DatabricksReplication, DatabricksSourceConfig, ResultDisposition, shared_auth,
+    BOOKMARK_TOKEN, DatabricksReplication, DatabricksSourceConfig, ResultDisposition, shared_auth,
 };
 use crate::convert::{ColumnInfo, row_to_json};
 
@@ -37,7 +37,7 @@ pub struct DatabricksSource {
     /// precedence over inline auth).
     auth_provider: Option<SharedAuthProvider>,
     /// Bookmark applied via [`Source::apply_start_bookmark`].
-    start_bookmark: Mutex<Option<Value>>,
+    start_bookmark: Mutex<Option<CursorBookmark>>,
     /// Backend-call context (#880) every request runs through.
     calls: faucet_core::CallSlot,
 }
@@ -82,10 +82,15 @@ struct Executed {
     result: Option<ResultChunk>,
 }
 
-/// Client-side incremental filter context.
+/// Incremental-read context (column + starting position).
 struct IncrementalCtx {
     column: String,
-    start: Value,
+    start: CursorBookmark,
+}
+
+/// A Databricks SQL identifier in backticks (a backtick inside is doubled).
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }
 
 impl DatabricksSource {
@@ -167,7 +172,7 @@ impl DatabricksSource {
                     .lock()
                     .expect("start_bookmark mutex poisoned")
                     .clone()
-                    .unwrap_or_else(|| initial_value.clone());
+                    .unwrap_or_else(|| CursorBookmark::initial(initial_value.clone()));
                 Some(IncrementalCtx {
                     column: column.clone(),
                     start,
@@ -177,7 +182,9 @@ impl DatabricksSource {
     }
 
     /// Build the request body: the SQL (with `${bookmark}` and `{ctx}` tokens
-    /// rewritten to named params) plus the `parameters` array.
+    /// rewritten to named params, and for an incremental read wrapped as
+    /// `SELECT * FROM (<sql>) AS q WHERE q.<column> >= :_faucet_bookmark
+    /// ORDER BY q.<column>`) plus the `parameters` array.
     fn build_body(&self, context: &HashMap<String, Value>, incr: Option<&IncrementalCtx>) -> Value {
         let mut sql = self.config.sql.clone();
         // Named parameters: start with the user's static ones.
@@ -209,14 +216,18 @@ impl DatabricksSource {
             }
         }
 
-        // Incremental `${bookmark}` token → `:_faucet_bookmark` named param.
-        if let Some(ctx) = incr
-            && sql.contains("${bookmark}")
-        {
-            sql = sql.replace("${bookmark}", ":_faucet_bookmark");
+        // Incremental: `${bookmark}` → the `:_faucet_bookmark` named param,
+        // and the outer `>=` cursor filter + order on the same param.
+        if let Some(ctx) = incr {
+            sql = sql.replace(BOOKMARK_TOKEN, ":_faucet_bookmark");
+            let c = quote_ident(&ctx.column);
+            let inner = sql.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
+            sql = format!(
+                "SELECT * FROM ({inner}\n) AS q WHERE q.{c} >= :_faucet_bookmark ORDER BY q.{c}"
+            );
             params.push(json!({
                 "name": "_faucet_bookmark",
-                "value": value_to_param_string(&ctx.start),
+                "value": value_to_param_string(&ctx.start.value),
             }));
         }
 
@@ -422,10 +433,11 @@ impl Source for DatabricksSource {
     }
 
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        let start = CursorBookmark::from_state(bookmark)?;
         *self
             .start_bookmark
             .lock()
-            .expect("start_bookmark mutex poisoned") = Some(bookmark);
+            .expect("start_bookmark mutex poisoned") = Some(start);
         Ok(())
     }
 
@@ -548,7 +560,9 @@ impl Source for DatabricksSource {
             let batch = self.config.batch_size;
             let cap = if batch == 0 { 1024 } else { batch };
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
-            let mut running_max: Option<Value> = None;
+            let mut tracker = incr
+                .as_ref()
+                .map(|ic| CursorTracker::new(ic.column.clone(), ic.start.clone()));
 
             // Walk chunks: the initial `result`, then follow next_chunk_internal_link.
             let mut chunk = resp.result;
@@ -557,23 +571,13 @@ impl Source for DatabricksSource {
                 {
                     for row in &data {
                         let obj = row_to_json(row, &columns);
-                        // Track the running max BEFORE the client-side filter so
-                        // the persisted bookmark reflects the full scan.
-                        if let Some(ic) = &incr
-                            && let Some(v) = obj.get(&ic.column)
-                        {
-                            running_max = Some(match running_max.take() {
-                                Some(m) => max_value(m, v.clone()),
-                                None => v.clone(),
-                            });
+                        if tracker.as_mut().is_none_or(|t| t.admit(&obj)) {
+                            buffer.push(obj);
                         }
-                        buffer.push(obj);
                         if batch != 0 && buffer.len() >= batch {
                             let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-                            let kept = apply_incr_filter(page, incr.as_ref());
-                            if !kept.is_empty() {
-                                yield StreamPage { records: kept, bookmark: None };
-                            }
+                            let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                            yield StreamPage { records: page, bookmark };
                         }
                     }
                 }
@@ -583,11 +587,18 @@ impl Source for DatabricksSource {
                 };
             }
 
-            // Final page carries the new bookmark (incremental only).
-            let kept = apply_incr_filter(buffer, incr.as_ref());
-            let bookmark = if incr.is_some() { running_max } else { None };
-            if !kept.is_empty() || bookmark.is_some() {
-                yield StreamPage { records: kept, bookmark };
+            // In incremental mode every page carries the position after its
+            // last row (the final page carries one even when empty).
+            if !buffer.is_empty() || tracker.is_some() {
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                yield StreamPage { records: buffer, bookmark };
+            }
+            if let Some(missing) = tracker.as_ref().map(CursorTracker::missing).filter(|n| *n > 0) {
+                tracing::warn!(
+                    missing,
+                    "databricks incremental read: rows without a cursor value were emitted \
+                     without moving the bookmark"
+                );
             }
         })
     }
@@ -596,13 +607,23 @@ impl Source for DatabricksSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        Ok(self.fetch_with_context_incremental(context).await?.0)
+    }
+
+    async fn fetch_with_context_incremental(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         use futures::StreamExt;
-        let mut out = Vec::new();
+        let mut records = Vec::new();
+        let mut bookmark = None;
         let mut s = self.stream_pages(context, self.config.batch_size);
         while let Some(page) = s.next().await {
-            out.extend(page?.records);
+            let page = page?;
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
         }
-        Ok(out)
+        Ok((records, bookmark))
     }
 
     async fn check(
@@ -665,14 +686,6 @@ impl Source for DatabricksSource {
     }
 }
 
-/// Apply the client-side incremental filter to a page (no-op for full runs).
-fn apply_incr_filter(page: Vec<Value>, incr: Option<&IncrementalCtx>) -> Vec<Value> {
-    match incr {
-        Some(ic) => filter_incremental(page, &ic.column, &ic.start),
-        None => page,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,7 +696,7 @@ mod tests {
         DatabricksSourceConfig {
             workspace_url: "https://x.cloud.databricks.com".into(),
             warehouse_id: "wh1".into(),
-            sql: "SELECT * FROM t WHERE ts > ${bookmark}".into(),
+            sql: "SELECT * FROM t WHERE ts >= ${bookmark}".into(),
             auth: AuthSpec::Inline(DatabricksAuth::Pat {
                 token: "tok".into(),
             }),
@@ -736,6 +749,14 @@ mod tests {
                 .contains(":_faucet_bookmark")
         );
         assert!(!body["statement"].as_str().unwrap().contains("${bookmark}"));
+        assert_eq!(
+            body["statement"],
+            json!(
+                "SELECT * FROM (SELECT * FROM t WHERE ts >= :_faucet_bookmark\n) AS q \
+                 WHERE q.`ts` >= :_faucet_bookmark ORDER BY q.`ts`"
+            )
+        );
+        assert_eq!(quote_ident("a`b"), "`a``b`");
         let params = body["parameters"].as_array().unwrap();
         // static `min` (typed) + the bookmark param.
         assert!(
@@ -794,7 +815,15 @@ mod tests {
         assert_eq!(s.state_key().as_deref(), Some("my-key"));
         // apply_start_bookmark overrides initial_value in the incr ctx.
         s.apply_start_bookmark(json!("2026-06-01")).await.unwrap();
-        assert_eq!(s.incremental_ctx().unwrap().start, json!("2026-06-01"));
+        assert_eq!(
+            s.incremental_ctx().unwrap().start.value,
+            json!("2026-06-01")
+        );
+        assert!(
+            s.apply_start_bookmark(json!({"value": null}))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
