@@ -62,6 +62,7 @@ pub enum RelationSource {
     /// Delimited file loaded via DuckDB `read_csv_auto`.
     Csv {
         /// Filesystem path to the CSV file (absolute, or relative to the working directory).
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
         /// Whether the first row is a header row. Default: `true`.
         #[serde(default = "default_true")]
@@ -70,6 +71,7 @@ pub enum RelationSource {
     /// Newline-delimited JSON loaded via DuckDB `read_json_auto`.
     Jsonl {
         /// Filesystem path to the JSONL file (absolute, or relative to the working directory).
+        #[schemars(extend("x-faucet-resource" = "path"))]
         path: String,
     },
     /// Inline rows materialized into a table.
@@ -84,6 +86,7 @@ pub enum RelationSource {
     /// materialized into a DuckDB table joinable by the relation's `name`.
     Http {
         /// Endpoint URL to fetch the rows from.
+        #[schemars(extend("x-faucet-resource" = "url"))]
         url: String,
         /// HTTP method. Default: `GET`.
         #[serde(default)]

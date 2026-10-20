@@ -152,3 +152,50 @@ async fn http_relation_http_error_status_surfaces() {
     );
     assert!(format!("{err}").contains("500"), "got: {err}");
 }
+
+#[tokio::test]
+async fn http_relation_honours_the_scoped_reference_policy() {
+    use faucet_core::resolve::ReferencePolicy;
+    let server = MockServer::start().await;
+    let counter = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/named-lists"))
+        .respond_with(CountingList(counter.clone()))
+        .mount(&server)
+        .await;
+    let cfg = http_relation_config(&format!("{}/named-lists", server.uri()), Some("$.items[*]"));
+
+    let deny = Arc::new(ReferencePolicy::open().with_url_hosts(["api.example.com"]));
+    let err =
+        faucet_core::http::with_reference_policy(deny, async { SqlTransform::compile(&cfg).err() })
+            .await
+            .expect("a host outside the allow-list is refused");
+    assert!(
+        format!("{err}").contains("not in the allow-list"),
+        "got: {err}"
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "nothing was fetched");
+
+    let allow = Arc::new(ReferencePolicy::open().with_url_hosts(["127.0.0.1"]));
+    faucet_core::http::with_reference_policy(allow, async {
+        SqlTransform::compile(&cfg).unwrap();
+    })
+    .await;
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn http_relation_never_follows_a_redirect_into_instance_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/go"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+        )
+        .mount(&server)
+        .await;
+    let cfg = http_relation_config(&format!("{}/go", server.uri()), None);
+    let err = SqlTransform::compile(&cfg).unwrap_err();
+    assert!(format!("{err}").contains("metadata"), "got: {err}");
+}

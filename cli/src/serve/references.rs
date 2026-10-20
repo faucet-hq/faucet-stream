@@ -159,7 +159,8 @@ fn schema_cache() -> &'static SchemaCache {
 }
 
 /// The config schemas of connector `kind` (its source and its sink, as
-/// registered — built-in or plugin).
+/// registered — built-in or plugin) and of a transform of that name, whose
+/// config can name resources too (a `sql` transform's reference relations).
 fn schemas(kind: &str) -> Arc<Vec<Value>> {
     if let Ok(cache) = schema_cache().lock()
         && let Some(hit) = cache.get(kind)
@@ -169,6 +170,7 @@ fn schemas(kind: &str) -> Arc<Vec<Value>> {
     let found: Vec<Value> = [
         crate::registry::source_schema(kind).ok(),
         crate::registry::sink_schema(kind).ok(),
+        crate::transforms::transform_schema(kind).ok(),
     ]
     .into_iter()
     .flatten()
@@ -203,6 +205,32 @@ pub fn runs_program(kind: &str) -> bool {
 mod tests {
     use super::*;
     use crate::cli::ReferenceArgs;
+
+    #[cfg(feature = "transform-sql")]
+    #[test]
+    fn a_sql_transform_names_its_relation_resources() {
+        let config = serde_json::json!({
+            "query": "SELECT * FROM batch, meta",
+            "relations": [
+                {"name": "meta", "source": {"type": "http", "url": "http://169.254.169.254/latest/"}},
+                {"name": "dim", "source": {"type": "csv", "path": "/etc/dim.csv"}}
+            ]
+        });
+        let found = connector_resources("sql", &config);
+        let urls: Vec<_> = found
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Url)
+            .map(|r| r.value.as_str())
+            .collect();
+        assert_eq!(urls, vec!["http://169.254.169.254/latest/"]);
+        assert!(
+            found
+                .iter()
+                .any(|r| r.kind == ResourceKind::Path && r.value == "/etc/dim.csv")
+        );
+        let caller = ServeReferencePolicy::default();
+        assert!(found.iter().any(|r| caller.caller().check(r).is_err()));
+    }
 
     #[test]
     fn the_default_caller_policy_is_an_allow_list() {
