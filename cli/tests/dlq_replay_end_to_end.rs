@@ -18,7 +18,7 @@ fn envelope(reason: &str, kind: &str, payload: Value) -> String {
         "payload": payload,
         "ts_ms": 1_751_760_000_000i64,
         "sink": "jsonl",
-        "pipeline": "orig",
+        "pipeline": "replay",
         "row": "",
         "record_index": 0,
     })
@@ -46,6 +46,7 @@ async fn inputs(pipeline: &str, dry_run: bool) -> ReplayInputs<'static> {
         reason: None,
         failed_dlq: None,
         row: None,
+        all_rows: false,
         dry_run,
         pipeline_name: pipeline.to_string(),
         execution: None,
@@ -190,4 +191,139 @@ pipeline:
         std::fs::canonicalize(fresh).unwrap(),
         std::fs::canonicalize(&dlq).unwrap()
     );
+}
+
+async fn sqlite_table(db: &Path, rows: &[(i64, &str, i64)]) -> sqlx::SqlitePool {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}?mode=rwc", db.display()))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, acct INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, name, acct) in rows {
+        sqlx::query("INSERT INTO t (id, name, acct) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(name)
+            .bind(acct)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    pool
+}
+
+async fn ids(pool: &sqlx::SqlitePool) -> Vec<i64> {
+    sqlx::query_scalar("SELECT id FROM t ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// A replay through a `write_mode: overwrite` row appends the replayed
+/// records: it never swaps in a table holding only them.
+#[tokio::test]
+async fn replay_into_an_overwrite_sink_keeps_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    let pool = sqlite_table(&db, &[(1, "a", 7), (2, "b", 7), (3, "c", 7)]).await;
+    let dlq = dir.path().join("dlq.jsonl");
+    write_file(
+        &dlq,
+        &format!(
+            "{}\n",
+            envelope("partial", "Sink", json!({"id": 4, "name": "d", "acct": 7}))
+        ),
+    );
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: sqlite, config: {{ database_url: \"sqlite://{}\", table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}\n",
+        db.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let outcome = dlq_replay::replay(&cfg, dlq.to_str().unwrap(), inputs("replay", false).await)
+        .await
+        .expect("replay succeeds");
+    assert_eq!(outcome.records_written, 1);
+    assert_eq!(ids(&pool).await, vec![1, 2, 3, 4]);
+}
+
+/// A replay never runs the row's scoped cleanup: the replayed rows are not
+/// the complete set for the scope.
+#[tokio::test]
+async fn replay_does_not_run_scoped_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db");
+    let pool = sqlite_table(&db, &[(1, "a", 7), (2, "b", 7), (3, "c", 7)]).await;
+    let dlq = dir.path().join("dlq.jsonl");
+    write_file(
+        &dlq,
+        &format!(
+            "{}\n",
+            envelope("partial", "Sink", json!({"id": 2, "name": "B", "acct": 7}))
+        ),
+    );
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source:\n    type: csv\n    config: {{ path: /dev/null }}\n    complete_for: {{ scope: {{ acct: 7 }}, on_missing: delete }}\n  sink: {{ type: sqlite, config: {{ database_url: \"sqlite://{}\", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] }} }}\n",
+        db.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    dlq_replay::replay(&cfg, dlq.to_str().unwrap(), inputs("replay", false).await)
+        .await
+        .expect("replay succeeds");
+    assert_eq!(ids(&pool).await, vec![1, 2, 3]);
+    let name: String = sqlx::query_scalar("SELECT name FROM t WHERE id = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "B");
+}
+
+/// Two matrix rows share a pipeline-level DLQ: replaying through `us` lands
+/// only `us`'s envelopes; `eu`'s are skipped and counted.
+#[tokio::test]
+async fn replay_of_a_shared_dlq_keeps_only_the_target_rows_envelopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let us = dir.path().join("us.jsonl");
+    let eu = dir.path().join("eu.jsonl");
+    let tagged = |row: &str, id: i64| {
+        let mut v: Value =
+            serde_json::from_str(&envelope("partial", "Sink", json!({"id": id}))).unwrap();
+        v["row"] = json!(row);
+        v.to_string()
+    };
+    write_file(
+        &dlq,
+        &format!(
+            "{}\n{}\n{}\n",
+            tagged("us", 1),
+            tagged("eu", 2),
+            tagged("us::partition::0001", 3)
+        ),
+    );
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: /dev/null }} }}\n  dlq: {{ sink: {{ type: jsonl, config: {{ path: {dlq} }} }} }}\nmatrix:\n  - id: us\n    sink: {{ config: {{ path: {us} }} }}\n  - id: eu\n    sink: {{ config: {{ path: {eu} }} }}\n",
+        dlq = dlq.display(),
+        us = us.display(),
+        eu = eu.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let failed = dir
+        .path()
+        .join("failed.jsonl")
+        .to_string_lossy()
+        .into_owned();
+    let mut inp: ReplayInputs<'_> = inputs("replay", false).await;
+    inp.row = Some("us");
+    inp.failed_dlq = Some(&failed);
+    let outcome = dlq_replay::replay(&cfg, dlq.to_str().unwrap(), inp)
+        .await
+        .expect("replay succeeds");
+    assert_eq!(outcome.candidates, 2);
+    assert_eq!(outcome.skipped_other_rows, 1);
+    let landed = read_lines(&us);
+    assert_eq!(landed, vec![json!({"id": 1}), json!({"id": 3})]);
+    assert!(!eu.exists());
 }

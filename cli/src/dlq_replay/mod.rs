@@ -20,7 +20,7 @@ use crate::executor::ExecuteOptions;
 use chrono::{DateTime, FixedOffset};
 use faucet_core::UnwrappedEnvelope;
 use plan::{build_replay_node, default_failed_dlq_path, validate_reason};
-use reader::{DlqDecryptor, expand_location, reason_matches, scan_files};
+use reader::{DlqDecryptor, expand_location, reason_matches, replay_selects, scan_files};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -76,6 +76,9 @@ pub struct InspectSummary {
 pub struct ReplayOutcome {
     /// Envelopes that matched the reason filter and would be fed to the pipeline.
     pub candidates: usize,
+    /// Envelopes matching the reason filter that another pipeline or row
+    /// wrote, and so were not replayed (`0` with `--all-rows`).
+    pub skipped_other_rows: usize,
     /// Records the sink accepted (survivors of transforms/quality/contract).
     /// `0` extra sink writes under `--dry-run` (the sink is a no-op counter).
     pub records_written: usize,
@@ -148,6 +151,9 @@ pub struct ReplayInputs<'a> {
     pub failed_dlq: Option<&'a str>,
     /// Which root to replay (`None` = the first root).
     pub row: Option<&'a str>,
+    /// Replay every envelope, whichever pipeline and row wrote it. By
+    /// default only the target row's own envelopes are replayed.
+    pub all_rows: bool,
     pub dry_run: bool,
     pub pipeline_name: String,
     pub execution: Option<ExecutionSpec>,
@@ -199,15 +205,31 @@ pub async fn replay(
         &failed,
         inputs.row,
         decryptor.clone(),
+        inputs.all_rows,
     )?;
 
-    // Count candidates up front with the same decryptor the reader will use.
+    // Count candidates up front with the same decryptor and filters the
+    // reader will use.
+    let target = plan::replay_target(cfg, &node, inputs.all_rows);
     let scan = scan_files(&files, &decryptor)?;
-    let candidates = scan
+    let matching: Vec<_> = scan
         .envelopes
         .iter()
         .filter(|e| reason_matches(e, reason.as_deref()))
+        .collect();
+    let candidates = matching
+        .iter()
+        .filter(|e| replay_selects(e, None, target.as_ref()))
         .count();
+    let skipped_other_rows = matching.len() - candidates;
+    if skipped_other_rows > 0 {
+        tracing::warn!(
+            skipped = skipped_other_rows,
+            row = %node.id,
+            "dlq replay: skipping envelopes another pipeline or row wrote; pass --all-rows to \
+             replay them through this row"
+        );
+    }
 
     // A replay runs under the config's `budget:` (merged with the caller's)
     // and `resilience:`, and stops on the caller's token (#871).
@@ -273,6 +295,7 @@ pub async fn replay(
 
     Ok(ReplayOutcome {
         candidates,
+        skipped_other_rows,
         records_written,
         dry_run: inputs.dry_run,
         failed_dlq: failed.to_string_lossy().into_owned(),

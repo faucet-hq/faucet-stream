@@ -125,6 +125,7 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
             reason: args.reason.as_deref(),
             failed_dlq: args.failed_dlq.as_deref(),
             row: args.row.as_deref(),
+            all_rows: args.all_rows,
             dry_run: args.dry_run,
             pipeline_name,
             execution: cfg.execution.clone(),
@@ -154,6 +155,13 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
             "DLQ replay: {} candidate record(s) from {} re-fed; {} written to the sink. \
              Rows that failed again went to {}.",
             outcome.candidates, args.from, outcome.records_written, outcome.failed_dlq
+        );
+    }
+    if outcome.skipped_other_rows > 0 {
+        println!(
+            "Skipped {} envelope(s) another pipeline or row wrote (pass --all-rows to replay \
+             them through this row, or --row to pick theirs).",
+            outcome.skipped_other_rows
         );
     }
     Ok(())

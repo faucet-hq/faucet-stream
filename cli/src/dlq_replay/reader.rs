@@ -507,6 +507,55 @@ pub struct DlqReaderSource {
     files: Vec<PathBuf>,
     reason: Option<String>,
     dec: DlqDecryptor,
+    target: Option<ReplayTarget>,
+}
+
+/// The pipeline and row a replay writes into. A DLQ location is often shared
+/// (a pipeline-level `dlq:` is inherited by every matrix row), so a replay
+/// keeps only the envelopes that row wrote: replaying another row's dead
+/// letters would land them in the wrong destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayTarget {
+    /// The config's `name:`; `None` when the config has none, so the
+    /// pipeline that wrote an envelope cannot be compared.
+    pub pipeline: Option<String>,
+    /// The target row's id.
+    pub row: String,
+}
+
+impl ReplayTarget {
+    /// Whether `env` was written by this pipeline and row. An envelope that
+    /// does not say who wrote it (no or empty `pipeline` / `row`) matches;
+    /// partitions of one row (`<row>::partition::<n>`) share a destination,
+    /// so they match each other.
+    pub fn matches(&self, env: &UnwrappedEnvelope) -> bool {
+        let pipeline_ok = match (&self.pipeline, env.pipeline.as_deref()) {
+            (Some(want), Some(got)) if !got.is_empty() => want == got,
+            _ => true,
+        };
+        let row_ok = match env.row.as_deref() {
+            Some(got) if !got.is_empty() => {
+                got == self.row || partition_base(got) == partition_base(&self.row)
+            }
+            _ => true,
+        };
+        pipeline_ok && row_ok
+    }
+}
+
+/// The row a partition invocation id (`<row>::partition::<n>`) belongs to.
+fn partition_base(id: &str) -> &str {
+    id.split("::partition::").next().unwrap_or(id)
+}
+
+/// Whether an envelope is replayed: its reason matches and, when a target is
+/// set, the target's pipeline and row wrote it.
+pub fn replay_selects(
+    env: &UnwrappedEnvelope,
+    reason: Option<&str>,
+    target: Option<&ReplayTarget>,
+) -> bool {
+    reason_matches(env, reason) && target.is_none_or(|t| t.matches(env))
 }
 
 impl DlqReaderSource {
@@ -514,7 +563,18 @@ impl DlqReaderSource {
     /// envelopes whose reason matches `reason` (if set). Sealed lines are
     /// decrypted through `dec`.
     pub fn new(files: Vec<PathBuf>, reason: Option<String>, dec: DlqDecryptor) -> Self {
-        Self { files, reason, dec }
+        Self {
+            files,
+            reason,
+            dec,
+            target: None,
+        }
+    }
+
+    /// Keep only the envelopes `target` wrote (see [`ReplayTarget`]).
+    pub fn with_target(mut self, target: Option<ReplayTarget>) -> Self {
+        self.target = target;
+        self
     }
 }
 
@@ -526,6 +586,7 @@ impl Source for DlqReaderSource {
     ) -> Result<Vec<Value>, FaucetError> {
         let files = self.files.clone();
         let reason = self.reason.clone();
+        let target = self.target.clone();
         let dec = self.dec.clone();
         // Blocking file IO off the async runtime.
         let scan = tokio::task::spawn_blocking(move || scan_files(&files, &dec))
@@ -534,7 +595,7 @@ impl Source for DlqReaderSource {
         Ok(scan
             .envelopes
             .into_iter()
-            .filter(|env| reason_matches(env, reason.as_deref()))
+            .filter(|env| replay_selects(env, reason.as_deref(), target.as_ref()))
             .map(|env| env.payload)
             .collect())
     }
@@ -747,6 +808,60 @@ mod tests {
             DlqReaderSource::new(vec![path], Some("contract".into()), DlqDecryptor::default());
         let filtered = src.fetch_all().await.unwrap();
         assert_eq!(filtered, vec![json!({"id": 2})]);
+    }
+
+    #[test]
+    fn replay_target_matches_its_own_rows() {
+        let env = |pipeline: Option<&str>, row: Option<&str>| UnwrappedEnvelope {
+            payload: json!({}),
+            reason: Some("partial".into()),
+            error_kind: None,
+            error_message: None,
+            record_index: None,
+            pipeline: pipeline.map(Into::into),
+            row: row.map(Into::into),
+            sink: None,
+            ts_ms: None,
+        };
+        let t = ReplayTarget {
+            pipeline: Some("etl".into()),
+            row: "us".into(),
+        };
+        assert!(t.matches(&env(Some("etl"), Some("us"))));
+        assert!(!t.matches(&env(Some("etl"), Some("eu"))));
+        assert!(!t.matches(&env(Some("other"), Some("us"))));
+        assert!(t.matches(&env(None, None)), "unlabelled envelopes match");
+        assert!(t.matches(&env(Some(""), Some(""))));
+        assert!(t.matches(&env(Some("etl"), Some("us::partition::0002"))));
+        let part = ReplayTarget {
+            pipeline: None,
+            row: "us::partition::0001".into(),
+        };
+        assert!(part.matches(&env(Some("anything"), Some("us::partition::0002"))));
+        assert!(part.matches(&env(Some("x"), Some("us"))));
+        assert!(!part.matches(&env(Some("x"), Some("usa"))));
+        assert!(replay_selects(&env(None, Some("eu")), None, None));
+        assert!(!replay_selects(&env(None, Some("eu")), None, Some(&t)));
+        assert!(!replay_selects(
+            &env(None, Some("us")),
+            Some("quality"),
+            Some(&t)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dlq_reader_source_skips_other_rows() {
+        let other =
+            envelope_line("quality", json!({"id": 2})).replace("\"row\":\"\"", "\"row\":\"eu\"");
+        let body = format!("{}\n{other}\n", envelope_line("quality", json!({"id": 1})));
+        let (_dir, path) = write_tmp("dlq.jsonl", &body);
+        let src = DlqReaderSource::new(vec![path], None, DlqDecryptor::default()).with_target(
+            Some(ReplayTarget {
+                pipeline: Some("etl".into()),
+                row: "us".into(),
+            }),
+        );
+        assert_eq!(src.fetch_all().await.unwrap(), vec![json!({"id": 1})]);
     }
 
     #[test]

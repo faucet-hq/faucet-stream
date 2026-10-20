@@ -716,6 +716,7 @@ fail again go to a *fresh* DLQ, never back to the source.
 | `--encryption-key-file <path>` | Read a DLQ key from a file (repeatable). `FAUCET_DLQ_ENCRYPTION_KEY` also supplies `--encryption-key`; both keep the key out of `ps` and shell history. Keys are redacted from faucet's output. |
 | `--failed-dlq <path>` | Where re-failed rows go. Default: a `replay-failed.jsonl` sibling of the source. |
 | `--row <id>` | Which root of the config to replay through. Default: the first root. |
+| `--all-rows` | Replay every envelope through the row, whichever pipeline and row wrote it. By default only the envelopes the selected row (of the config's `name:`) dead-lettered are replayed; the rest are reported as skipped. |
 | `--dry-run` | Report what would be replayed without writing. |
 | `--json` | Emit a JSON result. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
