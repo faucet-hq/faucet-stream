@@ -72,6 +72,8 @@ faucet run pipeline.yaml
 | `table_id` | string | — *(required)* | BigQuery table ID. Created automatically on first write when missing (see [Table creation](#table-creation)); set `create_table: false` to require it to pre-exist. |
 | `auth` | `BigQueryCredentials` | — *(required)* | Authentication — see [Authentication](#authentication). |
 
+`project_id`, `dataset_id` and `table_id` are checked when the sink is built: an empty id, or one containing a backtick, backslash, quote, `;` or control character — or a `.` in a dataset or table id — is refused with a config error. Table references in every generated statement are also escaped, so an id rendered from record data (a `${parent.*}` token, a discovered dataset name) can never end its own quoting.
+
 ### Table creation
 
 | Field | Type | Default | Description |
@@ -213,6 +215,10 @@ Appends (and overwrites) stream each page into a **single resumable load job** �
 This is the default because the alternative is job-latency bound rather than volume bound: a ~59k-row overwrite at `batch_size: 1000` issued ~60 sequential query jobs and took 6m44s, and BigQuery's per-table load-job budget (1,500/day) is spent one job per *run* here instead of one per *page*.
 
 **Native byte loads** (a source handing the sink raw NDJSON/CSV bytes) are typed by the sink's `schema` when set, else by the existing table's own schema, else as all-`STRING` columns from the payload (a CSV load's schema follows its header order). With `create_table: false` every load job is `CREATE_NEVER`, so a load cannot create the table the config says must already exist.
+
+A native byte load always replaces the whole table, so it is offered for `overwrite` only when the overwrite is neither scoped (`scope`) nor shared by fan-out rows; those overwrites take the row path, whose staged commit replaces only the scoped rows.
+
+A flush succeeds only once the load job is confirmed `DONE` without an error. If confirming fails (a job poll times out, or the job reports an error), the next flush polls the same job again instead of reporting success, and no new rows are accepted until it is confirmed; a failed job keeps failing every flush. A terminating upload that failed is re-sent unchanged.
 
 **Sources that bookmark every page** (CDC, Kafka, Kinesis, incremental file reads) make the pipeline flush after each committed page, and a flush finalizes the load. So that a continuous stream does not run one load job per page — blocking on each and exhausting the daily budget — the first flush commits the run's load job and later append pages stream through `tabledata.insertAll` for the rest of the run (logged once). The same applies to native NDJSON pages; native CSV pages keep loading per page. On `arrow` builds the first columnar batch is one Parquet load and later batches join the row path, so a run makes at most two load jobs (`bulk_load: true` still stages and loads each batch through GCS).
 

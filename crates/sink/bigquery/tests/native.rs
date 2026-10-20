@@ -813,3 +813,51 @@ async fn a_media_upload_response_cut_short_fails_the_load() {
         "{err}"
     );
 }
+
+/// A scoped or grouped overwrite must not take the byte path: it truncates the
+/// whole table and never runs the staged commit that honours the scope.
+#[tokio::test]
+async fn scoped_and_grouped_overwrites_withdraw_native_overwrite() {
+    use faucet_core::OverwriteScope;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    for grouped in [false, true] {
+        let mut cfg = native_config(&server);
+        cfg.write.write_mode = WriteMode::Overwrite;
+        if grouped {
+            cfg.overwrite_staging = true;
+        } else {
+            cfg.scope = Some(OverwriteScope::Window {
+                column: "dt".into(),
+                from: serde_json::json!("2026-10-20"),
+                to: serde_json::json!("2026-10-21"),
+            });
+        }
+        let (sink, _guard) = build_sink(&server, cfg).await;
+        for cap in sink.native_load_capabilities() {
+            assert_eq!(
+                cap.write_modes,
+                &[WriteMode::Append],
+                "{:?} must not claim Overwrite (grouped: {grouped})",
+                cap.format
+            );
+        }
+        let err = sink
+            .load_native(
+                NativeBatch::bytes(NativeFormat::NdJson, b"{\"id\":1}\n".to_vec())
+                    .with_records(Some(1)),
+                "p::row",
+                NativeLoadContext {
+                    write_mode: WriteMode::Overwrite,
+                    first_batch: true,
+                },
+            )
+            .await
+            .expect_err("a scoped/grouped byte overwrite is refused");
+        assert!(err.to_string().contains("native byte path"), "{err}");
+    }
+    assert!(
+        upload_bodies(&server).await.is_empty(),
+        "nothing was loaded"
+    );
+}

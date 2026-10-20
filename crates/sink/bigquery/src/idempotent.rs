@@ -236,16 +236,55 @@ pub(crate) fn column_expr(field: &FieldSpec, json_var: &str, path: &str, depth: 
 
 /// Backtick-quoted fully-qualified table reference (`` `project.dataset.table` ``).
 ///
-/// Inputs are not backtick-stripped (unlike [`quote_ident`]): BigQuery
-/// project/dataset/table names cannot contain a backtick per BQ naming rules,
-/// and these come from admin-controlled config, never from row data.
+/// Each component is escaped (backslash and backtick) so the reference can
+/// never close its own quotes, even though [`validate_table_path`] already
+/// refuses such names at construction: a table id may be rendered from
+/// record data (`${parent.*}` tokens, a discovered dataset name).
 pub(crate) fn table_ref(project: &str, dataset: &str, table: &str) -> String {
-    format!("`{project}.{dataset}.{table}`")
+    format!(
+        "`{}.{}.{}`",
+        escape_path_part(project),
+        escape_path_part(dataset),
+        escape_path_part(table)
+    )
 }
 
 /// Reference to the shared commit-token watermark table in the target dataset.
 fn commit_table_ref(project: &str, dataset: &str) -> String {
-    format!("`{project}.{dataset}.{COMMIT_TOKEN_TABLE}`")
+    table_ref(project, dataset, COMMIT_TOKEN_TABLE)
+}
+
+fn escape_path_part(part: &str) -> String {
+    part.replace('\\', "\\\\").replace('`', "\\`")
+}
+
+/// Refuse a project / dataset / table id BigQuery could not name, or that
+/// would change the meaning of a SQL table path: empty, a backtick,
+/// backslash, quote or control character anywhere, or a `.` in a dataset or
+/// table id. Project ids may carry `.` and `:` (domain-scoped projects).
+pub fn validate_table_path(
+    project: &str,
+    dataset: &str,
+    table: &str,
+) -> Result<(), faucet_core::FaucetError> {
+    fn check(what: &str, value: &str, allow_dots: bool) -> Result<(), faucet_core::FaucetError> {
+        let bad = value.chars().find(|c| {
+            matches!(c, '`' | '\\' | '\'' | '"' | ';')
+                || c.is_control()
+                || (!allow_dots && *c == '.')
+        });
+        if value.is_empty() || bad.is_some() {
+            return Err(faucet_core::FaucetError::Config(format!(
+                "BigQuery {what} {value:?} is not a valid BigQuery name{}",
+                bad.map(|c| format!(" (it contains {c:?})"))
+                    .unwrap_or_default()
+            )));
+        }
+        Ok(())
+    }
+    check("project_id", project, true)?;
+    check("dataset_id", dataset, false)?;
+    check("table_id", table, false)
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for the watermark table. Run as its own query
@@ -1042,6 +1081,34 @@ mod tests {
             build_drop_not_null_ddl("`p.d.t`", "created_at"),
             "ALTER TABLE `p.d.t` ALTER COLUMN `created_at` DROP NOT NULL"
         );
+    }
+
+    #[test]
+    fn table_refs_cannot_close_their_quotes() {
+        use super::{table_ref, validate_table_path};
+        assert_eq!(table_ref("p", "d", "t"), "`p.d.t`");
+        assert_eq!(table_ref("ex.com:p", "d", "t"), "`ex.com:p.d.t`");
+        assert_eq!(
+            table_ref("p", "d", "x`; DROP TABLE `p.d.billing"),
+            "`p.d.x\\`; DROP TABLE \\`p.d.billing`"
+        );
+        assert_eq!(table_ref("p", "d", "a\\`b"), "`p.d.a\\\\\\`b`");
+        assert!(validate_table_path("ex.com:p", "d_1", "raw table-1").is_ok());
+        for (p, d, t) in [
+            ("p", "d", "x`; DROP TABLE `p.d.billing"),
+            ("p", "d", "a\\b"),
+            ("p", "d", "a\nb"),
+            ("p", "d", "a;b"),
+            ("p", "d.e", "t"),
+            ("p", "d", "t.u"),
+            ("", "d", "t"),
+            ("p", "", "t"),
+            ("p", "d", ""),
+            ("p`", "d", "t"),
+        ] {
+            let err = validate_table_path(p, d, t).unwrap_err().to_string();
+            assert!(err.contains("not a valid BigQuery name"), "{err}");
+        }
     }
 
     #[test]
