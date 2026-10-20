@@ -541,3 +541,40 @@ async fn a_context_call_without_timeouts_streams_every_page() {
     }
     assert_eq!(total, 3);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_length_messages_do_not_end_the_stream() {
+    let server = common::start_server().await;
+    let config = GrpcStreamConfig::new(
+        &server.endpoint,
+        "faucet.test.echo.EchoService",
+        "Tail",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 4, "empty_between": true }))
+    .rpc_kind(RpcKind::ServerStreaming);
+
+    let records = GrpcStream::new(config).unwrap().fetch_all().await.unwrap();
+    let payloads: Vec<_> = records
+        .iter()
+        .filter_map(|r| r.get("payload").and_then(|p| p.as_str()))
+        .collect();
+    assert_eq!(payloads, ["event-0", "event-1", "event-2", "event-3"]);
+    assert_eq!(records.len(), 8, "every empty message is a record too");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_unary_response_yields_no_records() {
+    let server = common::start_server().await;
+    let config = GrpcStreamConfig::new(
+        &server.endpoint,
+        "faucet.test.echo.EchoService",
+        "List",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 0 }))
+    .records_path("$.items[*]");
+
+    let records = GrpcStream::new(config).unwrap().fetch_all().await.unwrap();
+    assert!(records.is_empty());
+}

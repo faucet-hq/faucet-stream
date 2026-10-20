@@ -44,6 +44,8 @@ message TailRequest {
   bool hold_open = 4;
   // Milliseconds to wait before answering the call.
   uint32 start_delay_ms = 5;
+  // Send an all-default (zero-length) Event before each real event.
+  bool empty_between = 6;
 }
 
 message Event {
