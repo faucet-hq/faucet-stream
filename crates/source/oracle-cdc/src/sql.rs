@@ -58,10 +58,12 @@ pub(crate) const THREADS_SQL: &str =
 /// The current incarnation's `RESETLOGS_CHANGE#`.
 pub(crate) const RESETLOGS_SQL: &str = "SELECT RESETLOGS_CHANGE# FROM V$DATABASE";
 
-/// Online logs overlapping `(:1, :2]` (one member per group is enough).
+/// Every online log (one member per group is enough). Unfiltered: the logs
+/// past a mining window show that a thread kept producing redo, which is how a
+/// deleted log at the end of the window is detected (a handful of groups per
+/// thread).
 pub(crate) const ONLINE_LOGS_SQL: &str = "SELECT MIN(f.MEMBER), l.THREAD#, l.SEQUENCE#, \
     l.FIRST_CHANGE#, l.NEXT_CHANGE# FROM V$LOG l JOIN V$LOGFILE f ON f.GROUP# = l.GROUP# \
-    WHERE l.NEXT_CHANGE# > :1 AND l.FIRST_CHANGE# <= :2 \
     GROUP BY l.THREAD#, l.SEQUENCE#, l.FIRST_CHANGE#, l.NEXT_CHANGE#";
 
 /// Current SCN plus the oldest open transaction's start. A transaction that

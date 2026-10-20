@@ -148,9 +148,14 @@ impl Shared {
 
     fn list_logs(&self, conn: &Connection, lo: u64, hi: u64) -> Result<Vec<LogFile>, FaucetError> {
         let mut out = Vec::new();
-        for (sql, archived) in [(ARCHIVED_LOGS_SQL, true), (ONLINE_LOGS_SQL, false)] {
+        let (lo, hi) = (i64_scn(lo), i64_scn(hi));
+        let window: [&dyn faucet_common_oracle::oracle::sql_type::ToSql; 2] = [&lo, &hi];
+        for (sql, archived, params) in [
+            (ARCHIVED_LOGS_SQL, true, &window[..]),
+            (ONLINE_LOGS_SQL, false, &[][..]),
+        ] {
             let rows = conn
-                .query_as::<(String, i64, i64, u64, u64)>(sql, &[&i64_scn(lo), &i64_scn(hi)])
+                .query_as::<(String, i64, i64, u64, u64)>(sql, params)
                 .map_err(|e| src_err("redo log listing", &e))?;
             for r in rows {
                 let (name, thread, sequence, first_change, next_change) =
