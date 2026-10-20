@@ -7,7 +7,9 @@
 //! cannot span it — the rename itself is the atomic unit, as in the swap).
 
 use crate::config::MysqlColumnMapping;
-use crate::sink::{MysqlDriver, bind_value, legacy_scope_key, quote_ident_mysql, scope_key};
+use crate::sink::{
+    MysqlDriver, bind_key, is_binary_type, legacy_scope_key, quote_ident_mysql, scope_key,
+};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
@@ -84,6 +86,44 @@ impl MysqlDriver {
             self.config.table_name,
             faucet_core::rollback::PREVIOUS_TABLE_SUFFIX
         )
+    }
+
+    /// For each `key` column, whether it stores raw bytes (so its key values
+    /// are decoded per `binary_encoding`, as the upsert stored them).
+    async fn binary_key_columns(
+        &self,
+        conn: &mut MySqlConnection,
+    ) -> Result<Vec<bool>, FaucetError> {
+        let columns = crate::sink::table_columns(&mut *conn, &self.config.table_name).await?;
+        Ok(self
+            .config
+            .write
+            .key
+            .iter()
+            .map(|k| {
+                columns
+                    .iter()
+                    .any(|(name, t)| name.eq_ignore_ascii_case(k) && is_binary_type(t))
+            })
+            .collect())
+    }
+
+    fn bind_key_tuple<'q>(
+        &self,
+        mut q: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+        tuple: &[(String, Value)],
+        binary: &[bool],
+    ) -> Result<sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>, FaucetError> {
+        for (i, (column, v)) in tuple.iter().enumerate() {
+            q = bind_key(
+                q,
+                v,
+                binary.get(i).copied().unwrap_or(false),
+                self.config.binary_encoding,
+            )
+            .map_err(|e| sink_err(&format!("key column {column}"), e))?;
+        }
+        Ok(q)
     }
 
     async fn columns_of(
@@ -165,6 +205,14 @@ impl MysqlDriver {
         }
         let table_ref = quote_ident_mysql(&self.config.table_name);
         let columns = self.journal_columns(&mut *conn).await?;
+        let binary: Vec<bool> = key
+            .iter()
+            .map(|k| {
+                columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(k) && is_binary_type(&c.data_type))
+            })
+            .collect();
         let row_expr = row_json_expr(&columns);
         let sql = journal_sql();
 
@@ -178,9 +226,7 @@ impl MysqlDriver {
             let select = positional_key_select(&table_ref, key, &row_expr, chunk.len());
             let mut q = sqlx::query(&select);
             for kt in chunk {
-                for (_, v) in &kt.0 {
-                    q = bind_value(q, v);
-                }
+                q = self.bind_key_tuple(q, &kt.0, &binary)?;
             }
             let rows = q
                 .fetch_all(&mut *conn)
@@ -251,6 +297,7 @@ impl MysqlDriver {
         let key = &self.config.write.key;
         let table_ref = quote_ident_mysql(&self.config.table_name);
         let sql = journal_sql();
+        let binary = self.binary_key_columns(&mut *conn).await?;
         let per = ((MAX_MYSQL_PARAMS - 1) / key.len().max(1)).max(1);
         let mut total = 0u64;
         for chunk in entries.chunks(per) {
@@ -261,9 +308,7 @@ impl MysqlDriver {
             );
             let mut q = sqlx::query(&count_sql);
             for e in chunk {
-                for (_, v) in &e.tuple(key).0 {
-                    q = bind_value(q, v);
-                }
+                q = self.bind_key_tuple(q, &e.tuple(key).0, &binary)?;
             }
             q = q.bind(run_id);
             let row = q
@@ -303,6 +348,7 @@ impl MysqlDriver {
         }
         let table_ref = quote_ident_mysql(&self.config.table_name);
         let sql = journal_sql();
+        let binary = self.binary_key_columns(&mut *conn).await?;
         let per = (MAX_MYSQL_PARAMS / key.len().max(1)).max(1);
         let mut present = 0u64;
         for chunk in restorable.chunks(per) {
@@ -310,9 +356,7 @@ impl MysqlDriver {
             let count_sql = format!("SELECT count(*) AS n FROM {table_ref} WHERE {predicate}");
             let mut q = sqlx::query(&count_sql);
             for e in chunk {
-                for (_, v) in &e.tuple(key).0 {
-                    q = bind_value(q, v);
-                }
+                q = self.bind_key_tuple(q, &e.tuple(key).0, &binary)?;
             }
             let row = q
                 .fetch_one(&mut *conn)
