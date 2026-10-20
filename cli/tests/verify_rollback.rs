@@ -1274,3 +1274,260 @@ async fn a_post_run_repair_runs_under_the_remaining_budget() {
     assert!(!summary.had_failures(), "{summary:?}");
     assert_eq!(rows(&d.dst).await.len(), 4, "the ghost row was deleted");
 }
+
+/// A state store whose bookmark rewind fails once.
+struct FailRewindOnce {
+    inner: faucet_core::FileStateStore,
+    key: String,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[faucet_core::async_trait]
+impl faucet_core::StateStore for FailRewindOnce {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, faucet_core::FaucetError> {
+        self.inner.get(key).await
+    }
+    async fn put(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), faucet_core::FaucetError> {
+        self.fail(key)?;
+        self.inner.put(key, value).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), faucet_core::FaucetError> {
+        self.fail(key)?;
+        self.inner.delete(key).await
+    }
+}
+
+impl FailRewindOnce {
+    fn fail(&self, key: &str) -> Result<(), faucet_core::FaucetError> {
+        if key == self.key && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(faucet_core::FaucetError::State(
+                "state store timed out".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The destination undo commits, then the bookmark rewind fails: a retry
+/// finishes the rewind instead of finding nothing to undo and leaving the
+/// bookmark past the deleted rows.
+#[tokio::test]
+async fn a_rollback_interrupted_after_the_undo_finishes_on_retry() {
+    use faucet_core::StateStore;
+    let d = fresh().await;
+    exec(&d.dst, "DROP TABLE dst").await;
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "append",
+        "rollback: {}",
+    ));
+    let run_id = run(&cfg).await.invocations[0].run_id.clone().unwrap();
+    let marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    let file = faucet_core::FileStateStore::new(&d.state);
+    file.put(&marker.state_key, &serde_json::json!({"seen": 4}))
+        .await
+        .unwrap();
+    let inputs = || RollbackInputs {
+        run_id: run_id.clone(),
+        row: None,
+        dry_run: false,
+        force: false,
+        pipeline_name: "mirror".into(),
+        auth: Default::default(),
+    };
+    let node = expand(&cfg).unwrap().remove(0);
+    let flaky = std::sync::Arc::new(FailRewindOnce {
+        inner: faucet_core::FileStateStore::new(&d.state),
+        key: marker.state_key.clone(),
+        failed: Default::default(),
+    });
+    let err = faucet_cli::rollback::rollback_node(&node, flaky, marker.clone(), &inputs())
+        .await
+        .expect_err("the rewind fails");
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(rows(&d.dst).await.is_empty(), "the undo committed");
+    assert_eq!(
+        file.get(&marker.state_key).await.unwrap(),
+        Some(serde_json::json!({"seen": 4})),
+        "the bookmark was not rewound"
+    );
+
+    // A dry run says what remains without changing anything.
+    let mut dry = inputs();
+    dry.dry_run = true;
+    let report = faucet_cli::rollback::rollback(&cfg, dry).await.unwrap();
+    assert!(!report.outcome.applied);
+    assert!(!report.bookmark_rewound);
+
+    let report = faucet_cli::rollback::rollback(&cfg, inputs())
+        .await
+        .unwrap();
+    assert!(report.outcome.applied, "{report:?}");
+    assert!(report.bookmark_rewound, "{report:?}");
+    assert_eq!(report.outcome.deleted, 4);
+    assert_eq!(file.get(&marker.state_key).await.unwrap(), None);
+    assert!(
+        faucet_cli::rollback::list(&cfg, "mirror", None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the marker is gone once the rewind finished"
+    );
+}
+
+/// The process died after recording the pending undo and the sink's commit,
+/// before recording that it committed: a retry that finds nothing of the run
+/// still finishes the rewind.
+#[tokio::test]
+async fn a_pending_undo_that_finds_nothing_finishes_the_rewind() {
+    use faucet_core::StateStore;
+    let d = fresh().await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "append",
+        "rollback: {}",
+    ));
+    exec(&d.dst, "DROP TABLE dst").await;
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let run_id = run(&cfg).await.invocations[0].run_id.clone().unwrap();
+    let mut marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    let file = faucet_core::FileStateStore::new(&d.state);
+    exec(&d.dst, "DELETE FROM dst").await;
+    marker.undo = Some(faucet_cli::rollback::UndoProgress::default());
+    let mk = faucet_core::StateKey::from_rendered(&marker.state_key)
+        .with_suffix(faucet_core::KeySuffix::RollbackRun(run_id.clone()))
+        .render();
+    file.put(&mk, &serde_json::to_value(&marker).unwrap())
+        .await
+        .unwrap();
+    let report = faucet_cli::rollback::rollback(
+        &cfg,
+        RollbackInputs {
+            run_id,
+            row: None,
+            dry_run: false,
+            force: false,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.outcome.applied, "{report:?}");
+    assert!(report.bookmark_rewound);
+    assert!(
+        report
+            .outcome
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("interrupted"),
+        "{report:?}"
+    );
+}
+
+/// A run's scoped cleanup deletes are journaled in its transaction, so a
+/// rollback restores the rows the cleanup removed (#706).
+#[tokio::test]
+async fn rollback_restores_rows_a_scoped_cleanup_deleted() {
+    let d = fresh().await;
+    exec(&d.dst, "DROP TABLE dst").await;
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, acct INTEGER, _faucet_run_id TEXT)",
+    )
+    .await;
+    exec(
+        &d.dst,
+        "INSERT INTO dst (id, name, acct) VALUES (1, 'old1', 7), (2, 'old2', 7), (3, 'three', 7), \
+         (4, 'four', 7), (9, 'other', 8)",
+    )
+    .await;
+    exec(&d.src, "DELETE FROM src WHERE id > 2").await;
+    let yaml = format!(
+        r#"
+version: 1
+name: mirror
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: "{src}"
+      query: "SELECT id, name, 7 AS acct FROM src ORDER BY id"
+    complete_for: {{ scope: {{ acct: 7 }}, on_missing: delete }}
+  sink:
+    type: sqlite
+    config:
+      database_url: "{dst}"
+      table_name: dst
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+  state:
+    type: file
+    config:
+      path: "{state}"
+rollback: {{}}
+"#,
+        src = d.src,
+        dst = d.dst,
+        state = d.state.display()
+    );
+    let cfg = load(&yaml);
+    let summary = run(&cfg).await;
+    assert!(!summary.had_failures(), "{summary:?}");
+    let run_id = summary.invocations[0].run_id.clone().unwrap();
+    assert_eq!(
+        rows(&d.dst).await,
+        vec![(1, "one".into()), (2, "two".into()), (9, "other".into())],
+        "the cleanup removed 3 and 4"
+    );
+    let report = faucet_cli::rollback::rollback(
+        &cfg,
+        RollbackInputs {
+            run_id,
+            row: None,
+            dry_run: false,
+            force: false,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.outcome.applied, "{report:?}");
+    assert_eq!(
+        rows(&d.dst).await,
+        vec![
+            (1, "old1".into()),
+            (2, "old2".into()),
+            (3, "three".into()),
+            (4, "four".into()),
+            (9, "other".into())
+        ],
+        "the upserts are reverted and the cleaned-up rows are back"
+    );
+}

@@ -62,6 +62,12 @@ table, a different database URL) — nothing is rewound: the report says
 `applied: false` with a note, and the bookmark, watermark and marker stay as
 they were, so fixing the config and running the rollback again still works.
 
+The undo and the rewind are recorded in the run's marker as they happen, so a
+rollback that fails after the destination undo committed (a state-store
+timeout, a dropped `POST /v1/runs/{id}/rollback`, Ctrl-C) is finished by
+running it again: the retry sees the undo was applied and completes the
+bookmark and watermark rewind instead of reporting that nothing was found.
+
 Undo is per dataset and **all-or-nothing per dataset**: a matrix run that
 wrote several tables is undone one row at a time (`--row`), each in one
 transaction where the backend allows it.

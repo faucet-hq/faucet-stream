@@ -50,6 +50,26 @@ pub struct RunMarker {
     /// The sink's exactly-once commit token before the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_before: Option<String>,
+    /// A rollback of this run that reached the destination: set before the
+    /// sink's undo and updated once it committed, so a retry after a failure
+    /// between the undo and the state rewind finishes the rewind instead of
+    /// finding nothing to undo and leaving the bookmark past the undone rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo: Option<UndoProgress>,
+}
+
+/// How far a rollback of a run got (see [`RunMarker::undo`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoProgress {
+    /// The destination undo committed; only the state rewind remains.
+    #[serde(default)]
+    pub applied: bool,
+    /// Rows the committed undo deleted.
+    #[serde(default)]
+    pub deleted: u64,
+    /// Rows the committed undo restored.
+    #[serde(default)]
+    pub restored: u64,
 }
 
 /// Retained run ids for one row, oldest first.
@@ -171,9 +191,11 @@ mod tests {
             run_id_column: "_faucet_run_id".into(),
             bookmark_before: Some(serde_json::json!({"updated_at": "2026-01-01"})),
             token_before: None,
+            undo: None,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert!(v.get("token_before").is_none());
+        assert!(v.get("undo").is_none());
         assert_eq!(serde_json::from_value::<RunMarker>(v).unwrap(), m);
     }
 }
