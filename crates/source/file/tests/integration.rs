@@ -247,6 +247,51 @@ async fn files_still_being_written_are_left_for_a_later_run() {
 }
 
 #[tokio::test]
+async fn name_mode_never_skips_a_file_that_settles_after_a_later_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let early = write(d, "export-2026-09-27.jsonl", b"{\"d\":27}\n");
+    write(d, "export-2026-09-28.jsonl", b"{\"d\":28}\n");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    std::fs::File::options()
+        .write(true)
+        .open(d.join("export-2026-09-28.jsonl"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let mut cfg = FileSourceConfig::new(dir_str(d)).incremental(IncrementalBy::Name);
+    cfg.stable_for_secs = Some(3600);
+    let first = FileSource::new(cfg.clone()).unwrap();
+    let ctx = HashMap::new();
+    let mut pages = first.stream_pages(&ctx, 0);
+    let mut records = Vec::new();
+    let mut mark = None;
+    while let Some(p) = pages.next().await {
+        let p = p.unwrap();
+        records.extend(p.records);
+        mark = p.bookmark.or(mark);
+    }
+    drop(pages);
+    assert!(
+        records.is_empty(),
+        "the later name waits for the unsettled file"
+    );
+    assert!(mark.is_none());
+    // The upload finishes; both files are read in name order.
+    std::fs::File::options()
+        .write(true)
+        .open(&early)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let second = FileSource::new(cfg).unwrap();
+    assert_eq!(
+        read_all(&second).await.unwrap(),
+        vec![json!({"d": 27}), json!({"d": 28})]
+    );
+}
+
+#[tokio::test]
 async fn avro_round_trip_preserves_logical_types() {
     let dir = tempfile::tempdir().unwrap();
     let schema = json!({"type": "record", "name": "r", "fields": [

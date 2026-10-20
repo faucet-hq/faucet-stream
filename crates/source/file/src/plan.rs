@@ -145,6 +145,10 @@ pub fn select(
     stable_for_secs: Option<u64>,
     now_ns: i64,
 ) -> Result<Vec<Candidate>, FaucetError> {
+    // The first (by path) new file still being written. In name mode the
+    // bookmark is the last path read, so reading any file that sorts after an
+    // unsettled one would move the bookmark past it and skip it for good.
+    let mut first_unsettled: Option<String> = None;
     if let Some(secs) = stable_for_secs {
         let cutoff = now_ns.saturating_sub((secs as i64).saturating_mul(1_000_000_000));
         let mut kept = Vec::with_capacity(files.len());
@@ -153,9 +157,29 @@ pub fn select(
                 kept.push(f);
             } else {
                 tracing::info!(path = %f.path, "file source: skipping a file modified within stable_for_secs");
+                if by == Some(IncrementalBy::Name)
+                    && is_new(bookmark, &f)?
+                    && first_unsettled
+                        .as_deref()
+                        .is_none_or(|p| f.path.as_str() < p)
+                {
+                    first_unsettled = Some(f.path);
+                }
             }
         }
         files = kept;
+    }
+    if let Some(stop) = &first_unsettled {
+        let before = files.len();
+        files.retain(|f| f.path.as_str() < stop.as_str());
+        if files.len() < before {
+            tracing::info!(
+                path = %stop,
+                deferred = before - files.len(),
+                "file source: deferring files that sort after one still being written \
+                 (`incremental.by: name` reads in name order)"
+            );
+        }
     }
     let mut out = Vec::with_capacity(files.len());
     let mut late = Vec::new();
@@ -295,6 +319,37 @@ mod tests {
             mtime_ns: Some(m),
             ctime_ns: Some(m),
         }
+    }
+
+    #[test]
+    fn name_mode_stops_before_a_file_still_being_written() {
+        let secs = 1_000_000_000;
+        let files = vec![
+            c("2026-09-26", 0),
+            c("2026-09-27", 100 * secs),
+            c("2026-09-28", 0),
+            c("2026-09-29", 100 * secs),
+        ];
+        let paths = |v: Vec<Candidate>| v.into_iter().map(|f| f.path).collect::<Vec<_>>();
+        let by = Some(IncrementalBy::Name);
+        let sel = select(files.clone(), by, None, Some(10), 101 * secs).unwrap();
+        assert_eq!(paths(sel), ["2026-09-26"]);
+        // An unsettled file the bookmark already passed does not hold back new ones.
+        let bm = Bookmark::Name {
+            last: "2026-09-27".into(),
+        };
+        let sel = select(files.clone(), by, Some(&bm), Some(10), 101 * secs).unwrap();
+        assert_eq!(paths(sel), ["2026-09-28"]);
+        // mtime mode is unaffected: an unsettled file is the newest.
+        let sel = select(
+            files,
+            Some(IncrementalBy::Mtime),
+            None,
+            Some(10),
+            101 * secs,
+        )
+        .unwrap();
+        assert_eq!(paths(sel), ["2026-09-26", "2026-09-28"]);
     }
 
     #[test]
