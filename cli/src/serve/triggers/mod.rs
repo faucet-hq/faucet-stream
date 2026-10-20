@@ -159,6 +159,7 @@ pub fn spawn_watchers(
                 poll_interval_secs,
                 mode,
                 start_at,
+                lookback_secs,
             } => match object_arrival::ObjectArrivalWatcher::build_store(store) {
                 Ok((s, bucket, prefix)) => {
                     let w = object_arrival::ObjectArrivalWatcher::new(
@@ -170,7 +171,8 @@ pub fn spawn_watchers(
                         Duration::from_secs(*poll_interval_secs),
                         *start_at,
                         chrono::Utc::now(),
-                    );
+                    )
+                    .with_lookback(Duration::from_secs(*lookback_secs));
                     handles.push(tokio::spawn(watcher::run_supervised(
                         w,
                         state.clone(),

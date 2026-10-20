@@ -71,6 +71,14 @@ pub enum TriggerKind {
         mode: ArrivalMode,
         #[serde(default)]
         start_at: StartAt,
+        /// How far behind the newest fired object a newly listed object is
+        /// still fired. Object stores list an object only once it is
+        /// complete, with the time it started (a multipart upload) or an
+        /// earlier write time, so it can appear after newer objects already
+        /// fired; every object within this window is remembered and fired
+        /// once. Default: 86400 (24 hours).
+        #[serde(default = "default_lookback_secs")]
+        lookback_secs: u64,
     },
     Webhook {
         #[serde(default = "default_webhook_methods")]
@@ -304,6 +312,10 @@ fn collect_unknown_keys(
 fn default_true() -> bool {
     true
 }
+fn default_lookback_secs() -> u64 {
+    86_400
+}
+
 fn default_poll_secs() -> u64 {
     30
 }
