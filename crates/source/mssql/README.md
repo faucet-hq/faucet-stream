@@ -13,7 +13,7 @@ Reach for it when you want to pull tables, views, or ad-hoc query results out of
 
 - **Native row streaming** — overrides `Source::stream_pages` to walk `tiberius`'s `QueryStream` row-by-row, buffering into pages of `batch_size` and yielding each page as it fills. Peak memory is `O(batch_size)`, never the full result set.
 - **Connection pooling** — a [`bb8`](https://crates.io/crates/bb8) + [`bb8-tiberius`](https://crates.io/crates/bb8-tiberius) pool is built once in `new()` and reused for every query; size it with `max_connections` (default 10).
-- **Incremental / bookmark replication** — track a monotonic column (e.g. `updated_at`) and emit only rows strictly greater than the stored bookmark on each run. The cursor pushes down to the server via the `@bookmark` token *and* is enforced client-side as a correctness backstop. If you configure `incremental` replication but omit the `@bookmark` token from the query, the run still produces correct rows (client-side filtering), but the server returns the **entire table every run** — so `faucet validate` / load warns you to add `@bookmark` to the `WHERE` clause for server-side pushdown.
+- **Incremental replication** — track a cursor column (e.g. `updated_at`) and read only rows not yet delivered, in cursor order, without skipping rows that share a cursor value (ties, late commits, `DATETIME`'s 1/300 s ticks); a crash replays at most one page (see [Resumable](#resumable)).
 - **Positional bind parameters** — `params` are sent as `@P1`, `@P2`, … bind values, and `${parent.path}` matrix-context placeholders resolve to additional bind markers at runtime — no string interpolation into SQL.
 - **Type-aware row decoding** — integers, floats, `BIT`, decimals (precision-preserving strings), dates/times, `DATETIMEOFFSET`, `UNIQUEIDENTIFIER`, and binary (base64) all map to sensible JSON.
 - **Four TLS modes** — `prefer` (default), `require`, `trust_server_certificate`, `disable` — with an optional CA cert path, shared with the MSSQL sink via [`faucet-common-mssql`](https://crates.io/crates/faucet-common-mssql).
@@ -63,7 +63,7 @@ faucet run pipeline.yaml
 |-------|------|---------|-------------|
 | `connection_url` | string | — | `mssql://user:pass@host:1433/database` URL form. **Mutually exclusive** with `connection_string`; set exactly one. Host required; port defaults to `1433`; database optional. Credentials are percent-decoded. |
 | `connection_string` | string | — | ADO.NET-style string handed straight to `tiberius`, e.g. `Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. **Mutually exclusive** with `connection_url`. The `tls` block is applied on top. |
-| `query` | string | — *(required)* | T-SQL to run. Use `@P1`, `@P2`, … for `params`, and the literal `@bookmark` token to bind the incremental cursor server-side. |
+| `query` | string | — *(required)* | T-SQL to run. Use `@P1`, `@P2`, … for `params`, and the literal `@bookmark` token (compared with `>=`) to apply the incremental cursor further inside the query. In incremental mode the query must not end in a top-level `ORDER BY`. |
 | `params` | array | `[]` | Positional bind parameters (`@P1`…`@Pn`), typed from each JSON value. Sent in declaration order, before any matrix-context values. |
 
 ### Batching & reliability
@@ -82,9 +82,9 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `replication.type` | `full` \| `incremental` | `full` | `full` re-fetches the whole result set every run; `incremental` emits only rows past the bookmark. |
+| `replication.type` | `full` \| `incremental` | `full` | `full` re-fetches the whole result set every run; `incremental` reads from the stored bookmark, in cursor order. |
 | `replication.column` | string | — *(required for `incremental`)* | The column whose value is the replication cursor (e.g. `updated_at`). Must be non-empty. |
-| `replication.initial_value` | any JSON | — *(required for `incremental`)* | Lower bound used on the first run, before any bookmark is stored. |
+| `replication.initial_value` | any JSON | — *(required for `incremental`)* | Inclusive lower bound for the first run, before any bookmark is stored. Not `null`. |
 
 ### TLS
 
@@ -149,7 +149,7 @@ pipeline:
     type: mssql
     config:
       connection_url: "mssql://sa:Str0ng%40Pass@localhost:1433/sales"
-      query: "SELECT id, email, updated_at FROM dbo.users WHERE updated_at > @bookmark ORDER BY updated_at"
+      query: "SELECT id, email, updated_at FROM dbo.users"
       batch_size: 1000
       tls:
         type: trust_server_certificate   # self-signed dev cert; use prefer/require in prod
@@ -210,7 +210,7 @@ pipeline:
 
 ## Streaming & batching
 
-The source overrides `Source::stream_pages`: it checks out a pooled connection, runs the query, and walks `tiberius`'s row stream. Rows are decoded and buffered until the buffer reaches `batch_size`, at which point a `StreamPage` is yielded; the final page carries the incremental bookmark (when replication is enabled) so the pipeline persists state only after every prior page has been written by the sink. With `batch_size: 0` the whole result set is buffered and emitted as one page.
+The source overrides `Source::stream_pages`: it checks out a pooled connection, runs the query, and walks `tiberius`'s row stream. Rows are decoded and buffered until the buffer reaches `batch_size`, at which point a `StreamPage` is yielded; with incremental replication every page carries the bookmark after its last row (the final page carries one even when empty), so the pipeline persists state only after the page has been written by the sink. With `batch_size: 0` the whole result set is buffered and emitted as one page.
 
 The `batch_size` argument the pipeline passes to `stream_pages` is informational — the config field is authoritative, so a pipeline-supplied hint never overrides an explicit value.
 
@@ -220,9 +220,11 @@ When `replication.type: incremental`, the source is resumable:
 
 - `state_key()` returns the configured `state_key`, or a key derived from the connection host plus a query fingerprint (e.g. `mssql:db.example.com:<hex>`).
 - Before fetching, the pipeline loads the stored bookmark and hands it to `apply_start_bookmark()`, which overrides the configured `initial_value` for that run.
-- Each page is filtered to rows strictly greater than the bookmark on `replication.column`, and the running maximum is persisted on the final page **after** the sink confirms the batch — so a crash mid-run never advances the bookmark past unwritten rows.
-
-**Server-side pushdown:** put the literal `@bookmark` token in your `WHERE` clause (e.g. `WHERE updated_at > @bookmark ORDER BY updated_at`). The source binds the cursor there as a parameter so SQL Server does the filtering. **Backstop:** whether or not `@bookmark` appears, the source *also* filters client-side, so correctness never depends on the query text — though without `@bookmark` the full result set is fetched and filtered in memory (fine for small tables, prefer `@bookmark` for large ones). `@bookmark` is a reserved token; don't use it as an identifier.
+- **How it reads.** The source wraps the query as `SELECT * FROM (<query>) AS q WHERE q.[<column>] >= @Pn ORDER BY q.[<column>]`, so SQL Server filters and orders by the cursor (index it). T-SQL forbids `ORDER BY` in a derived table, so the query itself must not end in a top-level `ORDER BY`. To apply the cursor further inside the query (a CTE, a join), write `@bookmark` there with `>=` (`WHERE o.updated_at >= @bookmark`); a `> @bookmark` is refused at load time because it would skip rows that share the bookmark value. `@bookmark` is a reserved token; don't use it as an identifier.
+- **Rows that share a cursor value are never skipped.** The bookmark stores the last cursor value **and** a 128-bit fingerprint of every row already emitted at it — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read re-reads that value with `>=` and drops only the rows it already emitted, so a row that commits later with the same `updated_at` (or the same `DATETIME` tick) is delivered, and a boundary row updated in place without its cursor changing is emitted again. Above 10,000 rows at one value the set is dropped and the value is re-read in full: duplicates, never loss.
+- **A crash replays at most one page.** Every page carries the bookmark after its last row, persisted only after the sink confirms the page.
+- **Older bookmarks.** A bare value stored by an earlier release reads as that value with an empty boundary: the first run after upgrading re-delivers the rows at that value once.
+- **Limits.** Rows whose cursor is `NULL` are never read. A row that commits with a cursor value *below* the stored bookmark is not seen; use a cursor set at commit, or the CDC source, when that matters.
 
 To use resume from the CLI, add a `state:` block (`file`, `memory`, `redis`, or `postgres`) to the pipeline as shown in the incremental example above.
 
@@ -299,9 +301,9 @@ For incremental replication, set `cfg.replication` to `MssqlReplication::Increme
 ## How it works
 
 1. `new()` validates the config, then builds the `bb8` + `bb8-tiberius` connection pool **once** via `faucet-common-mssql::build_pool` (TLS mode applied).
-2. Each query checks out a pooled connection, binds `params` (and the bookmark, when `@bookmark` is present) as typed `@Pn` parameters, and runs under `statement_timeout_secs`.
+2. Each query checks out a pooled connection, binds `params` (and, for incremental runs, the bookmark) as typed `@Pn` parameters, and runs under `statement_timeout_secs`.
 3. `tiberius`'s `QueryStream` is walked row-by-row; each row is decoded by its column type into JSON and buffered into `batch_size` pages.
-4. For incremental runs, each page is filtered against the bookmark and the running maximum is tracked; the bookmark is emitted on the final page so the pipeline persists it only after the sink confirms.
+4. For incremental runs, rows already emitted at the bookmark value are dropped and every page carries the position after its last row, so the pipeline persists it only after the sink confirms.
 5. `connector_name()` reports `"mssql"` for metrics labels; `check()` probes a pooled connection for `faucet doctor`.
 
 ## Lineage dataset URI
@@ -323,7 +325,8 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | TLS handshake fails against a self-signed dev server | Set `tls.type: trust_server_certificate` for local dev (never in production), or point `tls.ca_cert_path` at the server's CA. |
 | `Source: MSSQL query timed out` | The query ran longer than `statement_timeout_secs`. Raise the timeout (or set `0` to disable), and add the right indexes / `WHERE` clause. |
 | Incremental run re-emits old rows | No bookmark is being persisted — add a `state:` block, and make sure `replication.column` is the same monotonic column you filter on. |
-| Incremental run is slow on a large table | Add `@bookmark` to the `WHERE` clause so filtering pushes down to the server instead of fetching every row and filtering in memory. |
+| Incremental run is slow on a large table | Index `replication.column`: the source filters and orders by it server-side. |
+| `Config: MSSQL: compare @bookmark with >=, not >` | The query compares `@bookmark` strictly. Use `>=`; rows already emitted at the bookmark are dropped by the source. |
 | `Config: MSSQL incremental replication requires a non-empty column` | `replication.type` is `incremental` but `column` is empty. Set it to the cursor column. |
 | A `DECIMAL`/`MONEY` column arrives as a string | Intentional — decimals are decoded as strings to preserve full precision. Cast in a downstream transform if you need a JSON number. |
 | Windows / Azure AD login required | Not supported in v1 — only SQL Server username/password authentication. |

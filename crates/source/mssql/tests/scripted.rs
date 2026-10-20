@@ -78,12 +78,72 @@ async fn streams_rows_in_pages_with_the_bookmark_last() {
             json!({"id": 2, "name": "r2"})
         ]
     );
-    assert_eq!(got[0].1, None);
-    assert_eq!(
-        got[1],
-        (vec![json!({"id": 3, "name": "r3"})], Some(json!(3)))
-    );
+    // Every page carries the position after its last row.
+    assert_eq!(got[0].1.as_ref().unwrap()["value"], json!(2));
+    assert_eq!(got[1].0, vec![json!({"id": 3, "name": "r3"})]);
+    assert_eq!(got[1].1.as_ref().unwrap()["value"], json!(3));
     assert!(source.capabilities().range_read());
+    assert!(
+        server.saw("AS q WHERE q.[id] >= @P1 ORDER BY q.[id]"),
+        "{:?}",
+        server.requests()
+    );
+}
+
+/// A row that shares the stored cursor value but was not read before (a tie
+/// or a late commit) is delivered; the row already emitted at it is not.
+#[tokio::test]
+async fn a_row_tied_at_the_bookmark_is_not_skipped() {
+    let server = TdsServer::start().await.unwrap();
+    let mut c = cfg(&server);
+    c.replication = MssqlReplication::Incremental {
+        column: "id".into(),
+        initial_value: json!(0),
+    };
+    let source = started(&server, c).await;
+
+    // Run 1 read `r2` at id = 2.
+    on_query(&server, rows_of(&[(1, "r1"), (2, "r2")]));
+    let (first, bookmark) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(first.len(), 2);
+    source
+        .apply_start_bookmark(bookmark.unwrap())
+        .await
+        .unwrap();
+
+    // Run 2: the `>=` read returns `r2` again plus `late` (also id = 2).
+    on_query(&server, rows_of(&[(2, "r2"), (2, "late"), (3, "r3")]));
+    let (second, bookmark) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(
+        second,
+        vec![
+            json!({"id": 2, "name": "late"}),
+            json!({"id": 3, "name": "r3"})
+        ]
+    );
+    assert_eq!(bookmark.unwrap()["value"], json!(3));
+
+    // A legacy bare bookmark still loads (empty boundary: the value is re-read).
+    source.apply_start_bookmark(json!(3)).await.unwrap();
+    on_query(&server, rows_of(&[(3, "r3")]));
+    let (third, _) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(third, vec![json!({"id": 3, "name": "r3"})]);
+    assert!(
+        source
+            .apply_start_bookmark(json!({"value": null}))
+            .await
+            .is_err()
+    );
+}
+
+fn rows_of(items: &[(i64, &str)]) -> Reply {
+    Reply::rows(
+        &[("id", TdsType::BigInt), ("name", TdsType::NVarChar)],
+        items
+            .iter()
+            .map(|(i, n)| vec![TdsValue::Int(*i), TdsValue::Str((*n).to_string())])
+            .collect(),
+    )
 }
 
 #[tokio::test]

@@ -116,8 +116,8 @@ async fn conformance_bounded_memory() {
 // ── Check 3: bookmark round-trip (Docker) ───────────────────────────────────
 
 /// Seed an `events` table with an `updated_at` cursor column, configure
-/// `replication: incremental` on it (query pushes the `@bookmark` token
-/// server-side and the source also filters client-side), then let the battery
+/// `replication: incremental` on it (`>=` cursor read, boundary rows
+/// deduplicated by fingerprint), then let the battery
 /// drive the source to completion, capture its bookmark, re-apply it, seed one
 /// strictly-newer row, and re-drive — asserting the resumed run replays strictly
 /// fewer records than the first (i.e. the bookmark is honored).
@@ -143,7 +143,7 @@ async fn conformance_bookmark_roundtrip() {
 
     let mut scfg = MssqlSourceConfig::new(
         cfg.connection_url.clone().unwrap(),
-        "SELECT id, updated_at FROM dbo.events WHERE updated_at > @bookmark ORDER BY updated_at",
+        "SELECT id, updated_at FROM dbo.events WHERE updated_at >= @bookmark",
     );
     scfg.connection.tls = cfg.tls.clone();
     scfg.replication = MssqlReplication::Incremental {

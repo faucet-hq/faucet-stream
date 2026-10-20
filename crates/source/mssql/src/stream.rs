@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use faucet_core::check::{CheckContext, CheckReport, Probe};
-use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
 };
@@ -22,7 +22,7 @@ use faucet_common_mssql::{
     MssqlPool, build_pool, call_statement, quote_ident_mssql, statement_call_context,
 };
 
-use crate::config::{MssqlReplication, MssqlSourceConfig};
+use crate::config::{BOOKMARK_TOKEN, MssqlReplication, MssqlSourceConfig};
 use crate::convert::row_to_json;
 use crate::money;
 
@@ -32,7 +32,7 @@ pub struct MssqlSource {
     pool: MssqlPool,
     /// Bookmark loaded via [`Source::apply_start_bookmark`]; overrides the
     /// configured `initial_value` for incremental runs.
-    start_bookmark: Mutex<Option<Value>>,
+    start_bookmark: Mutex<Option<CursorBookmark>>,
     /// Shard applied by the cluster coordinator (Mode B), if any. `None` (or the
     /// whole-dataset shard) means the full query is streamed. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
@@ -107,7 +107,7 @@ impl MssqlSource {
             .await
     }
 
-    fn current_start(&self) -> Option<Value> {
+    fn current_start(&self) -> Option<CursorBookmark> {
         self.start_bookmark
             .lock()
             .expect("start_bookmark mutex poisoned")
@@ -136,7 +136,38 @@ fn bracket_quote(name: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 struct IncrementalCtx {
     column: String,
-    start: Value,
+    start: CursorBookmark,
+}
+
+impl IncrementalCtx {
+    fn tracker(&self) -> CursorTracker {
+        CursorTracker::new(self.column.clone(), self.start.clone())
+    }
+}
+
+/// `inner` filtered to `column >= @P{n}` (the bookmark bound as the next
+/// positional parameter), with the bind values extended to match; ordered by
+/// the cursor when `ordered`. Full replication passes through unchanged.
+fn cursor_wrap(
+    inner: String,
+    mut values: Vec<Value>,
+    incr: Option<&IncrementalCtx>,
+    ordered: bool,
+) -> (String, Vec<Value>) {
+    let Some(ctx) = incr else {
+        return (inner, values);
+    };
+    let c = bracket_quote(&ctx.column);
+    values.push(ctx.start.value.clone());
+    let filtered = format!(
+        "SELECT * FROM ({inner}) AS q WHERE q.{c} >= @P{n}",
+        n = values.len()
+    );
+    if ordered {
+        (format!("{filtered} ORDER BY q.{c}"), values)
+    } else {
+        (filtered, values)
+    }
 }
 
 /// Build the final query string, the ordered bind values, and (for incremental
@@ -144,11 +175,12 @@ struct IncrementalCtx {
 ///
 /// Pure function (no pool) so it is unit-testable. Param order is:
 /// `config.params` → context-substituted values → the incremental bookmark
-/// (only when the query contains the `@bookmark` token).
+/// (only when the query contains the `@bookmark` token). The `>=` cursor
+/// filter around the query is added by [`cursor_wrap`].
 fn build_query_and_params(
     config: &MssqlSourceConfig,
     context: &HashMap<String, Value>,
-    start_bookmark: Option<&Value>,
+    start_bookmark: Option<&CursorBookmark>,
 ) -> (String, Vec<Value>, Option<IncrementalCtx>) {
     // Resolve parent-context placeholders to positional @P markers.
     let (mut query, mut values) = if context.is_empty() {
@@ -173,13 +205,13 @@ fn build_query_and_params(
         } => {
             let start = start_bookmark
                 .cloned()
-                .unwrap_or_else(|| initial_value.clone());
-            // Server-side pushdown: bind the cursor where the user wrote
-            // `@bookmark`. If absent, only the client-side filter applies.
-            if query.contains("@bookmark") {
+                .unwrap_or_else(|| CursorBookmark::initial(initial_value.clone()));
+            // Bind the cursor where the user wrote `@bookmark` too (e.g. in
+            // a CTE); the outer `>=` filter always applies.
+            if query.contains(BOOKMARK_TOKEN) {
                 let idx = values.len() + 1;
-                query = query.replace("@bookmark", &format!("@P{idx}"));
-                values.push(start.clone());
+                query = query.replace(BOOKMARK_TOKEN, &format!("@P{idx}"));
+                values.push(start.value.clone());
             }
             Some(IncrementalCtx {
                 column: column.clone(),
@@ -360,14 +392,17 @@ impl Source for MssqlSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        Ok(self.collect_all(context).await?.0)
+        Ok(self.fetch_with_context_incremental(context).await?.0)
     }
 
     async fn fetch_with_context_incremental(
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        self.collect_all(context).await
+        if matches!(self.config.replication, MssqlReplication::Full) {
+            return Ok((self.collect_all(context).await?, None));
+        }
+        self.collect_incremental(context).await
     }
 
     fn stream_pages<'a>(
@@ -396,11 +431,12 @@ impl Source for MssqlSource {
                 out?
             };
             let query = self.shard_wrap(money::resolve(query, planned, &self.money_warned));
+            let (query, values) = cursor_wrap(query, values, incr.as_ref(), true);
+            let mut tracker = incr.as_ref().map(IncrementalCtx::tracker);
 
             // Scope the borrowed param slice to the query() call — the
             // QueryStream borrows the connection, not the params.
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
-            let mut running_max: Option<Value> = None;
             let mut total = 0usize;
 
             // The query and its row stream borrow the connection; a call cut
@@ -453,14 +489,15 @@ impl Source for MssqlSource {
                         }
                     };
                     let QueryItem::Row(row) = item else { continue };
-                    buffer.push(row_to_json(&row)?);
+                    let record = row_to_json(&row)?;
+                    if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
+                        buffer.push(record);
+                    }
                     if buffer.len() >= chunk {
                         let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-                        let kept = apply_incremental(page, incr.as_ref(), &mut running_max);
-                        total += kept.len();
-                        if !kept.is_empty() {
-                            yield StreamPage { records: kept, bookmark: None };
-                        }
+                        total += page.len();
+                        let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                        yield StreamPage { records: page, bookmark };
                     }
                 }
             };
@@ -471,13 +508,19 @@ impl Source for MssqlSource {
                 Err(e)?;
             }
 
-            // Final page carries the bookmark so the pipeline persists only
-            // after everything before it has been written.
-            let kept = apply_incremental(buffer, incr.as_ref(), &mut running_max);
-            total += kept.len();
-            let bookmark = if incr.is_some() { running_max.clone() } else { None };
-            if !kept.is_empty() || bookmark.is_some() {
-                yield StreamPage { records: kept, bookmark };
+            // In incremental mode every page carries the position after its
+            // last row (the final page carries one even when empty).
+            if !buffer.is_empty() || tracker.is_some() {
+                total += buffer.len();
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                yield StreamPage { records: buffer, bookmark };
+            }
+            if let Some(missing) = tracker.as_ref().map(CursorTracker::missing).filter(|n| *n > 0) {
+                tracing::warn!(
+                    missing,
+                    "MSSQL incremental read: rows without a cursor value were emitted \
+                     without moving the bookmark"
+                );
             }
 
             tracing::info!(rows = total, query = %self.config.query, "MSSQL source stream complete");
@@ -521,10 +564,11 @@ impl Source for MssqlSource {
     }
 
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        let start = CursorBookmark::from_state(bookmark)?;
         *self
             .start_bookmark
             .lock()
-            .expect("start_bookmark mutex poisoned") = Some(bookmark);
+            .expect("start_bookmark mutex poisoned") = Some(start);
         Ok(())
     }
 
@@ -738,8 +782,9 @@ impl Source for MssqlSource {
         };
 
         let start = self.current_start();
-        let (inner, values, _incr) =
+        let (inner, values, incr) =
             build_query_and_params(&self.config, &HashMap::new(), start.as_ref());
+        let (inner, values) = cursor_wrap(inner, values, incr.as_ref(), false);
         let key = quote_ident_mssql(&shard_cfg.key)?;
         let bounds_sql = pk_bounds_query(&inner, &key, "BIGINT");
 
@@ -810,14 +855,28 @@ impl Source for MssqlSource {
 }
 
 impl MssqlSource {
-    /// Run the query and return all decoded rows plus (for incremental) the new
-    /// bookmark. Used by the non-streaming convenience methods.
-    async fn collect_all(
+    /// Every page of an incremental read, and its last bookmark.
+    async fn collect_incremental(
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        let start = self.current_start();
-        let (query, values, incr) = build_query_and_params(&self.config, context, start.as_ref());
+        let mut pages = self.stream_pages(context, 0);
+        let mut records = Vec::new();
+        let mut bookmark = None;
+        while let Some(page) = pages.try_next().await? {
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
+        }
+        Ok((records, bookmark))
+    }
+
+    /// Run a full-replication query and return all decoded rows. Used by the
+    /// non-streaming convenience methods.
+    async fn collect_all(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        let (query, values, _) = build_query_and_params(&self.config, context, None);
 
         let mut conn = self.checkout().await?;
 
@@ -866,33 +925,7 @@ impl MssqlSource {
             records.push(row_to_json(row)?);
         }
 
-        let mut running_max: Option<Value> = None;
-        let records = apply_incremental(records, incr.as_ref(), &mut running_max);
-        let bookmark = if incr.is_some() { running_max } else { None };
-        Ok((records, bookmark))
-    }
-}
-
-/// Filter a page for incremental replication and advance `running_max`.
-/// For full replication the page passes through unchanged.
-fn apply_incremental(
-    page: Vec<Value>,
-    incr: Option<&IncrementalCtx>,
-    running_max: &mut Option<Value>,
-) -> Vec<Value> {
-    match incr {
-        None => page,
-        Some(ctx) => {
-            let kept = filter_incremental(page, &ctx.column, &ctx.start);
-            if let Some(m) = max_replication_value(&kept, &ctx.column) {
-                let m = m.clone();
-                *running_max = Some(match running_max.take() {
-                    Some(prev) => max_value(prev, m),
-                    None => m,
-                });
-            }
-            kept
-        }
+        Ok(records)
     }
 }
 
@@ -941,7 +974,7 @@ mod tests {
     #[test]
     fn build_incremental_binds_bookmark_token() {
         let cfg = MssqlSourceConfig {
-            query: "SELECT * FROM t WHERE updated_at > @bookmark".into(),
+            query: "SELECT * FROM t WHERE updated_at >= @bookmark".into(),
             replication: MssqlReplication::Incremental {
                 column: "updated_at".into(),
                 initial_value: json!("1970-01-01"),
@@ -949,13 +982,13 @@ mod tests {
             ..full_cfg()
         };
         let (q, v, incr) = build_query_and_params(&cfg, &HashMap::new(), None);
-        assert_eq!(q, "SELECT * FROM t WHERE updated_at > @P1");
+        assert_eq!(q, "SELECT * FROM t WHERE updated_at >= @P1");
         assert_eq!(v, vec![json!("1970-01-01")]);
         assert_eq!(
             incr,
             Some(IncrementalCtx {
                 column: "updated_at".into(),
-                start: json!("1970-01-01")
+                start: CursorBookmark::initial(json!("1970-01-01"))
             })
         );
     }
@@ -963,7 +996,7 @@ mod tests {
     #[test]
     fn build_incremental_uses_stored_bookmark_over_initial() {
         let cfg = MssqlSourceConfig {
-            query: "SELECT * FROM t WHERE c > @bookmark".into(),
+            query: "SELECT * FROM t WHERE c >= @bookmark".into(),
             params: vec![json!("p0")],
             replication: MssqlReplication::Incremental {
                 column: "c".into(),
@@ -971,12 +1004,12 @@ mod tests {
             },
             ..full_cfg()
         };
-        let stored = json!(500);
+        let stored = CursorBookmark::initial(json!(500));
         let (q, v, incr) = build_query_and_params(&cfg, &HashMap::new(), Some(&stored));
         // bookmark bound after the one configured param → @P2
-        assert_eq!(q, "SELECT * FROM t WHERE c > @P2");
+        assert_eq!(q, "SELECT * FROM t WHERE c >= @P2");
         assert_eq!(v, vec![json!("p0"), json!(500)]);
-        assert_eq!(incr.unwrap().start, json!(500));
+        assert_eq!(incr.unwrap().start.value, json!(500));
     }
 
     #[test]
@@ -992,7 +1025,7 @@ mod tests {
         let (q, v, incr) = build_query_and_params(&cfg, &HashMap::new(), None);
         assert_eq!(q, "SELECT * FROM t");
         assert!(v.is_empty());
-        assert!(incr.is_some(), "client-side filter must still run");
+        assert!(incr.is_some(), "the cursor filter must still run");
     }
 
     #[test]
@@ -1024,25 +1057,42 @@ mod tests {
     }
 
     #[test]
-    fn apply_incremental_filters_and_tracks_max() {
+    fn cursor_wrap_filters_with_ge_and_orders_by_the_cursor() {
         let ctx = IncrementalCtx {
-            column: "c".into(),
-            start: json!(10),
+            column: "up]d".into(),
+            start: CursorBookmark::initial(json!(10)),
         };
-        let mut running = None;
-        let page = vec![json!({"c": 5}), json!({"c": 15}), json!({"c": 20})];
-        let kept = apply_incremental(page, Some(&ctx), &mut running);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, Some(json!(20)));
+        let (q, v) = cursor_wrap("SELECT * FROM t".into(), vec![json!("p")], Some(&ctx), true);
+        assert_eq!(
+            q,
+            "SELECT * FROM (SELECT * FROM t) AS q WHERE q.[up]]d] >= @P2 ORDER BY q.[up]]d]"
+        );
+        assert_eq!(v, vec![json!("p"), json!(10)]);
+        let (q, _) = cursor_wrap("SELECT 1".into(), vec![], Some(&ctx), false);
+        assert!(!q.contains("ORDER BY"), "{q}");
+        let (q, v) = cursor_wrap("SELECT 1".into(), vec![json!(1)], None, true);
+        assert_eq!((q.as_str(), v), ("SELECT 1", vec![json!(1)]));
     }
 
     #[test]
-    fn apply_incremental_full_passes_through() {
-        let mut running = None;
-        let page = vec![json!({"c": 1}), json!({"c": 2})];
-        let kept = apply_incremental(page, None, &mut running);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, None);
+    fn tracker_keeps_rows_tied_at_the_bookmark() {
+        // Run 1 emitted `a` at ts=10; `b` committed later with the same ts.
+        // The `>=` read returns both; only `a` is dropped.
+        let mut first = IncrementalCtx {
+            column: "ts".into(),
+            start: CursorBookmark::initial(json!(0)),
+        }
+        .tracker();
+        let a = json!({"id": "a", "ts": 10});
+        assert!(first.admit(&a));
+        let ctx = IncrementalCtx {
+            column: "ts".into(),
+            start: CursorBookmark::from_state(first.bookmark().to_value()).unwrap(),
+        };
+        let mut second = ctx.tracker();
+        assert!(!second.admit(&a));
+        assert!(second.admit(&json!({"id": "b", "ts": 10})));
+        assert!(second.admit(&json!({"id": "c", "ts": 11})));
     }
 
     #[tokio::test]
@@ -1125,7 +1175,7 @@ mod tests {
         // The @Pn markers of a resolved incremental query survive the wrap —
         // tiberius binds them by name, not by textual position.
         let cfg = MssqlSourceConfig {
-            query: "SELECT * FROM t WHERE c > @bookmark".into(),
+            query: "SELECT * FROM t WHERE c >= @bookmark".into(),
             replication: MssqlReplication::Incremental {
                 column: "c".into(),
                 initial_value: json!(0),
