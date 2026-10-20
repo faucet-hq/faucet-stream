@@ -1710,6 +1710,7 @@ impl RestDriver {
                             == ReplicationMethod::Incremental
                             && self.config.replication_key.is_some(),
                         assume_ordered: self.config.assume_ordered,
+                        pushes_bookmark: self.config.replication_bind.is_some(),
                         max_pages: self.config.max_pages.unwrap_or_default(),
                     },
                     if self.config.persist_cursor {
@@ -3123,6 +3124,9 @@ struct TruncatedPass {
     windowed: bool,
     incremental: bool,
     assume_ordered: bool,
+    /// The bookmark reaches the next run's first request (`replication_bind`),
+    /// so resuming after it actually skips the pages already read.
+    pushes_bookmark: bool,
     max_pages: usize,
 }
 
@@ -3131,8 +3135,10 @@ struct TruncatedPass {
 /// unread page. An incremental or windowed pass cut short fails instead: its
 /// record-derived or window bookmark would skip the unread pages, and keeping
 /// none would re-read the same pages every run while each run looked green
-/// (#862 M-079) — unless the feed is declared `assume_ordered`, whose largest
-/// key read is a safe resume point.
+/// (#862 M-079) — unless the feed is declared `assume_ordered` and the
+/// bookmark is pushed to the server (`replication_bind`): then the largest key
+/// read is a safe resume point. Without the push-down the next run starts at
+/// page 1 again, so an ordered pass would stall just the same.
 fn pass_bookmark_after(
     pass: TruncatedPass,
     bookmark: Option<Value>,
@@ -3140,15 +3146,15 @@ fn pass_bookmark_after(
     if !pass.truncated || pass.persist_cursor {
         return Ok(bookmark);
     }
-    if pass.incremental && pass.assume_ordered && !pass.windowed {
+    if pass.incremental && pass.assume_ordered && pass.pushes_bookmark && !pass.windowed {
         return Ok(bookmark);
     }
     if pass.incremental || pass.windowed {
         return Err(FaucetError::Source(format!(
             "rest: max_pages ({}) cut an incremental pass short, so its bookmark cannot \
              advance and every run would re-read the same pages. Raise or remove \
-             max_pages, set persist_cursor, or set assume_ordered when the feed is \
-             sorted by the replication key",
+             max_pages, set persist_cursor, or set assume_ordered together with a \
+             replication_bind when the feed is sorted by the replication key",
             pass.max_pages
         )));
     }
@@ -4057,9 +4063,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_pages (3)"), "{err}");
-        let ordered = TruncatedPass {
+        let unpushed = TruncatedPass {
             assume_ordered: true,
             ..cut
+        };
+        let err = pass_bookmark_after(unpushed, bm.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("replication_bind"), "{err}");
+        let ordered = TruncatedPass {
+            pushes_bookmark: true,
+            ..unpushed
         };
         assert_eq!(pass_bookmark_after(ordered, bm.clone()).unwrap(), bm);
         let windowed = TruncatedPass {

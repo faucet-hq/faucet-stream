@@ -8,8 +8,11 @@ bookmark, which names the next unread page. An incremental or windowed pass the
 cap cuts short **fails the run**: a record-derived or window bookmark would skip
 the pages it never read, and keeping none would re-read the same pages every run
 while each run looked green. Set `assume_ordered: true` when the feed returns
-records in ascending `replication_key` order — a truncated incremental pass then
-persists the largest key it read and resumes after it. `assume_ordered` does not
+records in ascending `replication_key` order and the bookmark is pushed to the
+server with a `replication_bind` — a truncated incremental pass then persists the
+largest key it read and the next run's first request starts after it. Without a
+`replication_bind` the combination is refused at load time: the next run would
+start at page 1 again and re-read the same pages. `assume_ordered` does not
 apply to windowed passes or across `requests:` entries.
 
 | Style | Stops when |

@@ -4,7 +4,8 @@
 //! must not persist a bookmark that claims those pages: a record-derived
 //! (`running_max`) or window bookmark would skip them for good, and keeping
 //! none re-reads the same pages every run (#862 M-079), so such a pass fails
-//! unless the feed is `assume_ordered`. A persisted cursor names the next
+//! unless the feed is `assume_ordered` and the bookmark is pushed to the
+//! server with a `replication_bind`. A persisted cursor names the next
 //! unread page and is kept. With no explicit cap a feed is read to its natural
 //! end.
 
@@ -91,19 +92,73 @@ async fn a_truncated_incremental_pass_fails_instead_of_stalling() {
     assert!(err.contains("max_pages (1)"), "{err}");
 }
 
+fn since_bind() -> faucet_core::ReplicationBind {
+    serde_json::from_value(json!({"into": "query", "name": "updated_since"})).unwrap()
+}
+
 #[tokio::test]
-async fn an_ordered_truncated_pass_persists_the_largest_key_read() {
-    let server = two_page_feed().await;
+async fn an_ordered_truncated_pass_resumes_past_the_pages_it_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(query_param("updated_since", "2026-01-02T00:00:00Z"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": 3, "updated_at": "2026-01-03T00:00:00Z"}]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": 1, "updated_at": "2026-01-01T00:00:00Z"},
+                {"id": 2, "updated_at": "2026-01-02T00:00:00Z"},
+            ],
+            "next_page_token": "page-2"
+        })))
+        .with_priority(5)
+        .mount(&server)
+        .await;
     let config = RestStreamConfig::new(&server.uri(), "/items")
         .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .replication_bind(since_bind())
+        .pagination(cursor())
+        .max_pages(1)
+        .assume_ordered(true);
+    let (records, bookmark) = drain(&RestStream::new(config.clone()).unwrap()).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(bookmark, Some(json!("2026-01-02T00:00:00Z")));
+
+    let next = RestStream::new(config).unwrap();
+    next.apply_start_bookmark(bookmark.unwrap()).await.unwrap();
+    let (records, bookmark) = drain(&next).await;
+    assert_eq!(
+        records,
+        vec![json!({"id": 3, "updated_at": "2026-01-03T00:00:00Z"})]
+    );
+    assert_eq!(bookmark, Some(json!("2026-01-03T00:00:00Z")));
+}
+
+#[test]
+fn assume_ordered_without_a_server_side_bind_is_refused() {
+    // Without a push-down every run restarts at page 1 and re-reads the same
+    // `max_pages` pages while each run looks green.
+    let config = RestStreamConfig::new("http://localhost", "/items")
         .replication_method(ReplicationMethod::Incremental)
         .replication_key("updated_at")
         .pagination(cursor())
         .max_pages(1)
         .assume_ordered(true);
-    let (records, bookmark) = drain(&RestStream::new(config).unwrap()).await;
-    assert_eq!(records.len(), 2);
-    assert_eq!(bookmark, Some(json!("2026-01-02T00:00:00Z")));
+    let err = RestStream::new(config.clone())
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(err.contains("replication_bind"), "{err}");
+    assert!(RestStream::new(config.clone().replication_bind(since_bind())).is_ok());
+    assert!(RestStream::new(config.persist_cursor(true)).is_ok());
 }
 
 #[tokio::test]
@@ -116,6 +171,7 @@ async fn an_ordered_truncated_requests_entry_fails_instead_of_stalling() {
         .pagination(cursor())
         .max_pages(1)
         .assume_ordered(true)
+        .replication_bind(since_bind())
         .add_partition(HashMap::from([("region".to_string(), json!("eu"))]))
         .add_partition(HashMap::from([("region".to_string(), json!("us"))]));
     let (records, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
