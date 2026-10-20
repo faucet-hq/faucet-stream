@@ -1926,6 +1926,17 @@ pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult
         .iter()
         .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
     {
+        if n.delivery == faucet_core::DeliveryMode::ExactlyOnce && !sink_keyed(n) {
+            return Err(CliError::Config(format!(
+                "row '{}': `delivery: exactly_once` cannot be combined with `shard:` on source \
+                 '{}' — each shard keeps its own commit watermark, and which records a shard \
+                 reads can change between runs (a consumer-group slot is assigned partitions by \
+                 the broker, key ranges are re-planned), so a shard can re-read records another \
+                 shard already committed and write them again. Write with `write_mode: upsert` \
+                 and a `key` (exactly-once through keyed upserts), or remove `shard:`",
+                n.id, n.source.kind
+            )));
+        }
         if n.state.is_some() && pk_range_bookmarked(&n.source.kind, &n.source.config) {
             return Err(CliError::Config(format!(
                 "row '{}': `shard:` cannot be combined with incremental replication on source \
@@ -1938,6 +1949,20 @@ pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult
         }
     }
     check_sharded_file_sinks(nodes)
+}
+
+/// Whether `n`'s sink writes by key (`write_mode: upsert|delete` with a
+/// non-empty `key`), so re-writing a record is idempotent.
+fn sink_keyed(n: &ExpandedNode) -> bool {
+    matches!(
+        n.sink.config.get("write_mode").and_then(Value::as_str),
+        Some("upsert" | "delete")
+    ) && n
+        .sink
+        .config
+        .get("key")
+        .and_then(Value::as_array)
+        .is_some_and(|k| !k.is_empty())
 }
 
 /// `shard:` runs every shard of a row at once with the same sink config, so a
@@ -2634,6 +2659,37 @@ mod tests {
             kind: "cdc_unwrap".into(),
             config,
         }]
+    }
+
+    #[test]
+    fn sharding_an_exactly_once_watermark_run_is_refused() {
+        let yaml = |sink: &str| {
+            format!(
+                r#"
+version: 1
+name: s
+delivery: exactly_once
+shard: {{ count: 2 }}
+pipeline:
+  source: {{ type: kafka, config: {{ brokers: "localhost:9092", topics: [t], group_id: g, idle_timeout: 5 }} }}
+  sink: {{ type: postgres, config: {{ connection_url: "postgres://u@h/db", table_name: t2, column_mapping: auto_map{sink} }} }}
+  state: {{ type: file, config: {{ path: ./state }} }}
+"#
+            )
+        };
+        let cfg = PipelineConfig::from_text(&yaml(""), std::path::Path::new("t.yaml")).unwrap();
+        let nodes = expand(&cfg).unwrap();
+        let err = check_sharding(&cfg, &nodes).unwrap_err().to_string();
+        assert!(
+            err.contains("`delivery: exactly_once` cannot be combined"),
+            "{err}"
+        );
+        let keyed = PipelineConfig::from_text(
+            &yaml(", write_mode: upsert, key: [id]"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        assert!(check_sharding(&keyed, &expand(&keyed).unwrap()).is_ok());
     }
 
     #[test]

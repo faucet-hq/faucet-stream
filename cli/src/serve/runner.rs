@@ -833,7 +833,8 @@ pub(crate) async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
 /// the start (postgres PK-range sharding yields no resumable bookmark), can
 /// re-execute work and write **duplicate** rows to an append-mode sink. The
 /// safe configuration is `write_mode: upsert`/`delete` (keyed, so re-writes are
-/// idempotent) or `delivery: exactly_once`. We surface the risk loudly rather
+/// idempotent); a sharded `delivery: exactly_once` run must be keyed too
+/// (`check_sharding` refuses the watermark mechanism). We surface the risk loudly rather
 /// than silently duplicating — the repo's #1 worst bug class.
 /// Pure decision for [`warn_if_cluster_at_least_once`]: the sink kinds that
 /// would write non-idempotently under cluster failover / shard reclaim. Empty
@@ -875,8 +876,8 @@ fn warn_if_cluster_at_least_once(loaded: &LoadedSubmission, clustered: bool, sha
         tracing::warn!(
             sinks = ?risky,
             "{scope} execution is at-least-once: a failover or shard reclaim can re-run work \
-             and write duplicate rows to an append-mode sink. Set `write_mode: upsert` (or \
-             `delivery: exactly_once`) on the destination to make re-execution idempotent (F26/F39)."
+             and write duplicate rows to an append-mode sink. Set `write_mode: upsert` with a \
+             `key` on the destination to make re-execution idempotent (F26/F39)."
         );
     }
 }
