@@ -21,11 +21,12 @@ use serde_json::Value;
 
 use crate::config::{IdentifierCase, OracleColumnMapping, OracleSinkConfig};
 use crate::plan::{
-    BindKind, COLUMNS_SQL, ColumnInfo, ColumnRow, ORA_NAME_IN_USE, PreparedRows, TABLE_EXISTS_SQL,
-    add_column_sql, case_records, clone_table_sql, column_from_row, create_json_table_sql,
-    create_table_sql, delete_sql, dictionary_binds, drop_table_sql, drops_unknown, fold_names,
-    fold_page, ignoring, insert_sql, insertable_names, merge_sql, no_columns_error,
-    overwrite_swap_sql, pick_table, prepare_rows, relax_null_sql, rename_sql, schema_from_columns,
+    BindKind, COLUMNS_SQL, ColumnInfo, ColumnRow, ORA_NAME_IN_USE, PreparedRows,
+    REFERENCING_TABLES_SQL, TABLE_EXISTS_SQL, add_column_sql, case_records, clone_table_sql,
+    column_from_row, create_json_table_sql, create_table_sql, delete_sql, dictionary_binds,
+    drop_table_sql, drops_unknown, fold_names, fold_page, ignoring, insert_sql, insertable_names,
+    merge_sql, no_columns_error, overwrite_swap_sql, pick_table, prepare_rows,
+    referenced_overwrite_error, relax_null_sql, rename_sql, schema_from_columns,
     staging_fixups_sql, token_delete_sql, token_merge_sql, token_select_sql, token_table,
     token_table_ddl, upsert_groups, widen_column_sql,
 };
@@ -149,6 +150,23 @@ impl Inner {
             .query_row_as(TABLE_EXISTS_SQL, &[&owner, &name])
             .map_err(|e| sink_err("table probe", &e))?;
         Ok(n > 0)
+    }
+
+    /// Refuse an overwrite of a table other tables reference by foreign key.
+    fn refuse_referenced_target(&self, conn: &Connection) -> Result<(), FaucetError> {
+        let (owner, name) = dictionary_binds(&self.target)?;
+        let rows = conn
+            .query_as::<String>(REFERENCING_TABLES_SQL, &[&owner, &name])
+            .map_err(|e| sink_err("foreign-key probe", &e))?;
+        let mut referenced_by = Vec::new();
+        for r in rows {
+            referenced_by.push(r.map_err(|e| sink_err("foreign-key probe", &e))?);
+        }
+        if referenced_by.is_empty() {
+            Ok(())
+        } else {
+            Err(referenced_overwrite_error(&self.target, &referenced_by))
+        }
     }
 
     fn load_columns(&self, conn: &Connection, table: &str) -> Result<Vec<ColumnInfo>, FaucetError> {
@@ -742,6 +760,9 @@ impl StagingDriver for OracleDriver {
             if !exists {
                 return Err(faucet_core::missing_target_error("oracle sink", &i.target));
             }
+            // Before any row is staged: the swap's `DELETE FROM target` would
+            // cascade into (or be blocked by) referencing tables.
+            i.refuse_referenced_target(&conn)?;
             exec(
                 &conn,
                 &clone_table_sql(&i.staging_quoted, &i.target_quoted),
@@ -772,6 +793,8 @@ impl StagingDriver for OracleDriver {
                 }
                 return Ok(());
             }
+            // Again at the swap: a foreign key may have been added mid-run.
+            i.refuse_referenced_target(&conn)?;
             let target_cols = i.load_columns(&conn, &i.target)?;
             let swap = overwrite_swap_sql(&i.target_quoted, &i.staging_quoted, &target_cols)?;
             // The swap copies the whole table in one round trip each; the
