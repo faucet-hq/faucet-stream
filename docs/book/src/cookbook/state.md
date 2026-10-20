@@ -128,10 +128,11 @@ source:
 Combine it with a `replication_bind` of `into: body, path: /variables/since`
 for incremental reads.
 
-### Incremental SQL queries (postgres, mysql)
+### Incremental SQL queries
 
-The `postgres` and `mysql` query sources take a `replication:` block instead
-of `replication_method` / `replication_key`, with the same shape as `mssql`:
+The SQL query sources — `postgres`, `mysql`, `mssql`, `oracle`, `redshift`,
+`clickhouse`, `databricks` and `spanner` — take a `replication:` block instead
+of `replication_method` / `replication_key`:
 
 ```yaml
 source:
@@ -150,9 +151,16 @@ state:
 
 The source runs `SELECT * FROM (<query>) AS q WHERE q.updated_at >= <bookmark>
 ORDER BY q.updated_at`, so the server filters and orders by the cursor. Write
-the token — `${bookmark}` for postgres, `@bookmark` for mysql — inside the
-query with `>=` to apply the cursor in a CTE or join as well; a strict `>` is
-refused when the config loads.
+the source's bookmark token inside the query with `>=` to apply the cursor in a
+CTE or join as well; a strict `>` (or a reversed `<token> < column`) is refused
+when the config loads.
+
+| Source | Token in the query | Notes |
+|---|---|---|
+| `postgres`, `redshift`, `databricks` | `${bookmark}` | redshift casts it to the cursor column's type, read by describing the query |
+| `mysql`, `mssql`, `clickhouse` | `@bookmark` | `mssql`: the query must not end in a top-level `ORDER BY` (T-SQL refuses one in a derived table). `clickhouse`: an RFC 3339 bookmark is compared as `parseDateTime64BestEffort(…)` |
+| `oracle` | `:bookmark` | bound as a named bind variable |
+| `spanner` | `@bookmark` | binds by its JSON type, so cast it in your query (`TIMESTAMP(@bookmark)`); the outer filter casts to the column type for you |
 
 **Ties are never skipped.** The stored bookmark is the last cursor value read
 plus a fingerprint of every row already written at that value
@@ -168,6 +176,14 @@ most one page. Rows with a `NULL` cursor are never read, and a row committed
 with a cursor below the stored bookmark is not seen — use the CDC source when
 that matters. `faucet state show|set|reset` work on these bookmarks like any
 other. Example: `cli/examples/postgres_incremental_to_jsonl.yaml`.
+
+**Upgrading from a strict-`>` release.** The `mssql`, `oracle`, `redshift`,
+`clickhouse`, `databricks` and `spanner` sources used to keep rows strictly
+greater than a bare stored value, which skipped rows that shared it. A bookmark
+stored that way reads as a bookmark with no fingerprints, so the first run
+after upgrading re-delivers the rows at that value once (pair it with
+`write_mode: upsert` to absorb them). Queries written with `>` must switch to
+`>=`, and `initial_value` is now inclusive.
 
 ### Records without the key
 
