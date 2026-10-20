@@ -110,6 +110,27 @@ async fn exec(pool: &MssqlPool, sql: &str) {
     conn.execute(sql, &[]).await.expect("execute setup sql");
 }
 
+/// Run a CDC-enabling statement, retrying while SQL Server Agent is still
+/// starting: `sp_cdc_enable_table` adds the capture job and fails with error
+/// 14258 until the Agent is up, which the TDS readiness probe cannot see.
+async fn exec_cdc(pool: &MssqlPool, sql: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let mut conn = pool.get().await.expect("checkout");
+        match conn.execute(sql, &[]).await {
+            Ok(_) => return,
+            Err(e)
+                if e.to_string().contains("SQLServerAgent is starting")
+                    && std::time::Instant::now() < deadline =>
+            {
+                drop(conn);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => panic!("execute cdc setup sql: {e}"),
+        }
+    }
+}
+
 async fn scalar_i64(pool: &MssqlPool, sql: &str) -> i64 {
     let mut conn = pool.get().await.expect("checkout");
     let rows = conn
@@ -162,7 +183,7 @@ async fn setup_cdc(port: u16, n: usize) -> MssqlConnectionConfig {
         "IF OBJECT_ID('dbo.events') IS NULL CREATE TABLE dbo.events (id INT PRIMARY KEY)",
     )
     .await;
-    exec(
+    exec_cdc(
         &pool,
         "IF NOT EXISTS (SELECT 1 FROM cdc.change_tables ct \
              JOIN sys.objects o ON o.object_id = ct.source_object_id WHERE o.name = 'events') \
