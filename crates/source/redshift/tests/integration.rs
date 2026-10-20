@@ -315,7 +315,11 @@ async fn incremental_keeps_rows_tied_at_the_bookmark() {
     .expect("late rows");
     pool.close().await;
 
-    let (records, bookmark) = drain(&source).await;
+    // The buffered convenience path returns the same rows and bookmark.
+    let (records, bookmark) = source
+        .fetch_with_context_incremental(&HashMap::new())
+        .await
+        .expect("fetch");
     let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(
         ids,

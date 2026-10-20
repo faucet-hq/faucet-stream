@@ -240,13 +240,23 @@ impl Source for RedshiftSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        Ok(self.fetch_with_context_incremental(context).await?.0)
+    }
+
+    async fn fetch_with_context_incremental(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         use futures::StreamExt;
-        let mut out = Vec::new();
+        let mut records = Vec::new();
+        let mut bookmark = None;
         let mut s = self.stream_pages(context, self.config.batch_size);
         while let Some(page) = s.next().await {
-            out.extend(page?.records);
+            let page = page?;
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
         }
-        Ok(out)
+        Ok((records, bookmark))
     }
 
     /// Stream rows from the `sqlx` cursor without buffering the full result set.
