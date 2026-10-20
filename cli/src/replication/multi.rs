@@ -614,6 +614,17 @@ async fn run_group(
             return out;
         }
     };
+    // Every table's committed position: one whose pipeline does not open
+    // this cycle must still hold the shared stream back, or the stream starts
+    // (and confirms) past changes it has not applied.
+    let committed = match committed_positions(&shared, &group).await {
+        Ok(c) => c,
+        Err(e) => {
+            out.source_error = Some(e.to_string());
+            return out;
+        }
+    };
+    let mut floors = floors;
     let mut feeds = Vec::new();
     let mut runs: JoinSet<(String, Result<(), String>, Option<String>)> = JoinSet::new();
     let mut streamed = Vec::new();
@@ -622,6 +633,9 @@ async fn run_group(
         let mut node = match node {
             Ok(n) => n,
             Err(e) => {
+                if let Some(position) = committed.get(table) {
+                    floors.push(position.clone());
+                }
                 out.tables.insert(table.clone(), Err(e.to_string()));
                 continue;
             }
@@ -647,7 +661,16 @@ async fn run_group(
         });
     }
     let router = shared.router(&streamed, known);
-    let demux = feed::run_demux(source, feeds, router, floors, cancel, shared.live.clone()).await;
+    let demux = feed::run_demux(
+        source,
+        feeds,
+        router,
+        floors,
+        committed,
+        cancel,
+        shared.live.clone(),
+    )
+    .await;
     while let Some(joined) = runs.join_next().await {
         match joined {
             Ok((table, result, held)) => {
@@ -669,6 +692,38 @@ async fn run_group(
         Err(e) => out.source_error = Some(e.to_string()),
     }
     out
+}
+
+/// Each of `tables`' last committed stream position: the bookmark in its
+/// state key, else its join point (the position its snapshot was taken at).
+async fn committed_positions(
+    shared: &Shared,
+    tables: &[String],
+) -> CliResult<BTreeMap<String, Value>> {
+    let joins: BTreeMap<String, Value> = {
+        let state = shared.state.lock().await;
+        tables
+            .iter()
+            .filter_map(|t| {
+                let pos = state.tables.get(t)?.position.clone()?;
+                Some((t.clone(), pos))
+            })
+            .collect()
+    };
+    let mut out = BTreeMap::new();
+    for table in tables {
+        let stored = match shared.plan(table) {
+            Ok(plan) => shared.store.get(&shared.table_state_key(&plan)).await?,
+            Err(_) => None,
+        };
+        let position = stored
+            .and_then(|v| faucet_core::unwrap_state(&v).0)
+            .or_else(|| joins.get(table).cloned());
+        if let Some(p) = position {
+            out.insert(table.clone(), p);
+        }
+    }
+    Ok(out)
 }
 
 /// Run a multi-table mirror until SIGTERM (continuous) or until every table is

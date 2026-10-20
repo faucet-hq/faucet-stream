@@ -173,14 +173,19 @@ struct FeedState {
 /// Run one cycle of the shared stream: wait for every table pipeline to open
 /// (reporting its committed position), resume the source from the earliest
 /// one — never past a `floor` (the join position of a table still
-/// snapshotting, which the stream must keep for it) — route each record to
-/// its table, and close every feed when the source ends, `cancel` fires, or a
-/// new matching table appears.
+/// snapshotting, or the committed position of a table that failed to open,
+/// which the stream must keep for it) — route each record to its table, and
+/// close every feed when the source ends, `cancel` fires, or a new matching
+/// table appears. `committed` holds each table's last committed position: a
+/// feed whose pipeline never opens holds the stream at it, because the
+/// source may confirm the start position to its server (postgres-cdc lets
+/// the server recycle WAL before it) and the table resumes from there later.
 pub async fn run_demux(
     source: Arc<dyn Source>,
     feeds: Vec<TableFeed>,
     router: Router,
-    floors: Vec<Value>,
+    mut floors: Vec<Value>,
+    committed: BTreeMap<String, Value>,
     cancel: CancellationToken,
     live: LiveStats,
 ) -> Result<DemuxOutcome, FaucetError> {
@@ -201,6 +206,9 @@ pub async fn run_demux(
                 last_sent_at: Instant::now(),
             }),
             None => {
+                if let Some(position) = committed.get(&feed.table) {
+                    floors.push(position.clone());
+                }
                 outcome.dead.insert(feed.table);
             }
         }
@@ -548,6 +556,7 @@ mod tests {
             vec![fa, fb],
             router(&["a", "b"], false),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             live.clone(),
         )
@@ -601,6 +610,7 @@ mod tests {
             vec![fa, fb],
             router(&["a", "b"], false),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
@@ -619,6 +629,34 @@ mod tests {
         );
     }
 
+    /// A table whose pipeline never opens this cycle still holds the stream
+    /// at its committed position: the source may confirm the start to its
+    /// server, and the table resumes from its own position later.
+    #[tokio::test]
+    async fn a_table_that_fails_to_open_holds_the_resume_point_back() {
+        let src = script(vec![page(1, &["a"]), page(2, &["a"]), page(3, &["a"])]);
+        let (fa, ca) = channel("a", src.clone());
+        let (fb, cb) = channel("b", src.clone());
+        drop(cb);
+        let a = tokio::spawn(consume(ca, Some(2)));
+        let committed: BTreeMap<String, Value> =
+            [("a".to_string(), json!(2)), ("b".to_string(), json!(1))].into();
+        let out = run_demux(
+            src.clone(),
+            vec![fa, fb],
+            router(&["a", "b"], false),
+            vec![],
+            committed,
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.started_at, Some(json!(1)), "b's position holds it back");
+        assert!(out.dead.contains("b"));
+        a.await.unwrap();
+    }
+
     #[tokio::test]
     async fn floors_hold_the_resume_point_back() {
         let src = script(vec![page(1, &["a"]), page(2, &["a"]), page(3, &["a"])]);
@@ -629,6 +667,7 @@ mod tests {
             vec![fa],
             router(&["a"], false),
             vec![json!(1)],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
@@ -658,6 +697,7 @@ mod tests {
             vec![fa],
             router(&["a"], true),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
@@ -684,6 +724,7 @@ mod tests {
             vec![fa, fb],
             router(&["a", "b"], false),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
@@ -711,6 +752,7 @@ mod tests {
             vec![fa, fb],
             router(&["a", "b"], false),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
@@ -736,6 +778,7 @@ mod tests {
             vec![fa],
             router(&["a"], false),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
@@ -762,6 +805,7 @@ mod tests {
             vec![fa],
             router(&["a"], false),
             vec![],
+            Default::default(),
             cancel,
             Default::default(),
         )
@@ -802,6 +846,7 @@ mod tests {
             vec![fa, fb],
             router(&["a", "b"], false),
             vec![],
+            Default::default(),
             CancellationToken::new(),
             Default::default(),
         )
