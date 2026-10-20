@@ -482,25 +482,16 @@ impl Sink for BudgetSink {
         &self,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
+        // The same byte measure the usage meter charges a columnar page, so
+        // a byte ceiling and the run's reported bytes agree.
         let n = batch.num_rows() as u64;
+        let bytes = crate::columnar::batch_slice_bytes(batch);
         if let Some(v) = self.state.verdict() {
             return Err(v.error());
         }
-        if let Some(max) = self.spec.max_records {
-            let would = self.state.records() + n;
-            if would > max {
-                let v = BudgetVerdict {
-                    kind: BudgetKind::Records,
-                    limit: max,
-                    actual: would,
-                };
-                self.state.set_verdict(v.clone());
-                self.cancel.cancel();
-                return Err(v.error());
-            }
-        }
+        self.check_ceilings(n, bytes)?;
         let written = self.inner.write_batch_columnar(batch).await?;
-        self.account(written as u64, crate::columnar::batch_slice_bytes(batch));
+        self.account(written as u64, bytes);
         Ok(written)
     }
 }
@@ -753,6 +744,58 @@ mod tests {
             sink.write_batch_columnar(&batch(1)).await.is_err(),
             "after the verdict"
         );
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn columnar_pages_are_refused_whole_by_the_byte_ceiling() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        struct ColSink(AtomicUsize);
+        #[async_trait]
+        impl Sink for ColSink {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn flush(&self) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            fn supports_columnar(&self) -> bool {
+                true
+            }
+            async fn write_batch_columnar(&self, b: &RecordBatch) -> Result<usize, FaucetError> {
+                self.0.fetch_add(b.num_rows(), Ordering::SeqCst);
+                Ok(b.num_rows())
+            }
+        }
+        let batch = |n: i64| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from((0..n).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+        let one = crate::columnar::batch_slice_bytes(&batch(10));
+        assert!(one > 0);
+        let cancel = CancellationToken::new();
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(ColSink(AtomicUsize::new(0))),
+            BudgetSpec {
+                max_bytes: Some(one + one / 2),
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        assert_eq!(sink.write_batch_columnar(&batch(10)).await.unwrap(), 10);
+        assert_eq!(state.bytes(), one);
+        let err = sink.write_batch_columnar(&batch(10)).await.unwrap_err();
+        assert!(
+            matches!(err, FaucetError::BudgetExceeded { ref budget, .. } if budget == "max_bytes"),
+            "{err}"
+        );
+        assert!(cancel.is_cancelled());
+        assert_eq!(state.records(), 10, "the crossing batch never landed");
+        assert_eq!(state.bytes(), one);
     }
 
     #[tokio::test]
