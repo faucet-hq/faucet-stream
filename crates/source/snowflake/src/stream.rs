@@ -91,6 +91,7 @@ impl SnowflakeSource {
     /// `batch_size`).
     pub fn new(config: SnowflakeSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        faucet_common_snowflake::validate_account(&config.account)?;
         Ok(Self {
             config,
             client: http_client()?,
@@ -926,6 +927,16 @@ mod tests {
         match SnowflakeSource::new(config) {
             Err(FaucetError::Config(m)) => assert!(m.contains("batch_size"), "got: {m}"),
             _ => panic!("expected a batch_size Config error"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_an_account_that_would_leave_snowflake() {
+        let mut config = cfg();
+        config.account = "internal-admin.svc:8443/admin?x=".into();
+        match SnowflakeSource::new(config) {
+            Err(FaucetError::Config(m)) => assert!(m.contains("account"), "got: {m}"),
+            _ => panic!("expected an account Config error"),
         }
     }
 
