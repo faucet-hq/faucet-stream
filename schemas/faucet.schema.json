@@ -11544,7 +11544,7 @@
           "additionalProperties": true
         },
         {
-          "description": "Map top-level JSON keys directly to table columns. Only keys that match\nexisting columns are inserted; extra keys are ignored.",
+          "description": "Map top-level JSON keys directly to table columns. A key with no\nmatching column is added to the table (`ALTER TABLE … ADD COLUMN`)\nwhen `create_table` is true, and fails the write when it is false.",
           "type": "string",
           "const": "auto_map"
         }
