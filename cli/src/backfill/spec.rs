@@ -79,6 +79,39 @@ pub fn shared_unit_destination(node: &crate::expand::ExpandedNode) -> Option<Str
     (!has_scoping_tokens(&dest)).then_some(dest)
 }
 
+/// How a sink would replace its whole destination on every backfill unit —
+/// `write_mode: overwrite`, or a file sink that truncates its one file —
+/// when that destination does not vary per unit (no `${backfill.*}` /
+/// `${now.*}` token in the sink config). Each unit is its own run, so each
+/// would swap away every earlier window's rows.
+pub fn replacing_unit_destination(node: &crate::expand::ExpandedNode) -> Option<String> {
+    if has_scoping_tokens(&node.sink.config.to_string()) {
+        return None;
+    }
+    if node
+        .sink
+        .config
+        .get("write_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("overwrite")
+    {
+        return Some("`write_mode: overwrite`".into());
+    }
+    crate::registry::sink_truncating_path(&node.sink.kind, &node.sink.config)
+        .map(|path| format!("a file it rewrites each run ('{path}')"))
+}
+
+/// The refusal for [`replacing_unit_destination`].
+pub fn replacing_destination_error(row: &str, kind: &str, how: &str, units: usize) -> String {
+    format!(
+        "row '{row}': the {kind} sink replaces its destination on every run ({how}), and each of \
+         the {units} backfill units is its own run — every unit would replace the windows before \
+         it, leaving only the last. Write with `write_mode: append` or `upsert` (with a `key`), \
+         put a per-window token in the destination (e.g. `${{backfill.unit}}`), use --into a \
+         sink that appends, or backfill the range as one window (`--window` covering it)"
+    )
+}
+
 /// The refusal for [`shared_unit_destination`].
 pub fn shared_destination_error(row: &str, kind: &str, dest: &str) -> String {
     format!(
