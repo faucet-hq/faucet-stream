@@ -191,8 +191,20 @@ fn substitute_with(
             return Err("unterminated `${trigger.…}` token".into());
         };
         let token = &after[8..end];
+        // The value is the whole scalar: it lands as one string and cannot
+        // reach the text around it.
+        let whole = start == 0 && after[end + 1..].is_empty() && out.is_empty();
         match event.lookup(token, name, fired_at) {
-            Some(v) if escape => out.push_str(&v.replace("${", "$${")),
+            Some(v) if escape => {
+                if !whole && let Some(why) = spliced_value_refusal(&v) {
+                    return Err(format!(
+                        "the `${{trigger.{token}}}` value contains {why}, and the config splices \
+                         it into a longer string (a query, a path), where it could change the \
+                         meaning of the text around it; use the token as a whole value"
+                    ));
+                }
+                out.push_str(&v.replace("${", "$${"))
+            }
             Some(v) => out.push_str(&v),
             None => {
                 return Err(format!(
@@ -205,6 +217,23 @@ fn substitute_with(
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Why an event value (webhook body, query or header, an object key) may not
+/// be spliced into a longer config string, if it may not: a quote, a
+/// backtick, `;` or a backslash could end a quoted SQL literal or statement, a
+/// control character a line, and a `..` path segment could climb out of the
+/// directory the config names.
+fn spliced_value_refusal(v: &str) -> Option<String> {
+    if let Some(c) = v.chars().find(|c| ['\'', '"', '`', ';', '\\'].contains(c)) {
+        return Some(format!("`{c}`"));
+    }
+    if v.chars().any(char::is_control) {
+        return Some("a control character".into());
+    }
+    v.split('/')
+        .any(|seg| seg == "..")
+        .then(|| "a `..` path segment".into())
 }
 
 /// Deterministic idempotency key for the event (see spec §9).
@@ -276,6 +305,31 @@ pub fn render_name(template: &str, event: &TriggerEvent, name: &str, fired_at: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An event value spliced into a longer config string may not carry text
+    /// that could rewrite it (end a SQL literal, climb out of a directory); as
+    /// a whole scalar it may.
+    #[test]
+    fn a_spliced_event_value_cannot_rewrite_the_text_around_it() {
+        let obj = |key: &str| TriggerEvent::Object {
+            bucket: "b".into(),
+            key: key.into(),
+            size: 1,
+            last_modified: "t".into(),
+        };
+        let spliced = "query: \"SELECT * FROM t WHERE k = '${trigger.object_key}'\"\n";
+        for bad in ["x' OR '1'='1", "a;b", "../../etc/passwd", "a\nb", "a\\b"] {
+            let err = substitute(spliced, &obj(bad), "n", "f").unwrap_err();
+            assert!(err.contains("trigger.object_key"), "{bad}: {err}");
+        }
+        let ok = substitute(spliced, &obj("incoming/2026-10-21.csv"), "n", "f").unwrap();
+        assert!(ok.contains("k = 'incoming/2026-10-21.csv'"), "{ok}");
+        // A whole-scalar value lands as one string, whatever it holds.
+        let whole = substitute("key: ${trigger.object_key}\n", &obj("x' OR 1;"), "n", "f").unwrap();
+        assert_eq!(parsed(&whole)["key"], "x' OR 1;");
+        let path = substitute("path: out/${trigger.object_key}\n", &obj("../up"), "n", "f");
+        assert!(path.is_err());
+    }
 
     #[test]
     fn directives_carried_by_event_values_stay_literal_through_interpolation() {

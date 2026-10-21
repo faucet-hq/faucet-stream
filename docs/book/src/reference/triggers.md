@@ -105,6 +105,14 @@ and `bucket: ${trigger.bucket}` all yield a plain string, and a value holding
 `:`, quotes or newlines stays inside its scalar. A whole-value token is always a
 string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
 
+A token spliced into a longer string is plain text of that string — never a
+bound SQL parameter or an escaped path. So an event value (a webhook body, query
+value or header, an object key) spliced into a longer string may not carry a
+quote (`'`, `"`, `` ` ``), `;`, a backslash, a control character or a `..` path
+segment; such a fire is refused (a `500` for a webhook, an object skipped and
+logged). Keep tokens out of SQL text, and use a token as the whole value when it
+must carry any text.
+
 *`mode: per_object` — one token set per object:*
 
 | Token | Value |
