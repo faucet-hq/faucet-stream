@@ -257,8 +257,7 @@ Controls, when your role holds `LocalOutputManage` (`operator` and up — a
 
 - **Delete now** on any `present` output.
 - **Purge older than N days**, prefilled with the server's configured window.
-  It spans every dataset, so it appears only on the Datasets page, not on a
-  dataset's detail page.
+  On a dataset's detail page it purges only that dataset's outputs.
 - **Clean all local outputs** — behind a confirm, because it also removes files
   still inside their retention window. On a dataset's detail page the same button
   is scoped to that dataset.

@@ -303,6 +303,13 @@ export async function renderLocalOutputs(host, scope = {}) {
     paint(data);
   }
 
+  // On a dataset's page the age purge is scoped to that dataset (the server
+  // combines `dataset_id` with `older_than_days`), and the label says so.
+  function purgeLabel(n) {
+    const days = n === "" ? "N days" : `${n} day${n === "1" ? "" : "s"}`;
+    return datasetId ? `Purge this dataset's outputs older than ${days}` : `Purge older than ${days}`;
+  }
+
   function paint(data) {
     const {
       outputs,
@@ -330,16 +337,10 @@ export async function renderLocalOutputs(host, scope = {}) {
             } /> show cleaned</label>
             ${
               canManage
-                ? `${
-                    // The age purge spans every dataset (the server takes one
-                    // scope), so it lives only on the all-datasets page.
-                    datasetId
-                      ? ""
-                      : `<span class="lo-purge">
+                ? `<span class="lo-purge">
                      <input type="number" id="lo-days" min="0" value="${retention}" />
-                     <button class="btn-warn" id="lo-purge-btn">Purge older than ${retention} day${retention === 1 ? "" : "s"}</button>
-                   </span>`
-                  }
+                     <button class="btn-warn" id="lo-purge-btn">${purgeLabel(String(retention))}</button>
+                   </span>
                    <button class="btn-danger" id="lo-all">${
                      datasetId ? "Clean this dataset's outputs" : "Clean all local outputs"
                    }</button>`
@@ -372,29 +373,33 @@ export async function renderLocalOutputs(host, scope = {}) {
     if (!canManage) return;
     const daysInput = body.querySelector("#lo-days");
     const purgeBtn = body.querySelector("#lo-purge-btn");
-    if (daysInput && purgeBtn) {
-      // Keep the button label in sync with the typed window, so N is never a
-      // placeholder — it always names the exact days that will be purged.
-      daysInput.oninput = () => {
-        const n = daysInput.value.trim();
-        purgeBtn.textContent =
-          n === "" ? "Purge older than N days" : `Purge older than ${n} day${n === "1" ? "" : "s"}`;
-      };
-      purgeBtn.onclick = () => {
-        const days = Number(daysInput.value);
-        if (!Number.isFinite(days) || days < 0) {
-          toast("Enter a number of days (0 or more).", "error");
-          return;
-        }
-        // The typed window *is* the intent, so no dialog — except for 0, which
-        // means "everything" and clears the same gate as "clean all".
-        if (days === 0 && !confirm(CLEAN_ALL_PROMPT("every tracked local output"))) return;
+    // Keep the button label in sync with the typed window, so N is never a
+    // placeholder — it always names the exact days that will be purged.
+    daysInput.oninput = () => {
+      purgeBtn.textContent = purgeLabel(daysInput.value.trim());
+    };
+    purgeBtn.onclick = () => {
+      const days = Number(daysInput.value);
+      if (!Number.isFinite(days) || days < 0) {
+        toast("Enter a number of days (0 or more).", "error");
+        return;
+      }
+      // The typed window *is* the intent, so no dialog — except for 0, which
+      // means "everything" and clears the same gate as "clean all".
+      // A dataset-scoped purge is bounded by the dataset, so it needs no gate.
+      if (datasetId) {
         cleanup(
-          { older_than_days: days, confirm: days === 0 },
-          `purged outputs older than ${days} day(s)`,
+          { dataset_id: datasetId, older_than_days: days },
+          `purged this dataset's outputs older than ${days} day(s)`,
         );
-      };
-    }
+        return;
+      }
+      if (days === 0 && !confirm(CLEAN_ALL_PROMPT("every tracked local output"))) return;
+      cleanup(
+        { older_than_days: days, confirm: days === 0 },
+        `purged outputs older than ${days} day(s)`,
+      );
+    };
     body.querySelector("#lo-all").onclick = () => {
       // "Clean all" removes files that are still inside their retention window,
       // so it is never a bare one-click.

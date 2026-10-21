@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `GET /v1/local-outputs` | list, with age + state | `LocalOutputRead` (viewer+) |
 //! | `DELETE /v1/local-outputs/{id}` | one output, now | `LocalOutputManage` (operator+) |
-//! | `POST /v1/local-outputs/cleanup` | older-than-N / expired / all | `LocalOutputManage` |
+//! | `POST /v1/local-outputs/cleanup` | older-than-N (optionally one dataset) / expired / dataset / run / all | `LocalOutputManage` |
 //!
 //! The Datasets page's other control on these rows — *preview* the file's first
 //! N rows (#586) — lives in [`super::preview`]: reading, not reclaiming.
@@ -187,8 +187,9 @@ pub struct CleanupRequest {
     /// retention window. Must be set explicitly; the console confirms first.
     #[serde(default)]
     pub all: bool,
-    /// Only this dataset's outputs. Combines with nothing else — it is its own
-    /// scope (the Datasets detail view's "clean this dataset").
+    /// Only this dataset's outputs (the Datasets detail view's "clean this
+    /// dataset"). With `older_than_days` it narrows that age purge to this
+    /// dataset; it combines with nothing else.
     #[serde(default)]
     pub dataset_id: Option<String>,
     /// Only the outputs one run most recently wrote — "clean up after that run".
@@ -212,6 +213,17 @@ pub struct CleanupRequest {
 impl CleanupRequest {
     /// Resolve the request to exactly one scope, or explain what was wrong.
     fn scope(&self) -> Result<SweepScope, ServeError> {
+        // One dataset's outputs past an age — the detail page's age purge.
+        if let (Some(dataset_id), Some(days)) = (&self.dataset_id, self.older_than_days)
+            && !self.expired
+            && !self.all
+            && self.run_id.is_none()
+        {
+            return Ok(SweepScope::DatasetOlderThanDays {
+                dataset_id: dataset_id.clone(),
+                days,
+            });
+        }
         let chosen: Vec<SweepScope> = [
             self.older_than_days.map(SweepScope::OlderThanDays),
             self.expired.then_some(SweepScope::Expired),
@@ -234,7 +246,8 @@ impl CleanupRequest {
             // far more than the caller expected.
             _ => Err(ServeError::BadConfig(
                 "cleanup: `older_than_days`, `expired`, `dataset_id`, `run_id`, and `all` \
-                 are mutually exclusive — send exactly one"
+                 are mutually exclusive — send exactly one (only `dataset_id` with \
+                 `older_than_days` combine, to purge one dataset's older outputs)"
                     .into(),
             )),
         }
@@ -342,6 +355,29 @@ mod tests {
         // was asked for.
         let err = req().scope().unwrap_err();
         assert!(matches!(err, ServeError::BadConfig(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_dataset_combines_with_an_age() {
+        let mut r = req();
+        r.dataset_id = Some("ds1".into());
+        r.older_than_days = Some(7);
+        let scope = r.scope().unwrap();
+        assert_eq!(
+            scope,
+            SweepScope::DatasetOlderThanDays {
+                dataset_id: "ds1".into(),
+                days: 7
+            }
+        );
+        assert!(!scope.requires_confirmation());
+        r.older_than_days = Some(0);
+        assert!(
+            !r.scope().unwrap().requires_confirmation(),
+            "bounded by the dataset"
+        );
+        r.all = true;
+        assert!(r.scope().is_err(), "a third scope is still refused");
     }
 
     #[test]

@@ -292,6 +292,9 @@ pub enum SweepScope {
     Expired,
     /// Every tracked output, regardless of age.
     All,
+    /// One dataset's outputs older than N days — the dataset page's "purge
+    /// older than N", scoped to that dataset.
+    DatasetOlderThanDays { dataset_id: String, days: u32 },
 }
 
 impl SweepScope {
@@ -325,6 +328,7 @@ impl SweepScope {
             Self::OlderThanDays(_) => "older_than",
             Self::Expired => "expired",
             Self::All => "all",
+            Self::DatasetOlderThanDays { .. } => "dataset_older_than",
         }
     }
 }

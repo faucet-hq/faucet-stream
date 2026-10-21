@@ -462,6 +462,27 @@ async fn bulk_cleanup_scopes_and_dry_run() {
         .as_str()
         .unwrap()
         .to_string();
+    // A dataset's age purge stays inside that dataset: nothing is a day old,
+    // and a zero-day window (dry run) names only that dataset's file.
+    for (days, expect) in [(1, 0), (0, 1)] {
+        let report: Value = client
+            .post(format!("{base}/v1/local-outputs/cleanup"))
+            .bearer_auth("admin-tok")
+            .json(&serde_json::json!({
+                "dataset_id": dataset_a,
+                "older_than_days": days,
+                "dry_run": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["deleted"], expect, "{report}");
+        assert!(!report.to_string().contains("b.jsonl"), "{report}");
+    }
+    assert!(a.exists() && b.exists());
     let report: Value = client
         .post(format!("{base}/v1/local-outputs/cleanup"))
         .bearer_auth("admin-tok")

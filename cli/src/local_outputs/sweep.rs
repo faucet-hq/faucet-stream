@@ -171,6 +171,9 @@ fn in_scope(rec: &LocalOutputRecord, scope: &SweepScope, opts: &SweepOptions) ->
         }
         SweepScope::Expired => rec.is_expired_by_age(opts.default_retention_days, opts.now),
         SweepScope::All => true,
+        SweepScope::DatasetOlderThanDays { dataset_id, days } => {
+            rec.dataset_id == *dataset_id && rec.age_secs(opts.now) >= u64::from(*days) * 86_400
+        }
     }
 }
 
@@ -507,6 +510,26 @@ mod tests {
         other.dataset_id = "ds2".into();
         let rows = vec![rec("/tmp/a.jsonl", NOW), LocalOutputRecord::new(&other)];
         let sel = select(&rows, &SweepScope::Dataset("ds2".into()), &opts());
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].record.path, "/tmp/b.jsonl");
+    }
+
+    #[test]
+    fn a_dataset_age_scope_selects_that_datasets_older_outputs_only() {
+        let mut other_ds = obs("/tmp/b.jsonl", "2026-08-10T00:00:00Z");
+        other_ds.dataset_id = "ds2".into();
+        let mut recent = obs("/tmp/c.jsonl", "2026-08-19T00:00:00Z");
+        recent.dataset_id = "ds2".into();
+        let rows = vec![
+            rec("/tmp/a.jsonl", "2026-08-10T00:00:00Z"),
+            LocalOutputRecord::new(&other_ds),
+            LocalOutputRecord::new(&recent),
+        ];
+        let scope = SweepScope::DatasetOlderThanDays {
+            dataset_id: "ds2".into(),
+            days: 5,
+        };
+        let sel = select(&rows, &scope, &opts());
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].record.path, "/tmp/b.jsonl");
     }

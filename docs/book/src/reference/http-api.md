@@ -395,7 +395,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/usage` | `200` | Cost & usage report over recorded invocations (`by`, `since`, `until`, `pipeline`, `limit`, `include_records`) — viewer / `UsageRead`; requires the `catalog` build feature |
 | `GET` | `/v1/local-outputs` | `200` | List tracked local sink output files with age + state (`dataset_id`, `pipeline`, `include_expired`, `limit`) — viewer / `LocalOutputRead` |
 | `DELETE` | `/v1/local-outputs/{id}` | `200` | Delete one recorded output file now (operator / `LocalOutputManage`); `404` for an unknown id |
-| `POST` | `/v1/local-outputs/cleanup` | `200` | Bulk clean: `older_than_days` \| `expired` \| `dataset_id` \| `run_id` \| `all`, plus `dry_run` (operator / `LocalOutputManage`) |
+| `POST` | `/v1/local-outputs/cleanup` | `200` | Bulk clean: `older_than_days` \| `expired` \| `dataset_id` (optionally with `older_than_days`) \| `run_id` \| `all`, plus `dry_run` (operator / `LocalOutputManage`) |
 | `POST` | `/v1/templates` | `201` | Register a pipeline template (admin / `TemplateAdmin`) — requires the `templates` build feature |
 | `GET` | `/v1/templates` | `200` | List templates — newest version each, plus release state (viewer / `TemplateRead`) |
 | `GET` | `/v1/templates/{id}` | `200` | One template version + its whole release state. `?version=stable` (default), another channel, or `?version=N` |
@@ -827,7 +827,9 @@ the `catalog` feature.
   `{"older_than_days": N}`, `{"expired": true}` (each output's own window),
   `{"dataset_id": "…"}`, `{"run_id": "…"}` ("clean up after that run" — its
   history record is untouched), or `{"all": true}`. Sending none or several is a
-  `400` rather than a guess. Add `"dry_run": true` to see what would go.
+  `400` rather than a guess — except `{"dataset_id": "…", "older_than_days": N}`,
+  which purges that one dataset's outputs older than N days (the dataset page's
+  age purge). Add `"dry_run": true` to see what would go.
 
   A scope that ignores retention windows — `all`, and `older_than_days: 0`, which
   matches every output — also needs `"confirm": true`, or it is refused with a

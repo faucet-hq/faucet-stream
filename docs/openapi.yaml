@@ -1815,7 +1815,8 @@ paths:
         Deletes recorded local output files in bulk. Exactly one scope must be
         given — `older_than_days`, `expired` (each output's own window),
         `dataset_id`, `run_id`, or `all` — and combining them is a `400` rather
-        than a guess. A scope that ignores retention windows (`all`, or
+        than a guess. The one combination is `dataset_id` with
+        `older_than_days`: that dataset's outputs older than N days. A scope that ignores retention windows (`all`, or
         `older_than_days: 0`) additionally requires `confirm: true`, the same gate
         the CLI spells `--yes`. `all` includes outputs still inside their retention window, so a
         client should confirm before sending it. Only files the ledger records as
@@ -1840,7 +1841,9 @@ paths:
                   description: Delete outputs whose own retention window has elapsed.
                 dataset_id:
                   type: string
-                  description: Delete this dataset's outputs.
+                  description: >
+                    Delete this dataset's outputs. With `older_than_days`, only
+                    this dataset's outputs older than that many days.
                 run_id:
                   type: string
                   description: >
