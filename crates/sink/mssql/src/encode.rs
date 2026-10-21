@@ -37,9 +37,11 @@ impl BoundParam {
                 // the value.
                 Err(_) => BoundParam::Str(n.as_u64().unwrap().to_string()),
             },
-            // Its shortest text: SQL Server parses that exactly into a DECIMAL
-            // or a float, where a bound float converts from binary (#885).
-            Value::Number(n) => BoundParam::Str(n.to_string()),
+            // Its shortest text in positional form: SQL Server parses that
+            // exactly into a DECIMAL or a float, where a bound float converts
+            // from binary (#885). Exponent form (`1e-7`) converts to float but
+            // not to DECIMAL / NUMERIC / MONEY (error 8114), so it is expanded.
+            Value::Number(n) => BoundParam::Str(positional_decimal(&n.to_string())),
             Value::Bool(b) => BoundParam::Bool(*b),
             Value::Null => BoundParam::Null(None),
             // Arrays/objects are serialized; for a json_column this is the whole
@@ -66,6 +68,77 @@ impl BoundParam {
         }
     }
 }
+/// SQL Server's largest DECIMAL precision.
+const MAX_DECIMAL_DIGITS: usize = 38;
+
+/// A decimal number's text without an exponent: `1e-7` → `0.0000001`,
+/// `-1.5e+20` → `-150000000000000000000`. Text that is not a decimal in
+/// exponent form, or that would need more digits than any DECIMAL holds, is
+/// returned unchanged.
+pub(crate) fn positional_decimal(text: &str) -> String {
+    let Some(epos) = text.find(['e', 'E']) else {
+        return text.to_string();
+    };
+    let Ok(exp) = text[epos + 1..].parse::<i64>() else {
+        return text.to_string();
+    };
+    let mantissa = &text[..epos];
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa.strip_prefix('+').unwrap_or(mantissa)),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+        || exp.unsigned_abs() > 4096
+    {
+        return text.to_string();
+    }
+    let digits = format!("{int_part}{frac_part}");
+    // Position of the decimal point within `digits`.
+    let point = int_part.len() as i64 + exp;
+    let (int_digits, frac_digits) = if point <= 0 {
+        (
+            "0".to_string(),
+            format!("{}{digits}", "0".repeat(point.unsigned_abs() as usize)),
+        )
+    } else if point as usize >= digits.len() {
+        (
+            format!("{digits}{}", "0".repeat(point as usize - digits.len())),
+            String::new(),
+        )
+    } else {
+        (
+            digits[..point as usize].to_string(),
+            digits[point as usize..].to_string(),
+        )
+    };
+    let int_digits = int_digits.trim_start_matches('0');
+    let int_digits = if int_digits.is_empty() {
+        "0"
+    } else {
+        int_digits
+    };
+    let frac_digits = frac_digits.trim_end_matches('0');
+    // Past 38 digits no DECIMAL can hold the value; the exponent form is what
+    // a float column parses, and stays short.
+    let width = if int_digits == "0" {
+        0
+    } else {
+        int_digits.len()
+    } + frac_digits.len();
+    if width > MAX_DECIMAL_DIGITS {
+        return text.to_string();
+    }
+    if frac_digits.is_empty() {
+        format!("{sign}{int_digits}")
+    } else {
+        format!("{sign}{int_digits}.{frac_digits}")
+    }
+}
+
 /// `tiberius` routes parameterized statements through `sp_executesql`, which
 /// consumes two of the 2100 parameters itself; and a `VALUES` constructor
 /// allows at most 1000 row expressions.
@@ -819,6 +892,35 @@ mod tests {
             BoundParam::Str(s) => assert_eq!(s, "18446744073709551615"),
             BoundParam::I64(v) => panic!("u64::MAX wrapped to negative I64({v})"),
             _ => panic!("expected Str for u64 > i64::MAX"),
+        }
+    }
+
+    #[test]
+    fn exponent_floats_bind_as_positional_decimals() {
+        assert_eq!(positional_decimal("1e-7"), "0.0000001");
+        assert_eq!(positional_decimal("-1.25e-6"), "-0.00000125");
+        assert_eq!(positional_decimal("1.5e20"), "150000000000000000000");
+        assert_eq!(positional_decimal("-1.5e+20"), "-150000000000000000000");
+        assert_eq!(positional_decimal("1.234e2"), "123.4");
+        assert_eq!(positional_decimal("0.1"), "0.1");
+        assert_eq!(positional_decimal("12"), "12");
+        assert_eq!(positional_decimal("nope"), "nope");
+        assert_eq!(
+            positional_decimal("1e-38"),
+            format!("0.{}1", "0".repeat(37))
+        );
+        assert_eq!(positional_decimal("1e+300"), "1e+300");
+        assert_eq!(positional_decimal("1e-39"), "1e-39");
+        // What a record's float actually binds as.
+        for (v, want) in [
+            (json!(0.000001), "0.000001"),
+            (json!(1.5e20), "150000000000000000000"),
+            (json!(0.1), "0.1"),
+        ] {
+            match BoundParam::from_value(&v) {
+                BoundParam::Str(s) => assert_eq!(s, want),
+                _ => panic!("a float binds as text"),
+            }
         }
     }
 }
