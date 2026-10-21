@@ -65,6 +65,12 @@ pub(crate) struct BookmarkContext {
     /// Event clock for [`Self::stale_since_revoke`]: when each partition last
     /// delivered a message and when it was last revoked.
     pub(crate) events: Arc<Mutex<PartitionEvents>>,
+    /// Where each assigned partition starts fetching, resolved inside the
+    /// rebalance callback — the bookmark floor of a partition that delivers
+    /// nothing. Looking the position up later (at bookmark-build time) would
+    /// read a newer high watermark under `latest` and skip the records
+    /// produced in between.
+    pub(crate) assign_floors: Arc<Mutex<HashMap<(String, i32), i64>>>,
 }
 
 /// Per-partition delivery / revocation order (#789 MSG-95).
@@ -154,6 +160,9 @@ pub(crate) fn member_seeds(
 /// the still-retained backlog.
 /// `(topic, partition, low watermark, records lost)`.
 pub(crate) type Clamp = (String, i32, i64, u64);
+
+/// The group's committed offset of each partition (`None` = none committed).
+pub(crate) type Committed = HashMap<(String, i32), Option<i64>>;
 
 pub(crate) fn committed_clamps(
     assigned: &[(String, i32)],
@@ -352,11 +361,45 @@ impl ConsumerContext for BookmarkContext {
                     applied = seeks;
                 }
 
-                let (mut seeds, clamps) = if self.member_mode.load(Ordering::Acquire) {
+                let member = self.member_mode.load(Ordering::Acquire);
+                let (mut seeds, clamps, committed) = if member {
                     self.member_seed_offsets(base_consumer, tpl, &applied, &lookups)
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), HashMap::new())
                 };
+                // Outside member mode, pin every partition the bookmark does
+                // not name to where `auto.offset.reset` would start it, so the
+                // start is known exactly (see `assign_floors`).
+                let pins = if member {
+                    Vec::new()
+                } else {
+                    let seeked: std::collections::HashSet<(String, i32)> =
+                        applied.iter().map(|(t, p, _)| (t.clone(), *p)).collect();
+                    let unseeked: Vec<(String, i32)> = tpl
+                        .elements()
+                        .into_iter()
+                        .map(|e| (e.topic().to_string(), e.partition()))
+                        .filter(|tp| !seeked.contains(tp))
+                        .collect();
+                    let watermarks = batch_watermarks(base_consumer, &unseeked, &lookups);
+                    member_seeds(
+                        &unseeked,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &watermarks,
+                        self.earliest.load(Ordering::Acquire),
+                    )
+                };
+                for (topic, partition, offset) in &pins {
+                    if let Err(e) =
+                        tpl.set_partition_offset(topic, *partition, Offset::Offset(*offset))
+                    {
+                        self.record_error(FaucetError::State(format!(
+                            "kafka set_partition_offset topic={topic} partition={partition} \
+                             offset={offset}: {e}"
+                        )));
+                    }
+                }
                 for (topic, partition, start, lost) in clamps {
                     tracing::warn!(
                         topic = %topic,
@@ -401,6 +444,9 @@ impl ConsumerContext for BookmarkContext {
                 if !seeds.is_empty() {
                     commit_seeds(base_consumer, &seeds);
                 }
+                if let Ok(mut floors) = self.assign_floors.lock() {
+                    floors.extend(start_floors(tpl, &committed));
+                }
 
                 let rebalance = Rebalance::Assign(tpl);
                 self.post_rebalance(base_consumer, &rebalance);
@@ -410,6 +456,11 @@ impl ConsumerContext for BookmarkContext {
                 if let Ok(mut ev) = self.events.lock() {
                     for e in tpl.elements() {
                         ev.note_revoked((e.topic().to_string(), e.partition()));
+                    }
+                }
+                if let Ok(mut floors) = self.assign_floors.lock() {
+                    for e in tpl.elements() {
+                        floors.remove(&(e.topic().to_string(), e.partition()));
                     }
                 }
                 let rebalance = Rebalance::Revoke(tpl);
@@ -459,7 +510,7 @@ impl BookmarkContext {
         tpl: &TopicPartitionList,
         applied: &[(String, i32, i64)],
         lookups: &LookupBudget,
-    ) -> (Vec<(String, i32, i64)>, Vec<Clamp>) {
+    ) -> (Vec<(String, i32, i64)>, Vec<Clamp>, Committed) {
         let assigned: Vec<(String, i32)> = tpl
             .elements()
             .into_iter()
@@ -473,7 +524,7 @@ impl BookmarkContext {
             Ok(c) => committed_map(&c),
             Err(e) => {
                 tracing::warn!(error = %e, "kafka member mode: committed-offsets lookup failed; not seeding");
-                return (Vec::new(), Vec::new());
+                return (Vec::new(), Vec::new(), HashMap::new());
             }
         };
         let seeks: HashMap<(String, i32), i64> = applied
@@ -497,11 +548,29 @@ impl BookmarkContext {
             &watermarks,
             self.earliest.load(Ordering::Acquire),
         );
-        (
-            seeds,
-            committed_clamps(&assigned, &committed, &seeks, &lows),
-        )
+        let clamps = committed_clamps(&assigned, &committed, &seeks, &lows);
+        (seeds, clamps, committed)
     }
+}
+
+/// Where each partition of an about-to-be-assigned `tpl` starts: its concrete
+/// offset (a bookmark seek, a pin or a member seed), else the group's
+/// committed offset (member mode). A partition with neither is left out.
+pub(crate) fn start_floors(
+    tpl: &TopicPartitionList,
+    committed: &HashMap<(String, i32), Option<i64>>,
+) -> HashMap<(String, i32), i64> {
+    tpl.elements()
+        .into_iter()
+        .filter_map(|e| {
+            let tp = (e.topic().to_string(), e.partition());
+            let start = match e.offset() {
+                Offset::Offset(n) => Some(n),
+                _ => committed.get(&tp).copied().flatten(),
+            };
+            start.map(|n| (tp, n))
+        })
+        .collect()
 }
 
 /// The `(low, high)` watermarks of `tps` in two batched list-offsets requests
@@ -528,7 +597,7 @@ fn batch_watermarks(
         match consumer.offsets_for_times(tpl, timeout) {
             Ok(found) => offsets_map(&found),
             Err(e) => {
-                tracing::warn!(error = %e, "kafka member mode: watermark lookup failed");
+                tracing::warn!(error = %e, "kafka source: watermark lookup failed");
                 HashMap::new()
             }
         }
@@ -653,6 +722,36 @@ fn filter_seeks_by_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_floors_are_the_assigned_start_offsets() {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset("t", 0, Offset::Offset(7)).unwrap();
+        tpl.add_partition("t", 1);
+        tpl.add_partition("t", 2);
+        let committed = HashMap::from([
+            (("t".to_string(), 1), Some(3)),
+            (("t".to_string(), 2), None),
+        ]);
+        let floors = start_floors(&tpl, &committed);
+        assert_eq!(
+            floors,
+            HashMap::from([(("t".to_string(), 0), 7), (("t".to_string(), 1), 3)])
+        );
+        // An unseeked partition outside member mode is pinned to the
+        // watermark `auto.offset.reset` names, read at assignment.
+        let unseeked = vec![("t".to_string(), 5)];
+        let wm = HashMap::from([(("t".to_string(), 5), (2, 40))]);
+        let none = HashMap::new();
+        assert_eq!(
+            member_seeds(&unseeked, &HashMap::new(), &none, &wm, false),
+            vec![("t".to_string(), 5, 40)]
+        );
+        assert_eq!(
+            member_seeds(&unseeked, &HashMap::new(), &none, &wm, true),
+            vec![("t".to_string(), 5, 2)]
+        );
+    }
 
     #[test]
     fn the_lookup_budget_caps_each_lookup_and_runs_out() {
