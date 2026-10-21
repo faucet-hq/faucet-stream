@@ -129,6 +129,12 @@ passes them by construction; they run on any sink:
 | `assert_driver_declarations_truthful` | every lifecycle the sink does not declare (overwrite, exactly-once, cleanup, schema evolution, rollback) is refused by its hook; the declared ones' non-destructive probes answer; keyed dedup comes with a keyed write mode |
 | `assert_driver_row_paths_agree` | the plain, reported, per-row and governed (`write_governed`) writes of a valid page each account for every row |
 
+One more proves a source streams rather than buffers:
+
+| Check | Proves |
+|---|---|
+| `assert_first_page_before_exhaustion` | given a count of the records its backend has served, the source's first page arrives before the whole result set was read. `assert_bounded_memory` only checks page sizes, so a source that reads everything and then chunks it passes that one but fails this |
+
 ### A declared capability requires its check
 
 `faucet_conformance::required::REQUIREMENTS` maps each declared capability to

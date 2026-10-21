@@ -926,6 +926,10 @@ fn conformance_config_schema_valid() {
 async fn conformance_bounded_memory() {
     // drive a source that yields `total` records in pages of `batch`
     faucet_conformance::assert_bounded_memory(&source, batch, total).await;
+    // page sizes alone do not prove streaming: count what the backend served
+    // when the first page arrives
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, || served())
+        .await;
 }
 
 #[tokio::test]

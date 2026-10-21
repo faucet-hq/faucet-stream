@@ -20,7 +20,8 @@
 //!
 //! The core contract checks:
 //! 1. [`assert_config_schema_valid`] — the config schema is a valid JSON Schema.
-//! 2. [`assert_bounded_memory`] — the source pages instead of buffering.
+//! 2. [`assert_bounded_memory`] — the source hands records over in pages of at
+//!    most `batch_size` (see check 22 for buffering).
 //! 3. [`assert_bookmark_roundtrip`] — an incremental source resumes from its
 //!    bookmark rather than restarting.
 //! 4. [`assert_idempotent_replay`] — re-delivering committed rows leaves no
@@ -65,6 +66,11 @@
 //! 19. [`assert_batch_atomicity_truthful`] — a failed write of a batch
 //!     declared atomic lands no row; a per-row batch lands exactly its `Ok`
 //!     rows.
+//!
+//! Streaming check:
+//! 22. [`assert_first_page_before_exhaustion`] — a source's first page arrives
+//!     before its backend has served the whole result set (check 2 alone
+//!     cannot tell paging from buffering-then-chunking).
 //!
 //! Each check has both a passing and a `#[should_panic]` failing test in this
 //! crate — a check that cannot fail is worthless.
@@ -239,13 +245,18 @@ pub fn assert_config_schema_valid_value(schema: &Value, label: &str) {
 // ── Check 2: bounded memory ──────────────────────────────────────────────────
 
 /// **Check 2.** Drive `stream_pages` over a source that yields `total` records
-/// and assert the consumer never holds more than ~`batch_size` records live at
-/// once (i.e. the source pages instead of buffering everything).
+/// and assert it hands them over in pages of at most `batch_size`, so the
+/// consumer never holds more than one page.
 ///
 /// Requires `batch_size > 0` and `total > batch_size` for a meaningful result.
 /// Asserts: every record is streamed (`sum == total`), the largest single page
-/// is `<= batch_size`, and strictly `< total` (proving the source did not emit
-/// the whole set as one page).
+/// is `<= batch_size`, and strictly `< total` (the source did not emit the
+/// whole set as one page).
+///
+/// This proves paging granularity only. A source that reads the whole result
+/// into memory and then chunks it (the default `stream_pages`) passes it; use
+/// [`assert_first_page_before_exhaustion`] (check 22) with a count of what the
+/// backend has served to prove the source does not buffer.
 pub async fn assert_bounded_memory<S: Source + ?Sized>(
     source: &S,
     batch_size: usize,
@@ -284,6 +295,57 @@ pub async fn assert_bounded_memory<S: Source + ?Sized>(
         peak < total,
         "[{label}] peak page {peak} == total: source buffered the whole set into one page"
     );
+}
+
+// ── Check 22: the first page arrives before the source is exhausted ─────────
+
+/// **Check 22.** Prove a source streams rather than buffers: its first page
+/// must arrive before it has read the whole result set from its backend.
+///
+/// `produced` returns how many records the backend has served so far (a
+/// counting fake, a mock server's request log times its page size, a seeded
+/// table's rows read). It is read the moment the first page arrives; the check
+/// fails when it already equals `total`, because a source that read everything
+/// before yielding holds `O(total)` records however small its pages are.
+/// Read-ahead is fine: anything short of the whole set passes.
+///
+/// Requires `total > batch_size > 0`, and a backend whose result is larger
+/// than the source's read-ahead.
+pub async fn assert_first_page_before_exhaustion<S, F>(
+    source: &S,
+    batch_size: usize,
+    total: usize,
+    produced: F,
+) where
+    S: Source + ?Sized,
+    F: Fn() -> usize,
+{
+    assert!(
+        batch_size > 0 && total > batch_size,
+        "need total ({total}) > batch_size ({batch_size}) > 0 for a meaningful check"
+    );
+    let label = source.connector_name();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut stream = source.stream_pages(&ctx, batch_size);
+    let first = stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("[{label}] stream_pages yielded no page"))
+        .unwrap_or_else(|e| panic!("[{label}] stream_pages errored: {e}"));
+    let served = produced();
+    assert!(
+        !first.records.is_empty(),
+        "[{label}] the first page is empty"
+    );
+    assert!(
+        served < total,
+        "[{label}] the backend had served {served} of {total} records before the first page \
+         arrived: the source buffers the whole result set"
+    );
+    drop(first);
+    while let Some(page) = stream.next().await {
+        page.unwrap_or_else(|e| panic!("[{label}] stream_pages errored: {e}"));
+    }
 }
 
 // ── Check 3: bookmark round-trip (resumable sources) ─────────────────────────
@@ -1185,6 +1247,36 @@ mod tests {
         // batch 0 => single page of `total`, which must trip the bounded check.
         let s = CountingSource::new(500, 0);
         assert_bounded_memory(&s, 100, 500).await;
+    }
+
+    #[tokio::test]
+    async fn check2_cannot_tell_a_buffering_source_from_a_paging_one() {
+        // Documented limit: buffering-then-chunking passes check 2.
+        let s = doubles::BufferingSource::new(1000, 100);
+        assert_bounded_memory(&s, 100, 1000).await;
+    }
+
+    // ── Check 22: first page before exhaustion ───────────────────────────────
+
+    #[tokio::test]
+    async fn check22_passes_for_a_streaming_source() {
+        let s = CountingSource::new(1000, 100);
+        let produced = s.produced();
+        assert_first_page_before_exhaustion(&s, 100, 1000, || {
+            produced.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "buffers the whole result set")]
+    async fn check22_fails_for_a_source_that_buffers_then_chunks() {
+        let s = doubles::BufferingSource::new(1000, 100);
+        let produced = s.produced();
+        assert_first_page_before_exhaustion(&s, 100, 1000, || {
+            produced.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
     }
 
     // ── Check 3: bookmark round-trip ─────────────────────────────────────────

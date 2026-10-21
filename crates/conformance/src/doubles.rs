@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use faucet_core::check::{CheckContext, CheckReport};
@@ -52,6 +53,7 @@ pub struct CountingSource {
     batch: usize,
     resumable: bool,
     start: Arc<Mutex<usize>>,
+    produced: Arc<AtomicUsize>,
 }
 
 impl CountingSource {
@@ -62,6 +64,7 @@ impl CountingSource {
             batch,
             resumable: true,
             start: Arc::new(Mutex::new(0)),
+            produced: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -73,7 +76,16 @@ impl CountingSource {
             batch,
             resumable: false,
             start: Arc::new(Mutex::new(0)),
+            produced: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many records the source has generated so far — the "backend
+    /// served" count [`assert_first_page_before_exhaustion`] reads.
+    ///
+    /// [`assert_first_page_before_exhaustion`]: crate::assert_first_page_before_exhaustion
+    pub fn produced(&self) -> Arc<AtomicUsize> {
+        self.produced.clone()
     }
 }
 
@@ -84,6 +96,8 @@ impl Source for CountingSource {
         _context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
         let start = *self.start.lock().unwrap();
+        self.produced
+            .fetch_add(self.total.saturating_sub(start), Ordering::SeqCst);
         Ok((start..self.total).map(|i| json!({ "n": i })).collect())
     }
 
@@ -103,6 +117,7 @@ impl Source for CountingSource {
         };
         let total = self.total;
         let start = (*self.start.lock().unwrap()).min(total);
+        let produced = self.produced.clone();
         Box::pin(async_stream::try_stream! {
             let mut n = start;
             if n >= total {
@@ -114,6 +129,7 @@ impl Source for CountingSource {
             while n < total {
                 let end = (n + batch).min(total);
                 let records: Vec<Value> = (n..end).map(|i| json!({ "n": i })).collect();
+                produced.fetch_add(end - n, Ordering::SeqCst);
                 n = end;
                 let bookmark = if n >= total { Some(json!({ "n": total })) } else { None };
                 yield StreamPage { records, bookmark };
@@ -1194,6 +1210,61 @@ impl Sink for AtomicitySink {
 
     fn connector_name(&self) -> &'static str {
         "atomicity-sink"
+    }
+}
+
+/// A source that reads its whole result set before yielding anything, then
+/// hands it over in `batch`-sized pages (the default `stream_pages`). Passes
+/// [`assert_bounded_memory`](crate::assert_bounded_memory) and fails
+/// [`assert_first_page_before_exhaustion`](crate::assert_first_page_before_exhaustion).
+pub struct BufferingSource {
+    total: usize,
+    batch: usize,
+    produced: Arc<AtomicUsize>,
+}
+
+impl BufferingSource {
+    /// `total` records, all read up front, paged by `batch`.
+    pub fn new(total: usize, batch: usize) -> Self {
+        Self {
+            total,
+            batch,
+            produced: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many records the source has read so far.
+    pub fn produced(&self) -> Arc<AtomicUsize> {
+        self.produced.clone()
+    }
+}
+
+#[async_trait]
+impl Source for BufferingSource {
+    async fn fetch_with_context(
+        &self,
+        _context: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        self.produced.fetch_add(self.total, Ordering::SeqCst);
+        Ok((0..self.total).map(|i| json!({ "n": i })).collect())
+    }
+
+    fn stream_pages<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        _batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+        let batch = self.batch.max(1);
+        Box::pin(async_stream::try_stream! {
+            let all = self.fetch_with_context(context).await?;
+            for chunk in all.chunks(batch) {
+                yield StreamPage { records: chunk.to_vec(), bookmark: None };
+            }
+        })
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "buffering"
     }
 }
 

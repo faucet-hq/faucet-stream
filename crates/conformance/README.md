@@ -18,7 +18,7 @@ this crate — a check that cannot fail is worthless.
 | # | Function | What it proves |
 |---|---|---|
 | 1 | `assert_config_schema_valid` | `config_schema()` is a valid, round-tripping JSON Schema |
-| 2 | `assert_bounded_memory` | `stream_pages` pages instead of buffering the whole set |
+| 2 | `assert_bounded_memory` | `stream_pages` hands records over in pages of at most `batch_size` (paging granularity only: a source that buffers then chunks passes — see 22) |
 | 3 | `assert_bookmark_roundtrip` | a resumed run picks up *after* the emitted bookmark; strictly fewer records reappear |
 | 4 | `assert_idempotent_replay` | atomic-watermark replay (or keyed-upsert) converges to one row per key, no double-writes |
 | 5 | `assert_capabilities_truthful` | advertised `supports_*` capabilities match actual behavior (idempotency, schema evolution) |
@@ -43,6 +43,7 @@ Each proves a sink behaves as a capability it declares says it does:
 | 19 | `assert_batch_atomicity_truthful` | a failed write of a batch declared atomic lands no row; a per-row batch lands exactly its `Ok` rows |
 | 20 | `assert_driver_declarations_truthful` | every lifecycle the sink does not declare is refused by its hook, the declared ones' probes answer (RFC 0014) |
 | 21 | `assert_driver_row_paths_agree` | the plain, reported, per-row and governed writes of a valid page agree (RFC 0014) |
+| 22 | `assert_first_page_before_exhaustion` | given a count of what the backend has served, a source's first page arrives before the whole result set was read (it streams rather than buffers) |
 
 Checks 20 and 21 are required for a sink built on a family driver
 (`faucet_core::driver`, `faucet_common_sql::SqlDriver`); they run on any sink.
