@@ -501,6 +501,12 @@ job:
   # replaces it whenever the Job changes and leaves it alone otherwise.
   # A hook re-runs it on every install/upgrade instead. "" = no hook.
   helmHook: ""   # e.g. post-install,post-upgrade
+  # The run pod's working directory (serve.persistence.mountPath) is an
+  # emptyDir, wiped after every run. A `state: {type: file}` store or local
+  # outputs kept there are lost between runs: name an existing PVC here, or
+  # use a redis / postgres state store.
+  persistence:
+    existingClaim: ""
   podAnnotations: {}
   nodeSelector: {}
   tolerations: []
@@ -521,6 +527,12 @@ cronjob:
   backoffLimit: 3
   restartPolicy: Never
   extraArgs: []
+  # The run pod's working directory (serve.persistence.mountPath) is an
+  # emptyDir, wiped after every run. A `state: {type: file}` store or local
+  # outputs kept there are lost between runs: name an existing PVC here, or
+  # use a redis / postgres state store.
+  persistence:
+    existingClaim: ""
   resources:
     requests:
       cpu: 100m
