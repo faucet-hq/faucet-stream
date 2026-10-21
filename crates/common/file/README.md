@@ -81,6 +81,8 @@ flush fails.
 | `settle()` / `cancel()` | wait for background publishes and report the first error / wait for them and delete what they published |
 | `fetch(area, name, to)` / `exists` / `list` / `delete` | read back, check, list and remove files |
 | `promote(name)` | move a file from the overwrite swap area into place |
+| `join_overwrite_run(token)` | (defaulted: refused) make the swap area this overwrite run's own, `.faucet-overwrite-<tag>.run-<token>`, so concurrent runs never share one; `LocalBackend` and `RemoteBackend` support it |
+| `swap_runs()` / `drop_swap_run(run)` | (defaulted: none / no-op) list every run's tokened swap area; delete one (`None`: the untokened area) — how a tokened `begin` drops the untokened area and those a run abandoned more than 24 hours ago |
 | `prepare(area)` | create the directory, remove this output's crash leftovers |
 | `part_size()` / `open_stream(area, name)` | upload a line format in parts while it is written |
 | `describe`, `local_path` | messages, local-output previews |

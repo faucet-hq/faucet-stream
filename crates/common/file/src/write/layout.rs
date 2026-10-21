@@ -26,8 +26,10 @@ pub const UPLOAD_ROLE: &str = "-upload-";
 /// into before its files are moved into place.
 pub const SWAP_PREFIX: &str = ".faucet-overwrite-";
 /// What separates the swap area's name from an overwrite run token
-/// (`.faucet-overwrite-<tag>~<token>`): a character a tag never holds.
-pub const SWAP_RUN_SEPARATOR: char = '~';
+/// (`.faucet-overwrite-<tag>.run-<token>`). Only characters every store keeps
+/// as they are (a `~` comes back percent-encoded from some), so the token is
+/// recognised by its exact shape at the end of this template's own name.
+pub const SWAP_RUN_SEPARATOR: &str = ".run-";
 /// Digits in a part number (`00001`).
 pub const PART_WIDTH: usize = 5;
 
@@ -192,7 +194,7 @@ impl NameTemplate {
     /// The swap area's name for overwrite run `run`
     /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]):
     /// [`swap_dir_name`](Self::swap_dir_name) without a token, else
-    /// `<swap_dir_name>~<token>`, so concurrent runs never share one.
+    /// `<swap_dir_name>.run-<token>`, so concurrent runs never share one.
     pub fn swap_run_dir_name(&self, run: Option<&str>) -> String {
         match run {
             Some(token) => format!("{}{SWAP_RUN_SEPARATOR}{token}", self.swap_dir_name()),
@@ -324,13 +326,13 @@ mod tests {
         let (_, l) = t("out/x y-{part}.jsonl", false);
         assert_eq!(l.swap_dir_name(), ".faucet-overwrite-x_y-_part_.jsonl");
         let run = l.swap_run_dir_name(Some("67000000abcdef"));
-        assert_eq!(run, ".faucet-overwrite-x_y-_part_.jsonl~67000000abcdef");
+        assert_eq!(run, ".faucet-overwrite-x_y-_part_.jsonl.run-67000000abcdef");
         assert_eq!(l.swap_run_dir_name(None), l.swap_dir_name());
         assert!(is_swap_dir_name(&run));
         assert_eq!(l.swap_run_token(&run).as_deref(), Some("67000000abcdef"));
         assert_eq!(l.swap_run_token(&l.swap_dir_name()), None);
         assert_eq!(
-            l.swap_run_token(&format!("{}~nope", l.swap_dir_name())),
+            l.swap_run_token(&format!("{}.run-nope", l.swap_dir_name())),
             None
         );
         assert!(is_swap_dir_name(&l.swap_dir_name()));

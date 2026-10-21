@@ -1393,7 +1393,7 @@ async fn concurrent_remote_overwrite_runs_keep_their_own_files() {
     let tag = overwrite_remote(&mem).template().swap_dir_name();
     for key in [
         format!("pre/d/{tag}/part-00001.jsonl"),
-        format!("pre/d/{tag}~10000000aaaaaa/part-00001.jsonl"),
+        format!("pre/d/{tag}.run-10000000aaaaaa/part-00001.jsonl"),
     ] {
         mem.objects.lock().unwrap().insert(key, b"stale\n".to_vec());
     }
@@ -1450,7 +1450,7 @@ async fn concurrent_local_overwrite_runs_keep_their_own_files() {
     let open = || local(dir.path(), "out/data.jsonl", s.clone());
     let tag = open().template().swap_dir_name();
     let out = dir.path().join("out");
-    for area in [tag.clone(), format!("{tag}~10000000aaaaaa")] {
+    for area in [tag.clone(), format!("{tag}.run-10000000aaaaaa")] {
         std::fs::create_dir_all(out.join(&area)).unwrap();
         std::fs::write(out.join(&area).join("data.jsonl"), "stale\n").unwrap();
     }
@@ -1463,7 +1463,7 @@ async fn concurrent_local_overwrite_runs_keep_their_own_files() {
     run(&a).begin_overwrite().await.unwrap();
     run(&b).begin_overwrite().await.unwrap();
     assert!(!out.join(&tag).exists());
-    assert!(!out.join(format!("{tag}~10000000aaaaaa")).exists());
+    assert!(!out.join(format!("{tag}.run-10000000aaaaaa")).exists());
     let wa = run(&a);
     wa.write_rows(&[json!({"a": 1})]).await.unwrap();
     wa.flush().await.unwrap();
@@ -1476,7 +1476,7 @@ async fn concurrent_local_overwrite_runs_keep_their_own_files() {
         std::fs::read_to_string(out.join("data.jsonl")).unwrap(),
         "{\"a\":1}\n"
     );
-    assert!(out.join(format!("{tag}~{b}")).exists());
+    assert!(out.join(format!("{tag}.run-{b}")).exists());
     run(&b).commit_overwrite().await.unwrap();
     assert_eq!(
         std::fs::read_to_string(out.join("data.jsonl")).unwrap(),

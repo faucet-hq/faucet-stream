@@ -341,7 +341,7 @@ impl FileWriter {
     /// Join overwrite run `token`
     /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
     /// one run (begin, writers, commit) stages in that run's own swap area
-    /// (`.faucet-overwrite-<tag>~<token>`), so a concurrent overwrite run of
+    /// (`.faucet-overwrite-<tag>.run-<token>`), so a concurrent overwrite run of
     /// the same output neither drops nor moves in the other's files. Call
     /// before the first write.
     pub fn join_overwrite_run(&self, token: &str) -> Result<(), FaucetError> {
