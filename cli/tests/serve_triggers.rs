@@ -1210,3 +1210,35 @@ async fn an_unbuildable_watcher_is_reported_unhealthy() {
         Some("object store: bad endpoint")
     );
 }
+
+/// An object_arrival trigger is spawned as a supervised watcher with its
+/// configured look-back window, and stops on shutdown.
+#[cfg(feature = "triggers-object-store")]
+#[tokio::test]
+async fn an_object_arrival_trigger_spawns_a_watcher_with_its_lookback() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let inline = inline_pipeline(
+        csv.to_str().unwrap(),
+        dir.path().join("o.jsonl").to_str().unwrap(),
+    );
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b, region: us-east-1, endpoint: \"http://127.0.0.1:9\" }}\n    lookback_secs: 3600\n    poll_interval_secs: 3600\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let shutdown = CancellationToken::new();
+    let handles =
+        faucet_cli::serve::triggers::spawn_watchers(state.clone(), &compiled, shutdown.clone());
+    assert_eq!(handles.len(), 1, "one supervised object_arrival watcher");
+    shutdown.cancel();
+    for h in handles {
+        tokio::time::timeout(Duration::from_secs(30), h)
+            .await
+            .expect("the watcher stops on shutdown")
+            .unwrap();
+    }
+}

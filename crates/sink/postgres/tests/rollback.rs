@@ -502,3 +502,57 @@ async fn rollback_restores_a_row_whose_key_text_differs_from_the_record() {
         1
     );
 }
+
+/// A rollback-enabled scoped cleanup journals the rows it deletes in its
+/// transaction, so rolling the run back restores them (#706).
+#[tokio::test]
+async fn scoped_cleanup_deletes_are_journaled_and_restored_by_rollback() {
+    let (_c, url) = start_postgres().await;
+    exec(
+        &url,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, _faucet_run_id TEXT, team INT)",
+    )
+    .await;
+    exec(
+        &url,
+        "INSERT INTO users VALUES (1, 'keep', 'r0', 7), (2, 'stale', 'r0', 7), (3, 'other', 'r0', 8)",
+    )
+    .await;
+    let sink = PostgresSink::new(upsert_config(&url, "r1")).await.unwrap();
+    let page = [json!({"id": 1, "name": "keep-new", RUN_COL: "r1", "team": 7})];
+    sink.write_batch(&page).await.unwrap();
+    let policy = faucet_core::CleanupPolicy::new(
+        std::collections::BTreeMap::from([("team".to_string(), json!(7))]),
+        vec!["id".to_string()],
+        1000,
+    )
+    .unwrap();
+    let mut seen = faucet_core::SeenKeys::new();
+    seen.record_page(&page, &policy.key, policy.max_keys);
+    let deleted = sink.cleanup_scope(&policy.scope, &seen).await.unwrap();
+    assert_eq!(deleted, 1, "only the unwritten row inside the scope");
+    assert_eq!(
+        scalar(
+            &url,
+            "SELECT count(*) FROM _faucet_run_journal WHERE before_json IS NOT NULL"
+        )
+        .await,
+        2,
+        "the upserted row and the cleaned-up row both journal a before-image"
+    );
+
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert!(out.applied, "{out:?}");
+    assert_eq!(
+        rows(&url).await,
+        vec![
+            (1, "keep".into(), Some("r0".into())),
+            (2, "stale".into(), Some("r0".into())),
+            (3, "other".into(), Some("r0".into())),
+        ],
+        "the cleaned-up row is back and the upsert is undone"
+    );
+}
