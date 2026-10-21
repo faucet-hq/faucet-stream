@@ -960,11 +960,15 @@ async fn get_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
     let version = resolved_version_arg(store, id, args).await?;
-    let record = store
+    let mut record = store
         .template_get(id, Some(version))
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no pipeline template '{id}'"))?;
+    let body_withheld = !ctx.allow_template_admin;
+    if body_withheld {
+        record.body.clear();
+    }
     let launches = store
         .template_launches(id)
         .await
@@ -977,6 +981,7 @@ async fn get_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         "state": state,
         "is_stable": state.stable == Some(record.version),
         "launches": launches,
+        "body_withheld": body_withheld,
     })))
 }
 

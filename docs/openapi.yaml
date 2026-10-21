@@ -1996,8 +1996,9 @@ paths:
       summary: Get one pipeline template
       description: >
         One version of a template — the launched (`stable`) one unless `version`
-        is given — including the stored config body, the template's whole release
-        state, and the launch log. Pass `version=newest` to open a `draft`
+        is given — including the stored config body (admins without a tenant
+        scope only; others get an empty `body` and `body_withheld: true`), the
+        template's whole release state, and the launch log. Pass `version=newest` to open a `draft`
         template, which has no `stable` version yet. Requires the `TemplateRead`
         permission (viewer).
       operationId: getTemplate
@@ -3995,7 +3996,8 @@ components:
         - type: object
           required: [body, format, is_stable, launches]
           properties:
-            body: { type: string, description: "The config document, stored verbatim (interpolation directives unresolved)." }
+            body: { type: string, description: "The config document, stored verbatim (interpolation directives unresolved). Empty unless the caller is an admin with no tenant scope — see `body_withheld`." }
+            body_withheld: { type: boolean, description: "Present and true when `body` was withheld because the caller is not an unscoped admin (the stored config can hold inline credentials)." }
             format: { type: string, enum: [yaml, json] }
             is_stable: { type: boolean, description: "Whether the returned version is the currently launched one." }
             launches:

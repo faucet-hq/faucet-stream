@@ -1127,7 +1127,10 @@ re-launching the live version is a no-op, which keeps `previous` a real rollback
 target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
 `stable` / `previous` / `newest`, `is_stable`, the `tags` pointer map, and the
 `launches` log — so a client can pin, promote, launch, or roll back without a
-second request. Use `?version=newest` to read a `draft` template.
+second request. Use `?version=newest` to read a `draft` template. The stored
+`body` is returned only to an admin with no tenant scope; anyone else gets an
+empty `body` and `body_withheld: true` (the parameter surface stays in
+`params`), the same rule as a run's `config_body`.
 
 The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
 `overlay` / `overlay_version` are template-specific; every other field (`name`, `labels`, `timeout_secs`,

@@ -880,8 +880,8 @@ function renderVersions(host, id, st, d, reload) {
       <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || blocked ? "disabled" : ""}
         title="${escapeHtml(launchTitle)}">Launch</button>
       ${t && t.has_tests ? `<button class="btn-ghost tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
-      <button class="btn-ghost tpl-view">Config</button>
-      <button class="btn-ghost tpl-view-clean" title="comments stripped, canonical YAML">Clean</button>
+      <button class="btn-ghost tpl-view" data-perm="template_admin">Config</button>
+      <button class="btn-ghost tpl-view-clean" data-perm="template_admin" title="comments stripped, canonical YAML">Clean</button>
       <button class="${retired ? "btn-ghost" : "btn-warn"} tpl-vdeprecate" data-perm="template_admin"
         title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
       <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
