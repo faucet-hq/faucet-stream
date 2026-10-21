@@ -211,7 +211,7 @@ auth:
 | `encoding` | string | `json` | Request-body encoding: `json` (default) or `form` (`application/x-www-form-urlencoded`, required by OAuth token endpoints that expect a `resource=` param). `form` requires a flat object `body` of string/number/boolean values. |
 | `body` | object | *(none)* | Request body (e.g. carrying `client_id` / `client_secret` / `resource`). Omit for a GET. |
 | `token_path` | string | — *(required)* | JSONPath selecting the token from the response (e.g. `$.auth.access_token`). String and numeric matches are accepted. |
-| `expiry_path` | string | *(none)* | JSONPath selecting `expires_in` (seconds) from the response. When absent, the token is cached without an expiry. |
+| `expiry_path` | string | *(none)* | JSONPath selecting `expires_in` (seconds) from the response: an integer, a float (rounded down) or a numeric string. When absent, the token is cached without an expiry; when set but matching nothing usable, a warning is logged and the token is cached without an expiry. |
 | `expiry_ratio` | number | `0.9` | Refresh after `expires_in × expiry_ratio` seconds. Must be a finite number in `(0, 1]`. |
 | `apply_as` | object | *(Bearer)* | Where the fetched token is placed on each request. Default is `Authorization: Bearer <token>`. Set `apply_as: { header, template }` to place it in an arbitrary header (e.g. a session cookie): `template` is the header value with `{token}` substituted (defaults to the bare token). |
 
