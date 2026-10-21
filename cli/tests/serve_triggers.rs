@@ -1105,11 +1105,12 @@ async fn webhook_debounce_coalesces_second_fire() {
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_debounce_is_not_consumed_by_a_failed_fire() {
     let dir = tempfile::tempdir().unwrap();
+    // A config version this binary refuses: the submit fails, no run starts.
     let inline = serde_json::json!({
-        "version": 1,
+        "version": 99,
         "pipeline": {
             "source": { "type": "csv", "config": { "path": "in.csv" } },
-            "sink": { "type": "no-such-sink", "config": {} }
+            "sink": { "type": "stdout", "config": {} }
         }
     });
     let yaml = format!(
