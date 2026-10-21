@@ -260,9 +260,11 @@ pub trait AuthProvider: Send + Sync + std::fmt::Debug {
     /// request. When it returns `Some`, the connector uses it **instead of**
     /// `credential()` for that request.
     ///
-    /// `query` is the request's query parameters (the connector's, before the
-    /// HTTP client appends them), which OAuth1 folds into its signature base
-    /// string. Object-safe: no generics, all args are borrowed primitives.
+    /// `query` holds query parameters not already in `url`; OAuth1 folds both
+    /// `query` and the query component of `url` into its signature base string,
+    /// so a connector can pass the exact URL it sends (with an empty `query`); a
+    /// key present in both is taken from `query` only.
+    /// Object-safe: no generics, all args are borrowed primitives.
     async fn sign_request(
         &self,
         _method: &str,

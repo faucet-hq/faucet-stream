@@ -2633,21 +2633,14 @@ impl RestDriver {
         // supplied the request auth. A shared provider (from `auth: { ref }` or
         // a library caller) takes precedence over inline; inline OAuth2 /
         // TokenEndpoint resolve to a Bearer token via the per-source cache.
+        let mut sign_with_provider = false;
         let resolved_auth: Option<Auth> = if used_request_auth || !send_credentials {
             None
-        } else if let Some(provider) = &self.auth_provider {
-            // A per-request signer (OAuth1, #496) signs this exact method + URL +
-            // query; every other provider returns `None` here and we apply its
-            // reusable credential.
-            let cred = match provider
-                .sign_request(self.config.method.as_str(), &url, &query_btree)
-                .await?
-            {
-                Some(cred) => cred,
-                None => provider.credential().await?,
-            };
-            *sent = Some(cred.clone());
-            Some(credential_to_auth(cred))
+        } else if self.auth_provider.is_some() {
+            // Resolved once the whole query is assembled (below), so a
+            // per-request signer covers exactly what is sent.
+            sign_with_provider = true;
+            None
         } else {
             match &self.config.auth {
                 AuthSpec::Inline(Auth::OAuth2 {
@@ -2823,6 +2816,33 @@ impl RestDriver {
             if !echoed {
                 req = req.query(&[(param.as_str(), value.as_str())]);
             }
+        }
+
+        // A shared provider's credential. A per-request signer (OAuth1, #496)
+        // signs the final URL — substituted params, repeated params, binds,
+        // API-key and a next-page link's own query included; every other
+        // provider returns `None` here and we apply its reusable credential.
+        if sign_with_provider && let Some(provider) = &self.auth_provider {
+            let signed_url = req
+                .try_clone()
+                .and_then(|b| b.build().ok())
+                .map(|r| r.url().to_string())
+                .unwrap_or_else(|| url.clone());
+            let cred = match provider
+                .sign_request(
+                    self.config.method.as_str(),
+                    &signed_url,
+                    &std::collections::BTreeMap::new(),
+                )
+                .await?
+            {
+                Some(cred) => cred,
+                None => provider.credential().await?,
+            };
+            *sent = Some(cred.clone());
+            let mut auth_headers = HeaderMap::new();
+            credential_to_auth(cred).apply(&mut auth_headers)?;
+            req = req.headers(auth_headers);
         }
 
         // Build the request JSON body, if any. Substitute context into body

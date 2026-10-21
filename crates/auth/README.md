@@ -274,8 +274,10 @@ other IdPs is not exposed.
 ### `oauth1` (HMAC-SHA256 request signing)
 
 Unlike the token providers, OAuth1 has **no token to fetch** — it signs every
-request individually (the signature covers the HTTP method, URL, and query
-parameters). Requires the `oauth1` crate feature (`cargo add faucet-auth
+request individually (the signature covers the HTTP method, URL, and every
+query parameter — including those already in the URL, repeated keys included,
+so the `rest` source signs the exact URL it sends: parent-row values, repeated
+params, query binds, an API key and a next-page link's own query). Requires the `oauth1` crate feature (`cargo add faucet-auth
 --features oauth1`, or `cargo install faucet-cli --features oauth1`).
 
 | Field | Type | Default | Description |

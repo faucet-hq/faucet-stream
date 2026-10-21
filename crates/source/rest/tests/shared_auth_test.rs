@@ -322,3 +322,91 @@ async fn a_flow_style_provider_is_told_which_session_was_rejected() {
         vec![Credential::Token("0".into())]
     );
 }
+
+/// A per-request signer that records the URL it was asked to sign and puts it
+/// in a header, so the server can check it signed exactly what was sent.
+#[derive(Debug, Default)]
+struct RecordingSigner(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl AuthProvider for RecordingSigner {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        Err(FaucetError::Auth("signs each request".into()))
+    }
+    async fn sign_request(
+        &self,
+        _method: &str,
+        url: &str,
+        query: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Option<Credential>, FaucetError> {
+        assert!(query.is_empty(), "the URL carries the whole query");
+        self.0.lock().unwrap().push(url.to_string());
+        Ok(Some(Credential::Header {
+            name: "X-Signed-Url".into(),
+            value: url.to_string(),
+        }))
+    }
+    fn provider_name(&self) -> &'static str {
+        "recording-signer"
+    }
+}
+
+#[tokio::test]
+async fn a_request_signer_signs_the_exact_query_sent() {
+    let server = MockServer::start().await;
+    let next = format!("{}/items?page=2&cursor=a%2Bb", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(wiremock::matchers::query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": 2}]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": 1}], "next": next})),
+        )
+        .mount(&server)
+        .await;
+
+    let mut cfg = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .pagination(PaginationStyle::NextLinkInBody {
+            next_link_path: "$.next".into(),
+        })
+        .add_query_param_multi("tag", vec!["a".into(), "b".into()])
+        .add_partition(std::collections::HashMap::from([(
+            "acct".to_string(),
+            json!("7"),
+        )]));
+    cfg.query_params.insert("account".into(), "{acct}".into());
+    let signer = Arc::new(RecordingSigner::default());
+    let records = RestStream::new(cfg)
+        .unwrap()
+        .with_auth_provider(signer.clone() as SharedAuthProvider)
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2);
+    for req in &received {
+        let signed =
+            reqwest::Url::parse(req.headers.get("X-Signed-Url").unwrap().to_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            (signed.path(), signed.query()),
+            (req.url.path(), req.url.query()),
+            "signed URL must be the URL sent"
+        );
+    }
+    let first = received[0].url.as_str();
+    assert!(first.contains("account=7"), "{first}");
+    assert!(
+        first.contains("tag=a") && first.contains("tag=b"),
+        "{first}"
+    );
+    assert!(received[1].url.as_str().contains("cursor=a%2Bb"));
+    assert_eq!(signer.0.lock().unwrap().len(), 2);
+}

@@ -139,7 +139,8 @@ impl OAuth1Provider {
     ///
     /// The signature base string follows RFC 5849 §3.4.1: the HTTP method, the
     /// base URL (scheme/host/path, query stripped), and the normalized set of
-    /// OAuth + query parameters, `&`-joined and percent-encoded.
+    /// OAuth parameters, `query`, and the URL's own query pairs, `&`-joined and
+    /// percent-encoded.
     fn authorization_header(
         &self,
         method: &str,
@@ -160,12 +161,30 @@ impl OAuth1Provider {
         ];
 
         // Signature base string: method & base-url & normalized params. The
-        // parameter string merges OAuth params + query, each key & value
-        // percent-encoded, sorted by encoded key (then value), `&`-joined.
+        // parameter string merges OAuth params + `query` + every pair of the
+        // URL's own query component (RFC 5849 §3.4.1.3.1, repeated keys kept;
+        // a key also in `query` is taken from `query` only, so a caller passing
+        // both never double-counts it),
+        // each key & value percent-encoded, sorted by encoded key (then value),
+        // `&`-joined.
+        let without_fragment = url.split('#').next().unwrap_or(url);
+        let base_url = without_fragment
+            .split('?')
+            .next()
+            .unwrap_or(without_fragment);
+        let url_query: Vec<(String, String)> = reqwest::Url::parse(without_fragment)
+            .map(|u| u.query_pairs().into_owned().collect())
+            .unwrap_or_default();
         let mut encoded: Vec<(String, String)> = oauth_params
             .iter()
             .map(|(k, v)| (enc(k), enc(v)))
             .chain(query.iter().map(|(k, v)| (enc(k), enc(v))))
+            .chain(
+                url_query
+                    .iter()
+                    .filter(|(k, _)| !query.contains_key(k))
+                    .map(|(k, v)| (enc(k), enc(v))),
+            )
             .collect();
         encoded.sort();
         let param_string = encoded
@@ -174,7 +193,6 @@ impl OAuth1Provider {
             .collect::<Vec<_>>()
             .join("&");
 
-        let base_url = url.split('?').next().unwrap_or(url);
         let base_string = format!(
             "{}&{}&{}",
             method.to_uppercase(),
@@ -225,6 +243,44 @@ mod tests {
         assert_ne!(a, b, "two fresh providers must not share a first nonce");
         assert!(a.starts_with('0') && a.len() == 33, "{a}");
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric()), "{a}");
+    }
+
+    #[test]
+    fn the_url_query_is_signed_like_the_query_map() {
+        let p = provider();
+        let mut q = BTreeMap::new();
+        q.insert("page".to_string(), "2".to_string());
+        q.insert("since".to_string(), "2024-01-01 00:00".to_string());
+        let from_map = p.authorization_header("GET", "https://api.example.com/r", &q, "n", 1);
+        let from_url = p.authorization_header(
+            "GET",
+            "https://api.example.com/r?since=2024-01-01+00%3A00&page=2#frag",
+            &BTreeMap::new(),
+            "n",
+            1,
+        );
+        assert_eq!(from_map, from_url);
+        let unsigned =
+            p.authorization_header("GET", "https://api.example.com/r", &BTreeMap::new(), "n", 1);
+        assert_ne!(
+            from_url, unsigned,
+            "the URL's query must change the signature"
+        );
+        let repeated = p.authorization_header(
+            "GET",
+            "https://api.example.com/r?k=a&k=b",
+            &BTreeMap::new(),
+            "n",
+            1,
+        );
+        let single = p.authorization_header(
+            "GET",
+            "https://api.example.com/r?k=b",
+            &BTreeMap::new(),
+            "n",
+            1,
+        );
+        assert_ne!(repeated, single, "every repeated key is signed");
     }
 
     #[test]
