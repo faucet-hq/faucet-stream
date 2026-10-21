@@ -886,27 +886,42 @@ pub async fn send_status_update(
 /// converted to `Ok(None)`.
 pub async fn recv(duplex: &mut Duplex) -> Result<Option<ReplicationEvent>, FaucetError> {
     loop {
-        match duplex.next_event().await? {
+        match recv_item(duplex).await? {
             None => return Ok(None),
-
-            Some(ReplicationEvent::StoppedAt { .. }) => {
-                return Ok(None);
-            }
-
-            Some(ReplicationEvent::KeepAlive { .. }) => {
-                // Absorb keepalives without touching the applied-LSN — see the
-                // function doc. Continue the loop; do not surface to the caller.
-            }
-
-            Some(ev) => {
-                // Surface Begin, Commit, XLogData, Message (and any future
-                // variants) to the caller. The commit_lsn carried by Commit is
-                // what becomes the durable bookmark once the pipeline persists
-                // it — that, not wal_end, is the only position fed back to PG.
-                return Ok(Some(ev));
-            }
+            Some(StreamItem::KeepAlive { .. }) => {}
+            Some(StreamItem::Event(ev)) => return Ok(Some(ev)),
         }
     }
+}
+
+/// One item of the replication stream as [`recv_item`] surfaces it.
+#[derive(Debug)]
+pub enum StreamItem {
+    /// A transaction boundary, change data or logical message.
+    Event(ReplicationEvent),
+    /// A server heartbeat: every transaction committed below `wal_end` has
+    /// already been sent. Lets a consumer whose published tables are idle
+    /// record progress through WAL the publication does not cover.
+    KeepAlive {
+        /// The server's sent position.
+        wal_end: u64,
+    },
+}
+
+/// [`recv`], but surfacing keepalives (as [`StreamItem::KeepAlive`]) instead
+/// of absorbing them. A keepalive's position is still never advertised to
+/// the server here: the caller may only put it in a bookmark, which reaches
+/// the slot after the pipeline has persisted it.
+pub async fn recv_item(duplex: &mut Duplex) -> Result<Option<StreamItem>, FaucetError> {
+    Ok(match duplex.next_event().await? {
+        None | Some(ReplicationEvent::StoppedAt { .. }) => None,
+        Some(ReplicationEvent::KeepAlive { wal_end, .. }) => Some(StreamItem::KeepAlive {
+            wal_end: wal_end.as_u64(),
+        }),
+        // The commit_lsn carried by Commit, not wal_end, is what reaches the
+        // slot once the pipeline persists it.
+        Some(ev) => Some(StreamItem::Event(ev)),
+    })
 }
 
 // ── Clock helpers ──────────────────────────────────────────────────────────

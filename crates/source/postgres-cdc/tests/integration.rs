@@ -754,3 +754,83 @@ async fn a_restart_waits_for_the_previous_connection_to_release_the_slot() {
         "records: {records:?}"
     );
 }
+
+/// A slot whose published tables are idle still advances: write traffic on an
+/// unpublished table moves the server's sent position, keepalives carry it,
+/// and the cycle ends with a bookmark there, which the next cycle confirms —
+/// so the slot does not pin that WAL. A change committed afterwards to the
+/// published table is still delivered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_publication_does_not_pin_wal() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.users (id int4 PRIMARY KEY, name text); \
+         CREATE TABLE public.noise (id int4, pad text); \
+         CREATE PUBLICATION faucet_pub FOR TABLE public.users;",
+    )
+    .await;
+    let lsn = |v: &serde_json::Value| {
+        faucet_source_postgres_cdc::Bookmark::from_value(v.clone())
+            .unwrap()
+            .as_u64()
+            .unwrap()
+    };
+
+    let s1 = PostgresCdcSource::new(cfg(&url, "faucet_slot", "faucet_pub"))
+        .await
+        .expect("source 1");
+    let _ = s1.fetch_all_incremental().await.expect("warm-up");
+    ddl(&url, "INSERT INTO public.users VALUES (1, 'a');").await;
+    let (_, bm1) = s1.fetch_all_incremental().await.expect("first fetch");
+    let bm1 = bm1.expect("bookmark after a commit");
+
+    ddl(
+        &url,
+        "INSERT INTO public.noise SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g;",
+    )
+    .await;
+    let s2 = PostgresCdcSource::new(cfg(&url, "faucet_slot", "faucet_pub"))
+        .await
+        .expect("source 2");
+    s2.apply_start_bookmark(bm1.clone()).await.expect("apply");
+    let (records, bm2) = s2.fetch_all_incremental().await.expect("idle fetch");
+    assert!(
+        records.iter().all(|r| r["op"] != "insert"),
+        "nothing published changed: {records:?}"
+    );
+    let bm2 = bm2.expect("an idle cycle still records the sent position");
+    assert!(lsn(&bm2) > lsn(&bm1), "{bm2} must be past {bm1}");
+
+    ddl(&url, "INSERT INTO public.users VALUES (2, 'b');").await;
+    let s3 = PostgresCdcSource::new(cfg(&url, "faucet_slot", "faucet_pub"))
+        .await
+        .expect("source 3");
+    s3.apply_start_bookmark(bm2.clone()).await.expect("apply");
+    let (after, _) = s3.fetch_all_incremental().await.expect("resume");
+    let ids: Vec<_> = after
+        .iter()
+        .filter(|r| r["op"] == "insert")
+        .map(|r| r["after"]["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![2], "{after:?}");
+
+    let (client, conn) = tokio_postgres::connect(&url, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let row = client
+        .query_one(
+            "SELECT (confirmed_flush_lsn - '0/0'::pg_lsn)::text FROM pg_replication_slots \
+             WHERE slot_name = 'faucet_slot'",
+            &[],
+        )
+        .await
+        .expect("slot");
+    let confirmed: u64 = row.get::<_, String>(0).parse().expect("lsn");
+    assert!(
+        confirmed >= lsn(&bm2),
+        "slot confirmed {confirmed} < {}",
+        lsn(&bm2)
+    );
+}
