@@ -46,7 +46,7 @@ arrow = [
 
 [dev-dependencies]
 faucet-conformance.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 futures = { workspace = true }
 serde_json.workspace = true
 schemars.workspace = true

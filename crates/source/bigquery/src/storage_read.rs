@@ -21,8 +21,9 @@ use gcloud_googleapis::cloud::bigquery::storage::v1::big_query_read_client::BigQ
 use gcloud_googleapis::cloud::bigquery::storage::v1::read_rows_response::{Rows, Schema};
 use gcloud_googleapis::cloud::bigquery::storage::v1::read_session::TableReadOptions;
 use gcloud_googleapis::cloud::bigquery::storage::v1::{
-    CreateReadSessionRequest, DataFormat, ReadRowsRequest, ReadSession,
+    CreateReadSessionRequest, DataFormat, ReadRowsRequest, ReadRowsResponse, ReadSession,
 };
+use gcloud_gax::grpc::{Code, Status, Streaming};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -146,6 +147,113 @@ async fn within_for<F: std::future::Future>(
     })
 }
 
+/// The messages of one `ReadRows` call.
+type MessageStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send>>;
+
+/// Consecutive failed attempts (no row received in between) after which a
+/// `ReadRows` stream is given up.
+const MAX_STREAM_RESUMES: u32 = 5;
+
+/// The wait before resume attempt `attempt` (1-based): 1 s doubling, at most 30 s.
+fn resume_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((1u64 << attempt.saturating_sub(1).min(5)).min(30))
+}
+
+/// Whether a `ReadRows` failure is transient, so the stream is reopened at
+/// the rows already read. Long `ReadRows` streams are reset by the service as a
+/// matter of course (`UNAVAILABLE`, `INTERNAL` RST_STREAM).
+fn resumable(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable
+            | Code::Internal
+            | Code::Aborted
+            | Code::Unknown
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+    )
+}
+
+fn message_stream(responses: Streaming<ReadRowsResponse>) -> MessageStream {
+    Box::pin(futures::stream::unfold(
+        Some(responses),
+        |responses| async move {
+            let mut responses = responses?;
+            match responses.message().await {
+                Ok(Some(m)) => Some((Ok(m), Some(responses))),
+                Ok(None) => None,
+                Err(e) => Some((Err(e), None)),
+            }
+        },
+    ))
+}
+
+/// The messages of one Storage Read stream, reopened at `offset` = the rows
+/// already received after a transient failure — as the Storage Read client
+/// libraries do — so a routine stream reset neither fails the read nor
+/// repeats a row. `open(offset)` starts a `ReadRows` call at that row.
+fn resumable_messages<O, F>(
+    calls: faucet_core::CallContext,
+    mut open: O,
+) -> impl Stream<Item = Result<ReadRowsResponse, FaucetError>> + Send
+where
+    O: FnMut(i64) -> F + Send,
+    F: std::future::Future<Output = Result<MessageStream, Status>> + Send,
+{
+    async_stream::try_stream! {
+        let mut offset: i64 = 0;
+        let mut failures: u32 = 0;
+        'open: loop {
+            let opened = call(&calls, "read_rows", open(offset), "ReadRows").await?;
+            let mut messages = match opened {
+                Ok(m) => m,
+                Err(status) => {
+                    failures += 1;
+                    give_up_unless_resumable(&status, failures, "BigQuery ReadRows failed")?;
+                    calls.wait(resume_backoff(failures)).await?;
+                    continue 'open;
+                }
+            };
+            loop {
+                match call(&calls, "read_rows", messages.next(), "ReadRows message").await? {
+                    None => break 'open,
+                    Some(Ok(msg)) => {
+                        if msg.row_count > 0 {
+                            offset += msg.row_count;
+                            failures = 0;
+                        }
+                        yield msg;
+                    }
+                    Some(Err(status)) => {
+                        failures += 1;
+                        give_up_unless_resumable(
+                            &status,
+                            failures,
+                            "BigQuery ReadRows stream error",
+                        )?;
+                        tracing::warn!(
+                            offset,
+                            attempt = failures,
+                            error = %status,
+                            "BigQuery ReadRows stream interrupted; resuming at the rows already read"
+                        );
+                        calls.wait(resume_backoff(failures)).await?;
+                        continue 'open;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn give_up_unless_resumable(status: &Status, failures: u32, what: &str) -> Result<(), FaucetError> {
+    if resumable(status.code()) && failures <= MAX_STREAM_RESUMES {
+        Ok(())
+    } else {
+        Err(FaucetError::Source(format!("{what}: {status}")))
+    }
+}
+
 /// Open a read session for the configured table and stream its Arrow batches.
 fn read_batches<'a>(
     src: &'a BigQuerySource,
@@ -214,23 +322,30 @@ fn read_batches<'a>(
         let concurrency = cfg.stream_concurrency.max(1);
         let mut readers = Vec::with_capacity(created.streams.len());
         for stream in &created.streams {
-            let mut client = client.clone();
+            let client = client.clone();
             let name = stream.name.clone();
             let calls = calls.clone();
+            let open = move |offset: i64| {
+                let mut client = client.clone();
+                let read_stream = name.clone();
+                async move {
+                    let responses = client
+                        .read_rows(ReadRowsRequest { read_stream, offset })
+                        .await?
+                        .into_inner();
+                    Ok(message_stream(responses))
+                }
+            };
             readers.push(Box::pin(async_stream::try_stream! {
-                let rr = ReadRowsRequest { read_stream: name, offset: 0 };
-                let mut responses = call(&calls, "read_rows", client.read_rows(rr), "ReadRows")
-                    .await?
-                    .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows failed: {e}")))?
-                    .into_inner();
+                let messages = resumable_messages(calls, open);
+                futures::pin_mut!(messages);
                 // Per stream, not shared: each stream's messages carry their
                 // own schema, and a batch decoded against a neighbour's schema
-                // would be silently wrong rather than an error.
+                // would be silently wrong rather than an error. Kept across a
+                // resume: the stream's schema does not change.
                 let mut schema_bytes: Option<Vec<u8>> = None;
-                while let Some(msg) = call(&calls, "read_rows", responses.message(), "ReadRows message")
-                    .await?
-                    .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows stream error: {e}")))?
-                {
+                while let Some(msg) = messages.next().await {
+                    let msg = msg?;
                     if let Some(Schema::ArrowSchema(s)) = msg.schema {
                         schema_bytes = Some(s.serialized_schema);
                     }
@@ -338,6 +453,99 @@ mod tests {
     }
 
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn msg(rows: i64) -> ReadRowsResponse {
+        ReadRowsResponse {
+            row_count: rows,
+            ..Default::default()
+        }
+    }
+
+    /// An `open` that serves `script[n]` for the n-th call and records the
+    /// offsets it was asked for.
+    fn scripted(
+        script: Vec<Result<Vec<Result<ReadRowsResponse, Status>>, Status>>,
+        offsets: Arc<Mutex<Vec<i64>>>,
+    ) -> impl FnMut(i64) -> futures::future::Ready<Result<MessageStream, Status>> + Send {
+        let mut script = script.into_iter();
+        move |offset| {
+            offsets.lock().unwrap().push(offset);
+            futures::future::ready(
+                script
+                    .next()
+                    .expect("opened more often than scripted")
+                    .map(|m| Box::pin(futures::stream::iter(m)) as MessageStream),
+            )
+        }
+    }
+
+    async fn drain(
+        script: Vec<Result<Vec<Result<ReadRowsResponse, Status>>, Status>>,
+    ) -> (Result<Vec<i64>, FaucetError>, Vec<i64>) {
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let calls = faucet_core::CallContext::new();
+        let s = resumable_messages(calls, scripted(script, offsets.clone()));
+        futures::pin_mut!(s);
+        let mut rows = Vec::new();
+        let mut out = Ok(());
+        while let Some(m) = s.next().await {
+            match m {
+                Ok(m) => rows.push(m.row_count),
+                Err(e) => {
+                    out = Err(e);
+                    break;
+                }
+            }
+        }
+        let got = offsets.lock().unwrap().clone();
+        (out.map(|()| rows), got)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_stream_resumes_at_the_rows_already_read() {
+        let (rows, offsets) = drain(vec![
+            Ok(vec![Ok(msg(10)), Ok(msg(5)), Err(Status::unavailable("stream reset"))]),
+            Err(Status::internal("RST_STREAM")),
+            Ok(vec![Ok(msg(7))]),
+        ])
+        .await;
+        assert_eq!(rows.unwrap(), vec![10, 5, 7]);
+        assert_eq!(offsets, vec![0, 15, 15]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_error_is_not_resumed() {
+        let (rows, offsets) = drain(vec![Ok(vec![
+            Ok(msg(3)),
+            Err(Status::permission_denied("no")),
+        ])])
+        .await;
+        let err = rows.unwrap_err().to_string();
+        assert!(err.contains("ReadRows stream error"), "{err}");
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumes_are_bounded_without_progress() {
+        let script = (0..=MAX_STREAM_RESUMES)
+            .map(|_| Err(Status::unavailable("down")))
+            .collect();
+        let (rows, offsets) = drain(script).await;
+        assert!(rows.unwrap_err().to_string().contains("ReadRows failed"));
+        assert_eq!(offsets.len() as u32, MAX_STREAM_RESUMES + 1);
+    }
+
+    #[test]
+    fn resume_policy() {
+        assert!(resumable(Code::Unavailable));
+        assert!(resumable(Code::Internal));
+        assert!(!resumable(Code::InvalidArgument));
+        assert!(!resumable(Code::NotFound));
+        assert_eq!(resume_backoff(1).as_secs(), 1);
+        assert_eq!(resume_backoff(3).as_secs(), 4);
+        assert_eq!(resume_backoff(40).as_secs(), 30);
+    }
 
     #[test]
     fn resolve_table_two_and_three_part() {

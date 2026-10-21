@@ -241,6 +241,12 @@ read stayed as slow as a single stream. Batches from different streams
 guarantee across streams, since that is what sharding means. Each in-flight
 stream carries its own decode buffer, so this is also the memory knob.
 
+A read stream that the service resets mid-read (`UNAVAILABLE`, `INTERNAL`
+RST_STREAM and the other transient gRPC statuses — routine on long streams) is
+reopened at the rows it already delivered, with a 1 s doubling backoff, so no
+row is repeated and the read does not restart. Five failed attempts in a row
+without a row arriving in between, or any other status, fail the read.
+
 `read_api` no longer needs `read_table`: with only a `query`, the source runs
 it and reads the job's **destination table** through the same gRPC Arrow path
 (#621). Before this, arbitrary SQL fell back to paginating `getQueryResults`
