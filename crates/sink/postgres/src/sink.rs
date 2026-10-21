@@ -286,6 +286,26 @@ pub fn overwrite_staging_table_name(table: &str) -> String {
     derived_table_name(table, faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX)
 }
 
+/// The staging table of overwrite run `token` (`<table>__faucet_ovw_<token>`,
+/// shortened like [`overwrite_staging_table_name`]); the untokened name
+/// without one.
+pub(crate) fn run_staging_table_name(table: &str, token: Option<&str>) -> String {
+    derived_table_name(
+        table,
+        &faucet_core::idempotency::overwrite_staging_suffix(token),
+    )
+}
+
+/// The table part every tokened staging name of `table` shares.
+pub(crate) fn run_staging_base(table: &str) -> String {
+    let probe = "0".repeat(faucet_core::idempotency::OVERWRITE_RUN_TOKEN_LEN);
+    let suffix = faucet_core::idempotency::overwrite_staging_suffix(Some(&probe));
+    let name = derived_table_name(table, &suffix);
+    name.strip_suffix(suffix.as_str())
+        .unwrap_or(&name)
+        .to_string()
+}
+
 /// How a table's columns may be written: every non-generated column, and
 /// which of them are identity columns (`'a'` = `GENERATED ALWAYS`,
 /// `'d'` = `BY DEFAULT`).
@@ -832,6 +852,20 @@ impl PostgresSink {
     }
 }
 
+impl PostgresSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        let driver = self.inner.driver_mut().driver_mut();
+        driver.layout = driver.layout.clone().overwrite_run(Some(token.to_string()));
+        Ok(self)
+    }
+}
+
 #[async_trait]
 impl faucet_core::Sink for PostgresSink {
     faucet_core::forward_sink!(inner);
@@ -851,7 +885,34 @@ impl PostgresDriver {
     /// Staging table name used while an overwrite run is in flight (same schema
     /// as the target).
     fn staging_table_name(&self) -> String {
-        overwrite_staging_table_name(&self.config.table_name)
+        run_staging_table_name(
+            &self.config.table_name,
+            self.layout.overwrite_run.as_deref(),
+        )
+    }
+
+    /// Every table in the target's schema named like a tokened staging of it.
+    async fn tokened_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        let pattern = format!(
+            "{}%",
+            faucet_core::idempotency::like_literal(
+                &faucet_core::idempotency::overwrite_staging_prefix(&run_staging_base(
+                    &self.config.table_name
+                )),
+                '\\'
+            )
+        );
+        sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') AND c.relname LIKE $1 ESCAPE '\\' \
+             AND n.nspname = COALESCE($2, current_schema())",
+        )
+        .bind(pattern)
+        .bind(self.config.schema.as_deref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("postgres overwrite: list staging tables: {e}")))
     }
 
     async fn acquire(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, FaucetError> {
@@ -1144,6 +1205,14 @@ impl SqlDriver for PostgresDriver {
 
     fn staging_table(&self) -> String {
         self.staging_table_name()
+    }
+
+    fn staging_base(&self) -> String {
+        run_staging_base(&self.config.table_name)
+    }
+
+    async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        self.tokened_staging_tables().await
     }
 
     fn table_display(&self, table: &str) -> String {
@@ -1581,6 +1650,20 @@ mod tests {
         let multibyte = derived_table_name(&"é".repeat(40), "__faucet_prev");
         assert!(multibyte.len() <= 63);
         assert_eq!(super::overwrite_staging_table_name(&long), ovw);
+        // Tokened names shorten the same way, sharing one base per table.
+        let token = "67000000abcdef";
+        let run = super::run_staging_table_name(&long, Some(token));
+        assert!(run.len() <= 63, "{run}");
+        assert_eq!(
+            run,
+            format!("{}__faucet_ovw_{token}", super::run_staging_base(&long))
+        );
+        assert_eq!(
+            super::run_staging_table_name("t", Some(token)),
+            "t__faucet_ovw_67000000abcdef"
+        );
+        assert_eq!(super::run_staging_base("t"), "t");
+        assert_eq!(super::run_staging_table_name("t", None), "t__faucet_ovw");
     }
 
     #[test]

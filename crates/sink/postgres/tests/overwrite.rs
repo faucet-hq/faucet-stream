@@ -279,3 +279,63 @@ async fn a_first_overwrite_that_cannot_publish_staging_names_the_step() {
     let err = sink.commit_overwrite().await.unwrap_err().to_string();
     assert!(err.contains("postgres overwrite: publish staging"), "{err}");
 }
+
+async fn relation_exists(url: &str, name: &str) -> bool {
+    let pool = sqlx::PgPool::connect(url).await.expect("pool connect");
+    let present: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .expect("regclass");
+    pool.close().await;
+    present.is_some()
+}
+
+/// Two overwrite runs of one table at once (#930): each run stages under its
+/// own token, so neither begin drops the other's staging and each commit
+/// swaps in only its own rows. A begin sweeps a crashed run's long-abandoned
+/// staging but leaves a live run's alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_overwrite_runs_keep_their_own_rows() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (_c, url) = start_postgres().await;
+    create_kv_table(&url).await;
+    seed(&url, "INSERT INTO kv VALUES (0, 'old')").await;
+    let abandoned = "kv__faucet_ovw_10000000aaaaaa";
+    seed(&url, &format!("CREATE TABLE {abandoned} (LIKE kv)")).await;
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let sink = |token: String| {
+        let cfg = overwrite_config(&url);
+        async move {
+            PostgresSink::new(cfg)
+                .await
+                .unwrap()
+                .with_overwrite_run(&token)
+                .unwrap()
+        }
+    };
+
+    sink(a.clone()).await.begin_overwrite().await.unwrap();
+    sink(b.clone()).await.begin_overwrite().await.unwrap();
+    assert!(!relation_exists(&url, abandoned).await);
+    assert!(relation_exists(&url, &format!("kv__faucet_ovw_{a}")).await);
+    let (wa, wb) = (sink(a.clone()).await, sink(b.clone()).await);
+    wa.write_batch(&[json!({"id": 1, "name": "a1"})])
+        .await
+        .unwrap();
+    wb.write_batch(&[
+        json!({"id": 2, "name": "b1"}),
+        json!({"id": 3, "name": "b2"}),
+    ])
+    .await
+    .unwrap();
+    wa.write_batch(&[json!({"id": 4, "name": "a2"})])
+        .await
+        .unwrap();
+
+    sink(a.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names_ordered(&url).await, ["a1", "a2"]);
+    sink(b.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names_ordered(&url).await, ["b1", "b2"]);
+    assert!(!relation_exists(&url, &format!("kv__faucet_ovw_{b}")).await);
+}

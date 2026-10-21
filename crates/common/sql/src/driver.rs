@@ -345,6 +345,13 @@ pub trait SqlDriver: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The table part of a tokened staging name (`<base>__faucet_ovw_<token>`).
+    /// Default: the destination table; a backend that shortens long names
+    /// returns the shortened form.
+    fn staging_base(&self) -> String {
+        self.layout().table.clone()
+    }
+
     /// Split a page on the dead-letter path into the rows to write and
     /// per-row failures, over the destination's `columns`. Default: a record
     /// matching no column (when `require_match`) fails its own row.
@@ -438,7 +445,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             .unwrap_or(0);
         for name in self.driver.overwrite_staging_tables().await? {
             if faucet_core::idempotency::abandoned_overwrite_staging(
-                &layout.table,
+                &self.driver.staging_base(),
                 &name,
                 layout.overwrite_run.as_deref(),
                 now,
