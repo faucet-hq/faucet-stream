@@ -14,9 +14,10 @@
 //!   one-line `${vars.x}` edit that fans out across many rows shows up as the
 //!   real per-row effect, and two textually-different files that resolve to the
 //!   same movement show no diff.
-//! - **Secret-safe.** Every secret-sourced value is replaced with a stable
-//!   `<secret:hmac:…>` token before storage (see [`redact_value`]). No secret
-//!   material is ever persisted, and a rotated secret surfaces as a changed hash
+//! - **Secret-safe.** Every secret-sourced value, every literal value under a
+//!   credential-looking key and every connection-string credential is replaced
+//!   with a stable `<secret:hmac:…>` token before storage (see
+//!   [`redact_value`]), and a rotated secret surfaces as a changed hash
 //!   ("secret rotated") rather than printing either value.
 
 use crate::config::{ExecutionSpec, OnError, PipelineConfig};
@@ -140,18 +141,36 @@ pub async fn record_if_ok(
     super::record_config_snapshot(handle, &snapshot).await;
 }
 
-/// Recursively replace every secret-sourced string in `value` with a stable
-/// `<secret:hmac:…>` token. Non-secret strings pass through verbatim, so real
-/// config changes (paths, table names, page sizes) stay visible in the diff.
+/// Recursively replace every credential in `value` with a stable
+/// `<secret:hmac:…>` token: secret-sourced strings, literal values under a
+/// credential-looking key (`password`, `token`, `api_key`, …), and the
+/// userinfo / password parameters of a connection string. Everything else
+/// passes through verbatim, so real config changes (paths, table names, page
+/// sizes) stay visible in the diff.
 pub fn redact_value(value: &Value) -> Value {
+    redact_under(None, value)
+}
+
+fn redact_under(key: Option<&str>, value: &Value) -> Value {
+    let secret_key = key.is_some_and(crate::hub::catalog::is_secret_key);
     match value {
         Value::String(s) => {
-            Value::String(crate::secrets::registry::redact_with(s, secret_token).into_owned())
+            if secret_key && !crate::hub::catalog::looks_like_reference(s) && !is_secret_token(s) {
+                return Value::String(secret_token(s));
+            }
+            let s = crate::secrets::registry::redact_with(s, secret_token);
+            let stripped = faucet_core::redact_uri_credentials(&s);
+            if stripped == *s {
+                Value::String(s.into_owned())
+            } else {
+                Value::String(format!("{stripped} {}", secret_token(&s)))
+            }
         }
-        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
+        Value::Number(n) if secret_key => Value::String(secret_token(&n.to_string())),
+        Value::Array(items) => Value::Array(items.iter().map(|v| redact_under(key, v)).collect()),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), redact_value(v)))
+                .map(|(k, v)| (k.clone(), redact_under(Some(k), v)))
                 .collect(),
         ),
         other => other.clone(),
@@ -624,6 +643,40 @@ mod tests {
         // Stable: same value → same token.
         let again = redact_value(&json!("supersecrettoken"));
         assert_eq!(again.as_str().unwrap(), token);
+    }
+
+    #[test]
+    fn redact_value_hides_inline_credentials() {
+        let redacted = redact_value(&json!({
+            "connection_url": "postgres://app:S3cretPw@db:5432/prod",
+            "password": "hunter22",
+            "client_secret": 1234,
+            "auth": {"type": "bearer", "config": {"token": "tok-literal-value"}},
+            "api_key": "${param.api_key}",
+            "next_token": "$.paging.next",
+            "key": ["id"],
+            "table": "orders",
+        }));
+        let text = redacted.to_string();
+        for secret in ["S3cretPw", "hunter22", "tok-literal-value"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        let url = redacted["connection_url"].as_str().unwrap();
+        assert!(
+            url.starts_with("postgres://db:5432/prod <secret:hmac:"),
+            "{url}"
+        );
+        assert!(is_secret_token(redacted["password"].as_str().unwrap()));
+        assert!(is_secret_token(redacted["client_secret"].as_str().unwrap()));
+        assert!(is_secret_token(
+            redacted["auth"]["config"]["token"].as_str().unwrap()
+        ));
+        assert_eq!(redacted["auth"]["type"], json!("bearer"));
+        assert_eq!(redacted["api_key"], json!("${param.api_key}"));
+        assert_eq!(redacted["next_token"], json!("$.paging.next"));
+        assert_eq!(redacted["key"], json!(["id"]));
+        assert_eq!(redacted["table"], json!("orders"));
+        assert_eq!(redact_value(&redacted), redacted, "redaction is idempotent");
     }
 
     /// Write a config to a temp file and return (config, expanded nodes, path).

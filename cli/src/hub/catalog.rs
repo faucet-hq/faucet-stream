@@ -353,7 +353,7 @@ fn normalize_key(k: &str) -> String {
     out
 }
 
-fn is_secret_key(k: &str) -> bool {
+pub(crate) fn is_secret_key(k: &str) -> bool {
     let lk = normalize_key(k);
     SECRET_KEYS
         .iter()
@@ -380,7 +380,7 @@ fn is_literal(s: &str) -> bool {
 /// login-flow `capture:` block says *where to read* a token), or a one-/two-
 /// character constant (an API's documented placeholder `password: x`), which cannot be
 /// a real secret.
-fn looks_like_reference(s: &str) -> bool {
+pub(crate) fn looks_like_reference(s: &str) -> bool {
     s.is_empty()
         || (s.starts_with("${") && s.ends_with('}'))
         || s.starts_with("$.")
