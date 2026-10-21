@@ -331,6 +331,11 @@ pub fn discard(
         let mut already = reader::discarded_lines(file)?;
         let mut ids = String::new();
         let archive = archive_path(file);
+        let in_archive = if delete {
+            std::collections::HashSet::new()
+        } else {
+            archived_lines(&archive)?
+        };
         let mut removed = String::new();
         let mut archived = false;
         let mut file_discarded = 0usize;
@@ -344,8 +349,9 @@ pub fn discard(
             file_discarded += 1;
             ids.push_str(&id);
             ids.push('\n');
+            let archived_before = in_archive.contains(&id);
             already.insert(id);
-            if !delete {
+            if !delete && !archived_before {
                 removed.push_str(line);
                 removed.push('\n');
                 // Archive in bounded chunks, never the whole file at once.
@@ -448,6 +454,9 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
             })?;
             Ok((m.len(), m.modified().ok()))
         };
+        let original = std::fs::File::open(file).map_err(|e| {
+            CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
+        })?;
         let before = stamp(file)?;
         let tmp = file.with_file_name(format!(
             "{}.faucet-purge",
@@ -483,6 +492,7 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         }
         std::fs::rename(&tmp, file)
             .map_err(|e| CliError::Internal(format!("replacing '{}': {e}", file.display())))?;
+        copy_late_appends(&original, before.0, file)?;
         let sidecar = reader::discard_sidecar(file);
         if let Err(e) = std::fs::remove_file(&sidecar)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -520,8 +530,62 @@ fn append_to(path: &std::path::Path, body: &str) -> CliResult<()> {
         .open(path)
         .map_err(|e| CliError::Internal(format!("opening archive '{}': {e}", path.display())))?;
     f.write_all(body.as_bytes())
+        .and_then(|()| f.sync_all())
         .map_err(|e| CliError::Internal(format!("writing archive '{}': {e}", path.display())))?;
     Ok(())
+}
+
+/// Carry over bytes a writer appended to the replaced file after it was
+/// checked: they land at the end of the purged file instead of being lost
+/// with the old one.
+fn copy_late_appends(
+    original: &std::fs::File,
+    mut copied: u64,
+    dest: &std::path::Path,
+) -> CliResult<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let err = |e: std::io::Error| {
+        CliError::Internal(format!(
+            "carrying late lines into '{}': {e}",
+            dest.display()
+        ))
+    };
+    let mut src = original;
+    loop {
+        let len = original.metadata().map_err(err)?.len();
+        if len <= copied {
+            return Ok(());
+        }
+        src.seek(SeekFrom::Start(copied)).map_err(err)?;
+        let mut tail = Vec::with_capacity((len - copied) as usize);
+        src.take(len - copied).read_to_end(&mut tail).map_err(err)?;
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dest)
+            .map_err(err)?;
+        out.write_all(&tail)
+            .and_then(|()| out.sync_all())
+            .map_err(err)?;
+        copied += tail.len() as u64;
+        tracing::warn!(
+            file = %dest.display(),
+            bytes = tail.len(),
+            "dlq purge: lines appended during the purge were carried into the rewritten file"
+        );
+    }
+}
+
+/// The ids of the lines an earlier, interrupted discard already archived.
+fn archived_lines(archive: &std::path::Path) -> CliResult<std::collections::HashSet<String>> {
+    let mut ids = std::collections::HashSet::new();
+    if !archive.exists() {
+        return Ok(ids);
+    }
+    reader::for_each_line(archive, |line| {
+        ids.insert(reader::line_id(line));
+        Ok(())
+    })?;
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -835,6 +899,49 @@ mod tests {
         // The archive holds the discarded envelope.
         let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
         assert!(archived.contains("QualityFailure"));
+    }
+
+    #[test]
+    fn lines_appended_during_a_purge_are_carried_over() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "dlq.jsonl", "old-1\nold-2\n");
+        let original = std::fs::File::open(&path).unwrap();
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let tmp = write(dir.path(), "dlq.jsonl.faucet-purge", "old-2\n");
+        std::fs::rename(&tmp, &path).unwrap();
+        writeln!(live, "late").unwrap();
+        copy_late_appends(&original, 12, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+        copy_late_appends(&original, 17, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+    }
+
+    #[test]
+    fn a_retried_discard_does_not_archive_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n",
+            env_line("quality", "QualityFailure", 1, json!({"id": 1})),
+            env_line("quality", "QualityFailure", 2, json!({"id": 2})),
+        );
+        let path = write(dir.path(), "dlq.jsonl", &body);
+        let dec = DlqDecryptor::default();
+        discard(path.to_str().unwrap(), None, None, false, &dec).unwrap();
+        std::fs::remove_file(reader::discard_sidecar(&path)).unwrap();
+        let again = discard(path.to_str().unwrap(), None, None, false, &dec).unwrap();
+        assert_eq!(again.discarded, 2);
+        let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
+        assert_eq!(archived, body);
+        assert!(
+            reader::scan_files(&[path], &dec)
+                .unwrap()
+                .envelopes
+                .is_empty()
+        );
     }
 
     /// An envelope a running pipeline appends while (or after) a discard runs
