@@ -197,3 +197,62 @@ async fn a_retriable_request_failure_is_retried_after_the_backoff() {
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn a_response_with_fewer_results_than_entries_fails_every_entry() {
+    let server = MockServer::start().await;
+    put_records(&server, 1, json!([ok()])).await;
+    let sink = KinesisSink::new(config(&server.uri(), 500)).await.unwrap();
+
+    let out = sink
+        .write_batch_partial(&[json!({"k": "a", "n": 1}), json!({"k": "b", "n": 2})])
+        .await
+        .unwrap();
+    for o in &out {
+        let msg = o.as_ref().unwrap_err().to_string();
+        assert!(
+            msg.contains("1 result(s)") && msg.contains("for 2 entries"),
+            "{msg}"
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "not resent"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_records_array_is_not_reported_as_delivered() {
+    let server = MockServer::start().await;
+    put_records(&server, 1, json!([])).await;
+    let sink = KinesisSink::new(config(&server.uri(), 500)).await.unwrap();
+
+    assert!(
+        sink.write_batch(&[json!({"k": "a", "n": 1})])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_record_count_that_disagrees_with_the_results_fails_every_entry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "Kinesis_20131202.PutRecords"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/x-amz-json-1.1")
+                .set_body_json(json!({ "FailedRecordCount": 1, "Records": [ok()] })),
+        )
+        .mount(&server)
+        .await;
+    let sink = KinesisSink::new(config(&server.uri(), 500)).await.unwrap();
+
+    let out = sink
+        .write_batch_partial(&[json!({"k": "a", "n": 1})])
+        .await
+        .unwrap();
+    let msg = out[0].as_ref().unwrap_err().to_string();
+    assert!(msg.contains("FailedRecordCount 1"), "{msg}");
+}
