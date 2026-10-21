@@ -118,8 +118,9 @@ impl fmt::Debug for MongoSinkConfig {
 
 impl MongoSinkConfig {
     /// What a failed batch write leaves behind (#737): inserts (append /
-    /// overwrite) report per-row outcomes and fail outright only while
-    /// nothing is inserted; per-document upserts/deletes are best effort.
+    /// overwrite) report per-row outcomes (an insert whose outcome is unknown
+    /// fails its rows, never the whole call); per-document upserts/deletes
+    /// are best effort.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         match self.write.write_mode {
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete => {
