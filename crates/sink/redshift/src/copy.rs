@@ -90,8 +90,12 @@ pub(crate) fn copy_statement(
         }
     };
 
+    // Values render instants as RFC 3339 (`2024-05-01T10:00:00Z`) and dates
+    // as ISO 8601; COPY's default formats (`YYYY-MM-DD HH:MI:SS`) reject the
+    // `T` separator and the offset, so let COPY recognise them.
     let mut sql = format!(
-        "COPY {table_ref}{col_clause} FROM {} IAM_ROLE {} {format_clause}",
+        "COPY {table_ref}{col_clause} FROM {} IAM_ROLE {} {format_clause} \
+         TIMEFORMAT 'auto' DATEFORMAT 'auto'",
         sql_string_literal(s3_path),
         sql_string_literal(iam_role),
     );
@@ -320,7 +324,8 @@ mod tests {
         assert_eq!(
             sql,
             "COPY \"public\".\"events\" FROM 's3://bucket/staging/abc.jsonl' \
-             IAM_ROLE 'arn:aws:iam::123:role/redshift' FORMAT AS JSON 'auto ignorecase'"
+             IAM_ROLE 'arn:aws:iam::123:role/redshift' FORMAT AS JSON 'auto ignorecase' \
+             TIMEFORMAT 'auto' DATEFORMAT 'auto'"
         );
     }
 
@@ -337,7 +342,8 @@ mod tests {
         assert_eq!(
             sql,
             "COPY \"events\" (\"id\", \"name\") FROM 's3://b/k.csv' IAM_ROLE 'arn:role' \
-             FORMAT AS CSV NULL AS '__FAUCET_NULL__' REGION 'us-east-1'"
+             FORMAT AS CSV NULL AS '__FAUCET_NULL__' TIMEFORMAT 'auto' DATEFORMAT 'auto' \
+             REGION 'us-east-1'"
         );
     }
 

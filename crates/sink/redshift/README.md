@@ -27,7 +27,7 @@ Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 | `table_name` | yes | Target table (matched case-insensitively, as Redshift folds identifiers). |
 | `schema` | no | Namespace qualifying the table. Unset = the session's `current_schema()`; same-named tables in other schemas are ignored. |
 | `write_strategy` | no | `copy` (default) or `insert`. |
-| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto ignorecase'`) or `csv` (`FORMAT AS CSV NULL AS '__FAUCET_NULL__'`: a NULL is written as that marker and an empty string as `""`, so NULL text values do not load as empty strings). |
+| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto ignorecase'`) or `csv` (`FORMAT AS CSV NULL AS '__FAUCET_NULL__'`: a NULL is written as that marker and an empty string as `""`, so NULL text values do not load as empty strings). Both add `TIMEFORMAT 'auto' DATEFORMAT 'auto'`, so RFC 3339 instants (`2024-05-01T10:00:00Z`) and ISO dates load into `TIMESTAMP` / `TIMESTAMPTZ` / `DATE` columns. |
 | `copy.staging_bucket` | copy only | S3 bucket for staged files. |
 | `copy.staging_prefix` | no | Key prefix for staged objects. |
 | `copy.iam_role` | copy only | IAM role ARN Redshift assumes to read the staged file. |
