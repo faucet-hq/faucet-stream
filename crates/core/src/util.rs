@@ -1419,7 +1419,7 @@ mod tests {
             "jwt",
             "client_password",
         ] {
-            let uri = format!("https://h/p?{key}=sk_live_123&keep=1");
+            let uri = format!("https://h/p?{key}=tok-live-123&keep=1");
             assert_eq!(
                 redact_uri_credentials(&uri),
                 format!("https://h/p?{key}=***&keep=1"),

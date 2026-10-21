@@ -9,6 +9,7 @@ description = "Shared credentials and client construction for the faucet-stream 
 readme = "README.md"
 keywords = ["bigquery", "gcp", "etl", "pipeline", "faucet"]
 categories.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 faucet-core.workspace = true

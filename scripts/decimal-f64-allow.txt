@@ -3,6 +3,5 @@
 # Format: <path>: <text the flagged line contains> -- <reason>
 crates/core/src/profiling/drift.rs: c.distinct as f64 -- a distinct-value count fed to the anomaly test, not a column value
 crates/source/duckdb/src/convert.rs: f32::from(v) -- an Arrow Float16 widened to f32, a binary float; the decimal arms are the next match arms
-crates/source/iceberg/src/filter.rs: Datum::double(*i as f64) -- an integer filter literal compared against a DOUBLE column
 cli/src/sql_bind.rs: s.parse::<f64>() -- binds a decimal literal of at most 15 significant digits (is_plain_decimal), every one of which a double holds exactly; longer literals stay text
 crates/conformance/src/tds.rs: (*f as f32).to_le_bytes() -- the test TDS server encodes a REAL cell (a binary float) on the wire; the DECIMAL arm next to it sends exact digits

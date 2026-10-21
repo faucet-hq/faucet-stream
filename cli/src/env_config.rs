@@ -634,7 +634,7 @@ mod tests {
         let env: HashMap<String, String> = [
             (
                 "FAUCET_SOURCE_REST_AUTH_JSON",
-                r#"{"type":"bearer","config":{"token":"sk_live_tok_5521"}}"#,
+                r#"{"type":"bearer","config":{"token":"tok-live-5521"}}"#,
             ),
             (
                 "FAUCET_SOURCE_REST_HEADERS_JSON",
@@ -659,7 +659,7 @@ mod tests {
                 .is_empty()
         );
         let out = crate::secrets::registry::redact(
-            "Bearer sk_live_tok_5521 hdr-key-5521 application/json q/pw-5521 url-pw-5521 h-5521",
+            "Bearer tok-live-5521 hdr-key-5521 application/json q/pw-5521 url-pw-5521 h-5521",
         );
         assert_eq!(out, "Bearer *** *** application/json *** *** h-5521");
     }
