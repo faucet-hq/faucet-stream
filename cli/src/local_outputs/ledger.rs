@@ -362,6 +362,17 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Every reason, in a fixed order — what the metrics iterate.
+    pub const ALL: [SkipReason; 7] = [
+        Self::PreExisting,
+        Self::AlreadyDeleted,
+        Self::NotOnDisk,
+        Self::InFlight,
+        Self::DeleteFailed,
+        Self::RelativePath,
+        Self::OtherHost,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PreExisting => "pre_existing",
