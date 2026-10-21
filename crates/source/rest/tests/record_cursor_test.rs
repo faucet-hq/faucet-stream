@@ -31,6 +31,7 @@ fn keyset(page_size: usize) -> PaginationStyle {
         agg: Default::default(),
         stop_when_short: true,
         page_size,
+        inclusive: false,
     }
 }
 
@@ -144,4 +145,74 @@ async fn a_full_page_that_leaves_the_cursor_in_place_fails_the_run() {
     .await
     .expect_err("a stalled cursor on a full page must not end the run green");
     assert!(err.to_string().contains("did not advance"), "{err}");
+}
+
+#[tokio::test]
+async fn an_inclusive_keyset_on_a_non_unique_field_reads_every_row_once() {
+    // The server returns rows `>= after`: page 2 repeats the two rows tied at
+    // t=2 from the end of page 1, page 3 repeats the row at t=3.
+    let server = serve(vec![
+        json!([{"id": 1, "t": 1}, {"id": 2, "t": 2}, {"id": 3, "t": 2}]),
+        json!([{"id": 2, "t": 2}, {"id": 3, "t": 2}, {"id": 4, "t": 3}]),
+        json!([{"id": 4, "t": 3}, {"id": 5, "t": 3}]),
+    ])
+    .await;
+
+    let records = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/rows")
+            .records_path("$[*]")
+            .pagination(PaginationStyle::RecordFieldCursor {
+                field: "t".into(),
+                into: Default::default(),
+                param: "after".into(),
+                agg: Default::default(),
+                stop_when_short: true,
+                page_size: 3,
+                inclusive: true,
+            }),
+    )
+    .unwrap()
+    .fetch_all()
+    .await
+    .unwrap();
+
+    let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        after_params(&server).await,
+        vec![None, Some("2".into()), Some("3".into())]
+    );
+}
+
+#[tokio::test]
+async fn inclusive_keeps_a_new_row_that_shares_the_boundary_value() {
+    // Page 2 returns the boundary row again plus a row with the same value
+    // that was not on page 1: only the repeat is dropped.
+    let server = serve(vec![
+        json!([{"id": 1, "t": 1}, {"id": 2, "t": 2}]),
+        json!([{"id": 2, "t": 2}, {"id": 9, "t": 2}, {"id": 3, "t": 4}]),
+        json!([{"id": 3, "t": 4}]),
+    ])
+    .await;
+
+    let records = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/rows")
+            .records_path("$[*]")
+            .pagination(PaginationStyle::RecordFieldCursor {
+                field: "t".into(),
+                into: Default::default(),
+                param: "after".into(),
+                agg: Default::default(),
+                stop_when_short: false,
+                page_size: 2,
+                inclusive: true,
+            }),
+    )
+    .unwrap()
+    .fetch_all()
+    .await
+    .unwrap();
+
+    let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 9, 3]);
 }

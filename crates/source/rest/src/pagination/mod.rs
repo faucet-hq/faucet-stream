@@ -153,6 +153,14 @@ pub enum PaginationStyle {
     /// `stop_when_short` (default `true`) a page shorter than `page_size` ends
     /// pagination; a zero-record page always ends it, and a non-advancing cursor
     /// trips a loop guard.
+    ///
+    /// With the default exclusive bound the server must return rows strictly
+    /// past the cursor, so `field` must be unique: rows sharing the boundary
+    /// value at a page cut are never read (a warning names it when a page ends
+    /// on such a tie). Set `inclusive: true` for a server that returns rows
+    /// `>=` the cursor: rows already emitted at the boundary value are dropped
+    /// by whole-record fingerprint, so a non-unique field (`updated_at`) reads
+    /// every row exactly once.
     RecordFieldCursor {
         /// Record field whose value drives the cursor.
         field: String,
@@ -169,6 +177,10 @@ pub enum PaginationStyle {
         stop_when_short: bool,
         /// Expected page size, used for the short-page stop check.
         page_size: usize,
+        /// The server returns rows `>=` the cursor (default `false`: strictly
+        /// greater/less). Required for a non-unique cursor field.
+        #[serde(default)]
+        inclusive: bool,
     },
 }
 
@@ -216,6 +228,11 @@ pub struct PaginationState {
     /// pass (same reason as [`Self::seen_tokens`]).
     #[doc(hidden)]
     pub seen_page_fingerprints: std::collections::HashSet<u64>,
+    /// [`PaginationStyle::RecordFieldCursor`] with `inclusive`: how many copies
+    /// of each record (by fingerprint) were already emitted at the current
+    /// cursor value, so the next `>=` page drops exactly those.
+    #[doc(hidden)]
+    pub record_cursor_boundary: std::collections::HashMap<String, usize>,
 }
 
 impl PaginationState {
@@ -621,6 +638,71 @@ impl PaginationStyle {
         }
     }
 
+    /// [`PaginationStyle::RecordFieldCursor`] keyset step for one page: drop
+    /// the rows an `inclusive` server re-returned at the boundary value, move
+    /// the cursor, and remember the rows now emitted at the new boundary.
+    /// Returns the records to emit; every other style gets `records` back
+    /// unchanged. Call with the page's records *before*
+    /// [`advance`](Self::advance) (which still takes the server's row count).
+    pub fn keyset_page(&self, mut records: Vec<Value>, state: &mut PaginationState) -> Vec<Value> {
+        let PaginationStyle::RecordFieldCursor {
+            field,
+            inclusive,
+            page_size,
+            ..
+        } = self
+        else {
+            return records;
+        };
+        let before = state.record_field_cursor.clone();
+        if *inclusive && let Some(boundary) = &before {
+            records.retain(|r| {
+                if r.get(field) != Some(boundary) {
+                    return true;
+                }
+                let fp = faucet_core::replication::cursor::row_fingerprint(r);
+                match state.record_cursor_boundary.get_mut(&fp) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        false
+                    }
+                    _ => true,
+                }
+            });
+        }
+        self.update_record_cursor(&records, state);
+        let after = state.record_field_cursor.clone();
+        let Some(cursor) = after else {
+            return records;
+        };
+        if *inclusive {
+            if before.as_ref() != Some(&cursor) {
+                state.record_cursor_boundary.clear();
+            }
+            for r in records.iter().filter(|r| r.get(field) == Some(&cursor)) {
+                *state
+                    .record_cursor_boundary
+                    .entry(faucet_core::replication::cursor::row_fingerprint(r))
+                    .or_insert(0) += 1;
+            }
+        } else if records.len() >= *page_size
+            && records
+                .iter()
+                .filter(|r| r.get(field) == Some(&cursor))
+                .count()
+                > 1
+        {
+            tracing::warn!(
+                field = %field,
+                "rest: RecordFieldCursor page ended on several rows sharing the cursor value; \
+                 with an exclusive bound, more rows at that value are never read — use a \
+                 unique cursor field or set `inclusive: true` for a server that returns \
+                 rows >= the cursor"
+            );
+        }
+        records
+    }
+
     /// The JSONPath a cursor style reads its next-page token from
     /// ([`Cursor`](Self::Cursor) / [`CursorInBody`](Self::CursorInBody)); used by
     /// the resumable-cursor bookmark (#547). `None` for every other style.
@@ -870,6 +952,7 @@ mod new_style_tests {
             agg: RecordCursorAgg::Max,
             stop_when_short: true,
             page_size: 2,
+            inclusive: false,
         }
     }
 
@@ -954,6 +1037,7 @@ mod new_style_tests {
             agg: RecordCursorAgg::Max,
             stop_when_short: false,
             page_size: 2,
+            inclusive: false,
         };
         let mut state = PaginationState::default();
         let short = vec![json!({"JournalNumber": 9})];
@@ -980,6 +1064,7 @@ mod new_style_tests {
             agg: RecordCursorAgg::Min,
             stop_when_short: true,
             page_size: 2,
+            inclusive: false,
         };
         let mut state = PaginationState::default();
         style.update_record_cursor(&[json!({"seq": 10}), json!({"seq": 4})], &mut state);

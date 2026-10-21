@@ -262,6 +262,7 @@ async fn record_field_cursor_injects_max_of_field_and_stops_on_short_page() {
                 agg: Default::default(),
                 stop_when_short: true,
                 page_size: 2,
+                inclusive: false,
             }),
     )
     .unwrap()

@@ -154,7 +154,10 @@ pagination:
   agg: max                             # or `min`
   page_size: 100
   stop_when_short: true
+  inclusive: false                     # true: the server returns rows >= the cursor
 ```
+
+By default the cursor is an exclusive bound, so `field` must be unique: rows sharing the boundary value at a page cut are never read (a warning fires when a full page ends on such a tie). For a non-unique field like `updated_at`, filter the server on `>=` the cursor and set `inclusive: true`; the rows already emitted at the boundary value are dropped by whole-record fingerprint, so each row is read once.
 
 ## Resumable cursor & multi-array responses
 

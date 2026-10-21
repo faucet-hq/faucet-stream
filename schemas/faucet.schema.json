@@ -4848,7 +4848,7 @@
           }
         },
         {
-          "description": "Keyset pagination by the running max/min of a record field (#554). After\neach page the aggregate of `field` over its records is injected into the\nnext request (as a query param or body field per `into`) at `param`. With\n`stop_when_short` (default `true`) a page shorter than `page_size` ends\npagination; a zero-record page always ends it, and a non-advancing cursor\ntrips a loop guard.",
+          "description": "Keyset pagination by the running max/min of a record field (#554). After\neach page the aggregate of `field` over its records is injected into the\nnext request (as a query param or body field per `into`) at `param`. With\n`stop_when_short` (default `true`) a page shorter than `page_size` ends\npagination; a zero-record page always ends it, and a non-advancing cursor\ntrips a loop guard.\n\nWith the default exclusive bound the server must return rows strictly\npast the cursor, so `field` must be unique: rows sharing the boundary\nvalue at a page cut are never read (a warning names it when a page ends\non such a tie). Set `inclusive: true` for a server that returns rows\n`>=` the cursor: rows already emitted at the boundary value are dropped\nby whole-record fingerprint, so a non-unique field (`updated_at`) reads\nevery row exactly once.",
           "type": "object",
           "properties": {
             "field": {
@@ -4885,6 +4885,14 @@
               ],
               "format": "uint",
               "minimum": 0
+            },
+            "inclusive": {
+              "description": "The server returns rows `>=` the cursor (default `false`: strictly\ngreater/less). Required for a non-unique cursor field.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             },
             "type": {
               "type": "string",

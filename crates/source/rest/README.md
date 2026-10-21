@@ -138,6 +138,15 @@ pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param:
 
 Both stop on a short page (fewer than `limit`/`page_size` records) and guard against a non-advancing cursor.
 
+`RecordFieldCursor` sends the cursor as an exclusive bound by default, so the
+server must return rows strictly past it and `field` must be unique: rows that
+share the boundary value at a page cut would never be read (a warning fires when
+a full page ends on such a tie). For a non-unique field such as `updated_at`,
+use a server filter that returns rows `>=` the cursor and set `inclusive: true`:
+the rows already emitted at the boundary value are dropped by whole-record
+fingerprint, so every row is read exactly once. A full page whose rows all share
+one value still fails the run, since the cursor cannot get past it.
+
 **Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. It resumes **one** cursor, so it is refused with more than one `requests:` entry.
 
 ### Multi-array fan-out (`records_multi`) & envelope carry (`record_ancestors`)

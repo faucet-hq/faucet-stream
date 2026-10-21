@@ -1572,9 +1572,13 @@ impl RestDriver {
                     // the incremental filter drops old ones — a page of only-old
                     // rows must still move the cursor. A no-op for every
                     // non-RecordFieldCursor style.
-                    self.config
+                    // An `inclusive` keyset also drops the rows the server
+                    // re-returned at the boundary value (counted in `raw_count`,
+                    // which the short-page rule still reads).
+                    let raw_records = self
+                        .config
                         .pagination
-                        .update_record_cursor(&raw_records, &mut state);
+                        .keyset_page(raw_records, &mut state);
 
                     // #547: track the terminal cursor to persist as the bookmark.
                     if self.config.persist_cursor
