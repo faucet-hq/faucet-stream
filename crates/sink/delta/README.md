@@ -11,7 +11,7 @@ running/billed compute and no Python.
 ## Highlights
 
 - **Lazy create** — on first write the table is created from the inferred
-  schema when `create_if_not_missing` (default), honouring `partition_by`.
+  schema when `create_table` (default), honouring `partition_by`.
 - **Atomic commits** — each `flush()` is one Delta transaction, so a
   bookmark-carrying page commits (and becomes visible) atomically.
 - **Append-only in v1** — `write_mode` is `append`. MERGE/upsert is a
@@ -26,7 +26,7 @@ running/billed compute and no Python.
 | `table_uri` | string | — (required) | `file:///…`, a bare local path, `s3://…`, `abfss://…`, `gs://…` |
 | `credentials` | tagged enum | `{ type: default }` | `default` / `aws` / `azure` / `gcp` |
 | `storage_options` | map | `{}` | Passed verbatim to delta-rs; explicit keys win over `credentials` |
-| `create_if_not_missing` | bool | `true` | Create the table + schema on first write |
+| `create_table` | bool | `true` | Create the table + schema on first write (deprecated alias: `create_if_not_missing`) |
 | `partition_by` | string[] | `[]` | Partition columns (applied only on create) |
 | `schema_sample_size` | int | `100` | Records sampled to infer the schema on create (a field null in every sampled record becomes a nullable string column); an existing table's own schema is always used |
 | `batch_size` | int | `1000` | Arrow record-batch write size; `0` = no re-chunk |
