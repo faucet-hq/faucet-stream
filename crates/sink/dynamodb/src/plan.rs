@@ -72,18 +72,65 @@ pub(crate) struct Planned {
 }
 
 /// Stable identity of an item's key: the typed key attributes in key order.
+///
+/// A number key is identified by its value, not its text: DynamoDB treats
+/// `1`, `1.0`, `01` and `1e0` as one key, so the in-page dedup and the
+/// matching of unprocessed requests must too.
 pub(crate) fn key_canon(item: &Item, keys: &[String]) -> String {
     keys.iter()
         .map(|k| {
             let one: Item = item
                 .get(k)
-                .map(|v| (k.clone(), v.clone()))
+                .map(|v| match v {
+                    AttributeValue::N(n) => (
+                        k.clone(),
+                        AttributeValue::N(canonical_number(n).unwrap_or_else(|| n.clone())),
+                    ),
+                    other => (k.clone(), other.clone()),
+                })
                 .into_iter()
                 .collect();
             item_to_typed_json(&one).to_string()
         })
         .collect::<Vec<_>>()
         .join("\u{1f}")
+}
+
+/// A DynamoDB number's value as `[-]<digits>e<exp>` with no leading or
+/// trailing zeros (`0` for zero), so equal numbers render equally. `None`
+/// for text that is not a decimal.
+fn canonical_number(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let (negative, s) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (mantissa, exp_part) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let exp: i64 = match exp_part {
+        Some(e) => e.parse().ok()?,
+        None => 0,
+    };
+    let joined = format!("{int_part}{frac_part}");
+    let leading = joined.trim_start_matches('0');
+    let digits = leading.trim_end_matches('0');
+    if digits.is_empty() {
+        return Some("0".into());
+    }
+    let exp = exp
+        .checked_sub(frac_part.len() as i64)?
+        .checked_add((leading.len() - digits.len()) as i64)?;
+    Some(format!("{}{digits}e{exp}", if negative { "-" } else { "" }))
 }
 
 /// Key identity of an unprocessed `WriteRequest` returned by DynamoDB.
@@ -385,6 +432,43 @@ mod tests {
         assert_eq!(p.ops.len(), 1);
         assert_eq!(p.failures.len(), 2);
         assert!(p.failures[&0].to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn number_keys_are_identified_by_value() {
+        assert_eq!(canonical_number("1").as_deref(), Some("1e0"));
+        assert_eq!(canonical_number("001.50").as_deref(), Some("15e-1"));
+        assert_eq!(canonical_number("1.5").as_deref(), Some("15e-1"));
+        assert_eq!(canonical_number("1e2").as_deref(), Some("1e2"));
+        assert_eq!(canonical_number("100").as_deref(), Some("1e2"));
+        assert_eq!(canonical_number("-0.0").as_deref(), Some("0"));
+        assert_eq!(canonical_number("-2.").as_deref(), Some("-2e0"));
+        assert!(canonical_number("x").is_none());
+        assert!(canonical_number(".").is_none());
+        // A request DynamoDB hands back with the number re-rendered still
+        // matches the op that sent it.
+        let sent = plan(
+            &[json!({"pk": "a", "sk": "001"})],
+            &WriteSpec::default(),
+            &keys(),
+        );
+        let echoed: Item = [
+            ("pk".to_string(), AttributeValue::S("a".into())),
+            ("sk".to_string(), AttributeValue::N("1".into())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(key_canon(&echoed, &names()), sent.ops[0].canon);
+        // `1` and `1.0` are one key: the page keeps the last write.
+        let dup = plan(
+            &[
+                json!({"pk": "a", "sk": 1, "v": 1}),
+                json!({"pk": "a", "sk": 1.0, "v": 2}),
+            ],
+            &WriteSpec::default(),
+            &keys(),
+        );
+        assert_eq!(dup.ops.len(), 1);
     }
 
     #[test]
