@@ -20,8 +20,9 @@ faucet backfill pipeline.yaml --from 2026-06-01 --to 2026-07-01 --window 1d --re
 
 ## Scoping the source to the window
 
-Each unit substitutes `${backfill.*}` tokens in the source **and sink** configs
-before running, and sets the run's `${now.*}` clock to the unit's window start.
+Each unit substitutes `${backfill.*}` tokens in the source, sink **and
+transform** configs before running (so a `set` transform can stamp the window
+on every row), and sets the run's `${now.*}` clock to the unit's window start.
 Your source must reference at least one scoping token — otherwise every window
 would replay identical data, and the plan is rejected with a typed error
 (`faucet validate` enforces the same whenever a `backfill:` block is present).

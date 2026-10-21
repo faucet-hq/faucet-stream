@@ -175,6 +175,9 @@ fn build_unit_node(
     if time_mode {
         substitute_unit_tokens(&mut n.source.config, unit)?;
         substitute_unit_tokens(&mut n.sink.config, unit)?;
+        for t in &mut n.transforms {
+            substitute_unit_tokens(&mut t.config, unit)?;
+        }
     }
     n.delivery = faucet_core::DeliveryMode::AtLeastOnce;
     if n.delivery_guarantee
@@ -1109,6 +1112,10 @@ matrix:
             end: crate::backfill::plan::parse_boundary("2026-06-02", tz).unwrap(),
         };
         let mut scoped = root.clone();
+        scoped.transforms = vec![crate::config::TransformSpec {
+            kind: "set".into(),
+            config: json!({"values": {"window": "${backfill.unit}", "from": "${backfill.start_date}"}}),
+        }];
         scoped.cleanup_scope = Some(std::collections::BTreeMap::from([(
             "tenant".to_string(),
             json!("t1"),
@@ -1123,6 +1130,10 @@ matrix:
         let url = node.source.config["url"].as_str().unwrap();
         assert!(url.contains("since=2026-06-01T00:00:00+00:00"), "{url}");
         assert!(url.contains("until=2026-06-02T00:00:00+00:00"), "{url}");
+        assert_eq!(
+            node.transforms[0].config["values"],
+            json!({"window": "20260601T000000Z", "from": "2026-06-01"})
+        );
     }
 
     #[tokio::test]

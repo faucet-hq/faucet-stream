@@ -1144,6 +1144,9 @@ async fn build_topology_inner(
                 NodeKind::Sink(sink)
             }
             NodeSpec::Transform { transforms } => {
+                for t in transforms {
+                    crate::executor::reject_unresolved_backfill_tokens(&t.config, "transform")?;
+                }
                 let stages = compile_transforms(transforms)?;
                 let compiled = stages
                     .iter()

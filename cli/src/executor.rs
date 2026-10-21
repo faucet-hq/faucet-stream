@@ -2899,6 +2899,7 @@ async fn run_one_invocation(
     let mut transforms = node.transforms.clone();
     for t in &mut transforms {
         resolve_now_inplace(&mut t.config, opts.clock)?;
+        reject_unresolved_backfill_tokens(&t.config, "transform")?;
         if !fanout_ctx.is_empty() {
             resolve_inplace(&mut t.config, &fanout_ctx)?;
         }
@@ -5936,6 +5937,31 @@ matrix:
             Some(json!({"cursor": 7}))
         );
         assert_eq!(store.get("adopt::child::1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_backfill_token_in_a_transform_fails_outside_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "id\n1\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {csv} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}/out.jsonl }} }}
+  transforms:
+    - {{ type: set, config: {{ values: {{ window: "${{backfill.unit}}" }} }} }}
+"#,
+            csv = csv.display(),
+            out = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), ExecuteOptions::for_tests("bf"))
+            .await
+            .unwrap();
+        let err = summary.invocations[0].error.as_deref().unwrap();
+        assert!(err.contains("the transform config references"), "{err}");
+        assert!(!dir.path().join("out.jsonl").exists());
     }
 
     #[tokio::test]
