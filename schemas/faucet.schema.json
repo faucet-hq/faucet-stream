@@ -6967,7 +6967,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nThe bookmark is applied two ways: if the query contains the literal\ntoken `@bookmark`, it is bound as a parameter so the server filters\n(efficient); the source *also* filters client-side as a correctness\nbackstop. The new maximum of `column` is persisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.[column] >= <bookmark> ORDER BY q.[column]`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits, `DATETIME`'s 1/300 s\nticks) are never skipped. Every page carries a bookmark, so a crash\nreplays at most one page. Write `@bookmark` in the query (with `>=`)\nto apply the cursor further inside it, e.g. in a CTE; a strict `>` is\nrefused. The query must not end in a top-level `ORDER BY` (T-SQL\nforbids it in a derived table). Rows whose `column` is NULL are never\nread.",
           "type": "object",
           "properties": {
             "column": {
@@ -6975,7 +6975,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -8192,7 +8192,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted. If the SQL contains\nthe literal token `${bookmark}`, it is replaced with a positional bind\nparameter so Redshift filters server-side (efficient); the source also\nfilters client-side as a correctness backstop. The new maximum of\n`column` is persisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.\"column\" >= CAST($n AS <type>) ORDER BY q.\"column\"`\n(the column's type as the server describes it) and drops the rows it\nalready emitted at the bookmark value, so rows that share a cursor\nvalue (batch loads stamped with one `updated_at`, COPY jobs landing in\nseveral commits) are never skipped. Every page carries a bookmark, so\na crash replays at most one page. Write `${bookmark}` in the query\n(with `>=`) to apply the cursor further inside it; a strict `>` is\nrefused. Rows whose `column` is NULL are never read.",
           "type": "object",
           "properties": {
             "column": {
@@ -8200,7 +8200,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -8308,7 +8308,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nThe bookmark is applied two ways: if the query contains the literal\ntoken `@bookmark`, it is substituted as an injection-safe SQL literal so\nthe server filters (efficient pushdown); the source *also* filters\nclient-side as a correctness backstop. The new maximum of `column` is\npersisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.\"column\" >= <bookmark> ORDER BY q.\"column\"`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late inserts in the same second,\nasync-insert flushes) are never skipped. Every page carries a bookmark,\nso a crash replays at most one page. Write `@bookmark` in the query\n(with `>=`) to apply the cursor further inside it; it is substituted as\nan injection-safe SQL literal, and a strict `>` is refused. Rows whose\n`column` is NULL are never read.",
           "type": "object",
           "properties": {
             "column": {
@@ -8316,7 +8316,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -9520,7 +9520,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nThe bookmark is applied two ways: if the query contains the named\nparameter `@bookmark`, it is bound so the server filters (efficient);\nthe source *also* filters client-side as a correctness backstop. The\nnew maximum of `column` is persisted on the final page.\n\nSpanner does not implicitly coerce parameter types: a string bookmark\ncompared against a `TIMESTAMP` column needs an explicit cast in the\nquery, e.g. `WHERE updated_at > TIMESTAMP(@bookmark)`.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n``SELECT * FROM (<query>) AS q WHERE q.`column` >= CAST(@bookmark AS <type>) ORDER BY q.`column` ``\n(`<type>` is the column's type, read from the query's result metadata)\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits) are never skipped.\nEvery page carries a bookmark, so a crash replays at most one page.\nWrite `@bookmark` in the query (with `>=`) to apply the cursor further\ninside it; a strict `>` is refused. Rows whose `column` is NULL are\nnever read.\n\n`@bookmark` inside the query is bound by its JSON type (a timestamp\nbookmark is a STRING), and Spanner does not coerce parameter types: cast\nit where you use it, e.g. `WHERE updated_at >= TIMESTAMP(@bookmark)`.",
           "type": "object",
           "properties": {
             "column": {
@@ -9528,7 +9528,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -9885,7 +9885,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted. If the SQL contains\nthe literal token `${bookmark}`, it is bound as a `:_faucet_bookmark`\nnamed parameter so the warehouse filters server-side (efficient); the\nsource also filters client-side as a correctness backstop. The new\nmaximum of `column` is persisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the SQL as\n``SELECT * FROM (<sql>) AS q WHERE q.`column` >= :_faucet_bookmark ORDER BY q.`column` ``\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits) are never skipped.\nEvery page carries a bookmark, so a crash replays at most one page.\nWrite `${bookmark}` in the SQL (with `>=`) to apply the cursor further\ninside it; a strict `>` is refused. Rows whose `column` is NULL are\nnever read.",
           "type": "object",
           "properties": {
             "column": {
@@ -9893,7 +9893,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -21259,7 +21259,7 @@
                       "default": 1000
                     },
                     "arrow_native": {
-                      "description": "Fetch results as Apache Arrow instead of JSON. When `true`, the\nstatement is submitted with `EXTERNAL_LINKS` disposition +\n`ARROW_STREAM` format; each chunk's presigned link is fetched and\ndecoded as an Arrow IPC stream. This enables the **columnar** fast path\n([`Source::stream_batches`](faucet_core::Source::stream_batches)) so a\n`databricks → parquet`/`delta` chain skips the per-cell JSON decode.\n\nRequires the crate-local `arrow` feature, and (in this release) only\n[`DatabricksReplication::Full`] — the columnar path does not run the\nper-row client-side incremental filter. Defaults to `false` (the\n`INLINE` + `JSON_ARRAY` row path, unchanged). RFC 0002 / #375.",
+                      "description": "Fetch results as Apache Arrow instead of JSON. When `true`, the\nstatement is submitted with `EXTERNAL_LINKS` disposition +\n`ARROW_STREAM` format; each chunk's presigned link is fetched and\ndecoded as an Arrow IPC stream. This enables the **columnar** fast path\n([`Source::stream_batches`](faucet_core::Source::stream_batches)) so a\n`databricks → parquet`/`delta` chain skips the per-cell JSON decode.\n\nRequires the crate-local `arrow` feature, and (in this release) only\n[`DatabricksReplication::Full`] — the columnar path does not run the\nper-row cursor bookmark. Defaults to `false` (the\n`INLINE` + `JSON_ARRAY` row path, unchanged). RFC 0002 / #375.",
                       "type": [
                         "boolean",
                         "string"
@@ -31235,14 +31235,14 @@
           "type": "object"
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nPut the `:bookmark` placeholder in the query to push the cursor down to\nthe server (`WHERE UPDATED_AT > :bookmark`); the source also filters\nclient-side as a correctness backstop. `column` names the key exactly\nas it appears in the output — Oracle upper-cases unquoted names.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) q WHERE q.\"COLUMN\" >= :bookmark ORDER BY q.\"COLUMN\"`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits, `DATE`'s one-second\nresolution) are never skipped. Every page carries a bookmark, so a\ncrash replays at most one page. Write `:bookmark` in the query (with\n`>=`) to apply the cursor further inside it; a strict `>` is refused.\n`column` names the key exactly as it appears in the output — Oracle\nupper-cases unquoted names. Rows whose `column` is NULL are never read.",
           "properties": {
             "column": {
               "description": "Output column holding the replication cursor (e.g. `UPDATED_AT`).",
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "const": "incremental",
