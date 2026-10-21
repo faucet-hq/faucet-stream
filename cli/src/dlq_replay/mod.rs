@@ -20,7 +20,7 @@ use crate::executor::ExecuteOptions;
 use chrono::{DateTime, FixedOffset};
 use faucet_core::UnwrappedEnvelope;
 use plan::{build_replay_node, default_failed_dlq_path, validate_reason};
-use reader::{DlqDecryptor, expand_location, reason_matches, replay_selects, scan_files};
+use reader::{DlqDecryptor, expand_location, reason_matches, replay_selects, scan_each};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -107,33 +107,31 @@ pub fn inspect(
 ) -> CliResult<InspectSummary> {
     let reason = validate_reason(reason)?;
     let files = expand_location(location)?;
-    let scan = scan_files(&files, dec)?;
-    let envs: Vec<UnwrappedEnvelope> = scan
-        .envelopes
-        .into_iter()
-        .filter(|e| reason_matches(e, reason.as_deref()))
-        .collect();
-
     let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_error_kind: BTreeMap<String, usize> = BTreeMap::new();
-    for e in &envs {
+    let mut sample = Vec::new();
+    let mut total_envelopes = 0usize;
+    let scan = scan_each(&files, dec, |e| {
+        if !reason_matches(&e, reason.as_deref()) {
+            return Ok(());
+        }
+        total_envelopes += 1;
         *by_reason
             .entry(e.reason.clone().unwrap_or_else(|| "unknown".into()))
             .or_default() += 1;
         *by_error_kind
             .entry(e.error_kind.clone().unwrap_or_else(|| "unknown".into()))
             .or_default() += 1;
-    }
-    let sample = envs
-        .iter()
-        .take(sample_limit)
-        .map(EnvelopeSummary::from)
-        .collect();
+        if sample.len() < sample_limit {
+            sample.push(EnvelopeSummary::from(&e));
+        }
+        Ok(())
+    })?;
 
     Ok(InspectSummary {
         location: location.to_string(),
         files_read: scan.files_read,
-        total_envelopes: envs.len(),
+        total_envelopes,
         malformed: scan.malformed,
         non_envelope: scan.non_envelope,
         undecryptable: scan.undecryptable,
@@ -211,17 +209,17 @@ pub async fn replay(
     // Count candidates up front with the same decryptor and filters the
     // reader will use.
     let target = plan::replay_target(cfg, &node, inputs.all_rows);
-    let scan = scan_files(&files, &decryptor)?;
-    let matching: Vec<_> = scan
-        .envelopes
-        .iter()
-        .filter(|e| reason_matches(e, reason.as_deref()))
-        .collect();
-    let candidates = matching
-        .iter()
-        .filter(|e| replay_selects(e, None, target.as_ref()))
-        .count();
-    let skipped_other_rows = matching.len() - candidates;
+    let (mut matching, mut candidates) = (0usize, 0usize);
+    scan_each(&files, &decryptor, |e| {
+        if reason_matches(&e, reason.as_deref()) {
+            matching += 1;
+            if replay_selects(&e, None, target.as_ref()) {
+                candidates += 1;
+            }
+        }
+        Ok(())
+    })?;
+    let skipped_other_rows = matching - candidates;
     if skipped_other_rows > 0 {
         tracing::warn!(
             skipped = skipped_other_rows,
@@ -326,19 +324,18 @@ pub fn discard(
     let mut archived_to = Vec::new();
 
     for file in &files {
-        let text = std::fs::read_to_string(file).map_err(|e| {
-            CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
-        })?;
         let mut already = reader::discarded_lines(file)?;
         let mut ids = String::new();
+        let archive = archive_path(file);
         let mut removed = String::new();
+        let mut archived = false;
         let mut file_discarded = 0usize;
-        for line in text.lines() {
+        reader::for_each_line(file, |line| {
             let id = reader::line_id(line);
             if already.contains(&id)
                 || plan::discard_keep_line(line, dec, reason.as_deref(), before_ms)
             {
-                continue;
+                return Ok(());
             }
             file_discarded += 1;
             ids.push_str(&id);
@@ -347,15 +344,25 @@ pub fn discard(
             if !delete {
                 removed.push_str(line);
                 removed.push('\n');
+                // Archive in bounded chunks, never the whole file at once.
+                if removed.len() >= ARCHIVE_CHUNK_BYTES {
+                    append_to(&archive, &removed)
+                        .map_err(|e| faucet_core::FaucetError::Source(e.to_string()))?;
+                    removed.clear();
+                    archived = true;
+                }
             }
-        }
+            Ok(())
+        })?;
         if file_discarded == 0 {
             continue;
         }
         discarded += file_discarded;
         if !delete && !removed.is_empty() {
-            let archive = archive_path(file);
             append_to(&archive, &removed)?;
+            archived = true;
+        }
+        if archived {
             archived_to.push(archive.to_string_lossy().into_owned());
         }
         append_to(&reader::discard_sidecar(file), &ids)?;
@@ -368,6 +375,34 @@ pub fn discard(
         archived_to,
     })
 }
+
+/// Copy `file` into `tmp` line by line without the lines whose id is in
+/// `drop`; returns how many were dropped.
+fn filter_lines_into(
+    file: &std::path::Path,
+    tmp: &std::path::Path,
+    drop: &std::collections::HashSet<String>,
+) -> CliResult<usize> {
+    use std::io::Write;
+    let write_err =
+        |e: std::io::Error| faucet_core::FaucetError::Source(format!("writing '{}': {e}", tmp.display()));
+    let mut out = std::io::BufWriter::new(std::fs::File::create(tmp).map_err(write_err)?);
+    let mut purged = 0usize;
+    reader::for_each_line(file, |line| {
+        if drop.contains(&reader::line_id(line)) {
+            purged += 1;
+        } else {
+            out.write_all(line.as_bytes()).map_err(write_err)?;
+            out.write_all(b"\n").map_err(write_err)?;
+        }
+        Ok(())
+    })?;
+    out.flush().map_err(write_err)?;
+    Ok(purged)
+}
+
+/// How much archived text `discard` buffers before appending it.
+const ARCHIVE_CHUNK_BYTES: usize = 1 << 20;
 
 /// What [`purge`] did.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -409,33 +444,30 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
             Ok((m.len(), m.modified().ok()))
         };
         let before = stamp(file)?;
-        let text = std::fs::read_to_string(file).map_err(|e| {
-            CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
-        })?;
-        let (kept, purged) = match dec.reseal_without(file, &text, &ids)? {
-            Some(rebuilt) => rebuilt,
-            None => {
-                let mut kept = String::with_capacity(text.len());
-                let mut purged = 0usize;
-                for line in text.lines() {
-                    if ids.contains(&reader::line_id(line)) {
-                        purged += 1;
-                    } else {
-                        kept.push_str(line);
-                        kept.push('\n');
-                    }
-                }
-                (kept, purged)
-            }
-        };
         let tmp = file.with_file_name(format!(
             "{}.faucet-purge",
             file.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("dlq.jsonl")
         ));
-        std::fs::write(&tmp, &kept)
-            .map_err(|e| CliError::Internal(format!("writing '{}': {e}", tmp.display())))?;
+        let write_err =
+            |e: std::io::Error| CliError::Internal(format!("writing '{}': {e}", tmp.display()));
+        let purged = if reader::starts_sealed(file)? {
+            // A file sealed with whole-file integrity is verified and
+            // re-sealed as a whole.
+            let text = std::fs::read_to_string(file).map_err(|e| {
+                CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
+            })?;
+            match dec.reseal_without(file, &text, &ids)? {
+                Some((kept, purged)) => {
+                    std::fs::write(&tmp, &kept).map_err(write_err)?;
+                    purged
+                }
+                None => filter_lines_into(file, &tmp, &ids)?,
+            }
+        } else {
+            filter_lines_into(file, &tmp, &ids)?
+        };
         if stamp(file)? != before {
             let _ = std::fs::remove_file(&tmp);
             return Err(CliError::Config(format!(
