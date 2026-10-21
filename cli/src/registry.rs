@@ -966,7 +966,11 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-sftp")]
         "sftp" => {
             let cfg = decode::<faucet_sink_sftp::SftpSinkConfig>("sink", "sftp", config)?;
-            Ok(Box::new(faucet_sink_sftp::SftpSink::new(cfg)?))
+            let mut s = faucet_sink_sftp::SftpSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
+            Ok(Box::new(s))
         }
         #[cfg(feature = "sink-singer")]
         "singer" => {
@@ -979,7 +983,12 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-s3")]
         "s3" => {
             let cfg = decode::<faucet_sink_s3::S3SinkConfig>("sink", "s3", config)?;
-            boxed_sink(faucet_sink_s3::S3Sink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_s3::S3Sink::new(cfg),
+                overwrite_run,
+                faucet_sink_s3::S3Sink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-mongodb")]
         "mongodb" => {
@@ -1009,6 +1018,9 @@ async fn build_sink_inner(
                 config,
             )?;
             let mut s = faucet_sink_elasticsearch::ElasticsearchSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
             if let Some(name) = &auth_ref {
                 s = s.with_auth_provider(auth_catalog::resolve(auth, name)?);
             }
@@ -1051,12 +1063,21 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-file")]
         "file" => {
             let cfg = decode::<faucet_sink_file::FileSinkConfig>("sink", "file", config)?;
-            Ok(Box::new(faucet_sink_file::FileSink::new(cfg)?))
+            let mut s = faucet_sink_file::FileSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
+            Ok(Box::new(s))
         }
         #[cfg(feature = "sink-gcs")]
         "gcs" => {
             let cfg = decode::<faucet_sink_gcs::GcsSinkConfig>("sink", "gcs", config)?;
-            boxed_sink(faucet_sink_gcs::GcsSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_gcs::GcsSink::new(cfg),
+                overwrite_run,
+                faucet_sink_gcs::GcsSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-redshift")]
         "redshift" => {
@@ -1085,7 +1106,12 @@ async fn build_sink_inner(
                 "azure-blob",
                 config,
             )?;
-            boxed_sink(faucet_sink_azure_blob::AzureBlobSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_azure_blob::AzureBlobSink::new(cfg),
+                overwrite_run,
+                faucet_sink_azure_blob::AzureBlobSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-dynamodb")]
         "dynamodb" => {
@@ -1101,6 +1127,9 @@ async fn build_sink_inner(
                 config,
             )?;
             let mut s = faucet_sink_databricks::DatabricksSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
             if let Some(name) = &auth_ref {
                 s = s.with_auth_provider(auth_catalog::resolve(auth, name)?);
             }

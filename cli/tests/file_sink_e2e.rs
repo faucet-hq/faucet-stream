@@ -85,6 +85,44 @@ async fn overwrite_replaces_the_previous_part_set() {
     assert_eq!(names, vec!["rows-00001.jsonl".to_string()]);
 }
 
+/// Each overwrite run stages in its own swap directory: a run leaves a
+/// concurrent run's young swap directory alone, drops the untokened one and
+/// one a crashed run abandoned more than a day ago, and moves in only its own
+/// files.
+#[tokio::test]
+async fn an_overwrite_run_leaves_a_concurrent_runs_swap_area_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let sink = format!("      path: \"{d}/snap/rows.jsonl\"\n      write_mode: overwrite\n");
+    let snap = dir.path().join("snap");
+    let live = format!(
+        ".faucet-overwrite-rows.jsonl.run-{}",
+        faucet_core::idempotency::new_overwrite_run_token()
+    );
+    for area in [
+        live.as_str(),
+        ".faucet-overwrite-rows.jsonl",
+        ".faucet-overwrite-rows.jsonl.run-10000000aaaaaa",
+    ] {
+        std::fs::create_dir_all(snap.join(area)).unwrap();
+        std::fs::write(snap.join(area).join("rows.jsonl"), "{\"other\":1}\n").unwrap();
+    }
+    let summary = faucet_cli::run_from_yaml_str(&yaml(&api(2).await, &sink))
+        .await
+        .unwrap();
+    assert_eq!(summary.failure_count(), 0);
+    let mut names: Vec<String> = std::fs::read_dir(&snap)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![live.clone(), "rows.jsonl".to_string()]);
+    let back = faucet_source_file::read_records(snap.join("rows.jsonl").to_string_lossy())
+        .await
+        .unwrap();
+    assert_eq!(back.len(), 2, "only the run's own rows moved in");
+}
+
 #[test]
 fn rows_sharing_a_path_are_refused_at_load() {
     let cfg = PipelineConfig::from_text(

@@ -522,7 +522,7 @@ pipeline:
     .unwrap();
     assert_eq!(
         staging,
-        [live.clone()],
+        std::slice::from_ref(&live),
         "only the live run's staging is left"
     );
     pool.close().await;
