@@ -1011,6 +1011,11 @@ pub fn refuse_server_paths_with(
             check(&d.sink.kind, &d.sink.config, Access::Write);
         }
     }
+    findings_error(found)
+}
+
+/// The refusal a screening pass's findings amount to, if any.
+fn findings_error(mut found: Findings) -> Result<(), ServeError> {
     for list in [&mut found.protected, &mut found.policy] {
         list.sort();
         list.dedup();
@@ -1032,6 +1037,53 @@ pub fn refuse_server_paths_with(
         )));
     }
     Ok(())
+}
+
+/// Whether `value` is an absolute URL (`scheme://…`).
+fn is_absolute_url(value: &str) -> bool {
+    value.find("://").is_some_and(|i| {
+        i > 0
+            && value[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            && value.as_bytes()[0].is_ascii_alphabetic()
+    })
+}
+
+/// Every absolute URL anywhere in `doc` checked against `policy`; a URL whose
+/// host comes from a `${…}` token cannot be checked and is refused.
+fn url_findings(doc: &Value, policy: &ReferencePolicy, found: &mut Findings) {
+    for_each_string(doc, &mut |s| {
+        if !is_absolute_url(s) {
+            return;
+        }
+        if faucet_core::resolve::url_hosts(s)
+            .iter()
+            .any(|h| h.contains("${"))
+        {
+            found.policy.push(format!(
+                "{s} (a URL host in a submitted document may not come from a token — it cannot \
+                 be checked)"
+            ));
+        } else if let Err(e) = policy.check_url(s) {
+            found.policy.push(format!("{s} ({})", e.reason));
+        }
+    });
+}
+
+/// Screen a document fragment a request supplied for a run whose body is
+/// otherwise the operator's (an inline deployment overlay merged into a
+/// registered template): the fragment is caller input, so it is held to
+/// everything a caller-submitted config is — its subprocess connectors, its
+/// `${env:}` / `${file:}` / `${secret:}` / secret-manager references, every
+/// local path (system trees, the server's credential files, the caller path
+/// roots) and every URL it names — under the caller `policy`.
+pub fn screen_caller_fragment(doc: &Value, policy: &ReferencePolicy) -> Result<(), ServeError> {
+    screen_subprocess(doc, policy, false)?;
+    screen_references(doc, policy)?;
+    let mut found = data_path_findings(doc, true, Some(policy));
+    url_findings(doc, policy, &mut found);
+    findings_error(found)
 }
 
 /// The connector kinds `doc` names anywhere as a `type:` whose schema declares
@@ -1592,6 +1644,81 @@ pub async fn load_submission_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller-supplied fragment (an inline overlay) is screened like a
+    /// submitted config: references, subprocess connectors, paths and URLs.
+    #[test]
+    fn a_caller_fragment_is_screened_like_a_submitted_config() {
+        let root = tempfile::tempdir().unwrap();
+        let args = crate::cli::ReferenceArgs {
+            allow_path_root: vec![root.path().to_path_buf()],
+            allow_env: vec!["FAUCET_FRAGMENT_OK".into()],
+            ..Default::default()
+        };
+        let refs = crate::serve::references::ServeReferencePolicy::from_args(&args).unwrap();
+        let caller = refs.for_origin(
+            BodyOrigin::Caller {
+                allow_subprocess: false,
+            },
+            None,
+        );
+        let inside = root.path().join("state").display().to_string();
+        let ok = serde_json::json!({
+            "execution": { "max_concurrent": 1 },
+            "state": { "type": "file", "config": { "path": inside } },
+            "notifications": [{ "channel": { "type": "webhook", "config": {
+                "url": "https://hooks.example/${env:FAUCET_FRAGMENT_OK}" } } }],
+            "dlq": { "sink": { "type": "jsonl", "config": { "path": format!("{inside}/dlq.jsonl") } } },
+        });
+        screen_caller_fragment(&ok, &caller).expect("an allowed fragment passes");
+
+        let forbidden = |doc: Value, needle: &str| {
+            let err = screen_caller_fragment(&doc, &caller).unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains(needle)),
+                "{needle}: {err:?}"
+            );
+        };
+        forbidden(
+            serde_json::json!({ "state": { "type": "file", "config": { "path": "/proc/self" } } }),
+            "/proc/self",
+        );
+        forbidden(
+            serde_json::json!({ "dlq": { "sink": { "type": "jsonl", "config": {
+                "path": "/var/faucet-elsewhere/dlq.jsonl" } } } }),
+            "faucet-elsewhere",
+        );
+        forbidden(
+            serde_json::json!({ "sla": { "note": "${file:/etc/hostname}" } }),
+            "/etc/hostname",
+        );
+        forbidden(
+            serde_json::json!({ "x": "http://169.254.169.254/latest" }),
+            "metadata",
+        );
+        forbidden(
+            serde_json::json!({ "x": "https://${env:FAUCET_FRAGMENT_OK}/hook" }),
+            "may not come from a token",
+        );
+        let err = screen_caller_fragment(
+            &serde_json::json!({ "dlq": { "sink": { "type": "singer", "config": {} } } }),
+            &caller,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Unprocessable { .. }), "{err:?}");
+        // Open (operator) policy still refuses the system trees.
+        assert!(
+            screen_caller_fragment(
+                &serde_json::json!({ "state": { "type": "file", "config": { "path": "/sys/x" } } }),
+                &ReferencePolicy::open()
+            )
+            .is_err()
+        );
+        assert!(!is_absolute_url("://x"));
+        assert!(!is_absolute_url("1http://x"));
+        assert!(!is_absolute_url("a b://x"));
+        assert!(is_absolute_url("postgres+ssl://h/db"));
+    }
 
     /// A path a request names directly (a DLQ location) is held to the
     /// caller policy, the system trees and a tenant's root.

@@ -1044,6 +1044,17 @@ on a `pipeline` template is a `422`. The run is labelled `overlay` (and
 `overlay_version` for a registered one), and `warnings` flags incremental
 streams composed with no state store.
 
+An **inline** overlay is the request's own document, so it is screened like a
+submitted config before it is merged into the (trusted) template body: its
+`${env:}` / `${file:}` / `${secret:}` / secret-manager references, every local
+path (a `file` state store, a file DLQ sink), every URL (a notification
+webhook, an `http` DLQ sink) and any connector that runs a program are held to
+the [caller reference policy](#reference-policy) — refused with `403` (`422`
+for a subprocess connector without `--allow-subprocess-connectors`). A run for
+a tenant (a tenant-scoped principal, or `POST /v1/tenants/{tenant}/…`) may not
+carry an inline overlay at all (`403`); register the overlay and name it
+instead. Every refusal is audited as a denied `template.run`.
+
 **Registering never moves callers.** `POST /v1/templates` appends a version and
 stops there; `POST /v1/templates/{id}/launch` is the one call that moves `stable`
 and therefore every unpinned caller. So a template is `draft` until something is

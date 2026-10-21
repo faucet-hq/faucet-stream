@@ -1729,6 +1729,84 @@ tests:
             .unwrap()
             .expect("run record");
         assert!(!rec.labels.contains_key(LABEL_OVERLAY_VERSION));
+        // An inline overlay is the caller's document: it is screened like a
+        // submitted config, and never accepted for a tenant.
+        let refused = |overlay: Value| {
+            let state = state.clone();
+            async move {
+                let body: TriggerBody = serde_json::from_value(json!({
+                    "sink": "local-jsonl",
+                    "overlay": overlay,
+                }))
+                .unwrap();
+                trigger_template_outcome(state, actor(), "acme-exports".into(), body)
+                    .await
+                    .expect_err("inline overlay must be refused")
+            }
+        };
+        let err = refused(json!({ "dlq": { "sink": { "type": "singer", "config": {
+            "target_command": ["/bin/sh", "-c", "true"] } } } }))
+        .await;
+        assert!(
+            matches!(&err, ServeError::Unprocessable { message, .. }
+                if message.contains("inline `overlay`") && message.contains("singer")),
+            "{err:?}"
+        );
+        let err = refused(
+            json!({ "notifications": [{ "name": "n", "on": ["run_success"],
+            "channel": { "type": "webhook", "config": {
+                "url": "https://hooks.example/x?k=${env:FAUCET_TEST_NOT_ALLOWED}" } } }] }),
+        )
+        .await;
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("FAUCET_TEST_NOT_ALLOWED")),
+            "{err:?}"
+        );
+        let err = refused(
+            json!({ "notifications": [{ "name": "n", "on": ["run_success"],
+            "channel": { "type": "webhook", "config": {
+                "url": "http://169.254.169.254/latest/meta-data/" } } }] }),
+        )
+        .await;
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("169.254.169.254")),
+            "{err:?}"
+        );
+        let err = refused(json!({ "state": { "type": "file", "config": {
+            "path": "/var/faucet-not-an-allowed-root/state" } } }))
+        .await;
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("faucet-not-an-allowed-root")),
+            "{err:?}"
+        );
+        let mut tenant_actor = actor();
+        tenant_actor.tenant = Some("acme".into());
+        let body: TriggerBody = serde_json::from_value(json!({
+            "sink": "local-jsonl",
+            "overlay": { "execution": { "max_concurrent": 1 } }
+        }))
+        .unwrap();
+        let err =
+            trigger_template_outcome(state.clone(), tenant_actor, "acme-exports".into(), body)
+                .await
+                .expect_err("a tenant may not send an inline overlay");
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("tenant")),
+            "{err:?}"
+        );
+        let denials = state
+            .history()
+            .list_audit(&AuditFilter {
+                action: Some("template.run".into()),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.result == "denied")
+            .count();
+        assert_eq!(denials, 5);
         // A deployment is part of neither side of the compatibility matrix.
         let idx = template_matrix(State(state.clone())).await.unwrap().0;
         assert!(

