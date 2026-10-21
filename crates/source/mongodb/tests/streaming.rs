@@ -494,3 +494,19 @@ async fn config_schema_and_dataset_uri_via_instance() {
         "query options are not part of the identity: {ds}"
     );
 }
+
+/// A child fan-out whose filter is a whole `{key}` placeholder binds the
+/// parent's numeric id as a number, so it matches an integer field.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_placeholder_binds_a_numeric_parent_value_as_a_number() {
+    let (_container, uri) = start_mongo().await;
+    seed_docs(&uri, "testdb", "orders", 5).await;
+    let config = MongoSourceConfig::new(uri, "testdb", "orders")
+        .filter(serde_json::json!({"id": "{parent_id}"}))
+        .projection(serde_json::json!({"_id": 0, "id": 1}));
+    let source = MongoSource::new(config).await.expect("source new");
+    let ctx: HashMap<String, serde_json::Value> =
+        HashMap::from([("parent_id".to_string(), serde_json::json!(3))]);
+    let records = source.fetch_with_context(&ctx).await.expect("fetch");
+    assert_eq!(records, vec![serde_json::json!({"id": 3})]);
+}

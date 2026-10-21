@@ -147,9 +147,9 @@ impl faucet_core::Source for MongoSource {
         }
 
         // Substitute context placeholders into filter, projection, and sort.
-        let filter = substitute_optional_value(&self.config.filter, context, "filter")?;
-        let projection = substitute_optional_value(&self.config.projection, context, "projection")?;
-        let sort = substitute_optional_value(&self.config.sort, context, "sort")?;
+        let filter = substitute_optional_value(&self.config.filter, context);
+        let projection = substitute_optional_value(&self.config.projection, context);
+        let sort = substitute_optional_value(&self.config.sort, context);
 
         let db = self.client.database(&self.config.database);
         let collection = db.collection::<Document>(&self.config.collection);
@@ -239,9 +239,9 @@ impl faucet_core::Source for MongoSource {
                 )
             } else {
                 (
-                    substitute_optional_value(&self.config.filter, context, "filter")?,
-                    substitute_optional_value(&self.config.projection, context, "projection")?,
-                    substitute_optional_value(&self.config.sort, context, "sort")?,
+                    substitute_optional_value(&self.config.filter, context),
+                    substitute_optional_value(&self.config.projection, context),
+                    substitute_optional_value(&self.config.sort, context),
                 )
             };
 
@@ -420,28 +420,46 @@ fn descriptor_for_collection(
     descriptor
 }
 
-/// Substitute context placeholders in an optional JSON value.
-///
-/// Serialises the value to a string, runs [`substitute_context_json`] (which
-/// properly escapes string values for JSON safety), then deserialises back.
-/// Returns `None` when the input is `None`.
+/// Resolve `{key}` placeholders in an optional filter / projection / sort
+/// against the parent context, on the parsed tree. A string that is exactly
+/// one placeholder takes the context value with its JSON type (`{"owner_id":
+/// "{id}"}` with `id = 7` becomes the number `7`, so it matches an integer
+/// field); a placeholder inside a longer string, or in an object key, is
+/// interpolated as text. Returns `None` when the input is `None`.
 fn substitute_optional_value(
     value: &Option<Value>,
     context: &std::collections::HashMap<String, Value>,
-    field_name: &str,
-) -> Result<Option<Value>, FaucetError> {
+) -> Option<Value> {
+    value.as_ref().map(|v| substitute_tree(v, context))
+}
+
+fn substitute_tree(value: &Value, context: &std::collections::HashMap<String, Value>) -> Value {
     match value {
-        Some(v) => {
-            let s = serde_json::to_string(v).map_err(|e| {
-                FaucetError::Config(format!("failed to serialize {field_name}: {e}"))
-            })?;
-            let s = faucet_core::util::substitute_context_json(&s, context);
-            let resolved = serde_json::from_str(&s).map_err(|e| {
-                FaucetError::Config(format!("failed to parse substituted {field_name}: {e}"))
-            })?;
-            Ok(Some(resolved))
+        Value::String(s) => {
+            let whole = s
+                .strip_prefix('{')
+                .and_then(|r| r.strip_suffix('}'))
+                .filter(|k| !k.contains(['{', '}']))
+                .and_then(|k| context.get(k));
+            match whole {
+                Some(typed) => typed.clone(),
+                None => Value::String(faucet_core::util::substitute_context(s, context)),
+            }
         }
-        None => Ok(None),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| substitute_tree(v, context)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    (
+                        faucet_core::util::substitute_context(k, context),
+                        substitute_tree(v, context),
+                    )
+                })
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -626,7 +644,7 @@ mod tests {
     #[test]
     fn substitute_optional_value_none_passthrough() {
         let ctx: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-        let out = substitute_optional_value(&None, &ctx, "filter").unwrap();
+        let out = substitute_optional_value(&None, &ctx);
         assert!(out.is_none(), "None input must yield None output");
     }
 
@@ -638,9 +656,7 @@ mod tests {
         // The placeholder lives inside a JSON string value; substitution must
         // preserve JSON validity (string stays a string).
         let filter = Some(json!({"owner": "{user_id}"}));
-        let out = substitute_optional_value(&filter, &ctx, "filter")
-            .unwrap()
-            .expect("Some input yields Some output");
+        let out = substitute_optional_value(&filter, &ctx).expect("Some input yields Some output");
         assert_eq!(out, json!({"owner": "abc-123"}));
     }
 
@@ -648,9 +664,7 @@ mod tests {
     fn substitute_optional_value_no_placeholder_is_identity() {
         let ctx: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         let proj = Some(json!({"_id": 0, "name": 1}));
-        let out = substitute_optional_value(&proj, &ctx, "projection")
-            .unwrap()
-            .unwrap();
+        let out = substitute_optional_value(&proj, &ctx).unwrap();
         assert_eq!(out, json!({"_id": 0, "name": 1}));
     }
 
@@ -661,10 +675,42 @@ mod tests {
         let mut ctx: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         ctx.insert("name".into(), json!("a\"b"));
         let filter = Some(json!({"n": "{name}"}));
-        let out = substitute_optional_value(&filter, &ctx, "filter")
-            .unwrap()
-            .unwrap();
+        let out = substitute_optional_value(&filter, &ctx).unwrap();
         assert_eq!(out, json!({"n": "a\"b"}));
+    }
+
+    /// A whole-string placeholder keeps the context value's JSON type, so a
+    /// numeric parent id matches an integer field; embedded placeholders and
+    /// keys stay text.
+    #[test]
+    fn substitute_optional_value_keeps_the_type_of_a_whole_placeholder() {
+        let ctx: std::collections::HashMap<String, Value> = [
+            ("id".to_string(), json!(42)),
+            ("on".to_string(), json!(true)),
+            ("f".to_string(), json!("status")),
+        ]
+        .into();
+        let filter = Some(json!({
+            "customer_id": "{id}",
+            "active": "{on}",
+            "label": "order-{id}",
+            "{f}": {"$in": ["{id}", "{missing}"]},
+        }));
+        let out = substitute_optional_value(&filter, &ctx).unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "customer_id": 42,
+                "active": true,
+                "label": "order-42",
+                "status": {"$in": [42, "{missing}"]},
+            })
+        );
+        let doc = json_value_to_document(&out).unwrap();
+        assert!(matches!(
+            doc.get("customer_id"),
+            Some(bson::Bson::Int64(42) | bson::Bson::Int32(42))
+        ));
     }
 
     // --- bson_document_to_json_value: relaxed extended-JSON shapes ---

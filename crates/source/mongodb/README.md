@@ -208,6 +208,8 @@ filter:
   tenant_id: "{tenant_id}"      # resolved from the parent record's `tenant_id`
 ```
 
+A value that is exactly one placeholder takes the parent value with its JSON type: a numeric `id` binds as a number (matching an integer field), a boolean as a boolean, an object as a subdocument. A placeholder inside a longer string (`"order-{id}"`) or in a key is interpolated as text.
+
 ## Streaming & batching
 
 `MongoSource::stream_pages` drives the driver cursor (`Collection::find`) without buffering the full result. Documents are accumulated into a `batch_size` buffer and yielded as a `StreamPage` once the buffer fills; the trailing partial page (if any) is yielded after the cursor drains. The pipeline writes each page to the sink as it arrives, so memory is bounded by `batch_size × document_width`, not by the size of the collection or result set.
