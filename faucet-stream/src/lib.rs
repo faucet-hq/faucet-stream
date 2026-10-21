@@ -26,7 +26,6 @@
 //! | `source-rabbitmq` | RabbitMQ (AMQP 0.9.1) queue source |
 //! | `source-sftp` | SFTP source |
 //! | `source-file` | Local file source (path, directory, glob or URL; every file format) |
-
 //! | `source-s3` | AWS S3 file source |
 //! | `source-mongodb` | MongoDB query source |
 //! | `source-mongodb-cdc` | MongoDB CDC source (Change Streams) |
@@ -46,6 +45,17 @@
 //! | `source-dynamodb` | Amazon DynamoDB source (scan, query, Streams CDC) |
 //! | `source-oracle` | Oracle Database query source (needs Oracle Instant Client at runtime) |
 //! | `source-oracle-cdc` | Oracle CDC source via LogMiner (needs Oracle Instant Client at runtime) |
+//! | `source-mssql-cdc` | Microsoft SQL Server CDC source |
+//! | `source-gcs` | Google Cloud Storage file source |
+//! | `source-azure-blob` | Azure Blob Storage file source |
+//! | `source-bigquery` | Google BigQuery query source |
+//! | `source-snowflake` | Snowflake query source (SQL REST API) |
+//! | `source-redshift` | Amazon Redshift query source |
+//! | `source-clickhouse` | ClickHouse query source |
+//! | `source-pubsub` | Google Cloud Pub/Sub source |
+//! | `source-singer` | Singer tap bridge source (runs a Singer tap executable) |
+//! | `source-rest-excel`, `source-xml-excel` | Excel response bodies for the REST / XML sources |
+//! | `source-iceberg-glue`, `source-iceberg-sql`, `source-iceberg-hms` | Glue / SQL / Hive Metastore catalogs for the Iceberg source |
 //! | `sink-bigquery` | Google BigQuery streaming insert sink |
 //! | `sink-iceberg` | Apache Iceberg sink (append-only, REST/Glue/SQL/HMS catalogs) |
 //! | `sink-postgres` | PostgreSQL sink (jsonb or auto-mapped columns) |
@@ -60,7 +70,6 @@
 //! | `sink-rabbitmq` | RabbitMQ (AMQP 0.9.1) publish sink |
 //! | `sink-sftp` | SFTP sink |
 //! | `sink-singer` | Singer target bridge sink (runs a Singer target executable) |
-
 //! | `sink-s3` | AWS S3 file sink |
 //! | `sink-mongodb` | MongoDB insert sink |
 //! | `sink-redis` | Redis sink (streams, lists, key-value) |
@@ -77,10 +86,33 @@
 //! | `sink-oracle` | Oracle Database sink (upsert/overwrite, exactly-once; needs Oracle Instant Client at runtime) |
 //! | `sink-databricks` | Databricks SQL warehouse sink (append/upsert/overwrite, exactly-once) |
 //! | `sink-delta` | Apache Delta Lake sink (append-only; local FS or S3/Azure/GCS) |
+//! | `sink-stdout` | Stdout / stderr sink (JSON Lines, pretty JSON, TSV) |
+//! | `sink-gcs` | Google Cloud Storage file sink |
+//! | `sink-azure-blob` | Azure Blob Storage file sink |
+//! | `sink-redshift` | Amazon Redshift sink |
+//! | `sink-clickhouse` | ClickHouse sink |
+//! | `sink-pubsub` | Google Cloud Pub/Sub sink |
+//! | `sink-iceberg-glue`, `sink-iceberg-sql`, `sink-iceberg-hms` | Glue / SQL / Hive Metastore catalogs for the Iceberg sink |
+//! | `sink-mssql-staging`, `sink-clickhouse-staging`, `sink-databricks-staging` | Object-storage staged bulk loads for those sinks |
+//! | `delta-s3`, `delta-azure`, `delta-gcs` | Cloud warehouses for the Delta Lake source and sink |
+//! | `state`, `state-redis`, `state-postgres` | Redis / PostgreSQL bookmark state stores (`state` = both) |
+//! | `auth`, `oauth1`, `google-sa` | Shared single-flight auth providers (OAuth 1.0a, Google service accounts) |
+//! | `mtls`, `rabbitmq-tls` | Client-certificate TLS for the HTTP sources / TLS for RabbitMQ |
+//! | `compression` | gzip / zstd for the file and object-store connectors |
+//! | `arrow` | Columnar (Arrow) transfer paths |
+//! | `file-formats`, `file-format-csv`, `file-format-xml`, `file-format-excel`, `file-format-avro`, `file-format-orc`, `file-format-parquet` | Extra file formats for the file and object-store connectors |
+//! | `quality`, `quality-jsonschema` | Data-quality checks (`json_schema` check with the second) |
+//! | `contract` | Data contracts |
+//! | `masking` | PII detection and column masking |
+//! | `policy` | Data-flow policies |
+//! | `lineage`, `lineage-kafka` | OpenLineage emission (Kafka transport with the second) |
+//! | `transform-sql` | Embedded DuckDB SQL transform |
+//! | `transform-wasm` | WebAssembly transform |
+//! | `transforms`, `transform-flatten`, `transform-rename-keys`, `transform-keys-case`, `transform-select`, `transform-drop`, `transform-set`, `transform-rename-field`, `transform-cast`, `transform-redact`, `transform-value-case`, `transform-spell-symbols`, `transform-hash`, `transform-json-parse`, `transform-json-encode`, `transform-coalesce`, `transform-split-join`, `transform-lookup`, `transform-unpivot`, `transform-tree-flatten`, `transform-cross-join`, `transform-zip-columns`, `transform-filter`, `transform-explode`, `transform-cdc-unwrap` | Built-in record transforms (`transforms` = all of them) |
 //! | `kafka-schema-registry` | Schema Registry support for Kafka connectors |
 //! | `source` | All source connectors |
 //! | `sink` | All sink connectors |
-//! | `full` | Every connector |
+//! | `full` | Every feature |
 
 // Always re-export core types and traits.
 pub use faucet_core::*;

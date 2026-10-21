@@ -11,6 +11,8 @@ minus `default` and the per-transform `transform-*` features, which are subsets
 of `transforms`. Each manifest's docs.rs `features` list must reach every
 feature except the native-heavy `DOCS_RS_EXCLUDED` ones (and aggregates that
 pull them in), so the docs.rs build stays inside its memory limit (#794).
+The umbrella crate's `## Feature flags` table (its docs.rs landing page) must
+name every feature of its manifest except `default`.
 
 Usage: scripts/full-feature-coverage.py   (run from the repo root)
 """
@@ -25,6 +27,7 @@ CHECKS = (
 )
 DOCKERFILE = "Dockerfile"
 DIST = "dist-workspace.toml"
+UMBRELLA = ("faucet-stream/Cargo.toml", "faucet-stream/src/lib.rs")
 # Features left out of the docs.rs build: their native builds (bundled DuckDB,
 # librdkafka, Oracle) overran the docs.rs sandbox (#794).
 DOCS_RS_EXCLUDED = {
@@ -90,6 +93,21 @@ def docs_rs_gaps(features, docs):
     return missing, sorted(reached & tainted)
 
 
+def documented_features(lib_rs):
+    """Every backticked name in the first cell of the crate-doc feature table."""
+    names = set()
+    for line in lib_rs.splitlines():
+        row = re.match(r"^//!\s*\|([^|]*)\|", line)
+        if row:
+            names.update(re.findall(r"`([a-z0-9][a-z0-9-]*)`", row.group(1)))
+    return names
+
+
+def undocumented(features, lib_rs):
+    documented = documented_features(lib_rs)
+    return sorted(name for name in features if name != "default" and name not in documented)
+
+
 def dockerfile_default_features(text):
     found = re.search(r'^ARG DEFAULT_FEATURES="([^"]*)"', text, re.MULTILINE)
     return found.group(1) if found else None
@@ -119,6 +137,13 @@ def main():
             failed = True
             print(f"{path}: `full` does not enable: {', '.join(gaps)}")
             print("  Add them to `full` (or to an aggregate `full` enables).")
+    with open(UMBRELLA[0], "rb") as f:
+        umbrella = tomllib.load(f).get("features", {})
+    with open(UMBRELLA[1]) as f:
+        absent = undocumented(umbrella, f.read())
+    if absent:
+        failed = True
+        print(f"{UMBRELLA[1]}: the `## Feature flags` table omits: {', '.join(absent)}")
     with open(DOCKERFILE) as f:
         image = dockerfile_default_features(f.read())
     if image != "full":
