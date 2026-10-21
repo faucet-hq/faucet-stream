@@ -399,17 +399,68 @@ pub fn expand_location(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
     // A file sink's `{part}` template, and the `-{part}` it inserts before the
     // extension when a rollover cap is set, name numbered files (#862 M-026).
     if location.contains("{part}") {
-        return expand_location(&location.replace("{part}", "*"));
+        return numbered_parts(&location.replace("{part}", "*"), location);
     }
     match expand_plain(location) {
         Err(e) if !location.contains(['*', '?', '[']) && !Path::new(location).exists() => {
             match rolled_over_glob(location) {
-                Some(glob) => expand_plain(&glob).map_err(|_| e),
+                Some(glob) => numbered_parts(&glob, location).map_err(|_| e),
                 None => Err(e),
             }
         }
         other => other,
     }
+}
+
+/// The files `glob` matches whose file-name `*` stands for a part number
+/// (digits only), so `orders-*.jsonl` finds `orders-00001.jsonl` but never a
+/// sibling pipeline's `orders-eu.jsonl`.
+fn numbered_parts(glob: &str, location: &str) -> Result<Vec<PathBuf>, FaucetError> {
+    let pattern = Path::new(glob)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let files: Vec<PathBuf> = expand_plain(glob)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| is_numbered_part(name, &pattern))
+        })
+        .collect();
+    if files.is_empty() {
+        return Err(FaucetError::Source(format!(
+            "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
+             .jsonl files, or a glob)"
+        )));
+    }
+    Ok(files)
+}
+
+/// Whether `name` matches `pattern` with every `*` replaced by one or more
+/// digits. Pure.
+fn is_numbered_part(name: &str, pattern: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    for literal in parts {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &rest[digits..];
+        match rest.strip_prefix(literal) {
+            Some(r) => rest = r,
+            None => return false,
+        }
+    }
+    rest.is_empty()
 }
 
 /// The glob matching the numbered parts a rollover cap splits `path` into:
@@ -646,6 +697,24 @@ mod tests {
             Some("d/.h-*.jsonl")
         );
         assert_eq!(rolled_over_glob("d/noext").as_deref(), Some("d/noext-*"));
+    }
+
+    #[test]
+    fn the_rollover_fallback_matches_only_numbered_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("orders-eu.jsonl");
+        std::fs::write(&sibling, "x\n").unwrap();
+        let missing = format!("{}/orders.jsonl", dir.path().display());
+        assert!(expand_location(&missing).is_err(), "a sibling DLQ is not a part");
+        let tpl = format!("{}/orders-{{part}}.jsonl", dir.path().display());
+        assert!(expand_location(&tpl).is_err());
+        let part = dir.path().join("orders-00002.jsonl");
+        std::fs::write(&part, "x\n").unwrap();
+        assert_eq!(expand_location(&missing).unwrap(), vec![part.clone()]);
+        assert_eq!(expand_location(&tpl).unwrap(), vec![part]);
+        assert!(is_numbered_part("a-1-b-22.jsonl", "a-*-b-*.jsonl"));
+        assert!(!is_numbered_part("a--b-22.jsonl", "a-*-b-*.jsonl"));
+        assert!(!is_numbered_part("a-1.jsonl.bak", "a-*.jsonl"));
     }
 
     #[test]
