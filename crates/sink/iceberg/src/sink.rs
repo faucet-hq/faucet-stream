@@ -1048,7 +1048,8 @@ impl SchemaDriver for IcebergDriver {
         let tx = action.apply(tx).map_err(evolve_schema_err)?;
         let evolved = tx
             .commit(self.catalog.as_ref())
-            .await
+            .within(calls, "commit")
+            .await?
             .map_err(evolve_schema_err)?;
         calls
             .call_once("write", Self::close_writer(&mut state))
@@ -1144,7 +1145,7 @@ impl IcebergDriver {
             self.ensure_writer(calls, &mut state, &table).await?;
             let batch = json_to_record_batch(&good_records, &arrow_schema)?;
             let writer = state.writer.as_mut().expect("writer set above");
-            if let Err(e) = writer.write(batch).await {
+            if let Err(e) = calls.call_once("write", writer.write(batch)).await {
                 state.poison(&e);
                 return Err(e);
             }
