@@ -54,7 +54,10 @@ With a single integer key on two range-readable SQL sources (`postgres`,
 
 Any other key shape, or a source that cannot read a key range (a file, an
 API), compares the whole dataset in one keyed pass. `verify.max_rows_scanned`
-caps how much either side may read; a capped report is marked `truncated`.
+caps how much either side may read — the read stops once it passes the cap, in
+either mode — and a capped report is marked `truncated`. A range (or, in a
+whole-dataset pass, the dataset) a side could not finish reading is not diffed,
+so the cap never reports unread rows as missing.
 
 ```
 verify [orders]: DIFFERENT — sqlite:///app.db#orders vs sqlite:///mirror.db#orders (key id, range mode, 21 range(s) compared, 3 differing)

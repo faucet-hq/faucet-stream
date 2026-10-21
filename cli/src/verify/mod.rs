@@ -458,23 +458,41 @@ impl Session<'_> {
         })
     }
 
+    /// Rows either side may still fetch under `max_rows_scanned`.
+    fn budget_left(&self) -> Option<u64> {
+        self.max_rows.map(|cap| {
+            cap.saturating_sub(self.report.rows_fetched_source + self.report.rows_fetched_dest)
+        })
+    }
+
     /// Fetch the source side of `range` (whole dataset for `ALL`), shaped as
-    /// the pipeline would write it.
-    async fn fetch_source(&mut self, range: &KeyRange) -> CliResult<Vec<Value>> {
-        let rows = fetch_range(self.source, range, self.key, "source").await?;
+    /// the pipeline would write it. `None` = the scan budget ran out reading
+    /// it (the report is marked truncated).
+    async fn fetch_source(&mut self, range: &KeyRange) -> CliResult<Option<Vec<Value>>> {
+        let left = self.budget_left();
+        let (rows, complete) = fetch_range(self.source, range, self.key, "source", left).await?;
         self.report.rows_fetched_source += rows.len() as u64;
+        if !complete {
+            self.report.truncated = true;
+            return Ok(None);
+        }
         #[cfg(feature = "masking")]
         let rows = match self.masking {
             Some(m) => faucet_core::apply_masking(rows, m).records,
             None => rows,
         };
-        Ok(rows)
+        Ok(Some(rows))
     }
 
-    async fn fetch_dest(&mut self, range: &KeyRange) -> CliResult<Vec<Value>> {
-        let rows = fetch_range(self.dest, range, self.key, "destination").await?;
+    async fn fetch_dest(&mut self, range: &KeyRange) -> CliResult<Option<Vec<Value>>> {
+        let left = self.budget_left();
+        let (rows, complete) = fetch_range(self.dest, range, self.key, "destination", left).await?;
         self.report.rows_fetched_dest += rows.len() as u64;
-        Ok(rows)
+        if !complete {
+            self.report.truncated = true;
+            return Ok(None);
+        }
+        Ok(Some(rows))
     }
 
     /// Whole-dataset comparison: one fetch of each side, one keyed diff.
@@ -483,10 +501,16 @@ impl Session<'_> {
         self.diff_leaf(&KeyRange::ALL).await
     }
 
-    /// Fetch both sides of a leaf range and record the keyed differences.
+    /// Fetch both sides of a leaf range and record the keyed differences. A
+    /// side cut short by `max_rows_scanned` is not diffed: a partial set would
+    /// report the unread rows as missing.
     async fn diff_leaf(&mut self, range: &KeyRange) -> CliResult<()> {
-        let src = self.fetch_source(range).await?;
-        let dst = self.fetch_dest(range).await?;
+        let Some(src) = self.fetch_source(range).await? else {
+            return Ok(());
+        };
+        let Some(dst) = self.fetch_dest(range).await? else {
+            return Ok(());
+        };
         let diffs = diff_rows(&src, &dst, self.key, self.columns, self.exclude, self.norm);
         if diffs.is_empty() {
             return Ok(());
@@ -572,8 +596,12 @@ impl Session<'_> {
                     .ok_or_else(|| FaucetError::Source("range digest vanished".into()))?;
                 (a.same(&b), a.rows.max(b.rows), a.bounds_union(&b))
             } else {
-                let a = self.client_digest(&range, true).await?;
-                let b = self.client_digest(&range, false).await?;
+                let (Some(a), Some(b)) = (
+                    self.client_digest(&range, true).await?,
+                    self.client_digest(&range, false).await?,
+                ) else {
+                    break;
+                };
                 (a.same(&b), a.rows.max(b.rows), a.bounds_union(&b))
             };
             if same {
@@ -596,11 +624,14 @@ impl Session<'_> {
         &mut self,
         range: &KeyRange,
         is_source: bool,
-    ) -> CliResult<faucet_core::diff::ContentDigest> {
+    ) -> CliResult<Option<faucet_core::diff::ContentDigest>> {
         let rows = if is_source {
             self.fetch_source(range).await?
         } else {
             self.fetch_dest(range).await?
+        };
+        let Some(rows) = rows else {
+            return Ok(None);
         };
         let mut acc = DigestAccumulator::new();
         for r in &rows {
@@ -609,17 +640,21 @@ impl Session<'_> {
                 faucet_core::diff::key_int(r, self.key),
             );
         }
-        Ok(acc.finish())
+        Ok(Some(acc.finish()))
     }
 }
 
-/// Read one key range from a source. `ALL` clears any applied range.
+/// Read one key range from a source. `ALL` clears any applied range. With a
+/// `limit` the read is streamed and stops past it; the flag says whether the
+/// range was read completely.
 async fn fetch_range(
     src: &dyn Source,
     range: &KeyRange,
     key: &[String],
     side: &str,
-) -> CliResult<Vec<Value>> {
+    limit: Option<u64>,
+) -> CliResult<(Vec<Value>, bool)> {
+    use futures::StreamExt as _;
     if key.len() == 1 && (range.lo.is_some() || range.hi.is_some()) {
         src.apply_shard(&range.to_shard(&key[0]))
             .await
@@ -627,11 +662,26 @@ async fn fetch_range(
                 CliError::Config(format!("verify: narrowing the {side} to {range}: {e}"))
             })?;
     }
-    src.fetch_all().await.map_err(|e| {
+    let read_err = |e: FaucetError| {
         CliError::Faucet(FaucetError::Source(format!(
             "verify: reading the {side}: {e}"
         )))
-    })
+    };
+    let Some(limit) = limit else {
+        return Ok((src.fetch_all().await.map_err(read_err)?, true));
+    };
+    let context = HashMap::new();
+    let batch = usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000);
+    let mut pages = src.stream_pages(&context, batch);
+    let mut rows = Vec::new();
+    while let Some(page) = pages.next().await {
+        rows.extend(page.map_err(read_err)?.records);
+        if rows.len() as u64 > limit {
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            return Ok((rows, false));
+        }
+    }
+    Ok((rows, true))
 }
 
 /// The key range a PK shard descriptor covers (the whole space for a
@@ -1058,6 +1108,42 @@ mod tests {
         };
         let out = verify_node(&node, &spec, &repair_inputs()).await.unwrap();
         assert_eq!(out.report.repaired_upserts, Some(1), "{out:?}");
+    }
+
+    /// `max_rows_scanned` bounds a whole-dataset comparison too: the read
+    /// stops past the cap, the report is truncated, and a partial set is not
+    /// diffed into false "missing" rows.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn the_scan_cap_bounds_a_full_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(i64, &str, &str)> = (1..=5).map(|i| (i, "t", "v")).collect();
+        let node = sqlite_mirror(dir.path(), &["id", "ts"], &rows, "").await;
+        let spec = VerifySpec {
+            key: vec!["id".into(), "ts".into()],
+            max_rows_scanned: Some(3),
+            ..Default::default()
+        };
+        let check = VerifyInputs {
+            repair: false,
+            ..repair_inputs()
+        };
+        let out = verify_node(&node, &spec, &check).await.unwrap();
+        assert_eq!(out.strategy, "full");
+        assert!(out.report.truncated, "{out:?}");
+        assert!(out.report.rows_fetched_source <= 3, "{out:?}");
+        assert!(out.report.differences.is_empty(), "{out:?}");
+        let uncapped = verify_node(
+            &node,
+            &VerifySpec {
+                max_rows_scanned: None,
+                ..spec
+            },
+            &check,
+        )
+        .await
+        .unwrap();
+        assert_eq!(uncapped.report.differences.len(), 5);
     }
 
     #[test]
