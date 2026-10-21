@@ -322,9 +322,17 @@ pub struct Profiler {
     spec: ProfilingSpec,
     rows: u64,
     columns: HashMap<String, ColumnAcc>,
-    /// Column names seen and rejected by the cap (so the count is exact).
+    /// Column names seen and rejected by the cap, kept exactly up to
+    /// [`SKIPPED_EXACT`] names so the count is exact for ordinary records.
     skipped: std::collections::HashSet<String>,
+    /// Every rejected name, as a bounded sketch: records keyed by data (an id
+    /// or a date per key) would otherwise grow the exact set without limit.
+    skipped_sketch: HyperLogLog,
 }
+
+/// How many rejected column names are remembered exactly before the count
+/// switches to the bounded estimate.
+const SKIPPED_EXACT: usize = 1024;
 
 impl Profiler {
     pub fn new(spec: ProfilingSpec) -> Self {
@@ -333,6 +341,7 @@ impl Profiler {
             rows: 0,
             columns: HashMap::new(),
             skipped: std::collections::HashSet::new(),
+            skipped_sketch: HyperLogLog::new(),
         }
     }
 
@@ -362,7 +371,10 @@ impl Profiler {
                     continue;
                 }
                 if self.columns.len() >= self.spec.max_columns {
-                    self.skipped.insert(name.clone());
+                    self.skipped_sketch.insert(name.as_str());
+                    if self.skipped.len() < SKIPPED_EXACT && !self.skipped.contains(name) {
+                        self.skipped.insert(name.clone());
+                    }
                     continue;
                 }
                 let mut acc =
@@ -382,7 +394,11 @@ impl Profiler {
                 .iter()
                 .map(|(name, acc)| (name.clone(), acc.finish(self.rows, &self.spec)))
                 .collect(),
-            skipped_columns: self.skipped.len() as u64,
+            skipped_columns: if self.skipped.len() < SKIPPED_EXACT {
+                self.skipped.len() as u64
+            } else {
+                self.skipped_sketch.estimate().max(SKIPPED_EXACT as u64)
+            },
         }
     }
 }
@@ -504,6 +520,25 @@ mod tests {
         let mut p = Profiler::new(spec);
         p.observe_page(&[json!({"a": "x"})]);
         assert!(p.finish().columns["a"].top_values.is_none());
+    }
+
+    #[test]
+    fn rejected_column_names_are_counted_in_bounded_memory() {
+        let mut p = Profiler::new(ProfilingSpec {
+            max_columns: 1,
+            ..Default::default()
+        });
+        let page: Vec<Value> = (0..20_000)
+            .map(|i| json!({"id": i, format!("k{i}"): 1}))
+            .collect();
+        p.observe_page(&page);
+        assert_eq!(
+            p.skipped.len(),
+            SKIPPED_EXACT,
+            "the exact set stops growing"
+        );
+        let n = p.finish().skipped_columns;
+        assert!((19_000..=21_000).contains(&n), "estimate {n} ~ 20000");
     }
 
     #[test]
