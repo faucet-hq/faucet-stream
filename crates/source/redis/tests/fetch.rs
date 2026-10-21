@@ -418,6 +418,38 @@ async fn fetch_all_keys_returns_key_value_pairs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_scan_past_max_tracked_keys_still_reads_every_key() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    for i in 0..50 {
+        let _: () = conn.set(format!("k:{i}"), i).await.unwrap();
+    }
+    for limit in [0, 3, 1_000] {
+        let source = RedisSource::new(
+            RedisSourceConfig::new(
+                &url,
+                RedisSourceType::Keys {
+                    pattern: "k:*".into(),
+                },
+            )
+            .with_batch_size(7)
+            .with_max_tracked_keys(limit),
+        )
+        .unwrap();
+        let mut keys: Vec<String> = source
+            .fetch_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r["key"].as_str().unwrap().to_owned())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 50, "limit {limit}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_non_utf8_key_name_is_read_not_fatal() {
     let (_container, url) = start_redis().await;
     let mut conn = open_conn(&url).await;

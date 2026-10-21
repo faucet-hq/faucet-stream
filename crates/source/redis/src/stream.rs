@@ -274,6 +274,7 @@ impl faucet_core::Source for RedisSource {
         let batch_size = self.config.batch_size;
         let max_records = self.config.max_records;
         let decoding = Decoding::of(&self.config);
+        let max_tracked_keys = self.config.max_tracked_keys;
 
         Box::pin(async_stream::try_stream! {
             let mut conn = self.connection().await?;
@@ -329,7 +330,7 @@ impl faucet_core::Source for RedisSource {
                     } else {
                         substitute_pattern(pattern, context)
                     };
-                    let pages = stream_keys(&calls, &mut conn, &resolved, batch_size, max_records, decoding);
+                    let pages = stream_keys(&calls, &mut conn, &resolved, batch_size, max_records, decoding, max_tracked_keys);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -541,6 +542,7 @@ fn stream_keys<'a>(
     batch_size: usize,
     max_records: Option<usize>,
     decoding: Decoding,
+    max_tracked_keys: usize,
 ) -> impl Stream<Item = Result<StreamPage, FaucetError>> + 'a {
     use faucet_core::DEFAULT_BATCH_SIZE;
     async_stream::try_stream! {
@@ -560,8 +562,9 @@ fn stream_keys<'a>(
         let mut buffer: Vec<Vec<u8>> = Vec::new();
         let mut emitted: usize = 0;
         // SCAN may return a key more than once; emit each once (#789 MSG-85).
-        // A 16-byte fingerprint per key bounds the set however long the names.
-        let mut seen: HashSet<u128> = HashSet::new();
+        // A 16-byte fingerprint per key bounds the set however long the names,
+        // and `max_tracked_keys` bounds how many it holds.
+        let mut seen = SeenKeys::new(max_tracked_keys);
         let mut skipped: usize = 0;
 
         'scan: loop {
@@ -581,7 +584,7 @@ fn stream_keys<'a>(
                 })
                 .await?;
             cursor = next_cursor;
-            buffer.extend(keys.into_iter().filter(|k| seen.insert(key_fingerprint(k))));
+            buffer.extend(keys.into_iter().filter(|k| seen.first_time(k)));
 
             // Flush as many full pages as the buffer now holds.
             while emitted < cap && buffer.len() >= chunk_size {
@@ -606,6 +609,14 @@ fn stream_keys<'a>(
             skipped += other;
             yield StreamPage { records, bookmark: None };
         }
+        if seen.full {
+            tracing::warn!(
+                pattern,
+                max_tracked_keys,
+                "Redis Keys source matched more keys than max_tracked_keys; a key SCAN \
+                 returned again after that point may have been emitted twice"
+            );
+        }
         if skipped > 0 {
             tracing::warn!(
                 pattern,
@@ -614,6 +625,42 @@ fn stream_keys<'a>(
                  zset or stream); narrow the pattern to string keys"
             );
         }
+    }
+}
+
+/// The key names a `Keys` scan has emitted, at most `limit` of them.
+struct SeenKeys {
+    set: HashSet<u128>,
+    limit: usize,
+    /// The limit was reached while new keys were still arriving.
+    full: bool,
+}
+
+impl SeenKeys {
+    fn new(limit: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            limit,
+            full: false,
+        }
+    }
+
+    /// Whether `key` should be emitted: not one already remembered. Once
+    /// `limit` keys are remembered, new ones pass without being recorded.
+    fn first_time(&mut self, key: &[u8]) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        let fp = key_fingerprint(key);
+        if self.set.contains(&fp) {
+            return false;
+        }
+        if self.set.len() < self.limit {
+            self.set.insert(fp);
+        } else {
+            self.full = true;
+        }
+        true
     }
 }
 
@@ -710,6 +757,26 @@ fn stream_ignores_consumer_group(group: Option<&str>, consumer: Option<&str>) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seen_keys_dedups_up_to_its_limit_then_passes_new_keys() {
+        let mut seen = super::SeenKeys::new(2);
+        assert!(seen.first_time(b"a"));
+        assert!(!seen.first_time(b"a"));
+        assert!(seen.first_time(b"b"));
+        assert!(!seen.full);
+        assert!(seen.first_time(b"c"));
+        assert!(seen.full);
+        // Not remembered, so a repeat passes again; remembered keys still dedup.
+        assert!(seen.first_time(b"c"));
+        assert!(!seen.first_time(b"b"));
+        assert_eq!(seen.set.len(), 2);
+
+        let mut off = super::SeenKeys::new(0);
+        assert!(off.first_time(b"a"));
+        assert!(off.first_time(b"a"));
+        assert!(off.set.is_empty() && !off.full);
+    }
+
     /// The value-fidelity corpus (#885): every record, serialized the way a
     /// producer sends it, decodes back unchanged.
     #[test]

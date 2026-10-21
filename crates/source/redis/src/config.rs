@@ -78,6 +78,21 @@ pub struct RedisSourceConfig {
     /// sequences with U+FFFD, `error` fails the run naming the key.
     #[serde(default)]
     pub binary: RedisBinary,
+    /// `Keys` mode: how many matched key names the scan remembers to emit a
+    /// key `SCAN` returns twice only once (16 bytes plus set overhead each,
+    /// about 48 MB at the default 1,000,000). Past the limit the scan stops
+    /// remembering new keys, so a later duplicate can be emitted again (a
+    /// warning says so) while memory stays bounded. `0` turns de-duplication
+    /// off.
+    #[serde(default = "default_max_tracked_keys")]
+    pub max_tracked_keys: usize,
+}
+
+/// Default for [`RedisSourceConfig::max_tracked_keys`].
+pub const DEFAULT_MAX_TRACKED_KEYS: usize = 1_000_000;
+
+fn default_max_tracked_keys() -> usize {
+    DEFAULT_MAX_TRACKED_KEYS
 }
 
 /// Which Redis values the source parses as JSON.
@@ -119,6 +134,7 @@ impl std::fmt::Debug for RedisSourceConfig {
             .field("batch_size", &self.batch_size)
             .field("parse_json", &self.parse_json)
             .field("binary", &self.binary)
+            .field("max_tracked_keys", &self.max_tracked_keys)
             .finish()
     }
 }
@@ -133,7 +149,14 @@ impl RedisSourceConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             parse_json: RedisJsonParsing::default(),
             binary: RedisBinary::default(),
+            max_tracked_keys: DEFAULT_MAX_TRACKED_KEYS,
         }
+    }
+
+    /// Set [`max_tracked_keys`](Self::max_tracked_keys).
+    pub fn with_max_tracked_keys(mut self, max: usize) -> Self {
+        self.max_tracked_keys = max;
+        self
     }
 
     /// Set the maximum number of records to return.

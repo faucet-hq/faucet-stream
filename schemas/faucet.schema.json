@@ -19521,6 +19521,13 @@
                       "description": "What to do with a value that is not valid UTF-8 (msgpack, gzip, …):\n`base64` (default) emits it base64-encoded, `lossy` replaces invalid\nsequences with U+FFFD, `error` fails the run naming the key.",
                       "$ref": "#/$defs/source_redis__RedisBinary",
                       "default": "base64"
+                    },
+                    "max_tracked_keys": {
+                      "default": 1000000,
+                      "description": "`Keys` mode: how many matched key names the scan remembers to emit a\nkey `SCAN` returns twice only once (16 bytes plus set overhead each,\nabout 48 MB at the default 1,000,000). Past the limit the scan stops\nremembering new keys, so a later duplicate can be emitted again (a\nwarning says so) while memory stays bounded. `0` turns de-duplication\noff.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": "integer"
                     }
                   }
                 },

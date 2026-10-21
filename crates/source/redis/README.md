@@ -70,6 +70,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`, mapped onto each mode's native paging primitive. **`0` = no batching** (drain into one page). See [Streaming & batching](#streaming--batching). |
 | `parse_json` | `all` \| `containers` \| `none` | `all` | Which values are parsed as JSON. `all` parses any valid JSON value, so `"42"` becomes `42` and `"true"` becomes `true`; `containers` parses only objects and arrays, so `"1.10"`, `"true"` and long numeric ids stay strings (recommended when values are identifiers or decimal text whose exact spelling matters); `none` keeps every value a string. |
 | `binary` | `base64` \| `lossy` \| `error` | `base64` | A value that is not valid UTF-8 (msgpack, gzip, …): base64-encode it, replace invalid sequences with U+FFFD, or fail the run naming the key. |
+| `max_tracked_keys` | int | `1000000` | `Keys` mode: how many matched key names the scan remembers to drop a key `SCAN` returns twice. Bounds memory; `0` turns de-duplication off. |
 
 The connection reconnects on its own after the server drops it (a failover), with a short bounded retry when the server is unreachable.
 
@@ -108,7 +109,7 @@ Each entry is returned as:
 
 #### `Keys`
 
-Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once — the run keeps a 16-byte fingerprint of every matched key name, so memory grows with the number of keys matched, not their length. A key name that is not valid UTF-8 is rendered into the record's `key` per `binary`. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
+Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once — the run keeps a 16-byte fingerprint of each matched key name, up to `max_tracked_keys` of them (default 1,000,000, about 48 MB), so memory is bounded however large the keyspace. Past that limit new keys are no longer remembered, so a duplicate `SCAN` returns later (it does so only while the server resizes its keyspace) can be emitted twice, and a `WARN` says so; `max_tracked_keys: 0` turns de-duplication off. A key name that is not valid UTF-8 is rendered into the record's `key` per `binary`. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
