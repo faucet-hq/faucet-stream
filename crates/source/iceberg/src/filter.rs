@@ -387,11 +387,52 @@ fn parse_number(n: &str) -> Result<Literal, FaucetError> {
     if let Ok(i) = n.parse::<i64>() {
         return Ok(Literal::Int(i));
     }
-    n.parse::<f64>()
+    let f = n
+        .parse::<f64>()
         .ok()
         .filter(|f| f.is_finite())
-        .map(Literal::Float)
-        .ok_or_else(|| err(format!("{n:?} is not a number")))
+        .ok_or_else(|| err(format!("{n:?} is not a number")))?;
+    // A literal a double cannot hold exactly would be compared as a rounded
+    // value (a `decimal` column included): refuse it, so the filter never
+    // silently matches different rows. Quoted, it keeps every digit.
+    if decimal_key(n) != decimal_key(&f.to_string()) {
+        return Err(err(format!(
+            "number {n} has more digits than a double holds; quote it ('{n}') to compare \
+             a decimal column exactly"
+        )));
+    }
+    Ok(Literal::Float(f))
+}
+
+/// `(negative, significant digits, exponent)` of a decimal number's text, so
+/// two spellings of the same value compare equal (`1.50` and `1.5e0`).
+fn decimal_key(text: &str) -> Option<(bool, String, i64)> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exp) = match rest.find(['e', 'E']) {
+        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !(int.chars().chain(frac.chars())).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let digits = format!("{int}{frac}");
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    let digits = digits
+        .trim_start_matches('0')
+        .trim_end_matches('0')
+        .to_string();
+    if digits.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    // Exponent of the first significant digit.
+    let point = exp
+        .checked_add(int.len() as i64)?
+        .checked_sub(lead as i64)?;
+    Some((negative, digits, point))
 }
 
 /// Parse a filter expression.
@@ -490,6 +531,20 @@ pub fn datum_for(column: &str, lit: &Literal, ty: &PrimitiveType) -> Result<Datu
         (PrimitiveType::Float, Literal::Float(f)) => Ok(Datum::float(*f as f32)),
         (PrimitiveType::Double, Literal::Int(i)) => Ok(Datum::double(*i as f64)),
         (PrimitiveType::Double, Literal::Float(f)) => Ok(Datum::double(*f)),
+        (PrimitiveType::Float, Literal::Str(s)) => s
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(Datum::float)
+            .ok_or_else(mismatch),
+        (PrimitiveType::Double, Literal::Str(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(Datum::double)
+            .ok_or_else(mismatch),
         (
             PrimitiveType::Decimal { scale, .. },
             Literal::Int(_) | Literal::Float(_) | Literal::Str(_),
@@ -882,6 +937,29 @@ mod tests {
         ))
         .unwrap();
         assert!(parse(&vec!["b = true"; MAX_DEPTH + 1].join(" and ")).is_err());
+    }
+
+    /// An unquoted number a double cannot hold exactly is refused rather
+    /// than rounded; quoted, it keeps every digit for a decimal column, and a
+    /// float column still takes it.
+    #[test]
+    fn high_precision_numbers_are_never_rounded() {
+        for n in ["12345678901234567.89", "99999999999999999999"] {
+            let e = parse(&format!("a = {n}")).unwrap_err().to_string();
+            assert!(e.contains("quote it"), "{e}");
+        }
+        for n in ["1.5", "0.1", "2e3", "-0.25", "1.50", "123456789012.34"] {
+            assert!(parse(&format!("a = {n}")).is_ok(), "{n}");
+        }
+        let ty = PrimitiveType::Decimal {
+            precision: 20,
+            scale: 2,
+        };
+        let exact = datum_for("a", &Literal::Str("12345678901234567.89".into()), &ty).unwrap();
+        assert_eq!(exact.to_string(), "12345678901234567.89");
+        let d = datum_for("x", &Literal::Str("0.5".into()), &PrimitiveType::Double).unwrap();
+        assert_eq!(d, Datum::double(0.5));
+        assert!(datum_for("x", &Literal::Str("abc".into()), &PrimitiveType::Double).is_err());
     }
 
     #[test]
