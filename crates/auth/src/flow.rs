@@ -630,7 +630,12 @@ pub struct FlowProvider {
     state: Mutex<Option<Session>>,
     /// Logins so far; each session's number is exposed as [`FLOW_SESSION_KEY`].
     logins: std::sync::atomic::AtomicU64,
+    /// Recent `credential()` header values and the session that issued them.
+    issued: std::sync::Mutex<std::collections::VecDeque<(String, u64)>>,
 }
+
+/// How many issued header credentials are remembered for `invalidate`.
+const ISSUED_HEADERS_KEPT: usize = 256;
 
 /// Captured-context key holding the current session's number. A connector
 /// that consumes [`request_auth`](AuthProvider::request_auth) passes
@@ -658,6 +663,7 @@ impl FlowProvider {
             config,
             state: Mutex::new(None),
             logins: std::sync::atomic::AtomicU64::new(0),
+            issued: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -814,6 +820,23 @@ impl FlowProvider {
         Ok(ctx)
     }
 
+    fn remember_issued(&self, value: &str, session: u64) {
+        let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        if issued.len() >= ISSUED_HEADERS_KEPT {
+            issued.pop_front();
+        }
+        issued.push_back((value.to_owned(), session));
+    }
+
+    fn issued_session(&self, value: &str) -> Option<u64> {
+        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        issued
+            .iter()
+            .rev()
+            .find(|(v, _)| v == value)
+            .map(|(_, s)| *s)
+    }
+
     fn request_auth_from_ctx(&self, captured: &HashMap<String, String>) -> RequestAuth {
         let mut ctx = captured.clone();
         ctx.extend(Self::clock_ctx());
@@ -831,6 +854,9 @@ impl AuthProvider for FlowProvider {
         // credential. Query/cookie/body placements need `request_auth`.
         for p in &auth.placements {
             if let CredentialPlacement::Header { name, value } = p {
+                if let Some(Ok(session)) = ctx.get(FLOW_SESSION_KEY).map(|c| c.parse::<u64>()) {
+                    self.remember_issued(value, session);
+                }
                 return Ok(Credential::Header {
                     name: name.clone(),
                     value: value.clone(),
@@ -852,16 +878,18 @@ impl AuthProvider for FlowProvider {
             // another caller already re-logged for: keep the new session. A
             // token that names no session (empty, or not a session number)
             // invalidates the live one.
-            let superseded = match (state.as_ref(), stale) {
-                (Some(s), Credential::Token(sent)) => {
+            let sent_session = match stale {
+                Credential::Token(sent) => sent.parse::<u64>().ok(),
+                Credential::Header { value, .. } => self.issued_session(value),
+                _ => None,
+            };
+            let superseded = match (state.as_ref(), sent_session) {
+                (Some(s), Some(sent)) => {
                     s.valid()
-                        && match (
-                            sent.parse::<u64>(),
+                        && matches!(
                             s.ctx.get(FLOW_SESSION_KEY).map(|c| c.parse::<u64>()),
-                        ) {
-                            (Ok(sent), Some(Ok(cur))) => sent < cur,
-                            _ => false,
-                        }
+                            Some(Ok(cur)) if sent < cur
+                        )
                 }
                 _ => false,
             };
@@ -1295,6 +1323,35 @@ mod tests {
         p.invalidate(&Credential::Token("2".into())).await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 3);
         p.invalidate(&Credential::Bearer("whatever".into()))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn concurrent_header_invalidations_of_one_session_log_in_once() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(CountingLogin(hits.clone()))
+            .mount(&server)
+            .await;
+        let cfg = json!({
+            "steps": [ { "request": { "method": "POST", "url": format!("{}/login", server.uri()) },
+                         "capture": { "sid": "$.sid" } } ],
+            "apply": [ { "into": "header", "name": "X", "value": "${sid}" } ]
+        });
+        let p = FlowProvider::from_config(&cfg).unwrap();
+        let stale = p.credential().await.unwrap();
+        let first = p.invalidate(&stale).await.unwrap();
+        let second = p.invalidate(&stale).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(matches!(&first, Credential::Header { value, .. } if value == "S2"));
+        assert!(matches!(&second, Credential::Header { value, .. } if value == "S2"));
+        p.invalidate(&second).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        p.invalidate(&Credential::Header { name: "X".into(), value: "unknown".into() })
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4);
