@@ -201,10 +201,12 @@ Run a template once per tenant:
 ```bash
 curl -X POST localhost:8080/v1/templates/crm-contacts/fanout \
   -H "Authorization: Bearer $OPERATOR" -H 'content-type: application/json' \
-  -d '{"tenants": "all", "concurrency": 8}'
+  -d '{"tenants": "all", "fanout_concurrency": 8}'
 ```
 
-`tenants` is `"all"` (every tenant that is not suspended) or a list. Each
+`tenants` is `"all"` (every tenant that is not suspended) or a list.
+`fanout_concurrency` caps the submissions in flight (default 4); `concurrency`
+is the trigger body's own field and caps each run's connectors. Each
 tenant runs as itself; the response has one entry per tenant —
 `submitted` (with `run_id`), `pending_approval`, `skipped` (a missing or
 revoked connection, a suspended tenant, a tenant at its limit — with the

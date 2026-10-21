@@ -605,9 +605,10 @@ pub async fn resolve_tenants(
 #[derive(Debug, Clone, Deserialize)]
 pub struct FanoutBody {
     pub tenants: TenantSelector,
-    /// Submissions in flight at once. Default 4.
+    /// Submissions in flight at once. Default 4. (`concurrency` belongs to the
+    /// trigger body: each run's connector concurrency.)
     #[serde(default)]
-    pub concurrency: Option<usize>,
+    pub fanout_concurrency: Option<usize>,
     #[serde(flatten)]
     pub trigger: TriggerBody,
 }
@@ -684,7 +685,7 @@ pub async fn fan_out(
 ) -> Result<Vec<FanoutResult>, ServeError> {
     body.tenants.validate().map_err(ServeError::BadConfig)?;
     let concurrency = body
-        .concurrency
+        .fanout_concurrency
         .unwrap_or(DEFAULT_FANOUT_CONCURRENCY)
         .clamp(1, MAX_FANOUT_CONCURRENCY);
     let (targets, mut results) = resolve_tenants(state, &body.tenants).await?;
@@ -779,6 +780,18 @@ pub async fn fanout_template(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fanout_concurrency_and_run_concurrency_are_separate_fields() {
+        let body: super::FanoutBody = serde_json::from_value(serde_json::json!({
+            "tenants": "all",
+            "concurrency": 2,
+            "fanout_concurrency": 8,
+        }))
+        .unwrap();
+        assert_eq!(body.fanout_concurrency, Some(8));
+        assert_eq!(body.trigger.concurrency, Some(2));
+    }
+
     use super::*;
 
     #[test]

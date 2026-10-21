@@ -431,7 +431,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/connect/providers` | `200` | The `--connect-providers` providers |
 | `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |
-| `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `concurrency`) — operator / `RunWrite` |
+| `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `fanout_concurrency`) — operator / `RunWrite` |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |
