@@ -245,17 +245,31 @@ fn canonicalize_yaml(value: serde_yaml::Value) -> serde_yaml::Value {
 /// Replace `path` with `contents` atomically: a sibling temp file renamed
 /// over it, so an interrupted `fmt` never leaves a truncated config.
 fn write_atomically(path: &Path, contents: &str) -> CliResult<()> {
-    let name = path
+    let fail = |e: std::io::Error| CliError::Config(format!("cannot write '{}': {e}", path.display()));
+    // Rewrite a symlink's target, never the link itself.
+    let target = std::fs::canonicalize(path).map_err(fail)?;
+    let permissions = std::fs::metadata(&target).map_err(fail)?.permissions();
+    let name = target
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
-    let tmp = path.with_file_name(format!(".{name}.{}.fmt-tmp", std::process::id()));
-    std::fs::write(&tmp, contents)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            CliError::Config(format!("cannot write '{}': {e}", path.display()))
-        })
+    let tmp = target.with_file_name(format!(".{name}.{}.fmt-tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.set_permissions(permissions.clone())?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &target)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        fail(e)
+    })
 }
 
 /// A minimal LCS-based unified-ish line diff, used only to show what `--check`
@@ -418,6 +432,29 @@ mod tests {
             1,
             "no temp left"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_keeps_the_file_mode_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.yaml");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link.yaml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomically(&link, "new\n").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link survives"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "no temp left");
     }
 
     #[test]
