@@ -317,11 +317,24 @@ fn values_agree(sent: &Value, landed: &Value, tol: &Tolerance) -> bool {
     if tol.empty_string_is_null && sent.as_str() == Some("") && landed.is_null() {
         return true;
     }
-    if let (Some(eps), Some(a), Some(b)) = (tol.float_epsilon, sent.as_f64(), landed.as_f64()) {
-        let scale = a.abs().max(b.abs()).max(1.0);
-        return (a - b).abs() <= eps * scale;
+    // The epsilon is for floats only. An integer is compared exactly: going
+    // through an f64 would hide the precision loss past 2^53 the corpus's
+    // integer row exists to catch.
+    if let (Some(eps), Value::Number(n), Value::Number(m)) = (tol.float_epsilon, sent, landed) {
+        if n.is_i64() || n.is_u64() {
+            return integer_agrees(n, m);
+        }
+        if let (Some(a), Some(b)) = (n.as_f64(), m.as_f64()) {
+            let scale = a.abs().max(b.abs()).max(1.0);
+            return (a - b).abs() <= eps * scale;
+        }
     }
-    if tol.lenient_scalar_kind && !sent.is_object() && !sent.is_array() {
+    if tol.lenient_scalar_kind
+        && !sent.is_object()
+        && !sent.is_array()
+        && !sent.is_null()
+        && !landed.is_null()
+    {
         let render = |v: &Value| match v {
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -329,6 +342,23 @@ fn values_agree(sent: &Value, landed: &Value, tol: &Tolerance) -> bool {
         return render(sent) == render(landed);
     }
     false
+}
+
+/// Whether `landed` holds exactly the integer `sent`: the same integer, or a
+/// float that is that whole number and within the range an f64 holds exactly.
+fn integer_agrees(sent: &serde_json::Number, landed: &serde_json::Number) -> bool {
+    if let (Some(a), Some(b)) = (sent.as_i64(), landed.as_i64()) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (sent.as_u64(), landed.as_u64()) {
+        return a == b;
+    }
+    match (sent.as_i64(), landed.as_f64()) {
+        (Some(a), Some(b)) if !landed.is_i64() && !landed.is_u64() => {
+            a.unsigned_abs() <= 1 << 53 && a as f64 == b
+        }
+        _ => false,
+    }
 }
 
 /// Assert every value survived the round trip, panicking with every mismatch
@@ -480,6 +510,36 @@ mod tests {
             1,
             "an epsilon must not excuse a genuinely different value"
         );
+    }
+
+    #[test]
+    fn float_epsilon_does_not_hide_big_integer_rounding() {
+        let tol = Tolerance::exact().float_epsilon(1e-15);
+        assert!(diff_round_trip(&corpus(), &corpus(), &tol).is_empty());
+        let mut landed = corpus();
+        landed[0]["beyond_f64_exact"] = json!(9_007_199_254_740_992i64);
+        assert_eq!(diff_round_trip(&corpus(), &landed, &tol).len(), 1);
+        let mut landed = corpus();
+        landed[0]["i64_max"] = json!(i64::MAX as f64);
+        assert_eq!(diff_round_trip(&corpus(), &landed, &tol).len(), 1);
+        let mut landed = corpus();
+        landed[0]["i64_max"] = json!(i64::MAX - 1);
+        assert_eq!(diff_round_trip(&corpus(), &landed, &tol).len(), 1);
+        // A small whole number read back as a float is still the same value.
+        let mut landed = corpus();
+        landed[0]["negative"] = json!(-1.0);
+        assert!(diff_round_trip(&corpus(), &landed, &tol).is_empty());
+        // Floats keep their tolerance.
+        let mut landed = corpus();
+        landed[1]["repeating"] = json!(0.1 + 1e-16);
+        assert!(diff_round_trip(&corpus(), &landed, &tol).is_empty());
+    }
+
+    #[test]
+    fn lenient_scalar_kind_never_turns_null_into_text() {
+        let tol = Tolerance::exact().lenient_scalar_kind();
+        assert!(!values_agree(&Value::Null, &json!("null"), &tol));
+        assert!(!values_agree(&json!("null"), &Value::Null, &tol));
     }
 
     #[test]
