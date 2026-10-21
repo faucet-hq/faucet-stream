@@ -251,7 +251,16 @@ a URL or a program carries an `x-faucet-resource` annotation in its schema, so
 the server confines connector configs it has never seen, plugin connectors
 included, with no per-connector code. The same allow-list covers `${env:}`,
 `${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
-lineage paths, and the `token_url` / `url` of an `auth:` provider.
+lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,
+a `flow` provider's `steps[].request.url` and `base_url_from`, a service
+account's `token_uri` — in the config or inside `key_json`), a transform that
+reads a file (`lookup`'s `jsonl`), and the `reconcile:` count probe (a SQL probe
+runs sandboxed like every other SQL connector). An `auth:` provider in a
+caller's config may not name a local file at all: pass a service-account key
+inline as `key_json` rather than `key_file`, and leave out `oauth2_refresh`'s
+`persist` (the server decides where tokens are written). A tenant's
+connections are held to the same rules, under the tenant's policy, when they
+are stored and again whenever a run uses them.
 
 | Reference | Default for a caller's config | Widen with |
 |-----------|-------------------------------|------------|
@@ -276,7 +285,10 @@ checked, so it is refused; register the pipeline as a template instead.
 
 **At run time.** A caller's run executes with the caller policy scoped over
 it — on every instance that claims it, sharded or not — so its HTTP connectors
-check the first request and every redirect hop against it. Whatever the
+check the first request and every redirect hop against it. The network
+calls a submission makes before it is queued (partition bound probes,
+discovery fan-out, row selection, and the auth logins they trigger) run under
+the same policy. Whatever the
 origin, an HTTP connector never follows a redirect into a link-local or
 cloud-metadata address.
 

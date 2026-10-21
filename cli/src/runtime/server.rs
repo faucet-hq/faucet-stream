@@ -126,10 +126,19 @@ pub async fn load(
             ServeError::BadConfig(crate::secrets::registry::redact(&e.to_string()).into_owned())
         };
         let auth = loaded.auth_catalog().map_err(bad)?;
-        loaded.nodes = sel
-            .apply_resolved(&loaded.cfg, nodes, &auth)
-            .await
-            .map_err(bad)?;
+        // Resolving the selection may call the source (discovery): under the
+        // body's reference policy, like the load and the run.
+        let refs = std::sync::Arc::new(
+            state
+                .references()
+                .for_origin(principal.body_origin(), principal.tenant()),
+        );
+        loaded.nodes = faucet_core::http::with_reference_policy(
+            refs,
+            sel.apply_resolved(&loaded.cfg, nodes, &auth),
+        )
+        .await
+        .map_err(bad)?;
     }
     Ok(loaded)
 }
