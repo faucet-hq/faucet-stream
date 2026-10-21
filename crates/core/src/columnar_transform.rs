@@ -307,7 +307,7 @@ fn constant_column(
         // rather than silently corrupt if that gate is ever weakened.
         other => {
             return Err(FaucetError::Transform(format!(
-                "columnar set/redact: value {other} is not a columnar-safe scalar                  (should have fallen back to the Value path)"
+                "columnar set/redact: value {other} is not a columnar-safe scalar (should have fallen back to the Value path)"
             )));
         }
     };

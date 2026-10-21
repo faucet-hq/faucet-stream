@@ -105,7 +105,7 @@ pub enum FaucetError {
     /// saying where the rest went. The page is not checkpointed, so a resumed
     /// run reads it again.
     #[error(
-        "Rows unaccounted: the sink accepted {accepted} of {offered} offered rows and reported          no per-row failure or coalescing for the rest"
+        "Rows unaccounted: the sink accepted {accepted} of {offered} offered rows and reported no per-row failure or coalescing for the rest"
     )]
     RowsUnaccounted { offered: u64, accepted: u64 },
 
@@ -242,6 +242,17 @@ impl FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_unaccounted_message_reads_as_one_sentence() {
+        let msg = FaucetError::RowsUnaccounted {
+            offered: 10,
+            accepted: 9,
+        }
+        .to_string();
+        assert!(!msg.contains("  "), "{msg}");
+        assert!(msg.contains("accepted 9 of 10 offered rows and reported no per-row failure"));
+    }
 
     #[test]
     fn sink_status_types_only_retryable_statuses() {
