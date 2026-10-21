@@ -138,9 +138,14 @@ Evaluated in declared order; **first failure wins** for a given record.
 | `string_length` | `field`, `min?`, `max?` | char count in `[min, max]` (at least one bound required) | fail |
 | `json_schema` | `schema` | whole record validates against a JSON Schema document | (whole-record check) |
 
-**`compare` operators:** `gt`, `gte`, `lt`, `lte` require both the field value and
-the configured `value` to be JSON numbers; integer operands compare exactly (no
-`f64` rounding above 2^53). `eq` and `ne` compare two numbers by **numeric
+**`compare` operators:** `gt`, `gte`, `lt`, `lte` compare numbers: each operand
+is a JSON number or a string holding a decimal number (exact decimals and
+integers beyond 64 bits are written as strings, see
+[value fidelity](../reference/value-fidelity.md)), so `{field: amount, op: gte,
+value: 0}` works on a `NUMERIC` column. Decimal strings compare by their exact
+value and integer operands compare exactly (no `f64` rounding above 2^53); any
+other string fails the check. `type_is: number` still checks the JSON type, so
+it fails for a decimal written as a string. `eq` and `ne` compare two numbers by **numeric
 value** (so `1` and `1.0` are equal, and large 64-bit integers compare exactly),
 and all other types by exact structural equality — there is no cross-type
 coercion, so a string `"5"` never equals a number `5`.

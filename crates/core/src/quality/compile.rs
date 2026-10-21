@@ -6,6 +6,7 @@ use crate::error::FaucetError;
 use crate::quality::config::{
     BatchCheck, CompareOp, JsonType, OnFailure, QualitySpec, RecordCheck,
 };
+use crate::quality::record::ValueSetIndex;
 use crate::stage::CompiledPath;
 use serde_json::Value;
 
@@ -46,10 +47,14 @@ pub enum CompiledRecordKind {
     ValueInSet {
         path: CompiledPath,
         values: Vec<Value>,
+        /// Hashed lookup over `values`; build it with [`ValueSetIndex::new`].
+        index: ValueSetIndex,
     },
     NotInSet {
         path: CompiledPath,
         values: Vec<Value>,
+        /// Hashed lookup over `values`; build it with [`ValueSetIndex::new`].
+        index: ValueSetIndex,
     },
     Compare {
         path: CompiledPath,
@@ -212,6 +217,7 @@ fn compile_record_check(c: &RecordCheck) -> Result<CompiledRecordCheck, FaucetEr
                 kind: CompiledRecordKind::ValueInSet {
                     path: compile_path(field)?,
                     values: values.clone(),
+                    index: ValueSetIndex::new(values),
                 },
                 on_failure: *on_failure,
                 name: "value_in_set",
@@ -231,6 +237,7 @@ fn compile_record_check(c: &RecordCheck) -> Result<CompiledRecordCheck, FaucetEr
                 kind: CompiledRecordKind::NotInSet {
                     path: compile_path(field)?,
                     values: values.clone(),
+                    index: ValueSetIndex::new(values),
                 },
                 on_failure: *on_failure,
                 name: "not_in_set",
