@@ -54,7 +54,8 @@ pub struct PubsubSourceConfig {
     pub value_format: ValueFormat,
 
     /// JSON key the message attribute map is surfaced under. Default
-    /// `__attributes`.
+    /// `__attributes`. Must differ from the record's own fields (`data`,
+    /// `message_id`, `ordering_key`, `publish_time_millis`, `decode_error`).
     #[serde(default = "default_attributes_key")]
     pub attributes_key: String,
 
@@ -95,6 +96,15 @@ fn default_ack_deadline_extension_secs() -> u32 {
     60
 }
 
+/// Fields every record already carries, which `attributes_key` may not name.
+const RESERVED_RECORD_KEYS: &[&str] = &[
+    "data",
+    "message_id",
+    "ordering_key",
+    "publish_time_millis",
+    "decode_error",
+];
+
 fn default_attributes_key() -> String {
     DEFAULT_ATTRIBUTES_KEY.to_string()
 }
@@ -134,6 +144,13 @@ impl PubsubSourceConfig {
             return Err(FaucetError::Config(
                 "pubsub source: attributes_key must not be empty".into(),
             ));
+        }
+        if RESERVED_RECORD_KEYS.contains(&self.attributes_key.as_str()) {
+            return Err(FaucetError::Config(format!(
+                "pubsub source: attributes_key {:?} would replace the record's own `{}` \
+                 field; choose another name",
+                self.attributes_key, self.attributes_key
+            )));
         }
         if self.max_messages_per_pull == 0 || self.max_messages_per_pull > 1000 {
             return Err(FaucetError::Config(format!(
@@ -219,6 +236,19 @@ mod tests {
         let mut c = valid();
         c.attributes_key = String::new();
         assert!(c.validate().is_err());
+
+        for key in [
+            "data",
+            "message_id",
+            "ordering_key",
+            "publish_time_millis",
+            "decode_error",
+        ] {
+            let mut c = valid();
+            c.attributes_key = key.into();
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("would replace"), "{key}: {err}");
+        }
 
         let mut c = valid();
         c.max_messages_per_pull = 0;

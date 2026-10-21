@@ -18920,7 +18920,7 @@
                       "default": "json"
                     },
                     "attributes_key": {
-                      "description": "JSON key the message attribute map is surfaced under. Default\n`__attributes`.",
+                      "description": "JSON key the message attribute map is surfaced under. Default\n`__attributes`. Must differ from the record's own fields (`data`,\n`message_id`, `ordering_key`, `publish_time_millis`, `decode_error`).",
                       "type": "string",
                       "default": "__attributes"
                     },
