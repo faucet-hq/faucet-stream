@@ -307,3 +307,72 @@ async fn an_unreadable_data_file_fails_the_read() {
         );
     }
 }
+
+/// A table evolved by `ADD COLUMNS`: the columnar path gives every batch the
+/// table's schema — the old file's batch carries the new column as nulls, and a
+/// column stored at a narrower physical type is cast to the table's.
+#[cfg(feature = "arrow")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn columnar_batches_carry_the_table_schema_for_an_evolved_table() {
+    use arrow::array::{Array, Int32Array};
+    let dir = tempfile::tempdir().unwrap();
+    // Old file: id stored as int32, no email.
+    let old = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let new = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("email", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(StringArray::from(vec!["c@x"])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&dir.path().join("old.parquet"), &old, 1_000);
+    write_parquet(&dir.path().join("new.parquet"), &new, 1_000);
+    write_log(
+        dir.path(),
+        json!([
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "email", "type": "string", "nullable": true, "metadata": {}}
+        ]),
+        &[],
+        json!({}),
+        &[
+            ("old.parquet".into(), json!({})),
+            ("new.parquet".into(), json!({})),
+        ],
+        plain_protocol(),
+    );
+    for columns in [vec![], vec!["id".to_string(), "email".to_string()]] {
+        let mut cfg = source(dir.path());
+        cfg.columns = columns;
+        let src = DeltaSource::new(cfg).await.unwrap();
+        let ctx = std::collections::HashMap::new();
+        let batches: Vec<RecordBatch> = src
+            .stream_batches(&ctx, 0)
+            .map(|p| p.unwrap().batch)
+            .collect()
+            .await;
+        assert_eq!(batches.len(), 2);
+        for b in &batches {
+            let names: Vec<_> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
+            assert_eq!(names, vec!["id", "email"]);
+            assert_eq!(b.schema().field(0).data_type(), &DataType::Int64);
+            assert_eq!(b.schema().field(1).data_type(), &DataType::Utf8);
+        }
+        let old_batch = batches.iter().find(|b| b.num_rows() == 2).unwrap();
+        assert_eq!(old_batch.column(1).null_count(), 2);
+        let ids = old_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2]);
+    }
+}

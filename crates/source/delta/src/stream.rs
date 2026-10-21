@@ -407,6 +407,7 @@ impl faucet_core::Source for DeltaSource {
                         continue;
                     }
                     let batch = append_partition_columns(batch, &file.partitions, &schema, requested)?;
+                    let batch = conform_to_table(batch, &schema, requested, &file.path)?;
                     if self.config.batch_size == 0 {
                         file_batches.push(batch);
                     } else {
@@ -476,6 +477,63 @@ fn append_partition_columns(
     }
 
     arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| FaucetError::Source(format!("delta: assembling columnar batch failed: {e}")))
+}
+
+/// Give a data file's batch the table's schema, so every columnar page of a
+/// run has the same shape whatever file it came from: the table's columns in
+/// table order (only the `requested` ones when a projection is set), a column
+/// the file lacks (added to the table after the file was written) as nulls,
+/// and a column the file stores at another physical type cast to the table's.
+/// The row path gives the same answer: absent requested columns are null and
+/// values decode to the table's types.
+#[cfg(feature = "arrow")]
+fn conform_to_table(
+    batch: arrow::array::RecordBatch,
+    table_schema: &SchemaRef,
+    requested: Option<&[String]>,
+    file: &impl std::fmt::Display,
+) -> Result<arrow::array::RecordBatch, FaucetError> {
+    use arrow::datatypes::Schema;
+    use std::sync::Arc;
+
+    let n = batch.num_rows();
+    let in_schema = batch.schema();
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for field in table_schema.fields() {
+        if let Some(cols) = requested
+            && !cols.iter().any(|c| c == field.name())
+        {
+            continue;
+        }
+        match in_schema.index_of(field.name()) {
+            Ok(i) => {
+                let column = batch.column(i);
+                let column = if column.data_type() == field.data_type() {
+                    column.clone()
+                } else {
+                    arrow::compute::cast(column, field.data_type()).map_err(|e| {
+                        FaucetError::Source(format!(
+                            "delta: column '{}' in '{file}' is {} but the table declares {}: {e}",
+                            field.name(),
+                            column.data_type(),
+                            field.data_type()
+                        ))
+                    })?
+                };
+                let nullable = field.is_nullable() || column.null_count() > 0;
+                fields.push(Arc::new(field.as_ref().clone().with_nullable(nullable)));
+                columns.push(column);
+            }
+            Err(_) => {
+                fields.push(Arc::new(field.as_ref().clone().with_nullable(true)));
+                columns.push(arrow::array::new_null_array(field.data_type(), n));
+            }
+        }
+    }
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(n));
+    arrow::array::RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
         .map_err(|e| FaucetError::Source(format!("delta: assembling columnar batch failed: {e}")))
 }
 

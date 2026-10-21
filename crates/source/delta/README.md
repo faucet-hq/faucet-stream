@@ -48,7 +48,11 @@ The **`arrow`** feature opts this source into the columnar fast path (#375): whe
 the sink is also Arrow-capable (e.g. `faucet-sink-parquet` /
 `faucet-sink-delta`), it emits Arrow `RecordBatch` pages directly (Hive
 partition columns re-appended as constant columns) with no `serde_json::Value`
-materialization.
+materialization. Every batch carries the table's schema — its columns in table
+order (only the `columns` requested, when set), a column a file predates
+(`ALTER TABLE … ADD COLUMNS`) as nulls, and a column a file stores at a
+narrower physical type cast to the table's type — so a sink sees one schema for
+the whole run, as on the row path.
 
 ```yaml
 pipeline:
