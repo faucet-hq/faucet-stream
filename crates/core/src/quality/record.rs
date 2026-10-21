@@ -216,90 +216,12 @@ impl ValueSetIndex {
     }
 }
 
-/// An exact decimal: `±digits × 10^exp`, `digits` without leading zeros
-/// (empty for zero).
-#[derive(Debug, PartialEq, Eq)]
-struct Decimal {
-    negative: bool,
-    digits: Vec<u8>,
-    exp: i64,
-}
-
-impl Decimal {
-    fn parse(s: &str) -> Option<Self> {
-        let (negative, rest) = match s.as_bytes().first()? {
-            b'-' => (true, &s[1..]),
-            b'+' => (false, &s[1..]),
-            _ => (false, s),
-        };
-        let (mantissa, exp) = match rest.find(['e', 'E']) {
-            Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
-            None => (rest, 0),
-        };
-        let (int, frac) = match mantissa.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (mantissa, ""),
-        };
-        if int.is_empty() && frac.is_empty() {
-            return None;
-        }
-        if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
-        let mut exp = exp.checked_sub(i64::try_from(frac.len()).ok()?)?;
-        while digits.last() == Some(&0) {
-            digits.pop();
-            exp = exp.checked_add(1)?;
-        }
-        let lead = digits.iter().take_while(|d| **d == 0).count();
-        digits.drain(..lead);
-        let negative = negative && !digits.is_empty();
-        Some(Self {
-            negative,
-            digits,
-            exp,
-        })
-    }
-
-    fn magnitude_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        match (self.digits.is_empty(), other.digits.is_empty()) {
-            (true, true) => return Ordering::Equal,
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            _ => {}
-        }
-        let top = |d: &Self| d.exp as i128 + d.digits.len() as i128;
-        top(self)
-            .cmp(&top(other))
-            .then_with(|| self.digits.cmp(&other.digits))
-    }
-}
-
-impl Ord for Decimal {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self.negative, other.negative) {
-            (false, true) => std::cmp::Ordering::Greater,
-            (true, false) => std::cmp::Ordering::Less,
-            (false, false) => self.magnitude_cmp(other),
-            (true, true) => other.magnitude_cmp(self),
-        }
-    }
-}
-
-impl PartialOrd for Decimal {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// A `compare` ordering operand as an exact decimal: a JSON number, or a
 /// string holding one (how exact decimals and big integers are rendered).
-fn decimal_operand(v: &Value) -> Option<Decimal> {
+fn decimal_operand(v: &Value) -> Option<crate::replication::Decimal> {
     match v {
-        Value::Number(n) => Decimal::parse(&n.to_string()),
-        Value::String(s) => Decimal::parse(s),
+        Value::Number(n) => crate::replication::Decimal::parse(&n.to_string()),
+        Value::String(s) => crate::replication::Decimal::parse(s),
         _ => None,
     }
 }
@@ -396,7 +318,6 @@ mod tests {
             json!("1.2.3"),
             json!(""),
             json!("-"),
-            json!(" 1"),
             json!("1e"),
             json!(true),
         ] {

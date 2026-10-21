@@ -314,14 +314,14 @@ fn numeric_text(v: &Value) -> Option<std::borrow::Cow<'_, str>> {
 /// digits (`digits` empty means zero). Arbitrary length, so a DECIMAL(38)
 /// cursor orders exactly.
 #[derive(Debug, PartialEq, Eq)]
-struct Decimal {
+pub(crate) struct Decimal {
     negative: bool,
     digits: Vec<u8>,
     exp: i64,
 }
 
 impl Decimal {
-    fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         let s = text.trim();
         let (negative, s) = match s.as_bytes().first()? {
             b'-' => (true, &s[1..]),
