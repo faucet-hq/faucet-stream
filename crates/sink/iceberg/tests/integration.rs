@@ -281,6 +281,7 @@ async fn commit_failure_on_dropped_table_propagates_and_keeps_orphans() {
     let seed: Vec<serde_json::Value> = (0u64..5).map(|i| json!({ "id": i })).collect();
     setup.write_batch(&seed).await.expect("seed write");
     setup.flush().await.expect("seed flush");
+    let before = parquet_files(dir.path());
 
     // A writer with cleanup enabled buffers a batch (loading the table).
     let mut cfg = sink_config(&dir, "vanishing");
@@ -305,6 +306,38 @@ async fn commit_failure_on_dropped_table_propagates_and_keeps_orphans() {
         msg.contains("iceberg") && msg.contains("commit"),
         "error should describe the failed commit: {msg}"
     );
+
+    let after = parquet_files(dir.path());
+    assert!(
+        before.iter().all(|f| after.contains(f)),
+        "no earlier data file is deleted: before {before:?}, after {after:?}"
+    );
+    let uploaded: Vec<_> = after.iter().filter(|f| !before.contains(f)).collect();
+    assert!(
+        !uploaded.is_empty(),
+        "the failed commit's data file stays on disk: {after:?}"
+    );
+    for f in uploaded {
+        assert!(f.exists(), "{f:?}");
+    }
+}
+
+/// Every Parquet data file under `root`.
+fn parquet_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Empty `write_batch` followed by `flush` must not produce any snapshot.
