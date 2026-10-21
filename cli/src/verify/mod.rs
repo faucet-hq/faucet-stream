@@ -316,15 +316,12 @@ pub async fn verify_node_guarded(
         session.verify_full().await?;
         "full"
     };
-    // Cap what is reported; the tally still counts everything found.
     let total = session.report.differences.len();
-    if total > spec.max_differences {
-        session.report.differences.truncate(spec.max_differences);
-        session.report.truncated = true;
-    }
     let mut report = session.report;
     let source_rows = session.source_rows;
 
+    // The repair covers every difference found; `max_differences` caps only
+    // what is reported, below.
     let repair = inputs.repair || spec.repair;
     if repair && !report.differences.is_empty() {
         let allow_delete = inputs.allow_delete || spec.allow_delete;
@@ -334,12 +331,17 @@ pub async fn verify_node_guarded(
             &report.differences,
             &source_rows,
             allow_delete,
+            &spec.normalize,
             inputs,
             guards,
         )
         .await?;
         report.repaired_upserts = Some(ups);
         report.repaired_deletes = Some(dels);
+    }
+    if total > spec.max_differences {
+        report.differences.truncate(spec.max_differences);
+        report.truncated = true;
     }
 
     metrics::record(
@@ -702,6 +704,7 @@ async fn repair_node(
     differences: &[Difference],
     source_rows: &HashMap<String, Value>,
     allow_delete: bool,
+    norm: &Normalizer,
     inputs: &VerifyInputs,
     guards: &RunGuards,
 ) -> CliResult<(u64, u64)> {
@@ -714,15 +717,19 @@ async fn repair_node(
             node.sink.kind
         )));
     }
-    let norm = Normalizer::default();
     let mut upserts: Vec<Value> = Vec::new();
     let mut deletes: Vec<Value> = Vec::new();
     for d in differences {
-        let kt = key_text(&d.key, key, &norm);
+        // The same normalizer the session keyed `source_rows` with.
+        let kt = key_text(&d.key, key, norm);
         if d.needs_upsert() {
-            if let Some(row) = source_rows.get(&kt) {
-                upserts.push(row.clone());
-            }
+            let row = source_rows.get(&kt).ok_or_else(|| {
+                CliError::Config(format!(
+                    "verify --repair: no source row was kept for differing key {kt}; nothing \
+                     was written"
+                ))
+            })?;
+            upserts.push(row.clone());
         } else if d.needs_delete() && allow_delete {
             deletes.push(d.key.clone());
         }
@@ -943,6 +950,103 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.key, key);
         assert!(!outcome.report.differences.is_empty(), "{outcome:?}");
+    }
+
+    /// A SQLite database holding `src` (the source table) and an empty `t`
+    /// (the destination), and the root node mirroring one into the other.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    async fn sqlite_mirror(
+        dir: &std::path::Path,
+        key: &[&str],
+        rows: &[(i64, &str, &str)],
+        extra: &str,
+    ) -> ExpandedNode {
+        let db = dir.join("m.db");
+        let url = format!("sqlite:{}?mode=rwc", db.display());
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let pk = key.join(", ");
+        for table in ["src", "t"] {
+            sqlx::query(&format!(
+                "CREATE TABLE {table} (id INTEGER, ts TEXT, v TEXT, PRIMARY KEY ({pk}))"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, ts, v) in rows {
+            sqlx::query("INSERT INTO src (id, ts, v) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(ts)
+                .bind(v)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+        let yaml = format!(
+            "version: 1\nname: m\npipeline:\n  source: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", query: \"SELECT id, ts, v FROM src\" }} }}\n  sink: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [{pk}] }} }}\n{extra}",
+            db = db.display()
+        );
+        let cfg = PipelineConfig::from_text(&yaml, std::path::Path::new("m.yaml")).unwrap();
+        expand(&cfg).unwrap().remove(0)
+    }
+
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    fn repair_inputs() -> VerifyInputs {
+        VerifyInputs {
+            row: None,
+            repair: true,
+            allow_delete: false,
+            dry_run: false,
+            pipeline_name: "m".into(),
+            execution: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+        }
+    }
+
+    /// `max_differences` caps what is reported, never what is repaired.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn repair_covers_differences_beyond_the_reporting_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(i64, &str, &str)> = (1..=5).map(|i| (i, "x", "v")).collect();
+        let node = sqlite_mirror(dir.path(), &["id"], &rows, "").await;
+        let spec = VerifySpec {
+            max_differences: 2,
+            ..Default::default()
+        };
+        let out = verify_node(&node, &spec, &repair_inputs()).await.unwrap();
+        assert_eq!(out.report.differences.len(), 2);
+        assert!(out.report.truncated);
+        assert_eq!(out.report.repaired_upserts, Some(5), "{out:?}");
+
+        let check = VerifyInputs {
+            repair: false,
+            ..repair_inputs()
+        };
+        let again = verify_node(&node, &spec, &check).await.unwrap();
+        assert!(again.report.differences.is_empty(), "{again:?}");
+    }
+
+    /// The repair looks rows up under the spec's normalizer, so a non-default
+    /// `normalize` still re-syncs a timestamp-keyed row.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn repair_uses_the_specs_normalizer_for_key_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [(7, "2026-01-01 00:00:00", "a")];
+        let node = sqlite_mirror(dir.path(), &["id", "ts"], &rows, "").await;
+        let spec = VerifySpec {
+            key: vec!["id".into(), "ts".into()],
+            normalize: Normalizer {
+                timestamps: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = verify_node(&node, &spec, &repair_inputs()).await.unwrap();
+        assert_eq!(out.report.repaired_upserts, Some(1), "{out:?}");
     }
 
     #[test]
