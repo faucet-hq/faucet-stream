@@ -340,7 +340,10 @@ impl DynamoDbSource {
                     )))?,
                     OnGap::Resnapshot => {
                         tracing::warn!(table = %self.config.table_name, reasons = %reasons,
-                            "dynamodb streams: bookmark is past the trim horizon; resnapshotting");
+                            "dynamodb streams: bookmark is past the trim horizon; resnapshotting. \
+                             Items deleted while their stream records were trimmed are not in the \
+                             scan, so their destination rows are NOT removed — rebuild the \
+                             destination with an overwrite snapshot to drop them");
                         let keys = key_schema(&self.describe_table().await?)?;
                         let capture = capture_bookmark(&arn, &described);
                         let mut snap = self.scan_stream(

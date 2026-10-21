@@ -30448,7 +30448,7 @@
         },
         {
           "const": "resnapshot",
-          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. Converges on an upsert sink.",
+          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. On an upsert sink every item that\nstill exists converges; an item deleted while its stream records were\ntrimmed is not in the scan, so its destination row is not removed —\nrebuild the destination (an overwrite snapshot) to drop those.",
           "type": "string"
         }
       ]

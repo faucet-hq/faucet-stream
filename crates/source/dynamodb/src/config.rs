@@ -52,7 +52,10 @@ pub enum OnGap {
     #[default]
     Fail,
     /// Re-read the whole table (emitted as `op: "r"` envelopes), then resume
-    /// the stream from the trim horizon. Converges on an upsert sink.
+    /// the stream from the trim horizon. On an upsert sink every item that
+    /// still exists converges; an item deleted while its stream records were
+    /// trimmed is not in the scan, so its destination row is not removed —
+    /// rebuild the destination (an overwrite snapshot) to drop those.
     Resnapshot,
 }
 

@@ -117,7 +117,13 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
   applies from that run on. With
   `on_gap: resnapshot` the source instead scans the whole table (emitted as
   `op: "r"` envelopes, no bookmark until the scan completes) and then replays the
-  retained stream from the trim horizon; on an upsert sink this converges.
+  retained stream from the trim horizon. On an upsert sink every item that still
+  exists converges, but **deletes in the lost window are not propagated**: an
+  item removed while its stream records were trimmed is simply absent from the
+  scan, so its destination row stays. The source logs a warning saying so; to
+  drop those rows, rebuild the destination with an overwrite snapshot (e.g.
+  reset the `faucet mirror` state, or run a `mode: scan` pipeline with
+  `write_mode: overwrite`).
 - **`faucet mirror`** — `capture_resume_position` returns every current shard at
   its trim horizon, so a CDC run after the snapshot replays the retained window
   and converges.
