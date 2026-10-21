@@ -347,7 +347,22 @@ fn local_part(value: &str) -> Option<&str> {
     match scheme_of(value).as_deref() {
         Some("file") => {
             let rest = &value[5..];
-            Some(rest.strip_prefix("//").unwrap_or(rest))
+            let Some(after) = rest.strip_prefix("//") else {
+                return Some(rest);
+            };
+            // `file://host/path` (RFC 8089): an empty authority or `localhost`
+            // names the local absolute path; any other host is not local.
+            let (authority, path) = match after.find('/') {
+                Some(i) => (&after[..i], &after[i..]),
+                None => (after, ""),
+            };
+            if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+                Some(path)
+            } else if authority == "." || authority == ".." {
+                Some(after)
+            } else {
+                None
+            }
         }
         Some("sqlite") => {
             let rest = &value[7..];
@@ -779,7 +794,17 @@ impl ReferencePolicy {
         let refuse = |reason: String| Refusal::new(RefusalKind::Url, value, reason);
         let scheme = scheme_of(value).filter(|_| !value.starts_with('/'));
         match scheme.as_deref() {
-            Some("file") | Some("sqlite") => return self.check_path(value),
+            Some("file") | Some("sqlite") => {
+                return match local_part(value) {
+                    Some(local) => self
+                        .check_local(local)
+                        .map_err(|reason| Refusal::new(RefusalKind::Path, value, reason)),
+                    None if self.path_roots.is_none() => Ok(()),
+                    None => Err(refuse(
+                        "a `file:` URL that names a remote host is not a local path".into(),
+                    )),
+                };
+            }
             None if value.starts_with(['/', '.', '?', '#']) => return Ok(()),
             None if is_relative_path(value) => return Ok(()),
             _ => {}
@@ -1368,6 +1393,7 @@ mod tests {
             format!("{d}/sub/part-{{part}}.jsonl"),
             format!("{d}/x/${{now.date}}.csv"),
             format!("file://{d}/a"),
+            format!("file://localhost{d}/a"),
             format!("sqlite:{d}/db.sqlite?mode=rwc"),
             format!("sqlite://{d}/db.sqlite"),
             ":memory:".to_string(),
@@ -1378,6 +1404,9 @@ mod tests {
         }
         for bad in [
             "/etc/passwd".to_string(),
+            "file://localhost/etc/passwd".to_string(),
+            "file://LOCALHOST/etc/passwd".to_string(),
+            "file://elsewhere/etc/passwd".to_string(),
             format!("{d}/../escape"),
             format!("{d}/*/../../etc/*"),
             format!("{d}x/sibling"),
