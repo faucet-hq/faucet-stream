@@ -245,7 +245,13 @@ fn the_heuristic_recognises_resource_names() {
     ] {
         assert!(looks_like_resource(name), "{name}");
     }
-    for name in ["batch_size", "pathological", "urlish", "file_format", "hostname_case"] {
+    for name in [
+        "batch_size",
+        "pathological",
+        "urlish",
+        "file_format",
+        "hostname_case",
+    ] {
         assert!(!looks_like_resource(name), "{name}");
     }
 }
