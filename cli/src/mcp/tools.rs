@@ -1750,7 +1750,7 @@ mod tests {
         let mut cfg = csv_config(dir.path());
         cfg.push_str(
             "  masking:\n    rules:\n      - name: names\n        match: {fields: [name]}\n        \
-             action: {type: redact}\n        applies_to: [elsewhere]\n",
+             action: {type: redact}\n        applies_to: [postgres]\n",
         );
         let out = call_tool(
             &ctx(false),
