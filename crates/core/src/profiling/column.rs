@@ -214,13 +214,19 @@ impl ColumnAcc {
             Value::Object(_) => self.types.object += 1,
             Value::Array(_) => self.types.array += 1,
         }
-        let text = value_text(v);
         // Distinctness is typed — `1` and `"1"` are two values — while the
         // frequency sketch keys on the display text.
-        self.distinct
-            .insert_hash(hash64(&(type_tag(v), text.as_ref())));
+        let distinct_hash = match v {
+            Value::Object(_) | Value::Array(_) => {
+                let mut h = std::hash::DefaultHasher::new();
+                hash_canonical(v, &mut h);
+                std::hash::Hasher::finish(&h)
+            }
+            _ => hash64(&(type_tag(v), value_text(v).as_ref())),
+        };
+        self.distinct.insert_hash(distinct_hash);
         if let Some(top) = &mut self.top {
-            top.insert(&truncate_text(&text));
+            top.insert(&truncate_text(&value_text(v)));
             // The estimate only grows, so a column clearly past the cap (a
             // margin over the sketch's error) ends the run past it too and
             // will report no top values.
@@ -306,13 +312,44 @@ fn type_tag(v: &Value) -> u8 {
     }
 }
 
-fn truncate_text(s: &str) -> String {
-    if s.chars().count() <= MAX_VALUE_TEXT {
-        return s.to_string();
+/// Hash a value so that equal values hash equally whatever their objects' key
+/// order, without rendering it.
+fn hash_canonical<H: std::hash::Hasher>(v: &Value, h: &mut H) {
+    use std::hash::Hash;
+    type_tag(v).hash(h);
+    match v {
+        Value::Null => {}
+        Value::Bool(b) => b.hash(h),
+        Value::Number(n) => n.to_string().hash(h),
+        Value::String(s) => s.hash(h),
+        Value::Array(items) => {
+            items.len().hash(h);
+            for item in items {
+                hash_canonical(item, h);
+            }
+        }
+        Value::Object(map) => {
+            map.len().hash(h);
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (k, val) in entries {
+                k.hash(h);
+                hash_canonical(val, h);
+            }
+        }
     }
-    let mut out: String = s.chars().take(MAX_VALUE_TEXT).collect();
-    out.push('…');
-    out
+}
+
+fn truncate_text(s: &str) -> std::borrow::Cow<'_, str> {
+    match s.char_indices().nth(MAX_VALUE_TEXT) {
+        None => std::borrow::Cow::Borrowed(s),
+        Some((cut, _)) => {
+            let mut out = String::with_capacity(cut + '…'.len_utf8());
+            out.push_str(&s[..cut]);
+            out.push('…');
+            std::borrow::Cow::Owned(out)
+        }
+    }
 }
 
 /// The run-level accumulator: hand it every page the sink wrote, then
@@ -419,6 +456,38 @@ mod tests {
         b.insert("b".into(), json!(1));
         assert_eq!(value_text(&Value::Object(a)), r#"{"a":2,"b":1}"#);
         assert_eq!(value_text(&Value::Object(b)), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn truncate_text_borrows_short_text_and_cuts_long_text() {
+        assert!(matches!(
+            truncate_text("short"),
+            std::borrow::Cow::Borrowed("short")
+        ));
+        let exact = "é".repeat(MAX_VALUE_TEXT);
+        assert!(matches!(
+            truncate_text(&exact),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let long = "é".repeat(MAX_VALUE_TEXT + 5);
+        let cut = truncate_text(&long);
+        assert_eq!(cut.chars().count(), MAX_VALUE_TEXT + 1);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn nested_values_are_distinct_by_content_not_key_order() {
+        let mut first = serde_json::Map::new();
+        first.insert("b".into(), json!([1, {"y": 2, "x": 1}]));
+        first.insert("a".into(), json!("s"));
+        let rp = profile(&[
+            json!({"n": Value::Object(first)}),
+            json!({"n": {"a": "s", "b": [1, {"x": 1, "y": 2}]}}),
+            json!({"n": {"a": "s", "b": [{"x": 1, "y": 2}, 1]}}),
+            json!({"n": [1, "1"]}),
+            json!({"n": ["1", 1]}),
+        ]);
+        assert_eq!(rp.columns["n"].distinct, 4);
     }
 
     fn profile(records: &[Value]) -> RunProfile {
