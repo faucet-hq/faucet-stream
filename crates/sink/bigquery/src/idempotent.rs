@@ -406,6 +406,86 @@ pub(crate) fn unknown_fields(columns: &[FieldSpec], records: &[Value]) -> Vec<St
     out.into_iter().collect()
 }
 
+/// Values whose JSON shape the typed `JSON_VALUE` / `JSON_QUERY` extraction
+/// would silently turn into `NULL`: an object or array for a scalar column, a
+/// non-array for a `REPEATED` column, a non-object for a `STRUCT`. Each entry
+/// names the field path and the record's page index; at most `limit` entries.
+pub(crate) fn shape_mismatches(
+    columns: &[FieldSpec],
+    records: &[Value],
+    limit: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, r) in records.iter().enumerate() {
+        if let Some(obj) = r.as_object() {
+            check_fields(columns, obj, "", i, &mut out, limit);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn check_fields(
+    fields: &[FieldSpec],
+    obj: &serde_json::Map<String, Value>,
+    prefix: &str,
+    row: usize,
+    out: &mut Vec<String>,
+    limit: usize,
+) {
+    for f in fields {
+        if out.len() >= limit {
+            return;
+        }
+        let Some(v) = obj.get(&f.name) else { continue };
+        let path = if prefix.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{prefix}.{}", f.name)
+        };
+        if f.repeated {
+            match v {
+                Value::Null => {}
+                Value::Array(items) => {
+                    for (j, item) in items.iter().enumerate() {
+                        check_value(f, item, &format!("{path}[{j}]"), row, out, limit);
+                    }
+                }
+                _ => out.push(format!("`{path}` (record {row}: expected an array)")),
+            }
+        } else {
+            check_value(f, v, &path, row, out, limit);
+        }
+    }
+}
+
+fn check_value(
+    f: &FieldSpec,
+    v: &Value,
+    path: &str,
+    row: usize,
+    out: &mut Vec<String>,
+    limit: usize,
+) {
+    if out.len() >= limit || v.is_null() {
+        return;
+    }
+    match f.ty {
+        BqType::Json => {}
+        BqType::Struct => match v.as_object() {
+            Some(child) => check_fields(&f.fields, child, path, row, out, limit),
+            None => out.push(format!("`{path}` (record {row}: expected an object)")),
+        },
+        _ if v.is_object() || v.is_array() => out.push(format!(
+            "`{path}` (record {row}: expected a scalar, got an {})",
+            if v.is_object() { "object" } else { "array" }
+        )),
+        _ => {}
+    }
+}
+
 /// Deterministic, sanitized `requestId` for transport-retry dedup. Correctness
 /// does not depend on it (the transaction + core skip logic are authoritative);
 /// it just suppresses duplicate jobs from a retried HTTP request within
@@ -939,6 +1019,42 @@ mod tests {
         let m = sql.find("MERGE").unwrap();
         let c = sql.find("COMMIT TRANSACTION").unwrap();
         assert!(i < m && m < c, "statement order wrong: {sql}");
+    }
+
+    #[test]
+    fn shape_mismatches_flag_values_json_value_would_null() {
+        let columns = vec![
+            scalar("id", BqType::Int64),
+            scalar("address", BqType::String),
+            scalar("doc", BqType::Json),
+            repeated("tags", BqType::String),
+            record("geo", false, vec![scalar("city", BqType::String)]),
+        ];
+        let ok = vec![json!({
+            "id": 1, "address": "x", "doc": {"a": [1]}, "tags": ["a"],
+            "geo": {"city": "c"}
+        })];
+        assert!(shape_mismatches(&columns, &ok, 10).is_empty());
+        assert!(
+            shape_mismatches(&columns, &[json!({"address": null, "tags": null})], 10).is_empty()
+        );
+        let bad = vec![
+            json!({"id": 1, "address": {"city": "X"}}),
+            json!({"tags": "a", "geo": "c"}),
+            json!({"tags": [{"x": 1}], "geo": {"city": [1]}}),
+        ];
+        let got = shape_mismatches(&columns, &bad, 10);
+        assert_eq!(
+            got,
+            vec![
+                "`address` (record 0: expected a scalar, got an object)",
+                "`tags` (record 1: expected an array)",
+                "`geo` (record 1: expected an object)",
+                "`tags[0]` (record 2: expected a scalar, got an object)",
+                "`geo.city` (record 2: expected a scalar, got an array)",
+            ]
+        );
+        assert_eq!(shape_mismatches(&columns, &bad, 2).len(), 2);
     }
 
     #[test]

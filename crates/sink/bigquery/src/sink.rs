@@ -1678,6 +1678,17 @@ impl BigQueryDriver {
         columns: &[idempotent::FieldSpec],
         records: &[Value],
     ) -> Result<(), FaucetError> {
+        let mismatched = idempotent::shape_mismatches(columns, records, 10);
+        if !mismatched.is_empty() {
+            return Err(FaucetError::Sink(format!(
+                "BigQuery: value(s) at {} do not fit the column type of {}.{}.{}; the typed \
+                 insert would store NULL in their place",
+                mismatched.join(", "),
+                self.config.project_id,
+                self.config.dataset_id,
+                self.config.table_id
+            )));
+        }
         let unknown = idempotent::unknown_fields(columns, records);
         if unknown.is_empty() {
             return Ok(());
