@@ -303,7 +303,7 @@ mod fake {
                 let rows = payload(&body);
                 if q.contains("INSERT INTO `p.d.t`") {
                     *self.appended.lock().unwrap() += rows.len();
-                } else if q.contains("MERGE `p.d.t`") {
+                } else if q.contains("MERGE INTO `p.d.t` ") {
                     let mut keyed = self.keyed.lock().unwrap();
                     for r in rows {
                         keyed.insert(r["id"].to_string());
@@ -383,6 +383,20 @@ async fn conformance_declared_capabilities() {
         let bq = bq.clone();
         async move { bq.len() }
     };
+    // Positive control: a clean keyed page lands, so the atomicity check
+    // below measures real MERGE rows rather than a fake that ignores them.
+    let before = count().await;
+    faucet_core::Sink::write_batch(
+        &keyed,
+        &[json!({"id": 950, "v": "a"}), json!({"id": 951, "v": "b"})],
+    )
+    .await
+    .expect("clean keyed page");
+    assert_eq!(
+        count().await - before,
+        2,
+        "the fake must record keyed MERGE rows"
+    );
     faucet_conformance::assert_batch_atomicity_truthful(
         &keyed,
         count,
