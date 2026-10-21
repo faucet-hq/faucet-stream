@@ -249,7 +249,15 @@ Every config the server loads from a caller is checked against one
 allow-list before anything runs. A connector field that names a local path,
 a URL or a program carries an `x-faucet-resource` annotation in its schema, so
 the server confines connector configs it has never seen, plugin connectors
-included, with no per-connector code. The same allow-list covers `${env:}`,
+included, with no per-connector code. Host-bearing fields that are not URLs
+are annotated too and read for their hosts: a broker or server list
+(`brokers: b1:9092,b2:9092`, NATS `servers`), a bare `host` / `emulator_host`,
+an ADO.NET / ODBC connection string (`Server=tcp:host,1433;…`) and an Azure
+Storage connection string (`BlobEndpoint=…`, or the account host). A free-form
+option map (Delta `storage_options`) names the keys that hold an endpoint or a
+credential file (`x-faucet-resource-keys`), and those keys are checked like the
+typed fields. A transform's config is read the same way (a `sql` transform's
+`http` relation `url` and `csv` / `jsonl` relation `path`). The same allow-list covers `${env:}`,
 `${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
 lineage paths, and the `token_url` / `url` of an `auth:` provider.
 
@@ -270,7 +278,9 @@ follows a directory which does not exist yet, is refused. A path field that
 holds a remote URL (`s3://…`) is checked as a URL. A URL host is compared in
 the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
-metadata address they spell. A URL whose host a caller's config takes from
+metadata address they spell, and an `http(s)` URL's authority ends at a `\` as
+it does for HTTP clients (`http://169.254.169.254\@allowed.example/` names
+`169.254.169.254`). A URL whose host a caller's config takes from
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
 
@@ -278,7 +288,15 @@ checked, so it is refused; register the pipeline as a template instead.
 it — on every instance that claims it, sharded or not — so its HTTP connectors
 check the first request and every redirect hop against it. Whatever the
 origin, an HTTP connector never follows a redirect into a link-local or
-cloud-metadata address.
+cloud-metadata address, and a host *name* is judged by the addresses it
+resolves to when the connection is made: the client's resolver drops
+link-local / metadata addresses (so `169.254.169.254.nip.io`, or a name
+re-pointed after the submit-time check, is never connected to) unless the
+policy lists that name exactly. Behind an HTTP proxy the proxy resolves the
+target, so this check cannot apply there. A GCS `storage_host` that is not a
+`googleapis.com` endpoint never receives the server's own credentials
+(`application_default` or a key file); a Snowflake `account` must be an
+account identifier, so its request URL always names a Snowflake host.
 
 **DLQ locations.** The `location` of `POST /v1/dlq/inspect` and
 `/v1/dlq/discard`, and the `from` / `failed_dlq` of `POST /v1/dlq/replay`, are

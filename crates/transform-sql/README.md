@@ -92,7 +92,7 @@ Wire shape: `{ type: sql, config: { query, relations?, memory_limit?, threads? }
 | `csv` | `path` (string, required), `has_header` (bool, default `true`) | Delimited file loaded via DuckDB `read_csv_auto`. |
 | `jsonl` | `path` (string, required) | Newline-delimited JSON loaded via DuckDB `read_json_auto`. |
 | `values` | `columns` (list of strings, required), `rows` (list of lists, required) | Inline rows materialized into a table; no file I/O. Each inner row must have the same length as `columns`. |
-| `http` | `url` (string, required), `method` (`GET`\|`POST`, default `GET`), `headers` (map of string→string, optional), `records_path` (JSONPath string, optional) | Rows fetched from a small REST endpoint **once** at compile time and cached for the whole run. `records_path` selects the row array in the response body (e.g. `$.items[*]`); if omitted the whole body must be a JSON array. Every selected element must be a JSON object (one table row). |
+| `http` | `url` (string, required), `method` (`GET`\|`POST`, default `GET`), `headers` (map of string→string, optional), `records_path` (JSONPath string, optional) | Rows fetched from a small REST endpoint **once** at compile time and cached for the whole run. `records_path` selects the row array in the response body (e.g. `$.items[*]`); if omitted the whole body must be a JSON array. Every selected element must be a JSON object (one table row). Fetched through `faucet_core::http::Client` (120 s timeout, 256 MiB body cap, cross-origin redirects drop the headers, never a link-local / metadata address) under the reference policy a host scoped over the run. |
 
 ## Reference relations
 
