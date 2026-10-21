@@ -495,9 +495,14 @@ fn redact_secret_kv_values(s: &str) -> String {
 /// Whether a connection-string / query-string key names a credential whose
 /// value must be redacted from a lineage / catalog URI.
 ///
-/// Matches a denylist case-insensitively after stripping `-`/`_`/space, so
-/// `api_key`, `api-key`, and `apikey` all match one entry. Covers the common
-/// secret parameter names beyond `password`/`pwd` (audit #321 M11).
+/// Matches case-insensitively after stripping `-`/`_`/space, so `api_key`,
+/// `api-key`, and `apikey` all match one entry: an exact name (`password`,
+/// `sig`, `sas`, `auth`, `code`, `jwt`, …) or a credential suffix
+/// (`…token`, `…secret`, `…password`, `…signature`, `…credential`, `…apikey`,
+/// …), which covers `api_token`, `auth_token`, `X-Amz-Security-Token`,
+/// `X-Amz-Signature` and `X-Goog-Signature`. Over-redacting a harmless
+/// parameter costs little; missing a credential leaks it. A bare `key` is
+/// left alone: it names the dataset in some URIs (`redis://…?key=list`).
 fn is_secret_kv_key(key: &str) -> bool {
     let norm: String = key
         .trim()
@@ -505,28 +510,35 @@ fn is_secret_kv_key(key: &str) -> bool {
         .filter(|c| !matches!(c, '-' | '_' | ' '))
         .flat_map(char::to_lowercase)
         .collect();
-    matches!(
-        norm.as_str(),
-        "password"
-            | "pwd"
-            | "token"
-            | "apikey"
-            | "accesstoken"
-            | "refreshtoken"
-            | "sessiontoken"
-            | "clientsecret"
-            | "secret"
-            | "secretkey"
-            | "accesskey"
-            | "accesskeyid"
-            | "secretaccesskey"
-            | "sig"
-            | "sas"
-            | "accountkey"
-            | "sharedaccesskey"
-            | "authorization"
-            | "auth"
-    )
+    const EXACT: &[&str] = &[
+        "pwd",
+        "pass",
+        "passwd",
+        "sig",
+        "sas",
+        "auth",
+        "authorization",
+        "code",
+        "jwt",
+        "accesskeyid",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "signature",
+        "credential",
+        "credentials",
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "privatekey",
+        "accountkey",
+        "sharedaccesskey",
+        "signingkey",
+    ];
+    EXACT.contains(&norm.as_str()) || SUFFIXES.iter().any(|s| norm.ends_with(s))
 }
 
 /// Best-effort check that a string looks like a `host[:port]` authority — used
@@ -1388,6 +1400,36 @@ mod tests {
             redact_uri_credentials("snowflake://host/db?password=secret"),
             "snowflake://host/db?password=***"
         );
+    }
+
+    #[test]
+    fn redact_strips_credential_parameters_by_suffix() {
+        for key in [
+            "api_token",
+            "auth_token",
+            "private_token",
+            "X-Amz-Security-Token",
+            "X-Amz-Signature",
+            "X-Amz-Credential",
+            "X-Goog-Signature",
+            "passwd",
+            "pass",
+            "signature",
+            "code",
+            "jwt",
+            "client_password",
+        ] {
+            let uri = format!("https://h/p?{key}=sk_live_123&keep=1");
+            assert_eq!(
+                redact_uri_credentials(&uri),
+                format!("https://h/p?{key}=***&keep=1"),
+                "{key}"
+            );
+        }
+        for key in ["region", "limit", "page", "key", "monkey_business"] {
+            let uri = format!("https://h/p?{key}=v");
+            assert_eq!(redact_uri_credentials(&uri), uri, "{key}");
+        }
     }
 
     #[test]
