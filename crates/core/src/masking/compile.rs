@@ -96,6 +96,13 @@ impl CompiledMasking {
         if spec.rules.is_empty() {
             return Err(config_err("at least one rule is required"));
         }
+        if spec.key.as_deref().is_some_and(|k| k.trim().is_empty()) {
+            return Err(config_err(
+                "`key` is set but empty (did a secret or environment reference resolve to \
+                 an empty string?) — a digest under an empty key can be recomputed by anyone; \
+                 supply the key or remove `key` for an unkeyed digest",
+            ));
+        }
         let mut rules = Vec::with_capacity(spec.rules.len());
         for (i, rule) in spec.rules.iter().enumerate() {
             let compiled = compile_rule(rule, i)?; // validate every rule
@@ -245,6 +252,21 @@ mod tests {
                 .unwrap()
                 .retypes_by_value()
         );
+    }
+
+    #[test]
+    fn an_empty_key_is_refused() {
+        for key in ["", "   "] {
+            let s = spec(json!({"key": key, "rules": [
+                {"match": {"fields": ["email"]}, "action": {"type": "hash"}}
+            ]}));
+            let err = CompiledMasking::compile(&s).unwrap_err().to_string();
+            assert!(err.contains("empty"), "{err}");
+        }
+        let s = spec(json!({"key": "k", "rules": [
+            {"match": {"fields": ["email"]}, "action": {"type": "hash"}}
+        ]}));
+        assert!(CompiledMasking::compile(&s).is_ok());
     }
 
     #[test]
