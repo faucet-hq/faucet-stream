@@ -405,11 +405,19 @@ impl SinkDriver for KafkaDriver {
         ))
     }
 
-    async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
-        self.producer
-            .flush(self.config.message_timeout)
-            .map_err(|e| FaucetError::Sink(format!("kafka producer flush: {e}")))?;
-        Ok(())
+    async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        // rd_kafka_flush is a blocking FFI call.
+        let producer = self.producer.clone();
+        let timeout = self.config.message_timeout;
+        let flush = tokio::task::spawn_blocking(move || producer.flush(timeout));
+        calls
+            .call_once("flush", async {
+                flush
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("kafka producer flush task: {e}")))?
+                    .map_err(|e| FaucetError::Sink(format!("kafka producer flush: {e}")))
+            })
+            .await
     }
 
     fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
