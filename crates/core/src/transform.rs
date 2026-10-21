@@ -1624,12 +1624,14 @@ fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, Fau
 /// lands in two destination columns.
 #[cfg(feature = "transform-keys-case")]
 #[derive(Debug, Clone, Default)]
-pub struct KeyCaseAssignments(std::sync::Arc<std::sync::Mutex<HashMap<String, KeyCaseScope>>>);
+pub struct KeyCaseAssignments(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, KeyCaseScope>>>,
+);
 
 #[cfg(feature = "transform-keys-case")]
 #[derive(Debug, Default)]
 struct KeyCaseScope {
-    by_source: HashMap<String, String>,
+    by_source: std::collections::HashMap<String, String>,
     taken: std::collections::HashSet<String>,
 }
 

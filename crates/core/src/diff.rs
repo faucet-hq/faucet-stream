@@ -956,7 +956,7 @@ mod tests {
             row_hash(&src, &key, None, &[], &norm()),
             row_hash(&dst, &key, None, &[], &norm())
         );
-        assert!(diff_rows(&[src.clone()], &[dst], &key, None, &[], &norm()).is_empty());
+        assert!(diff_rows(std::slice::from_ref(&src), &[dst], &key, None, &[], &norm()).is_empty());
         assert_ne!(
             row_hash(&src, &key, None, &[], &norm()),
             row_hash(

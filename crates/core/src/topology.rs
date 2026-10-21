@@ -3709,6 +3709,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let trip = cancel.clone();
         tokio::spawn(async move {
+            #[allow(clippy::disallowed_methods)] // test: trip the cancel after the first page
             tokio::time::sleep(Duration::from_millis(50)).await;
             trip.cancel();
         });
