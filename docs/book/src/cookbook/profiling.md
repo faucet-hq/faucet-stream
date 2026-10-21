@@ -47,7 +47,10 @@ A column whose estimated distinct count exceeds `categorical_max_distinct`
 statistics but publishes no values (an id or free-text column should never
 land in a catalog as a list of examples). Because the pass runs *after*
 [masking](./masking.md), a masked column's profile holds only its masked
-values.
+values. When the config has a [`policy:`](./policies.md) block, a column the
+policy classifies (by its name, a nested field's name, or a value detector)
+publishes no top values either, so labelled values never reach the state
+store, the catalog or drift notifications.
 
 ## Drift detection
 

@@ -301,6 +301,36 @@ fn value_text(v: &Value) -> std::borrow::Cow<'_, str> {
     }
 }
 
+#[cfg(feature = "policy")]
+fn classify(
+    classifier: Option<&crate::policy::CompiledPolicy>,
+    name: &str,
+    v: &Value,
+    acc: &mut ColumnAcc,
+) {
+    if let Some(policy) = classifier
+        && acc.top.is_some()
+        && is_classified(policy, name, v)
+    {
+        acc.top = None;
+    }
+}
+
+#[cfg(feature = "policy")]
+fn is_classified(policy: &crate::policy::CompiledPolicy, path: &str, v: &Value) -> bool {
+    if !policy.labels_for_name(path).is_empty() {
+        return true;
+    }
+    match v {
+        Value::Null => false,
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, child)| is_classified(policy, &format!("{path}.{k}"), child)),
+        Value::Array(items) => items.iter().any(|item| is_classified(policy, path, item)),
+        scalar => !policy.labels_for_scalar(scalar).is_empty(),
+    }
+}
+
 fn type_tag(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
@@ -365,6 +395,8 @@ pub struct Profiler {
     /// Every rejected name, as a bounded sketch: records keyed by data (an id
     /// or a date per key) would otherwise grow the exact set without limit.
     skipped_sketch: HyperLogLog,
+    #[cfg(feature = "policy")]
+    classifier: Option<std::sync::Arc<crate::policy::CompiledPolicy>>,
 }
 
 /// How many rejected column names are remembered exactly before the count
@@ -379,7 +411,21 @@ impl Profiler {
             columns: HashMap::new(),
             skipped: std::collections::HashSet::new(),
             skipped_sketch: HyperLogLog::new(),
+            #[cfg(feature = "policy")]
+            classifier: None,
         }
+    }
+
+    /// Publish no top values for a column a data-flow policy classifies, by
+    /// its name, a nested field's name, or a value detector; its counts,
+    /// nulls and numeric summary are still profiled.
+    #[cfg(feature = "policy")]
+    pub fn withhold_classified_values(
+        mut self,
+        policy: std::sync::Arc<crate::policy::CompiledPolicy>,
+    ) -> Self {
+        self.classifier = Some(policy);
+        self
     }
 
     pub fn spec(&self) -> &ProfilingSpec {
@@ -404,6 +450,8 @@ impl Profiler {
                     continue;
                 }
                 if let Some(acc) = self.columns.get_mut(name) {
+                    #[cfg(feature = "policy")]
+                    classify(self.classifier.as_deref(), name, v, acc);
                     acc.observe(v);
                     continue;
                 }
@@ -416,6 +464,8 @@ impl Profiler {
                 }
                 let mut acc =
                     ColumnAcc::new(self.spec.top_values, self.spec.categorical_max_distinct);
+                #[cfg(feature = "policy")]
+                classify(self.classifier.as_deref(), name, v, &mut acc);
                 acc.observe(v);
                 self.columns.insert(name.clone(), acc);
             }
@@ -488,6 +538,30 @@ mod tests {
             json!({"n": ["1", 1]}),
         ]);
         assert_eq!(rp.columns["n"].distinct, 4);
+    }
+
+    #[cfg(feature = "policy")]
+    #[test]
+    fn classified_columns_publish_no_top_values() {
+        let policy: crate::policy::PolicySpec = serde_json::from_value(json!({
+            "classifications": [
+                {"label": "pii", "fields": ["ssn"]},
+                {"label": "contact", "value_detector": "email"}
+            ]
+        }))
+        .unwrap();
+        let policy = std::sync::Arc::new(crate::policy::CompiledPolicy::compile(&policy).unwrap());
+        let mut p = Profiler::new(ProfilingSpec::default()).withhold_classified_values(policy);
+        p.observe_page(&[
+            json!({"ssn": "1", "who": "x", "user": {"ssn": "2"}, "plan": "a"}),
+            json!({"ssn": "1", "who": "a@b.co", "user": {"ssn": "2"}, "plan": "a"}),
+        ]);
+        let rp = p.finish();
+        for col in ["ssn", "who", "user"] {
+            assert!(rp.columns[col].top_values.is_none(), "{col}");
+            assert_eq!(rp.columns[col].present, 2, "{col}");
+        }
+        assert!(rp.columns["plan"].top_values.is_some());
     }
 
     fn profile(records: &[Value]) -> RunProfile {
