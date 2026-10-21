@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use faucet_common_azure::{AzureBackend, build_store};
+use faucet_common_azure::{AzureBackend, build_azure};
 use faucet_common_file::write::{FileSink, SinkIdentity};
 use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
@@ -30,11 +30,11 @@ impl AzureBlobSink {
     /// across calls.
     pub async fn new(config: AzureBlobSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let store = build_store(&config.connection)?;
+        let store = build_azure(&config.connection)?;
         let write = config.write_config();
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
-        let backend = AzureBackend::builder(store, config.container())
+        let backend = AzureBackend::builder_for(store, config.container())
             .concurrency(config.concurrency)
             .scratch_dir(config.scratch_dir.as_deref().map(std::path::Path::new))
             .build(base, &template)?;

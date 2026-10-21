@@ -50,7 +50,12 @@ let store = build_store(&conn)?;
 [`faucet-common-file`](https://crates.io/crates/faucet-common-file) publishes
 blobs through; the [`faucet-sink-azure-blob`](https://crates.io/crates/faucet-sink-azure-blob)
 sink is a `FileSink<AzureBackend>` (RFC 0013, #886). Build it with
-`AzureBackend::builder(build_store(&conn)?, container).concurrency(n).scratch_dir(dir).build(base, &template)`.
+`AzureBackend::builder_for(build_azure(&conn)?, container).concurrency(n).scratch_dir(dir).build(base, &template)`.
+
+- Listing (overwrite commits, rollover cleanup) sends the key prefix to the
+  server and fetches page by page, one `list` round trip per page. A backend
+  built with `builder(store, …)` over a plain `ObjectStore` walks the
+  prefix's directory and filters it instead; `paginated_list(store)` opts it in.
 
 - A blob up to 8 MiB (`PART_BYTES`) is one `Put Blob`; a larger one is
   uploaded as blocks and committed with one `Put Block List`, which is what

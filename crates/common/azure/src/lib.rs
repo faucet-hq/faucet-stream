@@ -376,6 +376,14 @@ impl AzureConnection {
 /// credential is the one used. All build failures map to
 /// [`FaucetError::Config`].
 pub fn build_store(conn: &AzureConnection) -> Result<Arc<dyn ObjectStore>, FaucetError> {
+    Ok(build_azure(conn)?)
+}
+
+/// [`build_store`] as the concrete Azure store, which also lists by a raw key
+/// prefix ([`PaginatedListStore`](object_store::list::PaginatedListStore)).
+pub fn build_azure(
+    conn: &AzureConnection,
+) -> Result<Arc<object_store::azure::MicrosoftAzure>, FaucetError> {
     if conn.container.trim().is_empty() {
         return Err(FaucetError::Config(
             "azure: container name must not be empty".into(),

@@ -15,6 +15,7 @@ use faucet_core::FaucetError;
 use faucet_core::check::{CheckContext, CheckReport, Probe};
 use faucet_core::observability::RoundtripRecorder;
 use futures::StreamExt;
+use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ pub const PART_BYTES: usize = 8 * 1024 * 1024;
 
 struct AzureObjects {
     store: Arc<dyn ObjectStore>,
+    /// Lists by a raw key prefix, a page per request, when the store has it.
+    paginated: Option<Arc<dyn PaginatedListStore>>,
     container: String,
     part_bytes: usize,
     concurrency: usize,
@@ -46,6 +49,44 @@ fn list_root(prefix: &str) -> Option<ObjectPath> {
         .filter(|p| !p.as_ref().is_empty())
 }
 
+impl AzureObjects {
+    /// List the keys starting with `prefix` server-side (`prefix=` on List
+    /// Blobs), one request per page, rather than every blob under its
+    /// directory.
+    async fn list_by_prefix(
+        &self,
+        store: &dyn PaginatedListStore,
+        prefix: &str,
+    ) -> Result<Vec<String>, FaucetError> {
+        let raw = (!prefix.is_empty()).then_some(prefix);
+        let mut keys = Vec::new();
+        let mut token = None;
+        loop {
+            self.roundtrips.record("list");
+            let opts = PaginatedListOptions {
+                page_token: token.take(),
+                ..Default::default()
+            };
+            let page = store
+                .list_paginated(raw, opts)
+                .within(&self.calls, "list")
+                .await?
+                .map_err(|e| err("list", prefix, e))?;
+            keys.extend(
+                page.result
+                    .objects
+                    .into_iter()
+                    .map(|m| m.location.to_string())
+                    .filter(|k| k.starts_with(prefix)),
+            );
+            match page.page_token {
+                Some(next) if !next.is_empty() => token = Some(next),
+                _ => return Ok(keys),
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ObjectClient for AzureObjects {
     fn describe(&self, key: &str) -> String {
@@ -53,6 +94,9 @@ impl ObjectClient for AzureObjects {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        if let Some(paginated) = &self.paginated {
+            return self.list_by_prefix(paginated.as_ref(), prefix).await;
+        }
         let root = list_root(prefix);
         self.roundtrips.record("list");
         let mut listing = self.store.list(root.as_ref());
@@ -341,11 +385,22 @@ impl AzureBackend {
     ) -> AzureBackendBuilder {
         AzureBackendBuilder {
             store,
+            paginated: None,
             container: container.into(),
             concurrency: 1,
             part_bytes: PART_BYTES,
             scratch_dir: None,
         }
+    }
+
+    /// Start building a backend on an Azure store
+    /// ([`build_azure`](crate::build_azure)): keys are listed by their exact
+    /// prefix on the server, a page per request.
+    pub fn builder_for(
+        store: Arc<object_store::azure::MicrosoftAzure>,
+        container: impl Into<String>,
+    ) -> AzureBackendBuilder {
+        Self::builder(store.clone(), container).paginated_list(store)
     }
 
     /// The object store.
@@ -380,6 +435,7 @@ impl std::fmt::Debug for AzureBackend {
 #[must_use]
 pub struct AzureBackendBuilder {
     store: Arc<dyn ObjectStore>,
+    paginated: Option<Arc<dyn PaginatedListStore>>,
     container: String,
     concurrency: usize,
     part_bytes: usize,
@@ -387,6 +443,13 @@ pub struct AzureBackendBuilder {
 }
 
 impl AzureBackendBuilder {
+    /// List keys through `store` by their exact prefix, a page per request,
+    /// instead of walking the store's directory listing and filtering it.
+    pub fn paginated_list(mut self, store: Arc<dyn PaginatedListStore>) -> Self {
+        self.paginated = Some(store);
+        self
+    }
+
     /// Blobs (and blocks of one blob) uploaded at once. Default 1.
     pub fn concurrency(mut self, n: usize) -> Self {
         self.concurrency = n;
@@ -421,6 +484,7 @@ impl AzureBackendBuilder {
         ));
         let objects = Arc::new(AzureObjects {
             store: self.store.clone(),
+            paginated: self.paginated,
             container: self.container,
             part_bytes: self.part_bytes,
             concurrency: self.concurrency,
@@ -496,6 +560,70 @@ mod tests {
         assert_eq!(report.failed_count(), 0, "{report:?}");
     }
 
+    /// A paginated listing that records the prefixes it was asked for and
+    /// serves two pages.
+    #[derive(Default)]
+    struct TwoPages(Mutex<Vec<(Option<String>, Option<String>)>>);
+
+    #[async_trait]
+    impl PaginatedListStore for TwoPages {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            opts: PaginatedListOptions,
+        ) -> object_store::Result<object_store::list::PaginatedListResult> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((prefix.map(str::to_string), opts.page_token.clone()));
+            let meta = |k: &str| object_store::ObjectMeta {
+                location: ObjectPath::from(k),
+                last_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                size: 1,
+                e_tag: None,
+                version: None,
+            };
+            let (keys, next) = match opts.page_token.as_deref() {
+                None => (vec!["exports-1.jsonl"], Some("t2".to_string())),
+                _ => (vec!["exports-2.jsonl"], None),
+            };
+            Ok(object_store::list::PaginatedListResult {
+                result: object_store::ListResult {
+                    common_prefixes: Vec::new(),
+                    objects: keys.into_iter().map(meta).collect(),
+                },
+                page_token: next,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paginated_store_lists_by_the_exact_prefix_page_by_page() {
+        let pages = Arc::new(TwoPages::default());
+        let objects = AzureObjects {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            paginated: Some(pages.clone()),
+            container: "c".into(),
+            part_bytes: 4,
+            concurrency: 1,
+            roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            calls: Arc::new(faucet_core::CallSlot::default()),
+        };
+        let keys = objects.list("exports-").await.unwrap();
+        assert_eq!(keys, ["exports-1.jsonl", "exports-2.jsonl"]);
+        assert_eq!(
+            *pages.0.lock().unwrap(),
+            [
+                (Some("exports-".to_string()), None),
+                (Some("exports-".to_string()), Some("t2".to_string()))
+            ],
+            "the root-level prefix goes to the server, not the whole container"
+        );
+        pages.0.lock().unwrap().clear();
+        objects.list("").await.unwrap();
+        assert_eq!(pages.0.lock().unwrap()[0].0, None);
+    }
+
     #[test]
     fn list_roots_are_whole_segments() {
         assert_eq!(list_root("a/b-").unwrap().as_ref(), "a");
@@ -508,6 +636,7 @@ mod tests {
     async fn round_trips_against_an_in_memory_store() {
         let objects = AzureObjects {
             store: Arc::new(object_store::memory::InMemory::new()),
+            paginated: None,
             container: "c".into(),
             part_bytes: 4,
             concurrency: 2,
@@ -573,6 +702,7 @@ mod tests {
     fn objects(store: Arc<dyn ObjectStore>, part_bytes: usize) -> AzureObjects {
         AzureObjects {
             store,
+            paginated: None,
             container: "c".into(),
             part_bytes,
             concurrency: 1,
