@@ -70,3 +70,6 @@ export function mdInline(s) {
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
+
+/** Run statuses that never change again (mirrors `RunStatus::is_terminal`). */
+export const TERMINAL_RUN_STATUSES = ["completed", "failed", "cancelled"];

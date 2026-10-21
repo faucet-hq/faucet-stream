@@ -2,7 +2,7 @@ import { api, toast } from "../api.js";
 import { streamLogs } from "../sse.js";
 import { navigate } from "../router.js";
 import { formatTsSplit } from "../tz.js";
-import { escapeHtml, fmtInt, fmtCompact } from "../utils.js";
+import { escapeHtml, fmtInt, fmtCompact, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
 
 /** Human duration between two RFC3339 timestamps; "—" if either is missing. */
 function fmtDur(fromISO, toISO) {
@@ -26,7 +26,6 @@ function fmtMs(ms) {
   return `${m}m ${Math.round(s % 60)}s`;
 }
 
-const TERMINAL = ["completed", "failed", "cancelled"];
 
 const LOG_EXPORT_PILL = {
   exported: "pill-completed",
@@ -253,7 +252,7 @@ export async function renderDetail(container, { id }) {
     }
     renderHead(rec);
     const live = !TERMINAL.includes(rec.status);
-    container.querySelector("#cancel").hidden = !(rec.status === "running" || rec.status === "queued");
+    container.querySelector("#cancel").hidden = !live;
     container.querySelector("#delete").hidden = !TERMINAL.includes(rec.status);
     // Roll back (#706): only a finished run with at least one invocation id can
     // be undone. The toggle keeps its own hidden state once revealed.
