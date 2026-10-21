@@ -77,24 +77,76 @@ pub fn inject_collected(ctx: &mut HashMap<String, Value>, collected: &[Collected
     }
 }
 
-/// Project `select` (a dot-path, optionally `$`-prefixed) from each record and
-/// dedup the results in first-seen order. `null` / missing projections are
-/// skipped. `$` (or `""`) selects the whole record. Pure.
+/// Project `select` (a JSONPath; a bare `a.b` path is read as `$.a.b`) from
+/// each record and dedup the results in first-seen order. A path matching
+/// several values in one record (a wildcard) contributes each. `null` /
+/// missing projections are skipped. `$` (or `""`) selects the whole record.
+/// An invalid path projects nothing — [`check_select`] refuses it at load
+/// time. Pure.
 pub fn project_dedup(records: &[Value], select: &str) -> Vec<Value> {
+    project_dedup_counted(records, select).values
+}
+
+/// What [`project_dedup_counted`] produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projection {
+    /// The distinct projected values, first-seen order.
+    pub values: Vec<Value>,
+    /// Records whose projection was missing or `null`.
+    pub skipped: usize,
+}
+
+/// [`project_dedup`], also counting the records it skipped. Pure.
+pub fn project_dedup_counted(records: &[Value], select: &str) -> Projection {
+    let path = select_path(select);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<Value> = Vec::new();
+    let mut skipped = 0;
     for rec in records {
-        let Some(v) = project_value(rec, select) else {
-            continue;
+        let matches = match &path {
+            None => vec![rec.clone()],
+            Some(p) => faucet_core::util::extract_records(rec, Some(p)).unwrap_or_default(),
         };
-        if v.is_null() {
-            continue;
+        let mut any = false;
+        for v in matches {
+            if v.is_null() {
+                continue;
+            }
+            any = true;
+            if seen.insert(dedup_key(&v)) {
+                out.push(v);
+            }
         }
-        if seen.insert(dedup_key(&v)) {
-            out.push(v);
+        if !any {
+            skipped += 1;
         }
     }
-    out
+    Projection {
+        values: out,
+        skipped,
+    }
+}
+
+/// Refuse a `fan_out.select` that is not a valid JSONPath. Pure.
+pub fn check_select(select: &str) -> Result<(), String> {
+    match select_path(select) {
+        None => Ok(()),
+        Some(p) => faucet_core::util::extract_records(&Value::Null, Some(&p))
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// The JSONPath `select` names; `None` = the whole record.
+fn select_path(select: &str) -> Option<String> {
+    let s = select.trim();
+    if s.is_empty() || s == "$" {
+        None
+    } else if s.starts_with('$') {
+        Some(s.to_string())
+    } else {
+        Some(format!("$.{s}"))
+    }
 }
 
 /// Text identity of a value for dedup, with object keys sorted so two
@@ -116,24 +168,6 @@ fn dedup_key(v: &Value) -> String {
         }
         other => other.to_string(),
     }
-}
-
-/// Resolve a dot-path projection against one record. Supports a leading `$.` or
-/// bare `$` (whole record), then `a.b.c` segment walking into objects. Returns
-/// `None` if any segment is missing. Pure.
-fn project_value(record: &Value, select: &str) -> Option<Value> {
-    let path = select
-        .strip_prefix("$.")
-        .or_else(|| select.strip_prefix('$'))
-        .unwrap_or(select);
-    if path.is_empty() {
-        return Some(record.clone());
-    }
-    let mut cur = record;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    Some(cur.clone())
 }
 
 /// The number of invocations `dims` expands to (the product of the value-set
@@ -251,6 +285,32 @@ mod tests {
             project_dedup(&recs, "$.meta.code"),
             vec![json!("X"), json!("Y")]
         );
+    }
+
+    #[test]
+    fn select_is_jsonpath() {
+        let recs = vec![
+            json!({"account-id": "a", "items": [{"id": 1}, {"id": 2}], "a.b": "dotted"}),
+            json!({"account-id": "b", "items": [{"id": 2}, {"id": 3}], "a.b": null}),
+        ];
+        assert_eq!(project_dedup(&recs, "$['account-id']"), vec![json!("a"), json!("b")]);
+        assert_eq!(project_dedup(&recs, "$.items[0].id"), vec![json!(1), json!(2)]);
+        assert_eq!(
+            project_dedup(&recs, "$.items[*].id"),
+            vec![json!(1), json!(2), json!(3)]
+        );
+        let p = project_dedup_counted(&recs, "$['a.b']");
+        assert_eq!(p.values, vec![json!("dotted")]);
+        assert_eq!(p.skipped, 1);
+        assert_eq!(project_dedup_counted(&recs, "$.nope").skipped, 2);
+    }
+
+    #[test]
+    fn an_invalid_select_is_refused() {
+        assert!(check_select("$.items[").is_err());
+        assert!(check_select("$['account-id']").is_ok());
+        assert!(check_select("id").is_ok());
+        assert!(check_select("$").is_ok());
     }
 
     fn dim(id: &str, alias: &str, vals: Vec<Value>) -> Dim {

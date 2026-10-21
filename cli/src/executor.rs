@@ -2040,7 +2040,27 @@ async fn run_discovery(
         .await?;
         source.set_run_clock(opts.clock.to_utc());
         let records = source.fetch_with_context(&binds).await?;
-        let values = crate::discovery_matrix::project_dedup(&records, select);
+        let projection = crate::discovery_matrix::project_dedup_counted(&records, select);
+        if projection.skipped > 0 {
+            if projection.values.is_empty() {
+                tracing::warn!(
+                    row = %node.id,
+                    select,
+                    records = records.len(),
+                    "fan_out.select matched no value in any record: the rows that fan out \
+                     over it run zero times"
+                );
+            } else {
+                tracing::warn!(
+                    row = %node.id,
+                    select,
+                    skipped = projection.skipped,
+                    records = records.len(),
+                    "fan_out.select was missing or null in some records; they were skipped"
+                );
+            }
+        }
+        let values = projection.values;
         let n = values.len();
         if collect {
             // Publish one list per upstream tuple, keyed by the tuple, so a

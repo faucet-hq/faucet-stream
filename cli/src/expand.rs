@@ -475,6 +475,11 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     "matrix row '{id}': `discover.select` must not be empty"
                 )));
             }
+            if let Err(e) = crate::discovery_matrix::check_select(&disc.select) {
+                return Err(CliError::Config(format!(
+                    "matrix row '{id}': `fan_out.select` is not a valid JSONPath: {e}"
+                )));
+            }
             if !is_ident(&disc.as_alias) {
                 return Err(CliError::Config(format!(
                     "matrix row '{id}': `discover.as` ('{}') must match ^[a-z0-9][a-z0-9_-]*$",
