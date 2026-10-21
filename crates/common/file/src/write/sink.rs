@@ -144,6 +144,14 @@ impl<B: StorageBackend + ?Sized + 'static> FileSink<B> {
         self.inner.driver().writer()
     }
 
+    /// Join overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]); see
+    /// [`FileWriter::join_overwrite_run`].
+    pub fn with_overwrite_run(self, token: &str) -> Result<Self, FaucetError> {
+        self.writer().join_overwrite_run(token)?;
+        Ok(self)
+    }
+
     /// The storage backend.
     pub fn backend(&self) -> &Arc<B> {
         self.inner.driver().backend()

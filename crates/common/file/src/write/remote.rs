@@ -42,6 +42,33 @@ pub trait ObjectClient: Send + Sync {
     /// Every key that starts with `prefix` (recursive is fine; the backend
     /// keeps only direct children).
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError>;
+    /// The "directories" whose full key starts with `prefix`: each distinct
+    /// `prefix` + the rest of a key up to its next `/`, for keys that have
+    /// one. Default: derived from [`list`](Self::list), which fits a store
+    /// that lists recursively; a store whose listing returns only files in
+    /// one directory (SFTP) overrides it.
+    async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let mut dirs: Vec<String> = self
+            .list(prefix)
+            .await?
+            .into_iter()
+            .filter_map(|key| {
+                let rest = key.strip_prefix(prefix)?;
+                let end = rest.find('/')?;
+                Some(format!("{prefix}{}", &rest[..end]))
+            })
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        Ok(dirs)
+    }
+    /// Remove the directory `dir` once it is empty (an overwrite run's swap
+    /// area after its files are deleted). Default: nothing to do — a store
+    /// with flat keys has no directories.
+    async fn remove_empty_dir(&self, dir: &str) -> Result<(), FaucetError> {
+        let _ = dir;
+        Ok(())
+    }
     /// Whether `key` exists.
     async fn exists(&self, key: &str) -> Result<bool, FaucetError>;
     /// Download `key` into the local file `to`.
@@ -173,6 +200,9 @@ pub struct RemoteBackend {
     multipart: Option<Arc<dyn MultipartClient>>,
     base: String,
     swap: String,
+    /// The joined overwrite run's own swap prefix (see
+    /// [`StorageBackend::join_overwrite_run`]).
+    run_swap: std::sync::OnceLock<String>,
     template: NameTemplate,
     scratch: tempfile::TempDir,
     /// Held locked for the backend's life, so a later run can tell this
@@ -320,6 +350,7 @@ impl RemoteBackend {
         Ok(Self {
             _owner: owner,
             swap: format!("{base}{}/", template.swap_dir_name()),
+            run_swap: std::sync::OnceLock::new(),
             template: template.clone(),
             base,
             client,
@@ -436,16 +467,22 @@ impl RemoteBackend {
         &self.base
     }
 
-    /// The key prefix an overwrite run keeps its files under.
+    /// The key prefix an overwrite run keeps its files under (the joined
+    /// run's own, once joined).
     pub fn swap_prefix(&self) -> &str {
-        &self.swap
+        self.run_swap.get().unwrap_or(&self.swap)
     }
 
     fn prefix(&self, area: Area) -> &str {
         match area {
             Area::Destination => &self.base,
-            Area::Swap => &self.swap,
+            Area::Swap => self.swap_prefix(),
         }
+    }
+
+    /// The swap prefix of overwrite run `run` (the untokened one without).
+    fn run_prefix(&self, run: Option<&str>) -> String {
+        format!("{}{}/", self.base, self.template.swap_run_dir_name(run))
     }
 
     /// The full key of `name` in `area`.
@@ -531,6 +568,47 @@ impl StorageBackend for RemoteBackend {
     async fn delete_many(&self, area: Area, names: &[String]) -> Result<(), FaucetError> {
         let keys: Vec<String> = names.iter().map(|n| self.key(area, n)).collect();
         self.client.delete_many(&keys).await
+    }
+
+    fn join_overwrite_run(&self, token: &str) -> Result<(), FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        let prefix = self.run_prefix(Some(token));
+        if self.run_swap.get_or_init(|| prefix.clone()) != &prefix {
+            return Err(FaucetError::Config(
+                "remote file sink: already joined another overwrite run".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn swap_runs(&self) -> Result<Vec<String>, FaucetError> {
+        let prefix = format!(
+            "{}{}{}",
+            self.base,
+            self.template.swap_dir_name(),
+            super::layout::SWAP_RUN_SEPARATOR
+        );
+        Ok(self
+            .client
+            .list_dirs(&prefix)
+            .await?
+            .iter()
+            .filter_map(|dir| {
+                dir.strip_prefix(&self.base)
+                    .and_then(|name| self.template.swap_run_token(name))
+            })
+            .collect())
+    }
+
+    async fn drop_swap_run(&self, run: Option<&str>) -> Result<(), FaucetError> {
+        let prefix = self.run_prefix(run);
+        let keys = self.client.list(&prefix).await?;
+        if !keys.is_empty() {
+            self.client.delete_many(&keys).await?;
+        }
+        self.client
+            .remove_empty_dir(prefix.trim_end_matches('/'))
+            .await
     }
 
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {

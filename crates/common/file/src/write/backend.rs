@@ -162,6 +162,34 @@ pub trait StorageBackend: Send + Sync {
     /// runs through. Default: the backend makes no remote calls.
     fn set_call_context(&self, _ctx: CallContext) {}
 
+    /// Join overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): from now on
+    /// [`Area::Swap`] is that run's own area
+    /// ([`NameTemplate::swap_run_dir_name`](super::NameTemplate::swap_run_dir_name)),
+    /// so concurrent overwrite runs of one output never share one. Called
+    /// once, before the first use. Default: refused — the backend has one
+    /// fixed swap area.
+    fn join_overwrite_run(&self, token: &str) -> Result<(), FaucetError> {
+        let _ = token;
+        Err(FaucetError::Config(
+            "file sink: this storage backend cannot stage overwrite runs apart".into(),
+        ))
+    }
+
+    /// The run tokens of every tokened swap area of this output that exists
+    /// (any run's, this one's included). Default: none.
+    async fn swap_runs(&self) -> Result<Vec<String>, FaucetError> {
+        Ok(Vec::new())
+    }
+
+    /// Delete the swap area of overwrite run `run` (`None`: the untokened
+    /// area) and everything in it. A missing area is not an error. Default:
+    /// nothing to delete.
+    async fn drop_swap_run(&self, run: Option<&str>) -> Result<(), FaucetError> {
+        let _ = run;
+        Ok(())
+    }
+
     /// A non-mutating preflight probe of the storage (reachability,
     /// credentials). `None` when the backend has none, so the sink's own
     /// probe answers. Default: `None`.
@@ -277,6 +305,26 @@ macro_rules! delegate_storage_backend {
             }
             fn set_call_context(&self, ctx: $crate::__private::CallContext) {
                 $crate::write::StorageBackend::set_call_context(&self.$field, ctx)
+            }
+            fn join_overwrite_run(
+                &self,
+                token: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::join_overwrite_run(&self.$field, token)
+            }
+            async fn swap_runs(
+                &self,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::swap_runs(&self.$field).await
+            }
+            async fn drop_swap_run(
+                &self,
+                run: ::std::option::Option<&str>,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::drop_swap_run(&self.$field, run).await
             }
             async fn check(
                 &self,

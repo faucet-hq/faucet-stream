@@ -309,6 +309,9 @@ pub struct FileWriter {
     encryption: Option<faucet_core::CompiledEncryption>,
     state: tokio::sync::Mutex<State>,
     outputs: faucet_core::LocalOutputLog,
+    /// The overwrite run this writer belongs to (see
+    /// [`join_overwrite_run`](Self::join_overwrite_run)).
+    overwrite_run: std::sync::OnceLock<String>,
 }
 
 impl FileWriter {
@@ -331,7 +334,48 @@ impl FileWriter {
             backend,
             state: tokio::sync::Mutex::new(State::default()),
             outputs: faucet_core::LocalOutputLog::new(),
+            overwrite_run: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Join overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in that run's own swap area
+    /// (`.faucet-overwrite-<tag>~<token>`), so a concurrent overwrite run of
+    /// the same output neither drops nor moves in the other's files. Call
+    /// before the first write.
+    pub fn join_overwrite_run(&self, token: &str) -> Result<(), FaucetError> {
+        self.backend.join_overwrite_run(token)?;
+        if self.overwrite_run.get_or_init(|| token.to_string()) != token {
+            return Err(FaucetError::Config(
+                "file sink: already joined another overwrite run".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// At a tokened begin: drop the untokened swap area (an earlier
+    /// release's, or a run's without a token) and every tokened one another
+    /// run abandoned ([`faucet_core::idempotency::overwrite_run_abandoned`]).
+    /// A live run's area and this run's own are never touched. An interrupted
+    /// move such an area recorded is not finished: this run replaces every
+    /// file of the template when it commits.
+    async fn sweep_swap_areas(&self) -> Result<(), FaucetError> {
+        let Some(own) = self.overwrite_run.get() else {
+            return Ok(());
+        };
+        self.backend.drop_swap_run(None).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for token in self.backend.swap_runs().await? {
+            if faucet_core::idempotency::overwrite_run_abandoned(&token, Some(own), now) {
+                tracing::warn!(run = %token, "file sink: dropping an overwrite swap area an earlier run abandoned");
+                self.backend.drop_swap_run(Some(&token)).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The settings the writer was built with.
@@ -796,6 +840,7 @@ impl FileWriter {
         self.backend.prepare(Area::Destination).await?;
         self.finish_interrupted_move().await?;
         self.clear_swap().await?;
+        self.sweep_swap_areas().await?;
         self.backend.prepare(Area::Swap).await?;
         self.put_marker(SWAP_MARKER, "").await
     }
@@ -838,10 +883,16 @@ impl FileWriter {
         self.clear_swap().await
     }
 
-    /// Whether an overwrite swap area exists right now.
+    /// Whether an overwrite swap area exists right now: this run's own; or,
+    /// without a run token (the `faucet status` probe), the untokened area or
+    /// any run's tokened one.
     pub async fn swap_area_exists(&self) -> Result<bool, FaucetError> {
-        Ok(self.backend.exists(Area::Swap, SWAP_MARKER).await?
-            || self.backend.exists(Area::Swap, COMMIT_MARKER).await?)
+        if self.backend.exists(Area::Swap, SWAP_MARKER).await?
+            || self.backend.exists(Area::Swap, COMMIT_MARKER).await?
+        {
+            return Ok(true);
+        }
+        Ok(self.overwrite_run.get().is_none() && !self.backend.swap_runs().await?.is_empty())
     }
 
     /// Drop the open file's scratch files without publishing it.

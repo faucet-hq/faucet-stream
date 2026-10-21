@@ -196,6 +196,20 @@ impl ObjectClient for SftpObjects {
         self.calls.call_once("head", self.exists_now(key)).await
     }
 
+    /// The directories in `prefix`'s directory whose names start with the
+    /// rest of it (a listing returns files only).
+    async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        self.calls
+            .call_once("list", self.list_dirs_now(prefix))
+            .await
+    }
+
+    async fn remove_empty_dir(&self, dir: &str) -> Result<(), FaucetError> {
+        self.calls
+            .call_once("delete", self.remove_dir_now(dir))
+            .await
+    }
+
     async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
         self.calls
             .call_once("get", self.download_now(key, to))
@@ -330,6 +344,33 @@ impl SftpObjects {
             let _ = sftp.remove_file(tmp.as_str()).await;
         }
         result
+    }
+
+    async fn list_dirs_now(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let conn = self.connection().await?;
+        let (dir, start) = split_prefix(prefix);
+        let entries = match conn.session().read_dir(dir.as_str()).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                missing("list", &dir, e)?;
+                return Ok(Vec::new());
+            }
+        };
+        let base = &prefix[..prefix.len() - start.len()];
+        Ok(entries
+            .filter(|e| e.file_type().is_dir())
+            .map(|e| e.file_name())
+            .filter(|n| n.starts_with(start))
+            .map(|n| format!("{base}{n}"))
+            .collect())
+    }
+
+    async fn remove_dir_now(&self, dir: &str) -> Result<(), FaucetError> {
+        let conn = self.connection().await?;
+        match conn.session().remove_dir(dir).await {
+            Ok(()) => Ok(()),
+            Err(e) => missing("delete", dir, e).map(|_| ()),
+        }
     }
 
     async fn delete_now(&self, key: &str) -> Result<(), FaucetError> {

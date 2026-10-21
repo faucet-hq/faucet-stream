@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 pub struct LocalBackend {
     dir: PathBuf,
     swap: PathBuf,
+    /// The joined overwrite run's own swap directory (see
+    /// [`StorageBackend::join_overwrite_run`]).
+    run_swap: std::sync::OnceLock<PathBuf>,
     template: NameTemplate,
     create_dirs: bool,
 }
@@ -33,6 +36,7 @@ impl LocalBackend {
         };
         Self {
             swap: dir.join(template.swap_dir_name()),
+            run_swap: std::sync::OnceLock::new(),
             dir,
             template: template.clone(),
             create_dirs,
@@ -44,15 +48,15 @@ impl LocalBackend {
         &self.dir
     }
 
-    /// The overwrite swap directory.
+    /// The overwrite swap directory (the joined run's own, once joined).
     pub fn swap_dir(&self) -> &Path {
-        &self.swap
+        self.run_swap.get().unwrap_or(&self.swap)
     }
 
     fn area(&self, area: Area) -> &Path {
         match area {
             Area::Destination => &self.dir,
-            Area::Swap => &self.swap,
+            Area::Swap => self.swap_dir(),
         }
     }
 
@@ -199,7 +203,7 @@ impl StorageBackend for LocalBackend {
 
     async fn delete(&self, area: Area, name: &str) -> Result<(), FaucetError> {
         let path = self.path(area, name);
-        let swap = (area == Area::Swap).then(|| self.swap.clone());
+        let swap = (area == Area::Swap).then(|| self.swap_dir().to_path_buf());
         fs(move || {
             match std::fs::remove_file(&path) {
                 Ok(()) => sync_parent(&path),
@@ -212,6 +216,52 @@ impl StorageBackend for LocalBackend {
                 sync_parent(&dir);
             }
             Ok(())
+        })
+        .await
+    }
+
+    fn join_overwrite_run(&self, token: &str) -> Result<(), FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        let dir = self.dir.join(self.template.swap_run_dir_name(Some(token)));
+        if self.run_swap.get_or_init(|| dir.clone()) != &dir {
+            return Err(FaucetError::Config(
+                "file sink: already joined another overwrite run".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn swap_runs(&self) -> Result<Vec<String>, FaucetError> {
+        let dir = self.dir.clone();
+        let template = self.template.clone();
+        fs(move || {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(io_err("listing", &dir, e)),
+            };
+            Ok(entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| template.swap_run_token(n))
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn drop_swap_run(&self, run: Option<&str>) -> Result<(), FaucetError> {
+        let dir = self.dir.join(self.template.swap_run_dir_name(run));
+        fs(move || match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                sync_parent(&dir);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err("removing an overwrite swap area", &dir, e)),
         })
         .await
     }

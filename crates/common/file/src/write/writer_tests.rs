@@ -1381,3 +1381,112 @@ async fn an_encrypted_headerless_csv_keeps_its_column_order_after_a_flush() {
     // Row 1 is padded to the grown header; `b` stays the first column.
     assert_eq!(String::from_utf8(plain).unwrap(), "1,\n3,2\n");
 }
+
+/// Two overwrite runs of one remote output at once: each run's begin, writer
+/// and commit instances share its run token and swap area, so neither begin
+/// drops the other's files and each commit moves in only its own. A tokened
+/// begin drops the untokened area and an area a run abandoned a day ago.
+#[tokio::test]
+async fn concurrent_remote_overwrite_runs_keep_their_own_files() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let mem = Arc::new(Mem::default());
+    let tag = overwrite_remote(&mem).template().swap_dir_name();
+    for key in [
+        format!("pre/d/{tag}/part-00001.jsonl"),
+        format!("pre/d/{tag}~10000000aaaaaa/part-00001.jsonl"),
+    ] {
+        mem.objects.lock().unwrap().insert(key, b"stale\n".to_vec());
+    }
+    let run = |token: &str| {
+        let w = overwrite_remote(&mem);
+        w.join_overwrite_run(token).unwrap();
+        w
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    run(&a).begin_overwrite().await.unwrap();
+    run(&b).begin_overwrite().await.unwrap();
+    let keys = mem.keys();
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.contains("aaaaaa") || k.contains(&format!("{tag}/"))),
+        "{keys:?}"
+    );
+    let wa = run(&a);
+    wa.write_rows(&rows(2)).await.unwrap();
+    wa.flush().await.unwrap();
+    let wb = run(&b);
+    wb.write_rows(&[json!({"b": 1})]).await.unwrap();
+    wb.flush().await.unwrap();
+    // The untokened status probe sees the live runs' areas.
+    assert!(overwrite_remote(&mem).swap_area_exists().await.unwrap());
+    run(&a).commit_overwrite().await.unwrap();
+    let dest: Vec<String> = mem
+        .keys()
+        .into_iter()
+        .filter(|k| !k.contains(&tag))
+        .collect();
+    assert_eq!(dest, ["pre/d/part-00001.jsonl", "pre/d/part-00002.jsonl"]);
+    run(&b).commit_overwrite().await.unwrap();
+    assert_eq!(mem.keys(), ["pre/d/part-00001.jsonl"]);
+    assert_eq!(
+        mem.objects.lock().unwrap()["pre/d/part-00001.jsonl"],
+        b"{\"b\":1}\n".to_vec()
+    );
+    assert!(!overwrite_remote(&mem).swap_area_exists().await.unwrap());
+    let w = overwrite_remote(&mem);
+    w.join_overwrite_run(&a).unwrap();
+    assert!(w.join_overwrite_run(&b).is_err());
+    assert!(w.join_overwrite_run("../x").is_err());
+}
+
+/// The same race against a local directory.
+#[tokio::test]
+async fn concurrent_local_overwrite_runs_keep_their_own_files() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = jsonl();
+    s.write_mode = FileWriteMode::Overwrite;
+    let open = || local(dir.path(), "out/data.jsonl", s.clone());
+    let tag = open().template().swap_dir_name();
+    let out = dir.path().join("out");
+    for area in [tag.clone(), format!("{tag}~10000000aaaaaa")] {
+        std::fs::create_dir_all(out.join(&area)).unwrap();
+        std::fs::write(out.join(&area).join("data.jsonl"), "stale\n").unwrap();
+    }
+    let run = |token: &str| {
+        let w = open();
+        w.join_overwrite_run(token).unwrap();
+        w
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    run(&a).begin_overwrite().await.unwrap();
+    run(&b).begin_overwrite().await.unwrap();
+    assert!(!out.join(&tag).exists());
+    assert!(!out.join(format!("{tag}~10000000aaaaaa")).exists());
+    let wa = run(&a);
+    wa.write_rows(&[json!({"a": 1})]).await.unwrap();
+    wa.flush().await.unwrap();
+    let wb = run(&b);
+    wb.write_rows(&[json!({"b": 1})]).await.unwrap();
+    wb.flush().await.unwrap();
+    assert!(open().swap_area_exists().await.unwrap());
+    run(&a).commit_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data.jsonl")).unwrap(),
+        "{\"a\":1}\n"
+    );
+    assert!(out.join(format!("{tag}~{b}")).exists());
+    run(&b).commit_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data.jsonl")).unwrap(),
+        "{\"b\":1}\n"
+    );
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["data.jsonl"]);
+    assert!(!open().swap_area_exists().await.unwrap());
+}
