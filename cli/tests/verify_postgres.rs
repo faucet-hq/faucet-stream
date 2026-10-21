@@ -262,3 +262,92 @@ matrix:
     assert_eq!(body.lines().count(), 1, "{body}");
     assert!(body.contains("42"), "{body}");
 }
+
+/// A masked row cannot be compared by server digests (the backend digests the
+/// raw source, the destination holds masked values): verification digests
+/// client-side over masked rows instead of bisecting every range.
+#[cfg(feature = "masking")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_masked_row_digests_client_side() {
+    let (_c, url) = start_postgres().await;
+    exec(&url, "CREATE TABLE src (id BIGINT PRIMARY KEY, email TEXT)").await;
+    exec(
+        &url,
+        "INSERT INTO src SELECT g, 'u' || g || '@example.com' FROM generate_series(1, 50) g",
+    )
+    .await;
+    exec(&url, "CREATE TABLE dst (id BIGINT PRIMARY KEY, email TEXT)").await;
+    let yaml = format!(
+        r#"
+version: 1
+name: pg_masked
+pipeline:
+  source: {{ type: postgres, config: {{ connection_url: "{url}", query: "SELECT id, email FROM src" }} }}
+  sink: {{ type: postgres, config: {{ connection_url: "{url}", table_name: dst, column_mapping: auto_map, write_mode: upsert, key: [id] }} }}
+  masking:
+    rules:
+      - name: emails
+        match: {{ fields: [email] }}
+        action: {{ type: hash }}
+"#
+    );
+    let cfg = PipelineConfig::from_text(&yaml, Path::new("pg.yaml")).unwrap();
+    let summary = run_expanded(expand(&cfg).unwrap(), plain_options("pg_masked"))
+        .await
+        .unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let spec: VerifySpec = serde_yaml::from_str("ranges: 4\nleaf_rows: 8").unwrap();
+    let out = faucet_cli::verify::verify(
+        &cfg,
+        &spec,
+        VerifyInputs {
+            row: None,
+            repair: false,
+            allow_delete: false,
+            dry_run: false,
+            pipeline_name: "pg_masked".into(),
+            execution: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(out.report.equal(), "{out:?}");
+    assert!(!out.report.server_digests, "{out:?}");
+    assert_eq!(out.report.ranges_differing, 0, "{out:?}");
+}
+
+fn plain_options(name: &str) -> ExecuteOptions {
+    ExecuteOptions {
+        legacy_state_writes: false,
+        force_lease: false,
+        pipeline_name: name.into(),
+        run_id: None,
+        execution: None,
+        concurrency: None,
+        dry_run: false,
+        limit: None,
+        state_path_override: None,
+        state_scope: Default::default(),
+        shard: None,
+        auth: Default::default(),
+        clock: chrono::Utc::now().fixed_offset(),
+        cancel: None,
+        resilience: None,
+        sla: None,
+        reconcile: None,
+        verify: None,
+        rollback: None,
+        #[cfg(feature = "lineage")]
+        lineage: None,
+        #[cfg(feature = "lineage")]
+        lineage_cfg: None,
+        #[cfg(feature = "notify")]
+        notifier: None,
+        #[cfg(feature = "catalog")]
+        catalog: None,
+        usage: Default::default(),
+        budget: None,
+    }
+}

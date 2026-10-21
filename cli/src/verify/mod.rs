@@ -290,6 +290,17 @@ pub async fn verify_node_guarded(
     };
     #[cfg(not(feature = "masking"))]
     let masking: Option<()> = None;
+    // A backend digests the raw source rows, but the destination holds them
+    // masked, so a masked row's server digests could never agree: every range
+    // would bisect to its leaves. Digest client-side, over masked rows.
+    #[cfg(feature = "masking")]
+    let server_columns = match &masking {
+        Some(m) if !m.is_empty() => {
+            tracing::info!(row = %node.id, "verify: masking rewrites this row; digesting client-side");
+            None
+        }
+        _ => server_columns,
+    };
 
     let mut session = Session {
         source: source.as_ref(),
