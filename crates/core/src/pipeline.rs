@@ -1239,6 +1239,28 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
     }
 }
 
+/// The governance pass that quarantined most of a page's envelopes, read from
+/// each envelope's `reason`; ties go to the earlier pass in `ALL` order.
+fn dominant_governance_reason(envelopes: &[Value]) -> crate::dlq::DlqReason {
+    let candidates = [
+        crate::dlq::DlqReason::Quality,
+        crate::dlq::DlqReason::Contract,
+        crate::dlq::DlqReason::SchemaDrift,
+    ];
+    let mut counts = [0usize; 3];
+    for env in envelopes {
+        let reason = env.get("reason").and_then(Value::as_str);
+        if let Some(i) = candidates.iter().position(|c| Some(c.as_str()) == reason) {
+            counts[i] += 1;
+        }
+    }
+    let best = (0..candidates.len())
+        .rev()
+        .max_by_key(|&i| counts[i])
+        .unwrap_or(0);
+    candidates[best]
+}
+
 /// Fold the run's non-finite count (values with no JSON rendering written as
 /// `null`, #885) into the row accounts and the metric, and say so once.
 fn settle_non_finite(
@@ -2305,10 +2327,8 @@ where
                         // Capture the quality count BEFORE the splice — the splice
                         // moves `quality_envelopes`, so its length is unavailable
                         // afterward. Used below to pick the page `reason` label.
-                        #[cfg(feature = "quality")]
                         let quality_count = quality_envelopes.len();
-                        #[cfg(not(feature = "quality"))]
-                        let quality_count = 0usize;
+                        let governance_reason = dominant_governance_reason(quality_envelopes.envelopes());
                         envelopes.prepend(quality_envelopes);
                         let page_failures = envelopes.len();
 
@@ -2421,8 +2441,9 @@ where
                             //    was synthesized from an outer `write_batch_partial`
                             //    error (OnBatchError::DlqAll); no genuine per-row
                             //    failures occurred.
-                            //  - `quality`  — every envelope is quality-sourced
-                            //    (no sink-side failures on this page).
+                            //  - `quality` / `contract` / `schema_drift` — every
+                            //    envelope came from a governance pass (no sink-side
+                            //    failures); the most frequent pass names the page.
                             // The per-row quality volume is separately exposed via
                             // `faucet_quality_records_quarantined_total`.
                             let reason_label = if had_per_row_sink_failure {
@@ -2432,7 +2453,7 @@ where
                             } else if page_failures > quality_count {
                                 DlqReason::Partial.as_str()
                             } else {
-                                DlqReason::Quality.as_str()
+                                governance_reason.as_str()
                             };
                             counter!("faucet_sink_dlq_records_total", metric_labels.clone())
                                 .increment(page_failures as u64);
@@ -5235,6 +5256,25 @@ mod tests {
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0]["error"]["kind"], "QualityFailure");
         assert_eq!(result.dlq.unwrap().records_dlq, 1);
+    }
+
+    #[test]
+    fn governance_page_reason_follows_the_envelopes() {
+        use crate::dlq::DlqReason;
+        let env = |r: &str| json!({"reason": r});
+        assert_eq!(
+            dominant_governance_reason(&[env("contract"), env("contract"), env("quality")]),
+            DlqReason::Contract
+        );
+        assert_eq!(
+            dominant_governance_reason(&[env("schema_drift")]),
+            DlqReason::SchemaDrift
+        );
+        assert_eq!(
+            dominant_governance_reason(&[env("quality"), env("contract")]),
+            DlqReason::Quality
+        );
+        assert_eq!(dominant_governance_reason(&[]), DlqReason::Quality);
     }
 
     #[cfg(feature = "quality")]
