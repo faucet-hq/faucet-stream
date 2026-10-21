@@ -527,6 +527,17 @@ async fn run_expanded_unredacted(
     opts: ExecuteOptions,
 ) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
+    // A root's state key depends only on the run's names, so an invalid one
+    // fails the run before anything is written rather than mid-run.
+    for node in nodes.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
+        let uses_state = node.state.is_some() || opts.state_path_override.is_some();
+        let key = opts
+            .state_scope
+            .key(&opts.pipeline_name)
+            .with_row(node.id.as_str())
+            .render();
+        validate_unit_state_key(&node.id, uses_state, &key)?;
+    }
     if !opts.dry_run {
         check_overwrite_plan(&nodes, &opts).await?;
     }
@@ -5408,12 +5419,17 @@ mod tests {
         seed_table(&db_url).await;
         std::fs::write(dir.path().join("a.csv"), "id,v\n1,NEW\n").unwrap();
         let yaml = format!(
-            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\n  on_error: stop\npipeline:\n  sources:\n    a: {{ type: csv, config: {{ path: '{a}' }} }}\n    b: {{ type: csv, config: {{ path: '{b}' }} }}\n  sinks:\n    t: {{ type: sqlite, config: {{ database_url: '{db_url}', table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}\n    trash: {{ type: jsonl, config: {{ path: '{trash}' }} }}\nmatrix:\n  - id: a\n    source: {{ ref: a }}\n    sink: {{ ref: t }}\n  - id: b\n    source: {{ ref: b }}\n    sink: {{ ref: trash }}\n",
+            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\n  on_error: stop\npipeline:\n  sources:\n    a: {{ type: csv, config: {{ path: '{a}' }} }}\n    b: {{ type: csv, config: {{ path: '{b}' }} }}\n  sinks:\n    t: {{ type: sqlite, config: {{ database_url: '{db_url}', table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}\n    broken: {{ type: sqlite, config: {{ database_url: 'sqlite:{broken}', table_name: t }} }}\nmatrix:\n  - id: a\n    source: {{ ref: a }}\n    sink: {{ ref: t }}\n  - id: b\n    source: {{ ref: b }}\n    sink: {{ ref: broken }}\n",
             a = dir.path().join("a.csv").display(),
-            b = dir.path().join("missing.csv").display(),
-            trash = dir.path().join("trash.jsonl").display(),
+            b = dir.path().join("a.csv").display(),
+            broken = dir.path().join("no-such-dir").join("x.db").display(),
         );
-        let summary = run_yaml(&yaml, &dir.path().join("ow.yaml")).await;
+        let cfg = PipelineConfig::from_text(&yaml, &dir.path().join("ow.yaml")).unwrap();
+        let mut opts = exec_opts("ow");
+        opts.execution = cfg.execution.clone();
+        let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+        let b = summary.invocations.iter().find(|o| o.row_id == "b").unwrap();
+        assert!(b.error.is_some(), "the sibling must fail: {summary:?}");
         let a = summary
             .invocations
             .iter()

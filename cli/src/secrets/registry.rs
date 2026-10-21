@@ -248,23 +248,15 @@ pub fn redact_with(input: &str, token: impl Fn(&str) -> String) -> Cow<'_, str> 
     };
     // Merge overlapping occurrences into runs; each run is replaced by the
     // token of the longest secret in it.
-    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
-    for m in matcher.find_overlapping_iter(input) {
-        let (start, end, p) = (m.start(), m.end(), m.pattern().as_usize());
-        match runs.last_mut() {
-            Some(run) if start < run.1 => {
-                run.1 = run.1.max(end);
-                if c.patterns[p].len() > c.patterns[run.2].len() {
-                    run.2 = p;
-                }
-            }
-            _ => runs.push((start, end, p)),
-        }
-    }
+    // Overlapping matches arrive in end order, so sort them by start first.
+    let mut runs: Vec<(usize, usize, usize)> = matcher
+        .find_overlapping_iter(input)
+        .map(|m| (m.start(), m.end(), m.pattern().as_usize()))
+        .collect();
     if runs.is_empty() {
         return Cow::Borrowed(input);
     }
-    runs.sort_by_key(|r| r.0);
+    runs.sort_unstable();
     let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(runs.len());
     for r in runs {
         match merged.last_mut() {
@@ -492,6 +484,13 @@ mod tests {
         register("abcdXYZW");
         let out = redact("v=xxabcdXYZW end");
         assert_eq!(out, "v=*** end");
+        // A secret ending where a longer one ends (reported first) still
+        // masks the whole longer one.
+        register("cdXYZW-tail");
+        register("abcdXYZW-tail");
+        assert_eq!(redact("k=abcdXYZW-tail."), "k=***.");
+        unregister("cdXYZW-tail");
+        unregister("abcdXYZW-tail");
         let tokens = redact_with("v=xxabcdXYZW and abcdXYZW", |s| format!("<{}>", s.len()));
         assert_eq!(tokens, "v=<8> and <8>");
         unregister("xxab");
