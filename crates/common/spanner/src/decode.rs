@@ -35,13 +35,33 @@ impl TryFromValue for SpannerJson {
 
 /// Decode a whole [`Row`] into a JSON object keyed by column name, using the
 /// stream's column metadata (`RowIterator::columns_metadata`).
+///
+/// A column with no name (an unaliased expression) or a name another column
+/// already uses (a join's `a.id, b.id`) is refused: the record would otherwise
+/// lose one of the values or key it by `""`.
 pub fn row_to_json(row: &Row, fields: &[Field]) -> Result<Value, RowError> {
     let mut obj = serde_json::Map::with_capacity(fields.len());
     for (idx, field) in fields.iter().enumerate() {
+        if field.name.is_empty() {
+            return Err(RowError::CustomParseError(format!(
+                "result column {} has no name (an unaliased expression); give it an alias \
+                 with `AS`",
+                idx + 1
+            )));
+        }
         let SpannerJson(v) = row.column::<SpannerJson>(idx)?;
-        obj.insert(field.name.clone(), v);
+        if obj.insert(field.name.clone(), v).is_some() {
+            return Err(duplicate_name("result column", &field.name));
+        }
     }
     Ok(Value::Object(obj))
+}
+
+fn duplicate_name(what: &str, name: &str) -> RowError {
+    RowError::CustomParseError(format!(
+        "two {what}s are named {name:?}, so one value would replace the other; alias one of \
+         them with `AS`"
+    ))
 }
 
 fn type_code(ty: Option<&Type>) -> TypeCode {
@@ -118,11 +138,21 @@ pub fn decode_value(
                 .unwrap_or(&[]);
             let mut obj = serde_json::Map::with_capacity(list.values.len());
             for (idx, v) in list.values.iter().enumerate() {
+                // An unnamed field (`STRUCT(1, 2)`) is keyed by its position.
                 let (name, elem_ty) = fields
                     .get(idx)
+                    .filter(|f| !f.name.is_empty())
                     .map(|f| (f.name.clone(), f.r#type.as_ref()))
-                    .unwrap_or_else(|| (format!("_{idx}"), None));
-                obj.insert(name, decode_value(v, elem_ty, field_name)?);
+                    .unwrap_or_else(|| {
+                        (
+                            format!("_{idx}"),
+                            fields.get(idx).and_then(|f| f.r#type.as_ref()),
+                        )
+                    });
+                let value = decode_value(v, elem_ty, field_name)?;
+                if obj.insert(name.clone(), value).is_some() {
+                    return Err(duplicate_name(&format!("{field_name} STRUCT field"), &name));
+                }
             }
             Ok(Value::Object(obj))
         }
@@ -357,5 +387,89 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v, json!([false]));
+    }
+
+    fn field(name: &str, code: TypeCode) -> Field {
+        Field {
+            name: name.into(),
+            r#type: Some(ty(code)),
+        }
+    }
+
+    fn row(fields: Vec<Field>, values: Vec<prost_types::Value>) -> Row {
+        let index = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), i))
+            .collect();
+        Row::new(
+            std::sync::Arc::new(index),
+            std::sync::Arc::new(fields),
+            values,
+        )
+    }
+
+    #[test]
+    fn rows_keep_every_named_column() {
+        let fields = vec![field("id", TypeCode::Int64), field("n", TypeCode::String)];
+        let r = row(
+            fields.clone(),
+            vec![
+                pv(Kind::StringValue("1".into())),
+                pv(Kind::StringValue("a".into())),
+            ],
+        );
+        assert_eq!(
+            row_to_json(&r, &fields).unwrap(),
+            json!({"id": 1, "n": "a"})
+        );
+    }
+
+    #[test]
+    fn duplicate_or_unnamed_result_columns_are_refused() {
+        let dup = vec![field("id", TypeCode::Int64), field("id", TypeCode::Int64)];
+        let r = row(
+            dup.clone(),
+            vec![
+                pv(Kind::StringValue("1".into())),
+                pv(Kind::StringValue("2".into())),
+            ],
+        );
+        let err = row_to_json(&r, &dup).unwrap_err().to_string();
+        assert!(err.contains("\"id\"") && err.contains("AS"), "{err}");
+
+        let unnamed = vec![field("id", TypeCode::Int64), field("", TypeCode::Int64)];
+        let r = row(
+            unnamed.clone(),
+            vec![
+                pv(Kind::StringValue("1".into())),
+                pv(Kind::StringValue("3".into())),
+            ],
+        );
+        let err = row_to_json(&r, &unnamed).unwrap_err().to_string();
+        assert!(err.contains("column 2") && err.contains("no name"), "{err}");
+    }
+
+    #[test]
+    fn unnamed_struct_fields_are_keyed_by_position_and_duplicates_refused() {
+        let st = |names: [&str; 2]| {
+            let mut t = ty(TypeCode::Struct);
+            t.struct_type = Some(StructType {
+                fields: names.iter().map(|n| field(n, TypeCode::Int64)).collect(),
+            });
+            t
+        };
+        let val = pv(Kind::ListValue(prost_types::ListValue {
+            values: vec![
+                pv(Kind::StringValue("1".into())),
+                pv(Kind::StringValue("2".into())),
+            ],
+        }));
+        let v = decode_value(&val, Some(&st(["", ""])), "s").unwrap();
+        assert_eq!(v, json!({"_0": 1, "_1": 2}));
+        let err = decode_value(&val, Some(&st(["a", "a"])), "s")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"a\""), "{err}");
     }
 }
