@@ -1179,6 +1179,9 @@ async fn execute(
     actor: &AuthContext,
     mut change: ChangeRequest,
 ) -> Result<ChangeRequest, ServeError> {
+    if let Err(why) = requester_still_authorized(state.auth_mode(), &change) {
+        return finish_failed(state, actor, change, why).await;
+    }
     let requester = AuthContext {
         principal: change.requester.clone(),
         role: change.requester_role,
@@ -1432,6 +1435,48 @@ async fn execute_template_deprecate(
             version,
         }),
     ))
+}
+
+/// Under `--auth-config`, the requester must still be a configured principal
+/// with at least the role and the same tenant scope it held when it asked.
+/// Server-originated requesters (`system:`, `trigger:`, `sync:`, `runtime`)
+/// are not in the file and are not checked.
+fn requester_still_authorized(
+    mode: &crate::serve::config::AuthMode,
+    change: &ChangeRequest,
+) -> Result<(), String> {
+    let crate::serve::config::AuthMode::Rbac(rbac) = mode else {
+        return Ok(());
+    };
+    let name = change.requester.as_str();
+    let Some((role, tenant)) = rbac.principal(name) else {
+        if name == "runtime" || name.contains(':') {
+            return Ok(());
+        }
+        return Err(format!(
+            "requester '{name}' is no longer a principal in --auth-config, so the approved \
+             change cannot run on its behalf"
+        ));
+    };
+    let downgraded = change
+        .requester_role
+        .permissions()
+        .into_iter()
+        .any(|p| !role.grants(p));
+    if downgraded {
+        return Err(format!(
+            "requester '{name}' now holds role {role:?}, below the {:?} it held when it \
+             requested this change, so the approved change cannot run on its behalf",
+            change.requester_role
+        ));
+    }
+    if tenant != change.tenant.as_deref() {
+        return Err(format!(
+            "requester '{name}' is no longer scoped to the tenant this change was \
+             requested for, so the approved change cannot run on its behalf"
+        ));
+    }
+    Ok(())
 }
 
 async fn finish_failed(
@@ -1778,6 +1823,43 @@ mod tests {
             tenant: None,
             trusted_config: false,
         }
+    }
+
+    #[test]
+    fn execution_requires_the_requester_to_still_be_authorized() {
+        use crate::serve::config::AuthMode;
+        use crate::serve::rbac::{PrincipalSpec, RbacConfig};
+        let spec = |name: &str, role, tenant: Option<&str>| PrincipalSpec {
+            name: name.into(),
+            token: format!("tok-{name}"),
+            role,
+            tenant: tenant.map(Into::into),
+        };
+        let mode = |ps| AuthMode::Rbac(std::sync::Arc::new(RbacConfig::new(ps).unwrap()));
+        let c = stored(ChangeKind::Run, json!({}), "m", 1);
+
+        assert!(requester_still_authorized(&AuthMode::None, &c).is_ok());
+        assert!(
+            requester_still_authorized(&mode(vec![spec("bob", Role::Operator, None)]), &c).is_ok()
+        );
+        assert!(
+            requester_still_authorized(&mode(vec![spec("bob", Role::Admin, None)]), &c).is_ok()
+        );
+        let gone = requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &c)
+            .unwrap_err();
+        assert!(gone.contains("no longer a principal"), "{gone}");
+        let down = requester_still_authorized(&mode(vec![spec("bob", Role::Viewer, None)]), &c)
+            .unwrap_err();
+        assert!(down.contains("Viewer"), "{down}");
+        let scoped =
+            requester_still_authorized(&mode(vec![spec("bob", Role::Operator, Some("acme"))]), &c)
+                .unwrap_err();
+        assert!(scoped.contains("tenant"), "{scoped}");
+        let mut sys = c.clone();
+        sys.requester = "sync:origin".into();
+        assert!(
+            requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &sys).is_ok()
+        );
     }
 
     #[test]

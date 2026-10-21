@@ -83,6 +83,10 @@ default config now points somewhere else), the request becomes `invalidated`
 with the difference spelled out and **nothing runs**: the approver reviewed
 something else. A rotated secret or a live probe result is not material.
 
+Under `--auth-config` the requester is also checked again: if it is no longer
+a principal in the file, now holds a lower role than when it asked, or is
+scoped to a different tenant, the request becomes `failed` and nothing runs.
+
 Otherwise the request executes and becomes `executed` (with `run_id` or the
 template id and version) or, if execution itself errors, `failed` with the
 reason. A run carries the label `change: <id>` and, unless the requester set

@@ -384,6 +384,14 @@ impl RbacConfig {
         Ok(cfg)
     }
 
+    /// The current role and tenant of the principal named `name`, if any.
+    pub fn principal(&self, name: &str) -> Option<(Role, Option<&str>)> {
+        self.principals
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| (p.role, p.tenant.as_deref()))
+    }
+
     /// The approval policy (#703) this config carries.
     pub fn approvals(&self) -> &crate::serve::changes::ApprovalPolicy {
         &self.approvals
