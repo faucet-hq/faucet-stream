@@ -255,11 +255,12 @@ pub fn max_replication_value_path<'a>(
         .max_by(|a, b| json_compare(a, b))
 }
 
-/// Return the maximum value of `record[key]` across all records, if any.
+/// Return the maximum non-null value of `record[key]` across all records, if
+/// any.
 pub fn max_replication_value<'a>(records: &'a [Value], key: &str) -> Option<&'a Value> {
     records
         .iter()
-        .filter_map(|r| r.get(key))
+        .filter_map(|r| r.get(key).filter(|v| !v.is_null()))
         .max_by(|a, b| json_compare(a, b))
 }
 
@@ -297,7 +298,17 @@ fn number_as_i128(n: &serde_json::Number) -> Option<i128> {
 /// Whether two replication values can be ordered against each other: the same
 /// JSON type, or a number and a decimal string (sources such as Oracle emit a
 /// `NUMBER` as a number when it fits `f64` exactly and as a string otherwise).
+/// A timestamp with an offset and one without are not comparable: which
+/// instant the offset-less one names is unknown.
 fn comparable(a: &Value, b: &Value) -> bool {
+    if let (Value::String(x), Value::String(y)) = (a, b)
+        && let (Some(i), Some(j)) = (Instant::parse(x), Instant::parse(y))
+    {
+        return matches!(
+            (i, j),
+            (Instant::Zoned(_), Instant::Zoned(_)) | (Instant::Naive(_), Instant::Naive(_))
+        );
+    }
     type_rank(a) == type_rank(b) || numeric_text(a).is_some() && numeric_text(b).is_some()
 }
 
@@ -882,6 +893,32 @@ mod inclusive_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn max_replication_value_skips_nulls() {
+        let records = vec![json!({"k": null}), json!({"k": null})];
+        assert_eq!(max_replication_value(&records, "k"), None);
+        let records = vec![json!({"k": null}), json!({"k": 3}), json!({})];
+        assert_eq!(max_replication_value(&records, "k"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn mixed_zoned_and_naive_timestamps_are_kept() {
+        let start = json!("2024-01-02T10:00:00Z");
+        let records = vec![
+            json!({"ts": "2024-01-02 11:00:00"}),
+            json!({"ts": "2024-01-02T09:00:00Z"}),
+            json!({"ts": "2024-01-02T11:00:00+00:00"}),
+        ];
+        let kept = filter_incremental(records, "ts", &start);
+        assert_eq!(
+            kept,
+            vec![
+                json!({"ts": "2024-01-02 11:00:00"}),
+                json!({"ts": "2024-01-02T11:00:00+00:00"})
+            ]
+        );
+    }
 
     #[test]
     fn test_filter_incremental_strings() {
