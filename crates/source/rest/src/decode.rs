@@ -162,6 +162,17 @@ pub async fn run_decode_with_nulls(
     steps: &[DecodeStep],
     csv_null_values: &[String],
 ) -> Result<Vec<Value>, FaucetError> {
+    run_decode_with_csv(body, steps, csv_null_values, b'"').await
+}
+
+/// [`run_decode_with_nulls`], with a `parse: csv` step quoting fields with
+/// `csv_quote` (the source's `csv_quote`), as `response_format: csv` does.
+pub async fn run_decode_with_csv(
+    body: &[u8],
+    steps: &[DecodeStep],
+    csv_null_values: &[String],
+    csv_quote: u8,
+) -> Result<Vec<Value>, FaucetError> {
     let body = body.to_vec();
     let owned_steps = steps.to_vec();
     // Base64 / gunzip / unzip are CPU-bound and can be large: run them off the
@@ -178,7 +189,7 @@ pub async fn run_decode_with_nulls(
         sheet: None,
         header_row: 0,
     });
-    parse_records(&buf, &parse, csv_null_values).await
+    parse_records(&buf, &parse, csv_null_values, csv_quote).await
 }
 
 /// Largest buffer a decompression step may produce (1 GiB); a bigger member
@@ -342,6 +353,7 @@ async fn parse_records(
     bytes: &[u8],
     spec: &ParseSpec,
     csv_null_values: &[String],
+    csv_quote: u8,
 ) -> Result<Vec<Value>, FaucetError> {
     match spec.format {
         ParseFormat::Json => {
@@ -353,7 +365,7 @@ async fn parse_records(
             let dialect = crate::format::CsvDialect {
                 delimiter: spec.delimiter.unwrap_or(b','),
                 has_headers: spec.has_headers,
-                ..Default::default()
+                quote: csv_quote,
             };
             crate::format::parse_csv_with_nulls(bytes, dialect, csv_null_values)
                 .await
@@ -666,6 +678,28 @@ mod tests {
         let recs = run_decode(body.as_bytes(), &steps).await.unwrap();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_gunzip_csv_chain_honours_the_source_csv_quote() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"Id,Note\n1,'a, b'\n").unwrap();
+        let gz = enc.finish().unwrap();
+        let steps = vec![
+            DecodeStep::Simple(SimpleStep::Gunzip),
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    ..parse_json()
+                },
+            },
+        ];
+        let recs = run_decode_with_csv(&gz, &steps, &[], b'\'').await.unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["Note"], "a, b");
+        assert_eq!(recs[0].as_object().unwrap().len(), 2);
     }
 
     #[tokio::test]

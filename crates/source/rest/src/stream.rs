@@ -2346,10 +2346,11 @@ impl RestDriver {
         job: &crate::async_job::AsyncJobConfig,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         if !self.config.decode.is_empty() {
-            let records = crate::decode::run_decode_with_nulls(
+            let records = crate::decode::run_decode_with_csv(
                 bytes,
                 &self.config.decode,
                 &self.config.csv_null_values,
+                self.config.csv_quote,
             )
             .await?;
             return Ok((records, None));
@@ -2966,10 +2967,11 @@ impl RestDriver {
         // `none`. The records land as an array the downstream
         // (records_path-less) extraction passes straight through.
         if !self.config.decode.is_empty() {
-            let records = crate::decode::run_decode_with_nulls(
+            let records = crate::decode::run_decode_with_csv(
                 &bytes,
                 &self.config.decode,
                 &self.config.csv_null_values,
+                self.config.csv_quote,
             )
             .await?;
             return Ok((Value::Array(records), resp_headers));
