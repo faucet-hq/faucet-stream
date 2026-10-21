@@ -8,10 +8,13 @@
 //! 1. **Structure safety.** Substitution happens per JSON/YAML scalar, exactly
 //!    like [`crate::interpolate::interpolate_value`] — a supplied value holding
 //!    `:`, a newline, or `-` stays the single scalar it replaced and can never
-//!    inject a key or an array element. Downstream, SQL-bound and JSON-safe
-//!    substitution paths (`substitute_context_bind_params` /
-//!    `substitute_context_json` in `faucet_core::util`) are untouched, so the
-//!    existing SQL/JSON-injection guarantees still hold for param-derived text.
+//!    inject a key or an array element. That is all it guarantees: a param
+//!    spliced into a longer string (`query: "… WHERE id = '${param.id}'"`)
+//!    becomes literal text of that string — params are **not** bound as SQL
+//!    parameters. So a caller-supplied free-text value (no `values:` set) that
+//!    is spliced into a longer string may not carry a quote, a backtick, `;`,
+//!    a backslash or a control character; a whole-value reference, or a param
+//!    with a closed `values:` set, is unaffected.
 //! 2. **No re-interpolation of caller input.** Env/file/secret directives are
 //!    resolved *before* binding, so a supplied value is never itself scanned for
 //!    directives. Belt and braces, a supplied value containing `${` is rejected
@@ -443,7 +446,21 @@ pub fn bind_document(
     // with a registered template.
     let stashed = doc.get_mut(PARAMS_KEY).map(std::mem::take);
     let inert = inert_values(&bound);
-    let result = substitute(doc, &bound.values, &bound.placeholders, inert.as_ref());
+    // Caller values with no closed `values:` set: free text, held to
+    // `embedded_value_refusal` when spliced into a longer string.
+    let guarded: BTreeSet<String> = bound
+        .caller_supplied
+        .iter()
+        .filter(|n| spec.get(*n).is_none_or(|p| p.values.is_empty()))
+        .cloned()
+        .collect();
+    let result = substitute(
+        doc,
+        &bound.values,
+        &bound.placeholders,
+        inert.as_ref(),
+        &guarded,
+    );
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
     }
@@ -496,11 +513,15 @@ fn substitute(
     bound: &BTreeMap<String, Value>,
     lenient: &BTreeSet<String>,
     inert: Option<&BTreeMap<String, Value>>,
+    guarded: &BTreeSet<String>,
 ) -> CliResult<()> {
     if let Value::String(s) = v {
         let replaced = match whole_token(s, bound, bound, lenient)? {
             Some(typed) => typed,
-            None => Value::String(rewrite_text(s, bound, bound, lenient)?),
+            None => {
+                refuse_embedded(s, bound, guarded)?;
+                Value::String(rewrite_text(s, bound, bound, lenient)?)
+            }
         };
         if let (Some(inert), Value::String(out)) = (inert, &replaced) {
             refuse_new_directives(s, out, bound, lenient, inert)?;
@@ -511,7 +532,7 @@ fn substitute(
     match v {
         Value::Array(items) => {
             for item in items.iter_mut() {
-                substitute(item, bound, lenient, inert)?;
+                substitute(item, bound, lenient, inert, guarded)?;
             }
         }
         Value::Object(map) => {
@@ -519,7 +540,8 @@ fn substitute(
             // map so a rewritten key is honoured — mirrors `interpolate_value`.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                substitute(&mut val, bound, lenient, inert)?;
+                substitute(&mut val, bound, lenient, inert, guarded)?;
+                refuse_embedded(&key, bound, guarded)?;
                 let new_key = rewrite_text(&key, bound, bound, lenient)?;
                 if let Some(inert) = inert {
                     refuse_new_directives(&key, &new_key, bound, lenient, inert)?;
@@ -528,6 +550,56 @@ fn substitute(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Characters a caller value may not bring into a longer string: they end a
+/// quoted SQL literal or statement, quote an identifier, or escape — so a
+/// value spliced into a query (`WHERE id = '${param.id}'`) could change what
+/// it means rather than what it matches.
+const EMBEDDED_REFUSED: &[char] = &['\'', '"', '`', ';', '\\'];
+
+/// Why `value` may not be spliced into a longer string, if it may not.
+fn embedded_value_refusal(value: &Value) -> Option<String> {
+    let Value::String(s) = value else {
+        return None;
+    };
+    if let Some(c) = s.chars().find(|c| EMBEDDED_REFUSED.contains(c)) {
+        return Some(format!("`{c}`"));
+    }
+    s.chars()
+        .any(char::is_control)
+        .then(|| "a control character".to_string())
+}
+
+/// Refuse a caller-supplied free-text value embedded in a longer string when
+/// it carries a character that could rewrite the text around it. The value
+/// still works as a whole value (`field: ${param.x}`), or with a closed
+/// `values:` set.
+fn refuse_embedded(
+    s: &str,
+    bound: &BTreeMap<String, Value>,
+    guarded: &BTreeSet<String>,
+) -> CliResult<()> {
+    if guarded.is_empty() {
+        return Ok(());
+    }
+    for (_, dir) in iter_directives(s) {
+        let Directive::Deferred { id, path } = dir else {
+            continue;
+        };
+        if id != PARAM_ID || !guarded.contains(path) {
+            continue;
+        }
+        if let Some(why) = bound.get(path).and_then(embedded_value_refusal) {
+            return Err(CliError::Config(format!(
+                "param '{path}': the supplied value contains {why}, and the config splices it \
+                 into a longer string (a query, a URL, a path), where it could change the \
+                 meaning of the text around it. Declare a closed `values:` set for the \
+                 param, or use it as a whole value"
+            )));
+        }
     }
     Ok(())
 }
@@ -714,6 +786,64 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    /// A caller value spliced into a longer string may not carry text that
+    /// ends a quoted literal or a statement; as a whole value, or from a
+    /// closed `values:` set, it may.
+    #[test]
+    fn a_spliced_caller_value_cannot_rewrite_the_text_around_it() {
+        let doc = || {
+            json!({
+                "params": {
+                    "account": { "required": true },
+                    "region": { "required": true, "values": ["eu'1", "us"] }
+                },
+                "query": "SELECT * FROM orders WHERE account = '${param.account}' AND r = '${param.region}'",
+                "whole": "${param.account}"
+            })
+        };
+        for bad in ["x' OR '1'='1", "a;b", "a\\b", "a\nb", "a`b", "a\"b"] {
+            let mut d = doc();
+            let err = bind_document(
+                &mut d,
+                &supplied(&[("account", json!(bad)), ("region", json!("us"))]),
+                BindMode::Strict,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("param 'account'"), "{bad}: {err}");
+        }
+        // Plain text and a closed set's value (even with a quote) still bind.
+        let mut d = doc();
+        bind_document(
+            &mut d,
+            &supplied(&[("account", json!("acme-42")), ("region", json!("eu'1"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(
+            d["query"],
+            "SELECT * FROM orders WHERE account = 'acme-42' AND r = 'eu'1'"
+        );
+        // A whole-value reference takes any text.
+        let mut d = json!({
+            "params": { "account": { "required": true } },
+            "whole": "${param.account}"
+        });
+        bind_document(
+            &mut d,
+            &supplied(&[("account", json!("x' OR 1;"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(d["whole"], "x' OR 1;");
+        // Defaults are the author's text, not caller input.
+        let mut d = json!({
+            "params": { "q": { "default": "it's" } },
+            "s": "say '${param.q}'"
+        });
+        bind_document(&mut d, &supplied(&[]), BindMode::Strict).unwrap();
     }
 
     #[test]

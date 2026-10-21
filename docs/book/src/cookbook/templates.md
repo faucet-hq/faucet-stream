@@ -74,6 +74,15 @@ Fields per entry:
 Reference a param anywhere in the config as `${param.NAME}`. Write `$${param.x}`
 for a literal `${param.x}`.
 
+A param spliced into a longer string becomes plain text of that string — it is
+**not** bound as a SQL parameter or URL-encoded. So a value the caller supplies
+for a param without a `values:` set may not carry a quote (`'`, `"`, `` ` ``),
+`;`, a backslash or a control character when it is spliced into a longer string
+(`query: "… WHERE account = '${param.account}'"`); such a trigger is refused.
+For a param a lower-trust caller fills into a query, declare a closed `values:`
+set. A whole-value reference (`table: ${param.table}`) and a `default` are not
+restricted.
+
 ### Closed value sets
 
 `values:` turns a param into an **enumerable axis**. Without it a typo'd value —
