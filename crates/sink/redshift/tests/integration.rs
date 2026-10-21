@@ -690,3 +690,37 @@ async fn copy_stages_the_page_and_removes_it_when_copy_fails() {
     s3.verify().await;
     pool.close().await;
 }
+
+/// A record that shares no column with the table (a non-object or `{}`) is
+/// never written: the row path reports it
+/// skipped, the per-row path fails it on its own, so neither counts it written.
+#[tokio::test(flavor = "multi_thread")]
+async fn records_sharing_no_column_are_skipped_not_written() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+    let sink = RedshiftSink::new(insert_config(port, "events", 1000))
+        .await
+        .expect("sink builds");
+    let page = [json!({"id": 1}), json!({}), json!(7)];
+    let report = faucet_core::Sink::write_batch_reported(&sink, &page)
+        .await
+        .expect("write");
+    assert_eq!((report.accepted, report.skipped), (1, 2), "{report:?}");
+    sink.flush().await.unwrap();
+    assert_eq!(row_count(&pool, "events").await, 1);
+
+    let outcomes = faucet_core::Sink::write_batch_partial(&sink, &[json!({"id": 2}), json!({})])
+        .await
+        .expect("partial");
+    assert!(outcomes[0].is_ok());
+    let err = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(err.contains("no field"), "{err}");
+    assert_eq!(row_count(&pool, "events").await, 2);
+    pool.close().await;
+}

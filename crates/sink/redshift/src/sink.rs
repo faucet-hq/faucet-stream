@@ -685,44 +685,103 @@ impl RedshiftDriver {
         self.flush_pending(calls).await?;
         self.ensure_table_ready(calls, records).await?;
         self.ensure_columns(calls, records).await?;
-        match self.commit_group(calls, records).await {
-            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
-            Err((0, e)) => Err(e),
+        // A record sharing no column with the table cannot land: it fails on
+        // its own (and reaches the DLQ) instead of counting as written.
+        let unloadable = self.unloadable(records).await;
+        let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
+        let mut loadable = Vec::with_capacity(records.len());
+        let mut at = Vec::with_capacity(records.len());
+        for (i, (r, skip)) in records.iter().zip(&unloadable).enumerate() {
+            if *skip {
+                outcomes.push(Err(FaucetError::Sink(
+                    "redshift: no field of the record matches a column of the table".into(),
+                )));
+            } else {
+                outcomes.push(Ok(()));
+                loadable.push(r.clone());
+                at.push(i);
+            }
+        }
+        if loadable.is_empty() {
+            return Ok(outcomes);
+        }
+        match self.commit_group(calls, &loadable).await {
+            Ok(()) => Ok(outcomes),
+            Err((0, e)) if loadable.len() == records.len() => Err(e),
             Err((done, e)) => {
                 let message = e.to_string();
-                Ok((0..records.len())
-                    .map(|i| {
-                        if i < done {
-                            Ok(())
-                        } else {
-                            Err(FaucetError::Sink(format!(
-                                "redshift: write failed: {message}"
-                            )))
-                        }
-                    })
-                    .collect())
+                for &i in &at[done..] {
+                    outcomes[i] = Err(FaucetError::Sink(format!(
+                        "redshift: write failed: {message}"
+                    )));
+                }
+                Ok(outcomes)
             }
         }
     }
 
-    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
+    /// For each record, whether it shares no column with the table (by the
+    /// columns known after [`ensure_columns`](Self::ensure_columns)): it would
+    /// load as an all-NULL row, so it is never written.
+    async fn unloadable(&self, records: &[Value]) -> Vec<bool> {
+        let known = self.known_columns.lock().await;
+        records
+            .iter()
+            .map(|r| match (known.as_ref(), r.as_object()) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(cols), Some(o)) => !o.keys().any(|k| cols.contains(&k.to_lowercase())),
+            })
+            .collect()
+    }
+
+    async fn write_page(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok(faucet_core::WriteReport::accepted(0));
         }
         self.ensure_table_ready(calls, records).await?;
         self.ensure_columns(calls, records).await?;
+        // A record sharing no column with the table would load as an all-NULL
+        // row, so it is skipped — and reported skipped, never written.
+        let unloadable = self.unloadable(records).await;
+        let skipped = unloadable.iter().filter(|s| **s).count();
+        let loadable: std::borrow::Cow<'_, [Value]> = if skipped == 0 {
+            std::borrow::Cow::Borrowed(records)
+        } else {
+            tracing::warn!(
+                table = %self.config.table_name,
+                skipped,
+                "redshift: skipped record(s) with no column matching the table \
+                 (would have loaded an all-NULL row)"
+            );
+            records
+                .iter()
+                .zip(&unloadable)
+                .filter(|(_, skip)| !**skip)
+                .map(|(r, _)| r.clone())
+                .collect::<Vec<_>>()
+                .into()
+        };
+        let report = faucet_core::WriteReport::accepted(loadable.len()).with_skipped(skipped);
+        if loadable.is_empty() {
+            return Ok(report);
+        }
         // Accumulate across calls and load once per threshold (#617): `COPY`
         // wants millions of rows per load, and `batch_size` could only ever
         // split a page — never merge two small ones.
         let group = {
             let mut pending = self.pending.lock().await;
-            pending.push_page(records)
+            pending.push_page(&loadable)
         };
         if let Some(rows) = group {
-            let keep_end = rows.len() - records.len();
+            let keep_end = rows.len() - loadable.len();
             self.commit_or_restore(calls, rows, keep_end).await?;
         }
-        Ok(records.len())
+        Ok(report)
     }
 }
 
@@ -787,7 +846,7 @@ impl SinkDriver for RedshiftDriver {
             RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
                 self.write_partial(calls, rows).await?,
             )),
-            _ => Ok(PageWrite::accepted(self.write_page(calls, rows).await?)),
+            _ => Ok(PageWrite::reported(self.write_page(calls, rows).await?)),
         }
     }
 

@@ -14,7 +14,9 @@ Redshift speaks the PostgreSQL wire protocol, so the sink connects through
   no S3, but slower for bulk data. Sub-chunked to respect Redshift's bind-param
   limit. Columns are the union of table columns present across the page; a
   record that shares *no* column with the table is skipped (with a warning)
-  rather than inserted as an all-NULL row.
+  rather than inserted as an all-NULL row — on both strategies, reported as
+  skipped in the page's row accounting, and failed on its own (so it reaches
+  the DLQ) on the per-row path.
 
 Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 `supported_write_modes()` is `[Append]`.
