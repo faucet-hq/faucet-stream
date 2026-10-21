@@ -1176,6 +1176,11 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         {
                             store.put(key, bm).await?;
                         }
+                        if let Ok(res) = &run_result
+                            && let Some(bm) = res.bookmark.as_ref()
+                        {
+                            crate::observability::update_bookmark_lag(bm, &obs_labels);
+                        }
                     }
                     _ => {
                         if let Err(e) = wrapped_sink.abort_overwrite().await {
@@ -2458,14 +2463,18 @@ where
                                 counter!("faucet_sink_dlq_errors_total", lbl).increment(1);
                                 FaucetError::Sink(format!("DLQ sink flush failed: {e}"))
                             })?;
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            if !defer_bookmarks
-                                && let (Some(store), Some(key)) =
+                            if !defer_bookmarks {
+                                if let (Some(store), Some(key)) =
                                     (state_store.as_ref(), state_key.as_ref())
-                            {
-                                with_retry!("state_put", store.put(key, &bookmark))?;
+                                {
+                                    with_retry!("state_put", store.put(key, &bookmark))?;
+                                }
+                                let bm_labels = crate::observability::Labels::new(
+                                    &*pipeline_name,
+                                    &*row,
+                                    &*run_id,
+                                );
+                                crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             }
                             last_bookmark = Some(bookmark);
                         }
@@ -2536,9 +2545,6 @@ where
                                 (&pipeline_name, &row, sink_name),
                             )?;
                             with_retry!("flush", sink.flush())?;
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             if let (Some(store), Some(key)) =
                                 (state_store.as_ref(), state_key.as_ref())
                             {
@@ -2546,6 +2552,9 @@ where
                                     crate::idempotency::wrap_state(Some(&bookmark), next_seq);
                                 with_retry!("state_put", store.put(key, &wrapped))?;
                             }
+                            let bm_labels =
+                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
+                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             last_bookmark = Some(bookmark);
                         } else if !governed.is_empty() {
                             // No bookmark → not individually checkpointed; write
@@ -2613,14 +2622,18 @@ where
                             if !defer_bookmarks {
                                 with_retry!("flush", sink.flush())?;
                             }
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            if !defer_bookmarks
-                                && let (Some(store), Some(key)) =
+                            if !defer_bookmarks {
+                                if let (Some(store), Some(key)) =
                                     (state_store.as_ref(), state_key.as_ref())
-                            {
-                                with_retry!("state_put", store.put(key, &bookmark))?;
+                                {
+                                    with_retry!("state_put", store.put(key, &bookmark))?;
+                                }
+                                let bm_labels = crate::observability::Labels::new(
+                                    &*pipeline_name,
+                                    &*row,
+                                    &*run_id,
+                                );
+                                crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             }
                             last_bookmark = Some(bookmark);
                         }
