@@ -88,7 +88,7 @@ verify:
   leaf_rows: 1000           # bisect down to this many rows
   max_differences: 1000     # report cap (the count keeps going)
   normalize:
-    float_tolerance: 0.0
+    float_tolerance: 0.0     # floats this close compare equal
     timestamps: true
     numeric_strings: false  # key columns always compare `7` and "7" as equal
   after_run: true           # verify after every successful root run

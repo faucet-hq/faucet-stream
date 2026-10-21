@@ -3458,7 +3458,7 @@
       "type": "object",
       "properties": {
         "float_tolerance": {
-          "description": "Round floats to this absolute tolerance before comparing (`0` = exact).",
+          "description": "Floats no further apart than this absolute tolerance compare equal (`0` = exact).",
           "type": "number",
           "format": "double",
           "default": 0.0
