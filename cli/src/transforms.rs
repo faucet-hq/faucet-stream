@@ -283,6 +283,7 @@ struct LookupConfig {
     /// Path to a JSONL file of reference rows (one JSON object per line).
     /// Mutually exclusive with `values`.
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource" = "path"))]
     jsonl: Option<String>,
     /// Match keys: `{ record: <record field>, ref: <reference field> }`.
     on: LookupOnConfig,

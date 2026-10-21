@@ -203,6 +203,9 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
     if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut()) {
         force_source(&mut dest.config, &dest.kind);
     }
+    if let Some(r) = cfg.reconcile.as_mut() {
+        force_source(&mut r.count.config, &r.count.kind);
+    }
 }
 
 /// [`confine_sql`] over expanded rows: the merged configs each row builds.
@@ -2520,6 +2523,66 @@ schedule:
         assert!(message(&err).contains("--allow-subprocess-connectors"));
         let err = refuse_subprocess(&doc, allowed, true).unwrap_err();
         assert!(message(&err).contains("tenant"));
+    }
+
+    #[cfg(feature = "source-duckdb")]
+    #[test]
+    fn the_reconcile_count_probe_is_sandboxed() {
+        let mut cfg = cfg_of(
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\nreconcile:\n  count: { type: duckdb, config: { database: \":memory:\", query: \"SELECT 1 AS n\" } }\n",
+        );
+        confine_sql(&mut cfg);
+        assert_eq!(
+            cfg.reconcile.as_ref().unwrap().count.config["sandbox"],
+            true
+        );
+    }
+
+    /// A transform that reads a file (`lookup`'s `jsonl`) is screened through
+    /// its schema's annotations like a connector.
+    #[tokio::test]
+    async fn a_lookup_transform_reading_outside_the_caller_roots_is_refused() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        for (path, protected) in [
+            ("/var/faucet-not-a-root/ref.jsonl", false),
+            ("/proc/self/environ", true),
+        ] {
+            let body = format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  transforms:\n    - {{ type: lookup, config: {{ jsonl: \"{path}\", on: {{ record: k, ref: k }}, add: {{ v: v }} }} }}\n"
+            );
+            let err = load_submission(&body, ConfigFormat::Yaml, None, None, caller)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains(path)
+                    && (m.contains("system trees") == protected)),
+                "{path}: {err:?}"
+            );
+        }
+        let inside = std::env::temp_dir().join("faucet-lookup-ref.jsonl");
+        let body = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  transforms:\n    - {{ type: lookup, config: {{ jsonl: \"{}\", on: {{ record: k, ref: k }}, add: {{ v: v }} }} }}\n",
+            inside.display()
+        );
+        let err = load_submission(&body, ConfigFormat::Yaml, None, None, caller).await;
+        assert!(
+            !matches!(err, Err(ServeError::Forbidden(_))),
+            "a path under the caller roots passes the screen: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_probe_reading_a_protected_path_is_refused() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let body = "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\nreconcile:\n  count: { type: file, config: { path: /proc/self/environ, format: raw_text } }\n";
+        let err = load_submission(body, ConfigFormat::Yaml, None, None, caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
     }
 
     #[tokio::test]

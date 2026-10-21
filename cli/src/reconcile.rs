@@ -88,7 +88,14 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
             let v = first.get(f).ok_or_else(|| {
                 format!("reconcile: count_field '{f}' not found in the probe row")
             })?;
-            as_u64(v).ok_or_else(|| format!("reconcile: count_field '{f}' is not a number: {v}"))
+            // Name the JSON type, never the value: a probe's row is not the
+            // run's output and must not leak through the run's error.
+            as_u64(v).ok_or_else(|| {
+                format!(
+                    "reconcile: count_field '{f}' is not a number (got {})",
+                    json_type(v)
+                )
+            })
         }
         None => match first.as_object() {
             Some(m) => {
@@ -115,6 +122,17 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
                 "reconcile: the count probe's first row has no numeric field".to_string()
             }),
         },
+    }
+}
+
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -160,6 +178,20 @@ pub async fn run(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_non_numeric_count_names_its_type_not_its_value() {
+        for (v, ty) in [
+            (json!("s3cr3t-file-body"), "a string"),
+            (json!(null), "null"),
+            (json!(true), "a boolean"),
+            (json!(["x"]), "an array"),
+            (json!({"k": "x"}), "an object"),
+        ] {
+            let err = extract_count(&[json!({ "c": v })], Some("c")).unwrap_err();
+            assert!(err.contains(ty) && !err.contains("s3cr3t"), "{err}");
+        }
+    }
 
     #[test]
     fn extract_named_field() {
