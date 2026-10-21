@@ -79,6 +79,11 @@ sink writes item by item (still `concurrency`-bounded). A failed condition is
 skipped by default, which makes re-delivery idempotent with conditions like
 `attribute_not_exists(pk)` or `attribute_not_exists(pk) OR #v < :v`.
 
+With `on_condition_failure: fail`, a condition that fails on a retry after an
+attempt whose response was lost (a transport failure or an unreadable reply) is
+checked with a consistent `GetItem`: when the item already equals the put item
+(or a deleted key is gone), the earlier attempt landed and the row succeeds.
+
 ## Preflight
 
 `check()` runs `DescribeTable` and, for keyed modes, verifies `key` matches the
