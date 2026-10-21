@@ -57,6 +57,14 @@ impl std::fmt::Debug for OAuth1Provider {
     }
 }
 
+/// The RFC 5849 §3.4.1.2 base string URI: lower-case scheme and host, the
+/// port only when it is not the scheme's default, then the path.
+fn normalized_base_uri(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Some(format!("{}://{host}{port}{}", url.scheme(), url.path()))
+}
+
 impl OAuth1Provider {
     /// Build from a config object with `consumer_key`, `consumer_secret`,
     /// `token`, `token_secret`, optional `realm`, and optional
@@ -168,11 +176,19 @@ impl OAuth1Provider {
         // each key & value percent-encoded, sorted by encoded key (then value),
         // `&`-joined.
         let without_fragment = url.split('#').next().unwrap_or(url);
-        let base_url = without_fragment
-            .split('?')
-            .next()
-            .unwrap_or(without_fragment);
-        let url_query: Vec<(String, String)> = reqwest::Url::parse(without_fragment)
+        let parsed = reqwest::Url::parse(without_fragment).ok();
+        let base_url = parsed
+            .as_ref()
+            .and_then(normalized_base_uri)
+            .unwrap_or_else(|| {
+                without_fragment
+                    .split('?')
+                    .next()
+                    .unwrap_or(without_fragment)
+                    .to_owned()
+            });
+        let base_url = base_url.as_str();
+        let url_query: Vec<(String, String)> = parsed
             .map(|u| u.query_pairs().into_owned().collect())
             .unwrap_or_default();
         let mut encoded: Vec<(String, String)> = oauth_params
@@ -383,5 +399,31 @@ mod tests {
         assert!(!s.contains("TOKEN-SECRET-VALUE"), "{s}");
         assert!(!s.contains("ACCESS-TOKEN-VALUE"), "{s}");
         assert!(s.contains("ck"));
+    }
+
+    #[test]
+    fn base_uri_is_normalized_per_rfc_5849() {
+        let p = provider();
+        let q = BTreeMap::new();
+        let canonical = p.authorization_header("GET", "https://api.example.com/v1/x", &q, "n", 1);
+        for variant in [
+            "https://API.Example.COM/v1/x",
+            "HTTPS://api.example.com:443/v1/x",
+            "https://api.example.com/v1/x#frag",
+        ] {
+            assert_eq!(p.authorization_header("GET", variant, &q, "n", 1), canonical, "{variant}");
+        }
+        let other_port = p.authorization_header("GET", "https://api.example.com:8443/v1/x", &q, "n", 1);
+        assert_ne!(other_port, canonical);
+        let path_case = p.authorization_header("GET", "https://api.example.com/V1/x", &q, "n", 1);
+        assert_ne!(path_case, canonical, "the path keeps its case");
+    }
+
+    #[test]
+    fn normalized_base_uri_keeps_non_default_port() {
+        let u = reqwest::Url::parse("http://Host.Example:8080/a/b?c=d").unwrap();
+        assert_eq!(normalized_base_uri(&u).unwrap(), "http://host.example:8080/a/b");
+        let u = reqwest::Url::parse("http://host.example:80/").unwrap();
+        assert_eq!(normalized_base_uri(&u).unwrap(), "http://host.example/");
     }
 }
