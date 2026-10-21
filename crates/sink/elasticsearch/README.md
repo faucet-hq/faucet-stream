@@ -271,7 +271,7 @@ With a source `complete_for` claim and `write_mode: upsert`, the sink deletes th
 
 ## Dead-letter queue
 
-This sink overrides `Sink::write_batch_partial` to surface per-row failures from Elasticsearch's `_bulk` response items. Configure a DLQ at the pipeline level (see [cli/README.md — `dlq:`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/README.md)) and only the documents Elasticsearch actually rejected are routed there — already-indexed items stay in the main sink with no duplicates. This is why the bulk API's best-effort, partial-success behaviour doesn't double-write rows into the DLQ.
+This sink overrides `Sink::write_batch_partial` to surface per-row failures from Elasticsearch's `_bulk` response items. Configure a DLQ at the pipeline level (see [cli/README.md — `dlq:`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/README.md)) and only the documents Elasticsearch actually rejected are routed there — already-indexed items stay in the main sink with no duplicates. This is why the bulk API's best-effort, partial-success behaviour doesn't double-write rows into the DLQ. When a page spans several `_bulk` requests and a later request fails (timeout, HTTP error), the rows of the chunks already indexed stay `Ok`; only the failed request's rows (outcome unknown) and the rows after it, which were never sent, go to the DLQ. A failure before any row was answered fails the page as a whole, which `on_batch_error` decides about.
 
 > **Not effectively-once.** Elasticsearch does not commit a faucet commit token transactionally, so this sink does not support `delivery: exactly_once`. For idempotent re-sends use `write_mode: upsert` (or a stable `id_field` in append mode).
 

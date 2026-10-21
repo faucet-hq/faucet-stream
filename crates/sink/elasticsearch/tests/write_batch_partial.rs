@@ -317,3 +317,40 @@ async fn truncated_response_pads_with_failures() {
     assert!(outcomes[0].is_ok());
     assert!(outcomes[1].is_err());
 }
+
+/// A transport failure on a later `_bulk` chunk keeps the outcomes of the
+/// chunks already indexed: only the failed request's rows and the unsent rows
+/// after it are `Err`, so a DLQ never receives (and a replay never
+/// re-indexes) rows that landed.
+#[tokio::test]
+async fn later_chunk_failure_keeps_indexed_rows_ok() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [{ "index": { "status": 201 } }, { "index": { "status": 201 } }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&server)
+        .await;
+    let mut cfg = ElasticsearchSinkConfig::new(server.uri(), "idx");
+    cfg.batch_size = 2;
+    let sink = ElasticsearchSink::new(cfg).unwrap();
+    let rows: Vec<_> = (0..6).map(|i| json!({"a": i})).collect();
+    let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+    assert_eq!(outcomes.len(), 6);
+    assert!(outcomes[0].is_ok() && outcomes[1].is_ok(), "{outcomes:?}");
+    let failed = outcomes[2].as_ref().unwrap_err().to_string();
+    assert!(failed.contains("bulk request failed"), "{failed}");
+    let unsent = outcomes[5].as_ref().unwrap_err().to_string();
+    assert!(unsent.contains("not sent"), "{unsent}");
+    assert!(outcomes[3..].iter().all(|o| o.is_err()));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "the third chunk is never sent");
+}

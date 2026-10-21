@@ -441,12 +441,37 @@ impl EsDriver {
         entries: &[String],
         auth: &ElasticsearchAuth,
     ) -> Result<Vec<Value>, FaucetError> {
+        let run = self.bulk_items_run(calls, entries, auth).await;
+        match run.failed {
+            Some((_, e)) => Err(e),
+            None => Ok(run.results),
+        }
+    }
+
+    /// [`bulk_items`](Self::bulk_items) that keeps what it learned when a
+    /// request fails: `results` holds every item answered before the failure,
+    /// and `failed` names the entries whose request failed (their outcome is
+    /// unknown) with the error.
+    async fn bulk_items_run(
+        &self,
+        calls: &CallSlot,
+        entries: &[String],
+        auth: &ElasticsearchAuth,
+    ) -> BulkRun {
         let mut results = vec![Value::Null; entries.len()];
         let mut pending: Vec<usize> = (0..entries.len()).collect();
         let mut attempt: u32 = 0;
         while !pending.is_empty() {
             let body: String = pending.iter().map(|&i| entries[i].as_str()).collect();
-            let resp = self.send_bulk_body(calls, body, auth).await?;
+            let resp = match self.send_bulk_body(calls, body, auth).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return BulkRun {
+                        results,
+                        failed: Some((pending, e)),
+                    };
+                }
+            };
             let items = resp
                 .get("items")
                 .and_then(Value::as_array)
@@ -479,10 +504,20 @@ impl EsDriver {
                 attempt,
                 "Elasticsearch bulk items rejected as overloaded; retrying them"
             );
-            calls.wait(item_retry_delay(attempt)).await?;
+            if let Err(e) = calls.wait(item_retry_delay(attempt)).await {
+                // Nothing was re-sent: the items keep their last (rejected)
+                // answer, which reports them failed.
+                return BulkRun {
+                    results,
+                    failed: Some((Vec::new(), e)),
+                };
+            }
             pending = retry;
         }
-        Ok(results)
+        BulkRun {
+            results,
+            failed: None,
+        }
     }
 
     /// The `_id` an append writes under: `id_field`'s value when it is a
@@ -1088,6 +1123,14 @@ fn retriable_item(item: &Value) -> bool {
 }
 
 /// `Some(message)` when a `_bulk` item failed (or is missing — `Value::Null`).
+/// What one [`EsDriver::bulk_items_run`] learned.
+struct BulkRun {
+    /// One result object per entry (`Value::Null` when never answered).
+    results: Vec<Value>,
+    /// The entries whose request failed, and the error.
+    failed: Option<(Vec<usize>, FaucetError)>,
+}
+
 fn item_failure(item: &Value) -> Option<String> {
     if item.is_null() {
         return Some("Elasticsearch bulk response truncated — item outcome missing".into());
@@ -1833,7 +1876,10 @@ impl EsDriver {
     /// action was accepted, `Err` when Elasticsearch rejected it (after the
     /// transient `429`/`503` per-item retries), when its response item is
     /// missing, or when the record could not be turned into an action (a
-    /// missing/`null` key, an unusable `id_field` value). Only a transport/HTTP failure is an outer `Err`.
+    /// missing/`null` key, an unusable `id_field` value). A transport/HTTP
+    /// failure is an outer `Err` only when no row of the page was answered;
+    /// after a chunk has been indexed, the failed request's rows and the
+    /// unsent rows after it are per-row `Err`s and the indexed rows stay `Ok`.
     async fn write_rows(
         &self,
         calls: &CallSlot,
@@ -1876,17 +1922,53 @@ impl EsDriver {
             return Ok(outcomes);
         }
         let auth = self.resolve_auth().await?;
-        for chunk in self.chunked(&sendable) {
+        let mark = |outcomes: &mut Vec<faucet_core::RowOutcome>, origins: &[usize], msg: &str| {
+            for &orig in origins {
+                if outcomes[orig].is_ok() {
+                    outcomes[orig] = Err(FaucetError::Sink(msg.to_string()));
+                }
+            }
+        };
+        let chunks = self.chunked(&sendable);
+        for (ci, chunk) in chunks.iter().enumerate() {
             let entries: Vec<String> = chunk.iter().map(|(e, _)| e.clone()).collect();
-            let items = self.bulk_items(calls, &entries, &auth).await?;
-            for ((_, origins), item) in chunk.iter().zip(&items) {
+            let run = self.bulk_items_run(calls, &entries, &auth).await;
+            let unknown: std::collections::HashSet<usize> = run
+                .failed
+                .as_ref()
+                .map(|(pending, _)| pending.iter().copied().collect())
+                .unwrap_or_default();
+            for (pos, ((_, origins), item)) in chunk.iter().zip(&run.results).enumerate() {
+                if unknown.contains(&pos) {
+                    continue;
+                }
                 if let Some(msg) = item_failure(item) {
-                    for &orig in origins {
-                        if outcomes[orig].is_ok() {
-                            outcomes[orig] = Err(FaucetError::Sink(msg.clone()));
-                        }
+                    mark(&mut outcomes, origins, &msg);
+                }
+            }
+            // A failed request leaves the rows it carried with an unknown
+            // outcome and the later chunks unsent; every row already answered
+            // keeps its outcome, so the DLQ never receives indexed rows.
+            if let Some((_, e)) = run.failed {
+                if ci == 0 && unknown.len() == chunk.len() {
+                    // Nothing was answered: the whole page failed, which the
+                    // pipeline's `on_batch_error` policy decides about.
+                    return Err(e);
+                }
+                let unsent = format!("Elasticsearch bulk request failed: {e}");
+                for (pos, (_, origins)) in chunk.iter().enumerate() {
+                    if unknown.contains(&pos) {
+                        mark(&mut outcomes, origins, &unsent);
                     }
                 }
+                let skipped =
+                    format!("not sent: an earlier Elasticsearch bulk request failed: {e}");
+                for later in &chunks[ci + 1..] {
+                    for (_, origins) in later.iter() {
+                        mark(&mut outcomes, origins, &skipped);
+                    }
+                }
+                break;
             }
         }
         Ok(outcomes)
