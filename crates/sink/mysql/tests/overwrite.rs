@@ -229,3 +229,48 @@ async fn aborted_first_overwrite_leaves_no_table_behind() {
     sink().await.unwrap().abort_overwrite().await.unwrap();
     assert!(!target_present(&url).await);
 }
+
+/// Two overwrite runs of one table at once (#930): each run stages (and
+/// swaps through) names of its own token, so neither begin drops the other's
+/// staging and each commit swaps in only its own rows. A begin sweeps a
+/// crashed run's long-abandoned staging.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_overwrite_runs_keep_their_own_rows() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (_container, url) = start_mysql().await;
+    create_table(&url).await;
+    seed(&url, "INSERT INTO t (id, name) VALUES (0, 'old')").await;
+    let abandoned = "t__faucet_ovw_10000000aaaaaa";
+    seed(&url, &format!("CREATE TABLE {abandoned} LIKE t")).await;
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let sink = |token: String| {
+        let cfg = overwrite_config(&url);
+        async move {
+            MysqlSink::new(cfg)
+                .await
+                .unwrap()
+                .with_overwrite_run(&token)
+                .unwrap()
+        }
+    };
+
+    sink(a.clone()).await.begin_overwrite().await.unwrap();
+    sink(b.clone()).await.begin_overwrite().await.unwrap();
+    assert!(!table_exists(&url, abandoned).await);
+    let (wa, wb) = (sink(a.clone()).await, sink(b.clone()).await);
+    wa.write_batch(&[json!({"id": 1, "name": "a1"})])
+        .await
+        .unwrap();
+    wb.write_batch(&[json!({"id": 2, "name": "b1"})])
+        .await
+        .unwrap();
+    wa.write_batch(&[json!({"id": 3, "name": "a2"})])
+        .await
+        .unwrap();
+
+    sink(a.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names_ordered(&url).await, ["a1", "a2"]);
+    sink(b.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names_ordered(&url).await, ["b1"]);
+    assert!(!table_exists(&url, &format!("t__faucet_ovw_{b}")).await);
+}
