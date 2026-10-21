@@ -440,9 +440,19 @@ impl Sink for BudgetSink {
         Ok(r)
     }
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        let bytes = self.admit(records)?;
+        self.admit(records)?;
         let outcomes = self.inner.write_batch_partial(records).await?;
         let ok = outcomes.iter().filter(|o| o.is_ok()).count() as u64;
+        let bytes = if self.spec.max_bytes.is_some() {
+            records
+                .iter()
+                .zip(&outcomes)
+                .filter(|(_, o)| o.is_ok())
+                .map(|(r, _)| crate::usage::estimate_json_bytes(r))
+                .sum()
+        } else {
+            0
+        };
         self.account(ok, bytes);
         Ok(outcomes)
     }
@@ -993,5 +1003,49 @@ mod tests {
             &["native_load_capabilities", "load_native"],
         )
         .await;
+    }
+
+    struct HalfRejecting;
+    #[async_trait]
+    impl Sink for HalfRejecting {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        async fn write_batch_partial(
+            &self,
+            records: &[Value],
+        ) -> Result<Vec<RowOutcome>, FaucetError> {
+            Ok(records
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if i % 2 == 0 {
+                        Ok(())
+                    } else {
+                        Err(FaucetError::Sink("rejected".into()))
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_write_charges_bytes_for_accepted_rows_only() {
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(HalfRejecting),
+            BudgetSpec {
+                max_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        let records = page(4);
+        let outcomes = sink.write_batch_partial(&records).await.unwrap();
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 2);
+        assert_eq!(state.records(), 2);
+        let accepted = crate::usage::estimate_json_bytes(&records[0])
+            + crate::usage::estimate_json_bytes(&records[2]);
+        assert_eq!(state.bytes(), accepted);
+        assert!(state.bytes() < estimate_page_bytes(&records));
     }
 }
