@@ -8,14 +8,14 @@ services:
   loki:
     image: grafana/loki:3.2.1
     command: ["-config.file=/etc/loki/local-config.yaml"]
-    ports: ["3100:3100"]
+    ports: ["127.0.0.1:3100:3100"]
 
   alloy:
     image: grafana/alloy:v1.4.3
     command: ["run", "/etc/alloy/config.alloy", "--server.http.listen-addr=0.0.0.0:12345"]
     volumes:
       - ./alloy-loki.alloy:/etc/alloy/config.alloy:ro
-    ports: ["4317:4317", "4318:4318"]
+    ports: ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
     depends_on: [loki]
 
   grafana:
@@ -23,7 +23,7 @@ services:
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     depends_on: [loki]
 
   faucet:
