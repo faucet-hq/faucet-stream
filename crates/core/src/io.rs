@@ -416,18 +416,28 @@ impl CallContext {
         Fut: Future<Output = Result<T, FaucetError>>,
     {
         let reset;
-        let single = match &self.inner.retry {
-            Some(p) if p.max_attempts > 1 => {
-                reset = self.clone().without_retry();
-                &reset
-            }
-            _ => self,
+        let retries = matches!(&self.inner.retry, Some(p) if p.max_attempts > 1);
+        let single = if retries || self.inner.rate_limit_retries.is_some() {
+            reset = self
+                .clone()
+                .without_retry()
+                .edit(|i| i.rate_limit_retries = None);
+            &reset
+        } else {
+            self
         };
         let mut fut = Some(fut);
         single
             .call(op, || {
                 let f = fut.take();
-                async move { f.expect("call_once makes one attempt").await }
+                async move {
+                    match f {
+                        Some(f) => f.await,
+                        None => Err(FaucetError::Sink(format!(
+                            "{op}: a single-attempt call was run twice"
+                        ))),
+                    }
+                }
             })
             .await
     }
@@ -1000,6 +1010,18 @@ mod tests {
             .await;
         assert_eq!(r.unwrap(), 1);
         assert!(Instant::now() - start >= Duration::from_secs(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_once_returns_a_rate_limit_instead_of_retrying_it() {
+        let ctx = CallContext::new().with_rate_limit_retries(10);
+        let r: Result<(), _> = ctx
+            .call_once("post", async {
+                Err(FaucetError::RateLimited(Duration::from_secs(1)))
+            })
+            .await;
+        assert!(matches!(r, Err(FaucetError::RateLimited(_))), "{r:?}");
+        assert_eq!(ctx.rate_limit_retries(), Some(10), "the context is unchanged");
     }
 
     #[tokio::test(start_paused = true)]
