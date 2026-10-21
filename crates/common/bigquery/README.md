@@ -17,6 +17,7 @@ This is a small **internal/shared** crate: it holds the one credential enum and 
 | `build_client(&BigQueryCredentials)` | `async fn` | Turns a `BigQueryCredentials` into a ready-to-use [`gcp_bigquery_client::Client`]. Returns `FaucetError::Auth` on authentication failure or unparseable inline JSON. |
 | `build_client_with_tokens(&BigQueryCredentials)` | `async fn` | Like `build_client`, also returning the client's `TokenProvider` so requests the typed client cannot make reuse its cached token. |
 | `token_provider(&BigQueryCredentials)` | `async fn` | A `TokenProvider` (`Arc<dyn gcp_bigquery_client::auth::Authenticator>`) built once; it caches the access token and refreshes it before expiry. |
+| `access_token(&BigQueryCredentials)` | `async fn` | An access token for a request the typed client cannot make. The token provider is built once per set of credentials (and per runtime) and reused for an hour, so repeated calls share one cached token; building and minting are bounded by `TOKEN_MINT_TIMEOUT` (60 s). The `raw::tolerant_*` fallbacks use it and share one HTTP client. |
 | `raw::QueryResultsReader` | `struct` | `jobs.getQueryResults` with `formatOptions.useInt64Timestamp=true` on every page (integer-microsecond TIMESTAMP cells), one HTTP client, a cached token. |
 
 ### `BigQueryCredentials` variants

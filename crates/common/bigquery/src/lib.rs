@@ -97,8 +97,11 @@ pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// OAuth scope for BigQuery API calls made outside the typed client.
 pub const BQ_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 
-/// Mint a BigQuery access token from `creds` for a request the typed client
-/// cannot make (media uploads, schema-tolerant fallbacks).
+/// A BigQuery access token from `creds` for a request the typed client
+/// cannot make (media uploads, schema-tolerant fallbacks). The token provider
+/// is built once per set of credentials and reused (rebuilt after an hour),
+/// so the token is cached until shortly before it expires; building and
+/// minting are bounded by [`TOKEN_MINT_TIMEOUT`].
 pub async fn access_token(creds: &BigQueryCredentials) -> Result<String, FaucetError> {
     access_token_bq(creds).await.map_err(auth_error)
 }
@@ -158,8 +161,64 @@ impl gcp_bigquery_client::auth::Authenticator for CachedTokens {
     }
 }
 
+/// How long [`access_token`] reuses one token provider for a set of
+/// credentials before building it again (so a rotated key file is read).
+const PROVIDER_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Bound on building a token provider or minting one token: the
+/// authenticator's own HTTP client has no request timeout.
+pub const TOKEN_MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+type ProviderCache =
+    tokio::sync::Mutex<std::collections::HashMap<u64, (std::time::Instant, TokenProvider)>>;
+
+fn providers() -> &'static ProviderCache {
+    static CACHE: std::sync::OnceLock<ProviderCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// One token provider per set of credentials, so a caller minting a token
+/// per request (a media upload per page, a raw fallback per poll) reuses the
+/// cached token instead of building an authenticator and exchanging a new
+/// token every time.
+async fn cached_token_provider(creds: &BigQueryCredentials) -> Result<TokenProvider, BQError> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(creds)?.hash(&mut h);
+    // The authenticator's HTTP client lives on the runtime that built it.
+    tokio::runtime::Handle::try_current()
+        .ok()
+        .map(|rt| rt.id())
+        .hash(&mut h);
+    let key = h.finish();
+    let mut cache = providers().lock().await;
+    cache.retain(|_, (built, _)| built.elapsed() < PROVIDER_TTL);
+    if let Some((built, p)) = cache.get(&key)
+        && built.elapsed() < PROVIDER_TTL
+    {
+        return Ok(p.clone());
+    }
+    let p = bounded(token_provider_bq(creds)).await?;
+    cache.insert(key, (std::time::Instant::now(), p.clone()));
+    Ok(p)
+}
+
+async fn bounded<T>(
+    fut: impl std::future::Future<Output = Result<T, BQError>>,
+) -> Result<T, BQError> {
+    tokio::time::timeout(TOKEN_MINT_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| {
+            Err(BQError::ConnectionPoolError(format!(
+                "token request timed out after {}s",
+                TOKEN_MINT_TIMEOUT.as_secs()
+            )))
+        })
+}
+
 pub(crate) async fn access_token_bq(creds: &BigQueryCredentials) -> Result<String, BQError> {
-    token_provider_bq(creds).await?.access_token().await
+    let provider = cached_token_provider(creds).await?;
+    bounded(provider.access_token()).await
 }
 
 pub(crate) async fn token_provider_bq(
@@ -255,8 +314,15 @@ fn parse_authorized_user(
         .map_err(|e| BQError::InvalidAuthorizedUserAuthenticator(e.into()))
 }
 
+/// The client the raw fallbacks send through: built once and shared, so its
+/// connection pool is reused across calls.
 pub(crate) fn http_client_bq() -> Result<reqwest_bq::Client, BQError> {
-    http_client().map_err(|e| BQError::ConnectionPoolError(e.to_string()))
+    static CLIENT: std::sync::OnceLock<reqwest_bq::Client> = std::sync::OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c.clone());
+    }
+    let c = http_client().map_err(|e| BQError::ConnectionPoolError(e.to_string()))?;
+    Ok(CLIENT.get_or_init(|| c).clone())
 }
 
 #[allow(clippy::disallowed_methods)] // the BigQuery SDK takes its own reqwest major, not faucet_core::http's
