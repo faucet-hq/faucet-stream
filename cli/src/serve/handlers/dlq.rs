@@ -438,6 +438,7 @@ mod tests {
             records_written: 2,
             dry_run: false,
             failed_dlq: "/dlq.failed".into(),
+            skipped_other_rows: 0,
         });
         running.finish(&outcome, false).await;
         let rec = state.history().get("rp-1").await.unwrap().unwrap();

@@ -416,6 +416,7 @@ pipeline:
             std::time::Instant::now() < deadline,
             "unit 1's outcome was not persisted while unit 2 ran"
         );
+        #[allow(clippy::disallowed_methods)] // polling a file-backed marker in a test
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     cancel.cancel();
