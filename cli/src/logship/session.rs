@@ -448,7 +448,12 @@ impl LogShipSession {
         let shipper = self.shipper();
         let mut last = None;
         loop {
-            let report = shipper.pass().await;
+            // One pass may cover many runs; it gets only what is left of the
+            // flush budget.
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(report) = tokio::time::timeout(left, shipper.pass()).await else {
+                break;
+            };
             if let Some(r) = report.run(run_id) {
                 let done = r.view.pending_lines == 0 && !r.locked_elsewhere;
                 last = Some(r.view.clone());

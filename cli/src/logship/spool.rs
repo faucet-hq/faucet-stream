@@ -602,6 +602,10 @@ pub async fn ship_pass(
     let ids = spool.run_ids();
     let bytes_drop = plan_bytes_drops(spool, &ids, opts.max_bytes);
     for id in ids {
+        // Once an export failed this pass the collector is not taking lines;
+        // the remaining runs still get their bounds and retention, but are not
+        // each made to wait out another export timeout.
+        let exporter = exporter.filter(|_| !report.failed);
         if let Some(r) =
             process_run(spool, &id, exporter, opts, now, &bytes_drop, &mut report).await
         {
