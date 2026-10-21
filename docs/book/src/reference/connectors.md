@@ -464,10 +464,10 @@ sinks can actually *act* on it varies:
 | `spanner` | **✓ evolve** — additive columns + NOT NULL relax; base-type widening is not supported by Spanner (use `allow_type_widening: false`) |
 | `oracle` | **✓ evolve** — `ADD` columns, widen integer `NUMBER`s to decimals, relax `NOT NULL` |
 | `databricks` | **✓ evolve** — `ALTER TABLE … ADD COLUMNS`, numeric widening to `DOUBLE` via Delta type widening (tinyint/smallint/int/float), and `DROP NOT NULL`; other widenings are incompatible |
-| `iceberg` | detect-only — `warn`/`ignore`/`fail`/`quarantine` work; `evolve` blocked on upstream `iceberg-rust` (#255) |
+| `iceberg` | **✓ evolve** — adds new columns as optional fields; a widening or `NOT NULL` relax is refused with a typed error (`iceberg-rust` 0.10.0 has no type promotion), so pair it with `allow_type_widening: false` |
 | `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (schemaless; the `schema:` policy is inert) |
 
-`on_drift: evolve` against a detect-only or schemaless sink is rejected at
+`on_drift: evolve` against a schemaless sink is rejected at
 config-load. See [Schema drift](../cookbook/schema-drift.md) for the per-sink
 nuances (e.g. SQLite widening is a no-op; Elasticsearch can only add fields).
 
