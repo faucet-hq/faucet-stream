@@ -600,6 +600,11 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         target: &TableTarget,
         plans: &[WritePlan],
     ) -> Result<usize, FaucetError> {
+        // The groups share one table: read its columns and key types once,
+        // not once per group (a CDC page alternating upserts and deletes is
+        // one group per row).
+        let mut columns: Option<Vec<TableColumn>> = None;
+        let mut key_types: Option<Vec<Option<String>>> = None;
         let mut affected = 0usize;
         for plan in plans {
             if self.write.journals()
@@ -608,10 +613,25 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
                 exec.journal_plan(plan, run_id).await?;
             }
             if !plan.upserts.is_empty() {
-                affected += self.insert(exec, target, &plan.upserts, true).await?;
+                if columns.is_none() {
+                    columns = Some(exec.columns(target).await?);
+                }
+                let columns = columns.as_deref().unwrap_or_default();
+                let (written, statements) =
+                    self.insert_statements(target, columns, &plan.upserts, true)?;
+                for stmt in &statements {
+                    exec.execute(stmt).await?;
+                }
+                affected += written;
             }
             if !plan.deletes.is_empty() {
-                affected += self.delete(exec, target, &plan.deletes).await?;
+                if key_types.is_none() {
+                    key_types = Some(exec.key_types(target, &self.write.key).await?);
+                }
+                let key_types = key_types.as_deref().unwrap_or_default();
+                for stmt in &self.delete_statements(target, key_types, &plan.deletes)? {
+                    affected += exec.execute(stmt).await? as usize;
+                }
             }
         }
         Ok(affected)
