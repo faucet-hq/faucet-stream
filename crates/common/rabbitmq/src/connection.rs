@@ -98,6 +98,7 @@ pub struct RabbitMqConnectionConfig {
     pub url: Option<String>,
     /// Broker host. Defaults to `127.0.0.1` when `url` is not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub host: Option<String>,
     /// Broker port. Defaults to `5672` (`5671` with TLS).
     #[serde(default, skip_serializing_if = "Option::is_none")]

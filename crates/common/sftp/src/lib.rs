@@ -127,6 +127,7 @@ impl std::fmt::Debug for SftpAuth {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SftpConnectionConfig {
     /// Server hostname or IP address.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub host: String,
     /// Server port (default: 22).
     #[serde(default = "default_port")]

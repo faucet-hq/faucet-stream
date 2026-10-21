@@ -48,7 +48,10 @@ pub enum AzureCredentials {
     /// Full storage connection string
     /// (`DefaultEndpointsProtocol=…;AccountName=…;AccountKey=…;…`).
     ConnectionString {
-        /// Connection string.
+        /// Connection string. Its endpoints (`BlobEndpoint=`, or the account
+        /// host built from `AccountName=` / `EndpointSuffix=`) are checked
+        /// like a URL by a host that confines configs.
+        #[schemars(extend("x-faucet-resource" = "url"))]
         connection_string: String,
     },
     /// Azure Managed Identity (IMDS). For a user-assigned identity, set

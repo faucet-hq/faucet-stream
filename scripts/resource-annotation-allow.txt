@@ -35,12 +35,8 @@ sink:spanner database  # Spanner database id
 source:spanner database  # Spanner database id
 source:mysql-cdc start_position.file  # binlog file name on the server
 
-# Connection strings in a non-URL syntax (key=value pairs).
-sink:azure-blob auth.config.connection_string  # storage account connection string
-source:azure-blob auth.config.connection_string  # storage account connection string
-sink:mssql connection_string  # ADO.NET connection string
-source:mssql connection_string  # ADO.NET connection string
-source:mssql-cdc connection_string  # ADO.NET connection string
+# Credential-forwarding host patterns, not endpoints.
+source:rest trusted_hosts  # hosts a credential may follow a link to; every request is still checked
 
 # PEM content, not a file path.
 source:graphql tls.client_cert  # inline PEM certificate

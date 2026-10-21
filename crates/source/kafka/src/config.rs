@@ -11,6 +11,7 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 pub struct KafkaSourceConfig {
     /// Comma-separated bootstrap server list, e.g. `"broker1:9092,broker2:9092"`.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub brokers: String,
     /// One or more topics to subscribe to.
     pub topics: Vec<String>,

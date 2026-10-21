@@ -18,6 +18,7 @@ pub struct KafkaSinkConfig {
     /// Comma-separated `host:port` bootstrap brokers, passed straight through
     /// as librdkafka's `bootstrap.servers` (e.g. `"b1:9092,b2:9092"`).
     /// Required; a blank value is rejected at config load.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub brokers: String,
     /// Destination topic. Either a fixed name
     /// (`{ type: fixed, name: events }`) or a per-record JSONPath lookup
