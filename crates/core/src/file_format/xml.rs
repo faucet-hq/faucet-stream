@@ -138,13 +138,22 @@ pub fn encode(
     root_element: &str,
     record_element: &str,
 ) -> Result<Vec<u8>, FaucetError> {
+    for (what, name) in [("root", root_element), ("record", record_element)] {
+        let legal = name.split(':').count() <= 2
+            && name.split(':').all(|p| !p.is_empty() && sanitize(p) == p);
+        if !legal {
+            return Err(FaucetError::Sink(format!(
+                "xml: the {what} element name `{name}` is not a legal XML element name"
+            )));
+        }
+    }
     let mut w = quick_xml::Writer::new(Vec::new());
     w.write_event(Event::Start(BytesStart::new(root_element)))
         .map_err(err)?;
     for r in records {
         w.write_event(Event::Start(BytesStart::new(record_element)))
             .map_err(err)?;
-        write_value(&mut w, r)?;
+        write_value(&mut w, r, record_element)?;
         w.write_event(Event::End(BytesEnd::new(record_element)))
             .map_err(err)?;
     }
@@ -153,7 +162,11 @@ pub fn encode(
     Ok(w.into_inner())
 }
 
-fn write_value(w: &mut quick_xml::Writer<Vec<u8>>, v: &Value) -> Result<(), FaucetError> {
+fn write_value(
+    w: &mut quick_xml::Writer<Vec<u8>>,
+    v: &Value,
+    field: &str,
+) -> Result<(), FaucetError> {
     match v {
         Value::Object(map) => {
             for (k, child) in map {
@@ -163,7 +176,7 @@ fn write_value(w: &mut quick_xml::Writer<Vec<u8>>, v: &Value) -> Result<(), Fauc
                         for item in items {
                             w.write_event(Event::Start(BytesStart::new(&name)))
                                 .map_err(err)?;
-                            write_value(w, item)?;
+                            write_value(w, item, k)?;
                             w.write_event(Event::End(BytesEnd::new(&name)))
                                 .map_err(err)?;
                         }
@@ -171,7 +184,7 @@ fn write_value(w: &mut quick_xml::Writer<Vec<u8>>, v: &Value) -> Result<(), Fauc
                     other => {
                         w.write_event(Event::Start(BytesStart::new(&name)))
                             .map_err(err)?;
-                        write_value(w, other)?;
+                        write_value(w, other, k)?;
                         w.write_event(Event::End(BytesEnd::new(&name)))
                             .map_err(err)?;
                     }
@@ -180,10 +193,23 @@ fn write_value(w: &mut quick_xml::Writer<Vec<u8>>, v: &Value) -> Result<(), Fauc
             Ok(())
         }
         Value::Null => Ok(()),
-        other => w
-            .write_event(Event::Text(BytesText::new(&super::cell_text(other))))
-            .map_err(err),
+        other => {
+            let text = super::cell_text(other);
+            if let Some(c) = text.chars().find(|c| !is_xml_char(*c)) {
+                return Err(FaucetError::Sink(format!(
+                    "xml: field `{field}` holds the character U+{:04X}, which XML 1.0 \
+                     cannot represent",
+                    c as u32
+                )));
+            }
+            w.write_event(Event::Text(BytesText::new(&text)))
+                .map_err(err)
+        }
     }
+}
+
+fn is_xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
 }
 
 /// A field name that is a legal XML element name.
@@ -596,6 +622,20 @@ mod tests {
         let err = to_json(b"<a></a></a>").expect_err("unbalanced");
         assert!(matches!(err, FaucetError::Source(_)), "{err}");
         assert!(unbalanced("x").to_string().contains("malformed XML"));
+    }
+
+    #[test]
+    fn encode_refuses_text_and_names_xml_cannot_represent() {
+        let err = encode(&[json!({"note": "line\u{1}break"})], "rs", "r")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`note`") && err.contains("U+0001"), "{err}");
+        assert!(encode(&[json!({"t": "tab\tand\nnewline é"})], "rs", "r").is_ok());
+        assert!(encode(&[], "ns:rows", "r").is_ok());
+        for bad in ["", "1rows", "a b", "a:b:c", ":r"] {
+            assert!(encode(&[], bad, "r").is_err(), "{bad:?}");
+            assert!(encode(&[], "rs", bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
