@@ -958,7 +958,7 @@ pub(crate) async fn enqueue(
                 message,
                 details: None,
             })?;
-        cb.reject_secrets_in_cluster(state.cluster().enabled())
+        cb.reject_persisted_headers(state.persistent_history())
             .map_err(|message| ServeError::Unprocessable {
                 message,
                 details: None,

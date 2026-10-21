@@ -78,11 +78,10 @@ pub struct CallbackSpec {
     pub method: String,
     /// Extra headers sent with the request.
     ///
-    /// These are **credentials** in practice, so a clustered server refuses them
-    /// (see [`CallbackSpec::reject_secrets_in_cluster`]): a clustered submit
-    /// persists the run record — including this map — into the shared history
-    /// database for a peer to execute, which would store the value in clear
-    /// text.
+    /// These are **credentials** in practice, so a server with a persistent run
+    /// history refuses them (see [`CallbackSpec::reject_persisted_headers`]): it
+    /// stores the run record — including this map — in its history database,
+    /// which would keep the value in clear text.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     /// Static fields merged into the callback body (e.g. the caller's own job
@@ -185,18 +184,17 @@ impl CallbackSpec {
         Ok(())
     }
 
-    /// A clustered submit persists the run record for a peer to execute, so
-    /// caller-supplied credentials would land in the shared history database in
-    /// clear text. Mirrors the guard the template registry already applies to
-    /// secret params.
-    pub fn reject_secrets_in_cluster(&self, clustered: bool) -> Result<(), String> {
-        if clustered && !self.headers.is_empty() {
+    /// A server with a persistent run history (SQLite / PostgreSQL, clustered or
+    /// not) stores the run record, so caller-supplied header values would land
+    /// in the history database in clear text.
+    pub fn reject_persisted_headers(&self, persistent_history: bool) -> Result<(), String> {
+        if persistent_history && !self.headers.is_empty() {
             return Err(
-                "this callback carries `headers`, and a clustered server persists the run \
-                 record so a peer can execute it — which would store those values in the \
-                 shared run-history database in clear text. Authenticate the callback \
-                 without a request header (e.g. a capability token embedded in a \
-                 single-use URL path), or submit to a non-clustered server"
+                "this callback carries `headers`, and this server keeps a persistent run \
+                 history that stores the run record — which would keep those values in the \
+                 run-history database in clear text. Authenticate the callback without a \
+                 request header (e.g. a capability token embedded in a single-use URL path), \
+                 or submit to a server with in-memory run history"
                     .into(),
             );
         }
@@ -652,20 +650,18 @@ mod tests {
     }
 
     #[test]
-    fn cluster_guard_refuses_caller_supplied_headers() {
+    fn persistent_history_refuses_caller_supplied_headers() {
         let mut s = spec("https://x.example/h");
         s.headers
             .insert("Authorization".into(), "Bearer t".to_string());
-        // Non-clustered: fine, nothing is persisted for a peer.
-        assert!(s.reject_secrets_in_cluster(false).is_ok());
+        assert!(s.reject_persisted_headers(false).is_ok());
         let err = s
-            .reject_secrets_in_cluster(true)
-            .expect_err("clustered must refuse");
-        assert!(err.contains("shared run-history"), "{err}");
-        // Without headers a clustered submit is fine.
+            .reject_persisted_headers(true)
+            .expect_err("persistent history must refuse");
+        assert!(err.contains("persistent run history"), "{err}");
         assert!(
             spec("https://x.example/h")
-                .reject_secrets_in_cluster(true)
+                .reject_persisted_headers(true)
                 .is_ok()
         );
     }

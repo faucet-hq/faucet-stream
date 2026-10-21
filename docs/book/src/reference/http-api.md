@@ -1330,7 +1330,7 @@ no-op an hour later):
 | Host is link-local / cloud-metadata (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`, …) | Closes the instance-metadata SSRF hole. Override by naming the host in `--callback-allow-host`. |
 | A **tenant-scoped** principal names a loopback, private, shared (`100.64.0.0/10`), unique-local (`fc00::/7`) or unspecified address, or `localhost` | A tenant cannot submit a config, so its callback must not reach the server's own host or network. Override by naming the host in `--callback-allow-host`. |
 | `--callback-allow-host` is set and the host is not in it | Explicit allowlist mode. |
-| `headers` supplied on a **clustered** server | A clustered submit persists the run record — including these values — into the shared run-history database for a peer to execute, which would store them in clear text. Authenticate without a request header (e.g. a capability token in a single-use URL path), or submit to a non-clustered server. |
+| `headers` supplied to a server with a **persistent run history** (`--history sqlite:` / `postgres://`, clustered or not) | The server stores the run record — including these values — in its history database, which would keep them in clear text. Authenticate without a request header (e.g. a capability token in a single-use URL path), or submit to a server with in-memory run history. |
 | `extra_fields` key collides with a faucet-emitted field | Would let a submission spoof the `status`/`event` a receiver keys off. |
 | `on` contains a non-terminal status | |
 | Supplied on `POST /v1/backfill` | One backfill POST fans out into N unit runs, so a single callback has no single run to describe. Poll the unit runs by their `backfill` label instead. |

@@ -2805,9 +2805,10 @@ components:
           type: object
           additionalProperties: { type: string }
           description: >-
-            Extra request headers. Refused with 422 on a clustered server, which
-            persists the run record (including this map) into the shared
-            run-history database for a peer to execute.
+            Extra request headers. Refused with 422 on a server with a
+            persistent run history (`--history sqlite:`/`postgres://`, clustered
+            or not), which stores the run record (including this map) in its
+            history database.
         extra_fields:
           type: object
           additionalProperties: true

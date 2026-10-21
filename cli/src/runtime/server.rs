@@ -429,6 +429,13 @@ pub async fn submit(
             || (approval == Approval::Required
                 && state.requires_approval(crate::serve::changes::ChangeKind::Run)));
     if gated {
+        if let Some(cb) = req.callback.as_ref() {
+            cb.reject_persisted_headers(state.persistent_history())
+                .map_err(|message| ServeError::Unprocessable {
+                    message,
+                    details: None,
+                })?;
+        }
         let reason = req.reason.clone();
         let budget = req.budget.clone();
         let payload =

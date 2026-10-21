@@ -45,6 +45,8 @@ struct Inner {
     preview: crate::serve::preview::PreviewConfig,
     /// Allowlist of hosts a per-run completion callback may target (#481).
     callback_allow_hosts: Vec<String>,
+    /// Whether `--history` names a SQL backend (run records outlive the process).
+    persistent_history: bool,
     cluster: crate::serve::cluster::ClusterHandle,
     #[cfg(feature = "triggers")]
     triggers: crate::serve::triggers::health::TriggersHandle,
@@ -105,6 +107,10 @@ impl ServerState {
                 local_output_in_flight_grace: config.local_output_in_flight_grace,
                 preview: config.preview,
                 callback_allow_hosts: config.callback_allow_hosts.clone(),
+                persistent_history: !matches!(
+                    config.history,
+                    crate::serve::config::HistoryBackendSpec::Memory
+                ),
                 cluster: crate::serve::cluster::ClusterHandle::from_config(config),
                 #[cfg(feature = "triggers")]
                 triggers,
@@ -354,6 +360,11 @@ impl ServerState {
     /// link-local / cloud-metadata addresses (#481).
     pub fn callback_allow_hosts(&self) -> &[String] {
         &self.inner.callback_allow_hosts
+    }
+
+    /// Whether run records are stored in a SQL history backend.
+    pub fn persistent_history(&self) -> bool {
+        self.inner.persistent_history
     }
 
     pub fn cluster(&self) -> &crate::serve::cluster::ClusterHandle {
