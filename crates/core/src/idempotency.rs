@@ -323,6 +323,38 @@ pub fn overwrite_run_started(token: &str) -> Option<u64> {
         .flatten()
 }
 
+/// Refuse a value under [`OVERWRITE_RUN_KEY`] that is not a token
+/// [`new_overwrite_run_token`] made: it becomes part of a table name.
+pub fn check_overwrite_run_token(token: &str) -> Result<(), crate::FaucetError> {
+    if is_overwrite_run_token(token) {
+        Ok(())
+    } else {
+        Err(crate::FaucetError::Config(format!(
+            "`{OVERWRITE_RUN_KEY}` must be a {OVERWRITE_RUN_TOKEN_LEN}-character lowercase hex \
+             overwrite run token, got {token:?}"
+        )))
+    }
+}
+
+/// The name prefix every tokened staging of `table` starts with
+/// (`<table>__faucet_ovw_`), for a catalog query listing them.
+pub fn overwrite_staging_prefix(table: &str) -> String {
+    format!("{table}{OVERWRITE_STAGING_SUFFIX}_")
+}
+
+/// `text` as a SQL `LIKE` pattern matching it literally, escaping `%`, `_`
+/// and `escape` itself with `escape`.
+pub fn like_literal(text: &str, escape: char) -> String {
+    let mut out = String::with_capacity(text.len() + 4);
+    for c in text.chars() {
+        if c == '%' || c == '_' || c == escape {
+            out.push(escape);
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The staging suffix of an overwrite run: [`OVERWRITE_STAGING_SUFFIX`] alone
 /// without a token (the name every release before tokens used), else
 /// `__faucet_ovw_<token>`.
@@ -345,7 +377,7 @@ pub fn abandoned_overwrite_staging(
     own: Option<&str>,
     now_secs: u64,
 ) -> bool {
-    let prefix = format!("{table}{OVERWRITE_STAGING_SUFFIX}_");
+    let prefix = overwrite_staging_prefix(table);
     if name.len() != prefix.len() + OVERWRITE_RUN_TOKEN_LEN
         || !name.is_char_boundary(prefix.len())
         || !name[..prefix.len()].eq_ignore_ascii_case(&prefix)
@@ -665,6 +697,10 @@ mod overwrite_run_tests {
             assert!(!is_overwrite_run_token(bad), "{bad}");
         }
         assert_eq!(overwrite_staging_suffix(None), "__faucet_ovw");
+        assert!(check_overwrite_run_token(&t).is_ok());
+        assert!(check_overwrite_run_token("../x").is_err());
+        assert_eq!(overwrite_staging_prefix("t"), "t__faucet_ovw_");
+        assert_eq!(like_literal("a_b%c\\", '\\'), "a\\_b\\%c\\\\");
         assert_eq!(
             overwrite_staging_suffix(Some(&t)),
             "__faucet_ovw_67000000abcdef"

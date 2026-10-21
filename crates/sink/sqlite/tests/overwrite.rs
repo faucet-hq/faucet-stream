@@ -380,3 +380,68 @@ async fn json_column_mode_reports_no_drift_baseline() {
         .unwrap();
     assert!(auto.current_schema().await.unwrap().is_some());
 }
+
+/// Two overwrite runs of one table at once (#930): each run's begin, writer
+/// and commit instances share its run token, so neither begin drops the
+/// other's staging and neither commit swaps in the other's rows — the table
+/// ends holding exactly the last committed run's rows. A begin also sweeps
+/// staging a crashed run abandoned long ago, but never a live run's.
+#[tokio::test]
+async fn concurrent_overwrite_runs_keep_their_own_rows() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (_dir, url) = fresh_db("CREATE TABLE users (id INTEGER, name TEXT)").await;
+    seed(&url, "INSERT INTO users VALUES (0, 'old')").await;
+    let abandoned = "users__faucet_ovw_10000000aaaaaa";
+    seed(
+        &url,
+        &format!("CREATE TABLE {abandoned} (id INTEGER, name TEXT)"),
+    )
+    .await;
+    let cfg = || overwrite_config(&url, SqliteColumnMapping::AutoMap);
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let sink = |token: String| {
+        let cfg = cfg();
+        async move {
+            SqliteSink::new(cfg)
+                .await
+                .unwrap()
+                .with_overwrite_run(&token)
+                .unwrap()
+        }
+    };
+
+    sink(a.clone()).await.begin_overwrite().await.unwrap();
+    sink(b.clone()).await.begin_overwrite().await.unwrap();
+    assert!(
+        !table_exists(&url, abandoned).await,
+        "an abandoned staging is swept"
+    );
+    let writer_a = sink(a.clone()).await;
+    let writer_b = sink(b.clone()).await;
+    writer_a
+        .write_batch(&[
+            json!({"id": 1, "name": "a1"}),
+            json!({"id": 2, "name": "a2"}),
+        ])
+        .await
+        .unwrap();
+    writer_b
+        .write_batch(&[json!({"id": 3, "name": "b1"})])
+        .await
+        .unwrap();
+    writer_a
+        .write_batch(&[json!({"id": 4, "name": "a3"})])
+        .await
+        .unwrap();
+    writer_a.flush().await.unwrap();
+    writer_b.flush().await.unwrap();
+
+    sink(a.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names(&url, "users").await, ["a1", "a2", "a3"]);
+    assert!(table_exists(&url, &format!("users__faucet_ovw_{b}")).await);
+    sink(b.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names(&url, "users").await, ["b1"]);
+    for t in [&a, &b] {
+        assert!(!table_exists(&url, &format!("users__faucet_ovw_{t}")).await);
+    }
+}

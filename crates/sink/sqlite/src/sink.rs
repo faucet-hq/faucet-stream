@@ -527,6 +527,20 @@ impl SqliteSink {
     }
 }
 
+impl SqliteSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        let driver = self.inner.driver_mut().driver_mut();
+        driver.layout = driver.layout.clone().overwrite_run(Some(token.to_string()));
+        Ok(self)
+    }
+}
+
 #[async_trait]
 impl faucet_core::Sink for SqliteSink {
     faucet_core::forward_sink!(inner);
@@ -565,6 +579,21 @@ impl SqliteDriver {
         self.layout.staging_table()
     }
 
+    /// Every table named like a tokened staging of the target.
+    async fn tokened_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        let pattern = faucet_core::idempotency::like_literal(
+            &faucet_core::idempotency::overwrite_staging_prefix(&self.config.table_name),
+            '\\',
+        );
+        sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'",
+        )
+        .bind(format!("{pattern}%"))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: list staging tables: {e}")))
+    }
+
     /// Ensure the commit-token watermark table exists.
     pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         sqlx::query(&Sqlite.commit_token_table_sql())
@@ -579,6 +608,10 @@ impl SqliteDriver {
 impl SqlDriver for SqliteDriver {
     type Dialect = Sqlite;
     type Conn<'a> = SqliteConn<'a>;
+
+    async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        self.tokened_staging_tables().await
+    }
 
     fn engine(&self) -> &SqlSinkEngine<Sqlite> {
         &self.engine
