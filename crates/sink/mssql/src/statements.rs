@@ -104,7 +104,8 @@ pub(crate) fn staging_relax_sql(
 /// `rowversion` columns are never copied; the IDENTITY column is copied with
 /// `IDENTITY_INSERT` where staging has a value (so identities survive the
 /// overwrite) and generated where it does not. `IDENTITY_INSERT` needs `ALTER`
-/// on the table, so it is switched on only when staging holds such a value.
+/// on the table, so it is switched on only when staging holds such a value,
+/// and switched off again when the copy fails (it is session-wide).
 pub(crate) fn overwrite_swap_sql(
     target: &str,
     staging: &str,
@@ -136,7 +137,9 @@ pub(crate) fn overwrite_swap_sql(
     out.push(format!(
         "IF EXISTS (SELECT 1 FROM {staging} WHERE {id_q} IS NOT NULL) BEGIN \
          SET IDENTITY_INSERT {target} ON; \
+         BEGIN TRY \
          INSERT INTO {target} ({all}) SELECT {all} FROM {staging} WHERE {id_q} IS NOT NULL; \
+         END TRY BEGIN CATCH SET IDENTITY_INSERT {target} OFF; THROW; END CATCH; \
          SET IDENTITY_INSERT {target} OFF; END"
     ));
     if !plain.is_empty() {
@@ -398,7 +401,9 @@ mod tests {
                 "DELETE FROM [t]".to_string(),
                 "IF EXISTS (SELECT 1 FROM [s] WHERE [ID] IS NOT NULL) BEGIN \
                  SET IDENTITY_INSERT [t] ON; \
+                 BEGIN TRY \
                  INSERT INTO [t] ([ID], [NAME]) SELECT [ID], [NAME] FROM [s] WHERE [ID] IS NOT NULL; \
+                 END TRY BEGIN CATCH SET IDENTITY_INSERT [t] OFF; THROW; END CATCH; \
                  SET IDENTITY_INSERT [t] OFF; END"
                     .to_string(),
                 "INSERT INTO [t] ([NAME]) SELECT [NAME] FROM [s] WHERE [ID] IS NULL".to_string(),
