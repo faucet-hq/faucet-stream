@@ -236,7 +236,7 @@ The sink re-chunks each incoming `StreamPage` to keep individual `POST /_bulk` c
 
 ## Write modes (upsert / delete)
 
-Elasticsearch is schemaless and `_id`-addressable, so the sink supports all three write modes (`Sink::supported_write_modes()` returns `[Append, Upsert, Delete]`). The `_bulk` `index` action is an idempotent overwrite by `_id`, so an **upsert is just an `index` keyed on a stable `_id`**, and a **delete is a `delete` action by `_id`**.
+Elasticsearch is schemaless and `_id`-addressable, so the sink supports append, upsert and delete by `_id`, plus `overwrite` through an alias swap (`Sink::supported_write_modes()` returns `[Append, Upsert, Delete, Overwrite]`; see [Overwrite](#overwrite-full-refresh)). The `_bulk` `index` action is an idempotent overwrite by `_id`, so an **upsert is just an `index` keyed on a stable `_id`**, and a **delete is a `delete` action by `_id`**.
 
 - **`append`** (default) — every record is indexed; `_id` comes from `id_field` if set, otherwise Elasticsearch auto-generates one.
 - **`upsert`** — each record's `_id` is derived from its `key` columns and the document is re-indexed (idempotent overwrite). This **supersedes `id_field`** — `key` is authoritative for `_id` here.
@@ -360,7 +360,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 `ElasticsearchAuth` lives in [`faucet-common-elasticsearch`](https://crates.io/crates/faucet-common-elasticsearch) and is shared with [`faucet-source-elasticsearch`](https://crates.io/crates/faucet-source-elasticsearch). The sink re-exports it as `faucet_sink_elasticsearch::ElasticsearchAuth`.
 
-> **Deprecation:** the previous name `ElasticsearchSinkAuth` is retained as a deprecated type alias and removed in `0.4.0`. Migrate imports to `ElasticsearchAuth` at your convenience.
+> **Deprecation:** the previous name `ElasticsearchSinkAuth` is retained as a deprecated type alias and will be removed in the next major release. Migrate imports to `ElasticsearchAuth` at your convenience.
 
 ## Troubleshooting / FAQ
 
