@@ -184,10 +184,7 @@ async fn hand_off_to_cdc(
         position: marker.position.clone(),
     }
     .to_value()?;
-    if !store
-        .compare_and_put(marker_k, marker_raw, &done)
-        .await?
-    {
+    if !store.compare_and_put(marker_k, marker_raw, &done).await? {
         return Err(CliError::Config(format!(
             "mirror: the phase marker `{marker_k}` changed while this process ran the \
              snapshot — another mirror process is running this pipeline"
@@ -301,7 +298,14 @@ pub async fn run_replication(
             );
             return Ok(());
         }
-        hand_off_to_cdc(store.as_ref(), &marker_k, &cdc_k, &marker, marker_raw.as_ref()).await?;
+        hand_off_to_cdc(
+            store.as_ref(),
+            &marker_k,
+            &cdc_k,
+            &marker,
+            marker_raw.as_ref(),
+        )
+        .await?;
         tracing::info!(pipeline = %opts.pipeline_name, "mirror: snapshot complete; handing off to CDC");
     }
 
@@ -398,21 +402,41 @@ mod tests {
         use faucet_core::StateStore as _;
         let store = faucet_core::MemoryStateStore::new();
         let (m, c) = ("p::__replication__", "p::cdc");
-        assert!(bootstrap_marker(&store, m, c, &serde_json::json!("0/100")).await.unwrap());
-        assert!(!bootstrap_marker(&store, m, c, &serde_json::json!("0/500")).await.unwrap());
-        assert_eq!(store.get(c).await.unwrap(), Some(serde_json::json!("0/100")));
+        assert!(
+            bootstrap_marker(&store, m, c, &serde_json::json!("0/100"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !bootstrap_marker(&store, m, c, &serde_json::json!("0/500"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(c).await.unwrap(),
+            Some(serde_json::json!("0/100"))
+        );
         let raw = store.get(m).await.unwrap();
         let marker = ReplicationState::from_value(raw.clone().unwrap()).unwrap();
         assert_eq!(marker.position, serde_json::json!("0/100"));
 
         // The hand-off re-seeds the bookmark from the marker even if it moved.
         store.put(c, &serde_json::json!("0/900")).await.unwrap();
-        hand_off_to_cdc(&store, m, c, &marker, raw.as_ref()).await.unwrap();
-        assert_eq!(store.get(c).await.unwrap(), Some(serde_json::json!("0/100")));
+        hand_off_to_cdc(&store, m, c, &marker, raw.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(c).await.unwrap(),
+            Some(serde_json::json!("0/100"))
+        );
         let done = ReplicationState::from_value(store.get(m).await.unwrap().unwrap()).unwrap();
         assert!(done.snapshot_done);
         // A second hand-off against the stale marker is refused.
-        assert!(hand_off_to_cdc(&store, m, c, &marker, raw.as_ref()).await.is_err());
+        assert!(
+            hand_off_to_cdc(&store, m, c, &marker, raw.as_ref())
+                .await
+                .is_err()
+        );
     }
     use super::*;
     use crate::config::ConnectorSpec;

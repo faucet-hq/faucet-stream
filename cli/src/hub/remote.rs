@@ -92,12 +92,18 @@ const MAX_BODY_BYTES: usize = 32 << 20;
 /// Read a response body, refusing one larger than `limit` bytes.
 async fn read_capped(mut resp: reqwest::Response, limit: usize, what: &str) -> CliResult<Vec<u8>> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
-        return Err(net_err(what, format!("response is larger than {limit} bytes")));
+        return Err(net_err(
+            what,
+            format!("response is larger than {limit} bytes"),
+        ));
     }
     let mut out = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| net_err(what, e))? {
         if out.len() + chunk.len() > limit {
-            return Err(net_err(what, format!("response is larger than {limit} bytes")));
+            return Err(net_err(
+                what,
+                format!("response is larger than {limit} bytes"),
+            ));
         }
         out.extend_from_slice(&chunk);
     }
@@ -896,9 +902,17 @@ mod tests {
         #[allow(clippy::disallowed_methods)] // a raw test client against the mock
         let client = reqwest::Client::new();
         let get = || client.get(format!("{}/big", server.uri())).send();
-        let err = read_capped(get().await.unwrap(), 10, "probe").await.unwrap_err();
+        let err = read_capped(get().await.unwrap(), 10, "probe")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("larger than 10 bytes"), "{err}");
-        assert_eq!(read_capped(get().await.unwrap(), 100, "probe").await.unwrap().len(), 100);
+        assert_eq!(
+            read_capped(get().await.unwrap(), 100, "probe")
+                .await
+                .unwrap()
+                .len(),
+            100
+        );
     }
 
     #[tokio::test]

@@ -3845,7 +3845,10 @@ matrix:
         let nodes = expand(&c).unwrap();
         let child = nodes.iter().find(|n| n.id == "c").unwrap();
         assert!(
-            child.deferred_refs.iter().any(|r| r.referenced_id == "p" && r.dotted_path == "name"),
+            child
+                .deferred_refs
+                .iter()
+                .any(|r| r.referenced_id == "p" && r.dotted_path == "name"),
             "{:?}",
             child.deferred_refs
         );

@@ -465,8 +465,17 @@ fn register_secret_values(env: &HashMap<String, String>) {
 /// Lower-case key names that hold a credential inside a JSON value or a URL
 /// query / connection string.
 const SECRET_KEY_PARTS: &[&str] = &[
-    "password", "passwd", "pwd", "secret", "token", "key", "credential", "auth", "private",
-    "sig", "signature",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "key",
+    "credential",
+    "auth",
+    "private",
+    "sig",
+    "signature",
 ];
 
 fn is_secret_key(key: &str) -> bool {
@@ -477,8 +486,15 @@ fn is_secret_key(key: &str) -> bool {
 
 /// Name parts that mark a whole `*_JSON` value as a credential block (an
 /// `auth` or `credentials` object), not just a value holding a key list.
-const CREDENTIAL_BLOCK_PARTS: &[&str] =
-    &["AUTH", "CREDENTIAL", "SECRET", "PASSWORD", "PASSWD", "TOKEN", "PRIVATE"];
+const CREDENTIAL_BLOCK_PARTS: &[&str] = &[
+    "AUTH",
+    "CREDENTIAL",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "TOKEN",
+    "PRIVATE",
+];
 
 /// The credentials embedded in one `FAUCET_*` value: every string leaf of a
 /// credential-block `*_JSON` value (`*_AUTH_JSON`, `*_CREDENTIALS_JSON`, but
@@ -522,7 +538,9 @@ fn embedded_secrets(name: &str, value: &str) -> Vec<String> {
 fn collect_json_secrets(v: &Value, under_secret: bool, out: &mut Vec<String>) {
     match v {
         Value::String(s) if under_secret => out.push(s.clone()),
-        Value::Array(a) => a.iter().for_each(|x| collect_json_secrets(x, under_secret, out)),
+        Value::Array(a) => a
+            .iter()
+            .for_each(|x| collect_json_secrets(x, under_secret, out)),
         Value::Object(o) => o.iter().for_each(|(k, x)| {
             if k != "type" {
                 collect_json_secrets(x, under_secret || is_secret_key(k), out)
@@ -626,7 +644,10 @@ mod tests {
                 "FAUCET_SOURCE_POSTGRES_CONNECTION_URL",
                 "postgres://h-5521/db?user=u&password=q%2Fpw-5521",
             ),
-            ("FAUCET_SINK_PG_DATABASE_URL", "postgres://u:url-pw-5521@db/x"),
+            (
+                "FAUCET_SINK_PG_DATABASE_URL",
+                "postgres://u:url-pw-5521@db/x",
+            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))

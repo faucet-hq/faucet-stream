@@ -921,7 +921,9 @@ async fn run_expanded_unredacted(
                             .unwrap_or_else(|| "(missing)".to_string());
                         // Every keyless parent would share one bookmark, so a
                         // later parent would resume from another's watermark.
-                        if let Err(e) = check_parent_key(&node.id, parent_key, pk_value.as_ref(), uses_state) {
+                        if let Err(e) =
+                            check_parent_key(&node.id, parent_key, pk_value.as_ref(), uses_state)
+                        {
                             pre_outcomes.push(synthetic_outcome(
                                 &node.id,
                                 Some(pk_string),
@@ -5412,9 +5414,15 @@ mod tests {
             trash = dir.path().join("trash.jsonl").display(),
         );
         let summary = run_yaml(&yaml, &dir.path().join("ow.yaml")).await;
-        let a = summary.invocations.iter().find(|o| o.row_id == "a").unwrap();
+        let a = summary
+            .invocations
+            .iter()
+            .find(|o| o.row_id == "a")
+            .unwrap();
         assert!(
-            a.error.as_deref().is_some_and(|e| e.contains("destination is unchanged")),
+            a.error
+                .as_deref()
+                .is_some_and(|e| e.contains("destination is unchanged")),
             "{a:?}"
         );
         assert_eq!(read_table_vs(&db_url).await, vec!["OLD".to_string()]);
@@ -5449,7 +5457,10 @@ mod tests {
         assert!(row("p", None).error.is_none(), "{summary:?}");
         assert!(row("c", Some("1")).error.is_none(), "{summary:?}");
         let failed = row("c", Some("2"));
-        assert!(failed.error.as_deref().unwrap().contains("region"), "{failed:?}");
+        assert!(
+            failed.error.as_deref().unwrap().contains("region"),
+            "{failed:?}"
+        );
     }
 
     /// The invocation future must stay small enough to be *constructed* on a

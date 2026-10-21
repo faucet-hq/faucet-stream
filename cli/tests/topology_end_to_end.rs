@@ -933,7 +933,10 @@ pipeline:
     .await
     .unwrap();
     assert!(!db.exists(), "the dry run created the database");
-    assert!(!dir.path().join("out").exists(), "the dry run created its directory");
+    assert!(
+        !dir.path().join("out").exists(),
+        "the dry run created its directory"
+    );
 }
 
 /// #456 C2: `--dry-run` used to be silently ignored in topology mode, so it

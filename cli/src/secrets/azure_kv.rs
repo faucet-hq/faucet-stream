@@ -179,7 +179,9 @@ fn parse_reference(reference: &str) -> CliResult<(&str, &str, Option<&str>)> {
     if let Some(v) = version
         && !word(v, 127)
     {
-        return Err(bad(format!("version '{v}' must be letters, digits or hyphens")));
+        return Err(bad(format!(
+            "version '{v}' must be letters, digits or hyphens"
+        )));
     }
     Ok((vault, secret, version))
 }

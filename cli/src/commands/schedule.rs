@@ -561,8 +561,8 @@ async fn run_once(
         compiled.shutdown_grace,
         span,
     );
-    let summary = finish_or_drain(run, shutdown.recv(), compiled.shutdown_grace, pipeline_name)
-        .await?;
+    let summary =
+        finish_or_drain(run, shutdown.recv(), compiled.shutdown_grace, pipeline_name).await?;
     if summary.had_failures() {
         return Err(CliError::PipelineHadFailures {
             count: summary.failure_count(),
@@ -724,8 +724,9 @@ async fn run_loop(
                     // the scheduler exits (#146 R LOW).
                     // The scheduler exits, so drain the in-flight run first:
                     // it stops at a page boundary and flushes.
-                    let _ = graceful_shutdown(running.take(), compiled.shutdown_grace, &pipeline_name)
-                        .await;
+                    let _ =
+                        graceful_shutdown(running.take(), compiled.shutdown_grace, &pipeline_name)
+                            .await;
                     m::in_flight(&pipeline_name, 0);
                     return Err(CliError::ScheduleOverlapForbidden);
                 }

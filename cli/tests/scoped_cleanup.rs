@@ -532,7 +532,10 @@ pipeline:
       on_missing: delete
 {SQLITE_UPSERT}"#
         ));
-        assert!(err.contains("arrived since its last run"), "{source}: {err}");
+        assert!(
+            err.contains("arrived since its last run"),
+            "{source}: {err}"
+        );
     }
 }
 

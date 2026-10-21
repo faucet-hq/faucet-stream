@@ -293,8 +293,14 @@ mod tests {
             json!({"account-id": "a", "items": [{"id": 1}, {"id": 2}], "a.b": "dotted"}),
             json!({"account-id": "b", "items": [{"id": 2}, {"id": 3}], "a.b": null}),
         ];
-        assert_eq!(project_dedup(&recs, "$['account-id']"), vec![json!("a"), json!("b")]);
-        assert_eq!(project_dedup(&recs, "$.items[0].id"), vec![json!(1), json!(2)]);
+        assert_eq!(
+            project_dedup(&recs, "$['account-id']"),
+            vec![json!("a"), json!("b")]
+        );
+        assert_eq!(
+            project_dedup(&recs, "$.items[0].id"),
+            vec![json!(1), json!(2)]
+        );
         assert_eq!(
             project_dedup(&recs, "$.items[*].id"),
             vec![json!(1), json!(2), json!(3)]

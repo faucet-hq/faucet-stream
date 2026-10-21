@@ -1089,7 +1089,10 @@ per_stream:
         let err = compose_with(&src(), &keyed, &[WriteMode::Delete])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("the only alias is `overwrite: append`"), "{err}");
+        assert!(
+            err.contains("the only alias is `overwrite: append`"),
+            "{err}"
+        );
         let mut s = src();
         s.streams[0].write = WriteChoice::One(WriteMode::Upsert);
         let err = compose_with(&s, &sink, &[WriteMode::Append])

@@ -594,12 +594,19 @@ async fn a_rollback_is_refused_while_a_run_of_the_row_holds_its_lease() {
     let err = faucet_cli::rollback::rollback(&cfg, inputs(false))
         .await
         .unwrap_err();
-    assert!(matches!(err, faucet_cli::error::CliError::LeaseHeld(_)), "{err}");
+    assert!(
+        matches!(err, faucet_cli::error::CliError::LeaseHeld(_)),
+        "{err}"
+    );
     assert_eq!(rows(&d.dst).await.len(), 4, "refused: untouched");
     // A dry run changes nothing, so it needs no lease.
-    faucet_cli::rollback::rollback(&cfg, inputs(true)).await.unwrap();
+    faucet_cli::rollback::rollback(&cfg, inputs(true))
+        .await
+        .unwrap();
     live.release().await;
-    let report = faucet_cli::rollback::rollback(&cfg, inputs(false)).await.unwrap();
+    let report = faucet_cli::rollback::rollback(&cfg, inputs(false))
+        .await
+        .unwrap();
     assert!(report.outcome.applied, "{report:?}");
 }
 

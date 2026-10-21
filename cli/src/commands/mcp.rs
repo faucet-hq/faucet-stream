@@ -82,7 +82,8 @@ mod tests {
         let file = "version: 1\npipeline:\n  source: { type: csv, config: { path: /etc/passwd } }\n  sink: { type: stdout, config: {} }\n";
         for (what, config) in [("singer", singer), ("env", env), ("file", file)] {
             for tool in ["validate_config", "preview"] {
-                let out = crate::mcp::tools::call_tool(&ctx, tool, &json!({ "config": config })).await;
+                let out =
+                    crate::mcp::tools::call_tool(&ctx, tool, &json!({ "config": config })).await;
                 assert_eq!(out["isError"], true, "{what} via {tool}: {out}");
             }
         }

@@ -1489,13 +1489,18 @@ mod tests {
             let _ = done_tx.send("flushed");
         });
         let aborted = tokio::time::timeout(std::time::Duration::from_millis(50), request).await;
-        assert!(aborted.is_err(), "the request was dropped while the work ran");
+        assert!(
+            aborted.is_err(),
+            "the request was dropped while the work ran"
+        );
         assert!(cancel.is_cancelled());
         assert_eq!(done_rx.await.unwrap(), "flushed");
 
-        let ok = detached(Some(tokio_util::sync::CancellationToken::new()), async { 7 })
-            .await
-            .unwrap();
+        let ok = detached(Some(tokio_util::sync::CancellationToken::new()), async {
+            7
+        })
+        .await
+        .unwrap();
         assert_eq!(ok, 7);
     }
 }

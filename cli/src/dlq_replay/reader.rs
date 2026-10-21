@@ -534,8 +534,9 @@ pub fn scan_files(files: &[PathBuf], dec: &DlqDecryptor) -> Result<ScanResult, F
 /// `encryption:` block (reads one line).
 pub fn starts_sealed(file: &Path) -> Result<bool, FaucetError> {
     use std::io::BufRead;
-    let read_err =
-        |e: std::io::Error| FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()));
+    let read_err = |e: std::io::Error| {
+        FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
+    };
     let reader = std::io::BufReader::new(std::fs::File::open(file).map_err(read_err)?);
     for line in reader.lines() {
         let line = line.map_err(read_err)?;
@@ -566,8 +567,9 @@ pub fn for_each_line(
     mut visit: impl FnMut(&str) -> Result<(), FaucetError>,
 ) -> Result<(), FaucetError> {
     use std::io::BufRead;
-    let read_err =
-        |e: std::io::Error| FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()));
+    let read_err = |e: std::io::Error| {
+        FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
+    };
     let mut reader = std::io::BufReader::new(std::fs::File::open(file).map_err(read_err)?);
     let mut line = String::new();
     loop {
@@ -735,7 +737,11 @@ impl Source for DlqReaderSource {
     ) -> std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>,
     > {
-        let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
+        let chunk = if batch_size == 0 {
+            usize::MAX
+        } else {
+            batch_size
+        };
         let files = self.files.clone();
         let reason = self.reason.clone();
         let target = self.target.clone();
@@ -824,7 +830,10 @@ mod tests {
         let sibling = dir.path().join("orders-eu.jsonl");
         std::fs::write(&sibling, "x\n").unwrap();
         let missing = format!("{}/orders.jsonl", dir.path().display());
-        assert!(expand_location(&missing).is_err(), "a sibling DLQ is not a part");
+        assert!(
+            expand_location(&missing).is_err(),
+            "a sibling DLQ is not a part"
+        );
         let tpl = format!("{}/orders-{{part}}.jsonl", dir.path().display());
         assert!(expand_location(&tpl).is_err());
         let part = dir.path().join("orders-00002.jsonl");
@@ -925,10 +934,14 @@ mod tests {
         }
         body.push_str(&envelope_line("contract", json!({"id": 99})));
         let (_dir, path) = write_tmp("dlq.jsonl", &body);
-        let source = DlqReaderSource::new(vec![path], Some("quality".into()), DlqDecryptor::default());
+        let source =
+            DlqReaderSource::new(vec![path], Some("quality".into()), DlqDecryptor::default());
         let ctx = HashMap::new();
         let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
-        let sizes: Vec<usize> = pages.iter().map(|p| p.as_ref().unwrap().records.len()).collect();
+        let sizes: Vec<usize> = pages
+            .iter()
+            .map(|p| p.as_ref().unwrap().records.len())
+            .collect();
         assert_eq!(sizes, vec![2, 2, 1]);
         assert_eq!(pages[2].as_ref().unwrap().records[0], json!({"id": 4}));
         let all = source.fetch_with_context(&ctx).await.unwrap();

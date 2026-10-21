@@ -358,8 +358,7 @@ pub async fn compose_across(
     let s = parse_source_file(&source_file)?;
     let k = parse_sink_file(&sink_file)?;
     if let Some(hub) = &source_hub {
-        let official =
-            s.is_official() && is_official_file(hub, &source_file, catalog::SOURCE_DIR);
+        let official = s.is_official() && is_official_file(hub, &source_file, catalog::SOURCE_DIR);
         refuse_untrusted_directives(&source_file, &s.id(), official, &sides.trusted)?;
     }
     if let Some(hub) = &sink_hub {

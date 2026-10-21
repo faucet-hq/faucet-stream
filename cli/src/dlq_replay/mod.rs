@@ -384,8 +384,9 @@ fn filter_lines_into(
     drop: &std::collections::HashSet<String>,
 ) -> CliResult<usize> {
     use std::io::Write;
-    let write_err =
-        |e: std::io::Error| faucet_core::FaucetError::Source(format!("writing '{}': {e}", tmp.display()));
+    let write_err = |e: std::io::Error| {
+        faucet_core::FaucetError::Source(format!("writing '{}': {e}", tmp.display()))
+    };
     let mut out = std::io::BufWriter::new(std::fs::File::create(tmp).map_err(write_err)?);
     let mut purged = 0usize;
     reader::for_each_line(file, |line| {
