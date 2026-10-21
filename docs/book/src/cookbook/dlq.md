@@ -274,6 +274,20 @@ Rows that fail **again** on replay are quarantined to a *fresh* DLQ — a
 reports what would be replayed without writing; `--reason` replays only matching
 envelopes; `--row` picks a specific root when the config has several.
 
+**A replay only adds records, and only the target row's own.** Every envelope
+names the pipeline and row that dead-lettered it, and a shared DLQ (a
+pipeline-level `dlq:` is inherited by every matrix row) holds other rows'
+records too, so a replay keeps the envelopes the selected row of this config's
+`name:` wrote and reports the rest as `skipped_other_rows` — replay them with
+`--row <theirs>`, or pass `--all-rows` to send every envelope through the
+selected row. Partitions of one row share a destination and replay together.
+Nothing in a replay replaces the destination: a sink's `write_mode: overwrite`
+becomes an append (an overwrite would swap in a table holding only the
+replayed rows), a file sink that replaces its file each run appends to it, a
+sink that writes one whole local `.parquet` file is refused, and a row's scoped
+cleanup (`complete_for` with `on_missing: delete`) is not run — the replayed
+rows are never the complete set it deletes against.
+
 > **Make replay idempotent.** A replay is a fresh run — if some of a page
 > originally landed before the failure, replaying can duplicate it on an
 > append-only sink. Use [`write_mode: upsert`](./upsert.md) on the target so a

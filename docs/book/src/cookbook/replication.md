@@ -310,7 +310,10 @@ its own sink, write mode, drift policy, DLQ and **its own state key**
 routes each record by the table it belongs to. A table commits a stream
 position only after its own sink has flushed. The stream resumes from the
 **earliest** position any table has committed (so a slot never releases WAL a
-table still needs), and each table skips the changes it already applied. The
+table still needs) — including a table whose pipeline failed to open this cycle
+(an unreachable sink), which holds the stream at its committed position until it
+recovers, is paused or is re-snapshotted — and each table skips the changes it
+already applied. The
 skip is decided per change, by the change's own stream position: a replay can
 cut the stream into pages at different points than the run that committed
 them, so a page may straddle a table's position. Under

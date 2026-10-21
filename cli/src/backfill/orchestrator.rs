@@ -410,6 +410,16 @@ pub async fn run_backfill(
             "large backfill plan — consider a bigger --window"
         );
     }
+    if units.len() > 1
+        && let Some(how) = super::spec::replacing_unit_destination(&root)
+    {
+        return Err(CliError::Config(super::spec::replacing_destination_error(
+            &root.id,
+            &root.sink.kind,
+            &how,
+            units.len(),
+        )));
+    }
     let descriptor = opts.range.descriptor(&root.id);
     let rhash = range_hash(&descriptor);
     let marker_k = marker_key(&opts.pipeline_name, &rhash);
@@ -520,91 +530,58 @@ pub async fn run_backfill(
     // resumable record of the attempt.
     store.put(&marker_k, &marker.to_value()?).await?;
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(opts.concurrency.max(1)));
-    let marker_lock = Arc::new(tokio::sync::Mutex::new(marker));
+    let limit = opts.concurrency.max(1);
     let mut join = tokio::task::JoinSet::new();
     let opts = Arc::new(opts);
     let root = Arc::new(root);
     let total_todo = todo.len();
-    let mut reports: Vec<UnitReport> = Vec::with_capacity(total_todo);
+    let mut progress = Progress {
+        marker,
+        marker_k,
+        planned,
+        reports: Vec::with_capacity(total_todo),
+        succeeded: 0,
+        failed: 0,
+        lease_held: None,
+    };
 
-    for unit in todo {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| CliError::Internal(format!("backfill semaphore closed: {e}")))?;
-        if cancel.is_cancelled() {
-            drop(permit);
-            break;
+    // Spawn up to `limit` units at once and record each unit's outcome in the
+    // durable marker as soon as it finishes — never only after the last unit
+    // has been spawned — so a crash mid-backfill loses no completed unit.
+    let mut todo = todo.into_iter();
+    loop {
+        while join.len() < limit && !cancel.is_cancelled() {
+            let Some(unit) = todo.next() else { break };
+            let opts = opts.clone();
+            let root = root.clone();
+            let cfg_range = opts.range.clone();
+            let store = store.clone();
+            let cancel = cancel.clone();
+            let rhash = rhash.clone();
+            join.spawn(async move {
+                let result = run_one_unit(
+                    &root, &unit, &cfg_range, &rhash, fresh, &opts, &store, cancel,
+                )
+                .await;
+                (unit, result)
+            });
         }
-        let opts = opts.clone();
-        let root = root.clone();
-        let cfg_range = opts.range.clone();
-        let store = store.clone();
-        let cancel = cancel.clone();
-        let rhash = rhash.clone();
-        join.spawn(async move {
-            let _permit = permit;
-            let result = run_one_unit(
-                &root, &unit, &cfg_range, &rhash, fresh, &opts, &store, cancel,
-            )
-            .await;
-            (unit, result)
-        });
-    }
-
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    let mut lease_held: Option<CliError> = None;
-    while let Some(joined) = join.join_next().await {
+        let Some(joined) = join.join_next().await else {
+            break;
+        };
         let (unit, result) =
             joined.map_err(|e| CliError::Internal(format!("backfill unit task panicked: {e}")))?;
-        let (outcome, error) = match result {
-            Ok(()) => {
-                succeeded += 1;
-                super::metrics::record_unit(&opts.pipeline_name, "ok");
-                ("done".to_string(), None)
-            }
-            Err(e) => {
-                failed += 1;
-                super::metrics::record_unit(&opts.pipeline_name, "err");
-                let msg = e.to_string();
-                if matches!(e, CliError::LeaseHeld(_)) && lease_held.is_none() {
-                    cancel.cancel();
-                    lease_held = Some(e);
-                }
-                ("failed".to_string(), Some(msg))
-            }
-        };
-        // Durable per-unit progress: read-modify-write under the lock so a
-        // crash between units never loses a completed unit's outcome.
-        {
-            let mut m = marker_lock.lock().await;
-            match &error {
-                None => m.mark_done(&unit.id),
-                Some(e) => m.mark_failed(&unit.id, e.clone()),
-            }
-            store.put(&marker_k, &m.to_value()?).await?;
-            super::metrics::set_progress(&opts.pipeline_name, m.done_count(), planned);
-            tracing::info!(
-                unit = %unit.id,
-                outcome = %outcome,
-                done = m.done_count(),
-                failed = m.failed_count(),
-                planned,
-                "backfill unit finished"
-            );
-        }
-        reports.push(UnitReport {
-            unit: unit.id.clone(),
-            start: unit.start.to_rfc3339(),
-            end: unit.end.to_rfc3339(),
-            outcome,
-            error,
-        });
+        progress
+            .settle(unit, result, &store, &opts.pipeline_name, &cancel)
+            .await?;
     }
-
+    let Progress {
+        mut reports,
+        succeeded,
+        failed,
+        lease_held,
+        ..
+    } = progress;
     if let Some(held) = lease_held {
         return Err(held);
     }
@@ -618,6 +595,69 @@ pub async fn run_backfill(
         dry_run: false,
         units: reports,
     })
+}
+
+/// A running backfill's progress: the durable marker and the outcome table.
+struct Progress {
+    marker: BackfillState,
+    marker_k: String,
+    planned: usize,
+    reports: Vec<UnitReport>,
+    succeeded: usize,
+    failed: usize,
+    lease_held: Option<CliError>,
+}
+
+impl Progress {
+    /// Record one finished unit: persist the marker, then the report.
+    async fn settle(
+        &mut self,
+        unit: BackfillUnit,
+        result: CliResult<()>,
+        store: &Arc<dyn StateStore>,
+        pipeline: &str,
+        cancel: &CancellationToken,
+    ) -> CliResult<()> {
+        let (outcome, error) = match result {
+            Ok(()) => {
+                self.succeeded += 1;
+                super::metrics::record_unit(pipeline, "ok");
+                ("done".to_string(), None)
+            }
+            Err(e) => {
+                self.failed += 1;
+                super::metrics::record_unit(pipeline, "err");
+                let msg = e.to_string();
+                if matches!(e, CliError::LeaseHeld(_)) && self.lease_held.is_none() {
+                    cancel.cancel();
+                    self.lease_held = Some(e);
+                }
+                ("failed".to_string(), Some(msg))
+            }
+        };
+        match &error {
+            None => self.marker.mark_done(&unit.id),
+            Some(e) => self.marker.mark_failed(&unit.id, e.clone()),
+        }
+        store.put(&self.marker_k, &self.marker.to_value()?).await?;
+        super::metrics::set_progress(pipeline, self.marker.done_count(), self.planned);
+        tracing::info!(
+            unit = %unit.id,
+            outcome = %outcome,
+            done = self.marker.done_count(),
+            failed = self.marker.failed_count(),
+            planned = self.planned,
+            "backfill unit finished"
+        );
+        self.reports.push(UnitReport {
+            unit: unit.id.clone(),
+            start: unit.start.to_rfc3339(),
+            end: unit.end.to_rfc3339(),
+            outcome,
+            error,
+        });
+        Ok(())
+    }
 }
 
 /// Delete every planned unit's scoped state key
@@ -846,8 +886,8 @@ pipeline:
     type: rest
     config: { url: "https://api.example.com/orders?since=${backfill.start}&until=${backfill.end}" }
   sink:
-    type: jsonl
-    config: { path: ./out.jsonl }
+    type: file
+    config: { path: ./out.jsonl, if_exists: append }
 "#;
 
     fn time_range(
@@ -917,6 +957,28 @@ pipeline:
             msg.contains("--from-bookmark"),
             "suggests alternative: {msg}"
         );
+    }
+
+    /// A file rewritten on every run would keep only the last window.
+    #[tokio::test]
+    async fn units_may_not_rewrite_one_file() {
+        let cfg = parse_cfg(&SCOPED.replace(
+            "type: file\n    config: { path: ./out.jsonl, if_exists: append }",
+            "type: jsonl\n    config: { path: ./out.jsonl }",
+        ));
+        let opts = base_opts(time_range(
+            "2026-06-01",
+            "2026-06-03",
+            Some(crate::backfill::plan::WindowStep::Days(1)),
+        ));
+        let err = run_backfill(&cfg, opts).await.unwrap_err().to_string();
+        assert!(
+            err.contains("'./out.jsonl'") && err.contains("only the last"),
+            "{err}"
+        );
+        // One window is one run.
+        let one = base_opts(time_range("2026-06-01", "2026-06-03", None));
+        assert_eq!(run_backfill(&cfg, one).await.unwrap().planned, 1);
     }
 
     #[tokio::test]

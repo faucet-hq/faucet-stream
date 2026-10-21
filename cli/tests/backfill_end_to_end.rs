@@ -338,3 +338,133 @@ async fn a_held_unit_lease_fails_the_whole_backfill() {
     );
     assert!(err.to_string().contains("elsewhere"), "{err}");
 }
+
+/// Each finished unit is recorded in the durable marker before the next unit
+/// starts: while unit 2 hangs, unit 1 is already `done` in the store, so a
+/// crash at that point keeps unit 1's outcome for `--resume`.
+#[cfg(feature = "source-rest")]
+#[tokio::test(flavor = "multi_thread")]
+async fn backfill_marker_records_each_unit_as_it_finishes() {
+    use wiremock::matchers::{method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("day", "2026-06-02"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 2}]))
+                .set_delay(std::time::Duration::from_secs(120)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    let out = dir.path().join("out");
+    let yaml = format!(
+        r#"
+version: 1
+name: bf
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: "{url}"
+      path: /data
+      query_params: {{ day: "${{backfill.start_date}}" }}
+  sink:
+    type: jsonl
+    config: {{ path: "{out}/${{backfill.unit}}.jsonl" }}
+  state:
+    type: file
+    config: {{ path: "{state}" }}
+"#,
+        url = server.uri(),
+        out = out.display(),
+        state = state_dir.display(),
+    );
+    let cfg: PipelineConfig = faucet_cli::config::parse_with_extension(&yaml, "yaml").unwrap();
+    let range = || time_range("2026-06-01", "2026-06-04", 1);
+    let mut plan_opts = opts(range());
+    plan_opts.dry_run = true;
+    let plan = run_backfill(&cfg, plan_opts).await.expect("plan");
+    let marker_k = marker_key(
+        "bf",
+        &faucet_cli::backfill::plan::range_hash(&plan.descriptor),
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut run_opts = opts(range());
+    run_opts.cancel = Some(cancel.clone());
+    let cfg_run = cfg.clone();
+    let task = tokio::spawn(async move { run_backfill(&cfg_run, run_opts).await });
+
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let first = plan.units[0].unit.clone();
+    loop {
+        use faucet_core::StateStore as _;
+        if let Some(v) = store.get(&marker_k).await.unwrap()
+            && BackfillState::from_value(v).unwrap().is_done(&first)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unit 1's outcome was not persisted while unit 2 ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    cancel.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(60), task).await;
+}
+
+/// A multi-window backfill into an overwrite table is refused: each unit is
+/// its own run, so each would swap away every earlier window.
+#[tokio::test(flavor = "multi_thread")]
+async fn backfill_refuses_overwrite_sink_across_windows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (src, dst) = seed(dir.path()).await;
+    let state_dir = dir.path().join("state");
+    let yaml = format!(
+        r#"
+version: 1
+name: bf
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: "sqlite://{src}"
+      query: >-
+        SELECT id, day, amount FROM events
+        WHERE day >= '${{backfill.start_date}}' AND day < '${{backfill.end_date}}'
+  sink:
+    type: sqlite
+    config:
+      database_url: "sqlite://{dst}?mode=rwc"
+      table_name: events_out
+      column_mapping: auto_map
+      write_mode: overwrite
+  state:
+    type: file
+    config: {{ path: "{state}" }}
+"#,
+        state = state_dir.display(),
+    );
+    let cfg: PipelineConfig = faucet_cli::config::parse_with_extension(&yaml, "yaml").unwrap();
+    let err = run_backfill(&cfg, opts(time_range("2026-06-01", "2026-06-04", 1)))
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(err.contains("write_mode: overwrite"), "{err}");
+    assert_eq!(dst_row_count(&dst).await, 0);
+    // One window covering the range is one run, so it may overwrite.
+    let one = run_backfill(&cfg, opts(time_range("2026-06-01", "2026-06-04", 3)))
+        .await
+        .expect("one window");
+    assert_eq!(one.succeeded, 1);
+    assert_eq!(dst_row_count(&dst).await, 6);
+}

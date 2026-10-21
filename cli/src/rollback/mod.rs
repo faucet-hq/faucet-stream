@@ -17,7 +17,7 @@ pub mod spec;
 pub mod state;
 
 pub use spec::RollbackSpec;
-pub use state::{RunIndex, RunMarker};
+pub use state::{RunIndex, RunMarker, UndoProgress};
 
 use crate::auth_catalog::AuthCatalog;
 use crate::config::PipelineConfig;
@@ -309,20 +309,76 @@ pub async fn rollback_node(
         outcome.note = Some(later_runs_note(&later_runs));
         return Ok(base(outcome, true));
     }
-    let mut outcome = sink.rollback_run(&marker.run_id, &opts).await?;
+    let marker_k = state::marker_key(&marker.state_key, &marker.run_id);
+    let earlier = marker.undo;
+    let mut outcome = match earlier {
+        // An earlier rollback committed the undo and failed before the state
+        // rewind finished: finish it, the destination is already undone.
+        Some(p) if p.applied => {
+            if inputs.dry_run {
+                let mut o = RollbackOutcome::nothing(
+                    "an earlier rollback already undid the destination; the bookmark rewind \
+                     is what remains",
+                );
+                o.applied = false;
+                return Ok(base(o, false));
+            }
+            let mut o = RollbackOutcome::nothing(
+                "an earlier rollback undid the destination and was interrupted before the \
+                 bookmark rewind; finished it",
+            );
+            o.deleted = p.deleted;
+            o.restored = p.restored;
+            o
+        }
+        _ => {
+            if !inputs.dry_run {
+                // Recorded before the undo, so a failure after the sink
+                // commits is recognisable on retry.
+                let mut pending = marker.clone();
+                pending.undo = Some(earlier.unwrap_or_default());
+                store.put(&marker_k, &marker_value(&pending)?).await?;
+            }
+            sink.rollback_run(&marker.run_id, &opts).await?
+        }
+    };
     let blocked = outcome.conflicts > 0 && !inputs.force;
-    if outcome.applied && !inputs.dry_run && nothing_undone(&outcome) {
-        outcome.applied = false;
-        outcome.note = Some(format!(
-            "nothing of this run was found in {} ({}); the bookmark, watermark and undo \
-             marker are left as they are. Check that the sink config still names the table \
-             and database the run wrote to",
-            marker.sink_uri,
-            outcome
-                .note
-                .as_deref()
-                .unwrap_or("no rows, journal or previous table"),
-        ));
+    let resumed = earlier.is_some_and(|p| p.applied);
+    if outcome.applied && !inputs.dry_run && !resumed && nothing_undone(&outcome) {
+        if earlier.is_some() {
+            // An earlier attempt got as far as the undo and stopped before
+            // recording whether it committed; finding nothing now means it did.
+            outcome.note = Some(
+                "an earlier rollback of this run was interrupted after the undo; nothing of the \
+                 run is left in the destination, so the bookmark rewind was finished"
+                    .to_string(),
+            );
+        } else {
+            outcome.applied = false;
+            outcome.note = Some(format!(
+                "nothing of this run was found in {} ({}); the bookmark, watermark and undo \
+                 marker are left as they are. Check that the sink config still names the table \
+                 and database the run wrote to",
+                marker.sink_uri,
+                outcome
+                    .note
+                    .as_deref()
+                    .unwrap_or("no rows, journal or previous table"),
+            ));
+        }
+    }
+    if !outcome.applied && !inputs.dry_run && earlier.is_none() {
+        // Blocked: the undo changed nothing, so drop the pending record.
+        store.put(&marker_k, &marker_value(&marker)?).await?;
+    }
+    if outcome.applied && !inputs.dry_run && !resumed {
+        let mut done = marker.clone();
+        done.undo = Some(UndoProgress {
+            applied: true,
+            deleted: outcome.deleted,
+            restored: outcome.restored,
+        });
+        store.put(&marker_k, &marker_value(&done)?).await?;
     }
     let mut report = base(outcome, blocked);
     if !report.outcome.applied || inputs.dry_run {
@@ -348,9 +404,7 @@ pub async fn rollback_node(
     if let Err(e) = sink.forget_run(&marker.run_id).await {
         tracing::warn!(run_id = %marker.run_id, error = %e, "could not drop the run's journal");
     }
-    store
-        .delete(&state::marker_key(&marker.state_key, &marker.run_id))
-        .await?;
+    store.delete(&marker_k).await?;
     let mut index = RunIndex::decode(store.get(&ik).await?.as_ref());
     index.remove(&marker.run_id);
     store
@@ -368,6 +422,10 @@ pub async fn rollback_node(
         "run rolled back"
     );
     Ok(report)
+}
+
+fn marker_value(marker: &RunMarker) -> CliResult<Value> {
+    serde_json::to_value(marker).map_err(|e| CliError::Internal(format!("rollback marker: {e}")))
 }
 
 /// The sink found nothing of the run (`RollbackOutcome::nothing`: no rows,
@@ -482,6 +540,7 @@ pub fn marker_for(
         run_id_column,
         bookmark_before: None,
         token_before: None,
+        undo: None,
     }
 }
 

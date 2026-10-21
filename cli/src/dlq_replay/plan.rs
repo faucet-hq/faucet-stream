@@ -4,7 +4,7 @@
 //! unit-testable; the IO shims live in [`mod`](super) and [`reader`](super::reader).
 
 use crate::config::{ConnectorSpec, DlqSpec, OnBatchErrorSpec, PipelineConfig};
-use crate::dlq_replay::reader::{DlqDecryptor, DlqReaderSource, SourceOverride};
+use crate::dlq_replay::reader::{DlqDecryptor, DlqReaderSource, ReplayTarget, SourceOverride};
 use crate::error::{CliError, CliResult};
 use crate::expand::{ExpandedNode, NodeRole, expand};
 use faucet_core::{DeliveryMode, DlqReason, UnwrappedEnvelope};
@@ -156,6 +156,13 @@ pub fn select_replay_node(nodes: Vec<ExpandedNode>, row: Option<&str>) -> CliRes
 /// force at-least-once delivery, drop the state block (a replay is a fresh
 /// whole-location read), and point failures at a *fresh* DLQ so a replayed
 /// row that fails again can never re-feed the source location.
+///
+/// A replay only ever *adds* the dead-lettered records: the sink's
+/// `write_mode: overwrite` and a file sink's replace mode become appends
+/// ([`replay_sink_config`]), and scoped cleanup is dropped — a handful of
+/// replayed rows is never the complete set a cleanup deletes against. Unless
+/// `all_rows` is set, only envelopes the target pipeline and row wrote are
+/// replayed ([`replay_target`]).
 pub fn build_replay_node(
     cfg: &PipelineConfig,
     from_files: Vec<PathBuf>,
@@ -163,6 +170,7 @@ pub fn build_replay_node(
     failed_dlq: &Path,
     row: Option<&str>,
     decryptor: DlqDecryptor,
+    all_rows: bool,
 ) -> CliResult<ExpandedNode> {
     // Loop guard: the fresh DLQ must not be one of the source files.
     if from_files.iter().any(|f| same_file(f, failed_dlq)) {
@@ -182,7 +190,8 @@ pub fn build_replay_node(
             .as_ref()
             .and_then(|o| o.sink.config.get("encryption").cloned())
     });
-    let reader = DlqReaderSource::new(from_files, reason, decryptor);
+    let target = replay_target(cfg, &node, all_rows);
+    let reader = DlqReaderSource::new(from_files, reason, decryptor).with_target(target);
     node.source_override = Some(SourceOverride::new(Box::new(reader)));
 
     // A DLQ envelope's `payload` is the record as it entered the *write* path —
@@ -212,12 +221,82 @@ pub fn build_replay_node(
     // exactly-once (the reader is not a deterministic-replay source).
     node.state = None;
     node.delivery = DeliveryMode::AtLeastOnce;
+    node.sink.config = replay_sink_config(&node.sink)?;
+    // The replayed records are a few dead letters, not the complete record
+    // set a scoped cleanup deletes everything else against.
+    node.cleanup_scope = None;
     node.dlq = Some(failed_dlq_spec_sealed(
         failed_dlq,
         original_dlq.as_ref(),
         sealing,
     ));
     Ok(node)
+}
+
+/// The pipeline and row whose envelopes a replay through `node` keeps;
+/// `None` (every envelope) when `all_rows` is set.
+pub fn replay_target(
+    cfg: &PipelineConfig,
+    node: &ExpandedNode,
+    all_rows: bool,
+) -> Option<ReplayTarget> {
+    (!all_rows).then(|| ReplayTarget {
+        pipeline: cfg.name.clone(),
+        row: node.id.clone(),
+    })
+}
+
+/// The target sink config a replay writes with. A replay adds the
+/// dead-lettered records to what the destination holds, so nothing in it may
+/// replace the destination: `write_mode: overwrite` (which would swap in a
+/// table holding only the replayed rows) becomes `append`, and a file sink
+/// that replaces its file each run appends instead. A sink that can only
+/// write one whole file (a local `.parquet` file) is refused.
+pub fn replay_sink_config(sink: &ConnectorSpec) -> CliResult<Value> {
+    let mut cfg = sink.config.clone();
+    let Value::Object(map) = &mut cfg else {
+        return Ok(cfg);
+    };
+    if map.get("write_mode").and_then(Value::as_str) == Some("overwrite") {
+        tracing::warn!(
+            sink = %sink.kind,
+            "dlq replay: the target sink has `write_mode: overwrite`; the replayed records are \
+             appended to the destination instead of replacing it"
+        );
+        map.insert("write_mode".into(), Value::String("append".into()));
+    }
+    match sink.kind.as_str() {
+        "jsonl" | "csv" => {
+            map.insert("append".into(), Value::Bool(true));
+        }
+        kind if IF_EXISTS_DLQ_KINDS.contains(&kind) => {
+            let set = map.remove("if_exists").or_else(|| map.remove("mode"));
+            let keep = set
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|m| matches!(m, "error" | "error_if_exists"));
+            map.insert(
+                "if_exists".into(),
+                if keep {
+                    set.unwrap_or(Value::Null)
+                } else {
+                    Value::String("append".into())
+                },
+            );
+        }
+        "parquet" => {
+            if let Some(path) = crate::registry::sink_truncating_path("parquet", &sink.config) {
+                return Err(CliError::Config(format!(
+                    "dlq replay: the target `parquet` sink writes one whole file ('{path}'), which \
+                     a replay would replace with only the replayed records; replay through a row \
+                     whose sink appends (`--row`), or point the sink at a directory or a \
+                     `{{part}}` path"
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(cfg)
 }
 
 /// The raw `encryption` value of a config's local JSON Lines DLQ sink (a
@@ -679,6 +758,7 @@ mod replay_shaping_tests {
             Path::new("./failed.jsonl"),
             None,
             DlqDecryptor::default(),
+            false,
         )
         .expect("builds")
     }
@@ -788,6 +868,7 @@ matrix:
             Path::new("./failed.jsonl"),
             Some("b"),
             DlqDecryptor::default(),
+            false,
         )
         .expect("builds");
         let dlq = node.dlq.expect("a fresh DLQ");
@@ -809,8 +890,121 @@ matrix:
             Path::new("./failed.jsonl"),
             None,
             DlqDecryptor::default(),
+            false,
         )
         .expect("builds");
         assert!(node.quality.is_some(), "checks are idempotent; keep them");
+    }
+
+    fn spec(kind: &str, config: Value) -> ConnectorSpec {
+        ConnectorSpec {
+            kind: kind.into(),
+            config,
+            transforms: None,
+            inherit_transforms: true,
+            status: None,
+            tags: Vec::new(),
+            complete_for: None,
+            attributes: Default::default(),
+        }
+    }
+
+    /// A replay never replaces the destination: overwrite becomes append and
+    /// a replacing file sink appends.
+    #[test]
+    fn replay_sink_config_never_replaces() {
+        let c = replay_sink_config(&spec(
+            "sqlite",
+            json!({"table_name": "t", "write_mode": "overwrite"}),
+        ))
+        .unwrap();
+        assert_eq!(c["write_mode"], "append");
+        let c = replay_sink_config(&spec(
+            "sqlite",
+            json!({"write_mode": "upsert", "key": ["id"]}),
+        ))
+        .unwrap();
+        assert_eq!(c["write_mode"], "upsert");
+        let c = replay_sink_config(&spec("jsonl", json!({"path": "o.jsonl"}))).unwrap();
+        assert_eq!(c["append"], true);
+        let c = replay_sink_config(&spec(
+            "file",
+            json!({"path": "o.jsonl", "mode": "overwrite", "write_mode": "overwrite"}),
+        ))
+        .unwrap();
+        assert_eq!(c["if_exists"], "append");
+        assert_eq!(c["write_mode"], "append");
+        assert!(c.get("mode").is_none());
+        let c = replay_sink_config(&spec(
+            "s3",
+            json!({"bucket": "b", "if_exists": "error_if_exists"}),
+        ))
+        .unwrap();
+        assert_eq!(c["if_exists"], "error_if_exists");
+        let err = replay_sink_config(&spec(
+            "parquet",
+            json!({"destination": {"type": "local_path", "path": "o.parquet"}}),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("o.parquet"), "{err}");
+        let c = replay_sink_config(&spec(
+            "parquet",
+            json!({"destination": {"type": "local_path", "path": "dir/"}}),
+        ))
+        .unwrap();
+        assert_eq!(c["destination"]["path"], "dir/");
+        assert_eq!(
+            replay_sink_config(&spec("stdout", Value::Null)).unwrap(),
+            Value::Null
+        );
+    }
+
+    /// The replay node of an overwrite row with scoped cleanup appends and
+    /// runs no cleanup.
+    #[test]
+    fn replay_node_drops_overwrite_and_cleanup() {
+        let cfg = PipelineConfig::from_text(
+            r#"version: 1
+name: p
+pipeline:
+  source:
+    type: csv
+    config: { path: ./in.csv }
+    complete_for: { scope: { acct: 7 }, on_missing: delete }
+  sink: { type: sqlite, config: { database_url: "sqlite::memory:", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] } }
+"#,
+            Path::new("p.yaml"),
+        )
+        .unwrap();
+        assert!(
+            crate::expand::expand(&cfg).unwrap()[0]
+                .cleanup_scope
+                .is_some()
+        );
+        let node = replay_node(&cfg);
+        assert!(node.cleanup_scope.is_none());
+
+        let cfg = PipelineConfig::from_text(
+            r#"version: 1
+name: p
+pipeline:
+  source: { type: csv, config: { path: ./in.csv } }
+  sink: { type: sqlite, config: { database_url: "sqlite::memory:", table_name: t, column_mapping: auto_map, write_mode: overwrite } }
+"#,
+            Path::new("p.yaml"),
+        )
+        .unwrap();
+        assert_eq!(replay_node(&cfg).sink.config["write_mode"], "append");
+    }
+
+    #[test]
+    fn replay_target_names_the_row_unless_all_rows() {
+        let cfg = cfg("");
+        let node = crate::expand::expand(&cfg).unwrap().remove(0);
+        let t = replay_target(&cfg, &node, false).unwrap();
+        assert_eq!(t.pipeline.as_deref(), Some("replay-shape"));
+        assert_eq!(t.row, node.id);
+        assert!(replay_target(&cfg, &node, true).is_none());
     }
 }

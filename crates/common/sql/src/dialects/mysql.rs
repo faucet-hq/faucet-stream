@@ -145,6 +145,27 @@ impl SqlDialect for Mysql {
         ))
     }
 
+    fn cleanup_absent_keys_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+    ) -> Result<Option<String>, FaucetError> {
+        let t = &target.reference;
+        let pairs = key
+            .iter()
+            .map(|k| format!("{}, {t}.{}", self.quote_literal(k), quote_ident(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let delete = self.cleanup_delete_sql(target, scope, scope_types, key)?;
+        Ok(Some(delete.replacen(
+            "DELETE FROM ",
+            &format!("SELECT CAST(JSON_OBJECT({pairs}) AS CHAR) FROM "),
+            1,
+        )))
+    }
+
     fn commit_token_table_sql(&self) -> String {
         let (t, s, k) = self.commit_token_names();
         format!(

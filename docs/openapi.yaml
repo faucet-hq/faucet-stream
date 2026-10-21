@@ -804,6 +804,10 @@ paths:
                 reason: { type: string, enum: [partial, dlq_all, quality, schema_drift, contract] }
                 failed_dlq: { type: string }
                 row: { type: string }
+                all_rows:
+                  type: boolean
+                  default: false
+                  description: Replay every envelope through the row, whichever pipeline and row wrote it. By default only the envelopes the selected row (of the config's `name`) dead-lettered are replayed; the rest are counted in `skipped_other_rows`.
                 dry_run: { type: boolean, default: false }
                 encryption_keys:
                   type: array
@@ -818,7 +822,7 @@ paths:
                   description: Replay on behalf of this tenant (`tenants` feature) — the config loads under the tenant's scope and the replay is admitted against its limits, whose per-run ceilings bound it. A principal confined to another tenant gets a 404.
       responses:
         "200":
-          description: Replay outcome (id, tenant, candidates, records_written, failed_dlq)
+          description: Replay outcome (id, tenant, candidates, skipped_other_rows, records_written, failed_dlq)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad config, location, or reason filter }
         "401": { description: Missing or invalid bearer token }

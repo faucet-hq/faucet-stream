@@ -390,5 +390,26 @@ pipeline:
     let body = resp.text().await.unwrap();
     assert!(body.contains("out.jsonl"), "{body}");
 
+    // Several windows into one overwrite table → 400: each unit would swap
+    // away the windows before it.
+    let overwrite = r#"
+version: 1
+name: plain
+pipeline:
+  source: { type: sqlite, config: { database_url: "sqlite::memory:", query: "SELECT '${backfill.start}' AS s" } }
+  sink:   { type: sqlite, config: { database_url: "sqlite::memory:", table_name: t, column_mapping: auto_map, write_mode: overwrite } }
+"#;
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(
+            &json!({ "config": overwrite, "from": "2026-06-01", "to": "2026-06-03", "window": "1d" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("write_mode: overwrite"), "{body}");
+
     server.abort();
 }

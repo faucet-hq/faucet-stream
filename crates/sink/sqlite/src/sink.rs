@@ -369,6 +369,24 @@ impl SqlExecutor for SqliteExec<'_> {
             .map_err(|e| FaucetError::Sink(format!("{context}: {e}")))
     }
 
+    async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
+        let mut q = sqlx::query(&stmt.sql);
+        for p in &stmt.params {
+            q = bind_value(q, &p.value);
+        }
+        let rows = q
+            .fetch_all(&mut *self.conn)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("cleanup: reading keys to journal: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<String, _>(0).map_err(|e| {
+                    FaucetError::Sink(format!("cleanup: reading keys to journal: {e}"))
+                })
+            })
+            .collect()
+    }
+
     async fn journal_plan(
         &mut self,
         plan: &faucet_core::WritePlan,
@@ -411,6 +429,10 @@ impl SqlExecutor for SqliteConn<'_> {
 
     async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
         self.exec().execute(stmt).await
+    }
+
+    async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
+        self.exec().fetch_text(stmt).await
     }
 
     async fn journal_plan(

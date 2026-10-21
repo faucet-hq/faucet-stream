@@ -12,7 +12,7 @@ fn envelope(reason: &str, payload: serde_json::Value) -> String {
         "reason": reason,
         "payload": payload,
         "ts_ms": 1_751_760_000_000i64,
-        "sink": "jsonl", "pipeline": "orig", "row": "", "record_index": 0,
+        "sink": "jsonl", "pipeline": "replay", "row": "", "record_index": 0,
     })
     .to_string()
 }
@@ -156,6 +156,7 @@ fn replay_args(config: PathBuf, from: &Path, dry_run: bool, json: bool) -> DlqAr
             reason: None,
             failed_dlq: None,
             row: None,
+            all_rows: false,
             dry_run,
             json,
             env_file: None,
@@ -224,4 +225,40 @@ async fn replay_runs_under_the_configs_resilience_block() {
     dlq::run(replay_args(cfg, &dlq, false, true)).await.unwrap();
     let landed = std::fs::read_to_string(&out).unwrap();
     assert_eq!(landed.lines().count(), 2, "{landed}");
+}
+
+/// A shared DLQ holds another row's envelopes: the default replay skips them
+/// and says so; `--all-rows` replays them too.
+#[tokio::test]
+async fn replay_skips_other_rows_envelopes_unless_all_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = json!({
+        "error": { "kind": "QualityFailure", "message": "boom" },
+        "reason": "quality",
+        "payload": {"id": 9},
+        "ts_ms": 1_751_760_000_000i64,
+        "sink": "jsonl", "pipeline": "replay", "row": "eu", "record_index": 0,
+    })
+    .to_string();
+    let dlq = write(
+        dir.path(),
+        "shared.jsonl",
+        &format!("{}\n{other}\n", envelope("quality", json!({"id": 1}))),
+    );
+    let out = dir.path().join("out.jsonl");
+    let cfg = replay_config(dir.path(), &out);
+    dlq::run(replay_args(cfg.clone(), &dlq, false, false))
+        .await
+        .unwrap();
+    let landed = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(landed.lines().count(), 1, "{landed}");
+    assert!(!landed.contains("\"id\":9"), "{landed}");
+
+    let mut args = replay_args(cfg, &dlq, false, true);
+    if let DlqCommand::Replay(r) = &mut args.command {
+        r.all_rows = true;
+    }
+    dlq::run(args).await.unwrap();
+    let landed = std::fs::read_to_string(&out).unwrap();
+    assert!(landed.contains("\"id\":9"), "{landed}");
 }

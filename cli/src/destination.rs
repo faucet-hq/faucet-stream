@@ -144,13 +144,35 @@ impl Identities {
     }
 }
 
+/// Sinks on the shared file writer: their reported dataset URI names a
+/// bucket and prefix (or a directory), not the files a row's `path` template
+/// writes, so it cannot tell two rows' destinations apart.
+const FILE_WRITING_KINDS: &[&str] = &[
+    "file",
+    "jsonl",
+    "csv",
+    "parquet",
+    "s3",
+    "gcs",
+    "azure-blob",
+    "sftp",
+];
+
 /// The destination a built sink reports, normalised; `None` when the sink
 /// cannot be built or reports the uninformative default `<name>://unknown`.
+/// A file-writing sink is identified by the files its config names
+/// ([`sink_shared_destination`](crate::registry::sink_shared_destination)),
+/// never by its coarser dataset URI: rows writing different files under one
+/// prefix are different destinations.
 pub async fn reported_identity(
     kind: &str,
     config: &Value,
     auth: &crate::auth_catalog::AuthCatalog,
 ) -> Option<String> {
+    if FILE_WRITING_KINDS.contains(&kind) {
+        return crate::registry::sink_shared_destination(kind, config)
+            .and_then(|dest| uri_identity(kind, &dest));
+    }
     let sink = crate::registry::build_sink(kind, config.clone(), auth)
         .await
         .map_err(|e| {
@@ -577,6 +599,39 @@ mod tests {
             uri_identity("pg", "postgres://u:p@h/db?table=t/"),
             uri_identity("pg", "postgres://u:q@h/db?table=t")
         );
+    }
+
+    /// Object-store rows writing different files under one prefix report the
+    /// same dataset URI; they are different destinations, so they never share
+    /// one overwrite swap (each stages under its own template).
+    #[tokio::test]
+    async fn file_sinks_are_identified_by_the_files_they_write() {
+        let auth = crate::auth_catalog::AuthCatalog::new();
+        let cfg = |path: &str| json!({"bucket": "b", "prefix": "exports/", "path": path, "write_mode": "overwrite"});
+        let users = reported_identity("s3", &cfg("users.jsonl"), &auth).await;
+        let orders = reported_identity("s3", &cfg("orders.jsonl"), &auth).await;
+        assert!(users.as_deref().is_some_and(|u| u.contains("users.jsonl")));
+        assert_ne!(users, orders);
+        assert_eq!(
+            reported_identity("s3", &cfg("users.jsonl"), &auth).await,
+            users
+        );
+        assert!(
+            reported_identity("s3", &json!({"bucket": "b", "prefix": "exports/"}), &auth)
+                .await
+                .is_none(),
+            "no path: unique names per run, the config identity decides"
+        );
+        let mut a = node("a", NodeRole::Root, &[], cfg("users.jsonl"));
+        let mut b = node("b", NodeRole::Root, &[], cfg("orders.jsonl"));
+        a.sink.kind = "s3".into();
+        b.sink.kind = "s3".into();
+        let nodes = vec![a.clone(), b.clone()];
+        let ids = Identities::resolve(&nodes, &auth, is_overwrite).await;
+        assert!(!ids.same(&a, &b), "{ids:?}");
+        check_overwrite_selection_resolved(&nodes, std::slice::from_ref(&a), &auth)
+            .await
+            .unwrap();
     }
 
     #[test]

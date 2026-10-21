@@ -217,6 +217,22 @@ pub async fn submit_backfill(
             crate::backfill::spec::shared_destination_error(&node.id, &node.sink.kind, &dest),
         ));
     }
+    if units.len() > 1
+        && let Some((node, how)) = loaded
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
+            .find_map(|n| crate::backfill::spec::replacing_unit_destination(n).map(|h| (n, h)))
+    {
+        return Err(ServeError::BadConfig(
+            crate::backfill::spec::replacing_destination_error(
+                &node.id,
+                &node.sink.kind,
+                &how,
+                units.len(),
+            ),
+        ));
+    }
 
     let base_name = req
         .name

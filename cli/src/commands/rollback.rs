@@ -283,6 +283,7 @@ mod tests {
             run_id_column: "_faucet_run_id".into(),
             bookmark_before: None,
             token_before: None,
+            undo: None,
         };
         let t = render_list(&[m]);
         assert!(t.contains("abc") && t.contains("upsert") && t.contains("sqlite:///x#t"));

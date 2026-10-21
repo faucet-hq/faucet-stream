@@ -1477,6 +1477,12 @@ pub struct DlqReplayArgs {
     /// Which root row of the config to replay through. Defaults to the first root.
     #[arg(long)]
     pub row: Option<String>,
+    /// Replay every envelope through the row, whichever pipeline and row
+    /// wrote it. By default a replay keeps only the envelopes the selected
+    /// row (of this config's `name:`) dead-lettered, because a shared DLQ
+    /// holds other rows' records too.
+    #[arg(long)]
+    pub all_rows: bool,
     /// Report what would be replayed without writing to the sink.
     #[arg(long)]
     pub dry_run: bool,

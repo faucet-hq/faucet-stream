@@ -972,6 +972,7 @@ pub async fn replay_dlq(
             reason: req.reason.as_deref(),
             failed_dlq: req.failed_dlq.as_deref(),
             row: req.row.as_deref(),
+            all_rows: req.all_rows,
             dry_run: req.dry_run,
             pipeline_name,
             execution: loaded.cfg.execution.clone(),

@@ -321,7 +321,7 @@ pipeline:
       query: "SELECT '${backfill.start}' AS s"
   sink:
     type: jsonl
-    config: { path: ./out.jsonl }
+    config: { path: ./out.jsonl, append: true }
 "#,
         )
         .unwrap();

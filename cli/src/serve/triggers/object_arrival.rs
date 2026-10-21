@@ -22,21 +22,53 @@ pub struct ListedObject {
     pub etag: Option<String>,
 }
 
-/// Tracks a high-water `last_modified` + the set of keys seen exactly at that
-/// timestamp (ties), so the same object is never re-emitted while genuinely new
-/// objects (even at the same second) are.
-#[derive(Debug, Default)]
+/// Which listed objects are new. Remembers every object fired within
+/// `lookback` of the newest one (by key, ETag and `last_modified`), so an
+/// object that becomes listable after a newer one fired — a multipart upload
+/// carries its start time, a slow writer an earlier one — is still fired
+/// once, while an object already fired never is again. A rewritten object
+/// (new ETag or time) is new.
+#[derive(Debug)]
 pub struct Cursor {
+    /// `start_at: now`: objects last modified at or before this were there
+    /// before the watcher started.
+    floor: Option<chrono::DateTime<chrono::Utc>>,
+    /// The newest `last_modified` fired.
     watermark: Option<chrono::DateTime<chrono::Utc>>,
-    seen_at_watermark: std::collections::HashSet<String>,
+    lookback: chrono::Duration,
+    /// Fired objects within the window, by identity.
+    seen: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+}
+
+/// The default look-back window: 24 hours.
+pub const DEFAULT_LOOKBACK: Duration = Duration::from_secs(86_400);
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            floor: None,
+            watermark: None,
+            lookback: chrono::Duration::from_std(DEFAULT_LOOKBACK).unwrap_or_default(),
+            seen: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn identity(o: &ListedObject) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        o.key,
+        o.last_modified.timestamp_nanos_opt().unwrap_or_default(),
+        o.etag.as_deref().unwrap_or("")
+    )
 }
 
 impl Cursor {
     /// Seed for `start_at: now` — ignore everything at/below `now`.
     pub fn starting_now(now: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
-            watermark: Some(now),
-            seen_at_watermark: std::collections::HashSet::new(),
+            floor: Some(now),
+            ..Self::default()
         }
     }
 
@@ -45,42 +77,70 @@ impl Cursor {
         Self::default()
     }
 
-    /// Return objects strictly newer than the watermark (or at-watermark but
-    /// unseen). Does NOT advance the watermark — call [`Cursor::commit`] after a
-    /// successful fire so a dropped fire is retried.
-    pub fn new_objects(&self, listing: &[ListedObject]) -> Vec<ListedObject> {
-        let mut out = Vec::new();
-        for o in listing {
-            match self.watermark {
-                None => out.push(o.clone()),
-                Some(w) if o.last_modified > w => out.push(o.clone()),
-                Some(w) if o.last_modified == w && !self.seen_at_watermark.contains(&o.key) => {
-                    out.push(o.clone())
-                }
-                _ => {}
-            }
-        }
-        out
+    /// The same cursor remembering fired objects for `lookback` behind the
+    /// newest one.
+    pub fn with_lookback(mut self, lookback: Duration) -> Self {
+        self.lookback = chrono::Duration::from_std(lookback).unwrap_or(chrono::Duration::MAX);
+        self
     }
 
-    /// Mark an object committed (advance the watermark past it).
+    /// The oldest `last_modified` still considered: the watermark minus the
+    /// look-back window.
+    fn horizon(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.watermark.map(|w| {
+            w.checked_sub_signed(self.lookback)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        })
+    }
+
+    /// Return the listed objects not yet fired: after the start floor,
+    /// within the look-back window, and not remembered. Does NOT record them
+    /// — call [`Cursor::commit`] after a successful fire so a dropped fire is
+    /// retried.
+    pub fn new_objects(&self, listing: &[ListedObject]) -> Vec<ListedObject> {
+        let horizon = self.horizon();
+        listing
+            .iter()
+            .filter(|o| self.floor.is_none_or(|f| o.last_modified > f))
+            .filter(|o| horizon.is_none_or(|h| o.last_modified >= h))
+            .filter(|o| !self.seen.contains_key(&identity(o)))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `o` is newer than every object fired so far.
+    pub fn is_newest(&self, o: &ListedObject) -> bool {
+        self.watermark.is_none_or(|w| o.last_modified > w)
+    }
+
+    /// Record `o` as fired, and forget objects that fell out of the window.
     pub fn commit(&mut self, o: &ListedObject) {
-        match self.watermark {
-            Some(w) if o.last_modified > w => {
-                self.watermark = Some(o.last_modified);
-                self.seen_at_watermark.clear();
-                self.seen_at_watermark.insert(o.key.clone());
-            }
-            Some(w) if o.last_modified == w => {
-                self.seen_at_watermark.insert(o.key.clone());
-            }
-            None => {
-                self.watermark = Some(o.last_modified);
-                self.seen_at_watermark.insert(o.key.clone());
-            }
-            _ => {}
+        if self.is_newest(o) {
+            self.watermark = Some(o.last_modified);
+        }
+        self.seen.insert(identity(o), o.last_modified);
+        if let Some(h) = self.horizon() {
+            self.seen.retain(|_, lm| *lm >= h);
         }
     }
+}
+
+/// A stable digest of a batch's objects, so two batches with the same newest
+/// time but different objects get different idempotency keys.
+fn batch_digest(objects: &[ListedObject]) -> String {
+    use sha2::Digest as _;
+    let mut ids: Vec<String> = objects.iter().map(identity).collect();
+    ids.sort();
+    let mut h = sha2::Sha256::new();
+    for id in &ids {
+        h.update(id.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Return type of [`ObjectArrivalWatcher::build_store`]: the constructed
@@ -153,6 +213,13 @@ impl ObjectArrivalWatcher {
             cursor,
             compiled,
         }
+    }
+
+    /// Remember fired objects for `lookback` behind the newest one, so a
+    /// late-visible object is still fired (default [`DEFAULT_LOOKBACK`]).
+    pub fn with_lookback(mut self, lookback: Duration) -> Self {
+        self.cursor = std::mem::take(&mut self.cursor).with_lookback(lookback);
+        self
     }
 
     async fn list(&self) -> Result<Vec<ListedObject>, String> {
@@ -240,11 +307,20 @@ impl Watcher for ObjectArrivalWatcher {
                 }
             }
             ArrivalMode::Batch => {
-                let watermark = new.iter().map(|o| o.last_modified).max().unwrap();
+                let newest = new.iter().map(|o| o.last_modified).max().unwrap();
+                // A batch holding a newer object than any fired keys on that
+                // time (unique, it only grows); a batch of late objects only
+                // shares its newest time with an earlier batch, so it also
+                // keys on what it holds.
+                let watermark = if new.iter().any(|o| self.cursor.is_newest(o)) {
+                    newest.to_rfc3339()
+                } else {
+                    format!("{}:late:{}", newest.to_rfc3339(), batch_digest(&new))
+                };
                 let event = TriggerEvent::ObjectBatch {
                     bucket: self.bucket.clone(),
                     count: new.len(),
-                    watermark: watermark.to_rfc3339(),
+                    watermark,
                 };
                 match enqueue::fire(state, &self.compiled, event, &fired_at).await {
                     outcome if outcome.committed() => {
@@ -325,6 +401,54 @@ mod cursor_tests {
         assert_eq!(new, vec![b.clone()]);
         c.commit(&b);
         assert!(c.new_objects(&[a, b]).is_empty());
+    }
+
+    /// A multipart upload started before a small object that fired, and
+    /// listed only after it, carries the older time: it is still fired, once.
+    #[test]
+    fn a_late_visible_object_is_fired_once() {
+        let mut c = Cursor::starting_beginning();
+        let small = obj("small", 610);
+        c.commit(&small);
+        let big = obj("big", 600);
+        assert_eq!(
+            c.new_objects(&[small.clone(), big.clone()]),
+            vec![big.clone()]
+        );
+        c.commit(&big);
+        assert!(c.new_objects(&[small.clone(), big.clone()]).is_empty());
+        assert!(!c.is_newest(&big));
+        // Rewritten in place (new ETag): new again.
+        let mut rewritten = big.clone();
+        rewritten.etag = Some("v2".into());
+        assert_eq!(c.new_objects(&[rewritten.clone()]), vec![rewritten]);
+    }
+
+    #[test]
+    fn objects_older_than_the_lookback_are_ignored_and_forgotten() {
+        let mut c = Cursor::starting_beginning().with_lookback(Duration::from_secs(100));
+        c.commit(&obj("a", 1000));
+        assert!(c.new_objects(&[obj("old", 899)]).is_empty());
+        assert_eq!(c.new_objects(&[obj("edge", 900)]).len(), 1);
+        c.commit(&obj("b", 1200));
+        assert!(!c.seen.contains_key(&identity(&obj("a", 1000))), "pruned");
+        assert!(
+            c.new_objects(&[obj("a", 1000)]).is_empty(),
+            "outside the window"
+        );
+        let mut huge = Cursor::starting_beginning().with_lookback(Duration::MAX);
+        huge.commit(&obj("a", 1000));
+        assert_eq!(huge.new_objects(&[obj("ancient", 1)]).len(), 1);
+    }
+
+    #[test]
+    fn late_batches_key_on_their_objects() {
+        let a = vec![obj("a", 1), obj("b", 2)];
+        let b = vec![obj("c", 2)];
+        assert_ne!(batch_digest(&a), batch_digest(&b));
+        let mut swapped = a.clone();
+        swapped.reverse();
+        assert_eq!(batch_digest(&a), batch_digest(&swapped), "order-free");
     }
 
     #[test]

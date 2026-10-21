@@ -75,6 +75,15 @@ Units that run at once must not share a file or object destination: a file,
 of one file overwrite each other. Put a per-window token in the path, as the
 example above does, or pass `--concurrency 1`.
 
+Each unit is its own run, so a sink that replaces its whole destination on
+every run — `write_mode: overwrite`, or a file sink that rewrites one fixed
+file (`jsonl`/`csv` without `append: true`, a `file` sink with the default
+`if_exists: replace`) — would leave only the last window. A backfill of
+several units into such a destination is refused (CLI and
+`POST /v1/backfill`): write with `append` or `upsert`, put a per-window token
+in the destination, `--into` a sink that appends, or cover the range with one
+window.
+
 ## Windows, timezones, DST
 
 `--window` takes `45s`, `30m`, `6h`, `1d`, or `1w`; omitted (and no
@@ -105,7 +114,8 @@ resolves to the earliest instant, matching how `--from`/`--to` dates resolve.
 ## Progress, resume, restart
 
 A durable marker at `{name}::__backfill__::{range-hash}` in the pipeline's
-`state:` store records each unit's terminal outcome. Re-running the same range:
+`state:` store records each unit's terminal outcome as soon as that unit finishes, so a crash
+mid-backfill never loses a completed unit. Re-running the same range:
 
 - without a flag → an error telling you the marker exists (`N done, M failed`) —
   pass `--resume` or `--restart`;

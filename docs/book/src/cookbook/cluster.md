@@ -196,9 +196,9 @@ how many instances attempted them.
 > **Clustered runs are at-least-once.** Both `--cluster` failover and Mode B
 > shard reclaim can re-execute work, so an **append**-mode sink can end up with
 > duplicate rows. When a run is submitted to a clustered or sharded server,
-> faucet logs a warning recommending [`write_mode: upsert`](./upsert.md) (or
-> [`delivery: exactly_once`](./state.md#effectively-once-delivery)) so any replay is
-> idempotent. The run still proceeds — the warning is a reminder, not a gate.
+> faucet logs a warning recommending [`write_mode: upsert`](./upsert.md) with a
+> `key` so any replay is idempotent. The run still proceeds — the warning is a
+> reminder, not a gate.
 
 **Practical sizing advice:** set `--lease-ttl-secs` comfortably above your
 worst-case GC/IO stall. A 30-second default is appropriate for most JVM-free
@@ -405,16 +405,22 @@ How it differs from the other sharders:
   same sink config, so a file or object sink would have several writers
   clobbering each other's files; such a sharded run is refused too. Write to a
   database or keyed sink instead.
+- **No watermark exactly-once:** each shard keeps its own commit watermark,
+  and which records a shard reads can change between runs (the broker assigns
+  a Kafka slot its partitions; key ranges are re-planned), so a shard can
+  re-read records another shard already committed. A sharded
+  `delivery: exactly_once` run is refused unless its sink writes by key
+  (`write_mode: upsert` / `delete` with a `key`), where a re-written record
+  converges.
 - `faucet run`, `validate` and `schedule` ignore `shard:` (the config runs as
-  one unsharded invocation), so there these two cases only log a warning.
+  one unsharded invocation), so there these cases only log a warning.
 - **Rebalancing:** a shard whose owning instance's lease expires is reclaimed by
   the lease loop — requeued to another worker, or poisoned (failed) past
   `--cluster-max-attempts`. New members pick up unassigned/reclaimed shards on
   their next claim tick.
 - **Correctness boundary:** the same paused-not-crashed double-processing window
-  as Mode A applies per shard. Pair with `write_mode: upsert` (or effectively-once
-  delivery) so a reassigned shard's overlap is idempotent — as in the example
-  above.
+  as Mode A applies per shard. Pair with `write_mode: upsert` so a reassigned
+  shard's overlap is idempotent — as in the example above.
 
 Mode B metrics: `faucet_serve_shards_claimed_total`,
 `faucet_serve_shards_reclaimed_total{outcome}`.

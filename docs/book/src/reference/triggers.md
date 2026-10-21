@@ -86,7 +86,16 @@ store:
 poll_interval_secs: 30      # how often to list the prefix (default 30)
 mode: per_object            # per_object (one run per new object) | batch (one run for all new objects)
 start_at: now               # now (only objects seen after startup) | beginning (all objects, incl. existing)
+lookback_secs: 86400        # how far behind the newest fired object a late-listed one still fires (default 24h)
 ```
+
+An object is fired once, identified by its key, ETag and last-modified time
+(a rewritten object fires again). Object stores list an object only once it is
+complete, stamped with when it started — a multipart upload — or an earlier
+write time, so it can appear after newer objects already fired; any object
+last modified within `lookback_secs` of the newest fired one is still fired. A
+late `batch` gets its own idempotency key, so it is not taken for the earlier
+batch that shares its newest time.
 
 **`${trigger.*}` tokens injected into the run config:**
 
