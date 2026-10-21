@@ -80,6 +80,34 @@ fn net_err(what: &str, e: impl std::fmt::Display) -> CliError {
     CliError::Config(format!("hub github: {what}: {e}"))
 }
 
+/// Bounds on one GitHub request.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The largest response body read from the hub (a listing, a template, the
+/// index).
+const MAX_BODY_BYTES: usize = 32 << 20;
+
+/// Read a response body, refusing one larger than `limit` bytes.
+async fn read_capped(mut resp: reqwest::Response, limit: usize, what: &str) -> CliResult<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(net_err(what, format!("response is larger than {limit} bytes")));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| net_err(what, e))? {
+        if out.len() + chunk.len() > limit {
+            return Err(net_err(what, format!("response is larger than {limit} bytes")));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+async fn read_body(resp: reqwest::Response, what: &str) -> CliResult<Vec<u8>> {
+    read_capped(resp, MAX_BODY_BYTES, what).await
+}
+
 /// A catalog's `index.json` at the hub root: version history, `stable`, trust.
 const INDEX_FILE: &str = "index.json";
 
@@ -134,9 +162,14 @@ impl GithubHub {
                 "GithubHub::new called with a local hub location".into(),
             ));
         };
+        // A stalled connection must fail (and fall back to the cached
+        // snapshot) rather than hang every hub command.
         let client = faucet_core::http::Client::builder()
             .user_agent(concat!("faucet-stream/", env!("CARGO_PKG_VERSION")))
             .sensitive_header("authorization")
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build_reqwest()
             .map_err(|e| net_err("building HTTP client", e))?;
         let token = github_token(repo);
@@ -207,10 +240,7 @@ impl GithubHub {
                 "resolving ref",
             )
             .await?;
-        let sha = resp
-            .text()
-            .await
-            .map_err(|e| net_err("resolving ref", e))?
+        let sha = String::from_utf8_lossy(&read_body(resp, "resolving ref").await?)
             .trim()
             .to_string();
         if sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -264,10 +294,9 @@ impl GithubHub {
                 ),
             ));
         }
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| net_err(&format!("listing {rel}"), e))?;
+        let what = format!("listing {rel}");
+        let body: serde_json::Value = serde_json::from_slice(&read_body(resp, &what).await?)
+            .map_err(|e| net_err(&what, e))?;
         match body {
             serde_json::Value::Array(_) => Ok(Some(
                 serde_json::from_value(body).map_err(|e| net_err(&format!("listing {rel}"), e))?,
@@ -336,11 +365,9 @@ impl GithubHub {
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
-        let resp = self.send_checked(resp, &format!("fetching {rel}")).await?;
-        resp.bytes()
-            .await
-            .map(|b| Some(b.to_vec()))
-            .map_err(|e| net_err(&format!("fetching {rel}"), e))
+        let what = format!("fetching {rel}");
+        let resp = self.send_checked(resp, &what).await?;
+        read_body(resp, &what).await.map(Some)
     }
 
     /// Download a complete snapshot of the hub into `dest` (created),
@@ -359,10 +386,7 @@ impl GithubHub {
                         &format!("downloading {rel}"),
                     )
                     .await?;
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| net_err(&format!("downloading {rel}"), e))?;
+                let bytes = read_body(resp, &format!("downloading {rel}")).await?;
                 let target = dest.join(&rel);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)
@@ -416,10 +440,7 @@ impl GithubHub {
                 &format!("fetching {rel} @ {}", short_commit(commit)),
             )
             .await?;
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| net_err(&format!("fetching {rel}"), e))
+        read_body(resp, &format!("fetching {rel}")).await
     }
 }
 
@@ -862,6 +883,22 @@ mod tests {
         );
         assert!(!root.path().join("old").exists());
         assert!(!root.path().join("abc").exists());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(100)))
+            .mount(&server)
+            .await;
+        #[allow(clippy::disallowed_methods)] // a raw test client against the mock
+        let client = reqwest::Client::new();
+        let get = || client.get(format!("{}/big", server.uri())).send();
+        let err = read_capped(get().await.unwrap(), 10, "probe").await.unwrap_err();
+        assert!(err.to_string().contains("larger than 10 bytes"), "{err}");
+        assert_eq!(read_capped(get().await.unwrap(), 100, "probe").await.unwrap().len(), 100);
     }
 
     #[tokio::test]
