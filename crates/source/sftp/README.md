@@ -28,6 +28,7 @@ Connection, authentication, and host-key verification come from
 | `format` | enum | `jsonl` | `jsonl` \| `json_array` \| `raw_text` \| `csv` \| `xml` \| `xlsx`. |
 | `batch_size` | integer | `1000` | Records per page; `0` = one page per file. |
 | `concurrency` | integer | `4` | Files read concurrently. The prefetch is ordered, so records stay in listing order and a failing file is still blamed at its own position; `0` is clamped to 1. Lower than the object-store sources' default because every read shares one SSH channel. For `jsonl` it overlaps only the `open` round-trip (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole files are resident. |
+| `max_object_bytes` | integer | `2147483648` (2 GiB) | Largest file a format read whole into memory (`json_array`, `raw_text`, `csv`, `xml`, `xlsx`, `avro`, `orc`) may reach. The size the server reports is checked before reading and the read stops one byte past the cap, so a larger file fails with an error naming it instead of exhausting memory. `jsonl` and `parquet` stream and are not capped. |
 
 Symlinks are followed: a link to a file is read, a link to a directory is skipped.
 

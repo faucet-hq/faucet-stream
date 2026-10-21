@@ -194,11 +194,12 @@ impl SftpSource {
 
     /// Read a whole remote file into a UTF-8 `String` (used by `raw_text` and
     /// `json_array`, which cannot be parsed incrementally).
-    async fn read_file_text(sftp: &SftpSession, path: &str) -> Result<String, FaucetError> {
-        let bytes = sftp
-            .read(path)
-            .await
-            .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))?;
+    async fn read_file_text(
+        sftp: &SftpSession,
+        path: &str,
+        max: u64,
+    ) -> Result<String, FaucetError> {
+        let bytes = Self::read_file(sftp, path, max).await?;
         String::from_utf8(bytes)
             .map_err(|e| FaucetError::Source(format!("SFTP file '{path}' is not valid UTF-8: {e}")))
     }
@@ -209,7 +210,7 @@ impl SftpSource {
         calls: &faucet_core::CallContext,
         sftp: &SftpSession,
         path: &str,
-        format: SftpFormat,
+        config: &SftpSourceConfig,
         #[cfg_attr(
             not(any(
                 feature = "file-format-csv",
@@ -219,47 +220,52 @@ impl SftpSource {
             allow(unused_variables)
         )]
         opts: &faucet_core::FormatOptions,
-        #[cfg_attr(not(feature = "arrow"), allow(unused_variables))]
-        parquet: &faucet_core::ParquetReadOptions,
         #[cfg_attr(not(feature = "arrow"), allow(unused_variables))] batch_size: usize,
     ) -> Result<Fetched, FaucetError> {
+        let format = config.format;
+        let max = config.max_object_bytes;
         Ok(match format {
             SftpFormat::Jsonl => Fetched::Lines(
                 sftp.open(path)
                     .await
                     .map_err(|e| FaucetError::Source(format!("SFTP open '{path}' failed: {e}")))?,
             ),
-            SftpFormat::RawText => Fetched::RawText(Self::read_file_text(sftp, path).await?),
-            SftpFormat::JsonArray => Fetched::JsonArray(Self::read_file_text(sftp, path).await?),
+            SftpFormat::RawText => Fetched::RawText(Self::read_file_text(sftp, path, max).await?),
+            SftpFormat::JsonArray => {
+                Fetched::JsonArray(Self::read_file_text(sftp, path, max).await?)
+            }
             #[cfg(feature = "file-format-csv")]
-            SftpFormat::Csv => Self::fetch_decoded(sftp, path, format, opts).await?,
+            SftpFormat::Csv => Self::fetch_decoded(sftp, path, format, opts, max).await?,
             #[cfg(feature = "file-format-xml")]
-            SftpFormat::Xml => Self::fetch_decoded(sftp, path, format, opts).await?,
+            SftpFormat::Xml => Self::fetch_decoded(sftp, path, format, opts, max).await?,
             #[cfg(feature = "file-format-excel")]
-            SftpFormat::Xlsx => Self::fetch_decoded(sftp, path, format, opts).await?,
+            SftpFormat::Xlsx => Self::fetch_decoded(sftp, path, format, opts, max).await?,
             #[cfg(feature = "file-format-avro")]
-            SftpFormat::Avro => Fetched::Container(Self::read_file(sftp, path).await?),
+            SftpFormat::Avro => Fetched::Container(Self::read_file(sftp, path, max).await?),
             #[cfg(feature = "file-format-orc")]
-            SftpFormat::Orc => Fetched::Container(Self::read_file(sftp, path).await?),
+            SftpFormat::Orc => Fetched::Container(Self::read_file(sftp, path, max).await?),
             #[cfg(feature = "arrow")]
             SftpFormat::Parquet => Fetched::Parquet(
-                Self::open_parquet(calls, sftp, path, parquet, batch_size)
+                Self::open_parquet(calls, sftp, path, &config.parquet, batch_size)
                     .await?
                     .1,
             ),
         })
     }
 
-    /// A remote file's whole body.
-    #[cfg(any(
-        feature = "file-format-csv",
-        feature = "file-format-xml",
-        feature = "file-format-excel",
-        feature = "file-format-avro",
-        feature = "file-format-orc"
-    ))]
-    async fn read_file(sftp: &SftpSession, path: &str) -> Result<Vec<u8>, FaucetError> {
-        sftp.read(path)
+    /// A remote file's whole body, refusing one larger than `max` bytes
+    /// (`max_object_bytes`): the size the server reports is checked before
+    /// reading, and the read itself stops one byte past `max`, so a file that
+    /// grows (or a server that reports no size) still cannot exhaust memory.
+    async fn read_file(sftp: &SftpSession, path: &str, max: u64) -> Result<Vec<u8>, FaucetError> {
+        let file = sftp
+            .open(path)
+            .await
+            .map_err(|e| FaucetError::Source(format!("SFTP open '{path}' failed: {e}")))?;
+        if let Some(size) = file.metadata().await.ok().and_then(|m| m.size) {
+            check_file_size(size, max, path)?;
+        }
+        faucet_core::file_format::read_to_end_capped(file, max, path)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))
     }
@@ -333,7 +339,10 @@ impl SftpSource {
                 self.config.batch_size,
                 move |file| async move {
                     self.calls
-                        .call_once("get", Self::read_file(sftp, &file))
+                        .call_once(
+                            "get",
+                            Self::read_file(sftp, &file, self.config.max_object_bytes),
+                        )
                         .await
                 },
             ),
@@ -383,8 +392,9 @@ impl SftpSource {
         path: &str,
         format: SftpFormat,
         opts: &faucet_core::FormatOptions,
+        max: u64,
     ) -> Result<Fetched, FaucetError> {
-        let bytes = Self::read_file(sftp, path).await?;
+        let bytes = Self::read_file(sftp, path, max).await?;
         let shared = format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
@@ -447,10 +457,9 @@ impl faucet_core::Source for SftpSource {
             // path is moved into each future rather than borrowed: a closure
             // returning a borrow-capturing async block is not higher-ranked
             // enough for `buffered`.
-            let format = self.config.format;
+            let config = &self.config;
             let opts = self.config.format_options();
             let opts = &opts;
-            let parquet = &self.config.parquet;
             let concurrency = self.config.concurrency.max(1);
             let reads = calls.clone().with_roundtrip_metering(false);
             let calls = &calls;
@@ -461,7 +470,7 @@ impl faucet_core::Source for SftpSource {
                         let payload = calls
                             .call_once(
                                 "get",
-                                Self::fetch(calls, sftp, &file, format, opts, parquet, batch_size),
+                                Self::fetch(calls, sftp, &file, config, opts, batch_size),
                             )
                             .await;
                         (file, payload)
@@ -753,6 +762,17 @@ impl faucet_core::Source for SftpSource {
 }
 
 /// Return a human-readable name for a JSON value type.
+/// The error for a remote file larger than `max_object_bytes`.
+fn check_file_size(size: u64, max: u64, path: &str) -> Result<(), FaucetError> {
+    if size > max {
+        return Err(FaucetError::Source(format!(
+            "SFTP file '{path}' is {size} bytes, larger than `max_object_bytes` ({max} bytes); \
+             raise `max_object_bytes` to read it"
+        )));
+    }
+    Ok(())
+}
+
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -769,6 +789,36 @@ mod tests {
     use super::*;
     use faucet_common_sftp::SftpConnectionConfig;
     use faucet_core::Source;
+
+    #[test]
+    fn a_file_over_max_object_bytes_is_refused_by_name() {
+        assert!(check_file_size(64, 64, "/d/a.json").is_ok());
+        let err = check_file_size(65, 64, "/d/a.json")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/d/a.json") && err.contains("max_object_bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn max_object_bytes_defaults_to_the_shared_ceiling() {
+        assert_eq!(
+            cfg().max_object_bytes,
+            faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+        );
+        let mut doc = serde_json::to_value(cfg()).unwrap();
+        doc.as_object_mut().unwrap().remove("max_object_bytes");
+        let parsed: SftpSourceConfig = serde_json::from_value(doc.clone()).unwrap();
+        assert_eq!(
+            parsed.max_object_bytes,
+            faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+        );
+        doc["max_object_bytes"] = serde_json::json!(10);
+        let parsed: SftpSourceConfig = serde_json::from_value(doc).unwrap();
+        assert_eq!(parsed.max_object_bytes, 10);
+    }
 
     fn cfg() -> SftpSourceConfig {
         SftpSourceConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/data")

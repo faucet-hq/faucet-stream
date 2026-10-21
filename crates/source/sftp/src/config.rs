@@ -139,6 +139,16 @@ pub struct SftpSourceConfig {
     /// Column projection, used when `format: parquet` (#777).
     #[serde(default)]
     pub parquet: faucet_core::ParquetReadOptions,
+    /// Largest file, in bytes, a format read whole into memory (JSON array,
+    /// raw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails
+    /// with an error naming it instead of exhausting memory. `jsonl` and
+    /// `parquet` stream and are not capped. Default 2 GiB.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
+}
+
+fn default_max_object_bytes() -> u64 {
+    faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
 }
 
 fn default_batch_size() -> usize {
@@ -166,6 +176,7 @@ impl SftpSourceConfig {
             avro: faucet_core::AvroOptions::default(),
             orc: faucet_core::OrcOptions::default(),
             parquet: faucet_core::ParquetReadOptions::default(),
+            max_object_bytes: default_max_object_bytes(),
         }
     }
 

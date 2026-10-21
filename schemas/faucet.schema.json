@@ -17720,6 +17720,16 @@
                       "$ref": "#/$defs/source_sftp__ParquetReadOptions",
                       "default": {}
                     },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest file, in bytes, a format read whole into memory (JSON array,\nraw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails\nwith an error naming it instead of exhausting memory. `jsonl` and\n`parquet` stream and are not capped. Default 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
                     "connect_timeout_secs": {
                       "default": 30,
                       "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",

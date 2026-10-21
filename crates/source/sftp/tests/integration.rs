@@ -280,3 +280,43 @@ async fn symlinked_files_are_read_and_symlinked_directories_skipped() {
         "the symlinked file is read; the symlinked directory is not"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_file_past_max_object_bytes_fails_with_its_name() {
+    // `json_array` buffers a whole file; one past the cap must fail with an
+    // error naming it rather than be read into memory.
+    let big = format!("[{}]", vec!["{\"id\":1}"; 50].join(","));
+    let files = vec![
+        ("a-small.json".to_string(), "[{\"id\":1}]".to_string()),
+        ("b-big.json".to_string(), big),
+    ];
+    let Some((_c, port)) = start_sftp(&files).await else {
+        return;
+    };
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let mut config = SftpSourceConfig::new(conn, "/data")
+        .format(SftpFormat::JsonArray)
+        .with_batch_size(1);
+    config.max_object_bytes = 64;
+    let src = SftpSource::new(config).expect("config is valid");
+
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1);
+    let mut records = 0;
+    let mut error = None;
+    while let Some(page) = pages.next().await {
+        match page {
+            Ok(p) => records += p.records.len(),
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    assert_eq!(records, 1, "the file under the cap is read");
+    let error = error.expect("the file over the cap fails");
+    assert!(
+        error.contains("b-big.json") && error.contains("max_object_bytes"),
+        "{error}"
+    );
+}
