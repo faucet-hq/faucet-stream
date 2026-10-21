@@ -1377,7 +1377,13 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     for (const el of allInputs()) {
       const raw = el.value;
       if (raw === "") continue; // omitted → the template's default (or a typed error)
-      supplied[el.dataset.name] = coerce(raw, (params[el.dataset.name] || {}).type);
+      const type = (params[el.dataset.name] || {}).type;
+      const bad = invalidParam(raw, type);
+      if (bad) {
+        toast(`${el.dataset.name}: ${bad}`, "error");
+        return;
+      }
+      supplied[el.dataset.name] = coerce(raw, type);
     }
     const body = { version: host.querySelector("#tg-version").value };
     if (sinkSel) {
@@ -1519,9 +1525,15 @@ function channelTarget(channel, st) {
 
 /** Send the wire type the server expects; it accepts strings too, but a typed
  *  value keeps the error messages about the value rather than its spelling. */
+function invalidParam(raw, type) {
+  if (type === "int" && !/^\s*-?\d+\s*$/.test(raw)) return "expected a whole number";
+  if (type === "float" && !Number.isFinite(Number(raw.trim() || "x"))) return "expected a finite number";
+  return null;
+}
+
+// Numbers go as their exact text so the server parses them without float rounding.
 function coerce(raw, type) {
-  if (type === "int") return Number.parseInt(raw, 10);
-  if (type === "float") return Number.parseFloat(raw);
+  if (type === "int" || type === "float") return raw.trim();
   if (type === "bool") return raw === "true";
   return raw;
 }
