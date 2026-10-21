@@ -24,6 +24,7 @@ A pair the table does not list is supported.
 | `schema: { on_drift: evolve }` | falls back | ✓ | ✓ | ✓ | refused |
 | `dlq:` (`on_batch_error: propagate`) | falls back | ✓ | ✓ | refused | ✓ |
 | `dlq:` (`on_batch_error: dlq_all`) | falls back | falls back | ✓ | refused | ✓ |
+| `dlq:` with a sink reporting per-row outcomes | ✓ | falls back | ✓ | ✓ | ✓ |
 | `delivery: exactly_once` (atomic watermark) | falls back | falls back | ✓ | ✓ | ✓ |
 | `write_mode: upsert` / `delete` | falls back | ✓ | ✓ | ✓ | ✓ |
 | `write_mode: overwrite` | ✓ | falls back | ✓ | refused | ✓ |
