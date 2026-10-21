@@ -161,6 +161,11 @@ pub fn cast_expr(expr: &str, full_type: &str) -> String {
         )
     } else if t == "variant" {
         format!("parse_json({expr})")
+    } else if t == "binary" {
+        // Binary values travel as standard base64 text (the fidelity
+        // rendering); `CAST(… AS binary)` would store the text's UTF-8 bytes.
+        // `to_binary` decodes and fails on text that is not base64.
+        format!("to_binary({expr}, 'BASE64')")
     } else {
         format!("CAST({expr} AS {})", full_type.trim())
     }
@@ -1191,6 +1196,11 @@ mod tests {
             "from_json(x, 'map<string,int>', map('mode', 'FAILFAST'))"
         );
         assert_eq!(cast_expr("x", "variant"), "parse_json(x)");
+        // Binary arrives as base64 text and is decoded, not cast as text.
+        assert_eq!(cast_expr("x", "binary"), "to_binary(x, 'BASE64')");
+        assert_eq!(cast_expr("x", " BINARY "), "to_binary(x, 'BASE64')");
+        let b64 = faucet_core::fidelity::binary(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(b64, serde_json::json!("3q2+7w=="));
     }
 
     #[test]

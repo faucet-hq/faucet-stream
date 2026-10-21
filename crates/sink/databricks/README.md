@@ -27,7 +27,8 @@ For landing files in object storage without a warehouse, use
   checks nested keys against the declared type first and fails the page naming
   any it would drop (`payload.b`)
   — and `parse_json` over the value's JSON text for `VARIANT`, so a JSON string
-  stays a string), so the insert and staged paths can never land a value
+  stays a string; `to_binary(…, 'BASE64')` for `BINARY`, decoding the base64
+  text binary values travel as and failing on anything else), so the insert and staged paths can never land a value
   differently.
 - **Write modes** — `append`, `upsert` / `delete` via `MERGE` (with
   `delete_marker`), and `overwrite` via a staging table and an atomic swap.
