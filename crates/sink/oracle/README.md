@@ -58,7 +58,7 @@ Oracle stores `''` as `NULL`; an empty string is written as `NULL`.
 
 ## Write modes (upsert / delete)
 
-`write_mode: upsert` / `delete` require `auto_columns` and a non-empty `key`. Each page is partitioned by the shared planner (last write wins per key; rows missing a key are rejected), then applied in one transaction with array-bound `MERGE INTO … USING (SELECT :1 AS … FROM DUAL) … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT` and `DELETE … WHERE key = :n`. Only the columns present in the page are written. Pair with the `cdc_unwrap` transform to mirror a CDC source.
+`write_mode: upsert` / `delete` require `auto_columns` and a non-empty `key`. Each page is partitioned by the shared planner (last write wins per key; rows missing a key are rejected), then applied in one transaction with array-bound `MERGE INTO … USING (SELECT :1 AS … FROM DUAL) … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT` and `DELETE … WHERE key = :n`. Only the columns present in the page are written. Two writers merging the same new key at once can both take the insert branch; the one that loses fails with ORA-00001, which only rolls back that statement, so the sink runs the `MERGE` once more and it updates the row the other writer committed. Pair with the `cdc_unwrap` transform to mirror a CDC source.
 
 ## Overwrite (`write_mode: overwrite`)
 

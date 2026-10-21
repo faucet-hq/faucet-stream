@@ -146,8 +146,10 @@ impl SqlDialect for Mssql {
             format!(" WHEN MATCHED THEN UPDATE SET {update_set}")
         };
         Ok(format!(
-            "MERGE {table_ref} AS tgt USING (VALUES {}) AS src ({col_list}) ON {on}{matched} \
-             WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({insert_vals});",
+            // HOLDLOCK holds the key-range lock from the match to the insert,
+            // so two sessions merging one new key cannot both insert it.
+            "MERGE {table_ref} WITH (HOLDLOCK) AS tgt USING (VALUES {}) AS src ({col_list}) \
+             ON {on}{matched} WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({insert_vals});",
             self.values_sql(columns.len(), types, rows, 0)
         ))
     }

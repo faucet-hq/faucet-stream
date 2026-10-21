@@ -342,6 +342,32 @@ fn matrix_present_column_groups() {
     every_keyed_dialect!(append_unions_columns_and_upsert_groups_them);
 }
 
+/// Two writers upserting one new key must not both take the insert branch:
+/// the statement is either an atomic insert-or-update, or a `MERGE` that
+/// serializes the key (SQL Server's `HOLDLOCK`; Oracle's sink re-runs a
+/// `MERGE` that lost the race with ORA-00001).
+fn upsert_is_safe_under_concurrent_writers<D: SqlDialect>(d: D) {
+    let key = vec!["id".to_string()];
+    let cols = vec!["id".to_string(), "v".to_string()];
+    let sql = d
+        .upsert_sql(&d.quote("t").unwrap(), &key, &cols, &[None, None], 2)
+        .unwrap();
+    let name = d.name();
+    let safe = if sql.starts_with("INSERT") {
+        sql.contains("ON CONFLICT") || sql.contains("ON DUPLICATE KEY UPDATE")
+    } else if name == "oracle" {
+        sql.starts_with("MERGE INTO")
+    } else {
+        sql.starts_with("MERGE") && sql.contains("WITH (HOLDLOCK)")
+    };
+    assert!(safe, "{name}: {sql}");
+}
+
+#[test]
+fn matrix_upsert_concurrency() {
+    every_keyed_dialect!(upsert_is_safe_under_concurrent_writers);
+}
+
 #[test]
 fn matrix_upsert_text() {
     let key = vec!["id".to_string()];
@@ -363,7 +389,7 @@ fn matrix_upsert_text() {
     );
     assert_eq!(
         Mssql.upsert_sql("[t]", &key, &cols, &types, 1).unwrap(),
-        "MERGE [t] AS tgt USING (VALUES (@P1, @P2)) AS src ([id], [v]) ON tgt.[id] = src.[id] \
+        "MERGE [t] WITH (HOLDLOCK) AS tgt USING (VALUES (@P1, @P2)) AS src ([id], [v]) ON tgt.[id] = src.[id] \
          WHEN MATCHED THEN UPDATE SET tgt.[v] = src.[v] \
          WHEN NOT MATCHED THEN INSERT ([id], [v]) VALUES (src.[id], src.[v]);"
     );

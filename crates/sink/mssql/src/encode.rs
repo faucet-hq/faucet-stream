@@ -527,7 +527,10 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(sql.contains("MERGE [dbo].[t] AS tgt"), "{sql}");
+        assert!(
+            sql.contains("MERGE [dbo].[t] WITH (HOLDLOCK) AS tgt"),
+            "{sql}"
+        );
         assert!(
             sql.contains("USING (VALUES (@P1, @P2)) AS src ([id], [name])"),
             "{sql}"

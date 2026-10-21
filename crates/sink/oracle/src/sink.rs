@@ -77,8 +77,45 @@ fn run_batch(
     rows: &[Vec<Option<String>>],
     collect_errors: bool,
 ) -> Result<Vec<(usize, String)>, FaucetError> {
+    execute_batch(conn, sql, kinds, rows, collect_errors)?.map_err(|e| sink_err("write", &e))
+}
+
+/// ORA-00001: unique constraint violated.
+const ORA_UNIQUE_VIOLATION: i32 = 1;
+
+/// Run a keyed `MERGE` batch. Two sessions merging one new key can both take
+/// the insert branch, and the later one fails with ORA-00001. Oracle rolls
+/// back only that statement, so running it once more updates the row the
+/// other session committed.
+fn run_merge(
+    conn: &Connection,
+    sql: &str,
+    kinds: &[BindKind],
+    rows: &[Vec<Option<String>>],
+) -> Result<(), FaucetError> {
+    match execute_batch(conn, sql, kinds, rows, false)? {
+        Ok(_) => Ok(()),
+        Err(e) if is_unique_violation(faucet_common_oracle::ora_code(&e)) => {
+            run_batch(conn, sql, kinds, rows, false).map(|_| ())
+        }
+        Err(e) => Err(sink_err("write", &e)),
+    }
+}
+
+fn is_unique_violation(code: Option<i32>) -> bool {
+    code == Some(ORA_UNIQUE_VIOLATION)
+}
+
+/// [`run_batch`] keeping the execution error, so a caller can inspect its code.
+fn execute_batch(
+    conn: &Connection,
+    sql: &str,
+    kinds: &[BindKind],
+    rows: &[Vec<Option<String>>],
+    collect_errors: bool,
+) -> Result<Result<Vec<(usize, String)>, oracle::Error>, FaucetError> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Ok(Vec::new()));
     }
     let mut builder = conn.batch(sql, rows.len());
     if collect_errors {
@@ -94,16 +131,16 @@ fn run_batch(
         let refs: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
         batch.append_row(&refs).map_err(|e| sink_err("bind", &e))?;
     }
-    match batch.execute() {
+    Ok(match batch.execute() {
         Ok(()) => Ok(Vec::new()),
         Err(e) => match e.batch_errors() {
             Some(errs) if collect_errors => Ok(errs
                 .iter()
                 .map(|d| (d.offset() as usize, d.message().to_string()))
                 .collect()),
-            _ => Err(sink_err("write", &e)),
+            _ => Err(e),
         },
-    }
+    })
 }
 
 /// Commit `body`'s work, or roll it back when it fails.
@@ -342,7 +379,7 @@ impl Inner {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let sql = merge_sql(&self.target_quoted, key, &cols)?;
-            run_batch(conn, &sql, &kinds, &rows, false)?;
+            run_merge(conn, &sql, &kinds, &rows)?;
             affected += rows.len();
         }
         if !plan.deletes.is_empty() {
@@ -939,5 +976,17 @@ impl SchemaDriver for OracleDriver {
             Ok(())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_ora_00001_re_runs_a_merge() {
+        assert!(is_unique_violation(Some(1)));
+        assert!(!is_unique_violation(Some(2290)));
+        assert!(!is_unique_violation(None));
     }
 }
