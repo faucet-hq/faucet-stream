@@ -315,6 +315,21 @@ impl FlowConfig {
 
 /// Substitute `${key}` tokens from `ctx`. Unknown tokens are left verbatim.
 /// Single-pass — a substituted value is never re-scanned.
+/// Render every string leaf (and object key) of a JSON body, so a captured
+/// value is inserted as JSON string content, never as raw JSON text.
+fn render_json(value: &Value, ctx: &HashMap<String, String>) -> Value {
+    match value {
+        Value::String(s) => Value::String(render(s, ctx)),
+        Value::Array(items) => Value::Array(items.iter().map(|v| render_json(v, ctx)).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (render(k, ctx), render_json(v, ctx)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn render(template: &str, ctx: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -691,9 +706,7 @@ impl FlowProvider {
                     .collect();
                 builder = builder.form(&f);
             } else if let Some(json) = &req.json {
-                let rendered = render(&serde_json::to_string(json).unwrap_or_default(), &ctx);
-                let body: Value = serde_json::from_str(&rendered).unwrap_or_else(|_| json.clone());
-                builder = builder.json(&body);
+                builder = builder.json(&render_json(json, &ctx));
             }
             // Sign this login/pre-flight step itself (#541): a fresh clock,
             // captured values so far, then a header placement.
@@ -882,6 +895,36 @@ impl AuthProvider for FlowProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn render_json_escapes_captured_values_structurally() {
+        let c = ctx(&[("nonce", "ab\"c\\d"), ("k", "user")]);
+        let body = json!({"nonce": "${nonce}", "n": 3, "list": ["x-${k}"], "${k}": true});
+        let out = render_json(&body, &c);
+        assert_eq!(out["nonce"], json!("ab\"c\\d"));
+        assert_eq!(out["n"], json!(3));
+        assert_eq!(out["list"], json!(["x-user"]));
+        assert_eq!(out["user"], json!(true));
+    }
+
+    #[test]
+    fn render_json_cannot_add_keys() {
+        let c = ctx(&[("v", "x\", \"admin\": \"true")]);
+        let out = render_json(&json!({"a": "${v}"}), &c);
+        assert_eq!(out.as_object().unwrap().len(), 1);
+        assert_eq!(out["a"], json!("x\", \"admin\": \"true"));
+    }
+
+    #[test]
+    fn clock_ctx_nonce_is_random_and_unique() {
+        let a = FlowProvider::clock_ctx();
+        let b = FlowProvider::clock_ctx();
+        let (na, nb) = (&a["nonce"], &b["nonce"]);
+        assert_eq!(na.len(), 32);
+        assert!(na.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(na, nb);
+        assert!(!na.starts_with(&a["ts"]));
+    }
 
     fn ctx(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
