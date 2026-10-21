@@ -215,18 +215,35 @@ pipeline:
 
   function toYaml(obj) {
     // Minimal, dependency-free YAML emitter for the preview/editor hand-off.
-    const dump = (v, ind) => {
-      const pad = "  ".repeat(ind);
+    // A string is written plain only when YAML cannot read it as anything else;
+    // otherwise it is a JSON string, which is a valid double-quoted YAML scalar.
+    const plain = /^[A-Za-z_][A-Za-z0-9_\-./]*( [A-Za-z0-9_\-./]+)*$/;
+    const reserved = /^(true|false|yes|no|on|off|y|n|null|~)$/i;
+    const scalar = (v) => {
       if (v === null || v === undefined) return "null";
-      if (Array.isArray(v))
-        return v.length ? "\n" + v.map((i) => `${pad}- ${dump(i, ind + 1).replace(/^\n/, "")}`).join("\n") : "[]";
-      if (typeof v === "object" && !Object.keys(v).length) return "{}";
-      if (typeof v === "object")
-        return "\n" + Object.entries(v).map(([k, val]) => `${pad}${k}: ${dump(val, ind + 1)}`).join("\n");
-      if (typeof v === "string") return /[:#\n]/.test(v) ? JSON.stringify(v) : v;
-      return String(v);
+      if (typeof v === "number") return Number.isFinite(v) ? String(v) : JSON.stringify(String(v));
+      if (typeof v === "boolean") return String(v);
+      const t = String(v);
+      return plain.test(t) && !reserved.test(t) ? t : JSON.stringify(t);
     };
-    return Object.entries(obj).map(([k, v]) => `${k}: ${dump(v, 1)}`).join("\n").replace(/: \n/g, ":\n") + "\n";
+    const isCollection = (v) => v !== null && typeof v === "object" && Object.keys(v).length > 0;
+    const inline = (v) => (Array.isArray(v) ? "[]" : v !== null && typeof v === "object" ? "{}" : scalar(v));
+    // The lines of a non-empty mapping or sequence, every line indented `ind` levels.
+    const lines = (v, ind) => {
+      const pad = "  ".repeat(ind);
+      if (Array.isArray(v))
+        return v.flatMap((item) => {
+          if (!isCollection(item)) return [`${pad}- ${inline(item)}`];
+          // Render the item one level deeper, then put the dash in its first
+          // line's indentation so every key of the item lines up.
+          const inner = lines(item, ind + 1);
+          return [`${pad}- ${inner[0].slice(pad.length + 2)}`, ...inner.slice(1)];
+        });
+      return Object.entries(v).flatMap(([k, val]) =>
+        isCollection(val) ? [`${pad}${scalar(k)}:`, ...lines(val, ind + 1)] : [`${pad}${scalar(k)}: ${inline(val)}`],
+      );
+    };
+    return lines(obj, 0).join("\n") + "\n";
   }
 
   // --- mode toggle ---
