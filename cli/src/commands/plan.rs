@@ -142,7 +142,7 @@ async fn load_sample(
         refuse_side_effecting_live_read(&node.source.kind)?;
         let source = crate::registry::build_source(
             &node.source.kind,
-            node.source.config.clone(),
+            live_source_config(node, args.limit),
             auth,
             None,
         )
@@ -156,6 +156,15 @@ async fn load_sample(
         return Ok(Some(records));
     }
     Ok(None)
+}
+
+/// The source config a `plan --live --limit N` pull builds from: its page size
+/// is bounded by `N`, since a source pages by its own `batch_size` (and `0`
+/// reads the whole result set as one page) whatever the pull's hint says.
+fn live_source_config(node: &ExpandedNode, limit: usize) -> Value {
+    let mut config = node.source.config.clone();
+    crate::preview_sample::bound_batch_size(&node.source.kind, &mut config, limit);
+    config
 }
 
 /// Refuse a `plan --live` sample from a source kind whose read has side
@@ -728,6 +737,22 @@ mod tests {
         };
         super::run(args).await.expect("plan runs");
         assert!(!out.exists(), "plan must not write to the sink");
+    }
+
+    #[test]
+    fn a_live_pull_bounds_the_source_page_size_by_the_limit() {
+        for (configured, expected) in [("0", 10), ("5000", 10), ("3", 3)] {
+            let cfg = crate::config::PipelineConfig::from_text(
+                &format!(
+                    "version: 1\npipeline:\n  source:\n    type: csv\n    config:\n      path: in.csv\n      batch_size: {configured}\n  sink:\n    type: stdout\n    config: {{}}\n"
+                ),
+                std::path::Path::new("p.yaml"),
+            )
+            .unwrap();
+            let nodes = crate::expand::expand(&cfg).unwrap();
+            let config = live_source_config(&nodes[0], 10);
+            assert_eq!(config["batch_size"], expected, "batch_size {configured}");
+        }
     }
 
     #[tokio::test]
