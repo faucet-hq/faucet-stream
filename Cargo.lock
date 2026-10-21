@@ -4938,7 +4938,6 @@ version = "1.3.1"
 dependencies = [
  "arrow 58.3.0",
  "arrow 59.3.0",
- "arrow-json 58.3.0",
  "chrono",
  "deltalake",
  "faucet-core",
