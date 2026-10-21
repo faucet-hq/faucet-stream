@@ -90,7 +90,7 @@ source:
 |-------------------------|------|-------------|
 | `bucket` | string | S3 bucket (required). |
 | `key` | string | Single object key. Mutually exclusive with `prefix`. |
-| `prefix` | string | Object-key prefix to list and read. Mutually exclusive with `key`. |
+| `prefix` | string | Object-key prefix to list and read, matched as a plain string prefix like S3 itself (`events/2024-10` reads `events/2024-10-01.parquet`; end it with `/` to read one folder). Mutually exclusive with `key`. |
 | `region` | string | AWS region. Defaults to the standard resolution chain. |
 | `endpoint_url` | string | Custom endpoint for S3-compatible services. HTTP endpoints automatically allow plain HTTP. |
 

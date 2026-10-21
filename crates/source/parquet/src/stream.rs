@@ -692,24 +692,33 @@ async fn list_s3_prefix(
     store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<Vec<FileTarget>, FaucetError> {
-    let prefix_path = if prefix.is_empty() {
-        None
-    } else {
-        Some(ObjectPath::from(prefix))
-    };
+    // `object_store` matches a list prefix by whole path segments, while an
+    // S3 key prefix is a plain string prefix (`events/2024-10` selects
+    // `events/2024-10-01.parquet`). List the directory the prefix sits in and
+    // keep the keys that start with it.
+    let base = listing_base(prefix);
+    let base_path = (!base.is_empty()).then(|| ObjectPath::from(base));
 
-    let mut listing = store.list(prefix_path.as_ref());
+    let mut listing = store.list(base_path.as_ref());
     let mut keys = Vec::new();
     while let Some(item) = listing.next().await {
         let meta = item.map_err(|e| {
             FaucetError::Source(format!("S3 list error for prefix '{prefix}': {e}"))
         })?;
-        if is_data_object(meta.location.as_ref(), meta.size, prefix) {
+        if meta.location.as_ref().starts_with(prefix)
+            && is_data_object(meta.location.as_ref(), meta.size, prefix)
+        {
             keys.push(meta.location);
         }
     }
     keys.sort();
     Ok(keys.into_iter().map(FileTarget::S3).collect())
+}
+
+/// The directory part of an S3 key prefix (everything up to its last `/`),
+/// which `object_store` can list by segment.
+fn listing_base(prefix: &str) -> &str {
+    prefix.rfind('/').map_or("", |i| &prefix[..i])
 }
 
 /// Whether a listed key is a data file: not a zero-byte folder marker and
@@ -860,6 +869,52 @@ mod tests {
             matches!(&err, FaucetError::Config(m) if m.starts_with("parquet source: ")),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_prefix_that_ends_mid_segment_matches_keys_as_a_string_prefix() {
+        use super::*;
+        let store = object_store::memory::InMemory::new();
+        for key in [
+            "events/2024-10-01.parquet",
+            "events/2024-10-02.parquet",
+            "events/2024-11-01.parquet",
+            "events/2024-10/inner.parquet",
+            "other/2024-10-01.parquet",
+        ] {
+            store
+                .put(&ObjectPath::from(key), b"data".to_vec().into())
+                .await
+                .unwrap();
+        }
+        let names = |targets: Vec<FileTarget>| -> Vec<String> {
+            targets
+                .into_iter()
+                .map(|t| match t {
+                    FileTarget::S3(p) => p.to_string(),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(list_s3_prefix(&store, "events/2024-10").await.unwrap()),
+            [
+                "events/2024-10-01.parquet",
+                "events/2024-10-02.parquet",
+                "events/2024-10/inner.parquet",
+            ]
+        );
+        assert_eq!(
+            names(list_s3_prefix(&store, "events/2024-10/").await.unwrap()),
+            ["events/2024-10/inner.parquet"]
+        );
+        assert_eq!(
+            names(list_s3_prefix(&store, "even").await.unwrap()).len(),
+            4
+        );
+        assert_eq!(names(list_s3_prefix(&store, "").await.unwrap()).len(), 5);
+        assert_eq!(listing_base("a/b/c"), "a/b");
+        assert_eq!(listing_base("abc"), "");
     }
 
     #[tokio::test]
