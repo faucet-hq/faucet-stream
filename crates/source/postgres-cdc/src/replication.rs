@@ -749,6 +749,25 @@ pub async fn partition_roots(
     partition_roots_on(&mut conn, oids).await
 }
 
+/// The fractional digits the server prints `money` with under the
+/// `lc_monetary` locale this role and database get — the setting the
+/// walsender renders change values in.
+pub async fn money_fraction_digits(
+    connection_url: &str,
+    tls: &crate::config::CdcTls,
+) -> Result<u32, FaucetError> {
+    let mut conn = control_connection(connection_url, tls).await?;
+    let one: String = sqlx::query_scalar("SELECT (1::money)::text")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| pg_err("postgres-cdc money format", e))?;
+    crate::pgoutput::values::fraction_digits_of_money(&one).ok_or_else(|| {
+        FaucetError::Source(format!(
+            "postgres-cdc: cannot read the money format from the server's rendering {one:?}"
+        ))
+    })
+}
+
 /// A plain (non-replication) connection for catalog lookups.
 pub async fn control_connection(
     connection_url: &str,

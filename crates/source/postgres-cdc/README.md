@@ -190,7 +190,7 @@ Values arrive in Postgres text form and are decoded by column type OID:
 | `float4` / `float8` (finite) | number |
 | `float4` / `float8` `NaN` / `±Infinity` | a `null` counted in the run summary (`non_finite`) |
 | `numeric` | string (exact precision; `NaN` / `±Infinity` a counted `null`) |
-| `money` | string, the exact amount (`"1234.50"`), whatever the server's `lc_monetary` locale |
+| `money` | string, the exact amount (`"1234.50"`), whatever the server's `lc_monetary` locale — the number of fractional digits the locale prints is read from the server once per run (`SELECT 1::money`), so a three-digit currency such as KWD (`1.234`) is not mistaken for a thousands separator |
 | `json` / `jsonb` | the document, a number a JSON value cannot hold exactly kept as a string of its digits |
 | `bytea` | base64 string |
 | `json` / `jsonb` | parsed JSON value |

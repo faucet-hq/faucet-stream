@@ -834,3 +834,48 @@ async fn an_idle_publication_does_not_pin_wal() {
         lsn(&bm2)
     );
 }
+
+/// `money` decodes by the fractional digits the server's locale prints, read
+/// from the server rather than guessed from each value.
+#[tokio::test(flavor = "multi_thread")]
+async fn money_decodes_with_the_server_locale_fraction_digits() {
+    let (_pg, url) = start_postgres().await;
+    assert_eq!(
+        faucet_source_postgres_cdc::replication::money_fraction_digits(
+            &url,
+            &faucet_source_postgres_cdc::CdcTls::Disable,
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    ddl(
+        &url,
+        "CREATE TABLE public.prices (id int4 PRIMARY KEY, price money); \
+         CREATE PUBLICATION money_pub FOR TABLE public.prices;",
+    )
+    .await;
+    let source = PostgresCdcSource::new(cfg(&url, "money_slot", "money_pub"))
+        .await
+        .expect("source");
+    let _ = source.fetch_all_incremental().await.expect("warm-up");
+    ddl(
+        &url,
+        "INSERT INTO public.prices VALUES (1, 1234.5), (2, 1.234), (3, -0.07);",
+    )
+    .await;
+    let (records, _) = source.fetch_all_incremental().await.expect("fetch");
+    let prices: Vec<_> = records
+        .iter()
+        .filter(|r| r["op"] == "insert")
+        .map(|r| r["after"]["price"].clone())
+        .collect();
+    assert_eq!(
+        prices,
+        [
+            serde_json::json!("1234.50"),
+            serde_json::json!("1.23"),
+            serde_json::json!("-0.07")
+        ]
+    );
+}

@@ -6,7 +6,7 @@ use crate::pgoutput::messages::{
     Delete, Insert, Message, Relation, Truncate, TupleCell, TupleData, Update,
 };
 use crate::pgoutput::registry::RelationRegistry;
-use crate::pgoutput::values::text_to_json;
+use crate::pgoutput::values::text_to_json_with;
 use crate::replication::{
     self, ReplicationEvent, ReplicationParams, StreamItem, postgres_clock_to_unix_ms, recv_item,
     send_status_update,
@@ -623,8 +623,18 @@ impl PostgresCdcSource {
             //    `batch_size == 0` emits a single trailing page.
             let mut registry = RelationRegistry::new();
             let mut control: Option<sqlx::PgConnection> = None;
+            let money_fraction_digits = calls
+                .call_once(
+                    "query",
+                    replication::money_fraction_digits(
+                        &self.config.connection_url,
+                        &self.config.tls,
+                    ),
+                )
+                .await?;
             let mut state = TxnState {
                 max_staged_records: self.config.max_staged_records,
+                money_fraction_digits: Some(money_fraction_digits),
                 ..TxnState::default()
             };
             let mut agg_records: Vec<Value> = Vec::new();
@@ -907,6 +917,9 @@ struct TxnState {
     /// risking an OOM-kill on a huge bulk transaction (see
     /// [`PostgresCdcSourceConfig::max_staged_records`]).
     max_staged_records: Option<usize>,
+    /// Fractional digits of the server's `money` rendering; `None` infers
+    /// the decimal separator from each value.
+    money_fraction_digits: Option<u32>,
 }
 
 impl TxnState {
@@ -1039,7 +1052,7 @@ fn stage_insert(
     i: Insert,
 ) -> Result<(), FaucetError> {
     let rel = registry.get(i.relation_oid)?;
-    let after = tuple_to_object(rel, &i.new)?;
+    let after = tuple_to_object(rel, &i.new, state.money_fraction_digits)?;
     let r = record(
         rel,
         registry.root(rel.oid),
@@ -1058,10 +1071,10 @@ fn stage_update(
 ) -> Result<(), FaucetError> {
     let rel = registry.get(u.relation_oid)?;
     let before = match &u.old {
-        Some(t) => Some(tuple_to_object(rel, t)?),
+        Some(t) => Some(tuple_to_object(rel, t, state.money_fraction_digits)?),
         None => None,
     };
-    let after = tuple_to_object(rel, &u.new)?;
+    let after = tuple_to_object(rel, &u.new, state.money_fraction_digits)?;
     let r = record(
         rel,
         registry.root(rel.oid),
@@ -1079,7 +1092,7 @@ fn stage_delete(
     d: Delete,
 ) -> Result<(), FaucetError> {
     let rel = registry.get(d.relation_oid)?;
-    let before = Some(tuple_to_object(rel, &d.old)?);
+    let before = Some(tuple_to_object(rel, &d.old, state.money_fraction_digits)?);
     let r = record(rel, registry.root(rel.oid), "delete", state, before, None);
     state.push_staged(r)
 }
@@ -1130,7 +1143,11 @@ fn record(
 }
 
 /// Convert a tuple's text cells to a [`TupleRow`].
-fn tuple_to_object(rel: &Relation, tup: &TupleData) -> Result<TupleRow, FaucetError> {
+fn tuple_to_object(
+    rel: &Relation,
+    tup: &TupleData,
+    money_fraction_digits: Option<u32>,
+) -> Result<TupleRow, FaucetError> {
     if tup.cells.len() != rel.columns.len() {
         return Err(FaucetError::Source(format!(
             "postgres-cdc: tuple has {} cells but relation {}.{} has {} columns",
@@ -1151,7 +1168,10 @@ fn tuple_to_object(rel: &Relation, tup: &TupleData) -> Result<TupleRow, FaucetEr
                 unchanged_toast.push(col.name.clone());
             }
             TupleCell::Text(s) => {
-                values.insert(col.name.clone(), text_to_json(col.type_oid, s)?);
+                values.insert(
+                    col.name.clone(),
+                    text_to_json_with(col.type_oid, s, money_fraction_digits)?,
+                );
             }
         }
     }

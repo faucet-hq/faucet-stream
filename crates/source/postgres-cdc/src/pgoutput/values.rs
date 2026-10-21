@@ -63,6 +63,19 @@ fn array_element_oid(array_oid: u32) -> Option<u32> {
 /// if a structurally promised invariant is violated (e.g. `OID_BYTEA` text
 /// that doesn't start with `\x`).
 pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
+    text_to_json_with(type_oid, text, None)
+}
+
+/// [`text_to_json`] for a server whose `lc_monetary` locale prints `money`
+/// with `money_fraction_digits` fractional digits (see
+/// [`fraction_digits_of_money`]). With `None` the decimal separator of a
+/// `money` value is inferred from the text, which misreads a currency with
+/// three fractional digits (`1.234` read as 1234).
+pub fn text_to_json_with(
+    type_oid: u32,
+    text: &str,
+    money_fraction_digits: Option<u32>,
+) -> Result<Value, FaucetError> {
     Ok(match type_oid {
         OID_BOOL => match text {
             "t" => Value::Bool(true),
@@ -90,7 +103,7 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
         }
         OID_NUMERIC => faucet_core::fidelity::decimal_text(text)
             .map_err(|e| FaucetError::Source(format!("pgoutput: numeric {e}")))?,
-        OID_MONEY => money_json(text)?,
+        OID_MONEY => money_json(text, money_fraction_digits)?,
         OID_BYTEA => {
             let stripped = text.strip_prefix("\\x").ok_or_else(|| {
                 FaucetError::Source(format!(
@@ -117,7 +130,9 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
                 let mut out = Vec::with_capacity(elements.len());
                 for elem in elements {
                     match elem {
-                        Some(s) => out.push(text_to_json(elem_oid, &s)?),
+                        Some(s) => {
+                            out.push(text_to_json_with(elem_oid, &s, money_fraction_digits)?)
+                        }
                         None => out.push(Value::Null),
                     }
                 }
@@ -129,18 +144,46 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
     })
 }
 
+/// The number of fractional digits the server's `lc_monetary` locale prints,
+/// read from its rendering of `1::money` (`$1.00` → 2, `KD 1.000` → 3,
+/// `￥1` → 0). `None` when the text holds no `1` followed only by zeros.
+pub fn fraction_digits_of_money(one: &str) -> Option<u32> {
+    let digits: String = one.chars().filter(char::is_ascii_digit).collect();
+    let rest = digits.strip_prefix('1')?;
+    rest.chars()
+        .all(|c| c == '0')
+        .then(|| u32::try_from(rest.len()).ok())
+        .flatten()
+}
+
 /// A `money` value, which the server prints in its `lc_monetary` locale
 /// (`$1,234.50`, `-$5.00`, `1.234,50 €`, `($5.00)`), as the exact decimal the
-/// query source reads through `money::numeric`. The decimal separator is the
-/// last `.` or `,` unless exactly three digits follow it (a locale with no
-/// fractional digits prints `￥1,235`).
-fn money_json(text: &str) -> Result<Value, FaucetError> {
+/// query source reads through `money::numeric`. With the locale's fractional
+/// digit count known, the decimal separator is the last `.` or `,` when that
+/// many digits follow it, and a value that does not fit is an error. Without
+/// it, the last separator is the decimal one unless exactly three digits
+/// follow it (a locale with no fractional digits prints `￥1,235`).
+fn money_json(text: &str, fraction_digits: Option<u32>) -> Result<Value, FaucetError> {
     let negative = text.contains('-') || (text.contains('(') && text.contains(')'));
     let kept: String = text
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
         .collect();
-    let decimal_at = kept.rfind(['.', ',']).filter(|&i| kept.len() - i - 1 != 3);
+    let last = kept.rfind(['.', ',']);
+    let decimal_at = match fraction_digits {
+        None => last.filter(|&i| kept.len() - i - 1 != 3),
+        Some(0) => None,
+        Some(n) => {
+            let at = last.filter(|&i| kept.len() - i - 1 == n as usize);
+            if at.is_none() {
+                return Err(FaucetError::Source(format!(
+                    "pgoutput: money {text:?} does not carry the {n} fractional digits \
+                     the server's lc_monetary locale prints"
+                )));
+            }
+            at
+        }
+    };
     let mut digits = String::with_capacity(kept.len() + 1);
     if negative {
         digits.push('-');
@@ -345,6 +388,45 @@ mod tests {
             json!(9223372036854775807_i64)
         );
         assert!(text_to_json(OID_INT4, "abc").is_err());
+    }
+
+    #[test]
+    fn money_follows_the_locale_fraction_digits() {
+        assert_eq!(fraction_digits_of_money("$1.00"), Some(2));
+        assert_eq!(fraction_digits_of_money("KD 1.000"), Some(3));
+        assert_eq!(fraction_digits_of_money("1,000 د.ك."), Some(3));
+        assert_eq!(fraction_digits_of_money("￥1"), Some(0));
+        assert_eq!(fraction_digits_of_money("1,00 €"), Some(2));
+        assert_eq!(fraction_digits_of_money("n/a"), None);
+        assert_eq!(fraction_digits_of_money("$2.00"), None);
+        // A three-digit currency: the separator before three digits is the
+        // decimal one, not a thousands separator.
+        for (text, exact) in [
+            ("KD 1.234", "1.234"),
+            ("KD 0.500", "0.500"),
+            ("KD 1,234.500", "1234.500"),
+            ("-KD 7.001", "-7.001"),
+        ] {
+            assert_eq!(
+                text_to_json_with(OID_MONEY, text, Some(3)).unwrap(),
+                json!(exact),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            text_to_json_with(OID_MONEY, "￥1,235", Some(0)).unwrap(),
+            json!("1235")
+        );
+        assert_eq!(
+            text_to_json_with(OID_MONEY, "$1,234.50", Some(2)).unwrap(),
+            json!("1234.50")
+        );
+        assert_eq!(
+            text_to_json_with(791, "{\"KD 1.234\"}", Some(3)).unwrap(),
+            json!(["1.234"])
+        );
+        // A value that does not carry the locale's digits is refused.
+        assert!(text_to_json_with(OID_MONEY, "$1,234", Some(2)).is_err());
     }
 
     #[test]
