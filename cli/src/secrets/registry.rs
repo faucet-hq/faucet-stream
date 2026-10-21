@@ -48,10 +48,14 @@ impl Default for Registry {
 }
 
 struct Compiled {
-    /// Every form, longest first (ties by text): a secret that is a
-    /// substring of another is replaced after it, so the longer one's tail
-    /// is never left exposed.
+    /// Every form, longest first (ties by text).
     patterns: Vec<String>,
+    /// One automaton over every form, scanned once per input however many
+    /// forms are registered. Every (overlapping) occurrence is found and
+    /// overlapping occurrences are masked as one run, so no part of any
+    /// secret — the tail of a longer one, the head of one overlapping
+    /// another — is left exposed.
+    matcher: Option<aho_corasick::AhoCorasick>,
     max_len: usize,
 }
 
@@ -90,8 +94,17 @@ impl Registry {
             .cloned()
             .collect();
         patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        let matcher = (!patterns.is_empty())
+            .then(|| {
+                aho_corasick::AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::Standard)
+                    .build(&patterns)
+                    .ok()
+            })
+            .flatten();
         Compiled {
             max_len: patterns.first().map(String::len).unwrap_or(0),
+            matcher,
             patterns,
         }
     }
@@ -227,8 +240,60 @@ pub fn redact_message(input: &str) -> String {
 /// ever persisting the secret. Longer secrets are replaced first.
 pub fn redact_with(input: &str, token: impl Fn(&str) -> String) -> Cow<'_, str> {
     let c = compiled();
+    let Some(matcher) = c.matcher.as_ref() else {
+        return redact_each(input, &c.patterns, token);
+    };
+    // Merge overlapping occurrences into runs; each run is replaced by the
+    // token of the longest secret in it.
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for m in matcher.find_overlapping_iter(input) {
+        let (start, end, p) = (m.start(), m.end(), m.pattern().as_usize());
+        match runs.last_mut() {
+            Some(run) if start < run.1 => {
+                run.1 = run.1.max(end);
+                if c.patterns[p].len() > c.patterns[run.2].len() {
+                    run.2 = p;
+                }
+            }
+            _ => runs.push((start, end, p)),
+        }
+    }
+    if runs.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    runs.sort_by_key(|r| r.0);
+    let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(runs.len());
+    for r in runs {
+        match merged.last_mut() {
+            Some(m) if r.0 < m.1 => {
+                m.1 = m.1.max(r.1);
+                if c.patterns[r.2].len() > c.patterns[m.2].len() {
+                    m.2 = r.2;
+                }
+            }
+            _ => merged.push(r),
+        }
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0;
+    for (start, end, p) in merged {
+        out.push_str(&input[last..start]);
+        out.push_str(&token(&c.patterns[p]));
+        last = end;
+    }
+    out.push_str(&input[last..]);
+    Cow::Owned(out)
+}
+
+/// The pattern-by-pattern fallback for a registry the automaton could not be
+/// built for (never expected; kept so redaction never silently stops).
+fn redact_each<'a>(
+    input: &'a str,
+    patterns: &[String],
+    token: impl Fn(&str) -> String,
+) -> Cow<'a, str> {
     let mut out: Option<String> = None;
-    for secret in &c.patterns {
+    for secret in patterns {
         let current = out.as_deref().unwrap_or(input);
         if current.contains(secret.as_str()) {
             out = Some(current.replace(secret.as_str(), &token(secret)));
@@ -414,6 +479,38 @@ mod tests {
             "longer secret partially leaked: {out}"
         );
         assert_eq!(out, "value=*** end");
+    }
+
+    #[test]
+    #[serial]
+    fn overlapping_secrets_are_masked_as_one_run() {
+        clear();
+        register("xxab");
+        register("abcdXYZW");
+        let out = redact("v=xxabcdXYZW end");
+        assert_eq!(out, "v=*** end");
+        let tokens = redact_with("v=xxabcdXYZW and abcdXYZW", |s| format!("<{}>", s.len()));
+        assert_eq!(tokens, "v=<8> and <8>");
+        unregister("xxab");
+    }
+
+    #[test]
+    #[serial]
+    fn redaction_is_one_pass_over_many_forms() {
+        clear();
+        for i in 0..5000 {
+            register(&format!("secret-value-{i:05}"));
+        }
+        let line = "a b secret-value-04999 c secret-value-00001 d".repeat(4);
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            let out = redact(&line);
+            assert!(!out.contains("secret-value"), "{out}");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        for i in 0..5000 {
+            unregister(&format!("secret-value-{i:05}"));
+        }
     }
 
     #[test]

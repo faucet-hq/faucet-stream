@@ -268,6 +268,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 async-trait = "0.1.89"
+aho-corasick = "1"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
 futures-core = "0.3"

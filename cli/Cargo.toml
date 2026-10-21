@@ -666,6 +666,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 async-trait.workspace = true
+aho-corasick.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus = { workspace = true, optional = true }
 uuid.workspace = true
