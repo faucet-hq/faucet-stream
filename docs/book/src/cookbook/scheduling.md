@@ -7,7 +7,7 @@ pipeline fires on time every time.
 
 ```bash
 faucet schedule pipeline.yaml           # foreground; Ctrl-C or SIGTERM to stop
-faucet schedule pipeline.yaml --once    # run exactly once now, then exit
+faucet schedule pipeline.yaml --once    # run exactly once now, then exit (SIGTERM / Ctrl-C drains the run)
 ```
 
 The config must include a `schedule:` block alongside the usual `pipeline:`.
@@ -116,7 +116,7 @@ already executing.
 |--------|-------------|
 | `skip` (default) | The tick is dropped and a `faucet_schedule_overlaps_total{policy=skip}` counter is incremented. Use when it is acceptable to miss a cycle if the previous one ran long. Most pipelines. |
 | `queue` | One missed tick is buffered and fires immediately when the current run finishes. Further misses during that same run collapse into the single queued tick (in-memory only — lost on restart). Use when missing a cycle is unacceptable but strict concurrency still must be preserved. |
-| `forbid` | The process exits non-zero the moment an overlap would occur. Use when overlapping runs would produce corrupt output or you want a hard guarantee that no two instances run simultaneously — pair with a supervisor that alerts or pages on non-zero exit. |
+| `forbid` | The process exits non-zero the moment an overlap would occur, after draining the in-flight run (it stops at a page boundary and flushes within `shutdown_grace_secs`). Use when overlapping runs would produce corrupt output or you want a hard guarantee that no two instances run simultaneously — pair with a supervisor that alerts or pages on non-zero exit. |
 
 The overlap policy is in-process: it only knows about this scheduler's own
 runs. Across processes, every run also takes a lease on its row in the durable

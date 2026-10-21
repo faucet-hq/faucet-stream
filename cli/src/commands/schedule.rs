@@ -550,16 +550,19 @@ async fn run_once(
         catalog,
     );
     let span = run_span(1, now, now);
-    let summary = spawn_run(
+    // A stop signal drains the run like the scheduler loop does: it stops at a
+    // page boundary and flushes instead of dying mid-page.
+    let mut shutdown = crate::signals::Terminate::new()
+        .map_err(|e| CliError::Internal(format!("failed to install stop-signal handlers: {e}")))?;
+    let run = spawn_run(
         nodes.clone(),
         opts,
         compiled.run_timeout,
         compiled.shutdown_grace,
         span,
-    )
-    .handle
-    .await
-    .map_err(|e| CliError::Internal(format!("--once run task: {e}")))??;
+    );
+    let summary = finish_or_drain(run, shutdown.recv(), compiled.shutdown_grace, pipeline_name)
+        .await?;
     if summary.had_failures() {
         return Err(CliError::PipelineHadFailures {
             count: summary.failure_count(),
@@ -719,6 +722,10 @@ async fn run_loop(
                     // A prior `Dispatch` set the in-flight gauge to 1; reset it
                     // before we bail so `/metrics` doesn't read a stuck 1 after
                     // the scheduler exits (#146 R LOW).
+                    // The scheduler exits, so drain the in-flight run first:
+                    // it stops at a page boundary and flushes.
+                    let _ = graceful_shutdown(running.take(), compiled.shutdown_grace, &pipeline_name)
+                        .await;
                     m::in_flight(&pipeline_name, 0);
                     return Err(CliError::ScheduleOverlapForbidden);
                 }
@@ -730,7 +737,23 @@ async fn run_loop(
             next_due = match compiled.next_due_after_tick(next_due, Utc::now()) {
                 Some(t) => t,
                 None => {
-                    tracing::info!(pipeline = %pipeline_name, "no further scheduled occurrences; exiting");
+                    tracing::info!(pipeline = %pipeline_name, "no further scheduled occurrences; exiting once the in-flight run finishes");
+                    if let Some(rr) = running.take() {
+                        let finished = finish_or_drain(
+                            rr,
+                            shutdown.recv(),
+                            compiled.shutdown_grace,
+                            &pipeline_name,
+                        )
+                        .await;
+                        m::in_flight(&pipeline_name, 0);
+                        if let Err(e) = &finished {
+                            tracing::error!(pipeline = %pipeline_name, detail = %e, "final run failed");
+                        }
+                        if matches!(finished, Err(CliError::Cancelled)) {
+                            return Err(CliError::Cancelled);
+                        }
+                    }
                     return Ok(());
                 }
             };
@@ -936,6 +959,29 @@ async fn wait_for_run(
     match running {
         Some(rr) => classify((&mut rr.handle).await, breaker_cooldown),
         None => std::future::pending().await,
+    }
+}
+
+/// Await `run`; when `stop` resolves first, drain it like the shutdown arm
+/// (cooperative cancel, `grace` to flush, then abort) and report `Cancelled`.
+async fn finish_or_drain(
+    mut run: RunningRun,
+    stop: impl std::future::Future<Output = ()>,
+    grace: Duration,
+    pipeline_name: &str,
+) -> CliResult<RunSummary> {
+    let joined = tokio::select! {
+        biased;
+        joined = &mut run.handle => Some(joined),
+        () = stop => None,
+    };
+    match joined {
+        Some(joined) => joined.map_err(|e| CliError::Internal(format!("run task: {e}")))?,
+        None => {
+            tracing::info!(pipeline = %pipeline_name, "stop signal received; draining the in-flight run");
+            graceful_shutdown(Some(run), grace, pipeline_name).await?;
+            Err(CliError::Cancelled)
+        }
     }
 }
 
@@ -1422,6 +1468,40 @@ mod tests {
             Err(CliError::Cancelled)
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A stop signal during `--once` (or the scheduler's final run) cancels
+    /// the run cooperatively and waits for it to flush.
+    #[tokio::test]
+    async fn a_stop_signal_drains_the_run_cooperatively() {
+        let cancel = faucet_core::CancellationToken::new();
+        let seen = cancel.clone();
+        let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = flushed.clone();
+        let handle = tokio::spawn(async move {
+            seen.cancelled().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(summary(0, 1))
+        });
+        let run = RunningRun {
+            handle,
+            started: Instant::now(),
+            cancel,
+        };
+        let out = finish_or_drain(run, async {}, Duration::from_secs(30), "p").await;
+        assert!(matches!(out, Err(CliError::Cancelled)), "{out:?}");
+        assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_wins_over_a_pending_stop() {
+        let run = RunningRun {
+            handle: tokio::spawn(async { Ok(summary(0, 1)) }),
+            started: Instant::now(),
+            cancel: faucet_core::CancellationToken::new(),
+        };
+        let out = finish_or_drain(run, std::future::pending(), Duration::from_secs(1), "p").await;
+        assert!(out.is_ok(), "{out:?}");
     }
 
     /// A reload with `start_immediately` while a run is in flight waits for
