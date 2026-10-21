@@ -727,3 +727,78 @@ async fn oracle_review_862_overwrite_and_drift_paths() {
     let diff = faucet_core::drift::diff_schema(&dest, &page, true);
     assert!(diff.incompatible.is_empty(), "{diff:?}");
 }
+
+/// Two overwrite runs of one table at once: each run's begin, writer and
+/// commit instances share its run token, so neither begin drops the other's
+/// staging and neither commit swaps in the other's rows. A tokened begin
+/// also drops the untokened staging and staging a crashed run abandoned.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_concurrent_overwrite_runs_keep_their_own_rows() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    let abandoned = "\"RUNS__faucet_ovw_10000000aaaaaa\"";
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE RUNS (ID NUMBER, NAME VARCHAR2(20))",
+            "INSERT INTO RUNS VALUES (0, 'old')",
+            "CREATE TABLE \"RUNS__faucet_ovw\" (ID NUMBER, NAME VARCHAR2(20))",
+            &format!("CREATE TABLE {abandoned} (ID NUMBER, NAME VARCHAR2(20))"),
+        ],
+    )
+    .await;
+    let cfg = OracleSinkConfig {
+        write: WriteSpec {
+            write_mode: WriteMode::Overwrite,
+            ..Default::default()
+        },
+        ..OracleSinkConfig::new(conn.clone(), "RUNS")
+    };
+    let sink = |token: String| {
+        let cfg = cfg.clone();
+        async move {
+            OracleSink::new(cfg)
+                .await
+                .unwrap()
+                .with_overwrite_run(&token)
+                .unwrap()
+        }
+    };
+    let staging_count = |conn: OracleConnectionConfig| async move {
+        common::query_strings(
+            &conn,
+            "SELECT TO_CHAR(COUNT(*)) FROM USER_TABLES WHERE TABLE_NAME LIKE 'RUNS\\_\\_faucet\\_ovw%' ESCAPE '\\'",
+        )
+        .await[0]
+            .clone()
+            .unwrap()
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    sink(a.clone()).await.begin_overwrite().await.unwrap();
+    sink(b.clone()).await.begin_overwrite().await.unwrap();
+    // Only the two live runs' staging is left.
+    assert_eq!(staging_count(conn.clone()).await, "2");
+    let (wa, wb) = (sink(a.clone()).await, sink(b.clone()).await);
+    wa.write_batch(&[
+        json!({"ID": 1, "NAME": "a1"}),
+        json!({"ID": 2, "NAME": "a2"}),
+    ])
+    .await
+    .unwrap();
+    wb.write_batch(&[json!({"ID": 3, "NAME": "b1"})])
+        .await
+        .unwrap();
+    sink(a.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(
+        common::query_strings(&conn, "SELECT NAME FROM RUNS ORDER BY ID").await,
+        vec![Some("a1".into()), Some("a2".into())]
+    );
+    sink(b.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(
+        common::query_strings(&conn, "SELECT NAME FROM RUNS ORDER BY ID").await,
+        vec![Some("b1".into())]
+    );
+    assert_eq!(staging_count(conn.clone()).await, "0");
+}

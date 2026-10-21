@@ -385,6 +385,29 @@ pub(crate) fn dictionary_binds(table: &str) -> Result<(Option<String>, String), 
 pub(crate) const TABLE_EXISTS_SQL: &str = "SELECT COUNT(*) FROM ALL_TABLES \
     WHERE OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND TABLE_NAME = :2";
 
+/// Tables named like a tokened overwrite staging (`:1` owner or NULL for the
+/// current schema, `:2` a `LIKE` pattern escaped with `\\`).
+pub(crate) const TOKENED_STAGING_SQL: &str = "SELECT TABLE_NAME FROM ALL_TABLES \
+    WHERE OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) \
+    AND TABLE_NAME LIKE :2 ESCAPE '\\'";
+
+/// `name` qualified with `owner` when there is one.
+pub(crate) fn qualify(owner: Option<&str>, name: &str) -> String {
+    match owner {
+        Some(o) => format!("{o}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// The staging table of an overwrite of `target`: `<target>__faucet_ovw`, or
+/// `<target>__faucet_ovw_<token>` for an overwrite run token.
+pub(crate) fn staging_table_name(target: &str, run: Option<&str>) -> String {
+    format!(
+        "{target}{}",
+        faucet_core::idempotency::overwrite_staging_suffix(run)
+    )
+}
+
 /// Tables other than the target whose enabled foreign keys reference it
 /// (`:1` owner or NULL for the current schema, `:2` table), as `OWNER.TABLE`.
 /// Self-references are excluded: the swap replaces every row of the table at
@@ -1101,6 +1124,18 @@ mod tests {
             "DELETE FROM \"T\" WHERE \"A\" = :1 AND \"B\" = :2"
         );
         assert!(insert_sql("\"T\"", &["a\"".into()]).is_err());
+    }
+
+    #[test]
+    fn staging_names_carry_the_run_token() {
+        assert_eq!(staging_table_name("APP.T", None), "APP.T__faucet_ovw");
+        assert_eq!(
+            staging_table_name("T", Some("67000000abcdef")),
+            "T__faucet_ovw_67000000abcdef"
+        );
+        assert_eq!(qualify(Some("APP"), "T"), "APP.T");
+        assert_eq!(qualify(None, "T"), "T");
+        assert!(TOKENED_STAGING_SQL.contains("ESCAPE '\\'"));
     }
 
     #[test]
