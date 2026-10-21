@@ -819,25 +819,31 @@ pub fn compile_transforms(specs: &[TransformSpec]) -> CliResult<Vec<TransformSta
 }
 
 fn compile_one(spec: &TransformSpec) -> CliResult<TransformStage> {
-    match registry().into_iter().find(|t| t.kind == spec.kind) {
-        Some(def) => {
-            let config = crate::interpolate::unescaped(spec.config.clone());
-            if let Some((unknown, hint)) =
-                crate::registry::unknown_config_keys(&config, &(def.schema_fn)())
-            {
-                return Err(CliError::InvalidTransform {
-                    name: spec.kind.clone(),
-                    message: format!(
-                        "unknown config key(s): {unknown}{hint} — run `faucet schema transform \
-                         {}` for the full list",
-                        spec.kind
-                    ),
-                });
-            }
-            (def.compile_fn)(&spec.kind, config)
-        }
-        None => Err(unknown_transform(&spec.kind)),
+    let (def, config) = checked_config(spec)?;
+    (def.compile_fn)(&spec.kind, config)
+}
+
+/// A transform's definition and its config as every compile path must see
+/// it: `$${` escapes turned into `${` (transform configs are deferred from
+/// the document-level unescape) and unknown keys refused.
+fn checked_config(spec: &TransformSpec) -> CliResult<(TransformDef, Value)> {
+    let def = registry()
+        .into_iter()
+        .find(|t| t.kind == spec.kind)
+        .ok_or_else(|| unknown_transform(&spec.kind))?;
+    let config = crate::interpolate::unescaped(spec.config.clone());
+    if let Some((unknown, hint)) = crate::registry::unknown_config_keys(&config, &(def.schema_fn)())
+    {
+        return Err(CliError::InvalidTransform {
+            name: spec.kind.clone(),
+            message: format!(
+                "unknown config key(s): {unknown}{hint} — run `faucet schema transform {}` for \
+                 the full list",
+                spec.kind
+            ),
+        });
     }
+    Ok((def, config))
 }
 
 /// Like [`compile_transforms`] but also returns each stage's Arrow
@@ -857,7 +863,8 @@ pub fn compile_transforms_columnar(
     for s in specs {
         #[cfg(feature = "transform-sql")]
         if s.kind == "sql" {
-            let cfg = decode_sql("sql", s.config.clone())?;
+            let (_, config) = checked_config(s)?;
+            let cfg = decode_sql("sql", config)?;
             let transform = faucet_transform_sql::SqlTransform::compile(&cfg).map_err(|e| {
                 let message = match &e {
                     faucet_core::FaucetError::Transform(m)
@@ -1035,6 +1042,34 @@ mod tests {
             config: json!({ "fields": ["email"], "salt": "pepper" }),
         };
         compile_transforms(&[ok]).unwrap();
+    }
+
+    /// Both compile paths read a transform's config through
+    /// `checked_config`: `$${` escapes are undone and unknown keys refused.
+    #[cfg(feature = "transforms")]
+    #[test]
+    fn transform_configs_are_unescaped_and_key_checked_on_every_path() {
+        let spec = TransformSpec {
+            kind: "hash".into(),
+            config: json!({ "fields": ["email"], "salt": "$${not_a_token}" }),
+        };
+        let (_, config) = checked_config(&spec).unwrap();
+        assert_eq!(config["salt"], "${not_a_token}");
+        let bad = TransformSpec {
+            kind: "hash".into(),
+            config: json!({ "fields": ["email"], "slat": "pepper" }),
+        };
+        assert!(checked_config(&bad).is_err());
+        #[cfg(feature = "arrow")]
+        assert!(compile_transforms_columnar(&[bad]).is_err());
+        #[cfg(all(feature = "arrow", feature = "transform-sql"))]
+        {
+            let sql = TransformSpec {
+                kind: "sql".into(),
+                config: json!({ "query": "SELECT * FROM batch WHERE t = '$${name}'", "nope": 1 }),
+            };
+            assert!(compile_transforms_columnar(&[sql]).is_err(), "unknown key");
+        }
     }
 
     #[test]
