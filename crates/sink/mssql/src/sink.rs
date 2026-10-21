@@ -845,57 +845,83 @@ impl MssqlDriver {
 }
 
 /// The upsert/delete groups for one page. A single plan (one MERGE per kind)
-/// unless a deleted key may equal an upserted one under the column's collation
-/// (case, trailing spaces, or a non-ASCII key the check cannot fold); only then
-/// does page order matter, so the page is split into op runs
-/// ([`faucet_core::plan_writes_ordered`]).
+/// unless two of its keys may be equal under the column's collation (case,
+/// trailing spaces, or a non-ASCII key the check cannot fold exactly): one
+/// MERGE whose source holds two rows matching one target row fails (8672), and
+/// a delete and an upsert of one row must apply in page order. Then the page
+/// is split, in page order, into runs of one operation that never hold two
+/// collation-equal keys, so each MERGE matches a row at most once and the
+/// later record wins — under a case-sensitive collation too.
 fn page_plans(records: &[Value], spec: &faucet_core::WriteSpec) -> Vec<faucet_core::WritePlan> {
     let single = faucet_core::plan_writes(records, spec);
-    if collation_collision(&single) {
-        faucet_core::plan_writes_ordered(records, spec)
-    } else {
-        vec![single]
+    if !collation_collision(&single, &spec.key) {
+        return vec![single];
     }
-}
-
-/// A key folded the way a case-insensitive collation compares it; `None` when
-/// it holds a non-ASCII string, which accent-insensitive collations may fold
-/// further than this check can.
-fn folded_key(values: impl Iterator<Item = Value>) -> Option<Vec<String>> {
-    values
-        .map(|v| match v {
-            Value::String(s) if s.is_ascii() => Some(s.trim_end_matches(' ').to_ascii_lowercase()),
-            Value::String(_) => None,
-            other => Some(other.to_string()),
-        })
-        .collect()
-}
-
-/// Whether some deleted key may equal some upserted key under the collation.
-fn collation_collision(plan: &faucet_core::WritePlan) -> bool {
-    if plan.deletes.is_empty() || plan.upserts.is_empty() {
-        return false;
-    }
-    let key: Vec<&String> = plan
-        .deletes
-        .first()
-        .map(|k| k.0.iter().map(|(c, _)| c).collect())
-        .unwrap_or_default();
-    let mut upserted = std::collections::HashSet::new();
-    for rec in &plan.upserts {
-        let values = key
-            .iter()
-            .map(|c| rec.get(c.as_str()).cloned().unwrap_or(Value::Null));
-        match folded_key(values) {
-            Some(k) => {
-                upserted.insert(k);
-            }
-            None => return true,
+    let mut plans = Vec::new();
+    let mut run: Vec<Value> = Vec::new();
+    let mut run_is_delete = None;
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    for rec in records {
+        let one = faucet_core::plan_writes(std::slice::from_ref(rec), spec);
+        let Some(key) = faucet_core::write_mode::record_key(rec, &spec.key) else {
+            continue;
+        };
+        let is_delete = !one.deletes.is_empty();
+        let folded = fold_key(key.0.into_iter().map(|(_, v)| v)).0;
+        if !run.is_empty() && (run_is_delete != Some(is_delete) || seen.contains(&folded)) {
+            plans.push(faucet_core::plan_writes(&std::mem::take(&mut run), spec));
+            seen.clear();
         }
+        run_is_delete = Some(is_delete);
+        seen.insert(folded);
+        run.push(rec.clone());
     }
-    plan.deletes.iter().any(|d| {
-        folded_key(d.0.iter().map(|(_, v)| v.clone())).is_none_or(|k| upserted.contains(&k))
-    })
+    if !run.is_empty() {
+        plans.push(faucet_core::plan_writes(&run, spec));
+    }
+    plans
+}
+
+/// A key folded the way a case-insensitive collation compares it (trailing
+/// spaces dropped, lower-cased), and whether the fold is exact: a non-ASCII
+/// string may fold further under an accent-insensitive collation.
+fn fold_key(values: impl Iterator<Item = Value>) -> (Vec<String>, bool) {
+    let mut exact = true;
+    let folded = values
+        .map(|v| match v {
+            Value::String(s) if s.is_ascii() => s.trim_end_matches(' ').to_ascii_lowercase(),
+            Value::String(s) => {
+                exact = false;
+                s.trim_end_matches(' ').to_lowercase()
+            }
+            other => other.to_string(),
+        })
+        .collect();
+    (folded, exact)
+}
+
+/// Whether two keys of the plan may be equal under the collation: two fold
+/// equal, or a non-ASCII key sits beside the other operation (an
+/// accent-insensitive collation may equate it with one of those keys).
+fn collation_collision(plan: &faucet_core::WritePlan, key: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut inexact = false;
+    let upserted = plan.upserts.iter().map(|rec| {
+        fold_key(
+            key.iter()
+                .map(|c| rec.get(c.as_str()).cloned().unwrap_or(Value::Null)),
+        )
+    });
+    let deleted = plan
+        .deletes
+        .iter()
+        .map(|d| fold_key(d.0.iter().map(|(_, v)| v.clone())));
+    let mut equal = false;
+    for (folded, exact) in upserted.chain(deleted) {
+        inexact |= !exact;
+        equal |= !seen.insert(folded);
+    }
+    equal || (inexact && !plan.deletes.is_empty() && !plan.upserts.is_empty())
 }
 
 /// The prepared statements and key typing a scoped cleanup runs with.
@@ -2004,8 +2030,35 @@ mod tests {
         assert_eq!(page_plans(&accented, &spec).len(), 2);
         let numbers = [json!({"id": 1, "op": "d"}), json!({"id": 2, "v": 1})];
         assert_eq!(page_plans(&numbers, &spec).len(), 1);
-        let only_upserts = [json!({"id": "a"}), json!({"id": "A"})];
-        assert_eq!(page_plans(&only_upserts, &spec).len(), 1);
+        // Two upserts (or deletes) equal only under a case-insensitive
+        // collation go to separate MERGEs, the later one last.
+        let only_upserts = [json!({"id": "a", "v": 1}), json!({"id": "A", "v": 2})];
+        let plans = page_plans(&only_upserts, &spec);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[1].upserts[0]["v"], 2);
+        let bob = [
+            json!({"id": "Bob", "v": 1}),
+            json!({"id": "bob", "v": 2}),
+            json!({"id": "Bob", "v": 3}),
+        ];
+        let plans = page_plans(&bob, &spec);
+        let applied: Vec<_> = plans
+            .iter()
+            .flat_map(|p| p.upserts.iter())
+            .map(|r| r["v"].clone())
+            .collect();
+        assert_eq!(applied, [json!(1), json!(2), json!(3)]);
+        let deletes = [
+            json!({"id": "x", "op": "d"}),
+            json!({"id": "X ", "op": "d"}),
+        ];
+        assert_eq!(page_plans(&deletes, &spec).len(), 2);
+        let distinct = [
+            json!({"id": "a"}),
+            json!({"id": "b"}),
+            json!({"id": "José"}),
+        ];
+        assert_eq!(page_plans(&distinct, &spec).len(), 1);
     }
 
     // dataset_uri test is skipped: MssqlSink::new() requires a live pool
