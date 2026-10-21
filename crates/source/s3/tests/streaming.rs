@@ -450,6 +450,38 @@ async fn discover_falls_back_to_objects_under_leaf_prefix() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn discovered_object_rows_read_only_their_own_object() {
+    // `raw/a.json` is a string prefix of `raw/a.jsonl`; a row selecting the
+    // first by prefix alone would also read the second, duplicating it.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(
+        &endpoint,
+        &[
+            ("raw/a.json".to_string(), jsonl_body(1, 2)),
+            ("raw/a.jsonl".to_string(), jsonl_body(10, 12)),
+        ],
+    )
+    .await;
+
+    let source = build_source(&endpoint, S3SourceConfig::new(TEST_BUCKET).prefix("raw/")).await;
+    let datasets = source.discover().await.expect("discover");
+    assert_eq!(datasets.len(), 2);
+
+    let mut total = 0;
+    for d in &datasets {
+        let mut config = S3SourceConfig::new(TEST_BUCKET);
+        config.prefix = d.config_patch["prefix"].as_str().map(str::to_string);
+        config.include = d.config_patch["include"].as_str().map(str::to_string);
+        let row = build_source(&endpoint, config).await;
+        let records = collect_all(&row, 100).await;
+        let want = if d.name == "raw/a.json" { 2 } else { 3 };
+        assert_eq!(records.len(), want, "dataset {}", d.name);
+        total += records.len();
+    }
+    assert_eq!(total, 5, "every record is read by exactly one row");
+}
+
 // ---------------------------------------------------------------------------
 // #619 — `concurrency` on the streaming path.
 //

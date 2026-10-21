@@ -396,7 +396,7 @@ The source supports live introspection via `Source::discover()`: one `ListObject
 - `name` — the full key prefix (e.g. `raw/orders/`), `kind: prefix`
 - `config_patch` — `{ "prefix": "raw/orders/" }`, ready to deep-merge over the connection config as a matrix row
 
-When the listing returns no common prefixes but does return objects directly under the prefix (a "leaf directory"), each object becomes a descriptor instead (`kind: object`, `config_patch: { "prefix": "<full key>" }`), capped at the single listing page of 1000. `schema` and `estimated_rows` are never set — either would require reading or paging the whole listing. Discovery issues exactly one listing call and never recurses.
+When the listing returns no common prefixes but does return objects directly under the prefix (a "leaf directory"), each object becomes a descriptor instead (`kind: object`, `config_patch: { "prefix": "<full key>", "include": "<glob-escaped full key>" }` — the `include` makes the row read exactly that object, since a key used as a prefix also lists sibling keys that extend it, such as `a.json` → `a.jsonl`), capped at the single listing page of 1000. `schema` and `estimated_rows` are never set — either would require reading or paging the whole listing. Discovery issues exactly one listing call and never recurses.
 
 ## Lineage dataset URI
 

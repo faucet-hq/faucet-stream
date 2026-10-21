@@ -6970,6 +6970,7 @@ dependencies = [
  "faucet-conformance",
  "faucet-core",
  "futures",
+ "glob",
  "md-5 0.10.6",
  "parquet 58.3.0",
  "schemars 1.2.1",
