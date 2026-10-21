@@ -864,7 +864,6 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let mut deferred = Vec::new();
         collect_deferred(&merged_source.config, &mut deferred);
         collect_deferred(&merged_sink.config, &mut deferred);
-        check_deferred_scope(row_id, &role, &deferred, &row_id_set)?;
 
         // Resolved readiness status (#371): `merged_source.status` already
         // carries the template→row `source.status` scalar merge; default to
@@ -900,6 +899,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             row_id,
         )?;
         apply_cdc_unwrap_key(&merged_sink.config, &mut transforms);
+        // The executor resolves `${parent.*}` in transform configs too (#568),
+        // so their tokens are scoped like the connector's and the parent's
+        // captured projection keeps the fields they read.
+        for t in &transforms {
+            collect_deferred(&t.config, &mut deferred);
+        }
+        check_deferred_scope(row_id, &role, &deferred, &row_id_set)?;
         let state = row.state.clone().or_else(|| cfg.pipeline.state.clone());
         // Row override wins; fall back to the top-level delivery mode.
         let delivery = row.delivery.unwrap_or(cfg.delivery);
@@ -3820,6 +3826,41 @@ matrix:
         assert_eq!(posts.deferred_refs.len(), 1);
         assert_eq!(posts.deferred_refs[0].referenced_id, "users");
         assert_eq!(posts.deferred_refs[0].dotted_path, "id");
+    }
+
+    #[test]
+    fn transform_tokens_are_scoped_and_projected_like_connector_tokens() {
+        let c = cfg(r#"
+version: 1
+pipeline:
+  source: { type: rest, config: {} }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
+matrix:
+  - id: p
+  - id: c
+    parent: p
+    transforms: [{ type: set, config: { values: { pname: "${p.name}" } } }]
+"#);
+        let nodes = expand(&c).unwrap();
+        let child = nodes.iter().find(|n| n.id == "c").unwrap();
+        assert!(
+            child.deferred_refs.iter().any(|r| r.referenced_id == "p" && r.dotted_path == "name"),
+            "{:?}",
+            child.deferred_refs
+        );
+
+        let c = cfg(r#"
+version: 1
+pipeline:
+  source: { type: rest, config: {} }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
+matrix:
+  - id: p
+  - id: r
+    transforms: [{ type: set, config: { values: { src: "${p.id}" } } }]
+"#);
+        let err = expand(&c).unwrap_err().to_string();
+        assert!(err.contains("not its parent"), "{err}");
     }
 
     #[test]
