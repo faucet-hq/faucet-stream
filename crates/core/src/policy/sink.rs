@@ -34,6 +34,10 @@ pub struct PolicySink {
     facts: SinkFacts,
     scope: PolicyScope,
     masking: Option<Arc<CompiledMasking>>,
+    /// Masking applied after `masking`, closer to the destination (the
+    /// DLQ-only rules a DLQ's envelopes pass through); it wins on a column
+    /// both rewrite, since its action is the one that reached the sink.
+    later_masking: Option<Arc<CompiledMasking>>,
     dlq: Option<SinkFacts>,
     /// The wrapped sink is a DLQ: records are envelopes, the payload is
     /// classified, and any violation fails the write (#870).
@@ -53,6 +57,7 @@ impl PolicySink {
             facts,
             scope,
             masking: None,
+            later_masking: None,
             dlq: None,
             envelopes: false,
         }
@@ -91,6 +96,14 @@ impl PolicySink {
         self
     }
 
+    /// A second masking pass that ran after [`with_masking`](Self::with_masking)'s,
+    /// e.g. the DLQ-only rules applied to a DLQ's envelope payloads: a column
+    /// it rewrote by name counts as masked with its action.
+    pub fn with_later_masking(mut self, masking: Arc<CompiledMasking>) -> Self {
+        self.later_masking = Some(masking);
+        self
+    }
+
     /// Classify one record's scalar leaves (by name and by value) and evaluate
     /// the rules; returns the violations with the harshest runtime action.
     fn check_record(
@@ -98,7 +111,13 @@ impl PolicySink {
         record: &Value,
         names: &mut NameLabels,
     ) -> (Vec<ColumnFacts>, Vec<Violation>) {
-        let columns = classify_cached(&self.policy, record, self.masking.as_deref(), names);
+        let maskings: Vec<&CompiledMasking> = self
+            .later_masking
+            .iter()
+            .chain(&self.masking)
+            .map(|m| &**m)
+            .collect();
+        let columns = classify_cached(&self.policy, record, &maskings, names);
         if columns.is_empty() {
             return (columns, Vec::new());
         }
@@ -219,25 +238,29 @@ pub fn classify_record_masked(
     record: &Value,
     masking: Option<&CompiledMasking>,
 ) -> Vec<ColumnFacts> {
-    classify_cached(policy, record, masking, &mut NameLabels::new())
+    let maskings: Vec<&CompiledMasking> = masking.into_iter().collect();
+    classify_cached(policy, record, &maskings, &mut NameLabels::new())
 }
 
 /// Labels each dot-path earns by name, memoized across the records of a page
 /// so the classification regexes run once per path, not once per record.
 type NameLabels = std::collections::HashMap<String, BTreeSet<String>>;
 
+/// `maskings` are the passes that ran, the last-applied first: a column takes
+/// the action of the first one that rewrote it by name.
 fn classify_cached(
     policy: &CompiledPolicy,
     record: &Value,
-    masking: Option<&CompiledMasking>,
+    maskings: &[&CompiledMasking],
     names: &mut NameLabels,
 ) -> Vec<ColumnFacts> {
     let mut out: BTreeMap<String, (BTreeSet<String>, &'static str)> = BTreeMap::new();
     walk(policy, "", record, &BTreeSet::new(), &mut out, names);
     out.into_iter()
         .map(|(name, (labels, via))| ColumnFacts {
-            masked: masking
-                .and_then(|m| m.name_action_for(&name))
+            masked: maskings
+                .iter()
+                .find_map(|m| m.name_action_for(&name))
                 .map(str::to_string),
             name,
             labels,

@@ -573,3 +573,57 @@ async fn policy_quarantine_is_per_row_on_a_columnar_capable_pair() {
     assert_eq!(outcomes[0].1, vec![json!(1), json!(3)]);
     assert_eq!(outcomes[0].0, vec![json!({"id": 2, "contact": "none"})]);
 }
+
+/// A DLQ-only masking rule rewrites the quarantined payload before the DLQ's
+/// policy check, so a `mask:` rule it satisfies passes at run time exactly as
+/// the static pass reports — the run does not fail on the first quarantine.
+#[tokio::test]
+async fn dlq_only_masking_satisfies_a_mask_rule_at_the_dlq() {
+    let policy: faucet_core::PolicySpec = serde_json::from_value(json!({
+        "classifications": [{"label": "pii", "fields": ["email"]}],
+        "rules": [{"name": "pii-hashed", "when": {"label": "pii"}, "mask": ["hash"],
+                   "on_runtime": "fail"}]
+    }))
+    .unwrap();
+    let policy = Arc::new(CompiledPolicy::compile(&policy).unwrap());
+    let masking: faucet_core::MaskingSpec = serde_json::from_value(json!({
+        "key": "k",
+        "rules": [{"match": {"fields": ["email"]}, "action": {"type": "hash"}}]
+    }))
+    .unwrap();
+    let masking = Arc::new(faucet_core::CompiledMasking::compile(&masking).unwrap());
+    for dlq_masked in [true, false] {
+        let source = Rows::new(vec![
+            json!({"id": null, "email": "a@b.co"}),
+            json!({"id": 1, "note": "plain"}),
+        ]);
+        let main = Capture::new(Mode::All);
+        let dlq = Capture::new(Mode::All);
+        let mut d = dlq_of(Arc::clone(&dlq), Some("eu"));
+        if dlq_masked {
+            d = d.with_masking(Arc::clone(&masking));
+        }
+        let g = Governance::new()
+            .with_quality(quality_quarantine_null_id())
+            .with_policy(PolicyGovernance::new(
+                Arc::clone(&policy),
+                facts("main", "eu"),
+                scope(),
+            ))
+            .with_dlq(d);
+        let governed = g.sink_builder().build(Box::new(Shared(Arc::clone(&main))));
+        let result = Pipeline::new(&source, &governed)
+            .with_governance(g)
+            .run()
+            .await;
+        if dlq_masked {
+            result.unwrap();
+            assert_eq!(dlq.rows().len(), 1);
+            assert_ne!(dlq.rows()[0]["payload"]["email"], "a@b.co");
+        } else {
+            let err = result.unwrap_err();
+            assert!(matches!(err, FaucetError::PolicyViolation { .. }), "{err}");
+            assert!(dlq.rows().is_empty());
+        }
+    }
+}

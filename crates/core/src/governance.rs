@@ -704,6 +704,12 @@ pub(crate) fn govern_dlq(
         if let Some(m) = &p.masking {
             ps = ps.with_masking(Arc::clone(m));
         }
+        // The DLQ-only rules rewrite the payload after the main masking, so a
+        // column they mask satisfies a `mask:` rule as the static pass says.
+        #[cfg(feature = "masking")]
+        if let Some(m) = &dlq.masking {
+            ps = ps.with_later_masking(Arc::clone(m));
+        }
         sink = Box::new(ps);
     }
     #[cfg(feature = "masking")]
