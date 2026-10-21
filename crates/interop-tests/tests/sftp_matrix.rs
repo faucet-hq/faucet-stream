@@ -75,8 +75,13 @@ impl Remote for SftpRemote {
 
     fn sink(&self, cfg: Value) -> BoxFut<'_, Result<Box<dyn Sink>, FaucetError>> {
         Box::pin(async move {
+            let (cfg, run) = remote_matrix::take_run(cfg);
             let cfg = serde_json::from_value(cfg).map_err(FaucetError::Json)?;
-            Ok(Box::new(faucet_sink_sftp::SftpSink::new(cfg)?) as Box<dyn Sink>)
+            let mut sink = faucet_sink_sftp::SftpSink::new(cfg)?;
+            if let Some(token) = run {
+                sink = sink.with_overwrite_run(&token)?;
+            }
+            Ok(Box::new(sink) as Box<dyn Sink>)
         })
     }
 
@@ -122,5 +127,6 @@ async fn every_writable_format_takes_every_option_on_sftp() {
         _c: container,
     };
     remote_matrix::assert_corpus_written(&remote).await;
+    remote_matrix::assert_concurrent_overwrites(&remote).await;
     run_matrix_with(remote, full, 3).await;
 }

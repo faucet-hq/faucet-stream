@@ -60,6 +60,18 @@ impl S3Sink {
     }
 }
 
+impl S3Sink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in that run's own swap area,
+    /// so a concurrent overwrite run of the same output neither drops nor
+    /// moves in the other's files.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        self.inner = self.inner.with_overwrite_run(token)?;
+        Ok(self)
+    }
+}
+
 faucet_common_file::delegate_sink!(S3Sink, inner);
 
 /// What the S3 sink supplies to the shared sink; requests, metering and the

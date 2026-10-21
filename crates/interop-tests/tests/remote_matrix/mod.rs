@@ -53,6 +53,121 @@ pub async fn assert_corpus_written<R: Remote>(r: &R) {
     fidelity::assert_corpus_read(source.as_ref(), &sent, Tolerance::exact()).await;
 }
 
+/// Take the overwrite run token (`_overwrite_run`, which the CLI injects and
+/// `build_sink` hands to `with_overwrite_run`) out of a sink config.
+pub fn take_run(mut cfg: Value) -> (Value, Option<String>) {
+    let run = cfg
+        .as_object_mut()
+        .and_then(|m| m.remove(faucet_core::idempotency::OVERWRITE_RUN_KEY))
+        .and_then(|v| v.as_str().map(str::to_string));
+    (cfg, run)
+}
+
+/// Two overwrite runs of one output at once: each run's begin, writer and
+/// commit sinks share its run token, so neither begin drops the other's swap
+/// area and each commit moves in only its own files. A tokened begin also
+/// drops the untokened area and one a run abandoned more than a day ago.
+pub async fn assert_concurrent_overwrites<R: Remote>(r: &R) {
+    use faucet_core::idempotency::{OVERWRITE_RUN_KEY, new_overwrite_run_token};
+    let prefix = "concurrent/";
+    let base = r.config(
+        prefix,
+        json!({"path": "data.jsonl", "format": "json_lines", "batch_size": 0,
+               "write_mode": "overwrite"}),
+    );
+    // Swap areas an earlier release and a crashed run left behind.
+    let seed = |cfg: &Value, rows: Vec<Value>| {
+        let cfg = cfg.clone();
+        async move {
+            let sink = r.sink(cfg).await.expect("seed sink");
+            sink.begin_overwrite().await.expect("seed begin");
+            sink.write_batch(&rows).await.expect("seed write");
+            sink.flush().await.expect("seed flush");
+        }
+    };
+    // The tokened one first: a tokened begin drops the untokened area.
+    seed(
+        &with(&base, OVERWRITE_RUN_KEY, json!("10000000aaaaaa")),
+        vec![json!({"stale": "abandoned"})],
+    )
+    .await;
+    seed(&base, vec![json!({"stale": "legacy"})]).await;
+    let names = |objects: Vec<(String, Vec<u8>)>| -> Vec<String> {
+        objects.into_iter().map(|(n, _)| n).collect()
+    };
+    assert_eq!(
+        names(r.objects(prefix).await)
+            .iter()
+            .filter(|n| n.ends_with("data.jsonl"))
+            .count(),
+        2,
+        "two seeded swap areas"
+    );
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let run = |t: &str| with(&base, OVERWRITE_RUN_KEY, json!(t));
+    r.sink(run(&a))
+        .await
+        .unwrap()
+        .begin_overwrite()
+        .await
+        .unwrap();
+    r.sink(run(&b))
+        .await
+        .unwrap()
+        .begin_overwrite()
+        .await
+        .unwrap();
+    let left = names(r.objects(prefix).await);
+    assert!(
+        !left
+            .iter()
+            .any(|n| n.contains("aaaaaa") || n.ends_with("data.jsonl")),
+        "the legacy and abandoned areas are dropped, no file staged yet: {left:?}"
+    );
+    for (t, rows) in [
+        (
+            &a,
+            vec![json!({"run": "a", "i": 1}), json!({"run": "a", "i": 2})],
+        ),
+        (&b, vec![json!({"run": "b", "i": 3})]),
+    ] {
+        let sink = r.sink(run(t)).await.unwrap();
+        sink.write_batch(&rows).await.unwrap();
+        sink.flush().await.unwrap();
+    }
+    let rows = |objects: Vec<(String, Vec<u8>)>| -> Vec<Value> {
+        objects
+            .into_iter()
+            .find(|(n, _)| n == "data.jsonl")
+            .map(|(_, b)| {
+                String::from_utf8(b)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    r.sink(run(&a))
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(r.objects(prefix).await),
+        [json!({"run": "a", "i": 1}), json!({"run": "a", "i": 2})]
+    );
+    r.sink(run(&b))
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
+    assert_eq!(rows(r.objects(prefix).await), [json!({"run": "b", "i": 3})]);
+    assert_eq!(names(r.objects(prefix).await), ["data.jsonl"]);
+}
+
 pub const FORMATS: &[(&str, &str)] = &[
     ("json_lines", "jsonl"),
     ("json_array", "json"),
