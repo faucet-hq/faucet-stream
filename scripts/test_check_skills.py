@@ -81,3 +81,31 @@ class Skills(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Flags(unittest.TestCase):
+    HELP = {
+        (): "Usage: faucet <COMMAND>\n\nOptions:\n      --log-level <LEVEL>  verbosity\n  -h, --help  Print help\n",
+        ("backfill",): (
+            "Usage: faucet backfill [OPTIONS]\n\nOptions:\n"
+            "      --to-bookmark <V>  upper bound; see --to-date\n"
+            "  -o, --output <FMT>  format\n"
+        ),
+    }
+
+    def cli(self):
+        c = cs.Cli("faucet")
+        c.help = lambda words: self.HELP.get(words)
+        c.subcommands = lambda words: {"backfill"} if words == () else set()
+        return c
+
+    def test_help_flags_reads_option_lines_only(self):
+        self.assertEqual(cs.help_flags(self.HELP[("backfill",)]), {"--to-bookmark", "--output"})
+
+    def test_a_flag_that_prefixes_a_real_one_is_reported(self):
+        errs = self.cli().check("faucet backfill --to 2026-01-01")
+        self.assertEqual(len(errs), 1)
+        self.assertIn("--to", errs[0])
+
+    def test_declared_and_global_flags_pass(self):
+        self.assertEqual(self.cli().check("faucet backfill --to-bookmark 5 -o json --log-level info"), [])

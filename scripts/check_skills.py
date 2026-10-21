@@ -40,6 +40,7 @@ EXAMPLE_PATH = re.compile(r"(?<![\w/.-])(cli/examples/[\w./-]+\.(?:yaml|yml|json
 FENCE = re.compile(r"^(\s*)```(\w*)\s*$")
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 FLAG = re.compile(r"^--[a-z0-9][a-z0-9-]*")
+OPTION_LINE = re.compile(r"^\s+(?:-[A-Za-z0-9], )?(--[a-z0-9][a-z0-9-]*)", re.M)
 PINNED_RELEASE = re.compile(r"\bfaucet(?:-cli|-core)?\s+v?\d+\.\d+", re.I)
 VERSION_STEP = "## Step 0: use the project's faucet version"
 YAML_LANGS = ("yaml", "yml")
@@ -158,6 +159,11 @@ def link_errors(doc, text):
     return errors
 
 
+def help_flags(text):
+    """The long flags a clap `--help` text declares on its option lines."""
+    return set(OPTION_LINE.findall(text or ""))
+
+
 class Cli:
     def __init__(self, path):
         self.path = path
@@ -193,11 +199,11 @@ class Cli:
         text = self.help(tuple(words))
         if text is None:
             return [f"`faucet {' '.join(words)} --help` failed for `{line}`"]
-        top = self.help(()) or ""
+        known = help_flags(text) | help_flags(self.help(()))
         errs = []
         for tok in argv:
             m = FLAG.match(tok)
-            if m and m.group(0) not in text and m.group(0) not in top:
+            if m and m.group(0) not in known:
                 errs.append(f"unknown flag {m.group(0)} for `faucet {' '.join(words)}` in `{line}`")
         return errs
 
