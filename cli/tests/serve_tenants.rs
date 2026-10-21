@@ -320,6 +320,30 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         )
         .await;
     assert_eq!(code, 400);
+    // A connection is the tenant's input: its token endpoint may not reach a
+    // metadata host, and it may not name a local file.
+    let (code, body) = api
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/connections",
+            json!({"name": "meta", "provider": {"type": "oauth2", "config": {
+                "token_url": "http://169.254.169.254/latest/meta-data/iam/",
+                "client_id": "x", "client_secret": "y"}}}),
+        )
+        .await;
+    assert_eq!(code, 403, "{body}");
+    assert!(body.to_string().contains("169.254.169.254"), "{body}");
+    let (code, body) = api
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/connections",
+            json!({"name": "persisted", "provider": {"type": "oauth2_refresh", "config": {
+                "token_url": "https://idp.example/token", "client_id": "x",
+                "refresh_token": "r", "persist": {"path": "/tmp/faucet-other", "key": "k"}}}}),
+        )
+        .await;
+    assert_eq!(code, 403, "{body}");
+    assert!(body.to_string().contains("persist"), "{body}");
     let (_, listed) = api.get("admin-tok", "/v1/tenants/acme/connections").await;
     assert!(
         !listed.to_string().contains("acme-secret-token"),

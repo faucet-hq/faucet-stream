@@ -93,6 +93,11 @@ impl ShardSpec {
 
 // ── PK-range sharding (shared by the SQL query sources) ─────────────────────
 
+/// The most shards one source is ever split into. A planner caps its target
+/// here, so a mistyped (or hostile) `shard.count` cannot make the coordinator
+/// allocate and persist millions of shard rows.
+pub const MAX_SHARDS: usize = 4096;
+
 /// Split the integer range observed as `[min, max]` into up to `target`
 /// contiguous shards, each described by
 /// `{key, lo, hi, lo_unbounded, hi_unbounded, include_null}`. Interior cut
@@ -122,7 +127,7 @@ impl ShardSpec {
 /// every PK-range-sharded SQL source (postgres, mysql, mssql, sqlite) so the
 /// subtle boundary/NULL coverage logic lives in exactly one place.
 pub fn plan_pk_shards(key: &str, min: i64, max: i64, target: usize) -> Vec<ShardSpec> {
-    let target = target.max(1);
+    let target = target.clamp(1, MAX_SHARDS);
     // Range width as u128 to avoid i64 overflow on full-range PKs.
     let width = (max as i128 - min as i128 + 1).max(1) as u128;
     let n = (target as u128).min(width) as usize; // never more shards than values
@@ -333,6 +338,7 @@ pub fn shard_hash(key: &str) -> u64 {
 /// so enumeration is cheap and stays stable as new objects appear.
 /// `target <= 1` yields a single whole-dataset shard.
 pub fn plan_hash_shards(target: usize) -> Vec<ShardSpec> {
+    let target = target.min(MAX_SHARDS);
     if target <= 1 {
         return vec![ShardSpec::whole()];
     }
@@ -709,6 +715,16 @@ mod tests {
             assert_eq!(s.descriptor["index"], i);
             assert_eq!(s.id, i.to_string());
         }
+    }
+
+    #[test]
+    fn planners_never_exceed_max_shards() {
+        assert_eq!(plan_hash_shards(500_000_000).len(), MAX_SHARDS);
+        assert_eq!(
+            plan_pk_shards("id", 0, i64::MAX, usize::MAX).len(),
+            MAX_SHARDS
+        );
+        assert_eq!(plan_pk_shards("id", 0, 9, 0).len(), 1);
     }
 
     #[test]

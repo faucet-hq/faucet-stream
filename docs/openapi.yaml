@@ -4228,7 +4228,7 @@ components:
           description: "Version of the sink template: `stable` (default), another channel, or an exact number."
           $ref: "#/components/schemas/VersionSelector"
         overlay:
-          description: "Deployment overlay for a composed run (#679): a registered `kind: deployment` id, or an inline mapping of operational blocks (`state`, `dlq`, `notifications`, `sla`, `resilience`, `execution`, `delivery`, `schedule`, and per-stream `streams`). An inline overlay may omit `kind` and `name`. Refused for a `pipeline` template; anything that would change connectors or streams is a `422`."
+          description: "Deployment overlay for a composed run (#679): a registered `kind: deployment` id, or an inline mapping of operational blocks (`state`, `dlq`, `notifications`, `sla`, `resilience`, `execution`, `delivery`, `schedule`, and per-stream `streams`). An inline overlay may omit `kind` and `name`; it is the caller's document, so it is screened under the caller reference policy (references, local paths, URLs, subprocess connectors — `403` / `422`) and refused for a tenant run (`403`). Refused for a `pipeline` template; anything that would change connectors or streams is a `422`."
           nullable: true
           oneOf:
             - { type: string }

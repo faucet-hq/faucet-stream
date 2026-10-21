@@ -476,7 +476,7 @@ async fn coordinate_sharded_run(
     }
 
     let shards = source
-        .enumerate_shards(count)
+        .enumerate_shards(count.min(faucet_core::shard::MAX_SHARDS))
         .await
         .map_err(|e| CliError::Internal(format!("enumerate_shards: {e}")))?;
     let inserts: Vec<ShardInsert> = shards

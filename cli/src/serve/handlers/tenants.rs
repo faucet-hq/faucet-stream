@@ -330,6 +330,20 @@ async fn store_connection(
         .and_then(Value::as_str)
         .ok_or_else(|| ServeError::BadConfig("provider: missing `type`".into()))?
         .to_string();
+    // A connection is the tenant's input: its endpoints and files are held to
+    // the tenant's caller policy before the provider is built (building one
+    // may read a key file).
+    let policy = state.references().for_origin(
+        crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        Some(tenant),
+    );
+    crate::serve::load::screen_auth_providers(
+        [(format!("connection {name}"), &provider)],
+        &policy,
+        true,
+    )?;
     faucet_auth::build_provider(&provider)
         .map_err(|e| ServeError::BadConfig(format!("provider: {e}")))?;
     tenants::register_secrets(&provider);

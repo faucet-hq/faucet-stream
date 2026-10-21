@@ -203,6 +203,9 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
     if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut()) {
         force_source(&mut dest.config, &dest.kind);
     }
+    if let Some(r) = cfg.reconcile.as_mut() {
+        force_source(&mut r.count.config, &r.count.kind);
+    }
 }
 
 /// [`confine_sql`] over expanded rows: the merged configs each row builds.
@@ -1011,6 +1014,11 @@ pub fn refuse_server_paths_with(
             check(&d.sink.kind, &d.sink.config, Access::Write);
         }
     }
+    findings_error(found)
+}
+
+/// The refusal a screening pass's findings amount to, if any.
+fn findings_error(mut found: Findings) -> Result<(), ServeError> {
     for list in [&mut found.protected, &mut found.policy] {
         list.sort();
         list.dedup();
@@ -1032,6 +1040,53 @@ pub fn refuse_server_paths_with(
         )));
     }
     Ok(())
+}
+
+/// Whether `value` is an absolute URL (`scheme://…`).
+fn is_absolute_url(value: &str) -> bool {
+    value.find("://").is_some_and(|i| {
+        i > 0
+            && value[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            && value.as_bytes()[0].is_ascii_alphabetic()
+    })
+}
+
+/// Every absolute URL anywhere in `doc` checked against `policy`; a URL whose
+/// host comes from a `${…}` token cannot be checked and is refused.
+fn url_findings(doc: &Value, policy: &ReferencePolicy, found: &mut Findings) {
+    for_each_string(doc, &mut |s| {
+        if !is_absolute_url(s) {
+            return;
+        }
+        if faucet_core::resolve::url_hosts(s)
+            .iter()
+            .any(|h| h.contains("${"))
+        {
+            found.policy.push(format!(
+                "{s} (a URL host in a submitted document may not come from a token — it cannot \
+                 be checked)"
+            ));
+        } else if let Err(e) = policy.check_url(s) {
+            found.policy.push(format!("{s} ({})", e.reason));
+        }
+    });
+}
+
+/// Screen a document fragment a request supplied for a run whose body is
+/// otherwise the operator's (an inline deployment overlay merged into a
+/// registered template): the fragment is caller input, so it is held to
+/// everything a caller-submitted config is — its subprocess connectors, its
+/// `${env:}` / `${file:}` / `${secret:}` / secret-manager references, every
+/// local path (system trees, the server's credential files, the caller path
+/// roots) and every URL it names — under the caller `policy`.
+pub fn screen_caller_fragment(doc: &Value, policy: &ReferencePolicy) -> Result<(), ServeError> {
+    screen_subprocess(doc, policy, false)?;
+    screen_references(doc, policy)?;
+    let mut found = data_path_findings(doc, true, Some(policy));
+    url_findings(doc, policy, &mut found);
+    findings_error(found)
 }
 
 /// The connector kinds `doc` names anywhere as a `type:` whose schema declares
@@ -1149,27 +1204,73 @@ pub fn refuse_subprocess(
     screen_subprocess(doc, &policy, for_tenant)
 }
 
-/// Keys of a shared auth provider's config that name an endpoint it calls.
-const AUTH_URL_KEYS: &[&str] = &["token_url", "url", "authorization_url"];
-
 /// Refuse a shared auth provider (`auth:` catalog) whose token endpoint the
-/// reference policy does not allow.
+/// reference policy does not allow, or that reaches a system tree or a
+/// server credential file. Every endpoint and file a provider names is found
+/// by [`faucet_auth::provider_resources`].
 pub fn screen_auth_catalog(
     cfg: &PipelineConfig,
     policy: &ReferencePolicy,
 ) -> Result<(), ServeError> {
+    screen_auth_providers(
+        cfg.auth
+            .iter()
+            .flatten()
+            .map(|(n, s)| (format!("auth.{n}"), s)),
+        policy,
+        false,
+    )
+}
+
+/// [`screen_auth_catalog`] over any named provider specs (a config's `auth:`
+/// catalog, a tenant's connections). With `caller`, the specs came from a
+/// request: a provider may not name a local file at all — a key file is
+/// passed as `key_json`, and a refresh token is persisted by the server (a
+/// tenant connection persists to the vault), never to a caller-chosen
+/// directory.
+pub fn screen_auth_providers<'a>(
+    providers: impl IntoIterator<Item = (String, &'a Value)>,
+    policy: &ReferencePolicy,
+    caller: bool,
+) -> Result<(), ServeError> {
     let mut refused = Vec::new();
-    for (name, spec) in cfg.auth.iter().flatten() {
-        let Some(config) = spec.get("config") else {
-            continue;
-        };
-        for key in AUTH_URL_KEYS {
-            if let Some(Value::String(url)) = config.get(*key)
-                && let Err(e) = policy.check_url(url)
-            {
-                refused.push(format!("auth.{name}.config.{key}: {url} ({})", e.reason));
+    let mut files = Vec::new();
+    for (name, spec) in providers {
+        for r in faucet_auth::provider_resources(spec) {
+            let at = format!("{name}.config{}", r.pointer.replace('/', "."));
+            match r.kind {
+                ResourceKind::Path => {
+                    let path = local_path(&r.value).unwrap_or(&r.value);
+                    let access = if r.writes {
+                        Access::Write
+                    } else {
+                        Access::Read { recursive: false }
+                    };
+                    if caller {
+                        files.push(format!("{at}: {}", r.value));
+                    } else if data_path_is_protected(path, access) {
+                        files.push(format!(
+                            "{at}: {} (a system tree or a server credential file)",
+                            r.value
+                        ));
+                    }
+                }
+                _ => {
+                    if let Err(e) = policy.check(&r.to_resource_ref()) {
+                        refused.push(format!("{at}: {} ({})", r.value, e.reason));
+                    }
+                }
             }
         }
+    }
+    if !files.is_empty() {
+        files.sort();
+        return Err(ServeError::Forbidden(format!(
+            "the config's auth providers name local files a config loaded by `faucet serve` \
+             may not use: {}; pass a service-account key inline as `key_json`, and drop \
+             `persist` (a submitted config may not choose where the server writes tokens)",
+            files.join(", ")
+        )));
     }
     if refused.is_empty() {
         return Ok(());
@@ -1426,6 +1527,11 @@ pub async fn load_submission_with(
     };
 
     screen_references(&submitted, &refs)?;
+    let caller_auth: std::collections::BTreeSet<String> = submitted
+        .get("auth")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
 
     // 2. ${env}/${file}/${secret} interpolation against the server's env/fs,
     // resolved INTO the parsed tree (post-parse) so a resolved value can never
@@ -1508,11 +1614,40 @@ pub async fn load_submission_with(
         .await
         .map_err(resolution_error)?;
 
-    screen_auth_catalog(&cfg, &refs)?;
+    // A provider the request wrote is held to the caller rules; one only the
+    // operator's `--default-config` base declares is not.
+    let caller = matches!(origin, BodyOrigin::Caller { .. });
+    let written = |n: &str| caller && caller_auth.contains(n);
+    for by_caller in [true, false] {
+        screen_auth_providers(
+            cfg.auth
+                .iter()
+                .flatten()
+                .filter(|(n, _)| written(n) == by_caller)
+                .map(|(n, spec)| (format!("auth.{n}"), spec)),
+            &refs,
+            by_caller,
+        )?;
+    }
 
     // 5a. A tenant's connections join the auth catalog (#709), after secrets
     // resolution so an unsealed credential is never scanned for directives.
+    // A connection is the tenant's own input: it is held to the tenant's
+    // caller policy whatever the origin of the body that references it.
     if let Some(t) = &tenant {
+        let tenant_refs = references.for_origin(
+            BodyOrigin::Caller {
+                allow_subprocess: false,
+            },
+            Some(t.values.id.as_str()),
+        );
+        screen_auth_providers(
+            t.connections
+                .iter()
+                .map(|(n, spec)| (format!("connection {n}"), spec)),
+            &tenant_refs,
+            true,
+        )?;
         let catalog = cfg.auth.get_or_insert_with(Default::default);
         for (name, spec) in &t.connections {
             catalog.insert(name.clone(), spec.clone());
@@ -1528,9 +1663,14 @@ pub async fn load_submission_with(
     refuse_server_paths_with(&cfg, &[], origin, &refs)?;
     let auth =
         build_catalog(tenant.as_deref(), &cfg).map_err(|e| ServeError::BadConfig(e.to_string()))?;
+    // The submit-time network calls (bound probes, discovery, the auth logins
+    // they trigger) run under the body's reference policy, as the run will.
     tokio::time::timeout(
         SUBMIT_DISCOVERY_TIMEOUT,
-        crate::partition::resolve_runtime_with(&mut cfg, &auth),
+        faucet_core::http::with_reference_policy(
+            std::sync::Arc::new(refs.clone()),
+            crate::partition::resolve_runtime_with(&mut cfg, &auth),
+        ),
     )
     .await
     .map_err(|_| ServeError::Unprocessable {
@@ -1592,6 +1732,81 @@ pub async fn load_submission_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller-supplied fragment (an inline overlay) is screened like a
+    /// submitted config: references, subprocess connectors, paths and URLs.
+    #[test]
+    fn a_caller_fragment_is_screened_like_a_submitted_config() {
+        let root = tempfile::tempdir().unwrap();
+        let args = crate::cli::ReferenceArgs {
+            allow_path_root: vec![root.path().to_path_buf()],
+            allow_env: vec!["FAUCET_FRAGMENT_OK".into()],
+            ..Default::default()
+        };
+        let refs = crate::serve::references::ServeReferencePolicy::from_args(&args).unwrap();
+        let caller = refs.for_origin(
+            BodyOrigin::Caller {
+                allow_subprocess: false,
+            },
+            None,
+        );
+        let inside = root.path().join("state").display().to_string();
+        let ok = serde_json::json!({
+            "execution": { "max_concurrent": 1 },
+            "state": { "type": "file", "config": { "path": inside } },
+            "notifications": [{ "channel": { "type": "webhook", "config": {
+                "url": "https://hooks.example/${env:FAUCET_FRAGMENT_OK}" } } }],
+            "dlq": { "sink": { "type": "jsonl", "config": { "path": format!("{inside}/dlq.jsonl") } } },
+        });
+        screen_caller_fragment(&ok, &caller).expect("an allowed fragment passes");
+
+        let forbidden = |doc: Value, needle: &str| {
+            let err = screen_caller_fragment(&doc, &caller).unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains(needle)),
+                "{needle}: {err:?}"
+            );
+        };
+        forbidden(
+            serde_json::json!({ "state": { "type": "file", "config": { "path": "/proc/self" } } }),
+            "/proc/self",
+        );
+        forbidden(
+            serde_json::json!({ "dlq": { "sink": { "type": "jsonl", "config": {
+                "path": "/var/faucet-elsewhere/dlq.jsonl" } } } }),
+            "faucet-elsewhere",
+        );
+        forbidden(
+            serde_json::json!({ "sla": { "note": "${file:/etc/hostname}" } }),
+            "/etc/hostname",
+        );
+        forbidden(
+            serde_json::json!({ "x": "http://169.254.169.254/latest" }),
+            "metadata",
+        );
+        forbidden(
+            serde_json::json!({ "x": "https://${env:FAUCET_FRAGMENT_OK}/hook" }),
+            "may not come from a token",
+        );
+        let err = screen_caller_fragment(
+            &serde_json::json!({ "dlq": { "sink": { "type": "singer", "config": {} } } }),
+            &caller,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Unprocessable { .. }), "{err:?}");
+        // Open (operator) policy still refuses the system trees.
+        assert!(
+            screen_caller_fragment(
+                &serde_json::json!({ "state": { "type": "file", "config": { "path": "/sys/x" } } }),
+                &ReferencePolicy::open()
+            )
+            .is_err()
+        );
+        assert!(!is_absolute_url("://x"));
+        assert!(!is_absolute_url("1http://x"));
+        assert!(!is_absolute_url("a b://x"));
+        assert!(is_absolute_url("postgres+ssl://h/db"));
+    }
 
     /// A path a request names directly (a DLQ location) is held to the
     /// caller policy, the system trees and a tenant's root.
@@ -2283,6 +2498,66 @@ schedule:
         assert_eq!(dest.config["sandbox"], true);
     }
 
+    #[cfg(feature = "source-duckdb")]
+    #[test]
+    fn the_reconcile_count_probe_is_sandboxed() {
+        let mut cfg = cfg_of(
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\nreconcile:\n  count: { type: duckdb, config: { database: \":memory:\", query: \"SELECT 1 AS n\" } }\n",
+        );
+        confine_sql(&mut cfg);
+        assert_eq!(
+            cfg.reconcile.as_ref().unwrap().count.config["sandbox"],
+            true
+        );
+    }
+
+    /// A transform that reads a file (`lookup`'s `jsonl`) is screened through
+    /// its schema's annotations like a connector.
+    #[tokio::test]
+    async fn a_lookup_transform_reading_outside_the_caller_roots_is_refused() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        for (path, protected) in [
+            ("/var/faucet-not-a-root/ref.jsonl", false),
+            ("/proc/self/environ", true),
+        ] {
+            let body = format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  transforms:\n    - {{ type: lookup, config: {{ jsonl: \"{path}\", on: {{ record: k, ref: k }}, add: {{ v: v }} }} }}\n"
+            );
+            let err = load_submission(&body, ConfigFormat::Yaml, None, None, caller)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains(path)
+                    && (m.contains("system trees") == protected)),
+                "{path}: {err:?}"
+            );
+        }
+        let inside = std::env::temp_dir().join("faucet-lookup-ref.jsonl");
+        let body = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  transforms:\n    - {{ type: lookup, config: {{ jsonl: \"{}\", on: {{ record: k, ref: k }}, add: {{ v: v }} }} }}\n",
+            inside.display()
+        );
+        let err = load_submission(&body, ConfigFormat::Yaml, None, None, caller).await;
+        assert!(
+            !matches!(err, Err(ServeError::Forbidden(_))),
+            "a path under the caller roots passes the screen: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_probe_reading_a_protected_path_is_refused() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let body = "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\nreconcile:\n  count: { type: file, config: { path: /proc/self/environ, format: raw_text } }\n";
+        let err = load_submission(body, ConfigFormat::Yaml, None, None, caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
+    }
+
     #[tokio::test]
     async fn a_probe_reading_a_protected_path_is_refused_before_it_runs() {
         let caller = BodyOrigin::Caller {
@@ -2505,6 +2780,93 @@ schedule:
         screen_auth_catalog(&cfg, &open).unwrap();
         let hosts = ReferencePolicy::open().with_url_hosts(["other.example.com"]);
         assert!(screen_auth_catalog(&cfg, &hosts).is_err());
+    }
+
+    #[test]
+    fn every_provider_endpoint_and_file_is_screened() {
+        let caller = ReferencePolicy::deny_all()
+            .any_url_scheme()
+            .any_url_host()
+            .with_path_roots([std::env::temp_dir()]);
+        let one = |name: &str, spec: Value, policy: &ReferencePolicy, by_caller: bool| {
+            screen_auth_providers([(format!("auth.{name}"), &spec)], policy, by_caller)
+        };
+        let flow = serde_json::json!({"type": "flow", "config": {"steps": [
+            {"request": {"url": "https://login.example/x"}},
+            {"request": {"url": "http://169.254.169.254/latest/meta-data/"}}]}});
+        let err = one("f", flow, &caller, true).unwrap_err().to_string();
+        assert!(err.contains("auth.f.config.steps.1.request.url"), "{err}");
+        let sa = serde_json::json!({"type": "google_service_account", "config": {
+            "key_json": {"token_uri": "http://metadata.google.internal/t"}}});
+        let err = one("g", sa, &caller, true).unwrap_err().to_string();
+        assert!(err.contains("key_json.token_uri"), "{err}");
+        let tmp = std::env::temp_dir().join("k.json").display().to_string();
+        let key_file = serde_json::json!({"type": "google_service_account", "config": {
+            "key_file": tmp, "scopes": ["s"]}});
+        let err = one("g", key_file.clone(), &caller, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("auth.g.config.key_file") && err.contains("key_json"),
+            "{err}"
+        );
+        one("g", key_file, &ReferencePolicy::open(), false).expect("an operator's key file");
+        let persist = serde_json::json!({"type": "oauth2_refresh", "config": {
+            "token_url": "https://idp.example/t", "persist": {"path": tmp, "key": "k"}}});
+        let err = one("p", persist, &caller, true).unwrap_err().to_string();
+        assert!(err.contains("auth.p.config.persist.path"), "{err}");
+        let sys = serde_json::json!({"type": "oauth2_refresh", "config": {
+            "token_url": "https://idp.example/t", "persist": {"path": "/proc/self", "key": "k"}}});
+        let err = one("p", sys, &ReferencePolicy::open(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("system tree"), "{err}");
+    }
+
+    /// A caller's body may not name a file through an auth provider, while a
+    /// provider only the operator's `--default-config` declares may.
+    #[tokio::test]
+    async fn a_callers_auth_providers_are_screened_at_load() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let refs = crate::serve::references::ServeReferencePolicy::default();
+        let pipeline = serde_json::json!({
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "jsonl", "config": { "path": "out.jsonl" } }
+        });
+        let key = std::env::temp_dir().join("faucet-no-such-key.json");
+        let provider = serde_json::json!({ "type": "google_service_account", "config": {
+            "key_file": key.display().to_string(), "scopes": ["s"] } });
+        let body = serde_json::json!({ "version": 1, "auth": { "g": provider },
+            "pipeline": pipeline })
+        .to_string();
+        let err = load_submission_with(&body, ConfigFormat::Json, None, None, caller, None, &refs)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("auth.g.config.key_file")),
+            "{err:?}"
+        );
+        // The same provider in the operator's base is not the caller's: it gets
+        // past the screen (and fails only because the key does not exist).
+        let base = serde_json::json!({ "version": 1, "auth": { "g": provider } });
+        let body = serde_json::json!({ "pipeline": pipeline }).to_string();
+        let err = load_submission_with(
+            &body,
+            ConfigFormat::Json,
+            Some(&base),
+            None,
+            caller,
+            None,
+            &refs,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !matches!(&err, ServeError::Forbidden(_)),
+            "an operator's provider was screened as the caller's: {err:?}"
+        );
     }
 
     #[test]

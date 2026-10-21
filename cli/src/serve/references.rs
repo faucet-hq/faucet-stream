@@ -158,8 +158,9 @@ fn schema_cache() -> &'static SchemaCache {
     CACHE.get_or_init(Default::default)
 }
 
-/// The config schemas of connector `kind` (its source and its sink, as
-/// registered — built-in or plugin).
+/// The config schemas of `kind` — a connector's source and sink, as
+/// registered (built-in or plugin), and a transform of that name — so every
+/// `{type, config}` a config holds is screened through its annotations.
 fn schemas(kind: &str) -> Arc<Vec<Value>> {
     if let Ok(cache) = schema_cache().lock()
         && let Some(hit) = cache.get(kind)
@@ -169,6 +170,7 @@ fn schemas(kind: &str) -> Arc<Vec<Value>> {
     let found: Vec<Value> = [
         crate::registry::source_schema(kind).ok(),
         crate::registry::sink_schema(kind).ok(),
+        crate::transforms::transform_schema(kind).ok(),
     ]
     .into_iter()
     .flatten()

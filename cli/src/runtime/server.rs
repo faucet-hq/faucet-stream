@@ -126,10 +126,19 @@ pub async fn load(
             ServeError::BadConfig(crate::secrets::registry::redact(&e.to_string()).into_owned())
         };
         let auth = loaded.auth_catalog().map_err(bad)?;
-        loaded.nodes = sel
-            .apply_resolved(&loaded.cfg, nodes, &auth)
-            .await
-            .map_err(bad)?;
+        // Resolving the selection may call the source (discovery): under the
+        // body's reference policy, like the load and the run.
+        let refs = std::sync::Arc::new(
+            state
+                .references()
+                .for_origin(principal.body_origin(), principal.tenant()),
+        );
+        loaded.nodes = faucet_core::http::with_reference_policy(
+            refs,
+            sel.apply_resolved(&loaded.cfg, nodes, &auth),
+        )
+        .await
+        .map_err(bad)?;
     }
     Ok(loaded)
 }
@@ -1159,6 +1168,48 @@ mod templates {
         PendingApproval(Box<crate::serve::changes::ChangeRequest>),
     }
 
+    /// An inline overlay is the request's own document, merged into a body
+    /// that otherwise loads trusted: a run for a tenant may not carry one
+    /// (like an `env` override), and anyone else's is screened as a
+    /// caller-submitted config before it is merged.
+    async fn screen_inline_overlay(
+        state: &ServerState,
+        actor: &crate::serve::rbac::AuthContext,
+        id: &str,
+        tenant: Option<&str>,
+        doc: &serde_json::Value,
+    ) -> Result<(), ServeError> {
+        let refused = if tenant.is_some() {
+            Err(ServeError::Forbidden(
+                "an inline `overlay` is never allowed for a tenant-scoped principal or a run \
+                 made for a tenant — name a registered deployment overlay instead"
+                    .into(),
+            ))
+        } else {
+            let policy = state.references().for_origin(state.caller_origin(), None);
+            crate::serve::load::screen_caller_fragment(doc, &policy).map_err(|e| match e {
+                ServeError::Forbidden(m) => ServeError::Forbidden(format!("inline `overlay`: {m}")),
+                ServeError::Unprocessable { message, details } => ServeError::Unprocessable {
+                    message: format!("inline `overlay`: {message}"),
+                    details,
+                },
+                other => other,
+            })
+        };
+        if let Err(e) = &refused {
+            crate::serve::audit::write_target_detail(
+                state,
+                actor,
+                "template.run",
+                format!("template:{id}"),
+                format!("inline overlay refused: {}", e.api_error().error.message),
+                "denied",
+            )
+            .await;
+        }
+        refused
+    }
+
     /// Run a registered template (#444): resolve the version, materialize it
     /// with the caller's params (composing a sink template, applying an
     /// overlay), label the run with its provenance and [`super::submit`] it.
@@ -1195,6 +1246,9 @@ mod templates {
             ));
         }
         let overlay = body.overlay_choice();
+        if let Some(crate::templates::OverlayChoice::Inline(doc)) = &overlay {
+            screen_inline_overlay(&state, &actor, &id, tenant.as_deref(), doc).await?;
+        }
         let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
         // An unpinned request means `stable` — the launched version.
         let s = state.history();

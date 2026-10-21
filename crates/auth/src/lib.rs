@@ -125,6 +125,110 @@ pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
     }
 }
 
+/// One external resource an auth provider spec names: an endpoint it calls
+/// or a local file it reads or writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProviderResource {
+    /// Where it sits in the spec's `config` (a JSON pointer, e.g.
+    /// `/steps/0/request/url`).
+    pub pointer: String,
+    pub kind: faucet_core::resolve::ResourceKind,
+    pub value: String,
+    /// The provider writes this path (a token store), not only reads it.
+    pub writes: bool,
+}
+
+impl ProviderResource {
+    fn new(
+        pointer: impl Into<String>,
+        kind: faucet_core::resolve::ResourceKind,
+        value: &str,
+        writes: bool,
+    ) -> Self {
+        Self {
+            pointer: pointer.into(),
+            kind,
+            value: value.to_string(),
+            writes,
+        }
+    }
+
+    /// The resource as a [`faucet_core::resolve::ResourceRef`], for
+    /// [`faucet_core::resolve::ReferencePolicy::check`].
+    pub fn to_resource_ref(&self) -> faucet_core::resolve::ResourceRef {
+        faucet_core::resolve::ResourceRef::new(self.pointer.clone(), self.kind, self.value.clone())
+    }
+}
+
+/// Every endpoint and local file a `{ type, config }` provider spec names —
+/// what a server must hold to its reference policy before it builds the
+/// provider (building one may read a file; using it calls the endpoints).
+/// Includes the default endpoint a provider falls back to when the spec names
+/// none only where the spec can override it (a service-account key's own
+/// `token_uri`). An unknown type names nothing.
+pub fn provider_resources(spec: &Value) -> Vec<ProviderResource> {
+    use faucet_core::resolve::ResourceKind::{Path, Url};
+    let mut out = Vec::new();
+    let Some(config) = spec.get("config") else {
+        return out;
+    };
+    let kind = spec.get("type").and_then(Value::as_str).unwrap_or_default();
+    let url = |out: &mut Vec<ProviderResource>, pointer: String, v: Option<&Value>| {
+        if let Some(Value::String(s)) = v
+            && !s.trim().is_empty()
+        {
+            out.push(ProviderResource::new(pointer, Url, s, false));
+        }
+    };
+    match kind {
+        "oauth2" => url(&mut out, "/token_url".into(), config.get("token_url")),
+        "oauth2_refresh" => {
+            url(&mut out, "/token_url".into(), config.get("token_url"));
+            if let Some(Value::String(p)) = config.get("persist").and_then(|v| v.get("path")) {
+                out.push(ProviderResource::new("/persist/path", Path, p, true));
+            }
+        }
+        "token_endpoint" => url(&mut out, "/url".into(), config.get("url")),
+        "google_service_account" => {
+            url(&mut out, "/token_uri".into(), config.get("token_uri"));
+            if let Some(Value::String(p)) = config.get("key_file") {
+                out.push(ProviderResource::new("/key_file", Path, p, false));
+            }
+            let key = match config.get("key_json") {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                Some(v @ Value::Object(_)) => Some(v.clone()),
+                _ => None,
+            };
+            if let Some(key) = key {
+                url(&mut out, "/key_json/token_uri".into(), key.get("token_uri"));
+            }
+        }
+        "flow" => {
+            for (i, step) in config
+                .get("steps")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                url(
+                    &mut out,
+                    format!("/steps/{i}/request/url"),
+                    step.get("request").and_then(|r| r.get("url")),
+                );
+            }
+            url(
+                &mut out,
+                "/base_url_from".into(),
+                config.get("base_url_from"),
+            );
+        }
+        _ => {}
+    }
+    out
+}
+
 /// For an `oauth2_refresh` spec (`{ type, config }`) whose `persist:` block
 /// uses the default key: the pre-#789 shared key when a refresh token is still
 /// stored only there (#862 M-077). The provider no longer reads it, so the
@@ -269,6 +373,83 @@ pub(crate) fn parse_expiry_ratio(config: &Value) -> Result<f64, FaucetError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_resources_name_every_endpoint_and_file() {
+        use faucet_core::resolve::ResourceKind;
+        let found = |spec: serde_json::Value| {
+            super::provider_resources(&spec)
+                .into_iter()
+                .map(|r| (r.pointer, r.kind, r.value, r.writes))
+                .collect::<Vec<_>>()
+        };
+        let url = |p: &str, v: &str| (p.to_string(), ResourceKind::Url, v.to_string(), false);
+        assert_eq!(
+            found(serde_json::json!({"type": "oauth2", "config": {"token_url": "https://i/t"}})),
+            vec![url("/token_url", "https://i/t")]
+        );
+        assert_eq!(
+            found(serde_json::json!({"type": "oauth2_refresh", "config": {
+                "token_url": "https://i/t", "persist": {"path": "/srv/tok", "key": "k"}}})),
+            vec![
+                url("/token_url", "https://i/t"),
+                (
+                    "/persist/path".into(),
+                    ResourceKind::Path,
+                    "/srv/tok".into(),
+                    true
+                )
+            ]
+        );
+        assert_eq!(
+            found(serde_json::json!({"type": "token_endpoint", "config": {"url": "https://i/x"}})),
+            vec![url("/url", "https://i/x")]
+        );
+        assert_eq!(
+            found(
+                serde_json::json!({"type": "google_service_account", "config": {
+                "key_file": "/k.json", "token_uri": "https://o/t"}})
+            ),
+            vec![
+                url("/token_uri", "https://o/t"),
+                (
+                    "/key_file".into(),
+                    ResourceKind::Path,
+                    "/k.json".into(),
+                    false
+                )
+            ]
+        );
+        assert_eq!(
+            found(
+                serde_json::json!({"type": "google_service_account", "config": {
+                "key_json": "{\"token_uri\": \"https://k/t\"}"}})
+            ),
+            vec![url("/key_json/token_uri", "https://k/t")]
+        );
+        assert_eq!(
+            found(
+                serde_json::json!({"type": "google_service_account", "config": {
+                "key_json": {"token_uri": "https://k/t"}}})
+            ),
+            vec![url("/key_json/token_uri", "https://k/t")]
+        );
+        assert_eq!(
+            found(serde_json::json!({"type": "flow", "config": {
+                "steps": [{"request": {"url": "https://a/1"}}, {"request": {"url": " "}}],
+                "base_url_from": "${base}"}})),
+            vec![
+                url("/steps/0/request/url", "https://a/1"),
+                url("/base_url_from", "${base}")
+            ]
+        );
+        assert!(found(serde_json::json!({"type": "static", "config": {"token": "t"}})).is_empty());
+        assert!(found(serde_json::json!({"type": "oauth2"})).is_empty());
+        let r = super::provider_resources(
+            &serde_json::json!({"type": "oauth2", "config": {"token_url": "https://i/t"}}),
+        );
+        assert_eq!(r[0].to_resource_ref().value, "https://i/t");
+    }
+
     #[test]
     fn unknown_provider_config_keys_are_refused() {
         let spec = |kind: &str, config: serde_json::Value| serde_json::json!({ "type": kind, "config": config });

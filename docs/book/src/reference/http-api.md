@@ -251,7 +251,16 @@ a URL or a program carries an `x-faucet-resource` annotation in its schema, so
 the server confines connector configs it has never seen, plugin connectors
 included, with no per-connector code. The same allow-list covers `${env:}`,
 `${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
-lineage paths, and the `token_url` / `url` of an `auth:` provider.
+lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,
+a `flow` provider's `steps[].request.url` and `base_url_from`, a service
+account's `token_uri` — in the config or inside `key_json`), a transform that
+reads a file (`lookup`'s `jsonl`), and the `reconcile:` count probe (a SQL probe
+runs sandboxed like every other SQL connector). An `auth:` provider in a
+caller's config may not name a local file at all: pass a service-account key
+inline as `key_json` rather than `key_file`, and leave out `oauth2_refresh`'s
+`persist` (the server decides where tokens are written). A tenant's
+connections are held to the same rules, under the tenant's policy, when they
+are stored and again whenever a run uses them.
 
 | Reference | Default for a caller's config | Widen with |
 |-----------|-------------------------------|------------|
@@ -276,7 +285,10 @@ checked, so it is refused; register the pipeline as a template instead.
 
 **At run time.** A caller's run executes with the caller policy scoped over
 it — on every instance that claims it, sharded or not — so its HTTP connectors
-check the first request and every redirect hop against it. Whatever the
+check the first request and every redirect hop against it. The network
+calls a submission makes before it is queued (partition bound probes,
+discovery fan-out, row selection, and the auth logins they trigger) run under
+the same policy. Whatever the
 origin, an HTTP connector never follows a redirect into a link-local or
 cloud-metadata address.
 
@@ -1043,6 +1055,17 @@ lacks, or declares a param differently from the templates is a `422`; `overlay`
 on a `pipeline` template is a `422`. The run is labelled `overlay` (and
 `overlay_version` for a registered one), and `warnings` flags incremental
 streams composed with no state store.
+
+An **inline** overlay is the request's own document, so it is screened like a
+submitted config before it is merged into the (trusted) template body: its
+`${env:}` / `${file:}` / `${secret:}` / secret-manager references, every local
+path (a `file` state store, a file DLQ sink), every URL (a notification
+webhook, an `http` DLQ sink) and any connector that runs a program are held to
+the [caller reference policy](#reference-policy) — refused with `403` (`422`
+for a subprocess connector without `--allow-subprocess-connectors`). A run for
+a tenant (a tenant-scoped principal, or `POST /v1/tenants/{tenant}/…`) may not
+carry an inline overlay at all (`403`); register the overlay and name it
+instead. Every refusal is audited as a denied `template.run`.
 
 **Registering never moves callers.** `POST /v1/templates` appends a version and
 stops there; `POST /v1/templates/{id}/launch` is the one call that moves `stable`

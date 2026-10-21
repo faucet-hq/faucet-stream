@@ -960,6 +960,20 @@ pub struct ShardingSpec {
     pub count: usize,
 }
 
+impl ShardingSpec {
+    /// Refuse a `count` above [`faucet_core::shard::MAX_SHARDS`].
+    pub fn validate(&self) -> Result<(), String> {
+        let max = faucet_core::shard::MAX_SHARDS;
+        if self.count > max {
+            return Err(format!(
+                "shard.count is {} — at most {max} shards are supported",
+                self.count
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Failure-handling policy across the matrix.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
