@@ -250,3 +250,55 @@ fn invalid_matchers_fail_at_load() {
     let err = RestStream::new(c).err().unwrap().to_string();
     assert!(err.contains("retry_on_response[0]"), "{err}");
 }
+
+/// Throttles each path `throttles` times (counted per path), after a delay
+/// long enough that concurrent partitions overlap.
+struct PerPathThrottle {
+    calls: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    throttles: usize,
+}
+impl Respond for PerPathThrottle {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut calls = self.calls.lock().unwrap();
+        let n = calls.entry(req.url.path().to_string()).or_insert(0);
+        *n += 1;
+        let t = if *n <= self.throttles {
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"code": 17}}))
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": 1}]}))
+        };
+        t.set_delay(Duration::from_millis(50))
+    }
+}
+
+#[tokio::test]
+async fn concurrent_requests_each_get_their_own_match_budget() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    Mock::given(method("GET"))
+        .respond_with(PerPathThrottle {
+            calls: calls.clone(),
+            throttles: 2,
+        })
+        .mount(&server)
+        .await;
+    let mut c = RestStreamConfig::new(&server.uri(), "/p/{n}")
+        .records_path("$.data[*]")
+        .pagination(PaginationStyle::None)
+        .retry_backoff(Duration::from_millis(1));
+    c.retry_on_response = vec![meta_matcher()];
+    c.max_retries = 2;
+    c.partition_concurrency = Some(4);
+    c.partitions = (0..4)
+        .map(|n| std::collections::HashMap::from([("n".to_string(), json!(n))]))
+        .collect();
+    let records = RestStream::new(c)
+        .unwrap()
+        .fetch_all()
+        .await
+        .expect("each partition is within its own max_retries");
+    assert_eq!(records.len(), 4);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 4);
+    assert!(calls.values().all(|n| *n == 3), "{calls:?}");
+}

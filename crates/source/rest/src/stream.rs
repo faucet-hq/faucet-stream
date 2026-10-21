@@ -29,6 +29,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
+tokio::task_local! {
+    /// Consecutive `retry_on_response` matches of the backend call being polled.
+    static MATCHER_HITS: std::cell::Cell<u32>;
+}
+
+/// Run one backend call (all its attempts) with its own `retry_on_response`
+/// match counter. A task-local scope follows the future, so two calls polled
+/// concurrently in one task still count separately.
+fn with_matcher_scope<F: std::future::Future>(
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    MATCHER_HITS.scope(std::cell::Cell::new(0), fut)
+}
+
 /// A configured REST API stream that handles pagination, auth, and extraction.
 pub struct RestStream {
     inner: DriverSource<RestDriver>,
@@ -802,9 +816,7 @@ impl RestDriver {
             headers,
             body,
         )?;
-        let hits = self
-            .matcher_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hits = self.bump_matcher_hits();
         if hits >= self.retry_policy.max_attempts.saturating_sub(1) {
             self.reset_matcher_hits();
             tracing::warn!(
@@ -868,9 +880,29 @@ impl RestDriver {
         )
     }
 
+    /// Count one `retry_on_response` match for the current backend call and
+    /// return the matches before it. Each call runs inside its own
+    /// [`with_matcher_scope`] counter, so concurrent requests (partitions,
+    /// key ranges, a probe beside a job) never share one budget; the
+    /// driver-wide counter only serves a path outside any scope.
+    fn bump_matcher_hits(&self) -> u32 {
+        MATCHER_HITS
+            .try_with(|c| {
+                let n = c.get();
+                c.set(n.saturating_add(1));
+                n
+            })
+            .unwrap_or_else(|_| {
+                self.matcher_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            })
+    }
+
     fn reset_matcher_hits(&self) {
-        self.matcher_hits
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if MATCHER_HITS.try_with(|c| c.set(0)).is_err() {
+            self.matcher_hits
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Count (and warn once about) records that lacked the replication key.
@@ -1548,19 +1580,20 @@ impl RestDriver {
                     // The resolved policy (an injected `resilience:` policy when the
                     // legacy fields are untouched) sets the retry budget + base
                     // backoff; rate limits keep their own budget.
-                    let (body, resp_headers) = self
-                        .call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
-                        .call("page", || {
-                            self.execute_request(
-                                &params_clone,
-                                url_override.as_deref(),
-                                ctx_ref,
-                                is_first_page,
-                                &body_params,
-                                &pass_window_binds,
-                            )
-                        })
-                        .await?;
+                    let (body, resp_headers) = with_matcher_scope(
+                        self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+                            .call("page", || {
+                                self.execute_request(
+                                    &params_clone,
+                                    url_override.as_deref(),
+                                    ctx_ref,
+                                    is_first_page,
+                                    &body_params,
+                                    &pass_window_binds,
+                                )
+                            }),
+                    )
+                    .await?;
 
                     let raw_records = self.extract_page(&body)?;
                     let raw_count = raw_records.len();
@@ -1941,20 +1974,22 @@ impl RestDriver {
         // submitted job, and a connection dropped mid-body is retried the same
         // way the pagination path retries a page. Same policy knobs as the
         // pagination runner.
-        self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
-            .call(op, || async {
-                let resp = self
-                    .job_request_response_once(op, method, url, headers, query, json, false)
-                    .await?;
-                let status = resp.status().as_u16();
-                let resp_headers = resp.headers().clone();
-                let bytes = self.client.bytes(resp).await?;
-                if let Some(e) = self.classify_success_response(status, &resp_headers, &bytes) {
-                    return Err(e);
-                }
-                Ok((bytes, resp_headers))
-            })
-            .await
+        with_matcher_scope(
+            self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+                .call(op, || async {
+                    let resp = self
+                        .job_request_response_once(op, method, url, headers, query, json, false)
+                        .await?;
+                    let status = resp.status().as_u16();
+                    let resp_headers = resp.headers().clone();
+                    let bytes = self.client.bytes(resp).await?;
+                    if let Some(e) = self.classify_success_response(status, &resp_headers, &bytes) {
+                        return Err(e);
+                    }
+                    Ok((bytes, resp_headers))
+                }),
+        )
+        .await
     }
 
     /// Send a fetch request and return the raw [`reqwest::Response`] with its body
@@ -1973,11 +2008,13 @@ impl RestDriver {
         query: &HashMap<String, String>,
         json: Option<&Value>,
     ) -> Result<reqwest::Response, FaucetError> {
-        self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
-            .call(op, || {
-                self.job_request_response_once(op, method, url, headers, query, json, true)
-            })
-            .await
+        with_matcher_scope(
+            self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+                .call(op, || {
+                    self.job_request_response_once(op, method, url, headers, query, json, true)
+                }),
+        )
+        .await
     }
 
     /// One unretried attempt — the shared request-building core of
@@ -3788,9 +3825,11 @@ impl RestDriver {
             return self.discover_get_text_once(url, what).await;
         }
         // Only a `retry_on_response` match (a rate limit) is retried here.
-        self.call_ctx(0)
-            .call("discover", || self.discover_get_text_once(url, what))
-            .await
+        with_matcher_scope(
+            self.call_ctx(0)
+                .call("discover", || self.discover_get_text_once(url, what)),
+        )
+        .await
     }
 
     async fn discover_get_text_once(&self, url: &str, what: &str) -> Result<String, FaucetError> {
@@ -4039,6 +4078,38 @@ impl RestDriver {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn matcher_hits_count_per_call_scope() {
+        let d = RestDriver::new(RestStreamConfig::new("http://x", "/r")).unwrap();
+        let (a, b) = tokio::join!(
+            with_matcher_scope(async {
+                let first = d.bump_matcher_hits();
+                tokio::task::yield_now().await;
+                (first, d.bump_matcher_hits())
+            }),
+            with_matcher_scope(async {
+                let first = d.bump_matcher_hits();
+                tokio::task::yield_now().await;
+                d.reset_matcher_hits();
+                (first, d.bump_matcher_hits())
+            }),
+        );
+        assert_eq!(
+            a,
+            (0, 1),
+            "a sibling's reset must not touch this call's count"
+        );
+        assert_eq!(b, (0, 0));
+        assert_eq!(
+            d.bump_matcher_hits(),
+            0,
+            "outside a scope the driver counter is used"
+        );
+        assert_eq!(d.bump_matcher_hits(), 1);
+        d.reset_matcher_hits();
+        assert_eq!(d.bump_matcher_hits(), 0);
+    }
 
     #[test]
     fn a_truncated_requests_run_fails_only_for_incremental_passes() {
