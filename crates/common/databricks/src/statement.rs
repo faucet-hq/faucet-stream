@@ -496,10 +496,25 @@ impl StatementClient {
                         return Err(spent);
                     }
                     let poll_url = format!("{url}/{id}");
-                    let resp = self.send(Verb::Get, &poll_url, None, &mut auth).await?;
-                    current = self.parse(resp).await?;
+                    let polled = match self.send(Verb::Get, &poll_url, None, &mut auth).await {
+                        Ok(resp) => self.parse(resp).await,
+                        Err(e) => Err(e),
+                    };
+                    // A poll that fails (retries spent, cancelled, deadline,
+                    // an unreadable reply) leaves the statement running on
+                    // the warehouse unless it is cancelled here.
+                    match polled {
+                        Ok(next) => current = next,
+                        Err(e) => {
+                            self.cancel(&id, &auth).await;
+                            return Err(e);
+                        }
+                    }
                 }
                 StatementState::Unknown => {
+                    if let Some(id) = current.statement_id.as_deref() {
+                        self.cancel(id, &auth).await;
+                    }
                     return Err(self.side.error(format!(
                         "databricks: unexpected statement state '{raw_state}'"
                     )));

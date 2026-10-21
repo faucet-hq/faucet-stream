@@ -229,6 +229,47 @@ async fn deadline_cancels_the_statement() {
     assert!(err.to_string().contains("cancelled"), "{err}");
 }
 
+/// A poll that fails after the statement started still cancels it, so the
+/// warehouse does not keep running (and maybe commit) a write the run reported
+/// as failed.
+#[tokio::test]
+async fn a_failed_poll_cancels_the_statement() {
+    for poll_reply in [
+        ResponseTemplate::new(502).set_body_string("bad gateway"),
+        ResponseTemplate::new(200).set_body_string("not json"),
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"statement_id": "s", "status": {"state": "WEIRD"}})),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"statement_id": "s", "status": {"state": "RUNNING"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/s"))
+            .respond_with(poll_reply)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/s/cancel"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            client(&server.uri(), opts())
+                .execute(&StatementRequest::new("MERGE"))
+                .await
+                .is_err()
+        );
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn cancel_failure_is_only_logged() {
     let server = MockServer::start().await;
