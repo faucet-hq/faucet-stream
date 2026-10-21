@@ -128,6 +128,19 @@ fn fits(dest: &Value, page: &Value) -> bool {
     })
 }
 
+/// Whether one record's own `value` for a column fits the destination column
+/// type `dest` — the per-row test behind a column a page-level diff reported
+/// as widened or incompatible, so a row whose value already fits is kept.
+pub(crate) fn value_fits(dest: &Value, name: &str, value: &Value) -> bool {
+    let destination = serde_json::json!({"type": "object", "properties": {name: dest}});
+    let mut row = serde_json::Map::new();
+    row.insert(name.to_string(), value.clone());
+    let page = infer_page_schema(&destination, &[Value::Object(row)]);
+    page.get("properties")
+        .and_then(|p| p.get(name))
+        .is_some_and(|fragment| fits(dest, fragment))
+}
+
 /// Key a sink may add to a column fragment in [`crate::Sink::current_schema`]
 /// listing extra JSON types the column stores faithfully without changing its
 /// declared type — e.g. `{"type":"integer","x-faucet-also-accepts":["boolean"]}`
@@ -579,6 +592,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn value_fits_tests_one_value_against_the_destination_column() {
+        let int = json!({"type": "integer"});
+        assert!(value_fits(&int, "n", &json!(7)));
+        assert!(!value_fits(&int, "n", &json!(1.5)));
+        assert!(!value_fits(&int, "n", &json!("x")));
+        assert!(
+            !value_fits(&int, "n", &Value::Null),
+            "a NOT NULL column refuses null"
+        );
+        let nullable = json!({"type": ["number", "null"]});
+        assert!(value_fits(&nullable, "n", &json!(1.5)));
+        assert!(value_fits(&nullable, "n", &json!(7)));
+        assert!(value_fits(&nullable, "n", &Value::Null));
+        // Exact numeric text lands in a number column (fidelity rendering).
+        assert!(value_fits(&nullable, "n", &json!("12.50")));
+    }
     use serde_json::json;
 
     fn schema(props: Value) -> Value {

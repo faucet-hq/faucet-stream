@@ -7139,8 +7139,8 @@ mod tests {
             droppable_required: vec!["legacy".into()],
         };
         let records = vec![
-            json!({"id": 1, "amount": 1.5, "legacy": "x"}), // touches widened col → DLQ
-            json!({"id": 2, "amount": 7, "legacy": "y"}),   // touches widened col → DLQ
+            json!({"id": 1, "amount": 1.5, "legacy": "x"}), // value needs the widening → DLQ
+            json!({"id": 2, "amount": 7, "legacy": "y"}),   // integer fits the column → kept
             json!({"id": 3, "legacy": "z"}),                // no widened col, has legacy → kept
             json!({"id": 4}),                               // missing required `legacy` → DLQ
         ];
@@ -7148,18 +7148,24 @@ mod tests {
         // index, not the survivor-relative one (#321 L6).
         let page_indices = vec![10, 11, 12, 13];
         let (kept, env) = quarantine_drift_rows(&diff, records, &page_indices, "sink", "pl", "");
-        assert_eq!(kept, vec![json!({"id": 3, "legacy": "z"})]);
+        assert_eq!(
+            kept,
+            vec![
+                json!({"id": 2, "amount": 7, "legacy": "y"}),
+                json!({"id": 3, "legacy": "z"})
+            ]
+        );
         assert_eq!(
             env.len(),
-            3,
-            "widening rows + the missing-required row quarantined"
+            2,
+            "the row whose value needs the widening + the missing-required row"
         );
-        // The three quarantined rows are at page positions 10, 11, 13.
+        // The quarantined rows are at page positions 10 and 13.
         let indices: Vec<i64> = env
             .iter()
             .map(|e| e["record_index"].as_i64().unwrap())
             .collect();
-        assert_eq!(indices, vec![10, 11, 13]);
+        assert_eq!(indices, vec![10, 13]);
     }
 
     #[tokio::test]

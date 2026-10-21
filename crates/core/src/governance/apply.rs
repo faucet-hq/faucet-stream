@@ -530,9 +530,9 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
 /// Partition records: those exhibiting any drift column go to the DLQ; the rest
 /// are kept. Returns `(kept, envelopes)`.
 ///
-/// A row "exhibits drift" if it either **contains** a column whose shape diverges
-/// from the destination — an addition, a type widening, or an incompatible type
-/// change — or **omits** a `droppable_required` column (a destination NOT NULL
+/// A row "exhibits drift" if it either **contains** a column the destination
+/// lacks (an addition), **holds a value** that does not fit its destination
+/// column's type (the rows behind a widening or incompatible change), or **omits** a `droppable_required` column (a destination NOT NULL
 /// column absent from the page). All four buckets must be covered: a widening or
 /// droppable-required column written to a *non-evolved* destination is exactly
 /// the silent corruption `quarantine` exists to prevent.
@@ -546,12 +546,16 @@ pub(crate) fn quarantine_drift_rows(
 ) -> (Vec<Value>, Vec<Value>) {
     use crate::dlq::{DlqReason, build_envelope};
     // Columns that taint a row by their PRESENCE in the record.
-    let present_cols: std::collections::HashSet<&str> = diff
-        .additions
+    let present_cols: std::collections::HashSet<&str> =
+        diff.additions.iter().map(|c| c.name.as_str()).collect();
+    // Columns the page diverges on: a row is tainted only when its OWN value
+    // does not fit the destination column (one 1.5 in an INTEGER column must
+    // not divert every row that carries an integer there).
+    let typed_cols: Vec<(&str, &Value)> = diff
+        .widenings
         .iter()
-        .chain(&diff.widenings)
         .chain(&diff.incompatible)
-        .map(|c| c.name.as_str())
+        .filter_map(|c| c.from.as_ref().map(|dest| (c.name.as_str(), dest)))
         .collect();
     // Required destination columns that taint a row by their ABSENCE.
     let required_cols: std::collections::HashSet<&str> =
@@ -563,6 +567,10 @@ pub(crate) fn quarantine_drift_rows(
             .as_object()
             .map(|m| {
                 m.keys().any(|k| present_cols.contains(k.as_str()))
+                    || typed_cols.iter().any(|(name, dest)| {
+                        m.get(*name)
+                            .is_some_and(|v| !crate::drift::value_fits(dest, name, v))
+                    })
                     || required_cols.iter().any(|c| !m.contains_key(*c))
             })
             .unwrap_or(false);
