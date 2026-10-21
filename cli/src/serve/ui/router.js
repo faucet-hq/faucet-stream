@@ -3,6 +3,7 @@
 const routes = [];
 let teardown = null;
 let rootContainer = null;
+let generation = 0;
 
 export function route(pattern, render) {
   // pattern like "#/runs/:id" → regex with named groups
@@ -23,6 +24,7 @@ export function navigate(hash) {
 }
 
 async function dispatch(container) {
+  const gen = ++generation;
   if (teardown) {
     try { teardown(); } catch { /* ignore */ }
     teardown = null;
@@ -38,7 +40,18 @@ async function dispatch(container) {
     if (m) {
       const params = { query };
       r.names.forEach((n, i) => (params[n] = decodeURIComponent(m[i + 1])));
-      teardown = (await r.render(container, params)) || null;
+      let td = null;
+      try {
+        td = (await r.render(container, params)) || null;
+      } catch (e) {
+        if (gen === generation) throw e;
+        return;
+      }
+      if (gen !== generation) {
+        if (td) { try { td(); } catch { /* ignore */ } }
+        return;
+      }
+      teardown = td;
       return;
     }
   }

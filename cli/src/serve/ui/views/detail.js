@@ -400,11 +400,17 @@ export async function renderDetail(container, { id }) {
     onError: (e) => appendLog(`— log stream error: ${e.message} —`, "log-truncated"),
   });
 
-  await load();
-  return () => {
+  const stop = () => {
     clearTimeout(pollTimer);
     logCtrl?.abort();
   };
+  try {
+    await load();
+  } catch (e) {
+    stop();
+    throw e;
+  }
+  return stop;
 }
 
 /** `98 ok · 2 dlq` — where one invocation's offered rows went (#879). */
