@@ -164,10 +164,17 @@ impl TokenEndpointProvider {
                 self.token_path
             ))
         })?;
-        let expires_in = self
-            .expiry_path
-            .as_deref()
-            .and_then(|p| extract_u64(&body, p));
+        let expires_in = self.expiry_path.as_deref().and_then(|p| {
+            let found = extract_u64(&body, p);
+            if found.is_none() {
+                tracing::warn!(
+                    expiry_path = p,
+                    "token endpoint: expiry_path did not match a non-negative number of seconds; \
+                     the token is reused until the API rejects it"
+                );
+            }
+            found
+        });
         Ok((token, expires_in))
     }
 }
@@ -283,14 +290,52 @@ fn extract_string(body: &Value, path: &str) -> Option<String> {
     }
 }
 
+/// A non-negative number of seconds from an integer, a float (rounded down)
+/// or a numeric string.
 fn extract_u64(body: &Value, path: &str) -> Option<u64> {
     let results = body.query(path).ok()?;
-    results.first()?.as_u64()
+    seconds_of(results.first()?)
+}
+
+fn seconds_of(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64().or_else(|| float_seconds(n.as_f64()?)),
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse::<u64>()
+                .ok()
+                .or_else(|| float_seconds(s.parse::<f64>().ok()?))
+        }
+        _ => None,
+    }
+}
+
+fn float_seconds(f: f64) -> Option<u64> {
+    (f.is_finite() && f >= 0.0).then(|| f.floor() as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_accepts_integers_floats_and_numeric_strings() {
+        use serde_json::json;
+        for (body, want) in [
+            (json!({"e": 3600}), Some(3600)),
+            (json!({"e": 3599.9}), Some(3599)),
+            (json!({"e": "1800"}), Some(1800)),
+            (json!({"e": " 1800.5 "}), Some(1800)),
+            (json!({"e": -5}), None),
+            (json!({"e": "-5"}), None),
+            (json!({"e": "soon"}), None),
+            (json!({"e": "NaN"}), None),
+            (json!({"e": true}), None),
+            (json!({}), None),
+        ] {
+            assert_eq!(extract_u64(&body, "$.e"), want, "{body}");
+        }
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::method;
