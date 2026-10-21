@@ -284,11 +284,16 @@ impl<D: MessageDriver> MessageSinkDriver<D> {
                     }
                 }
                 Ok(Ok(results)) => {
-                    return Err(FaucetError::Sink(format!(
+                    let e = FaucetError::Sink(format!(
                         "{}: {} outcomes for a group of {sent} messages",
                         self.driver.connector_name(),
                         results.len()
-                    )));
+                    ));
+                    if g == 0 {
+                        return Err(e);
+                    }
+                    fail_open(&mut outcomes[base..], || FaucetError::Sink(e.to_string()));
+                    return Ok(outcomes);
                 }
                 Ok(Err(e)) if g == 0 => return Err(e),
                 Ok(Err(e)) => {
