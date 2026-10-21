@@ -1258,6 +1258,18 @@ async fn run_expanded_unredacted(
                             group.dest
                         ),
                     );
+                } else if level_cancelled && opts.limit.is_none() {
+                    // A `--limit` sample is discarded on purpose (warned
+                    // above); a stopped or cancelled run's members did not
+                    // land either.
+                    unswapped.insert(
+                        gi,
+                        format!(
+                            "overwrite of '{}' discarded because the run was stopped or \
+                             cancelled before the group finished; the destination is unchanged",
+                            group.dest
+                        ),
+                    );
                 }
             } else if let Err(e) = sink.commit_overwrite().await {
                 tracing::error!(error = %e, dest = %group.dest, "overwrite: commit failed");
@@ -5302,6 +5314,29 @@ mod tests {
             vec!["OLD".to_string()],
             "destination must be unchanged: {vs:?}"
         );
+    }
+
+    /// An overwrite whose staging is discarded because a sibling failed under
+    /// `on_error: stop` reports its members failed: nothing landed.
+    #[tokio::test]
+    async fn an_overwrite_discarded_by_a_stopped_level_is_not_reported_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite:{}", dir.path().join("ow.db").display());
+        seed_table(&db_url).await;
+        std::fs::write(dir.path().join("a.csv"), "id,v\n1,NEW\n").unwrap();
+        let yaml = format!(
+            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\n  on_error: stop\npipeline:\n  sources:\n    a: {{ type: csv, config: {{ path: '{a}' }} }}\n    b: {{ type: csv, config: {{ path: '{b}' }} }}\n  sinks:\n    t: {{ type: sqlite, config: {{ database_url: '{db_url}', table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}\n    trash: {{ type: jsonl, config: {{ path: '{trash}' }} }}\nmatrix:\n  - id: a\n    source: {{ ref: a }}\n    sink: {{ ref: t }}\n  - id: b\n    source: {{ ref: b }}\n    sink: {{ ref: trash }}\n",
+            a = dir.path().join("a.csv").display(),
+            b = dir.path().join("missing.csv").display(),
+            trash = dir.path().join("trash.jsonl").display(),
+        );
+        let summary = run_yaml(&yaml, &dir.path().join("ow.yaml")).await;
+        let a = summary.invocations.iter().find(|o| o.row_id == "a").unwrap();
+        assert!(
+            a.error.as_deref().is_some_and(|e| e.contains("destination is unchanged")),
+            "{a:?}"
+        );
+        assert_eq!(read_table_vs(&db_url).await, vec!["OLD".to_string()]);
     }
 
     /// A parent record missing a field an overwrite child's sink names fails
