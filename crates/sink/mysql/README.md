@@ -374,7 +374,7 @@ Drive it end-to-end via `Pipeline::new(source, sink).run()`.
 
 ## How it works
 
-1. `MysqlSink::new()` builds a `sqlx::MySqlPool` **once** with the configured `max_connections`.
+1. `MysqlSink::new()` builds a `sqlx::MySqlPool` **once** with the configured `max_connections`. Every pooled connection adds `STRICT_ALL_TABLES` to its session `sql_mode` (keeping the server's other modes), so on a server that is not strict an over-long string, an out-of-range number or non-numeric text for a number column fails the write (or goes to the DLQ) instead of being stored truncated, clamped or as `0`.
 2. `write_batch()` slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT` in its own transaction.
 3. **JSON mode** — each record is serialized to a JSON string: `INSERT INTO t (col) VALUES (?), (?), ...`.
 4. **AutoMap mode** — column names are read from `INFORMATION_SCHEMA.COLUMNS` for the current database; a multi-row INSERT is built dynamically with `?` placeholders, bound as native MySQL types. The column set is the union of record keys across the batch; the INSERT is sub-chunked so `rows × columns` stays under the 65,535-placeholder limit.

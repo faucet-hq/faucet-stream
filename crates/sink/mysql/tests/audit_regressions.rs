@@ -635,3 +635,39 @@ async fn mysql_review_862_regressions() {
         vec!["YES/b'1'"]
     );
 }
+
+/// On a server whose `sql_mode` is not strict, MySQL turns an over-long
+/// string into a warning and stores it truncated; the sink makes its sessions
+/// strict, so the write fails instead of landing a changed value.
+#[tokio::test]
+async fn a_non_strict_server_still_refuses_truncation() {
+    let (_c, url) = start_mysql().await;
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    exec(&pool, "SET GLOBAL sql_mode = 'NO_ENGINE_SUBSTITUTION'").await;
+    exec(
+        &pool,
+        "CREATE TABLE lax (id BIGINT PRIMARY KEY, name VARCHAR(5), n TINYINT)",
+    )
+    .await;
+    pool.close().await;
+
+    let sink = MysqlSink::new(config(&url, "lax", WriteMode::Append, &[]))
+        .await
+        .unwrap();
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "far too long"})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Data too long"), "{err}");
+    let err = sink
+        .write_batch(&[json!({"id": 2, "name": "ok", "n": 100000})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Out of range"), "{err}");
+
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    let rows = texts(&pool, "SELECT CAST(COUNT(*) AS CHAR) FROM lax").await;
+    assert_eq!(rows, ["0"]);
+}

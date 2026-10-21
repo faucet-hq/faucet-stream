@@ -1030,6 +1030,21 @@ impl SqlExecutor for MysqlConn<'_> {
     }
 }
 
+/// Add `STRICT_ALL_TABLES` to a connection's `sql_mode`. A server whose mode
+/// lacks it turns an over-long string, an out-of-range number or non-numeric
+/// text for a number column into a warning and writes a truncated, clamped or
+/// zero value; strict mode makes each a statement error, so the page fails
+/// (or the row goes to the DLQ) instead of landing changed. The server's other
+/// modes are kept.
+pub(crate) const STRICT_SQL_MODE: &str =
+    "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES')";
+
+async fn strict_session(conn: &mut sqlx::MySqlConnection) -> Result<(), sqlx::Error> {
+    sqlx::Executor::execute(conn, STRICT_SQL_MODE)
+        .await
+        .map(|_| ())
+}
+
 impl MysqlSink {
     /// Create a new MySQL sink. Establishes a connection pool.
     pub async fn new(config: MysqlSinkConfig) -> Result<Self, FaucetError> {
@@ -1048,6 +1063,7 @@ impl MysqlSink {
 
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
+            .after_connect(|conn, _meta| Box::pin(async move { strict_session(conn).await }))
             .connect(&config.connection_url)
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL connection failed: {e}")))?;
