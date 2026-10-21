@@ -404,8 +404,7 @@ Staging a crashed run left behind is cleaned up by a later run of the same
 table, with one rule: a run drops another run's staging only once that run's
 token is more than 24 hours old, because a younger one may still be in use. It
 also drops the untokened `<table>__faucet_ovw` an earlier release left. Until
-then, `faucet status --probe` reports the leftover staging as `present`
-(except on `bigquery`, whose probe checks only the untokened name). You may
+then, `faucet status --probe` reports the leftover staging as `present`. You may
 drop a leftover `<table>__faucet_ovw_<token>` yourself once you know its run is
 gone. Library callers that drive the lifecycle without a token keep the single
 `<table>__faucet_ovw` name and its old behaviour: concurrent runs share it.

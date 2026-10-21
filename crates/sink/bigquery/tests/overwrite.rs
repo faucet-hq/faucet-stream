@@ -2298,8 +2298,37 @@ async fn staging_probe_reports_present_and_absent() {
         })))
         .mount(&server)
         .await;
+    // Without a run token the probe also lists every run's tokened staging.
+    let listing = |names: &[String]| {
+        let rows: Vec<_> = names.iter().map(|n| json!({"f": [{"v": n}]})).collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+            "schema": {"fields": [{"name": "table_name", "type": "STRING"}]},
+            "totalRows": rows.len().to_string(),
+            "rows": rows,
+        }))
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(listing(&[]))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, config_overwrite()).await;
     assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
+    let live = format!(
+        "{TABLE_ID}__faucet_ovw_{}",
+        faucet_core::idempotency::new_overwrite_run_token()
+    );
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(listing(&[live]))
+        .mount(&server)
+        .await;
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(true));
 }
 
 /// The resumable-upload initiate body (the load-job JSON) of the first upload.

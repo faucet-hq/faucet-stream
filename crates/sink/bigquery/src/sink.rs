@@ -3513,7 +3513,11 @@ impl StagingDriver for BigQueryDriver {
 
     /// Probe for the `<table>__faucet_ovw` staging table (read-only).
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
-        Ok(self.table_exists(calls, &self.overwrite_temp_id()).await?)
+        if self.table_exists(calls, &self.overwrite_temp_id()).await? {
+            return Ok(true);
+        }
+        // Without a run token (the `faucet status` probe): any run's staging.
+        Ok(self.overwrite_run.is_none() && !self.tokened_staging(calls).await?.is_empty())
     }
 }
 
