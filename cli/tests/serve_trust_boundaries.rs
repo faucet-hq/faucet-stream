@@ -425,6 +425,14 @@ async fn a_viewer_cannot_make_the_server_load_a_config() {
     {
         let (code, _) = api.get("viewer-tok", "/v1/status?template=ghost").await;
         assert_eq!(code, 404, "a template is still readable by a viewer");
+        // Caller params steer what the server connects to: operator only.
+        let with_params = json!({"template": "ghost", "params": {"db_host": "10.0.0.5"}});
+        for route in ["/v1/status", "/v1/mirror/trust"] {
+            let (code, err) = api.post("viewer-tok", route, with_params.clone()).await;
+            assert_eq!(code, 403, "{route}: {err}");
+            let (code, ok) = api.post("op-tok", route, with_params.clone()).await;
+            assert_ne!(code, 403, "{route}: {ok}");
+        }
     }
 }
 

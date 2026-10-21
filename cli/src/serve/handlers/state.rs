@@ -74,6 +74,14 @@ async fn resolve(
                 .into(),
         ));
     }
+    if !src.params.is_empty() && !actor.role.grants(crate::serve::rbac::Permission::Doctor) {
+        return Err(ServeError::Forbidden(
+            "template `params` decide what the server connects to when it reads the state \
+             (a host, a path), which needs the operator role; a viewer reads a template with \
+             its declared defaults"
+                .into(),
+        ));
+    }
     let loaded = match (&src.config, &src.template) {
         (Some(_), Some(_)) => {
             return Err(ServeError::BadConfig(

@@ -27,8 +27,8 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
-| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template` (without caller `params`), `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config` or template `params`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
 ```yaml
@@ -149,7 +149,7 @@ someone does.
 | *any unclassified `/v1` route* | — | — | ✓ |
 
 ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
-² With a registered `template`. An inline `config` is loaded on the server, so it needs `operator` (`403` for a viewer).
+² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
 
 Two entries are POSTs a **read** token can reach, because they change nothing:
 
