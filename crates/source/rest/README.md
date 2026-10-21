@@ -466,6 +466,13 @@ SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
 without such a key fall back to sequential paging. Ranges are planned per run —
 never bookmarked.
 
+When `$metadata` is available, each emitted row's sink patch also carries the
+entity's column `schema` from its EDM types, so a typed sink declares real
+columns: `Edm.DateTimeOffset` / `Edm.Date` become timestamp / date strings and
+`Edm.Decimal` is declared as exact decimal text (`{"type": "string", "format":
+"decimal"}`), never a binary float column; `Edm.Double` / `Edm.Single` stay
+`number`.
+
 ### Response-decode pipeline (`decode`)
 
 Consume payloads that aren't plain JSON — including files embedded in a JSON/SOAP

@@ -49,7 +49,11 @@ pub fn edm_type_to_json(edm_type: &str) -> Value {
     match t {
         "Boolean" => json!({ "type": "boolean" }),
         "Byte" | "SByte" | "Int16" | "Int32" | "Int64" => json!({ "type": "integer" }),
-        "Decimal" | "Double" | "Single" => json!({ "type": "number" }),
+        // An exact decimal never travels as a binary float (value fidelity):
+        // declare it as decimal text so a typed sink makes a lossless column
+        // rather than FLOAT64/DOUBLE. Double/Single are genuine floats.
+        "Decimal" => json!({ "type": "string", "format": "decimal" }),
+        "Double" | "Single" => json!({ "type": "number" }),
         // Temporal EDM types serialize as RFC3339 JSON strings but carry a real
         // date/time type — tag the format so a typed sink (BigQuery) declares
         // TIMESTAMP/DATE and coerces the string on load, rather than STRING.
@@ -338,7 +342,12 @@ mod tests {
     fn edm_types_map_to_json_types() {
         assert_eq!(edm_type_to_json("Edm.Boolean"), json!({"type": "boolean"}));
         assert_eq!(edm_type_to_json("Edm.Int64"), json!({"type": "integer"}));
-        assert_eq!(edm_type_to_json("Edm.Decimal"), json!({"type": "number"}));
+        assert_eq!(
+            edm_type_to_json("Edm.Decimal"),
+            json!({"type": "string", "format": "decimal"})
+        );
+        assert_eq!(edm_type_to_json("Edm.Double"), json!({"type": "number"}));
+        assert_eq!(edm_type_to_json("Edm.Single"), json!({"type": "number"}));
         assert_eq!(edm_type_to_json("Edm.String"), json!({"type": "string"}));
         // Temporal EDM types carry a format hint so typed sinks declare
         // TIMESTAMP/DATE instead of STRING.
@@ -382,7 +391,8 @@ mod tests {
         let schema = d.schema.as_ref().unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["DocEntry"]["type"], "integer");
-        assert_eq!(schema["properties"]["Total"]["type"], "number");
+        assert_eq!(schema["properties"]["Total"]["type"], "string");
+        assert_eq!(schema["properties"]["Total"]["format"], "decimal");
         assert_eq!(schema["properties"]["Posted"]["type"][0], "boolean");
         assert_eq!(schema["properties"]["Posted"]["type"][1], "null");
     }
@@ -437,7 +447,8 @@ mod tests {
         // matches the untransformed record keys; EDM types mapped, temporal
         // types tagged with a format hint.
         assert_eq!(schema["properties"]["DocEntry"]["type"], "integer"); // non-null Int32
-        assert_eq!(schema["properties"]["Total"]["type"], "number"); // non-null Decimal
+        assert_eq!(schema["properties"]["Total"]["type"], "string"); // non-null Decimal
+        assert_eq!(schema["properties"]["Total"]["format"], "decimal");
         assert_eq!(schema["properties"]["DocDate"]["type"][0], "string"); // nullable DateTimeOffset
         assert_eq!(schema["properties"]["DocDate"]["format"], "date-time");
         assert_eq!(schema["properties"]["Posted"]["type"][0], "boolean"); // nullable Boolean

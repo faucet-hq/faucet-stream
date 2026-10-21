@@ -285,7 +285,9 @@ async fn odata_discover_types_objects_from_metadata_and_renders_table_ids() {
     // types instead of autodetecting (and rejecting a row that doesn't fit).
     let schema = &ledger.sink_patch.as_ref().unwrap()["schema"];
     assert_eq!(schema["properties"]["RecId"]["type"], "integer");
-    assert_eq!(schema["properties"]["Amount"]["type"][0], "number");
+    // Edm.Decimal is exact: declared as decimal text, never a float column.
+    assert_eq!(schema["properties"]["Amount"]["type"][0], "string");
+    assert_eq!(schema["properties"]["Amount"]["format"], "decimal");
     server.verify().await;
 }
 
