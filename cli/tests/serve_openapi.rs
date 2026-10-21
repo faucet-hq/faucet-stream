@@ -131,6 +131,9 @@ const ROUTES_TENANTS: &[(&str, &str)] = &[
     ("GET", "/v1/connect/callback"),
 ];
 
+#[cfg(feature = "mcp")]
+const ROUTES_MCP: &[(&str, &str)] = &[("POST", "/mcp")];
+
 /// Returns the full canonical route set for the current feature configuration.
 fn canonical_routes() -> BTreeSet<(String, String)> {
     #[allow(unused_mut)]
@@ -156,6 +159,10 @@ fn canonical_routes() -> BTreeSet<(String, String)> {
     }
     #[cfg(feature = "tenants")]
     for (m, p) in ROUTES_TENANTS {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(feature = "mcp")]
+    for (m, p) in ROUTES_MCP {
         set.insert((m.to_string(), p.to_string()));
     }
     set
@@ -194,6 +201,11 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
             || path.starts_with("/v1/connect/")
             || path.ends_with("/fanout")
         {
+            continue;
+        }
+        // …and the `mcp` feature's transport (#420).
+        #[cfg(not(feature = "mcp"))]
+        if path == "/mcp" {
             continue;
         }
         // …and the `templates` feature's routes (#444).
@@ -297,7 +309,11 @@ async fn every_documented_route_is_wired_on_the_live_server() {
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
-        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+        let mcp = faucet_cli::serve::McpServeSettings {
+            enabled: cfg!(feature = "mcp"),
+            allow_mutations: false,
+        };
+        let _ = faucet_cli::serve::run_server(config, mcp).await;
     });
 
     let client = reqwest::Client::new();

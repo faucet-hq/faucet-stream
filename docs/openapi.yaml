@@ -2540,6 +2540,37 @@ paths:
                       type: string
                       enum: [run_read, run_write, schema_read, doctor, trigger_fire, dlq_read, dlq_manage, catalog_read, template_read, template_admin, local_output_read, local_output_manage, audit_read, reload, identity]
         "401": { description: Missing or invalid bearer token }
+  /mcp:
+    post:
+      summary: Model Context Protocol transport (only with `--mcp`)
+      description: >
+        Mounted only when the server runs with `--mcp` (and was built with the
+        `mcp` feature). The body is one JSON-RPC 2.0 request; the response is
+        its JSON-RPC result or error. The route needs a read scope; mutating
+        tools additionally need `--mcp-allow-mutations` and the caller's
+        run-write scope, and the config-executing tools need the doctor scope.
+      operationId: mcp
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: A JSON-RPC 2.0 request.
+              properties:
+                jsonrpc: { type: string, example: "2.0" }
+                id: {}
+                method: { type: string, example: tools/list }
+                params: { type: object }
+      responses:
+        "200":
+          description: The JSON-RPC response (a tool failure is a JSON-RPC error, still 200).
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /healthz:
     get:
       summary: Liveness probe (unauthenticated)
