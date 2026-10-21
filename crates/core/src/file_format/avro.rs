@@ -755,6 +755,23 @@ fn at(path: &str) -> String {
     }
 }
 
+/// How well a union branch matches a JSON value's own type: `0` an exact
+/// match, `1` a compatible conversion, `2` the lenient text rendering a
+/// `string` branch gives any non-string value.
+fn union_branch_rank(v: &Value, b: &Schema) -> u8 {
+    match (v, b) {
+        (Value::String(_), Schema::String | Schema::Enum(_) | Schema::Uuid(_)) => 0,
+        (Value::Number(n), Schema::Int | Schema::Long) if n.as_i64().is_some() => 0,
+        (Value::Number(n), Schema::Float | Schema::Double) if n.as_i64().is_none() => 0,
+        (Value::Bool(_), Schema::Boolean) => 0,
+        (Value::Object(_), Schema::Record(_) | Schema::Map(_)) => 0,
+        (Value::Array(_), Schema::Array(_)) => 0,
+        (Value::String(_), _) => 1,
+        (_, Schema::String) => 2,
+        _ => 1,
+    }
+}
+
 fn from_json(
     v: &Value,
     schema: &Schema,
@@ -838,11 +855,18 @@ fn from_json(
             {
                 return Ok(Av::Union(i as u32, Box::new(Av::Null)));
             }
+            // Exact JSON-type branches first, the lenient string branch last,
+            // so `["string","long"]` writes 42 as a long, not as "42".
+            let mut order: Vec<(u8, usize)> = variants
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| !matches!(b, Schema::Null))
+                .map(|(i, b)| (union_branch_rank(v, b), i))
+                .collect();
+            order.sort_by_key(|(rank, _)| *rank);
             let mut last = None;
-            for (i, b) in variants.iter().enumerate() {
-                if matches!(b, Schema::Null) {
-                    continue;
-                }
+            for (_, i) in order {
+                let b = &variants[i];
                 match from_json(v, b, names, text, path) {
                     Ok(d) => return Ok(Av::Union(i as u32, Box::new(d))),
                     Err(e) => last = Some(e),
@@ -1375,6 +1399,34 @@ mod tests {
         let names = named(&schema);
         let v = to_json(&datum, &schema, &names, Mode::Arrow, &mut Vec::new()).unwrap();
         assert_eq!(v, json!(r#"{"a":2,"z":1}"#));
+    }
+
+    #[test]
+    fn a_union_prefers_the_branch_of_the_values_own_type() {
+        let schema = Schema::parse_str(
+            r#"{"type":"record","name":"R","fields":[
+                {"name":"amount","type":["null","string","long"]},
+                {"name":"ratio","type":["string","long","double"]},
+                {"name":"flag","type":["string","boolean"]},
+                {"name":"payload","type":["string",{"type":"record","name":"P","fields":[{"name":"x","type":"long"}]}]},
+                {"name":"label","type":["long","string"]}]}"#,
+        )
+        .unwrap();
+        let rec =
+            json!({"amount": 42, "ratio": 1.5, "flag": true, "payload": {"x": 3}, "label": "a"});
+        let datum = datum_from_json_with(&rec, &schema, BytesText::Base64).unwrap();
+        let Av::Record(fields) = datum else { panic!() };
+        assert_eq!(fields[0].1, Av::Union(2, Box::new(Av::Long(42))));
+        assert_eq!(fields[1].1, Av::Union(2, Box::new(Av::Double(1.5))));
+        assert_eq!(fields[2].1, Av::Union(1, Box::new(Av::Boolean(true))));
+        assert!(matches!(&fields[3].1, Av::Union(1, b) if matches!(**b, Av::Record(_))));
+        assert_eq!(fields[4].1, Av::Union(1, Box::new(Av::String("a".into()))));
+        // A value no exact branch takes still falls back to the string branch.
+        let lenient = Schema::parse_str(r#"["null","string","long"]"#).unwrap();
+        assert_eq!(
+            datum_from_json_with(&json!(true), &lenient, BytesText::Base64).unwrap(),
+            Av::Union(1, Box::new(Av::String("true".into())))
+        );
     }
 
     #[test]
