@@ -427,7 +427,10 @@ async fn a_missing_target_without_create_table_is_named() {
     c.create_table = false;
     let sink = MssqlSink::new(c).await.unwrap();
     let err = sink.write_batch(&page()).await.unwrap_err().to_string();
-    assert!(err.contains("t"), "{err}");
+    assert!(
+        err.contains("does not exist") && err.contains("create_table: false"),
+        "{err}"
+    );
 
     server.on_times(TABLE_PROBE, Reply::error("probe broke"), 1);
     let mut c = auto(&server, WriteMode::Append, &[]);
