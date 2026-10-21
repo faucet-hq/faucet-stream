@@ -223,6 +223,11 @@ sink:
       sas_token: "${env:MSSQL_STAGE_SAS}"          # SAS the server uses to READ the stage
 ```
 
+A staged page is one `COPY INTO`, so it lands or fails whole: under a `dlq:`
+the failed page follows `on_batch_error` rather than being split per row, and
+`delivery: exactly_once` is refused (the load cannot commit with the watermark
+row; use `write_mode: upsert` without `staging:` for an exactly-once mirror).
+
 Build with the crate's `staging` feature (CLI: `--features sink-mssql-staging`,
 in `full`). **Azure only** (`az://…`), **CSV only**, and **`write_mode: append`
 only**: `COPY INTO` loads straight into the target table, so `overwrite`, `upsert`
@@ -253,7 +258,7 @@ With `isolate_row_failures: true` (default), a batch that fails is rolled back a
 
 ## Effectively-once delivery
 
-`MssqlSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
+`MssqlSink` implements `Sink::supports_idempotent_writes` (returns `true` unless `staging:` is set) and the two companion hooks:
 
 - `write_batch_idempotent(records, scope, token)` — writes `records` and UPSERTs the `token` into a `_faucet_commit_token(scope NVARCHAR, token NVARCHAR)` watermark table inside the **same transaction** (respecting `transaction_per_batch`), so both commit together or neither does. A scope too long for the key column is stored as a shortened digest form; a watermark written under the form releases before faucet-core 1.13 used is still read, and the next commit moves it to the current form.
 - `last_committed_token(scope)` — reads the current watermark so the pipeline can skip already-committed pages on resume.
@@ -409,7 +414,7 @@ already landed a second time). See
 
 ## Capabilities
 
-Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema. Cleanup needs `column_mapping: auto_columns`; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes (not with a `staging:` block), keyed upsert and schema evolution with a reported schema. Cleanup needs `column_mapping: auto_columns`; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 

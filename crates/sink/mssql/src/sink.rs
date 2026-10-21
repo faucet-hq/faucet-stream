@@ -1989,7 +1989,11 @@ impl SinkDriver for MssqlDriver {
         policy: RowPolicy,
     ) -> Result<PageWrite, FaucetError> {
         match policy {
-            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(self.write_partial(rows).await?)),
+            // `COPY INTO` loads a page whole, so a staged page succeeds or
+            // fails as a unit on the per-row path too.
+            RowPolicy::PerRow if self.config.staging.is_none() => {
+                Ok(PageWrite::from_outcomes(self.write_partial(rows).await?))
+            }
             _ => {
                 let n = self.write_whole(rows).await?;
                 Ok(PageWrite::reported(self.report(rows.len(), n)))
@@ -2014,8 +2018,12 @@ impl SinkDriver for MssqlDriver {
         Some(self)
     }
 
+    /// Not with `staging:`: `COPY INTO` cannot commit with the watermark row.
     fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
-        Some(self)
+        self.config
+            .staging
+            .is_none()
+            .then_some(self as &dyn CommitTokenDriver)
     }
 
     /// Column-mapping mode only: the scope + key predicates address real

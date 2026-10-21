@@ -524,3 +524,18 @@ async fn hung_idempotent_statements_time_out() {
     let err = sink.write_batch(&page()).await.unwrap_err().to_string();
     assert!(err.contains("MSSQL merge"), "{err}");
 }
+
+#[tokio::test]
+async fn a_staged_page_loads_whole_on_the_per_row_path() {
+    let server = TdsServer::start().await.unwrap();
+    script_table(&server);
+    let mut c = auto(&server, WriteMode::Append, &[]);
+    c.staging = Some(
+        serde_json::from_value(json!({"location": "s3://bucket/stage/", "format": "csv"})).unwrap(),
+    );
+    let sink = MssqlSink::new(c).await.unwrap();
+    assert!(!sink.supports_idempotent_writes());
+    // The page goes to the staged load, not row-by-row `INSERT`s.
+    assert!(sink.write_batch_partial(&page()).await.is_err());
+    assert!(!server.saw("INSERT INTO"));
+}

@@ -16,7 +16,7 @@ fn capabilities(config: &Value) -> Capabilities {
             WriteMode::Delete,
             WriteMode::Overwrite,
         ])
-        .idempotent_writes(true)
+        .idempotent_writes(kind_level || !is_set(config, "staging"))
         .keyed_upsert(true)
         .keyed_dedup(!kind_level && dedups_by_key(config))
         .cleanup(column_mapped)
@@ -49,6 +49,14 @@ mod tests {
                 .capabilities(&json!({"column_mapping": {"type": "json_column", "column": "d"}}))
                 .cleanup()
         );
+    }
+
+    #[test]
+    fn a_staged_load_declares_no_idempotent_writes() {
+        let staged = capabilities(&json!({"table": "t", "staging": {"location": "az://c/p"}}));
+        assert!(!staged.idempotent_writes());
+        assert!(capabilities(&json!({"table": "t"})).idempotent_writes());
+        assert!(capabilities(&Value::Null).idempotent_writes());
     }
 
     #[test]
