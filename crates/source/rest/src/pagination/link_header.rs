@@ -9,14 +9,21 @@ use reqwest::header::HeaderMap;
 /// not split a link), and matches the `rel` parameter case-insensitively
 /// whether it is quoted (`rel="next"`) or unquoted (`rel=next`) and even when
 /// it carries multiple space-separated relations (`rel="prev next"`) (#78 LOW).
+///
+/// Every `Link` header field is read: RFC 8288 makes several fields equivalent
+/// to one comma-joined field, and servers commonly send `rel="first"` and
+/// `rel="next"` on separate lines. A field holding non-visible-ASCII bytes is
+/// read lossily rather than ending pagination.
 pub fn extract_next_link(headers: &HeaderMap) -> Option<String> {
-    let link = headers.get("link")?.to_str().ok()?;
-    for (uri, rel) in parse_link_header(link) {
-        if rel
-            .split_whitespace()
-            .any(|tok| tok.eq_ignore_ascii_case("next"))
-        {
-            return Some(uri);
+    for value in headers.get_all("link") {
+        let link = String::from_utf8_lossy(value.as_bytes());
+        for (uri, rel) in parse_link_header(&link) {
+            if rel
+                .split_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case("next"))
+            {
+                return Some(uri);
+            }
         }
     }
     None
@@ -55,11 +62,11 @@ fn parse_link_header(header: &str) -> Vec<(String, String)> {
         let params = &seg[lt + 1 + gt + 1..];
         let mut rel = String::new();
         for param in params.split(';') {
-            let param = param.trim();
-            if let Some(v) = param
-                .strip_prefix("rel=")
-                .or_else(|| param.strip_prefix("rel ="))
-            {
+            // Parameter names are case-insensitive (RFC 8288 §3).
+            let Some((name, v)) = param.split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("rel") {
                 rel = v.trim().trim_matches('"').to_string();
                 break;
             }
@@ -73,6 +80,54 @@ fn parse_link_header(header: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn next_in_a_later_link_field_is_found() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "link",
+            HeaderValue::from_static(r#"<https://api.example.com/items?page=1>; rel="first""#),
+        );
+        headers.append(
+            "link",
+            HeaderValue::from_static(r#"<https://api.example.com/items?page=2>; rel="next""#),
+        );
+        assert_eq!(
+            extract_next_link(&headers),
+            Some("https://api.example.com/items?page=2".to_string()),
+        );
+    }
+
+    #[test]
+    fn rel_parameter_name_is_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "link",
+            HeaderValue::from_static(r#"<https://api.example.com/items?page=2>; REL="next""#),
+        );
+        assert_eq!(
+            extract_next_link(&headers),
+            Some("https://api.example.com/items?page=2".to_string()),
+        );
+    }
+
+    #[test]
+    fn non_ascii_first_field_does_not_end_pagination() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "link",
+            HeaderValue::from_bytes(b"<https://api.example.com/caf\xc3\xa9>; rel=\"about\"")
+                .unwrap(),
+        );
+        headers.append(
+            "link",
+            HeaderValue::from_static(r#"<https://api.example.com/items?page=2>; rel="next""#),
+        );
+        assert_eq!(
+            extract_next_link(&headers),
+            Some("https://api.example.com/items?page=2".to_string()),
+        );
+    }
 
     #[test]
     fn test_extract_next_link() {

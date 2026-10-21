@@ -472,6 +472,43 @@ async fn test_link_header_pagination() {
 }
 
 #[tokio::test]
+async fn link_header_next_in_a_second_link_field_is_followed() {
+    let server = MockServer::start().await;
+    let page1_url = format!("{}/api/split?page=1", server.uri());
+    let page2_url = format!("{}/api/split?page=2", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/split"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 3}]})))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/split"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"items": [{"id": 1}, {"id": 2}]}))
+                .append_header("link", format!(r#"<{page1_url}>; rel="first""#).as_str())
+                .append_header("link", format!(r#"<{page2_url}>; rel="next""#).as_str()),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/api/split")
+            .records_path("$.items[*]")
+            .pagination(PaginationStyle::LinkHeader),
+    )
+    .unwrap();
+
+    let records = stream.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 3, "page 2 must be read: {records:?}");
+    assert_eq!(records[2]["id"], 3);
+}
+
+#[tokio::test]
 async fn test_next_link_in_body_pagination() {
     let server = MockServer::start().await;
     let page2_url = format!("{}/api/workers?page=2", server.uri());
