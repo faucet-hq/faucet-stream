@@ -358,11 +358,7 @@ impl Source for PostgresCdcSource {
     }
 
     fn dataset_uri(&self) -> String {
-        format!(
-            "{}?publication={}",
-            faucet_core::redact_uri_credentials(&self.config.connection_url),
-            self.config.publication_name
-        )
+        publication_uri(&self.config.connection_url, &self.config.publication_name)
     }
 
     /// Preflight probe that does **not** start replication.
@@ -1198,6 +1194,17 @@ fn cycle_ended(max_cycle: Duration, elapsed: Duration, in_txn: bool) -> bool {
     !max_cycle.is_zero() && !in_txn && elapsed >= max_cycle
 }
 
+/// The lineage identity of a publication: the server/database URL without
+/// credentials or connection parameters, plus the publication name.
+fn publication_uri(connection_url: &str, publication: &str) -> String {
+    let redacted = faucet_core::redact_uri_credentials(connection_url);
+    let base = redacted
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(redacted.as_str());
+    format!("{base}?publication={publication}")
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1845,12 +1852,26 @@ mod tests {
         );
     }
 
-    // dataset_uri is a pure-config method; the source requires a live DB to
-    // construct (async + real PG connection), so we verify the logic directly.
     #[test]
     fn dataset_uri_strips_credentials() {
-        let redacted = faucet_core::redact_uri_credentials("postgres://u:p@h:5432/db");
-        let uri = format!("{}?publication={}", redacted, "my_pub");
-        assert_eq!(uri, "postgres://h:5432/db?publication=my_pub");
+        assert_eq!(
+            publication_uri("postgres://u:p@h:5432/db", "my_pub"),
+            "postgres://h:5432/db?publication=my_pub"
+        );
+    }
+
+    #[test]
+    fn dataset_uri_drops_connection_parameters() {
+        assert_eq!(
+            publication_uri(
+                "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=/ca",
+                "pub"
+            ),
+            "postgres://h/db?publication=pub"
+        );
+        assert_eq!(
+            publication_uri("postgres://h/db?sslmode=require#frag", "pub"),
+            "postgres://h/db?publication=pub"
+        );
     }
 }

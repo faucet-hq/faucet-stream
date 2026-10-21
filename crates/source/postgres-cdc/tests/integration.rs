@@ -159,6 +159,9 @@ async fn sslmode_prefer_falls_back_to_plaintext_on_a_server_without_tls() {
         faucet_source_postgres_cdc::CdcTls::Prefer
     );
     let source = PostgresCdcSource::new(config).await.expect("source");
+    let uri = source.dataset_uri();
+    assert!(uri.ends_with("?publication=faucet_pub"), "{uri}");
+    assert!(!uri.contains("sslmode"), "{uri}");
     let _ = source.fetch_all_incremental().await.expect("warm-up");
     ddl(&url, "INSERT INTO public.p VALUES (1);").await;
     let (records, _) = source.fetch_all_incremental().await.expect("fetch");
