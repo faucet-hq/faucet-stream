@@ -420,7 +420,32 @@ pub fn same_shape(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema) ->
         && a.fields()
             .iter()
             .zip(b.fields().iter())
-            .all(|(x, y)| x.name() == y.name() && x.data_type() == y.data_type())
+            .all(|(x, y)| x.name() == y.name() && same_type(x.data_type(), y.data_type()))
+}
+
+/// Type equality that ignores the nullability and metadata of nested fields
+/// (and the name of a list or map entry), as [`same_shape`] does at the top.
+#[cfg(feature = "arrow")]
+fn same_type(a: &arrow::datatypes::DataType, b: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType as D;
+    match (a, b) {
+        (D::List(x), D::List(y))
+        | (D::LargeList(x), D::LargeList(y))
+        | (D::ListView(x), D::ListView(y))
+        | (D::LargeListView(x), D::LargeListView(y)) => same_type(x.data_type(), y.data_type()),
+        (D::FixedSizeList(x, n), D::FixedSizeList(y, m)) => {
+            n == m && same_type(x.data_type(), y.data_type())
+        }
+        (D::Map(x, sx), D::Map(y, sy)) => sx == sy && same_type(x.data_type(), y.data_type()),
+        (D::Struct(x), D::Struct(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(f, g)| f.name() == g.name() && same_type(f.data_type(), g.data_type()))
+        }
+        (D::Dictionary(kx, vx), D::Dictionary(ky, vy)) => kx == ky && same_type(vx, vy),
+        _ => a == b,
+    }
 }
 
 /// The error for two files whose shapes disagree, naming both and the first
@@ -463,6 +488,42 @@ mod tests {
     use super::*;
     #[cfg(feature = "file-format-avro")]
     use serde_json::json;
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn same_shape_ignores_nested_nullability_and_entry_names() {
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+        let list = |name: &str, nullable: bool| {
+            DataType::List(Arc::new(Field::new(name, DataType::Utf8, nullable)))
+        };
+        let strukt = |nullable: bool| {
+            DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, nullable)]))
+        };
+        let a = Schema::new(vec![
+            Field::new("tags", list("item", true), true),
+            Field::new("s", strukt(true), true),
+        ]);
+        let b = Schema::new(vec![
+            Field::new("tags", list("element", false), false),
+            Field::new("s", strukt(false), true),
+        ]);
+        assert!(same_shape(&a, &b));
+        let c = Schema::new(vec![
+            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), true),
+            Field::new("s", strukt(true), true),
+        ]);
+        assert!(!same_shape(&a, &c), "a different leaf type is a conflict");
+        let d = Schema::new(vec![
+            Field::new("tags", list("item", true), true),
+            Field::new(
+                "s",
+                DataType::Struct(Fields::from(vec![Field::new("y", DataType::Int64, true)])),
+                true,
+            ),
+        ]);
+        assert!(!same_shape(&a, &d), "a renamed struct field is a conflict");
+    }
 
     #[cfg(feature = "file-format-avro")]
     fn avro(records: &[Value]) -> Vec<u8> {
