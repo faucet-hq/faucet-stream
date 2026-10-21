@@ -321,7 +321,9 @@ pub(crate) const FNV_BASIS_B: u64 = 0x84222325_cbf29ce4;
 /// A 128-bit fingerprint of `record`'s compared columns: the key columns plus
 /// `columns` (every non-excluded field when `columns` is `None`), each
 /// canonicalised through `norm`. Column order does not matter — the fields are
-/// hashed in sorted name order.
+/// hashed in sorted name order. Without a column list a null field is skipped,
+/// so a column one side omits and the other carries as null hashes alike (as
+/// [`diff_rows`] compares them).
 pub fn row_hash(
     record: &Value,
     key: &[String],
@@ -334,7 +336,12 @@ pub fn row_hash(
     let mut names: Vec<&str> = match columns {
         Some(cols) => cols.iter().map(String::as_str).collect(),
         None => obj
-            .map(|o| o.keys().map(String::as_str).collect())
+            .map(|o| {
+                o.iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, _)| k.as_str())
+                    .collect()
+            })
             .unwrap_or_default(),
     };
     for k in key {
@@ -937,6 +944,28 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn row_hash_treats_absent_and_null_columns_alike() {
+        let key = vec!["id".to_string()];
+        let src = json!({"id": 1, "name": "a"});
+        let dst = json!({"id": 1, "name": "a", "note": null});
+        assert_eq!(
+            row_hash(&src, &key, None, &[], &norm()),
+            row_hash(&dst, &key, None, &[], &norm())
+        );
+        assert!(diff_rows(&[src.clone()], &[dst], &key, None, &[], &norm()).is_empty());
+        assert_ne!(
+            row_hash(&src, &key, None, &[], &norm()),
+            row_hash(
+                &json!({"id": 1, "name": "a", "note": "x"}),
+                &key,
+                None,
+                &[],
+                &norm()
+            )
         );
     }
 
