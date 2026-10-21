@@ -4025,6 +4025,18 @@ mod xml_body_tests {
     }
 
     #[test]
+    fn xml_url_path_fan_out_values_are_percent_encoded() {
+        let ctx: HashMap<String, Value> =
+            HashMap::from([("p".into(), json!({"acct": "../admin/export?all=1#"}))]);
+        let mut cfg = json!({"path": "/accounts/${p.acct}/invoices"});
+        resolve_resource_fields(true, "xml", &mut cfg, &ctx).unwrap();
+        assert_eq!(
+            cfg["path"],
+            "/accounts/..%2Fadmin%2Fexport%3Fall%3D1%23/invoices"
+        );
+    }
+
+    #[test]
     fn url_path_fan_out_values_are_percent_encoded() {
         let ctx: HashMap<String, Value> =
             HashMap::from([("p".into(), json!({"id": "a/b", "href": "/x/1"}))]);

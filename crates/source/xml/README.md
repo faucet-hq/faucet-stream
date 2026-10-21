@@ -68,7 +68,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `base_url` | string | — *(required)* | Base URL of the API. |
-| `path` | string | — *(required)* | Request path appended to `base_url`. |
+| `path` | string | — *(required)* | Request path appended to `base_url`. A `{key}` placeholder (from a parent row or partition) and a `${parent.field}` fan-out token embedded in the path are filled percent-encoded, so a value holding `/`, `?` or `#` stays inside its segment; a value of `.` or `..` fails the request. A path that is exactly one fan-out token takes the value raw. |
 | `method` | string | `GET` | HTTP method. Use `POST` for SOAP. |
 | `body` | string | *(unset)* | Optional **raw** request body — a hand-written SOAP envelope for `POST`. Mutually exclusive with `soap.body_inner`. |
 | `soap` | `SoapConfig` | *(unset)* | First-class SOAP ergonomics — see [SOAP](#soap). Sugar over the raw `body` path. |

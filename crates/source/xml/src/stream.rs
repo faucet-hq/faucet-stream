@@ -222,6 +222,46 @@ fn credential_to_auth(cred: Credential) -> XmlAuth {
     }
 }
 
+/// Fill `{key}` placeholders in a URL path with percent-encoded values, so a
+/// parent value holding `/`, `?` or `#` stays inside its segment instead of
+/// addressing another resource; a value of `.` or `..` is refused.
+fn substitute_path(
+    template: &str,
+    ctx: &HashMap<String, serde_json::Value>,
+) -> Result<String, FaucetError> {
+    let mut encoded = HashMap::with_capacity(ctx.len());
+    for (k, v) in ctx {
+        let raw = match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if template.contains(&format!("{{{k}}}")) && (raw == "." || raw == "..") {
+            return Err(FaucetError::Source(format!(
+                "xml: path placeholder `{{{k}}}` resolved to `{raw}`, which would change the \
+                 request path"
+            )));
+        }
+        encoded.insert(
+            k.clone(),
+            serde_json::Value::String(encode_path_segment(&raw)),
+        );
+    }
+    Ok(faucet_core::util::substitute_context(template, &encoded))
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 impl XmlStream {
     /// Create a new XML stream from the given configuration.
     ///
@@ -628,7 +668,7 @@ impl XmlDriver {
         let path = if context.is_empty() {
             self.config.path.clone()
         } else {
-            faucet_core::util::substitute_context(&self.config.path, context)
+            substitute_path(&self.config.path, context)?
         };
 
         // #567 rich per-request auth: a flow provider may override the base-URL,
@@ -934,6 +974,28 @@ fn short_page(stop_when_short: bool, record_count: usize, size: Option<usize>) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn path_placeholders_are_percent_encoded() {
+        let ctx = HashMap::from([
+            (
+                "acct".to_string(),
+                serde_json::json!("../admin/export?all=1#"),
+            ),
+            ("n".to_string(), serde_json::json!(7)),
+        ]);
+        assert_eq!(
+            substitute_path("/accounts/{acct}/invoices/{n}", &ctx).unwrap(),
+            "/accounts/..%2Fadmin%2Fexport%3Fall%3D1%23/invoices/7"
+        );
+        let dots = HashMap::from([("acct".to_string(), serde_json::json!(".."))]);
+        let err = substitute_path("/accounts/{acct}", &dots).unwrap_err();
+        assert!(
+            err.to_string().contains("would change the request path"),
+            "{err}"
+        );
+        assert_eq!(substitute_path("/fixed", &dots).unwrap(), "/fixed");
+    }
     use super::*;
 
     #[test]

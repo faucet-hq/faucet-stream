@@ -512,3 +512,31 @@ async fn a_deeply_nested_response_fails_instead_of_overflowing_the_stack() {
     let err = XmlStream::new(config).fetch_all().await.unwrap_err();
     assert!(err.to_string().contains("XML nesting exceeds"), "{err}");
 }
+
+#[tokio::test]
+async fn a_parent_value_cannot_rewrite_the_request_path() {
+    use faucet_core::Source as _;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(items_doc(0, 1)))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/accounts/{acct}/invoices")
+        .records_element_path("root.item");
+    let ctx = HashMap::from([(
+        "acct".to_string(),
+        serde_json::json!("../admin/export?all=1#"),
+    )]);
+    let records = XmlStream::new(config)
+        .fetch_with_context(&ctx)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].url.path(),
+        "/accounts/..%2Fadmin%2Fexport%3Fall%3D1%23/invoices"
+    );
+    assert_eq!(received[0].url.query(), None);
+}
