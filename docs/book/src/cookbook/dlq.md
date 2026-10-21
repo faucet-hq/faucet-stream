@@ -215,8 +215,11 @@ DLQ inspect: ./dlq/contract_breaches.jsonl
       {"order_id":"A-17","status":"backordered"}
 ```
 
-The location may be a single `.jsonl` file, a directory of `*.jsonl` files, or a
-glob. Blank, malformed, and non-envelope lines are counted (`malformed` /
+The location may be a single `.jsonl` file, a directory of JSON Lines files
+(`.jsonl` / `.ndjson`, plain or `.gz` / `.zst`-compressed, which are decoded),
+or a glob. A directory or glob skips discard archives, the `replay-failed`
+files a replay writes, and files a writer has not finished (`*.faucet-tmp*`,
+`*.faucet-purge`); name such a file directly to read it. Blank, malformed, and non-envelope lines are counted (`malformed` /
 `non-envelope`) but never abort the read. Add `--reason contract` to restrict the
 breakdown, `--limit N` to size the sample, or `--json` for a machine-readable
 summary.

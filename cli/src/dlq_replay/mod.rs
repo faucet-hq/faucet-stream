@@ -448,6 +448,13 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         if ids.is_empty() {
             continue;
         }
+        if reader::is_compressed(file) {
+            return Err(CliError::Config(format!(
+                "DLQ file '{}' is compressed and cannot be rewritten in place; its discarded \
+                 envelopes stay hidden from replay, inspect and status",
+                file.display()
+            )));
+        }
         let stamp = |f: &std::path::Path| -> CliResult<(u64, Option<std::time::SystemTime>)> {
             let m = std::fs::metadata(f).map_err(|e| {
                 CliError::Internal(format!("reading DLQ file '{}': {e}", f.display()))

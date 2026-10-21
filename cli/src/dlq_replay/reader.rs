@@ -349,6 +349,62 @@ pub fn is_archive(path: &Path) -> bool {
     })
 }
 
+/// Whether a directory or glob listing leaves `path` out: a discard archive or
+/// sidecar, the DLQ a replay writes its re-failures to (read it by naming it),
+/// or a file a writer or `faucet dlq discard --purge` has not finished
+/// (`<name>.faucet-tmp…`, `<name>.faucet-purge`).
+pub fn skipped_in_listing(path: &Path) -> bool {
+    is_archive(path)
+        || super::plan::is_replay_failure(path)
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".faucet-"))
+}
+
+/// Whether a directory entry is a JSON Lines file, compressed or not
+/// (`.jsonl`, `.ndjson`, optionally `.gz` / `.zst`).
+fn is_json_lines_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let base = name
+        .strip_suffix(".gz")
+        .or_else(|| name.strip_suffix(".zst"))
+        .unwrap_or(name);
+    base.ends_with(".jsonl") || base.ends_with(".ndjson")
+}
+
+/// Whether `file` is gzip/zstd-compressed, judged by its name.
+pub fn is_compressed(file: &Path) -> bool {
+    file.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".gz") || n.ends_with(".zst"))
+}
+
+/// Open a DLQ file for line reads, decoding a `.gz` / `.zst` file.
+fn open_lines(
+    file: &Path,
+) -> Result<std::io::BufReader<Box<dyn std::io::Read + Send>>, FaucetError> {
+    let f = std::fs::File::open(file)
+        .map_err(|e| FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display())))?;
+    #[cfg(feature = "compression")]
+    let reader = faucet_core::compression::wrap_sync_reader(
+        f,
+        faucet_core::compression::CompressionConfig::Auto.resolve(&file.to_string_lossy()),
+    );
+    #[cfg(not(feature = "compression"))]
+    let reader: Box<dyn std::io::Read + Send> = if is_compressed(file) {
+        return Err(FaucetError::Config(format!(
+            "DLQ file '{}' is compressed; this build has no `compression` feature",
+            file.display()
+        )));
+    } else {
+        Box::new(f)
+    };
+    Ok(std::io::BufReader::new(reader))
+}
+
 /// The discard sidecar of a DLQ file.
 pub fn discard_sidecar(file: &Path) -> PathBuf {
     let name = file
@@ -433,7 +489,7 @@ fn numbered_parts(glob: &str, location: &str) -> Result<Vec<PathBuf>, FaucetErro
     if files.is_empty() {
         return Err(FaucetError::Source(format!(
             "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
-             .jsonl files, or a glob)"
+             .jsonl / .ndjson files (optionally .gz / .zst), or a glob)"
         )));
     }
     Ok(files)
@@ -480,7 +536,7 @@ fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
         glob::glob(location)
             .map_err(|e| FaucetError::Config(format!("invalid DLQ glob '{location}': {e}")))?
             .filter_map(Result::ok)
-            .filter(|p| p.is_file() && !is_archive(p))
+            .filter(|p| p.is_file() && !skipped_in_listing(p))
             .collect()
     } else {
         let path = Path::new(location);
@@ -489,9 +545,7 @@ fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
                 .map_err(|e| FaucetError::Source(format!("reading DLQ dir '{location}': {e}")))?
                 .filter_map(Result::ok)
                 .map(|e| e.path())
-                .filter(|p| {
-                    p.is_file() && p.extension().is_some_and(|x| x == "jsonl") && !is_archive(p)
-                })
+                .filter(|p| p.is_file() && is_json_lines_name(p) && !skipped_in_listing(p))
                 .collect()
         } else if path.is_file() {
             vec![path.to_path_buf()]
@@ -535,7 +589,7 @@ pub fn starts_sealed(file: &Path) -> Result<bool, FaucetError> {
     let read_err = |e: std::io::Error| {
         FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
     };
-    let reader = std::io::BufReader::new(std::fs::File::open(file).map_err(read_err)?);
+    let reader = open_lines(file)?;
     for line in reader.lines() {
         let line = line.map_err(read_err)?;
         if !line.trim().is_empty() {
@@ -568,7 +622,7 @@ pub fn for_each_line(
     let read_err = |e: std::io::Error| {
         FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
     };
-    let mut reader = std::io::BufReader::new(std::fs::File::open(file).map_err(read_err)?);
+    let mut reader = open_lines(file)?;
     let mut line = String::new();
     loop {
         line.clear();
@@ -1019,6 +1073,63 @@ mod tests {
         assert_eq!(got.len(), 2, "glob matches both .jsonl files, not the .txt");
         // A glob that matches nothing errors.
         assert!(expand_location(&format!("{}/*.none", dir.path().display())).is_err());
+    }
+
+    #[test]
+    fn listings_skip_replay_failures_and_unfinished_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "dlq.jsonl",
+            "replay-failed.jsonl",
+            "dlq.replay-failed.jsonl",
+            "dlq.jsonl.faucet-tmp",
+            "dlq.jsonl.faucet-purge",
+            "dlq.jsonl.faucet-tmp-upload-1",
+        ] {
+            std::fs::write(dir.path().join(name), "\n").unwrap();
+        }
+        let only = vec![dir.path().join("dlq.jsonl")];
+        assert_eq!(expand_location(dir.path().to_str().unwrap()).unwrap(), only);
+        assert_eq!(
+            expand_location(&format!("{}/*", dir.path().display())).unwrap(),
+            only
+        );
+        let named = dir.path().join("replay-failed.jsonl");
+        assert_eq!(
+            expand_location(named.to_str().unwrap()).unwrap(),
+            vec![named]
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn compressed_and_ndjson_files_are_listed_and_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::json!({
+            "error": {"kind": "QualityFailure", "message": "x"},
+            "reason": "quality",
+            "payload": {"id": 1},
+            "ts_ms": 1,
+        })
+        .to_string();
+        use faucet_core::compression::{Compression, compress_buf};
+        let body = format!("{line}\n");
+        std::fs::write(
+            dir.path().join("a.jsonl.gz"),
+            compress_buf(body.as_bytes(), Compression::Gzip).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.ndjson.zst"),
+            compress_buf(body.as_bytes(), Compression::Zstd).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("c.ndjson"), format!("{line}\n")).unwrap();
+        let files = expand_location(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(files.len(), 3, "{files:?}");
+        let scan = scan_files(&files, &DlqDecryptor::default()).unwrap();
+        assert_eq!(scan.envelopes.len(), 3);
+        assert_eq!(scan.malformed, 0);
     }
 
     #[test]
