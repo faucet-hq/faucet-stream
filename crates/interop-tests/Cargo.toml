@@ -41,6 +41,7 @@ faucet-source-file = { workspace = true, features = ["arrow", "encryption", "fil
 faucet-source-gcs = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-iceberg = { workspace = true, features = ["arrow", "catalog-sql"] }
 faucet-source-mysql.workspace = true
+faucet-source-mysql-cdc.workspace = true
 faucet-source-oracle.workspace = true
 faucet-source-postgres.workspace = true
 faucet-source-postgres-cdc.workspace = true

@@ -144,7 +144,7 @@ Every change event is one JSON object:
 | Column type | JSON |
 |---|---|
 | `TIMESTAMP` | RFC 3339 UTC string |
-| `DATETIME` / `DATE` / `TIME` | `YYYY-MM-DD HH:MM:SS[.fff]` / `YYYY-MM-DD` / `HH:MM:SS[.fff]` strings |
+| `DATETIME` / `DATE` / `TIME` | RFC 3339 at `+00:00` (`2024-01-03T04:05:06.123456+00:00`, exactly as the `mysql` query source snapshots it; a zero date keeps `0000-00-00 00:00:00`) / `YYYY-MM-DD` / `HH:MM:SS[.fff]` strings |
 | `YEAR` | number |
 | `FLOAT` | the single-precision value's shortest decimal form |
 | `ENUM` / `SET` | the label / the comma-joined labels (needs `binlog_row_metadata=FULL`, already required) |

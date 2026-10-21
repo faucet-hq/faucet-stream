@@ -139,7 +139,7 @@ pub enum ColumnHint {
     Timestamp,
     /// `DATE`: `YYYY-MM-DD`.
     Date,
-    /// `DATETIME`: `YYYY-MM-DD HH:MM:SS[.fff…]`.
+    /// `DATETIME`: RFC 3339 at `+00:00`, as the query source renders it.
     DateTime,
     /// `TIME`: `HH:MM:SS[.fff…]`.
     Time,
@@ -312,12 +312,24 @@ fn hinted_value(hint: &ColumnHint, v: &Value) -> Option<Json> {
         (ColumnHint::Date, Value::Date(y, mo, d, ..)) => {
             Some(Json::String(format!("{y:04}-{mo:02}-{d:02}")))
         }
-        (ColumnHint::DateTime, Value::Date(y, mo, d, h, mi, s, micro)) => {
-            Some(Json::String(format!(
-                "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{}",
-                fraction(*micro)
-            )))
-        }
+        // The query source decodes DATETIME as a UTC instant and renders
+        // RFC 3339, so a mirror's snapshot and change rows agree. A value
+        // chrono cannot hold (a zero date) keeps MySQL's own text.
+        (ColumnHint::DateTime, Value::Date(y, mo, d, h, mi, s, micro)) => Some(Json::String(
+            chrono::NaiveDate::from_ymd_opt(i32::from(*y), u32::from(*mo), u32::from(*d))
+                .and_then(|date| {
+                    date.and_hms_micro_opt(u32::from(*h), u32::from(*mi), u32::from(*s), *micro)
+                })
+                .map_or_else(
+                    || {
+                        format!(
+                            "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{}",
+                            fraction(*micro)
+                        )
+                    },
+                    |at| at.and_utc().to_rfc3339(),
+                ),
+        )),
         (ColumnHint::Time, Value::Time(false, 0, h, mi, s, micro)) if *h < 24 => Some(
             Json::String(format!("{h:02}:{mi:02}:{s:02}{}", fraction(*micro))),
         ),
@@ -487,7 +499,11 @@ mod tests {
                 ColumnHint::DateTime,
                 Value::Date(2026, 6, 6, 12, 30, 0, 123_456)
             ),
-            Some(Json::String("2026-06-06 12:30:00.123456".into()))
+            Some(Json::String("2026-06-06T12:30:00.123456+00:00".into()))
+        );
+        assert_eq!(
+            v(ColumnHint::DateTime, Value::Date(0, 0, 0, 0, 0, 0, 0)),
+            Some(Json::String("0000-00-00 00:00:00".into()))
         );
         assert_eq!(
             v(ColumnHint::Time, Value::Time(false, 0, 10, 0, 0, 0)),

@@ -613,14 +613,14 @@ async fn anchor_types_and_compressed_transactions() {
         rows[0],
         &json!({
             "id": 1, "at": "2026-06-06T12:30:00+00:00", "status": "shipped",
-            "flags": "a,c", "d": "2026-06-06", "dt": "2026-06-06 12:30:00.500",
+            "flags": "a,c", "d": "2026-06-06", "dt": "2026-06-06T12:30:00.500+00:00",
             "tm": "10:00:00", "y": 2026, "f": 0.1
         })
     );
     assert_eq!(rows[1]["at"], json!(null));
     assert_eq!(rows[1]["flags"], json!(""));
     assert_eq!(rows[1]["y"], json!(0), "YEAR 0000 is 0, not 1900");
-    assert_eq!(rows[1]["dt"], json!("2026-01-02 00:00:00"));
+    assert_eq!(rows[1]["dt"], json!("2026-01-02T00:00:00+00:00"));
 
     // SQL-28: a compressed transaction's bookmark is the payload's end.
     source

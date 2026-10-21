@@ -5409,6 +5409,7 @@ dependencies = [
  "faucet-source-graphql",
  "faucet-source-iceberg",
  "faucet-source-mysql",
+ "faucet-source-mysql-cdc",
  "faucet-source-oracle",
  "faucet-source-parquet",
  "faucet-source-postgres",
