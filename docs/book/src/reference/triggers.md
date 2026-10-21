@@ -391,7 +391,7 @@ faucet schema triggers     # print the JSON Schema for the triggers file
 | `faucet_serve_trigger_runs_dropped_total` | Counter | `trigger`, `reason` | Fires dropped because the run queue was full (`reason="queue_full"`) |
 | `faucet_serve_trigger_errors_total` | Counter | `trigger`, `type` | Watcher errors (poll failures, etc.) |
 | `faucet_serve_trigger_missed_ticks_total` | Counter | `trigger` | `schedule` ticks that never ran: passed while no server was up, or collapsed into one catch-up |
-| `faucet_serve_trigger_tenant_failures_total` | Counter | `trigger`, `tenant` | Fan-out fires refused for one tenant while the other tenants ran |
+| `faucet_serve_trigger_tenant_failures_total` | Counter | `trigger`, `tenant` | Fan-out fires refused for one tenant, or skipped at its `max_concurrent_runs` limit, while the other tenants ran |
 
 ## Cluster note
 

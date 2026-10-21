@@ -130,20 +130,44 @@ pub async fn fire(
     let mut outcomes = Vec::with_capacity(targets.len());
     for tenant in targets {
         let outcome = fire_one(state, compiled, &event, fired_at, tenant.as_deref()).await;
-        let outcome = match (tenant, outcome) {
-            (Some(t), FireOutcome::Failed(e)) => {
-                tenant_fire_failed(state, compiled.name(), &t, &e).await;
-                FireOutcome::Coalesced
-            }
-            (Some(t), FireOutcome::Error(e)) => {
-                tracing::warn!(trigger = compiled.name(), tenant = %t, error = %e, "tenant fire failed; retrying");
-                FireOutcome::Error(e)
-            }
-            (_, other) => other,
-        };
+        let (outcome, refused) = fold_tenant(compiled.name(), tenant.as_deref(), outcome);
+        if let (Some(t), Some(e)) = (&tenant, refused) {
+            tenant_fire_failed(state, compiled.name(), t, &e).await;
+        }
         outcomes.push(outcome);
     }
     combine(outcomes)
+}
+
+/// One tenant's outcome as the fan-out counts it, and the error to report for
+/// that tenant when its fire was refused for good. A tenant's refusal or its
+/// concurrency limit commits for it, so the shared event is not held back
+/// for every other tenant; a transient error is still retried.
+fn fold_tenant(
+    trigger: &str,
+    tenant: Option<&str>,
+    outcome: FireOutcome,
+) -> (FireOutcome, Option<String>) {
+    let Some(t) = tenant else {
+        return (outcome, None);
+    };
+    match outcome {
+        FireOutcome::Failed(e) => (FireOutcome::Coalesced, Some(e)),
+        FireOutcome::Error(e) => {
+            tracing::warn!(trigger, tenant = %t, error = %e, "tenant fire failed; retrying");
+            (FireOutcome::Error(e), None)
+        }
+        FireOutcome::Dropped(TENANT_LIMIT) => {
+            tracing::warn!(
+                trigger,
+                tenant = %t,
+                "tenant is at its max_concurrent_runs limit; this fire is skipped for it"
+            );
+            metrics::tenant_failed(trigger, t);
+            (FireOutcome::Coalesced, None)
+        }
+        other => (other, None),
+    }
 }
 
 /// One tenant's fire was refused for a reason a retry cannot fix: record it
@@ -172,6 +196,9 @@ async fn tenant_fire_failed(state: &ServerState, trigger: &str, tenant: &str, er
     #[cfg(not(feature = "tenants"))]
     let _ = state;
 }
+
+/// The drop reason for a tenant at its `max_concurrent_runs` limit.
+const TENANT_LIMIT: &str = "tenant_limit";
 
 fn is_deterministic(e: &crate::serve::error::ServeError) -> bool {
     use crate::serve::error::ServeError;
@@ -317,8 +344,8 @@ async fn fire_one(
             FireOutcome::Dropped("queue_full")
         }
         Err(crate::serve::error::ServeError::TooManyRequests(_)) => {
-            metrics::dropped(compiled.name(), "tenant_limit");
-            FireOutcome::Dropped("tenant_limit")
+            metrics::dropped(compiled.name(), TENANT_LIMIT);
+            FireOutcome::Dropped(TENANT_LIMIT)
         }
         Err(crate::serve::error::ServeError::Conflict(m)) if kind == "queue_depth" => {
             metrics::error(compiled.name(), kind);
@@ -590,6 +617,33 @@ mod tests {
         ));
     }
     use crate::serve::triggers::spec::{RunTemplate, TriggerKind, TriggerSpec};
+
+    /// A tenant at its concurrency limit skips the fire for itself; the
+    /// fan-out still commits for the others. Queue backpressure is retried.
+    #[test]
+    fn a_tenant_at_its_limit_does_not_hold_back_the_fan_out() {
+        let outcomes = vec![
+            fold_tenant("t", Some("big"), FireOutcome::Dropped(TENANT_LIMIT)).0,
+            fold_tenant("t", Some("small"), FireOutcome::Enqueued("r2".into())).0,
+        ];
+        assert!(matches!(combine(outcomes), FireOutcome::Enqueued(ref id) if id == "r2"));
+        let (o, refused) = fold_tenant("t", Some("x"), FireOutcome::Failed("bad".into()));
+        assert!(matches!(o, FireOutcome::Coalesced));
+        assert_eq!(refused.as_deref(), Some("bad"));
+        assert!(matches!(
+            fold_tenant("t", Some("x"), FireOutcome::Dropped("queue_full")).0,
+            FireOutcome::Dropped("queue_full")
+        ));
+        assert!(matches!(
+            fold_tenant("t", Some("x"), FireOutcome::Error("e".into())).0,
+            FireOutcome::Error(_)
+        ));
+        // Without a tenant the outcome is untouched.
+        assert!(matches!(
+            fold_tenant("t", None, FireOutcome::Dropped(TENANT_LIMIT)).0,
+            FireOutcome::Dropped(TENANT_LIMIT)
+        ));
+    }
 
     fn compiled_webhook() -> CompiledTrigger {
         CompiledTrigger {
