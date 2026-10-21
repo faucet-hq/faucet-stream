@@ -87,12 +87,23 @@ impl std::fmt::Display for WindowStep {
 }
 
 impl WindowStep {
-    /// The nominal duration, for logging and for the absolute fallback.
-    fn nominal(self) -> Duration {
+    /// The nominal duration, for the absolute fallback. `None` when the step
+    /// does not fit in a [`Duration`].
+    fn nominal(self) -> Option<Duration> {
         match self {
-            Self::Absolute(d) => d,
-            Self::Days(n) => Duration::days(n),
-            Self::Weeks(n) => Duration::weeks(n),
+            Self::Absolute(d) => Some(d),
+            Self::Days(n) => Duration::try_days(n),
+            Self::Weeks(n) => Duration::try_weeks(n),
+        }
+    }
+
+    /// The calendar day count of a `d` / `w` step. `None` for an absolute step
+    /// or one too large to count.
+    fn calendar_days(self) -> Option<i64> {
+        match self {
+            Self::Absolute(_) => None,
+            Self::Days(n) => Some(n),
+            Self::Weeks(n) => n.checked_mul(7),
         }
     }
 }
@@ -125,8 +136,14 @@ pub fn parse_window(s: &str) -> CliResult<WindowStep> {
         "s" => WindowStep::Absolute(Duration::try_seconds(n).ok_or_else(out_of_range)?),
         "m" => WindowStep::Absolute(Duration::try_minutes(n).ok_or_else(out_of_range)?),
         "h" => WindowStep::Absolute(Duration::try_hours(n).ok_or_else(out_of_range)?),
-        "d" => WindowStep::Days(n),
-        "w" => WindowStep::Weeks(n),
+        "d" => {
+            Duration::try_days(n).ok_or_else(out_of_range)?;
+            WindowStep::Days(n)
+        }
+        "w" => {
+            Duration::try_weeks(n).ok_or_else(out_of_range)?;
+            WindowStep::Weeks(n)
+        }
         _ => return Err(err()),
     };
     Ok(step)
@@ -145,7 +162,7 @@ fn advance_calendar(cursor: DateTime<Utc>, tz: chrono_tz::Tz, days: i64) -> Opti
     let naive = cursor
         .with_timezone(&tz)
         .naive_local()
-        .checked_add_signed(Duration::days(days))?;
+        .checked_add_signed(Duration::try_days(days)?)?;
     for extra_hours in 0..=3 {
         let candidate = naive.checked_add_signed(Duration::hours(extra_hours))?;
         if let Some(local) = tz.from_local_datetime(&candidate).earliest() {
@@ -210,21 +227,19 @@ pub fn plan_windows(
         // Calendar steps keep the local wall clock; absolute steps add elapsed
         // time. Either way the next boundary must be strictly ahead of the
         // cursor, or the loop could not terminate — fall back to the nominal
-        // duration if a zone quirk ever produced a non-advancing instant.
-        let next = match step {
-            WindowStep::Absolute(d) => cursor + d,
-            WindowStep::Days(n) => {
-                advance_calendar(cursor, tz, n).unwrap_or(cursor + step.nominal())
-            }
-            WindowStep::Weeks(n) => {
-                advance_calendar(cursor, tz, n * 7).unwrap_or(cursor + step.nominal())
-            }
+        // duration if a zone quirk ever produced a non-advancing instant. A
+        // boundary past the representable date range lies beyond `end`, so it
+        // ends the range.
+        let nominal = || {
+            step.nominal()
+                .and_then(|d| cursor.checked_add_signed(d))
+                .unwrap_or(end)
         };
-        let next = if next > cursor {
-            next
-        } else {
-            cursor + step.nominal()
+        let next = match step.calendar_days() {
+            None => nominal(),
+            Some(days) => advance_calendar(cursor, tz, days).unwrap_or_else(nominal),
         };
+        let next = if next > cursor { next } else { nominal() };
         let unit_end = next.min(end);
         units.push(TimeChunk {
             id: cursor.format("%Y%m%dT%H%M%SZ").to_string(),
@@ -721,6 +736,36 @@ mod tests {
             assert!(err.to_string().contains("too large"), "{w}: {err}");
         }
         assert!(parse_window("5é").is_err());
+    }
+
+    #[test]
+    fn huge_calendar_windows_are_a_usage_error_not_a_panic() {
+        for w in [
+            "999999999999999d",
+            "2000000000000000000w",
+            "9223372036854775807d",
+        ] {
+            let err = parse_window(w).unwrap_err();
+            assert!(err.to_string().contains("too large"), "{w}: {err}");
+        }
+    }
+
+    #[test]
+    fn windows_past_the_date_range_end_the_range_instead_of_panicking() {
+        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
+        let from = parse_boundary("2026-01-01", tz).unwrap();
+        let to = parse_boundary("2026-02-01", tz).unwrap();
+        for step in [
+            parse_window("9000000000000s").unwrap(),
+            parse_window("100000000000d").unwrap(),
+            parse_window("15000000000w").unwrap(),
+            WindowStep::Days(i64::MAX),
+            WindowStep::Weeks(i64::MAX),
+        ] {
+            let units = plan_windows(from, to, Some(step), tz).unwrap();
+            assert_eq!(units.len(), 1, "{step}");
+            assert_eq!(units[0].end, to, "{step}");
+        }
     }
 
     #[test]
