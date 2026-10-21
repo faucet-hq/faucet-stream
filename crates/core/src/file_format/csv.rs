@@ -231,6 +231,7 @@ fn encode_rows(
     quote: u8,
     has_headers: bool,
 ) -> Result<Vec<u8>, FaucetError> {
+    super::require_objects(records, "csv")?;
     let headers = super::header_union(records);
     let mut wtr = csv::WriterBuilder::new()
         .delimiter(delimiter)
@@ -255,6 +256,15 @@ fn encode_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_object_record_is_refused_not_written_as_an_empty_row() {
+        let recs = vec![serde_json::json!({"a": 1}), serde_json::json!("b")];
+        let err = encode_rows(&recs, b',', b'"', true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("record 1 is not a JSON object"), "{err}");
+    }
     use serde_json::json;
 
     #[tokio::test]

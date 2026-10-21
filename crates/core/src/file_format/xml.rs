@@ -18,14 +18,29 @@ use serde_json::{Map, Value};
 
 /// Parse XML bytes into records.
 ///
-/// `record_element` names the repeated element. When no element of that name
-/// exists, the document root's direct children are used instead — right for the
+/// `record_element` names the repeated element, matched at any depth. The
+/// default name (`record`) is matched only directly under the root. When no
+/// element of that name exists, the document root's direct children are used instead — right for the
 /// common `<rows><row/>…</rows>` shape without forcing every config to spell it
 /// out, and reported in the error when neither yields anything.
 pub fn decode(bytes: &[u8], record_element: &str) -> Result<Vec<Value>, FaucetError> {
     let doc = to_json(bytes)?;
     let mut out = Vec::new();
-    collect(&doc, record_element, &mut out);
+    if record_element == super::default_record_element() {
+        // The default name is not a declaration: match it only directly under
+        // the root (where the writer puts it), so a nested field that happens
+        // to be called `record` never replaces the real rows.
+        if let Some(found) = doc
+            .as_object()
+            .and_then(|m| m.values().next())
+            .and_then(Value::as_object)
+            .and_then(|root| root.get(record_element))
+        {
+            collect_value(found, &mut out);
+        }
+    } else {
+        collect(&doc, record_element, &mut out);
+    }
     if !out.is_empty() {
         return Ok(out);
     }
@@ -69,6 +84,14 @@ fn collect(v: &Value, key: &str, out: &mut Vec<Value>) {
             }
             Work::Visit(_) => {}
         }
+    }
+}
+
+/// `v` as records: an array's items, or `v` itself.
+fn collect_value(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Array(items) => out.extend(items.iter().cloned()),
+        other => out.push(other.clone()),
     }
 }
 
@@ -346,6 +369,24 @@ pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_default_record_name_only_matches_directly_under_the_root() {
+        let xml = b"<exports><item><id>1</id><record>A-1</record></item>\
+                    <item><id>2</id><record>B-2</record></item></exports>";
+        assert_eq!(
+            decode(xml, "record").expect("decode"),
+            vec![
+                json!({"id": "1", "record": "A-1"}),
+                json!({"id": "2", "record": "B-2"})
+            ]
+        );
+        // A named element is still found at any depth.
+        assert_eq!(
+            decode(xml, "id").expect("decode"),
+            vec![json!("1"), json!("2")]
+        );
+    }
 
     #[test]
     fn a_document_cut_between_records_is_an_error() {

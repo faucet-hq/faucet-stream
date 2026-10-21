@@ -45,9 +45,23 @@ pub fn decode(
     if total_rows == 0 {
         return Ok(Vec::new());
     }
+    // `header_row` counts sheet rows, but calamine's range starts at the first
+    // non-empty row, so translate. The default 0 keeps meaning "the first row
+    // with content"; any other row above the used range is blank.
+    let start_row = range.start().map_or(0, |(r, _)| r as usize);
+    let header_at = if header_row == 0 {
+        0
+    } else if header_row < start_row {
+        return Err(FaucetError::Source(format!(
+            "xlsx: header_row {header_row} is blank in sheet '{name_of_sheet}' (its first \
+             row with content is {start_row}, 0-based)"
+        )));
+    } else {
+        header_row - start_row
+    };
     let headers: Vec<String> = range
         .rows()
-        .nth(header_row)
+        .nth(header_at)
         .ok_or_else(|| {
             FaucetError::Source(format!(
                 "xlsx: header_row {header_row} is beyond the sheet ({total_rows} rows)"
@@ -77,9 +91,9 @@ pub fn decode(
     }
     // A calamine range is rectangular, so every row is exactly as wide as the
     // header and each cell has its own (now unique) key.
-    let timestamps = timestamp_columns(range.rows().skip(header_row + 1));
+    let timestamps = timestamp_columns(range.rows().skip(header_at + 1));
     let mut out = Vec::new();
-    for row in range.rows().skip(header_row + 1) {
+    for row in range.rows().skip(header_at + 1) {
         let obj: Map<String, Value> = headers
             .iter()
             .cloned()
@@ -129,6 +143,7 @@ fn resolve_sheet(names: &[String], sheet: Option<&str>) -> Result<String, Faucet
 /// text, with nested structure re-serialized as JSON rather than dropped.
 pub fn encode(records: &[Value], sheet: Option<&str>) -> Result<Vec<u8>, FaucetError> {
     use rust_xlsxwriter::{Workbook, Worksheet};
+    super::require_objects(records, "xlsx")?;
     let headers = super::header_union(records);
     let mut book = Workbook::new();
     let mut ws = Worksheet::new();
@@ -284,6 +299,13 @@ fn cell_to_value_in(cell: &calamine::Data, timestamp: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_object_record_is_refused_not_written_as_an_empty_row() {
+        let recs = vec![serde_json::json!({"a": 1}), serde_json::json!("b")];
+        let err = encode(&recs, None).unwrap_err().to_string();
+        assert!(err.contains("record 1 is not a JSON object"), "{err}");
+    }
     use serde_json::json;
 
     #[test]
@@ -349,6 +371,25 @@ mod tests {
         let bytes = encode(&[json!({"a": 1})], None).expect("encode");
         let err = decode(&bytes, None, 99).expect_err("out of range");
         assert!(err.to_string().contains("header_row 99"), "{err}");
+    }
+
+    #[test]
+    fn header_row_counts_sheet_rows_even_below_leading_blank_rows() {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let ws = book.add_worksheet();
+        ws.write_string(2, 0, "id").unwrap();
+        ws.write_string(2, 1, "name").unwrap();
+        for (r, (id, name)) in [(1.0, "a"), (2.0, "b")].into_iter().enumerate() {
+            ws.write_number(3 + r as u32, 0, id).unwrap();
+            ws.write_string(3 + r as u32, 1, name).unwrap();
+        }
+        let bytes = book.save_to_buffer().unwrap();
+        let want = vec![json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})];
+        assert_eq!(decode(&bytes, None, 2).unwrap(), want);
+        // The default still means the first row with content.
+        assert_eq!(decode(&bytes, None, 0).unwrap(), want);
+        let err = decode(&bytes, None, 1).unwrap_err().to_string();
+        assert!(err.contains("header_row 1 is blank"), "{err}");
     }
 
     #[test]

@@ -312,7 +312,7 @@ pub struct ExcelOptions {
     pub header_row: usize,
 }
 
-fn default_record_element() -> String {
+pub(crate) fn default_record_element() -> String {
     "record".into()
 }
 
@@ -675,6 +675,19 @@ pub fn header_union(records: &[Value]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Refuse a record a tabular encoder cannot place in a row: every cell is
+/// keyed by a field name, so a scalar or array would be written as an empty
+/// row and counted as written.
+#[cfg(any(feature = "file-format-csv", feature = "file-format-excel"))]
+pub(crate) fn require_objects(records: &[Value], format: &str) -> Result<(), FaucetError> {
+    match records.iter().position(|r| !r.is_object()) {
+        None => Ok(()),
+        Some(i) => Err(FaucetError::Sink(format!(
+            "{format}: record {i} is not a JSON object; a row needs named fields"
+        ))),
+    }
 }
 
 /// One cell's text for the tabular formats.
