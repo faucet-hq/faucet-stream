@@ -308,6 +308,99 @@ fn origin_lock(origin: &str) -> Arc<tokio::sync::Mutex<()>> {
     Arc::clone(map.entry(origin.to_string()).or_default())
 }
 
+/// How long a pull's cluster lease lasts before a peer may take it over (a
+/// pull is bounded by its fetch timeouts, far shorter).
+const SYNC_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
+/// How long a pull waits for another instance's pull of the same origin.
+const SYNC_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A cluster-wide lease on one origin's pull, held in the registry's
+/// settings store.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SyncLease {
+    holder: String,
+    expires: chrono::DateTime<chrono::Utc>,
+}
+
+impl SyncLease {
+    fn key(origin: &str) -> String {
+        format!("template_sync:{origin}")
+    }
+
+    /// The registry cannot be reached now (a store that simply keeps no
+    /// settings is not this: it is one process with nothing to coordinate).
+    fn unavailable(e: &crate::serve::history::HistoryError) -> bool {
+        e.is_unreachable() || matches!(e, crate::serve::history::HistoryError::Degraded(_))
+    }
+
+    /// This process, as a lease holder.
+    fn me() -> &'static str {
+        static ME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        ME.get_or_init(|| uuid::Uuid::now_v7().to_string())
+    }
+
+    /// Take the lease, waiting out a peer's pull. A store without a settings
+    /// table (one process, nothing to coordinate) needs no lease.
+    #[allow(clippy::disallowed_methods)] // waiting on a peer's lease, not a backend call
+    async fn acquire(store: &TemplateStore, origin: &str) -> CliResult<Option<String>> {
+        let key = Self::key(origin);
+        let started = tokio::time::Instant::now();
+        loop {
+            let current = match store.meta_get(&key).await {
+                Ok(c) => c,
+                Err(e) if !Self::unavailable(&e) => return Ok(None),
+                Err(e) => return Err(CliError::Internal(format!("reading the sync lease: {e}"))),
+            };
+            let now = chrono::Utc::now();
+            let held = current
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<SyncLease>(c).ok())
+                .is_some_and(|l| l.holder != Self::me() && l.expires > now);
+            if !held {
+                let mine = serde_json::json!(SyncLease {
+                    holder: Self::me().to_string(),
+                    expires: now + SYNC_LEASE_TTL,
+                })
+                .to_string();
+                match store
+                    .meta_compare_and_set(&key, current.as_deref(), &mine)
+                    .await
+                {
+                    Ok(true) => return Ok(Some(mine)),
+                    Ok(false) => {}
+                    Err(e) if !Self::unavailable(&e) => return Ok(None),
+                    Err(e) => {
+                        return Err(CliError::Internal(format!("taking the sync lease: {e}")));
+                    }
+                }
+            }
+            if started.elapsed() >= SYNC_LEASE_WAIT {
+                return Err(CliError::Internal(format!(
+                    "another instance is pulling origin '{origin}'; try again later"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+impl SyncLease {
+    /// Release a lease taken by [`SyncLease::acquire`] (expire it now).
+    async fn release_value(store: &TemplateStore, origin: &str, mine: &str) {
+        let done = serde_json::json!(SyncLease {
+            holder: Self::me().to_string(),
+            expires: chrono::Utc::now(),
+        })
+        .to_string();
+        if let Err(e) = store
+            .meta_compare_and_set(&Self::key(origin), Some(mine), &done)
+            .await
+        {
+            tracing::warn!(origin, error = %e, "could not release the template-sync lease; it expires on its own");
+        }
+    }
+}
+
 /// The `created_by` recorded for a pull.
 pub fn sync_actor(origin: &str) -> String {
     format!("sync:{origin}")
@@ -335,7 +428,18 @@ pub async fn sync_origin(
     // register the same body twice.
     let lock = origin_lock(&origin.name);
     let _guard = lock.lock().await;
+    // And one pull per origin across a cluster sharing this registry: each
+    // instance would otherwise plan from the same snapshot and register the
+    // same body once per instance. A dry run changes nothing and takes none.
+    let lease = if dry_run {
+        None
+    } else {
+        Some(SyncLease::acquire(store, &origin.name).await?)
+    };
     let result = sync_origin_inner(store, origin, dry_run, actor).await;
+    if let Some(Some(mine)) = lease {
+        SyncLease::release_value(store, &origin.name, &mine).await;
+    }
     let outcome = match &result {
         Ok(r) if r.failed() > 0 => "partial",
         Ok(_) => "ok",
@@ -533,6 +637,42 @@ pub fn spawn_interval_syncs(
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
+    /// A pull waits for (and, past the wait, gives up on) another instance's
+    /// lease on the same origin; a released or expired lease is taken.
+    #[tokio::test(start_paused = true)]
+    async fn the_sync_lease_is_shared_across_instances() {
+        let store: TemplateStore = std::sync::Arc::new(
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60)),
+        );
+        let peer = serde_json::json!(SyncLease {
+            holder: "peer".into(),
+            expires: chrono::Utc::now() + chrono::Duration::hours(1),
+        })
+        .to_string();
+        store.meta_put(&SyncLease::key("o"), &peer).await.unwrap();
+        let err = SyncLease::acquire(&store, "o")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another instance"), "{err}");
+
+        let expired = serde_json::json!(SyncLease {
+            holder: "peer".into(),
+            expires: chrono::Utc::now() - chrono::Duration::seconds(1),
+        })
+        .to_string();
+        store
+            .meta_put(&SyncLease::key("o"), &expired)
+            .await
+            .unwrap();
+        let mine = SyncLease::acquire(&store, "o")
+            .await
+            .unwrap()
+            .expect("taken");
+        SyncLease::release_value(&store, "o", &mine).await;
+        assert!(SyncLease::acquire(&store, "o").await.unwrap().is_some());
+    }
+
     use super::*;
     use crate::serve::history::memory::MemoryHistory;
     use crate::serve::history::templates::TemplateStatus;
