@@ -296,34 +296,67 @@ impl OtlpLogExporter {
     /// Export `lines`, isolating a line the collector rejects as malformed:
     /// a rejected batch is split in halves and retried, down to the single
     /// line, which is dropped (so one poisoned line never blocks the run).
-    /// Any other failure stops at the first line it could not deliver.
+    ///
+    /// A line is dropped only once the collector has accepted another part of
+    /// the batch: a collector that rejects everything (a wrong path, a gateway
+    /// missing a tenant header) is a delivery failure, so the lines stay
+    /// buffered and are retried. Any other failure stops at the first line it
+    /// could not deliver.
     pub async fn export_isolating(
         &self,
         run_attrs: &BTreeMap<String, String>,
         lines: &[ShipLine],
     ) -> ExportOutcome {
         let mut out = ExportOutcome::default();
+        let mut accepted_any = false;
+        // Leading single lines rejected before anything was accepted.
+        let mut unproven = 0usize;
+        let mut last_rejection = None;
         let mut stack: Vec<&[ShipLine]> = vec![lines];
         while let Some(part) = stack.pop() {
             if part.is_empty() {
                 continue;
             }
             match self.export_classified(run_attrs, part).await {
-                Ok(_) => out.handled += part.len(),
+                Ok(_) => {
+                    if !accepted_any {
+                        accepted_any = true;
+                        out.handled += unproven;
+                        out.dropped += unproven as u64;
+                        unproven = 0;
+                    }
+                    out.handled += part.len();
+                }
                 Err(e) if e.payload_rejected && part.len() > 1 => {
                     let (a, b) = part.split_at(part.len() / 2);
                     stack.push(b);
                     stack.push(a);
+                    last_rejection = Some(e);
                 }
-                Err(e) if e.payload_rejected => {
+                Err(e) if e.payload_rejected && accepted_any => {
                     out.handled += 1;
                     out.dropped += 1;
+                }
+                Err(e) if e.payload_rejected => {
+                    unproven += 1;
+                    last_rejection = Some(e);
+                    // Two lines in a row rejected and none accepted: the
+                    // collector is refusing payloads, not one bad line.
+                    if unproven >= 2 {
+                        break;
+                    }
                 }
                 Err(e) => {
                     out.error = Some(e);
                     break;
                 }
             }
+        }
+        if !accepted_any && unproven > 0 && out.error.is_none() {
+            out.error = last_rejection.map(|e| ExportError {
+                message: format!("{} (the collector accepted no line)", e.message),
+                ..e
+            });
         }
         out
     }
@@ -488,11 +521,25 @@ mod tests {
 
     /// A collector that answers 400 to any batch containing `line 3`.
     async fn picky_collector() -> String {
+        rejecting_collector(
+            |buf| buf.windows(6).any(|w| w == b"line 3"),
+            Default::default(),
+        )
+        .await
+    }
+
+    /// A collector that answers 400 to any request body `reject` matches,
+    /// counting requests in `hits`.
+    async fn rejecting_collector(
+        reject: fn(&[u8]) -> bool,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -517,8 +564,7 @@ mod tests {
                             }
                         }
                     }
-                    let poisoned = buf.windows(6).any(|w| w == b"line 3");
-                    let resp: &[u8] = if poisoned {
+                    let resp: &[u8] = if reject(&buf) {
                         b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 7\r\n\r\nbad req"
                     } else {
                         b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
@@ -550,6 +596,33 @@ mod tests {
         let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
         assert_eq!((out.handled, out.dropped), (5, 1));
         assert!(out.error.is_none());
+    }
+
+    /// A collector that rejects every payload keeps the lines buffered: no
+    /// line is dropped without the collector having accepted another one.
+    #[tokio::test]
+    async fn a_collector_rejecting_everything_drops_nothing() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = rejecting_collector(|_| true, hits.clone()).await;
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint,
+            protocol: OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let lines: Vec<ShipLine> = (1..=64).map(|i| line(i, &[])).collect();
+        let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
+        assert_eq!((out.handled, out.dropped), (0, 0));
+        let e = out.error.expect("a delivery failure");
+        assert!(e.message.contains("accepted no line"), "{}", e.message);
+        assert!(e.payload_rejected);
+        // Bisects down one spine, not the whole batch.
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) < 16);
+        // A single line alone is retried, not dropped, too.
+        let one = ex.export_isolating(&BTreeMap::new(), &lines[..1]).await;
+        assert_eq!((one.handled, one.dropped), (0, 0));
+        assert!(one.error.is_some());
     }
 
     #[tokio::test]
