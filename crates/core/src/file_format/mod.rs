@@ -529,6 +529,61 @@ where
         .map_err(|e| FaucetError::Source(format!("'{what}' is not valid UTF-8: {e}")))
 }
 
+/// Wrap `reader` so that no line read through it may exceed `max` bytes: the
+/// read fails (an `InvalidData` I/O error naming the cap) once more than `max`
+/// bytes arrive without a `\n`.
+///
+/// For streamed, newline-delimited formats — JSON Lines, CSV — whose readers
+/// buffer one line (or row) whole: without it, a body with no newline (a
+/// single-line dump, a binary file, a misbehaving endpoint) is accumulated in
+/// memory until it ends. The count is over the bytes as they arrive, so read
+/// buffering does not affect it. A CSV field quoting newlines is counted line
+/// by line.
+pub fn line_capped<R>(reader: R, max: u64) -> LineCapped<R> {
+    LineCapped {
+        inner: reader,
+        since_newline: 0,
+        max,
+    }
+}
+
+/// A reader whose lines are bounded (see [`line_capped`]).
+#[derive(Debug)]
+pub struct LineCapped<R> {
+    inner: R,
+    since_newline: u64,
+    max: u64,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCapped<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            let fresh = &buf.filled()[before..];
+            self.since_newline = match fresh.iter().rposition(|b| *b == b'\n') {
+                Some(i) => (fresh.len() - i - 1) as u64,
+                None => self.since_newline.saturating_add(fresh.len() as u64),
+            };
+            if self.since_newline > self.max {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "a line is longer than `max_object_bytes` ({} bytes) — is the file \
+                         missing its newlines? raise `max_object_bytes` to read it",
+                        self.max
+                    ),
+                )));
+            }
+        }
+        polled
+    }
+}
+
 /// The error for a file past `max_object_bytes`.
 pub fn check_object_size(len: u64, max: u64, what: &str) -> Result<(), FaucetError> {
     if len > max {
@@ -736,6 +791,27 @@ mod capped_read_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn line_capped_bounds_one_line_not_the_stream() {
+        use tokio::io::AsyncBufReadExt as _;
+        let body = b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n".repeat(100);
+        let mut lines = tokio::io::BufReader::new(line_capped(&body[..], 64)).lines();
+        let mut n = 0;
+        while let Some(_line) = lines.next_line().await.unwrap() {
+            n += 1;
+        }
+        assert_eq!(
+            n, 300,
+            "the whole stream is far past the cap, each record is not"
+        );
+
+        let long = vec![b'x'; 1_000];
+        let mut lines = tokio::io::BufReader::new(line_capped(&long[..], 64)).lines();
+        let err = lines.next_line().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("max_object_bytes"), "{err}");
+    }
 
     #[tokio::test]
     async fn decode_owned_matches_decode_and_runs_off_the_runtime() {

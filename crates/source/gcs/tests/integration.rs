@@ -483,6 +483,41 @@ async fn markers_are_skipped_and_whole_objects_are_capped() {
     let mut bad = config();
     bad.include = Some("[".into());
     assert!(GcsSource::new(bad).await.is_err());
+
+    // A streamed JSON Lines object is bounded per line, not as a whole: short
+    // lines read past the cap, a newline-free object fails.
+    let short: String = (0..50).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+    seed_object(&host, &bucket, "ln/short.jsonl", &short, "text/plain").await;
+    let long = format!(
+        "[{}]",
+        (0..200)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    seed_object(&host, &bucket, "ln2/long.jsonl", &long, "text/plain").await;
+    let lines = |prefix: &str| {
+        let mut c = GcsSourceConfig::new(&bucket)
+            .prefix(prefix)
+            .file_format(GcsFileFormat::JsonLines)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host);
+        c.max_object_bytes = 64;
+        c
+    };
+    let short = GcsSource::new(lines("ln/")).await.unwrap();
+    assert_eq!(stream_all(&short).await.len(), 50);
+    let long = GcsSource::new(lines("ln2/")).await.unwrap();
+    let ctx = HashMap::new();
+    let mut pages = long.stream_pages(&ctx, 0);
+    let err = loop {
+        match futures::StreamExt::next(&mut pages).await {
+            Some(Err(e)) => break e,
+            Some(Ok(_)) => continue,
+            None => panic!("a newline-free object must fail the streamed read"),
+        }
+    };
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
 }
 
 #[cfg(feature = "arrow")]

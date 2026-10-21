@@ -520,7 +520,11 @@ impl faucet_core::Source for FileSource {
                 if let Some(format) = format {
                     match opened {
                         Opened::Lines(reader) => {
-                            let mut lines = reader.lines();
+                            // One line is bounded by `max_object_bytes`, so a
+                            // body with no newline fails instead of being
+                            // buffered whole.
+                            let reader = faucet_core::file_format::line_capped(reader, self.config.max_object_bytes);
+                            let mut lines = tokio::io::BufReader::new(reader).lines();
                             let mut n = 0usize;
                             while let Some(line) = lines.next_line().await.map_err(|e| read_err(path, e))? {
                                 n += 1;
@@ -538,6 +542,7 @@ impl faucet_core::Source for FileSource {
                         }
                         #[cfg(feature = "file-format-csv")]
                         Opened::Csv(reader) => {
+                            let reader = faucet_core::file_format::line_capped(reader, self.config.max_object_bytes);
                             let mut rows = faucet_core::file_format::csv::CsvRowReader::new(reader, &opts.csv, false)?;
                             while let Some(r) = rows.next_record().await.map_err(|e| {
                                 FaucetError::Source(format!("file source: '{path}': {e}"))

@@ -762,7 +762,11 @@ impl faucet_core::Source for GcsSource {
                 };
                 match payload {
                     Fetched::Lines(reader) => {
-                        let mut lines = reader.lines();
+                        // One line is bounded by `max_object_bytes`, so an
+                        // object with no newline fails instead of being
+                        // buffered whole.
+                        let reader = faucet_core::file_format::line_capped(reader, self.config.max_object_bytes);
+                        let mut lines = tokio::io::BufReader::new(reader).lines();
                         let mut line_num: usize = 0;
                         while let Some(line) = lines
                             .next_line()

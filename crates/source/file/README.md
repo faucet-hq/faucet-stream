@@ -176,7 +176,10 @@ skip it for good, so the files after it wait for the same later run.
 Formats read whole into memory (JSON arrays, XML, Excel, and Avro/ORC/Parquet
 when compressed, remote or encrypted) stop at `max_object_bytes` (default
 2 GiB) once decompressed: a larger file — or a decompression bomb — fails with
-an error naming the file instead of exhausting memory.
+an error naming the file instead of exhausting memory. Streamed JSON Lines and
+CSV files have no whole-file limit, but one line may not exceed
+`max_object_bytes`: a file (or `http(s)://` body) with no newline fails the
+same way instead of being buffered whole.
 
 ## HTTP
 

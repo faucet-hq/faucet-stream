@@ -74,7 +74,7 @@ faucet run pipeline.yaml
 | `file_format` | enum | `json_lines` | `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`, `avro`, `orc` — see [File formats](#file-formats-604). |
 | `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | *(unset)* | Hard cap on the number of objects read (applied after listing, and to an explicit `object_keys` list). |
-| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. It also bounds one line of a streamed JSON Lines object, so an object with no newline fails the same way. |
 
 ### Performance
 

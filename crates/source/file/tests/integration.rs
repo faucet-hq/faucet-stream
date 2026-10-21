@@ -556,6 +556,44 @@ async fn a_whole_file_past_max_object_bytes_fails_instead_of_exhausting_memory()
     assert!(FileSource::new(cfg).is_err());
 }
 
+/// A streamed JSON Lines or CSV file is read without a whole-file cap, but one
+/// record is bounded by `max_object_bytes`: a file with no record delimiter
+/// fails instead of being buffered whole, and a large file of short records
+/// still reads.
+#[tokio::test]
+async fn one_record_past_max_object_bytes_fails_a_streamed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let many: String = (0..2_000).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+    let ok = write(dir.path(), "many.jsonl", many.as_bytes());
+    let mut cfg = FileSourceConfig::new(ok);
+    cfg.max_object_bytes = 1_024;
+    assert_eq!(
+        read_all(&FileSource::new(cfg).unwrap())
+            .await
+            .unwrap()
+            .len(),
+        2_000
+    );
+
+    let one_line = format!(
+        "[{}]",
+        (0..2_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for name in ["dump.jsonl", "dump.csv"] {
+        let path = write(dir.path(), name, one_line.as_bytes());
+        let mut cfg = FileSourceConfig::new(path);
+        cfg.max_object_bytes = 1_024;
+        let err = read_all(&FileSource::new(cfg).unwrap()).await.unwrap_err();
+        assert!(
+            err.contains("max_object_bytes") && err.contains(name),
+            "{err}"
+        );
+    }
+}
+
 mod http {
     use super::*;
     use wiremock::matchers::{header, method, path};

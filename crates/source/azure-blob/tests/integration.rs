@@ -526,6 +526,43 @@ async fn listing_handles_partial_prefixes_special_names_markers_and_the_size_cap
         .await
         .unwrap_err();
     assert!(err.to_string().contains("max_object_bytes"), "{err}");
+
+    // A streamed JSON Lines blob is bounded per line, not as a whole: short
+    // lines read past the cap, a newline-free blob fails.
+    let short: String = (0..50).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+    put_object(&store, "ln/short.jsonl", short.into_bytes()).await;
+    let long = format!(
+        "[{}]",
+        (0..200)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    put_object(&store, "ln2/long.jsonl", long.into_bytes()).await;
+    let lines = |prefix: &str| {
+        let mut c = source_config(port)
+            .prefix(prefix)
+            .file_format(AzureFileFormat::JsonLines);
+        c.max_object_bytes = 64;
+        c
+    };
+    let short = AzureBlobSource::new(lines("ln/"))
+        .await
+        .expect("source new");
+    assert_eq!(drain_pages(&short).await.0.len(), 50);
+    let long = AzureBlobSource::new(lines("ln2/"))
+        .await
+        .expect("source new");
+    let ctx = HashMap::new();
+    let mut pages = long.stream_pages(&ctx, 0);
+    let err = loop {
+        match futures::StreamExt::next(&mut pages).await {
+            Some(Err(e)) => break e,
+            Some(Ok(_)) => continue,
+            None => panic!("a newline-free object must fail the streamed read"),
+        }
+    };
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
 }
 
 // ── Missing blobs, a spent call context, and the round-trip recorder ─────────
