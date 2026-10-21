@@ -89,10 +89,19 @@ function partsInZone(date, tz, withSeconds) {
 export function zonedWallToUtc(y, mo, d, h, mi) {
   const tz = getTz();
   if (tz === "local") return new Date(y, mo, d, h, mi);
+  return wallToUtcInZone(y, mo, d, h, mi, tz);
+}
+
+function zoneOffsetAt(ms, tz) {
+  const p = partsInZone(new Date(ms), tz, true);
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - ms;
+}
+
+/** Wall-clock fields in IANA zone `tz` → UTC instant, using the offset at the target instant. */
+export function wallToUtcInZone(y, mo, d, h, mi, tz) {
   const asUtc = Date.UTC(y, mo, d, h, mi);
-  const p = partsInZone(new Date(asUtc), tz, true);
-  const shown = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
-  return new Date(asUtc - (shown - asUtc)); // subtract the zone's offset
+  const first = asUtc - zoneOffsetAt(asUtc, tz);
+  return new Date(asUtc - zoneOffsetAt(first, tz));
 }
 
 /** UTC Date → the wall-clock fields it shows as in the selected zone (for reopening). */
