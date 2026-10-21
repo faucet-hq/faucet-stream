@@ -61,7 +61,22 @@ const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 /// exponential backoff. Retrying with **no** delay (the original behaviour)
 /// turned a brief upstream 503 into an amplifying burst of requests within
 /// microseconds — the thundering herd core's backoff exists to prevent.
-fn retry_policy(max_retries: usize) -> faucet_core::RetryPolicy {
+///
+/// A non-idempotent method is not retried after a timeout: the endpoint may
+/// already have accepted the body, and a resend would deliver it twice.
+fn retry_policy(max_retries: usize, idempotent: bool) -> faucet_core::RetryPolicy {
+    use faucet_core::RetryClass;
+    let retry_on = if idempotent {
+        faucet_core::RetryClassSet::default()
+    } else {
+        [
+            RetryClass::Http5xx,
+            RetryClass::RateLimited,
+            RetryClass::Connection,
+        ]
+        .into_iter()
+        .collect()
+    };
     faucet_core::RetryPolicy {
         max_attempts: u32::try_from(max_retries)
             .unwrap_or(u32::MAX)
@@ -70,7 +85,37 @@ fn retry_policy(max_retries: usize) -> faucet_core::RetryPolicy {
         base: RETRY_BASE,
         max: std::time::Duration::from_secs(60),
         jitter: true,
-        retry_on: faucet_core::RetryClassSet::default(),
+        retry_on,
+    }
+}
+
+/// True for the methods RFC 9110 defines as idempotent.
+fn is_idempotent(method: &reqwest::Method) -> bool {
+    use reqwest::Method;
+    [
+        Method::GET,
+        Method::HEAD,
+        Method::PUT,
+        Method::DELETE,
+        Method::OPTIONS,
+        Method::TRACE,
+    ]
+    .contains(method)
+}
+
+/// For a non-idempotent method, a transport error raised after the request
+/// may have reached the endpoint (a reset mid-response) is reported without
+/// a retry class; a failure to connect stays retriable.
+fn classify_send_error(err: FaucetError, idempotent: bool) -> FaucetError {
+    match err {
+        FaucetError::Http(e)
+            if !idempotent && !e.is_connect() && !e.is_timeout() && e.status().is_none() =>
+        {
+            FaucetError::Sink(format!(
+                "http send failed after the request may have been delivered, not retried: {e}"
+            ))
+        }
+        other => other,
     }
 }
 
@@ -221,7 +266,11 @@ impl Endpoint {
         calls
             .call("send", || async {
                 let req = self.build_request_with_auth(body, auth)?;
-                let resp = self.client.send(req).await?;
+                let resp = self
+                    .client
+                    .send(req)
+                    .await
+                    .map_err(|e| classify_send_error(e, is_idempotent(&self.config.method)))?;
                 match check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
                     Ok(_) => Ok(()),
                     Err(FaucetError::Source(message)) => Err(FaucetError::Sink(message)),
@@ -252,7 +301,10 @@ impl HttpDriver for Endpoint {
     /// `max_retries` over the run's recorder and deadline; each `send` round
     /// trip is metered.
     fn call_context(&self) -> CallContext {
-        CallContext::new().with_retry(retry_policy(self.config.max_retries))
+        CallContext::new().with_retry(retry_policy(
+            self.config.max_retries,
+            is_idempotent(&self.config.method),
+        ))
     }
 
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
@@ -467,12 +519,34 @@ mod tests {
         // core's capped, jittered exponential from a non-zero base (a zero
         // delay turned a brief 503 into an amplifying burst). A `RateLimited`
         // error waits its own `Retry-After` in the core runner.
-        let p = retry_policy(3);
+        let p = retry_policy(3, true);
         assert_eq!(p.max_attempts, 4);
         assert_eq!(p.base, RETRY_BASE);
         assert!(p.jitter);
         assert_eq!(p.backoff, faucet_core::BackoffKind::Exponential);
-        assert_eq!(retry_policy(0).max_attempts, 1);
-        assert_eq!(retry_policy(usize::MAX).max_attempts, u32::MAX);
+        assert_eq!(retry_policy(0, true).max_attempts, 1);
+        assert_eq!(retry_policy(usize::MAX, true).max_attempts, u32::MAX);
+    }
+
+    #[test]
+    fn non_idempotent_methods_do_not_retry_timeouts() {
+        use super::{is_idempotent, retry_policy};
+        use faucet_core::RetryClass;
+        assert!(!is_idempotent(&reqwest::Method::POST));
+        assert!(!is_idempotent(&reqwest::Method::PATCH));
+        assert!(is_idempotent(&reqwest::Method::PUT));
+        assert!(is_idempotent(&reqwest::Method::DELETE));
+        let post = retry_policy(3, false).retry_on;
+        assert!(!post.contains(RetryClass::Timeout));
+        assert!(post.contains(RetryClass::Connection));
+        assert!(post.contains(RetryClass::Http5xx));
+        assert!(post.contains(RetryClass::RateLimited));
+        assert!(retry_policy(3, true).retry_on.contains(RetryClass::Timeout));
+    }
+
+    #[test]
+    fn non_http_errors_pass_through_unchanged() {
+        let err = super::classify_send_error(FaucetError::Sink("x".into()), false);
+        assert!(matches!(err, FaucetError::Sink(m) if m == "x"));
     }
 }

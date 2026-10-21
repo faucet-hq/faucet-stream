@@ -27706,7 +27706,7 @@
                       }
                     },
                     "max_retries": {
-                      "description": "Number of retries on transient failures (default: 0).",
+                      "description": "Number of retries on transient failures (default: 0).\nA `POST` / `PATCH` is not retried after a timeout or a\nconnection dropped mid-response, since the endpoint may already hold it.",
                       "type": [
                         "integer",
                         "string"
