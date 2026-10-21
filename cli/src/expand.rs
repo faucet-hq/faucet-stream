@@ -1001,6 +1001,25 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         if let Some(ref spec) = masking {
             faucet_core::CompiledMasking::compile(spec)
                 .map_err(|e| CliError::Config(format!("masking (row `{row_id}`): {e}")))?;
+            // An `applies_to` entry naming no sink template, sink kind or the
+            // DLQ scopes its rule to nothing, leaving the fields unmasked.
+            let unknown = spec.unknown_applies_to(|t| {
+                t == crate::governance::DLQ_ID
+                    || registry.sinks.contains_key(t)
+                    || merged_sink.kind == t
+                    || crate::registry::is_known_sink_kind(t)
+            });
+            if !unknown.is_empty() {
+                let list: Vec<String> = unknown
+                    .iter()
+                    .map(|(rule, t)| format!("rule `{rule}` names `{t}`"))
+                    .collect();
+                return Err(CliError::Config(format!(
+                    "masking: {} — `applies_to` must name a sink template, a sink kind or \
+                     `dlq`; a rule scoped to an unknown name masks nothing",
+                    list.join(", ")
+                )));
+            }
         }
 
         // Resilience poison-pill cross-check: `poison.action: dlq` routes
@@ -2734,6 +2753,37 @@ mod tests {
             kind: "cdc_unwrap".into(),
             config,
         }]
+    }
+
+    #[cfg(feature = "masking")]
+    #[test]
+    fn a_masking_rule_scoped_to_an_unknown_sink_is_refused() {
+        let yaml = |target: &str| {
+            format!(
+                r#"
+version: 1
+name: m
+pipeline:
+  source: {{ type: csv, config: {{ path: ./in.csv }} }}
+  sinks:
+    warehouse: {{ type: jsonl, config: {{ path: ./a.jsonl }} }}
+  masking:
+    rules:
+      - name: emails
+        match: {{ value_detector: email }}
+        action: {{ type: hash }}
+        applies_to: [{target}]
+matrix:
+  - id: r
+    sink: {{ ref: warehouse }}
+"#
+            )
+        };
+        let err = expand(&cfg(&yaml("warehose"))).unwrap_err().to_string();
+        assert!(err.contains("rule `emails` names `warehose`"), "{err}");
+        for ok in ["warehouse", "jsonl", "dlq"] {
+            expand(&cfg(&yaml(ok))).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
     }
 
     #[test]

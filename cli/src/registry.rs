@@ -1308,6 +1308,12 @@ fn config_object(config: &Value) -> std::borrow::Cow<'_, Value> {
     }
 }
 
+/// Whether `kind` names a sink connector: compiled in (built-in or plugin), or
+/// a first-party one this binary was built without.
+pub(crate) fn is_known_sink_kind(kind: &str) -> bool {
+    sink_kinds().contains(&kind) || uncompiled_builtin(kind, "sink")
+}
+
 /// Whether `kind` is a first-party connector this binary was built without.
 fn uncompiled_builtin(kind: &str, role: &str) -> bool {
     static INDEX: OnceLock<Vec<(String, String)>> = OnceLock::new();

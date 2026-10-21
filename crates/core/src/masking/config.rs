@@ -119,6 +119,27 @@ pub enum Detector {
     PhoneLoose,
 }
 
+impl MaskingSpec {
+    /// Each rule's `applies_to` entries that `known` does not recognise, as
+    /// `(rule label, entry)` pairs. A rule scoped only to names that match no
+    /// destination applies nowhere, so a misspelt sink name would silently
+    /// leave its fields unmasked; callers refuse such a policy at load time.
+    pub fn unknown_applies_to(&self, known: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .flat_map(|(i, rule)| {
+                let label = rule.name.clone().unwrap_or_else(|| format!("rule_{i}"));
+                rule.applies_to
+                    .iter()
+                    .filter(|t| !known(t))
+                    .map(move |t| (label.clone(), t.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}
+
 impl std::fmt::Display for Detector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -192,6 +213,25 @@ impl MaskAction {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unknown_applies_to_names_each_unrecognised_target() {
+        let spec: MaskingSpec = serde_json::from_value(json!({
+            "rules": [
+                {"name": "emails", "match": {"value_detector": "email"},
+                 "action": {"type": "hash"}, "applies_to": ["bigqeury", "dlq"]},
+                {"match": {"fields": ["ssn"]}, "action": {"type": "redact"}},
+                {"match": {"fields": ["x"]}, "action": {"type": "redact"},
+                 "applies_to": ["warehouse"]}
+            ]
+        }))
+        .unwrap();
+        let known = |t: &str| matches!(t, "dlq" | "warehouse" | "bigquery");
+        assert_eq!(
+            spec.unknown_applies_to(known),
+            vec![("emails".to_string(), "bigqeury".to_string())]
+        );
+    }
 
     #[test]
     fn parses_full_masking_block() {
