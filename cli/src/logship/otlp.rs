@@ -318,7 +318,7 @@ impl OtlpLogExporter {
                 continue;
             }
             match self.export_classified(run_attrs, part).await {
-                Ok(_) => {
+                Ok(rejected) => {
                     if !accepted_any {
                         accepted_any = true;
                         out.handled += unproven;
@@ -326,6 +326,7 @@ impl OtlpLogExporter {
                         unproven = 0;
                     }
                     out.handled += part.len();
+                    out.dropped += rejected.min(part.len() as u64);
                 }
                 Err(e) if e.payload_rejected && part.len() > 1 => {
                     let (a, b) = part.split_at(part.len() / 2);
@@ -534,12 +535,29 @@ mod tests {
         reject: fn(&[u8]) -> bool,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> String {
+        let respond: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(move |buf| {
+            if reject(buf) {
+                b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 7\r\n\r\nbad req"
+                    .to_vec()
+            } else {
+                b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_vec()
+            }
+        });
+        scripted_collector(std::sync::Arc::new(respond), hits).await
+    }
+
+    /// A collector that answers each request body with `respond`'s raw bytes.
+    async fn scripted_collector(
+        respond: std::sync::Arc<Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>>,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let respond = respond.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -564,12 +582,8 @@ mod tests {
                             }
                         }
                     }
-                    let resp: &[u8] = if reject(&buf) {
-                        b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 7\r\n\r\nbad req"
-                    } else {
-                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-                    };
-                    let _ = sock.write_all(resp).await;
+                    let resp = respond(&buf);
+                    let _ = sock.write_all(&resp).await;
                 });
             }
         });
@@ -595,6 +609,40 @@ mod tests {
         assert!(e.detail.contains("bad req"));
         let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
         assert_eq!((out.handled, out.dropped), (5, 1));
+        assert!(out.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn records_the_collector_rejects_in_a_partial_success_count_as_dropped() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess;
+        let respond: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(|_| {
+            let body = ExportLogsServiceResponse {
+                partial_success: Some(ExportLogsPartialSuccess {
+                    rejected_log_records: 2,
+                    error_message: "attribute limit".into(),
+                }),
+            }
+            .encode_to_vec();
+            let mut resp = format!(
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            resp.extend_from_slice(&body);
+            resp
+        });
+        let endpoint =
+            scripted_collector(std::sync::Arc::new(respond), Default::default()).await;
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint,
+            protocol: OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let lines: Vec<ShipLine> = (1..=5).map(|i| line(i, &[])).collect();
+        let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
+        assert_eq!((out.handled, out.dropped), (5, 2));
         assert!(out.error.is_none());
     }
 
