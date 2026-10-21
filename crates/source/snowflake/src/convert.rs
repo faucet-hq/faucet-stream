@@ -13,7 +13,8 @@
 //! | `fixed`, scale > 0      | `String` (exact decimal — full precision preserved) |
 //! | `real`                  | `Number` (f64)                           |
 //! | `boolean`               | `Bool`                                   |
-//! | `text` / `binary`       | `String`                                 |
+//! | `text`                  | `String`                                 |
+//! | `binary`                | `String`, standard base64 (the API sends hex; a cell that is not hex passes through) |
 //! | `date`                  | `String` `YYYY-MM-DD`                    |
 //! | `time`                  | `String` `HH:MM:SS[.fff…]`               |
 //! | `timestamp_ntz`         | `String` `YYYY-MM-DDTHH:MM:SS[.fff…]` (no offset) |
@@ -101,8 +102,29 @@ fn cell_to_json(cell: Option<&Value>, ty: &str, scale: i64) -> Value {
                 .map(Value::String)
                 .unwrap_or_else(|| Value::String(s.to_owned()))
         }
+        // The SQL API renders BINARY as hex; the canonical rendering is base64.
+        "binary" => decode_hex(s)
+            .map(|bytes| faucet_core::fidelity::binary(&bytes))
+            .unwrap_or_else(|| Value::String(s.to_owned())),
         _ => Value::String(s.to_owned()),
     }
+}
+
+/// Bytes of an even-length hex string (either case); `None` for anything else.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|p| Some(nibble(p[0])? << 4 | nibble(p[1])?))
+        .collect()
 }
 
 /// Render a SQL API temporal cell as ISO 8601. The JSON v2 format sends a
@@ -299,6 +321,11 @@ mod tests {
                 Value::String(s) if name == "canonical_decimal" => (col_scaled(name, 9), json!(s)),
                 Value::String(s) if name == "canonical_decimal_scale" => {
                     (col_scaled(name, 2), json!(s))
+                }
+                Value::String(s) if name == "canonical_binary" => {
+                    // Bytes 00 01 02 FD FE FF, as the SQL API sends them.
+                    assert_eq!(s, "AAEC/f7/");
+                    (col(name, "binary"), json!("000102FDFEFF"))
                 }
                 Value::String(s) if name == "canonical_big_integer" => {
                     (col(name, "fixed"), json!(s))
@@ -594,8 +621,24 @@ mod tests {
     #[test]
     fn unknown_type_passes_through_as_string() {
         let row = [json!("0xDEADBEEF")];
-        let cols = [col("BLOB", "binary")];
+        let cols = [col("BLOB", "geography")];
         assert_eq!(row_to_json(&row, &cols), json!({"BLOB": "0xDEADBEEF"}));
+    }
+
+    #[test]
+    fn binary_hex_is_rendered_as_base64() {
+        // TO_BINARY('Hello', 'UTF-8') arrives as hex.
+        let cols = [col("B", "binary")];
+        assert_eq!(
+            row_to_json(&[json!("48656C6C6F")], &cols),
+            json!({"B": "SGVsbG8="})
+        );
+        assert_eq!(row_to_json(&[json!("")], &cols), json!({"B": ""}));
+        assert_eq!(row_to_json(&[json!("00ff")], &cols), json!({"B": "AP8="}));
+        // Not hex (odd length, or a non-hex digit): kept as sent.
+        assert_eq!(row_to_json(&[json!("ABC")], &cols), json!({"B": "ABC"}));
+        assert_eq!(row_to_json(&[json!("0xDE")], &cols), json!({"B": "0xDE"}));
+        assert_eq!(row_to_json(&[Value::Null], &cols), json!({"B": null}));
     }
 
     #[test]

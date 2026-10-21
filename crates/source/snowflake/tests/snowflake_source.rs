@@ -489,3 +489,27 @@ async fn discover_surfaces_typed_error_on_catalog_failure() {
         other => panic!("expected Source error, got: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn binary_columns_arrive_as_base64() {
+    // The SQL API sends BINARY hex-encoded; the record carries base64.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "090001",
+            "statementHandle": "h",
+            "resultSetMetaData": {
+                "rowType": [{"name": "B", "type": "binary"}],
+                "partitionInfo": [{"rowCount": 2}],
+                "format": "jsonv2",
+                "numRows": 2,
+            },
+            "data": [["48656C6C6F"], [null]],
+        })))
+        .mount(&server)
+        .await;
+
+    let rows = build_source(cfg(), &server).fetch_all().await.unwrap();
+    assert_eq!(rows, vec![json!({"B": "SGVsbG8="}), json!({"B": null})]);
+}
