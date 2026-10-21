@@ -4803,7 +4803,7 @@
           }
         },
         {
-          "description": "Offset/limit pagination that writes the offset and limit into the JSON\n**request body** (POST-query APIs), rather than the query string\n([`Offset`](Self::Offset)) or a cursor token\n([`CursorInBody`](Self::CursorInBody)). Each request sends\n`body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the\noffset advances by the page's record count. With `stop_when_short`\n(default `true`) a page shorter than `limit` ends pagination; a zero-record\npage always ends it, and a repeated identical page trips a loop guard.\nEither field may be a JSON Pointer (`/page/offset`) for a nested\nlocation, with the same rules as `CursorInBody.body_cursor_field`.",
+          "description": "Offset/limit pagination that writes the offset and limit into the JSON\n**request body** (POST-query APIs), rather than the query string\n([`Offset`](Self::Offset)) or a cursor token\n([`CursorInBody`](Self::CursorInBody)). Each request sends\n`body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the\noffset advances by the page's record count (or by `rows_path`, which\nis required when `records_path` fans out to nested children or\n`record_ancestors` is set, as for [`Offset`](Self::Offset)). A\nzero-record page ends pagination, a readable `total_path` ends it once\nthe offset reaches the total, and a repeated identical page trips a\nloop guard. With `stop_when_short` (default `false`) a page shorter than\n`limit` also ends it — only for servers that never cap a page below\n`limit`, since a capped page would end the run with rows unread.\nEither field may be a JSON Pointer (`/page/offset`) for a nested\nlocation, with the same rules as `CursorInBody.body_cursor_field`.",
           "type": "object",
           "properties": {
             "offset_field": {
@@ -4825,7 +4825,7 @@
                 "boolean",
                 "string"
               ],
-              "default": true
+              "default": false
             },
             "rows_path": {
               "description": "JSONPath whose matches are counted to advance the offset and detect a\nshort page, instead of the extracted record count — for report APIs\nwhose whole response is one record (`$.rows`). An array counts its\nelements, an object 1, null or no match 0 (which ends pagination).",

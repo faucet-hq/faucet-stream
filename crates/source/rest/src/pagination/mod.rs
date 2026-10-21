@@ -119,16 +119,21 @@ pub enum PaginationStyle {
     /// ([`Offset`](Self::Offset)) or a cursor token
     /// ([`CursorInBody`](Self::CursorInBody)). Each request sends
     /// `body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the
-    /// offset advances by the page's record count. With `stop_when_short`
-    /// (default `true`) a page shorter than `limit` ends pagination; a zero-record
-    /// page always ends it, and a repeated identical page trips a loop guard.
+    /// offset advances by the page's record count (or by `rows_path`, which
+    /// is required when `records_path` fans out to nested children or
+    /// `record_ancestors` is set, as for [`Offset`](Self::Offset)). A
+    /// zero-record page ends pagination, a readable `total_path` ends it once
+    /// the offset reaches the total, and a repeated identical page trips a
+    /// loop guard. With `stop_when_short` (default `false`) a page shorter than
+    /// `limit` also ends it — only for servers that never cap a page below
+    /// `limit`, since a capped page would end the run with rows unread.
     /// Either field may be a JSON Pointer (`/page/offset`) for a nested
     /// location, with the same rules as `CursorInBody.body_cursor_field`.
     OffsetInBody {
         offset_field: String,
         limit_field: String,
         limit: usize,
-        #[serde(default = "default_true")]
+        #[serde(default)]
         stop_when_short: bool,
         /// JSONPath whose matches are counted to advance the offset and detect a
         /// short page, instead of the extracted record count — for report APIs

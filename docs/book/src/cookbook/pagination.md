@@ -22,7 +22,7 @@ apply to windowed passes or across `requests:` entries.
 | `CursorInBody` | the next-token JSONPath is null/absent (or repeats) — for POST-search APIs that take the cursor in the request body |
 | `PageNumber` | a page returns zero records (or an identical body repeats) |
 | `Offset` | the offset reaches `total` (via `total_path`), or an empty page arrives (a short page alone does not stop it: servers clamp `limit`; `stop_when_short: true` opts in for servers that reject an offset past the end) |
-| `OffsetInBody` | a short page arrives — offset/limit are written into the JSON **request body** (POST-query APIs) |
+| `OffsetInBody` | like `Offset` (`total`, an empty page, or `stop_when_short: true`) — offset/limit are written into the JSON **request body** (POST-query APIs) |
 | `RecordFieldCursor` | a short page arrives — keyset paging by the running max/min of a **record field** |
 | `LinkHeader` | there's no `rel="next"` in the `Link` response header |
 | `NextLinkInBody` | the next-page URL in the body is absent, null, or empty |
@@ -109,7 +109,7 @@ pagination:
 
 ## Offset / limit in the body (POST-query APIs)
 
-For POST endpoints that take `offset`/`limit` in the JSON **request body** (not the query string). The offset advances by each page's record count and paging stops on a short page.
+For POST endpoints that take `offset`/`limit` in the JSON **request body** (not the query string). The offset advances by each page's record count and paging stops on an empty page or once the offset reaches `total_path`. A short page alone does not stop it (servers clamp `limit`) unless `stop_when_short: true`. When `records_path` fans out to nested children (`$.orders[*].lines[*]`) or `record_ancestors` is set, set `rows_path` to the server's row array, or the offset would advance by child records.
 
 ```yaml
 pagination:
@@ -117,7 +117,7 @@ pagination:
   offset_field: offset
   limit_field: limit
   limit: 500
-  stop_when_short: true                # default
+  stop_when_short: true                # only for servers that never cap a page (default false)
 ```
 
 Report APIs return the whole response as **one** record (headers plus a `rows`

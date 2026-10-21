@@ -1176,6 +1176,9 @@ impl RestStreamConfig {
         }
         if let PaginationStyle::Offset {
             rows_path: None, ..
+        }
+        | PaginationStyle::OffsetInBody {
+            rows_path: None, ..
         } = &self.pagination
         {
             let fans_out = self
@@ -1188,7 +1191,7 @@ impl RestStreamConfig {
                     .is_some_and(|p| multi_match_segments(p) > 1);
             if fans_out {
                 return Err(faucet_core::FaucetError::Config(
-                    "rest: `pagination: Offset` advances by the record count, but this \
+                    "rest: offset pagination advances by the record count, but this \
                      `records_path`/`record_ancestors` yields nested child records rather than \
                      server rows — set `pagination.rows_path` to the server's row array"
                         .into(),
@@ -2092,6 +2095,41 @@ mod tests {
             .pagination(offset(None));
         assert!(c.validate().is_ok());
         c.record_ancestors = Some(HashMap::from([("e".to_string(), "id".to_string())]));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn offset_in_body_needs_rows_path_when_records_fan_out_and_keeps_paging_past_a_short_page() {
+        let style: PaginationStyle = serde_json::from_value(serde_json::json!({
+            "type": "OffsetInBody",
+            "offset_field": "offset",
+            "limit_field": "limit",
+            "limit": 100
+        }))
+        .unwrap();
+        assert!(matches!(
+            style,
+            PaginationStyle::OffsetInBody {
+                stop_when_short: false,
+                ..
+            }
+        ));
+        let mut c = RestStreamConfig::new("https://api.example.com", "/search")
+            .records_path("$.orders[*].lines[*]")
+            .pagination(style.clone());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("rows_path"), "{err}");
+        c.pagination = PaginationStyle::OffsetInBody {
+            offset_field: "offset".into(),
+            limit_field: "limit".into(),
+            limit: 100,
+            stop_when_short: false,
+            rows_path: Some("$.orders".into()),
+            total_path: None,
+        };
+        assert!(c.validate().is_ok());
+        let mut c = RestStreamConfig::new("https://api.example.com", "/search").pagination(style);
+        c.record_ancestors = Some(HashMap::from([("o".to_string(), "id".to_string())]));
         assert!(c.validate().is_err());
     }
 }
