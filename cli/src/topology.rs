@@ -1025,6 +1025,8 @@ async fn build_topology_inner(
                     continue;
                 }
                 let source = build_source(&k, c.clone(), auth, None).await?;
+                // The run's clock bounds clock-aligned reads, as in matrix mode.
+                source.set_run_clock(clock.to_utc());
                 record_identity(&mut identities, id, &k, c, source.dataset_uri());
                 NodeKind::Source(source)
             }

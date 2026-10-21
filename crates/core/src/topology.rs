@@ -906,6 +906,22 @@ impl Topology {
             .map(|(id, s)| (id.clone(), s.connector_name()))
             .collect();
 
+        // A source that drains its buffered tail when told to stop (a live
+        // feed that cannot re-read what it received) gets the token itself.
+        // When every source drains, the rest of the graph stops when its
+        // inputs close rather than on the token, so that tail reaches the
+        // sinks — `Pipeline::run`'s rule; the flush grace still bounds a wedge.
+        let drains: HashMap<String, bool> = sources
+            .iter()
+            .map(|(id, s)| (id.clone(), s.set_cancel(coop.clone())))
+            .collect();
+        let all_drain = !drains.is_empty() && drains.values().all(|d| *d);
+        let flow = if all_drain {
+            CancellationToken::new()
+        } else {
+            coop.clone()
+        };
+
         for (id, source) in sources {
             let node_outs = outs.remove(&id).unwrap_or_default();
             let keep = node_outs.clone();
@@ -915,7 +931,10 @@ impl Topology {
                 plan.start.clone(),
                 opts.batch_size,
                 node_outs,
-                coop.clone(),
+                SourceStop {
+                    cancel: flow.clone(),
+                    drains: all_drain,
+                },
             ));
             by_id.insert(
                 id.clone(),
@@ -928,7 +947,7 @@ impl Topology {
             let keep = node_outs.clone();
             let mut node_ins = ins.remove(&node.id).unwrap_or_default();
             let pipeline = opts.pipeline_name.clone();
-            let cancel = coop.clone();
+            let cancel = flow.clone();
             let Node { id, kind } = node;
 
             let built: Result<NodeFut, FaucetError> = match kind {
@@ -2001,23 +2020,39 @@ fn cancelled(cancel: &Option<CancellationToken>) -> bool {
     cancel.as_ref().is_some_and(|c| c.is_cancelled())
 }
 
+/// How a source node stops: on `cancel` at the next page boundary, or — for a
+/// source that drains its buffered tail when told to stop
+/// ([`Source::set_cancel`]) — by reading its stream to the end.
+struct SourceStop {
+    cancel: CancellationToken,
+    drains: bool,
+}
+
 async fn run_source_node(
     labels: Labels,
     source: Arc<dyn Source>,
     start_bookmark: Option<Value>,
     batch_size: usize,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
-    cancel: CancellationToken,
+    stop: SourceStop,
 ) -> Result<NodeOutcome, FaucetError> {
+    let SourceStop { cancel, drains } = stop;
     let node_id = labels.row.to_string();
     // The same instrumentation `Pipeline::run` layers on: per-node source
-    // metrics, with the node id as `row`, and a round-trip recorder.
-    source.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+    // metrics, with the node id as `row`, a round-trip recorder, and the
+    // call context (the cancel token only when the source does not drain).
+    let recorder = Arc::new(crate::observability::RoundtripRecorder::new(
         crate::observability::RoundtripSide::Source,
         labels.pipeline.to_string(),
         node_id.clone(),
         source.connector_name(),
-    )));
+    ));
+    source.set_roundtrip_recorder(Arc::clone(&recorder));
+    let mut ctx = crate::io::CallContext::default().with_recorder(recorder);
+    if !drains {
+        ctx = ctx.with_cancel(cancel.clone());
+    }
+    source.set_call_context(ctx);
     let source = crate::observability::InstrumentedSource::new(source.as_ref(), labels);
     if let Some(bm) = start_bookmark {
         source.apply_start_bookmark(bm).await?;
@@ -2026,10 +2061,14 @@ async fn run_source_node(
     let mut pages = source.stream_pages(&ctx, batch_size);
     let mut records = 0usize;
     loop {
-        let item = tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            item = pages.next() => item,
+        let item = if drains {
+            pages.next().await
+        } else {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                item = pages.next() => item,
+            }
         };
         let Some(item) = item else { break };
         let page = item?;
@@ -2496,12 +2535,16 @@ async fn run_sink_node(
         node_id.clone(),
         opts.run_id.clone(),
     );
-    sink.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+    let recorder = Arc::new(crate::observability::RoundtripRecorder::new(
         crate::observability::RoundtripSide::Sink,
         opts.pipeline_name.clone(),
         node_id.clone(),
         sink.connector_name(),
-    )));
+    ));
+    sink.set_roundtrip_recorder(Arc::clone(&recorder));
+    // As `Pipeline::run` installs it: the recorder, never the cancel token (a
+    // cancelled run still flushes what it wrote).
+    sink.set_call_context(crate::io::CallContext::default().with_recorder(recorder));
     let run_labels = vec![
         Label::new("pipeline", SharedString::from(opts.pipeline_name.clone())),
         Label::new("row", SharedString::from(node_id.clone())),
@@ -3622,6 +3665,79 @@ mod tests {
         // Cancelled before/early: far fewer than 1000 records written.
         assert!(store.lock().unwrap().len() < 1000);
         let _ = result;
+    }
+
+    /// A live feed that drains on cancel: it yields its buffered tail once told
+    /// to stop, then ends.
+    struct DrainingSource {
+        token: Mutex<Option<CancellationToken>>,
+    }
+    #[async_trait]
+    impl Source for DrainingSource {
+        async fn fetch_with_context(
+            &self,
+            _c: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(Vec::new())
+        }
+        fn set_cancel(&self, token: CancellationToken) -> bool {
+            *self.token.lock().unwrap() = Some(token);
+            true
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _c: &'a std::collections::HashMap<String, Value>,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>>
+        {
+            let token = self
+                .token
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("set_cancel ran first");
+            Box::pin(async_stream::stream! {
+                yield Ok(StreamPage { records: vec![json!({"n": 1})], bookmark: None });
+                token.cancelled().await;
+                yield Ok(StreamPage { records: vec![json!({"n": 2}), json!({"n": 3})], bookmark: None });
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_draining_source_delivers_its_tail_to_the_sinks_on_cancel() {
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trip.cancel();
+        });
+        let (sink, store) = CollectSink::new();
+        let topo = Topology::builder()
+            .source(
+                "s",
+                Box::new(DrainingSource {
+                    token: Mutex::new(None),
+                }),
+            )
+            .transform("t", Vec::new())
+            .sink("k", Box::new(sink))
+            .edge("s", "t")
+            .edge("t", "k")
+            .build()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            topo.run(TopologyOptions::new("p").with_cancel(cancel)),
+        )
+        .await
+        .expect("the drained stream ends the run")
+        .unwrap();
+        assert_eq!(
+            store.lock().unwrap().len(),
+            3,
+            "the buffered tail is written"
+        );
     }
 
     #[test]
