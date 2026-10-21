@@ -140,14 +140,16 @@ pub fn record_lag_gauges(labels: &[Label], lag: &SourceLag) {
 /// How often the pipeline asks a source for its lag while pages flow.
 pub const LAG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long one lag query may take before it is abandoned (logged once), so a
-/// hung query never stalls page delivery.
+/// How long one lag query may take before it is abandoned (logged once). After
+/// the first such timeout the run stops asking, so a hung query stalls at most
+/// one page.
 pub const LAG_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Polls [`Source::lag`](crate::Source::lag) for one run: on the first page,
 /// then at most every [`LAG_POLL_INTERVAL`], and once more when the run ends.
-/// A failing or slow (over [`LAG_POLL_TIMEOUT`]) query is logged once and
-/// never fails or stalls the run.
+/// A failing query is logged once and never fails the run; a slow one (over
+/// [`LAG_POLL_TIMEOUT`]) is abandoned and lag polling stops for the rest of
+/// the run, since every poll waits on the page path.
 pub(crate) struct LagPoller<'a> {
     source: &'a dyn crate::Source,
     labels: Vec<Label>,
@@ -156,6 +158,8 @@ pub(crate) struct LagPoller<'a> {
     timeout: std::time::Duration,
     last_poll: std::sync::Mutex<Option<std::time::Instant>>,
     warned: std::sync::atomic::AtomicBool,
+    /// A query timed out: further polls would hold a page each, so stop.
+    gave_up: std::sync::atomic::AtomicBool,
 }
 
 impl<'a> LagPoller<'a> {
@@ -181,6 +185,7 @@ impl<'a> LagPoller<'a> {
             timeout: LAG_POLL_TIMEOUT,
             last_poll: std::sync::Mutex::new(None),
             warned: std::sync::atomic::AtomicBool::new(false),
+            gave_up: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -199,6 +204,9 @@ impl<'a> LagPoller<'a> {
     /// Poll unless the last poll was under the interval ago (`force` skips
     /// the throttle).
     pub(crate) async fn poll(&self, force: bool) {
+        if self.gave_up.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let now = std::time::Instant::now();
         {
             let Ok(mut last) = self.last_poll.lock() else {
@@ -211,10 +219,14 @@ impl<'a> LagPoller<'a> {
         }
         let result = match tokio::time::timeout(self.timeout, self.source.lag()).await {
             Ok(r) => r,
-            Err(_) => Err(crate::FaucetError::Source(format!(
-                "lag query did not answer within {:?}",
-                self.timeout
-            ))),
+            Err(_) => {
+                self.gave_up
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(crate::FaucetError::Source(format!(
+                    "lag query did not answer within {:?}; not polled again this run",
+                    self.timeout
+                )))
+            }
         };
         match result {
             Ok(Some(lag)) if !lag.is_empty() => {
@@ -369,6 +381,15 @@ mod tests {
             .await
             .expect("poll must return after its timeout");
         assert!(p.warned.load(std::sync::atomic::Ordering::Relaxed));
+        // Once a query has hung, later polls (periodic or forced) return at
+        // once instead of holding another page for the whole timeout.
+        let p = p.with_timeout(std::time::Duration::from_secs(3600));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            p.poll(true).await;
+            p.poll(false).await;
+        })
+        .await
+        .expect("a poller that gave up never waits again");
         assert_eq!(obs.last(), None);
         use crate::Source;
         assert!(
