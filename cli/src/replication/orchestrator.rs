@@ -142,6 +142,60 @@ pub(crate) fn spawn_cancel_on_signal(token: CancellationToken) {
     });
 }
 
+/// Record the bootstrap marker at `position` — only if no marker exists, so
+/// two mirror processes started together cannot both bootstrap — and, when
+/// this process won, seed the CDC bookmark there (a bare value: exactly-once's
+/// `unwrap_state` reads it as seq 0, so it serves both delivery modes).
+/// Returns whether this process bootstrapped.
+async fn bootstrap_marker(
+    store: &dyn faucet_core::StateStore,
+    marker_k: &str,
+    cdc_k: &str,
+    position: &serde_json::Value,
+) -> CliResult<bool> {
+    let marker = ReplicationState {
+        phase: Phase::Snapshot,
+        snapshot_done: false,
+        position: position.clone(),
+    }
+    .to_value()?;
+    if !store.compare_and_put(marker_k, None, &marker).await? {
+        return Ok(false);
+    }
+    store.put(cdc_k, position).await?;
+    Ok(true)
+}
+
+/// The snapshot finished: seed the CDC bookmark from the marker's position
+/// (the one the snapshot was taken against, whatever another process may have
+/// written to the bookmark since) and mark the hand-off — refusing when the
+/// marker changed under this process.
+async fn hand_off_to_cdc(
+    store: &dyn faucet_core::StateStore,
+    marker_k: &str,
+    cdc_k: &str,
+    marker: &ReplicationState,
+    marker_raw: Option<&serde_json::Value>,
+) -> CliResult<()> {
+    store.put(cdc_k, &marker.position).await?;
+    let done = ReplicationState {
+        phase: Phase::Cdc,
+        snapshot_done: true,
+        position: marker.position.clone(),
+    }
+    .to_value()?;
+    if !store
+        .compare_and_put(marker_k, marker_raw, &done)
+        .await?
+    {
+        return Err(CliError::Config(format!(
+            "mirror: the phase marker `{marker_k}` changed while this process ran the \
+             snapshot — another mirror process is running this pipeline"
+        )));
+    }
+    Ok(())
+}
+
 /// Run the two-phase replication. Validates, bootstraps (captures + seeds the
 /// CDC position), snapshots (if not already done), then streams CDC (looping
 /// until SIGTERM when `continuous`).
@@ -194,26 +248,16 @@ pub async fn run_replication(
                 cdc_node.source.kind
             ))
         })?;
-        // Seed the CDC bookmark (bare value — exactly-once's unwrap_state reads a
-        // bare value as seq=0, so this works for both delivery modes) and record
-        // the phase marker.
-        store.put(&cdc_k, &position).await?;
-        store
-            .put(
-                &marker_k,
-                &ReplicationState {
-                    phase: Phase::Snapshot,
-                    snapshot_done: false,
-                    position: position.clone(),
-                }
-                .to_value()?,
-            )
-            .await?;
-        tracing::info!(pipeline = %opts.pipeline_name, "mirror bootstrap: captured CDC position, seeded bookmark");
+        if bootstrap_marker(store.as_ref(), &marker_k, &cdc_k, &position).await? {
+            tracing::info!(pipeline = %opts.pipeline_name, "mirror bootstrap: captured CDC position, seeded bookmark");
+        } else {
+            tracing::warn!(pipeline = %opts.pipeline_name, "mirror bootstrap: another mirror process bootstrapped first; using its position");
+        }
     }
 
     // Re-read the marker (it now exists). Decide the remaining work.
-    let marker = match store.get(&marker_k).await? {
+    let marker_raw = store.get(&marker_k).await?;
+    let marker = match marker_raw.clone() {
         Some(v) => ReplicationState::from_value(v)?,
         None => {
             return Err(CliError::Internal(
@@ -257,17 +301,7 @@ pub async fn run_replication(
             );
             return Ok(());
         }
-        store
-            .put(
-                &marker_k,
-                &ReplicationState {
-                    phase: Phase::Cdc,
-                    snapshot_done: true,
-                    position: marker.position.clone(),
-                }
-                .to_value()?,
-            )
-            .await?;
+        hand_off_to_cdc(store.as_ref(), &marker_k, &cdc_k, &marker, marker_raw.as_ref()).await?;
         tracing::info!(pipeline = %opts.pipeline_name, "mirror: snapshot complete; handing off to CDC");
     }
 
@@ -358,6 +392,28 @@ fn cdc_loop_action(cycle_ok: bool, continuous: bool, cancelled: bool) -> CdcLoop
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn only_one_concurrent_bootstrap_seeds_the_cdc_bookmark() {
+        use faucet_core::StateStore as _;
+        let store = faucet_core::MemoryStateStore::new();
+        let (m, c) = ("p::__replication__", "p::cdc");
+        assert!(bootstrap_marker(&store, m, c, &serde_json::json!("0/100")).await.unwrap());
+        assert!(!bootstrap_marker(&store, m, c, &serde_json::json!("0/500")).await.unwrap());
+        assert_eq!(store.get(c).await.unwrap(), Some(serde_json::json!("0/100")));
+        let raw = store.get(m).await.unwrap();
+        let marker = ReplicationState::from_value(raw.clone().unwrap()).unwrap();
+        assert_eq!(marker.position, serde_json::json!("0/100"));
+
+        // The hand-off re-seeds the bookmark from the marker even if it moved.
+        store.put(c, &serde_json::json!("0/900")).await.unwrap();
+        hand_off_to_cdc(&store, m, c, &marker, raw.as_ref()).await.unwrap();
+        assert_eq!(store.get(c).await.unwrap(), Some(serde_json::json!("0/100")));
+        let done = ReplicationState::from_value(store.get(m).await.unwrap().unwrap()).unwrap();
+        assert!(done.snapshot_done);
+        // A second hand-off against the stale marker is refused.
+        assert!(hand_off_to_cdc(&store, m, c, &marker, raw.as_ref()).await.is_err());
+    }
     use super::*;
     use crate::config::ConnectorSpec;
     use crate::expand::expand;
