@@ -277,6 +277,99 @@ pub const OVERWRITE_STAGING_SUFFIX: &str = "__faucet_ovw";
 /// a prefix catches this one too.
 pub const OVERWRITE_STAGING_OLD_SUFFIX: &str = "__faucet_ovw_old";
 
+/// Config key the CLI sets on every sink instance of one overwrite run (the
+/// `begin`, writer and `commit` instances) to a per-run token from
+/// [`new_overwrite_run_token`]. A sink that honours it stages under
+/// [`overwrite_staging_suffix`]`(Some(token))`, so two concurrent overwrite
+/// runs of one destination never drop or share each other's staging.
+pub const OVERWRITE_RUN_KEY: &str = "_overwrite_run";
+
+/// Length of an overwrite run token: 8 hex digits of the run's start (Unix
+/// seconds) then 6 random hex digits.
+pub const OVERWRITE_RUN_TOKEN_LEN: usize = 14;
+
+/// How long another run's tokened staging is presumed in use. A `begin`
+/// drops a sibling run's staging only once its token is older than this —
+/// the staging of a crashed run; a live run is never that old in practice.
+pub const ABANDONED_OVERWRITE_STAGING: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// A fresh overwrite run token (see [`OVERWRITE_RUN_KEY`]): lowercase hex,
+/// valid unquoted in every SQL dialect, ordered by start time.
+pub fn new_overwrite_run_token() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    overwrite_run_token_at(secs, &uuid::Uuid::new_v4().simple().to_string()[..6])
+}
+
+fn overwrite_run_token_at(secs: u64, random: &str) -> String {
+    format!("{:08x}{random}", secs & 0xffff_ffff)
+}
+
+/// Whether `token` has the shape [`new_overwrite_run_token`] produces.
+pub fn is_overwrite_run_token(token: &str) -> bool {
+    token.len() == OVERWRITE_RUN_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The run's start (Unix seconds) a token records.
+pub fn overwrite_run_started(token: &str) -> Option<u64> {
+    is_overwrite_run_token(token)
+        .then(|| u64::from_str_radix(&token[..8], 16).ok())
+        .flatten()
+}
+
+/// The staging suffix of an overwrite run: [`OVERWRITE_STAGING_SUFFIX`] alone
+/// without a token (the name every release before tokens used), else
+/// `__faucet_ovw_<token>`.
+pub fn overwrite_staging_suffix(run: Option<&str>) -> String {
+    match run {
+        Some(token) => format!("{OVERWRITE_STAGING_SUFFIX}_{token}"),
+        None => OVERWRITE_STAGING_SUFFIX.to_string(),
+    }
+}
+
+/// Whether `name` is the tokened staging of `table` that another run left
+/// behind long enough ago ([`ABANDONED_OVERWRITE_STAGING`]) to be dropped:
+/// `<table>__faucet_ovw_<token>` with a token other than `own`, started
+/// before `now_secs` minus the threshold. Names compare ignoring ASCII case
+/// (a catalog may fold them). The untokened staging and the mid-swap
+/// `__faucet_ovw_old` relation are never matched here.
+pub fn abandoned_overwrite_staging(
+    table: &str,
+    name: &str,
+    own: Option<&str>,
+    now_secs: u64,
+) -> bool {
+    let prefix = format!("{table}{OVERWRITE_STAGING_SUFFIX}_");
+    if name.len() != prefix.len() + OVERWRITE_RUN_TOKEN_LEN
+        || !name.is_char_boundary(prefix.len())
+        || !name[..prefix.len()].eq_ignore_ascii_case(&prefix)
+    {
+        return false;
+    }
+    let token = name[prefix.len()..].to_ascii_lowercase();
+    if own.is_some_and(|o| o == token) {
+        return false;
+    }
+    let Some(started) = overwrite_run_started(&token) else {
+        return false;
+    };
+    // Tokens keep 32 bits of seconds; read one from the future as one era
+    // back rather than as abandoned forever.
+    let now = now_secs & 0xffff_ffff;
+    let age = if started <= now {
+        now - started
+    } else {
+        now + (1 << 32) - started
+    };
+    age > ABANDONED_OVERWRITE_STAGING.as_secs()
+}
+
 /// Length of the `__h:` + 64 hex-digit SHA-256 suffix appended to a shortened
 /// scope.
 const SCOPE_DIGEST_LEN: usize = 4 + 64;
@@ -547,6 +640,87 @@ mod tests {
         // An orphan sweep matching the base suffix as a prefix must also catch
         // the mid-swap relation.
         assert!(OVERWRITE_STAGING_OLD_SUFFIX.starts_with(OVERWRITE_STAGING_SUFFIX));
+    }
+}
+
+#[cfg(test)]
+mod overwrite_run_tests {
+    use super::*;
+
+    #[test]
+    fn tokens_are_short_hex_and_record_their_start() {
+        let t = new_overwrite_run_token();
+        assert!(is_overwrite_run_token(&t), "{t}");
+        assert_ne!(t, new_overwrite_run_token());
+        let t = overwrite_run_token_at(0x6700_0000, "abcdef");
+        assert_eq!(t, "67000000abcdef");
+        assert_eq!(overwrite_run_started(&t), Some(0x6700_0000));
+        for bad in [
+            "",
+            "67000000abcdeg",
+            "67000000ABCDEF",
+            "67000000abcde",
+            "old",
+        ] {
+            assert!(!is_overwrite_run_token(bad), "{bad}");
+        }
+        assert_eq!(overwrite_staging_suffix(None), "__faucet_ovw");
+        assert_eq!(
+            overwrite_staging_suffix(Some(&t)),
+            "__faucet_ovw_67000000abcdef"
+        );
+    }
+
+    #[test]
+    fn only_another_runs_old_staging_is_abandoned() {
+        let day = ABANDONED_OVERWRITE_STAGING.as_secs();
+        let start = 0x6700_0000u64;
+        let old = format!("t__faucet_ovw_{}", overwrite_run_token_at(start, "aaaaaa"));
+        assert!(abandoned_overwrite_staging(
+            "t",
+            &old,
+            None,
+            start + day + 1
+        ));
+        assert!(abandoned_overwrite_staging(
+            "T",
+            &old.to_uppercase(),
+            None,
+            start + day + 1
+        ));
+        // Young: a run may still be using it.
+        assert!(!abandoned_overwrite_staging("t", &old, None, start + day));
+        // Our own staging is never another run's.
+        assert!(!abandoned_overwrite_staging(
+            "t",
+            &old,
+            Some("67000000aaaaaa"),
+            start + 2 * day
+        ));
+        // Not a tokened staging of this table.
+        for name in [
+            "t__faucet_ovw",
+            "t__faucet_ovw_old",
+            "tt__faucet_ovw_67000000aaaaaa",
+            "t__faucet_ovw_67000000aaaaaa_x",
+            "t__faucet_ovw_zzzzzzzzaaaaaa",
+        ] {
+            assert!(
+                !abandoned_overwrite_staging("t", name, None, start + 2 * day),
+                "{name}"
+            );
+        }
+        // A token past a 32-bit wrap is one era old, not in the future.
+        let late = format!(
+            "t__faucet_ovw_{}",
+            overwrite_run_token_at(0xffff_ff00, "bbbbbb")
+        );
+        assert!(abandoned_overwrite_staging(
+            "t",
+            &late,
+            None,
+            (1 << 32) + day
+        ));
     }
 }
 

@@ -1072,3 +1072,43 @@ fn futures_lite_block_on<F: std::future::Future>(f: F) -> F::Output {
         .expect("runtime")
         .block_on(f)
 }
+
+/// Concurrent overwrite runs of one table stage apart (#930): a run token
+/// makes the staging name its own, a plain identifier each dialect accepts
+/// and quotes without escaping, and two runs never share one.
+fn overwrite_runs_stage_under_their_own_name<D: SqlDialect>(d: D) {
+    use faucet_common_sql::SqlLayout;
+    use faucet_core::idempotency::{abandoned_overwrite_staging, new_overwrite_run_token};
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let untokened = SqlLayout::new("orders").staging_table();
+    let staging_a = SqlLayout::new("orders")
+        .overwrite_run(Some(a.clone()))
+        .staging_table();
+    let staging_b = SqlLayout::new("orders")
+        .overwrite_run(Some(b))
+        .staging_table();
+    assert_eq!(untokened, "orders__faucet_ovw");
+    assert_eq!(staging_a, format!("orders__faucet_ovw_{a}"));
+    assert_ne!(staging_a, staging_b);
+    for name in [&untokened, &staging_a] {
+        d.check_ident(name).unwrap();
+        let quoted = d.quote_ident(name);
+        assert!(quoted.contains(name.as_str()), "{quoted}");
+    }
+    // A live sibling run's staging is never swept by another run's begin.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(!abandoned_overwrite_staging(
+        "orders",
+        &staging_b,
+        Some(&a),
+        now
+    ));
+}
+
+#[test]
+fn matrix_overwrite_staging_names() {
+    every_dialect!(overwrite_runs_stage_under_their_own_name);
+}

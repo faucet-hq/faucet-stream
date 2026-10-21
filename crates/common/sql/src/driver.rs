@@ -90,6 +90,11 @@ pub struct SqlLayout {
     pub create_table: bool,
     /// Rows per append transaction (`0`: the whole page).
     pub batch_size: usize,
+    /// The overwrite run this instance belongs to
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): its staging table is
+    /// `<table>__faucet_ovw_<token>`, so concurrent overwrite runs of one
+    /// table never share staging. `None`: the untokened `<table>__faucet_ovw`.
+    pub overwrite_run: Option<String>,
 }
 
 impl SqlLayout {
@@ -101,7 +106,15 @@ impl SqlLayout {
             json_column: None,
             create_table: true,
             batch_size: 0,
+            overwrite_run: None,
         }
+    }
+
+    /// Stage overwrites under the run token `token` (see
+    /// [`SqlLayout::overwrite_run`]).
+    pub fn overwrite_run(mut self, token: Option<String>) -> Self {
+        self.overwrite_run = token;
+        self
     }
 
     /// Store each record whole in `column`.
@@ -127,7 +140,7 @@ impl SqlLayout {
         format!(
             "{}{}",
             self.table,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+            faucet_core::idempotency::overwrite_staging_suffix(self.overwrite_run.as_deref())
         )
     }
 }
@@ -323,6 +336,15 @@ pub trait SqlDriver: Send + Sync {
         self.table_exists(&self.staging_table()).await
     }
 
+    /// The names of the tables beside the destination whose names start with
+    /// `<table>__faucet_ovw_` — other overwrite runs' staging, which a
+    /// `begin` drops once abandoned
+    /// ([`faucet_core::idempotency::abandoned_overwrite_staging`]). Default:
+    /// none (nothing is swept).
+    async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        Ok(Vec::new())
+    }
+
     /// Split a page on the dead-letter path into the rows to write and
     /// per-row failures, over the destination's `columns`. Default: a record
     /// matching no column (when `require_match`) fails its own row.
@@ -377,6 +399,12 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         &self.driver
     }
 
+    /// The SQL driver, to adjust it before the first write (an overwrite run
+    /// token).
+    pub fn driver_mut(&mut self) -> &mut D {
+        &mut self.driver
+    }
+
     fn engine(&self) -> &SqlSinkEngine<D::Dialect> {
         self.driver.engine()
     }
@@ -396,6 +424,36 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         calls
             .call_once(what, self.driver.guard(what, Box::pin(fut)))
             .await
+    }
+
+    /// Drop the staging other overwrite runs of this table abandoned (a
+    /// crashed run's `<table>__faucet_ovw_<token>`, older than
+    /// [`faucet_core::idempotency::ABANDONED_OVERWRITE_STAGING`]). A live
+    /// run's staging and this run's own are never touched.
+    async fn drop_abandoned_staging(&self) -> Result<(), FaucetError> {
+        let layout = self.layout();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for name in self.driver.overwrite_staging_tables().await? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                &layout.table,
+                &name,
+                layout.overwrite_run.as_deref(),
+                now,
+            ) {
+                tracing::warn!(staging = %name, "overwrite: dropping staging an earlier run abandoned");
+                let target = self.driver.target(&name);
+                self.driver
+                    .ddl(
+                        &format!("DROP TABLE IF EXISTS {}", target.reference),
+                        "overwrite: drop abandoned staging",
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The table data writes land in: staging while overwriting.
@@ -646,6 +704,7 @@ impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
         self.op(calls, "begin_overwrite", async {
             let layout = self.layout();
             self.driver.drop_staging(true).await?;
+            self.drop_abandoned_staging().await?;
             if layout.create_table && !self.driver.table_exists(&layout.table).await? {
                 return Ok(());
             }
@@ -828,6 +887,7 @@ mod tests {
         layout: SqlLayout,
         exists: bool,
         split_keyed: bool,
+        siblings: Vec<String>,
         log: Mutex<Vec<String>>,
     }
 
@@ -838,6 +898,7 @@ mod tests {
                 layout,
                 exists,
                 split_keyed: false,
+                siblings: Vec::new(),
                 log: Mutex::new(Vec::new()),
             }
         }
@@ -924,6 +985,50 @@ mod tests {
         fn splits_keyed_pages(&self) -> bool {
             self.split_keyed
         }
+        async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+            Ok(self.siblings.clone())
+        }
+    }
+
+    /// A tokened overwrite stages under its own run's name and, at begin,
+    /// drops only its own leftover and staging another run abandoned more
+    /// than a day ago — never a live concurrent run's (#930).
+    #[tokio::test]
+    async fn a_tokened_overwrite_stages_apart_and_sweeps_only_abandoned_runs() {
+        use faucet_core::idempotency::{ABANDONED_OVERWRITE_STAGING, new_overwrite_run_token};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old = now - ABANDONED_OVERWRITE_STAGING.as_secs() - 60;
+        let own = new_overwrite_run_token();
+        let live = new_overwrite_run_token();
+        let abandoned = format!("{:08x}cccccc", old);
+        let mut mem = Mem::new(SqlLayout::new("t").overwrite_run(Some(own.clone())), true);
+        mem.engine = SqlSinkEngine::new(
+            Sqlite,
+            WriteSpec {
+                write_mode: WriteMode::Overwrite,
+                ..WriteSpec::default()
+            },
+        );
+        mem.siblings = vec![
+            format!("t__faucet_ovw_{own}"),
+            format!("t__faucet_ovw_{live}"),
+            format!("t__faucet_ovw_{abandoned}"),
+            "t__faucet_ovw".into(),
+            "t__faucet_ovw_old".into(),
+        ];
+        assert_eq!(mem.staging_table(), format!("t__faucet_ovw_{own}"));
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        sink.begin_overwrite().await.unwrap();
+        assert_eq!(
+            sink.driver().driver().log(),
+            [
+                format!("DROP TABLE IF EXISTS `t__faucet_ovw_{own}`"),
+                format!("DROP TABLE IF EXISTS `t__faucet_ovw_{abandoned}`"),
+            ]
+        );
     }
 
     #[tokio::test]
