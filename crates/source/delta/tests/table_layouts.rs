@@ -361,7 +361,12 @@ async fn columnar_batches_carry_the_table_schema_for_an_evolved_table() {
             .await;
         assert_eq!(batches.len(), 2);
         for b in &batches {
-            let names: Vec<_> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
+            let names: Vec<_> = b
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
             assert_eq!(names, vec!["id", "email"]);
             assert_eq!(b.schema().field(0).data_type(), &DataType::Int64);
             assert_eq!(b.schema().field(1).data_type(), &DataType::Utf8);

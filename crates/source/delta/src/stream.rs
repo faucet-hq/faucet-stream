@@ -533,8 +533,12 @@ fn conform_to_table(
         }
     }
     let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(n));
-    arrow::array::RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
-        .map_err(|e| FaucetError::Source(format!("delta: assembling columnar batch failed: {e}")))
+    arrow::array::RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &options,
+    )
+    .map_err(|e| FaucetError::Source(format!("delta: assembling columnar batch failed: {e}")))
 }
 
 /// The Arrow reader's batch size: `batch_size`, or the whole file for the

@@ -411,9 +411,7 @@ impl BigQuerySource {
                 reader
                     .get(&self.config.project_id, job_id, params.clone())
                     .await
-                    .map_err(|e| {
-                        bq_error(format!("BigQuery jobs.getQueryResults failed: {e}"), &e)
-                    })
+                    .map_err(|e| bq_error(format!("BigQuery jobs.getQueryResults failed: {e}"), &e))
             })
             .await
             .map_err(settle)

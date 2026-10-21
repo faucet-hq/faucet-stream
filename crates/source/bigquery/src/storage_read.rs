@@ -17,13 +17,13 @@ use faucet_core::columnar::ColumnarPage;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::StreamExt;
 use gcloud_gax::conn::{ConnectionManager, ConnectionOptions, Environment};
+use gcloud_gax::grpc::{Code, Status, Streaming};
 use gcloud_googleapis::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_googleapis::cloud::bigquery::storage::v1::read_rows_response::{Rows, Schema};
 use gcloud_googleapis::cloud::bigquery::storage::v1::read_session::TableReadOptions;
 use gcloud_googleapis::cloud::bigquery::storage::v1::{
     CreateReadSessionRequest, DataFormat, ReadRowsRequest, ReadRowsResponse, ReadSession,
 };
-use gcloud_gax::grpc::{Code, Status, Streaming};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -505,7 +505,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reset_stream_resumes_at_the_rows_already_read() {
         let (rows, offsets) = drain(vec![
-            Ok(vec![Ok(msg(10)), Ok(msg(5)), Err(Status::unavailable("stream reset"))]),
+            Ok(vec![
+                Ok(msg(10)),
+                Ok(msg(5)),
+                Err(Status::unavailable("stream reset")),
+            ]),
             Err(Status::internal("RST_STREAM")),
             Ok(vec![Ok(msg(7))]),
         ])
