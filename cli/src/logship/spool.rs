@@ -136,27 +136,34 @@ impl Spool {
         write_json_atomic(&self.cursor_path(run_id), c)
     }
 
-    /// Every run the spool knows (a meta or a segment), oldest first.
+    /// Every run the spool knows, oldest first. A run is one faucet wrote:
+    /// its `<id>.meta.json` holds run metadata naming `<id>` (the writer puts
+    /// it down before the segment). Any other file in the directory — an
+    /// unrelated `.jsonl` when `spool_dir` is shared — is never shipped or
+    /// deleted.
     pub fn run_ids(&self) -> Vec<String> {
         let mut ids: BTreeMap<String, std::time::SystemTime> = BTreeMap::new();
         let Ok(rd) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
+        let mtime = |p: &Path| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let id = name
-                .strip_suffix(".meta.json")
-                .or_else(|| name.strip_suffix(".jsonl"));
-            if let Some(id) = id {
-                let mtime = e
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                let slot = ids.entry(id.to_string()).or_insert(mtime);
-                if mtime < *slot {
-                    *slot = mtime;
-                }
+            let Some(id) = name.strip_suffix(".meta.json") else {
+                continue;
+            };
+            if self.read_meta(id).is_none_or(|m| m.run_id != id) {
+                continue;
             }
+            let mut t = mtime(&e.path());
+            if self.segment(id).exists() {
+                t = t.min(mtime(&self.segment(id)));
+            }
+            ids.insert(id.to_string(), t);
         }
         let mut v: Vec<(String, std::time::SystemTime)> = ids.into_iter().collect();
         v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -971,6 +978,64 @@ mod tests {
         assert_eq!(run.view.pending_lines, 1);
     }
 
+    /// A failed export stops the pass exporting: the other runs are not each
+    /// made to wait out an export timeout against a collector that is down.
+    #[tokio::test]
+    async fn a_failed_export_stops_the_pass_from_exporting_further_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        for id in ["a", "b", "c"] {
+            w.begin(
+                RunMeta {
+                    run_id: id.into(),
+                    ..Default::default()
+                },
+                10,
+            );
+            w.append(id, line("x", &now_ts()));
+            w.end(id);
+        }
+        let ex = crate::logship::otlp::OtlpLogExporter::new(&faucet_core::OtelConfig {
+            endpoint: "http://127.0.0.1:1".into(),
+            protocol: faucet_core::OtelProtocol::Http,
+            timeout_secs: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let r = ship_pass(&spool, Some(&ex), opts(), Utc::now()).await;
+        assert!(r.failed);
+        let attempted = ["a", "b", "c"]
+            .iter()
+            .filter(|id| spool.read_cursor(id).last_attempt_at.is_some())
+            .count();
+        assert_eq!(attempted, 1, "only the first run is exported");
+        for id in ["a", "b", "c"] {
+            assert_eq!(r.run(id).unwrap().view.pending_lines, 1);
+        }
+    }
+
+    /// Files faucet did not write are not runs: they are never shipped or
+    /// removed, even when the spool directory is shared.
+    #[tokio::test]
+    async fn foreign_files_in_the_spool_directory_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        std::fs::write(dir.path().join("events.jsonl"), "{\"a\":1}\n").unwrap();
+        std::fs::write(dir.path().join("other.meta.json"), "{\"x\":1}").unwrap();
+        std::fs::write(
+            dir.path().join("renamed.meta.json"),
+            "{\"run_id\":\"someone-else\"}",
+        )
+        .unwrap();
+        assert!(spool.run_ids().is_empty());
+        let mut o = opts();
+        o.retention = std::time::Duration::ZERO;
+        let r = ship_pass(&spool, None, o, Utc::now()).await;
+        assert!(r.runs.is_empty());
+        assert!(dir.path().join("events.jsonl").exists());
+    }
+
     #[tokio::test]
     async fn max_age_drops_the_oldest_undelivered_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -1163,17 +1228,26 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        std::fs::write(spool.meta_path("first"), b"{}").unwrap();
+        std::fs::write(spool.meta_path("first"), br#"{"run_id":"first"}"#).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(spool.segment("first"), b"").unwrap();
+        // A segment faucet wrote no metadata for is not a run.
+        std::fs::write(spool.segment("loose"), b"").unwrap();
         let ids = spool.run_ids();
         assert!(ids.contains(&"two".to_string()) && ids.contains(&"first".to_string()));
+        assert!(!ids.contains(&"loose".to_string()));
     }
 
     #[tokio::test]
     async fn settled_runs_are_removed_after_retention() {
         let dir = tempfile::tempdir().unwrap();
         let spool = Spool::open(dir.path()).unwrap();
+        spool
+            .write_meta(&RunMeta {
+                run_id: "orphan".into(),
+                ..Default::default()
+            })
+            .unwrap();
         std::fs::write(spool.segment("orphan"), b"").unwrap();
         let o = ShipOptions {
             retention: Duration::ZERO,
