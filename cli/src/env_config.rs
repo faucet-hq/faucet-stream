@@ -510,12 +510,12 @@ fn embedded_secrets(name: &str, value: &str) -> Vec<String> {
         let block = CREDENTIAL_BLOCK_PARTS.iter().any(|p| name.contains(p));
         collect_json_secrets(&json, block, &mut out);
     }
-    if let Ok(url) = url::Url::parse(value) {
-        if let Some(pw) = url.password() {
-            out.push(pw.to_string());
-            if let Ok(decoded) = urlencoding_decode(pw) {
-                out.push(decoded);
-            }
+    if let Ok(url) = url::Url::parse(value)
+        && let Some(pw) = url.password()
+    {
+        out.push(pw.to_string());
+        if let Ok(decoded) = urlencoding_decode(pw) {
+            out.push(decoded);
         }
     }
     for pair in value.split(['?', '&', ';']) {
