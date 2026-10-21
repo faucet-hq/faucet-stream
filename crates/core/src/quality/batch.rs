@@ -96,7 +96,7 @@ pub fn evaluate_unique_check(c: &CompiledBatchCheck, survivors: &[Value]) -> Vec
 fn value_key(v: Option<&Value>) -> String {
     match v {
         None => "\u{0}__missing__".into(),
-        Some(val) => val.to_string(),
+        Some(val) => crate::util::canonical_json(val),
     }
 }
 
@@ -117,6 +117,21 @@ mod tests {
             .batch
             .pop()
             .unwrap()
+    }
+
+    #[test]
+    fn value_key_ignores_object_key_order() {
+        let mut a = serde_json::Map::new();
+        a.insert("b".into(), json!(2));
+        a.insert("a".into(), json!(1));
+        let mut b = serde_json::Map::new();
+        b.insert("a".into(), json!(1));
+        b.insert("b".into(), json!(2));
+        assert_eq!(
+            value_key(Some(&Value::Object(a))),
+            value_key(Some(&Value::Object(b)))
+        );
+        assert_ne!(value_key(Some(&json!(1))), value_key(Some(&json!("1"))));
     }
 
     #[test]
