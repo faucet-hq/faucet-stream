@@ -169,10 +169,10 @@ pub enum KeyCollision {
     /// (the default — never silently drops a column).
     #[default]
     Error,
-    /// Disambiguate colliding keys by appending `_2`, `_3`, … in original
-    /// key order (first occurrence keeps the base name). Deterministic and
-    /// order-stable, mirroring z3z1ma `target-bigquery`'s
-    /// `add_underscore_when_invalid`.
+    /// Disambiguate colliding keys by appending `_2`, `_3`, … in the order
+    /// the keys are first seen in the run (the first keeps the base name). A
+    /// source key keeps its name for the whole run, even in a record where
+    /// the key it collided with is absent.
     Suffix,
 }
 
@@ -913,9 +913,14 @@ impl Clone for CompiledTransform {
                 replacement: replacement.clone(),
             },
             #[cfg(feature = "transform-keys-case")]
-            Self::KeysCase { mode, on_collision } => Self::KeysCase {
+            Self::KeysCase {
+                mode,
+                on_collision,
+                assignments,
+            } => Self::KeysCase {
                 mode: *mode,
                 on_collision: *on_collision,
+                assignments: assignments.clone(),
             },
             #[cfg(feature = "transform-select")]
             Self::Select { fields } => Self::Select {
@@ -1092,6 +1097,9 @@ pub enum CompiledTransform {
     KeysCase {
         mode: KeyCaseMode,
         on_collision: KeyCollision,
+        /// The output name each source key took under `on_collision: suffix`,
+        /// shared by every clone of this transform for the run.
+        assignments: KeyCaseAssignments,
     },
     #[cfg(feature = "transform-select")]
     Select {
@@ -1208,6 +1216,7 @@ pub fn compile(t: &RecordTransform) -> Result<CompiledTransform, FaucetError> {
         RecordTransform::KeysCase { mode, on_collision } => Ok(CompiledTransform::KeysCase {
             mode: *mode,
             on_collision: *on_collision,
+            assignments: KeyCaseAssignments::default(),
         }),
         #[cfg(feature = "transform-select")]
         RecordTransform::Select { fields } => Ok(CompiledTransform::Select {
@@ -1443,9 +1452,11 @@ fn apply_one(value: Value, t: &CompiledTransform) -> Result<Value, FaucetError> 
         #[cfg(feature = "transform-rename-keys")]
         CompiledTransform::RenameKeys { re, replacement } => rename_keys(value, re, replacement),
         #[cfg(feature = "transform-keys-case")]
-        CompiledTransform::KeysCase { mode, on_collision } => {
-            keys_case(value, *mode, *on_collision)
-        }
+        CompiledTransform::KeysCase {
+            mode,
+            on_collision,
+            assignments,
+        } => keys_case(value, *mode, *on_collision, assignments, ""),
         #[cfg(feature = "transform-select")]
         CompiledTransform::Select { fields } => Ok(select_fields(value, fields)),
         #[cfg(feature = "transform-drop")]
@@ -1607,17 +1618,63 @@ fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, Fau
 
 // ── KeysCase ──────────────────────────────────────────────────────────────────
 
+/// The output name each source key took under [`KeyCollision::Suffix`], per
+/// object path, learned over the run. A key keeps the name it was first given
+/// whichever other keys a later record carries, so one source field never
+/// lands in two destination columns.
+#[cfg(feature = "transform-keys-case")]
+#[derive(Debug, Clone, Default)]
+pub struct KeyCaseAssignments(std::sync::Arc<std::sync::Mutex<HashMap<String, KeyCaseScope>>>);
+
+#[cfg(feature = "transform-keys-case")]
+#[derive(Debug, Default)]
+struct KeyCaseScope {
+    by_source: HashMap<String, String>,
+    taken: std::collections::HashSet<String>,
+}
+
+#[cfg(feature = "transform-keys-case")]
+impl KeyCaseAssignments {
+    /// The output name for `source` (re-cased to `recased`) in the object at
+    /// `path`: the one it was given before, else `recased`, else the first
+    /// free `recased_2`, `recased_3`, ….
+    fn name_for(&self, path: &str, source: &str, recased: String) -> String {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let scope = guard.entry(path.to_owned()).or_default();
+        if let Some(name) = scope.by_source.get(source) {
+            return name.clone();
+        }
+        let name = if scope.taken.contains(&recased) {
+            let mut n = 2usize;
+            let mut candidate = format!("{recased}_{n}");
+            while scope.taken.contains(&candidate) {
+                n += 1;
+                candidate = format!("{recased}_{n}");
+            }
+            candidate
+        } else {
+            recased
+        };
+        scope.taken.insert(name.clone());
+        scope.by_source.insert(source.to_owned(), name.clone());
+        name
+    }
+}
+
 /// Recursively re-case every key in the record according to `mode`.
 ///
 /// When two distinct keys within the same object re-case to the same name,
 /// `on_collision` decides: [`KeyCollision::Error`] fails the record (default,
 /// never drops a column); [`KeyCollision::Suffix`] appends `_2`, `_3`, … in
-/// original key order to make each unique (deterministic + order-stable).
+/// the order the keys were first seen in the run, and a key keeps its name
+/// for the rest of the run (see [`KeyCaseAssignments`]).
 #[cfg(feature = "transform-keys-case")]
 fn keys_case(
     value: Value,
     mode: KeyCaseMode,
     on_collision: KeyCollision,
+    assignments: &KeyCaseAssignments,
+    path: &str,
 ) -> Result<Value, FaucetError> {
     match value {
         Value::Object(map) => {
@@ -1627,34 +1684,22 @@ fn keys_case(
                 let recased = if tokens.is_empty() {
                     // An all-symbol key tokenises to nothing — keep the
                     // original key instead of producing a blank one.
-                    k
+                    k.clone()
                 } else {
                     apply_key_case(tokens, mode)
                 };
-                let new_v = keys_case(v, mode, on_collision)?;
-                let final_key = if new_map.contains_key(&recased) {
-                    match on_collision {
-                        KeyCollision::Error => {
-                            return Err(FaucetError::Transform(format!(
-                                "keys_case produced a duplicate key '{recased}'; two distinct \
-                                 keys re-case to the same name under mode {mode:?} (set \
-                                 on_collision: suffix to disambiguate)"
-                            )));
-                        }
-                        KeyCollision::Suffix => {
-                            // Bump the numeric suffix until the name is free —
-                            // guards against colliding with a real `name_2` key.
-                            let mut n = 2usize;
-                            let mut candidate = format!("{recased}_{n}");
-                            while new_map.contains_key(&candidate) {
-                                n += 1;
-                                candidate = format!("{recased}_{n}");
-                            }
-                            candidate
-                        }
+                let child_path = format!("{path}\u{1f}{k}");
+                let new_v = keys_case(v, mode, on_collision, assignments, &child_path)?;
+                let final_key = match on_collision {
+                    KeyCollision::Error if new_map.contains_key(&recased) => {
+                        return Err(FaucetError::Transform(format!(
+                            "keys_case produced a duplicate key '{recased}'; two distinct \
+                             keys re-case to the same name under mode {mode:?} (set \
+                             on_collision: suffix to disambiguate)"
+                        )));
                     }
-                } else {
-                    recased
+                    KeyCollision::Error => recased,
+                    KeyCollision::Suffix => assignments.name_for(path, &k, recased),
                 };
                 new_map.insert(final_key, new_v);
             }
@@ -1663,7 +1708,7 @@ fn keys_case(
         Value::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                out.push(keys_case(v, mode, on_collision)?);
+                out.push(keys_case(v, mode, on_collision, assignments, path)?);
             }
             Ok(Value::Array(out))
         }
@@ -2339,7 +2384,7 @@ fn json_parse_fields(
                     continue;
                 };
                 let s = s.clone();
-                match serde_json::from_str::<Value>(&s) {
+                match crate::fidelity::from_str(&s) {
                     Ok(parsed) => {
                         let target = into.unwrap_or(field.as_str());
                         map.insert(target.to_owned(), parsed);
@@ -2821,6 +2866,35 @@ mod tests {
         let vals: std::collections::BTreeSet<i64> =
             obj.values().filter_map(Value::as_i64).collect();
         assert_eq!(vals, [1, 2, 3].into_iter().collect());
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_suffix_keeps_each_source_key_in_one_column_across_records() {
+        let t = compiled(&[RecordTransform::KeysCase {
+            mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Suffix,
+        }]);
+        let first = apply_all(json!({"AccountId__c": "A", "Account_Id__c": "B"}), &t);
+        let second = apply_all(json!({"Account_Id__c": "C"}), &t.clone());
+        let third = apply_all(json!({"AccountId__c": "D", "n": {"Account_Id__c": 1}}), &t);
+        let col = |v: &Value, want: &str| {
+            v.as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, x)| *x == want)
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            col(&first, "B"),
+            col(&second, "C"),
+            "Account_Id__c moved columns"
+        );
+        assert_eq!(col(&first, "A"), col(&third, "D"));
+        assert_ne!(col(&first, "A"), col(&first, "B"));
+        // A nested object is its own scope: its lone key takes the base name.
+        assert_eq!(third["n"], json!({"account_id_c": 1}));
     }
 
     #[cfg(feature = "transform-keys-case")]
@@ -4662,6 +4736,18 @@ mod tests {
             &compiled(&json_parse_spec("payload", JsonParseOnError::Keep)),
         );
         assert_eq!(out["payload"], json!({"a": 1, "b": [2, 3]}));
+    }
+
+    #[cfg(feature = "transform-json-parse")]
+    #[test]
+    fn json_parse_keeps_big_integers_and_exact_decimals_exact() {
+        let out = apply_all(
+            json!({"payload": "{\"id\": 123456789012345678901234, \"total\": 12345678.123456789012345, \"n\": 7}"}),
+            &compiled(&json_parse_spec("payload", JsonParseOnError::Error)),
+        );
+        assert_eq!(out["payload"]["id"], json!("123456789012345678901234"));
+        assert_eq!(out["payload"]["total"], json!("12345678.123456789012345"));
+        assert_eq!(out["payload"]["n"], json!(7));
     }
 
     #[cfg(feature = "transform-json-parse")]
