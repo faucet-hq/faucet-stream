@@ -3,7 +3,7 @@
 //! pure; `DepthProbe` is the IO seam (Redis/Kafka impls + a fake in tests).
 
 use super::context::TriggerEvent;
-use super::enqueue::{self};
+use super::enqueue::{self, FireOutcome};
 use super::spec::QueueSpec;
 use super::watcher::Watcher;
 use crate::serve::state::ServerState;
@@ -118,7 +118,19 @@ impl Watcher for QueueDepthWatcher {
                 "could not retract an uncommitted edge; it is re-fired on the next poll"
             );
         }
-        Ok(false)
+        uncommitted_result(outcome)
+    }
+}
+
+/// What a poll whose fire did not commit reports to the supervisor: a dropped
+/// fire (backpressure) is retried quietly, a failed or erroring one is an
+/// error, so the watcher backs off and turns unhealthy instead of refiring a
+/// run that cannot start on every poll while reporting healthy.
+fn uncommitted_result(outcome: FireOutcome) -> Result<bool, String> {
+    match outcome {
+        FireOutcome::Failed(e) => Err(format!("queue_depth run cannot start: {e}")),
+        FireOutcome::Error(e) => Err(format!("queue_depth fire failed: {e}")),
+        _ => Ok(false),
     }
 }
 
@@ -339,5 +351,19 @@ mod tests {
         h.trigger_edge_retract("q", 2).await.unwrap();
         assert_eq!(h.trigger_edge_rise("q").await.unwrap(), Some(2), "retried");
         h.trigger_edge_rearm("other").await.unwrap();
+    }
+
+    #[test]
+    fn a_failed_fire_is_a_poll_error_and_a_dropped_one_is_not() {
+        assert!(
+            uncommitted_result(FireOutcome::Failed("no such source".into()))
+                .unwrap_err()
+                .contains("no such source")
+        );
+        assert!(uncommitted_result(FireOutcome::Error("db".into())).is_err());
+        assert_eq!(
+            uncommitted_result(FireOutcome::Dropped("queue_full")),
+            Ok(false)
+        );
     }
 }
