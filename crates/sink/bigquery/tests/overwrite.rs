@@ -1076,6 +1076,39 @@ async fn empty_media_load_stream_finalizes_cleanly() {
     );
 }
 
+/// A direct overwrite whose source was empty empties an existing target at
+/// the terminal flush, as the staged path's swap does; nothing is uploaded.
+#[tokio::test]
+async fn empty_direct_overwrite_truncates_an_existing_target() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-trunc").await;
+
+    let mut config = config_overwrite();
+    config.media_load = true;
+    config.create_table = false;
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.begin_overwrite().await.expect("begin");
+    sink.flush().await.expect("flush");
+    sink.flush().await.expect("second flush");
+    sink.commit_overwrite().await.expect("commit");
+
+    let qs = queries(&server).await;
+    assert_eq!(
+        qs.iter()
+            .filter(|q| q.as_str() == "TRUNCATE TABLE `p.d.t`")
+            .count(),
+        1,
+        "{qs:?}"
+    );
+    let reqs = server.received_requests().await.expect("recording");
+    assert!(!reqs.iter().any(|r| r.url.path().starts_with("/upload/")));
+}
+
 /// Aborting a direct overwrite cancels the un-finalized resumable session
 /// (DELETE the session URI); no finalize PUT is sent.
 #[tokio::test]

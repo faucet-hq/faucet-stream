@@ -941,6 +941,11 @@ pub(crate) struct BigQueryDriver {
     /// bookmarks every page, SQL-36): later appends stream via `insertAll`
     /// instead of opening one load job per page.
     stream_appends: AtomicBool,
+    /// Whether this (writer) instance wrote any row of a direct overwrite run,
+    /// by any path. A direct overwrite that wrote nothing truncates the
+    /// target at its terminal flush, so an empty source empties the table as
+    /// the staged path does.
+    overwrite_rows: AtomicBool,
     /// Whether a columnar batch has already been loaded with its own job.
     #[cfg(feature = "arrow")]
     columnar_loaded: AtomicBool,
@@ -1093,6 +1098,7 @@ impl BigQueryDriver {
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
+            overwrite_rows: AtomicBool::new(false),
             #[cfg(feature = "arrow")]
             columnar_loaded: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
@@ -1110,6 +1116,7 @@ impl BigQueryDriver {
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
+            overwrite_rows: AtomicBool::new(false),
             #[cfg(feature = "arrow")]
             columnar_loaded: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
@@ -1391,6 +1398,43 @@ impl BigQueryDriver {
     /// See [`is_direct_overwrite`] for the rule.
     fn direct_overwrite(&self) -> bool {
         is_direct_overwrite(&self.config)
+    }
+
+    /// Record that a page of `n` rows reached this instance.
+    fn note_rows(&self, n: usize) {
+        if n > 0 {
+            self.overwrite_rows.store(true, Ordering::Release);
+        }
+    }
+
+    /// The terminal flush of a direct overwrite that wrote no row: replace the
+    /// existing target's rows with nothing (`TRUNCATE TABLE`), the result the
+    /// staged path's swap gives an empty source. A missing target stays
+    /// missing. Runs once per instance.
+    async fn truncate_if_empty_direct_overwrite(
+        &self,
+        calls: &CallSlot,
+    ) -> Result<(), FaucetError> {
+        if !self.config.write.is_overwrite()
+            || !self.direct_overwrite()
+            || self.overwrite_rows.load(Ordering::Acquire)
+            || self.upload_session.lock().await.is_some()
+        {
+            return Ok(());
+        }
+        if self.table_exists(calls, &self.config.table_id).await? {
+            tracing::info!(
+                table = %format!(
+                    "{}.{}.{}",
+                    self.config.project_id, self.config.dataset_id, self.config.table_id
+                ),
+                "BigQuery overwrite: the source produced no rows; truncating the target"
+            );
+            self.run_ddl(calls, format!("TRUNCATE TABLE {}", self.table_ref()))
+                .await?;
+        }
+        self.overwrite_rows.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Load one page into the overwrite staging table via the typed, buffer-free
@@ -1837,8 +1881,9 @@ impl BigQueryDriver {
 
     /// Feed one page into the streaming resumable session, opening (or
     /// re-opening, after a prior finalize) the session on demand. Empty pages
-    /// are a no-op (never open a session for zero rows — an empty source leaves
-    /// the destination untouched, matching the non-streaming path).
+    /// are a no-op (never open a session for zero rows); a direct overwrite
+    /// whose source was empty truncates the target at its terminal flush
+    /// instead (`truncate_if_empty_direct_overwrite`).
     async fn feed_session(
         &self,
         calls: &CallSlot,
@@ -2883,6 +2928,7 @@ impl BigQueryDriver {
         ctx: faucet_core::NativeLoadContext,
     ) -> Result<usize, FaucetError> {
         let _ = scope; // v1: no per-scope isolation on the native load path.
+        self.note_rows(1);
         if ctx.write_mode == faucet_core::WriteMode::Overwrite
             && (self.config.scope.is_some() || self.config.overwrite_staging)
         {
@@ -3148,7 +3194,8 @@ impl SinkDriver for BigQueryDriver {
     /// end-of-stream (so `commit_overwrite` is a no-op); a no-op on every
     /// non-streaming path.
     async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        self.finalize_session(calls).await
+        self.finalize_session(calls).await?;
+        self.truncate_if_empty_direct_overwrite(calls).await
     }
 
     async fn write(
@@ -3157,6 +3204,7 @@ impl SinkDriver for BigQueryDriver {
         rows: &[Value],
         policy: RowPolicy,
     ) -> Result<PageWrite, FaucetError> {
+        self.note_rows(rows.len());
         match policy {
             RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
                 self.write_partial(calls, rows).await?,
@@ -3532,6 +3580,7 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
         calls: &CallSlot,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
+        self.note_rows(batch.num_rows());
         let overwrite = self.config.write.write_mode == faucet_core::WriteMode::Overwrite;
         // `swap` so only the first batch of an overwrite run truncates; every
         // later batch must append or the run keeps replacing its own output.
