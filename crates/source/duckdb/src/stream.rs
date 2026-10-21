@@ -37,6 +37,26 @@ pub struct DuckdbSource {
     calls: faucet_core::CallSlot,
 }
 
+/// Interrupts the connection's running query when dropped, unless disarmed
+/// once the query has finished.
+struct InterruptOnDrop {
+    handle: Option<Arc<duckdb::InterruptHandle>>,
+}
+
+impl InterruptOnDrop {
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.interrupt();
+        }
+    }
+}
+
 /// Whether `e` is the call context cutting a call short.
 fn cut_short(e: &FaucetError) -> bool {
     matches!(
@@ -524,7 +544,14 @@ impl faucet_core::Source for DuckdbSource {
             }
         });
 
+        // Owned by the stream, so dropping the stream — the pipeline stopping
+        // at a cancel, `--limit`, a sink error — interrupts a query still
+        // running instead of leaving it to hold the connection.
+        let guard = InterruptOnDrop {
+            handle: Some(self.interrupt.clone()),
+        };
         Box::pin(async_stream::try_stream! {
+            let mut guard = guard;
             let calls = self.calls.get();
             calls.record("query");
             // A page read from the running query is not a round trip of its own.
@@ -546,7 +573,9 @@ impl faucet_core::Source for DuckdbSource {
             }
             // The channel also closes when the reader panics; only a reader
             // that returned is a complete result (#789 SQL-42).
-            reader.await.map_err(|e| {
+            let finished = reader.await;
+            guard.disarm();
+            finished.map_err(|e| {
                 FaucetError::Source(format!("DuckDB reader stopped before the end of the result: {e}"))
             })?;
             tracing::info!(
@@ -665,6 +694,41 @@ mod tests {
             Err(FaucetError::Timeout { .. })
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_stream_interrupts_the_running_query() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT count(*) AS n FROM range(1000000000000) a",
+        ))
+        .await
+        .unwrap();
+        let ctx = HashMap::new();
+        {
+            let mut stream = source.stream_pages(&ctx, 0);
+            let first = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                futures::StreamExt::next(&mut stream),
+            )
+            .await;
+            assert!(first.is_err(), "the query is still running");
+        }
+        // The abandoned query stops and releases the connection, which then
+        // runs the next query normally.
+        let conn = source.conn.clone();
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.lock().unwrap();
+                conn.query_row("SELECT 41 + 1", [], |r| r.get::<_, i64>(0))
+            }),
+        )
+        .await
+        .expect("the connection was released")
+        .unwrap()
+        .unwrap();
+        assert_eq!(next, 42);
     }
 
     #[tokio::test]
