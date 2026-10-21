@@ -255,11 +255,24 @@ async fn a_cut_connection_never_reports_a_bookmark_it_cannot_back() {
     // tier asserts this with a scripted source; here the failure is a real
     // socket death partway through a real cursor.
     let (container, url) = start_postgres().await;
-    let total = 3_000;
+    // The sink is the bottleneck here: an incremental read sorts by its
+    // cursor, so a per-row server delay would hold every row back until the
+    // sort finishes.
+    let total = 200_000;
     seed(&url, total).await;
 
-    let src = slow_source(&url, 100).await;
-    let sink = TestSink::new();
+    let src = PostgresSource::new(
+        PostgresSourceConfig::new(url.as_str(), "SELECT id, payload FROM big")
+            .incremental("id", serde_json::json!(0))
+            .with_batch_size(1_000),
+    )
+    .await
+    .expect("source");
+    let key = src
+        .state_key()
+        .expect("an incremental source has a state key");
+    let store = std::sync::Arc::new(faucet_core::MemoryStateStore::new());
+    let sink = SlowSink(TestSink::new());
 
     let killer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -267,22 +280,50 @@ async fn a_cut_connection_never_reports_a_bookmark_it_cannot_back() {
         container
     });
 
-    let outcome = within("cut connection bookmark", Pipeline::new(&src, &sink).run()).await;
+    let pipeline = Pipeline::new(&src, &sink).with_state_store(store.clone());
+    let outcome = within("cut connection bookmark", pipeline.run()).await;
     let _ = killer.await;
 
-    match outcome {
-        // The expected path: a failure carries no bookmark for a caller to
-        // persist.
-        Err(_) => {}
-        Ok(result) => {
-            let written = sink.len();
-            panic!(
-                "the run returned Ok(bookmark = {:?}) after its connection died, with {written} \
-                 rows written. Persisting that bookmark would skip every unread row on the \
-                 next run.",
-                result.bookmark
-            );
-        }
+    if let Ok(result) = &outcome {
+        panic!(
+            "the run returned Ok(bookmark = {:?}) after its connection died, with {} \
+             rows written",
+            result.bookmark,
+            sink.0.len()
+        );
+    }
+    // Rows arrive in id order from 1, so the sink holds exactly ids 1..=written.
+    let written = sink.0.len() as i64;
+    assert!(
+        written > 0 && written < total,
+        "the cut must land mid-stream: {written} rows"
+    );
+    let stored = faucet_core::StateStore::get(store.as_ref(), &key)
+        .await
+        .expect("state read")
+        .expect("pages before the cut persisted a bookmark");
+    let value = stored
+        .pointer("/data/value")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("bookmark value: {stored}"));
+    assert!(
+        value <= written,
+        "the persisted bookmark {value} covers rows past the {written} the sink confirmed"
+    );
+}
+
+/// A recording sink that takes 40 ms per page, so a long read is still in
+/// flight when the connection is cut.
+struct SlowSink(TestSink);
+
+#[faucet_core::async_trait]
+impl faucet_core::Sink for SlowSink {
+    async fn write_batch(
+        &self,
+        records: &[serde_json::Value],
+    ) -> Result<usize, faucet_core::FaucetError> {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        self.0.write_batch(records).await
     }
 }
 
