@@ -404,6 +404,15 @@ pub async fn admit_inline(
         .or_default()
         .clone();
     let guard = lock.lock_owned().await;
+    // Re-read under the lock: a delete (or suspend) that ran while this
+    // admission waited must win over it.
+    let rec = get_tenant(state, tenant).await?;
+    if rec.suspended {
+        metrics::record_limit_rejection(tenant, "suspended");
+        return Err(ServeError::Conflict(format!(
+            "tenant '{tenant}' is suspended"
+        )));
+    }
     if let Some(max) = rec.limits.max_concurrent_runs {
         let active = active_runs(state, tenant, max as usize + 1).await?;
         if active >= max as usize {
@@ -936,14 +945,36 @@ pub struct DeleteReport {
 /// connect sessions.
 /// Destination data is never touched. Refused while a run is active.
 pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteReport, ServeError> {
-    get_tenant(state, tenant).await?;
-    let active = active_runs(state, tenant, 1).await?;
-    if active > 0 {
+    let rec = get_tenant(state, tenant).await?;
+    if active_runs(state, tenant, 1).await? > 0 {
         return Err(ServeError::Conflict(format!(
             "tenant '{tenant}' has runs queued or running; cancel them before deleting it"
         )));
     }
+    // Close admission before deleting: suspend the tenant (every instance's
+    // admission refuses it from here on), wait out an admission already
+    // holding the lock, then check again with any run it admitted recorded.
     let history = state.history();
+    if !rec.suspended {
+        let mut closed = rec.clone();
+        closed.suspended = true;
+        history.tenant_upsert(&closed).await.map_err(store_err)?;
+    }
+    let lock = state
+        .tenants()
+        .admission
+        .entry(tenant.to_string())
+        .or_default()
+        .clone();
+    let _admission = lock.lock_owned().await;
+    if active_runs(state, tenant, 1).await? > 0 {
+        if !rec.suspended {
+            history.tenant_upsert(&rec).await.map_err(store_err)?;
+        }
+        return Err(ServeError::Conflict(format!(
+            "tenant '{tenant}' has runs queued or running; cancel them before deleting it"
+        )));
+    }
     let mut report = DeleteReport::default();
 
     let mut run_ids = Vec::new();
@@ -1519,6 +1550,50 @@ mod tests {
             delete_tenant(&state, "acme").await,
             Err(ServeError::Conflict(_))
         ));
+    }
+
+    /// A delete waits for an admission already in progress and then sees the
+    /// run it admitted; once a delete has begun, new admissions are refused.
+    #[tokio::test]
+    async fn delete_closes_admission_and_sees_a_run_admitted_meanwhile() {
+        let (state, _) = state_with_vault();
+        state
+            .history()
+            .tenant_upsert(&tenant("acme"))
+            .await
+            .unwrap();
+        let mut req: crate::serve::runner::SubmitRequest =
+            serde_json::from_value(serde_json::json!({"config": "x"})).unwrap();
+        let held = admit(&state, "acme", &mut req).await.unwrap();
+        let deleting = {
+            let state = state.clone();
+            tokio::spawn(async move { delete_tenant(&state, "acme").await })
+        };
+        // The delete has suspended the tenant and waits for the admission.
+        for _ in 0..100 {
+            if state
+                .history()
+                .tenant_get("acme")
+                .await
+                .unwrap()
+                .is_some_and(|t| t.suspended)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!deleting.is_finished());
+        // The admitted submit records its run, then releases the admission.
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.tenant = Some("acme".into());
+        state.history().upsert(&rec).await.unwrap();
+        drop(held);
+        assert!(matches!(
+            deleting.await.unwrap(),
+            Err(ServeError::Conflict(_))
+        ));
+        let t = state.history().tenant_get("acme").await.unwrap().unwrap();
+        assert!(!t.suspended, "a refused delete reopens admission");
     }
 
     #[tokio::test]
