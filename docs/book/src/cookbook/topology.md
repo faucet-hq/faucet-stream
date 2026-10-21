@@ -142,7 +142,7 @@ join's two incoming edges carry `as:` labels that match `build.edge` /
       on_missing: null           # left-mode fill when there is no match
       on_duplicate: first        # or `cartesian` (one output row per build match)
       on_collision: overwrite    # or `skip` / `error`
-      key_normalize: preserve    # or `stringify` so "42" matches 42
+      key_normalize: preserve    # or `stringify` so "42" matches 42 (42.0 matches 42 in both)
       max_build_records: 10000000
     write: { kind: sink, ref: warehouse }
   edges:

@@ -24,7 +24,8 @@
 //!   already exists on the probe record.
 //! - **`key_normalize`** controls whether `"42"` (string) and `42` (number)
 //!   are treated as the same key ([`KeyNormalize::Stringify`]) or as distinct
-//!   keys ([`KeyNormalize::Preserve`], the default — no coercion).
+//!   keys ([`KeyNormalize::Preserve`], the default — no coercion). Numbers
+//!   compare by value in both modes: `42` and `42.0` are one key.
 
 use crate::error::FaucetError;
 use serde::{Deserialize, Serialize};
@@ -382,14 +383,14 @@ fn canonical_key(value: &Value, mode: KeyNormalize) -> Option<String> {
     match mode {
         KeyNormalize::Preserve => match value {
             Value::String(s) => Some(format!("s:{s}")),
-            Value::Number(n) => Some(format!("n:{n}")),
+            Value::Number(_) => Some(format!("n:{}", crate::write_mode::key_scalar_text(value))),
             Value::Bool(b) => Some(format!("b:{b}")),
             Value::Null => None,
             _ => None,
         },
         KeyNormalize::Stringify => match value {
             Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
+            Value::Number(_) => Some(crate::write_mode::key_scalar_text(value)),
             Value::Bool(b) => Some(b.to_string()),
             Value::Null => None,
             _ => None,
@@ -401,6 +402,28 @@ fn canonical_key(value: &Value, mode: KeyNormalize) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn integral_floats_key_like_integers() {
+        for mode in [KeyNormalize::Preserve, KeyNormalize::Stringify] {
+            assert_eq!(
+                canonical_key(&json!(42.0), mode),
+                canonical_key(&json!(42), mode)
+            );
+            assert_ne!(
+                canonical_key(&json!(42.5), mode),
+                canonical_key(&json!(42), mode)
+            );
+        }
+        assert_eq!(
+            canonical_key(&json!("42"), KeyNormalize::Stringify),
+            canonical_key(&json!(42.0), KeyNormalize::Stringify)
+        );
+        assert_ne!(
+            canonical_key(&json!("42"), KeyNormalize::Preserve),
+            canonical_key(&json!(42.0), KeyNormalize::Preserve)
+        );
+    }
 
     fn cfg() -> JoinConfig {
         JoinConfig {
