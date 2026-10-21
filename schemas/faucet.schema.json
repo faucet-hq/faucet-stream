@@ -15423,8 +15423,10 @@
                     },
                     "replication_key_ordered": {
                       "description": "Declares that the query returns records in ascending `replication_key`\norder. Only then may a run that stops before the last page (`max_pages`,\nor a cursor loop) advance the bookmark: otherwise unread pages could\nhold older keys the next run would skip, so the bookmark stays put.",
-                      "type": "boolean",
-                      "default": false
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
                     },
                     "retry_on_response": {
                       "description": "Responses to treat as throttling and retry — including a `200` whose\nbody reports it (`match_success: true` with\n`body_path: \"$.errors[*].extensions.code\"`, `values: [THROTTLED]`). A\nrule's `backoff_from` reads the wait from the response (`cost_bucket`\nfor a leaky-bucket cost report, or a reset header / body value).\nChecked before the response's `errors[]` are classified; a match\nretries the whole request, so partial `data` is never emitted.",
@@ -19541,11 +19543,14 @@
                       "default": "base64"
                     },
                     "max_tracked_keys": {
-                      "default": 1000000,
                       "description": "`Keys` mode: how many matched key names the scan remembers to emit a\nkey `SCAN` returns twice only once (16 bytes plus set overhead each,\nabout 48 MB at the default 1,000,000). Past the limit the scan stops\nremembering new keys, so a later duplicate can be emitted again (a\nwarning says so) while memory stays bounded. `0` turns de-duplication\noff.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
                       "format": "uint",
                       "minimum": 0,
-                      "type": "integer"
+                      "default": 1000000
                     }
                   }
                 },
