@@ -270,8 +270,9 @@ The vault key reaches the pod as `FAUCET_VAULT_KEY` from your Secret and never
 sits in Helm values. Each previous key is read from its Secret into
 `FAUCET_VAULT_PREVIOUS_KEY_<n>` and joined into `FAUCET_VAULT_PREVIOUS_KEYS`, so
 it stays out of both the pod spec and the process arguments. The render
-fails when tenants are enabled without a vault key or with `memory` history
-(tenants and their sealed connections live in the run history).
+fails when tenants are enabled without a vault key, or with `memory` history
+or `sqlite` history without `serve.persistence` (tenants and their sealed
+connections live in the run history, and an emptyDir is lost on restart).
 `serve.connectProviders` requires `serve.tenants`.
 
 ### Approvals and MCP
@@ -322,7 +323,8 @@ upgrades and floods it with runs, then reports what held. See
 ### Render-time checks
 
 The render fails on: a feature block enabled with zero or several file sources;
-`tenants` without a vault key or with `memory` history; `connectProviders`
+`tenants` or `cluster` with `memory` history, or with `sqlite` history but no
+`serve.persistence`; `tenants` without a vault key; `connectProviders`
 without `tenants`; an unknown approval kind, a zero expiry, or template
 approvals with template sync; `mcp.allowMutations` without `mcp.enabled`;
 `serve.otel` content that drops `logs` while `otel.logs` is on. Template sync

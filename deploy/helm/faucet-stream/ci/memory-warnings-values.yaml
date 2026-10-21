@@ -1,5 +1,5 @@
 # Templates sync / triggers with memory history render, with a warning in NOTES.
-# expect: WARNING: serve.templatesSync is on with serve.history.backend=memory
+# expect: restart (serve.history.backend=memory). Synced
 # expect: Note: serve.triggers runs with serve.history.backend=memory
 serve:
   templatesSync:

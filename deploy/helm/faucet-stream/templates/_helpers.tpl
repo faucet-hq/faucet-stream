@@ -262,3 +262,14 @@ true
         -H 'Content-Type: application/json' --data-binary @-
   # → {"run_id": "…"}; follow it at /v1/runs/<run_id>
 {{- end }}
+
+{{/*
+"true" when the serve run history survives a pod restart: postgres, or sqlite
+on a persistent volume (without one the file sits on an emptyDir).
+*/}}
+{{- define "faucet-stream.durableHistory" -}}
+{{- $h := .Values.serve.history.backend -}}
+{{- if or (eq $h "postgres") (and (eq $h "sqlite") (or .Values.serve.persistence.enabled .Values.serve.persistence.existingClaim)) -}}
+true
+{{- end -}}
+{{- end -}}

@@ -12,8 +12,8 @@
 {{- if and .Values.serve.enabled (eq .Values.serve.auth.mode "rbac") (not .Values.serve.auth.rbacConfig) (not .Values.serve.auth.existingSecret) -}}
 {{- fail "serve.auth.mode=rbac requires serve.auth.rbacConfig (inline principals) or serve.auth.existingSecret." -}}
 {{- end -}}
-{{- if and .Values.serve.enabled .Values.serve.cluster.enabled (eq .Values.serve.history.backend "memory") -}}
-{{- fail "serve.cluster.enabled=true requires a persistent history backend: set serve.history.backend to sqlite or postgres." -}}
+{{- if and .Values.serve.enabled .Values.serve.cluster.enabled (not (include "faucet-stream.durableHistory" .)) -}}
+{{- fail "serve.cluster.enabled=true requires a persistent history backend: set serve.history.backend to postgres, or sqlite with serve.persistence.enabled (or serve.persistence.existingClaim) — without a volume the sqlite file is on an emptyDir and is lost on every restart." -}}
 {{- end -}}
 {{- if and .Values.serve.enabled (lt (int .Values.serve.localOutputs.retentionDays) 0) -}}
 {{- fail (printf "serve.localOutputs.retentionDays must be 0 (never expire) or a positive number of days (got %v)." .Values.serve.localOutputs.retentionDays) -}}
@@ -55,8 +55,8 @@
 {{- end -}}
 {{- end -}}
 {{- if .Values.serve.tenants.enabled -}}
-{{- if eq .Values.serve.history.backend "memory" -}}
-{{- fail "serve.tenants.enabled=true requires a persistent history backend: tenants, their sealed connections and state ledgers live in the run history, so with memory every restart deletes them. Set serve.history.backend to sqlite (with serve.persistence) or postgres." -}}
+{{- if not (include "faucet-stream.durableHistory" .) -}}
+{{- fail "serve.tenants.enabled=true requires a persistent history backend: tenants, their sealed connections and state ledgers live in the run history, so with memory (or sqlite on an emptyDir) every restart deletes them. Set serve.history.backend to postgres, or sqlite with serve.persistence.enabled (or serve.persistence.existingClaim)." -}}
 {{- end -}}
 {{- if not (and .Values.serve.tenants.vaultKey.existingSecret .Values.serve.tenants.vaultKey.existingSecretKey) -}}
 {{- fail "serve.tenants.enabled=true requires serve.tenants.vaultKey.existingSecret (and existingSecretKey): the server refuses to store or open tenant connections without a vault key. Create one with: kubectl create secret generic faucet-vault --from-literal=FAUCET_VAULT_KEY=$(openssl rand -base64 48)" -}}

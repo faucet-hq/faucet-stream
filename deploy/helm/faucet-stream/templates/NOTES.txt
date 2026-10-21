@@ -77,9 +77,10 @@ MCP endpoint: /mcp ({{ if .Values.serve.mcp.allowMutations }}read + mutating too
 Hosted OAuth connect: GET /v1/connect/callback is public by design and must be
 reachable from your users' browsers at each provider's `redirect_base`.
 {{- end }}
-{{- if and .Values.serve.templatesSync.enabled (eq .Values.serve.history.backend "memory") }}
+{{- if and .Values.serve.templatesSync.enabled (not (include "faucet-stream.durableHistory" .)) }}
 
-WARNING: serve.templatesSync is on with serve.history.backend=memory. Synced
+WARNING: serve.templatesSync is on with a run history that does not survive a
+restart (serve.history.backend={{ .Values.serve.history.backend }}{{ if eq .Values.serve.history.backend "sqlite" }} without serve.persistence{{ end }}). Synced
 templates, their versions and launches live in the run history, so every pod
 restart starts the registry from scratch (each template re-registers as
 version 1 and `stable` follows only the sidecars again). Use sqlite (with

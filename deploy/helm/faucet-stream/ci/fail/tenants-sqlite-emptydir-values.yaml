@@ -1,0 +1,8 @@
+# expect-error: or sqlite on an emptyDir) every restart deletes them
+serve:
+  history:
+    backend: sqlite
+  tenants:
+    enabled: true
+    vaultKey:
+      existingSecret: faucet-vault

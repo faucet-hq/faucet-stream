@@ -1,0 +1,22 @@
+# sqlite history on an emptyDir: synced templates do not survive a restart.
+# expect: - --templates-sync=/etc/faucet-templates-sync/sync.yaml
+# expect: name: t-faucet-stream-serve-templates-sync
+# expect: token: "${env:GITHUB_TOKEN}"
+# expect: WARNING: serve.templatesSync is on with a run history that does not survive
+serve:
+  history:
+    backend: sqlite
+  templatesSync:
+    enabled: true
+    content: |
+      version: 1
+      origins:
+        - name: platform
+          source:
+            type: github
+            config:
+              repo: acme/data-templates
+              ref: main
+              token: "${env:GITHUB_TOKEN}"
+          prefix: platform-
+          launch: follow
