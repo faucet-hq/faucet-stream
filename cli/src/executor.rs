@@ -3906,7 +3906,7 @@ fn resolve_resource_fields(
         *s = match r.kind {
             ResourceKind::Url => crate::interpolate::interpolate_record_path(s, ctx)?,
             ResourceKind::Path => crate::interpolate::interpolate_record_file_path(s, ctx)?,
-            ResourceKind::Command => continue,
+            _ => continue,
         };
     }
     Ok(())

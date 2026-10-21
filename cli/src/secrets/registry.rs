@@ -98,6 +98,9 @@ impl Registry {
             .then(|| {
                 aho_corasick::AhoCorasick::builder()
                     .match_kind(aho_corasick::MatchKind::Standard)
+                    // A DFA over thousands of forms costs far more to build
+                    // (on every registry change) than it saves per line.
+                    .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
                     .build(&patterns)
                     .ok()
             })
