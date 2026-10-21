@@ -31,16 +31,22 @@ impl MssqlDriver {
             .validate(&[StagingScheme::Azure], &[StagingFormat::Csv])?;
         let uploader = StageUploader::from_location(loc)?.with_call_context(self.calls.get());
         let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
-        let (staged, sql) = crate::staged::build_staged_copy_sql(
-            &uploader,
-            &self.table_quoted,
-            &self.config.table,
-            &self.stage_run_id,
-            seq,
-            records,
-            staging,
-        )
-        .await?;
+        // Bounded by the run's deadline and cancel, not the per-statement timeout.
+        let ctx = self.calls.get().without_timeout();
+        let (staged, sql) = ctx
+            .call_once(
+                "stage",
+                crate::staged::build_staged_copy_sql(
+                    &uploader,
+                    &self.table_quoted,
+                    &self.config.table,
+                    &self.stage_run_id,
+                    seq,
+                    records,
+                    staging,
+                ),
+            )
+            .await?;
 
         let run = async {
             let mut conn = self.checkout().await?;
@@ -56,9 +62,17 @@ impl MssqlDriver {
             .await
         }
         .await;
-        uploader
-            .cleanup(&[staged], staging.spec.cleanup, run.is_ok())
+        let cleaned = ctx
+            .call_once("cleanup", async {
+                uploader
+                    .cleanup(&[staged], staging.spec.cleanup, run.is_ok())
+                    .await;
+                Ok(())
+            })
             .await;
+        if let Err(e) = cleaned {
+            tracing::warn!(error = %e, "MSSQL staged object cleanup did not finish");
+        }
         run?;
         tracing::debug!(records = records.len(), "MSSQL staged load written");
         Ok(records.len())
