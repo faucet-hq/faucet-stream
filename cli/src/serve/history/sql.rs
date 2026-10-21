@@ -674,6 +674,10 @@ pub struct Stmts {
     /// `upsert` that leaves an existing row alone.
     pub insert_new: String,
     pub select_body: String,
+    /// A run's owner and status (lease-ownership check).
+    pub select_run_owner: String,
+    /// A shard's owner and status (lease-ownership check).
+    pub select_shard_owner: String,
     pub select_status: String,
     pub select_submitted: String,
     pub delete: String,
@@ -1210,6 +1214,10 @@ impl Stmts {
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=$1".into(),
+            select_run_owner: "SELECT owner, status FROM faucet_serve_runs WHERE run_id=$1".into(),
+            select_shard_owner: "SELECT owner, status FROM faucet_serve_shards \
+                WHERE run_id=$1 AND shard_id=$2"
+                .into(),
             select_status: "SELECT status FROM faucet_serve_runs WHERE run_id=$1".into(),
             select_submitted: "SELECT submitted_at FROM faucet_serve_runs WHERE run_id=$1".into(),
             delete: "DELETE FROM faucet_serve_runs WHERE run_id=$1".into(),
@@ -1772,6 +1780,10 @@ impl Stmts {
                 VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=?".into(),
+            select_run_owner: "SELECT owner, status FROM faucet_serve_runs WHERE run_id=?".into(),
+            select_shard_owner: "SELECT owner, status FROM faucet_serve_shards \
+                WHERE run_id=? AND shard_id=?"
+                .into(),
             select_status: "SELECT status FROM faucet_serve_runs WHERE run_id=?".into(),
             select_submitted: "SELECT submitted_at FROM faucet_serve_runs WHERE run_id=?".into(),
             delete: "DELETE FROM faucet_serve_runs WHERE run_id=?".into(),
@@ -3099,6 +3111,56 @@ macro_rules! impl_sql_history {
                 Ok(count)
             }
 
+            async fn lease_lost(
+                &self,
+                run_id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.select_run_owner)
+                    .bind(run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(false);
+                };
+                let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                let status: String = row.try_get("status").map_err(backend)?;
+                Ok($crate::serve::history::sql::held_by_peer(
+                    owner.as_deref(),
+                    &status,
+                    &self.instance_id,
+                    &["pending", "queued", "running"],
+                ))
+            }
+
+            async fn shard_lease_lost(
+                &self,
+                run_id: &str,
+                shard_id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.select_shard_owner)
+                    .bind(run_id)
+                    .bind(shard_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(false);
+                };
+                let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                let status: String = row.try_get("status").map_err(backend)?;
+                Ok($crate::serve::history::sql::held_by_peer(
+                    owner.as_deref(),
+                    &status,
+                    &self.instance_id,
+                    &["pending", "running"],
+                ))
+            }
+
             async fn renew_leases(&self) -> Result<usize, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
@@ -3865,6 +3927,13 @@ macro_rules! impl_sql_history {
             async fn finalize_completed_sharded_parents(
                 &self,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
+                Ok(self.finalize_completed_sharded_parents_records().await?.len())
+            }
+
+            async fn finalize_completed_sharded_parents_records(
+                &self,
+            ) -> Result<Vec<$crate::serve::history::RunRecord>, $crate::serve::history::HistoryError>
+            {
                 use sqlx::Row as _;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
@@ -3878,7 +3947,7 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
 
-                let mut finalized = 0usize;
+                let mut finalized = Vec::new();
                 for row in &rows {
                     let run_id: String = row.try_get("run_id").map_err(backend)?;
                     let progress = self.shard_progress(&run_id).await?;
@@ -3920,7 +3989,6 @@ macro_rules! impl_sql_history {
                         .map_err(backend)?
                         .rows_affected();
                     if n == 1 {
-                        finalized += 1;
                         $crate::serve::metrics::record_run_finished(
                             rec.status,
                             rec.status.finished_reason(),
@@ -3931,6 +3999,7 @@ macro_rules! impl_sql_history {
                             failed = progress.failed,
                             "sharded run finalized by sweep (F11)"
                         );
+                        finalized.push(rec);
                     }
                 }
                 Ok(finalized)

@@ -640,6 +640,28 @@ pub trait RunHistory: Send + Sync {
     /// Insert or replace a run record.
     async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError>;
 
+    /// Whether a peer now holds `run_id`'s lease: the run is still live in
+    /// the cluster (pending, queued or running) but no longer owned by this
+    /// instance. A missing or terminal run is not lost. Default: never (a
+    /// store with no owners).
+    async fn lease_lost(&self, run_id: &str) -> Result<bool, HistoryError> {
+        let _ = run_id;
+        Ok(false)
+    }
+
+    /// [`lease_lost`](Self::lease_lost) for one shard of a sharded run.
+    async fn shard_lease_lost(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
+        let _ = (run_id, shard_id);
+        Ok(false)
+    }
+
+    /// [`upsert`](Self::upsert) for a record other instances must see (a
+    /// cluster's `pending` run): a degraded store refuses it rather than
+    /// keeping it in memory, where no instance would ever claim it.
+    async fn upsert_coordinated(&self, rec: &RunRecord) -> Result<(), HistoryError> {
+        self.upsert(rec).await
+    }
+
     /// Insert a run record only when no record has its id; `false` when one
     /// does. Backends override it with an atomic insert so two writers racing
     /// for one id cannot both win.
@@ -877,7 +899,20 @@ pub trait RunHistory: Send + Sync {
     /// benign no-op and the run-finished metric is never double-counted. Default:
     /// nothing to finalize.
     async fn finalize_completed_sharded_parents(&self) -> Result<usize, HistoryError> {
-        Ok(0)
+        Ok(self
+            .finalize_completed_sharded_parents_records()
+            .await?
+            .len())
+    }
+
+    /// [`finalize_completed_sharded_parents`](Self::finalize_completed_sharded_parents),
+    /// returning the records this call finalized — the caller owns the
+    /// completion side effects (callback, tenant accounting) a finalize that
+    /// won the status fence must fire. Default: nothing to finalize.
+    async fn finalize_completed_sharded_parents_records(
+        &self,
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        Ok(Vec::new())
     }
 
     // ── queue_depth trigger edges (#789 SERVE-11) ────────────────────────────

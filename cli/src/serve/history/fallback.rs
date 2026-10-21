@@ -274,6 +274,18 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.upsert(rec), f => f.upsert(rec))
     }
 
+    async fn lease_lost(&self, run_id: &str) -> Result<bool, HistoryError> {
+        strict!(self, p => p.lease_lost(run_id), f => f.lease_lost(run_id))
+    }
+
+    async fn shard_lease_lost(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
+        strict!(self, p => p.shard_lease_lost(run_id, shard_id), f => f.shard_lease_lost(run_id, shard_id))
+    }
+
+    async fn upsert_coordinated(&self, rec: &RunRecord) -> Result<(), HistoryError> {
+        strict!(self, p => p.upsert_coordinated(rec), f => f.upsert_coordinated(rec))
+    }
+
     async fn insert_new(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
         via!(self, p => p.insert_new(rec), f => f.insert_new(rec))
     }
@@ -307,16 +319,16 @@ impl RunHistory for FallbackHistory {
     }
 
     async fn claim_pending(&self, limit: usize) -> Result<Vec<RunRecord>, HistoryError> {
-        via!(self, p => p.claim_pending(limit), f => f.claim_pending(limit))
+        strict!(self, p => p.claim_pending(limit), f => f.claim_pending(limit))
     }
     async fn reclaim_orphans(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
-        via!(self, p => p.reclaim_orphans(max_attempts), f => f.reclaim_orphans(max_attempts))
+        strict!(self, p => p.reclaim_orphans(max_attempts), f => f.reclaim_orphans(max_attempts))
     }
     async fn release_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
         strict!(self, p => p.release_owned(rec), f => f.release_owned(rec))
     }
     async fn finalize_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
-        via!(self, p => p.finalize_owned(rec), f => f.finalize_owned(rec))
+        strict!(self, p => p.finalize_owned(rec), f => f.finalize_owned(rec))
     }
     async fn finalize_sharded_parent(
         &self,
@@ -325,20 +337,20 @@ impl RunHistory for FallbackHistory {
         finished_at: DateTime<Utc>,
         error: Option<String>,
     ) -> Result<bool, HistoryError> {
-        via!(
+        strict!(
             self,
             p => p.finalize_sharded_parent(run_id, status, finished_at, error.clone()),
             f => f.finalize_sharded_parent(run_id, status, finished_at, error.clone())
         )
     }
     async fn cancel_pending(&self, run_id: &str) -> Result<bool, HistoryError> {
-        via!(self, p => p.cancel_pending(run_id), f => f.cancel_pending(run_id))
+        strict!(self, p => p.cancel_pending(run_id), f => f.cancel_pending(run_id))
     }
     async fn request_cancel(&self, run_id: &str) -> Result<(), HistoryError> {
-        via!(self, p => p.request_cancel(run_id), f => f.request_cancel(run_id))
+        strict!(self, p => p.request_cancel(run_id), f => f.request_cancel(run_id))
     }
     async fn pending_cancellations(&self) -> Result<Vec<String>, HistoryError> {
-        via!(self, p => p.pending_cancellations(), f => f.pending_cancellations())
+        strict!(self, p => p.pending_cancellations(), f => f.pending_cancellations())
     }
     async fn heartbeat_instance(&self, beat: &InstanceHeartbeat) -> Result<(), HistoryError> {
         strict!(self, p => p.heartbeat_instance(beat), f => f.heartbeat_instance(beat))
@@ -354,19 +366,19 @@ impl RunHistory for FallbackHistory {
         run_id: &str,
         shards: &[crate::serve::history::ShardInsert],
     ) -> Result<usize, HistoryError> {
-        via!(self, p => p.insert_shards(run_id, shards), f => f.insert_shards(run_id, shards))
+        strict!(self, p => p.insert_shards(run_id, shards), f => f.insert_shards(run_id, shards))
     }
     async fn claim_shards(
         &self,
         limit: usize,
     ) -> Result<Vec<crate::serve::history::ClaimedShard>, HistoryError> {
-        via!(self, p => p.claim_shards(limit), f => f.claim_shards(limit))
+        strict!(self, p => p.claim_shards(limit), f => f.claim_shards(limit))
     }
     async fn renew_shard_leases(&self) -> Result<usize, HistoryError> {
         strict!(self, p => p.renew_shard_leases(), f => f.renew_shard_leases())
     }
     async fn reclaim_shards(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
-        via!(self, p => p.reclaim_shards(max_attempts), f => f.reclaim_shards(max_attempts))
+        strict!(self, p => p.reclaim_shards(max_attempts), f => f.reclaim_shards(max_attempts))
     }
     async fn finalize_shard(
         &self,
@@ -374,11 +386,11 @@ impl RunHistory for FallbackHistory {
         shard_id: &str,
         outcome: super::ShardOutcome,
     ) -> Result<bool, HistoryError> {
-        via!(self, p => p.finalize_shard(run_id, shard_id, outcome), f => f.finalize_shard(run_id, shard_id, outcome))
+        strict!(self, p => p.finalize_shard(run_id, shard_id, outcome), f => f.finalize_shard(run_id, shard_id, outcome))
     }
 
     async fn release_shard(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
-        via!(self, p => p.release_shard(run_id, shard_id), f => f.release_shard(run_id, shard_id))
+        strict!(self, p => p.release_shard(run_id, shard_id), f => f.release_shard(run_id, shard_id))
     }
     async fn shard_progress(
         &self,
@@ -387,10 +399,15 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.shard_progress(run_id), f => f.shard_progress(run_id))
     }
     async fn pending_shard_cancellations(&self) -> Result<Vec<String>, HistoryError> {
-        via!(self, p => p.pending_shard_cancellations(), f => f.pending_shard_cancellations())
+        strict!(self, p => p.pending_shard_cancellations(), f => f.pending_shard_cancellations())
+    }
+    async fn finalize_completed_sharded_parents_records(
+        &self,
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        strict!(self, p => p.finalize_completed_sharded_parents_records(), f => f.finalize_completed_sharded_parents_records())
     }
     async fn finalize_completed_sharded_parents(&self) -> Result<usize, HistoryError> {
-        via!(self, p => p.finalize_completed_sharded_parents(), f => f.finalize_completed_sharded_parents())
+        strict!(self, p => p.finalize_completed_sharded_parents(), f => f.finalize_completed_sharded_parents())
     }
     async fn trigger_edge_rise(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
         strict!(self, p => p.trigger_edge_rise(trigger), f => f.trigger_edge_rise(trigger))
@@ -1166,6 +1183,48 @@ mod tests {
                 .await,
             Err(HistoryError::Degraded(_))
         ));
+    }
+
+    /// Cluster coordination never falls through to memory: an owner-fenced
+    /// finalize that "won" in memory would report a success the primary never
+    /// saw, and a pending run kept in memory is never claimed.
+    #[tokio::test]
+    async fn cluster_coordination_fails_closed_when_the_primary_is_unreachable() {
+        let fb = FallbackHistory::healthy(Box::new(AlwaysFail), Duration::from_secs(60), "test");
+        let mut rec = RunRecord::queued(
+            "r1".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        rec.status = RunStatus::Pending;
+        assert!(matches!(
+            fb.upsert_coordinated(&rec).await,
+            Err(HistoryError::Degraded(_))
+        ));
+        assert!(fb.degraded());
+        assert!(
+            fb.get("r1").await.unwrap().is_none(),
+            "nothing kept in memory"
+        );
+        assert!(matches!(
+            fb.finalize_owned(&rec).await,
+            Err(HistoryError::Degraded(_))
+        ));
+        assert!(fb.claim_pending(4).await.is_err());
+        assert!(fb.reclaim_orphans(3).await.is_err());
+        assert!(fb.cancel_pending("r1").await.is_err());
+        assert!(fb.request_cancel("r1").await.is_err());
+        assert!(fb.claim_shards(4).await.is_err());
+        assert!(
+            fb.finalize_sharded_parent("r1", RunStatus::Completed, chrono::Utc::now(), None)
+                .await
+                .is_err()
+        );
+        // A plain record write still degrades to memory, as before.
+        fb.upsert(&rec).await.unwrap();
+        assert!(fb.get("r1").await.unwrap().is_some());
     }
 
     #[tokio::test]

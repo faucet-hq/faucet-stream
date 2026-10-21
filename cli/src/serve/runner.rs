@@ -745,8 +745,9 @@ async fn execute_shard(
             // Fired by the claim loop for a remote cancel. Flush within the grace
             // window; a cooperative cancel returns Ok(partial), so the shard is
             // Cancelled — but a flush that FAILS must surface, not be masked.
+            let grace = state.cluster().flush_grace(RUN_FLUSH_GRACE);
             Terminal::cancelled()
-                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
+                .after_interrupt(tokio::time::timeout(grace, &mut work).await.ok())
         }
         _ = server_shutdown.cancelled() => {
             coop.cancel();
@@ -807,7 +808,7 @@ pub(crate) async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
             // record: `finalize_sharded_parent` takes fields, not the record, so
             // this is the only way to get the persisted terminal state.
             match state.history().get(run_id).await {
-                Ok(Some(rec)) => crate::serve::callback::fire(&rec).await,
+                Ok(Some(rec)) => finalized_elsewhere(&rec).await,
                 Ok(None) => tracing::warn!(
                     run_id,
                     "sharded parent vanished before its callback could fire"
@@ -1083,12 +1084,15 @@ pub(crate) async fn enqueue(
             release_orphaned_claim(&state, &req, &run_id).await;
             return Err(e);
         }
-        if let Err(e) = state.history().upsert(&rec).await {
+        if let Err(e) = state.history().upsert_coordinated(&rec).await {
             // The record write that should follow a `Fresh` claim failed — release
             // the orphaned claim so a replay starts fresh instead of 404-ing for
             // the whole retention window (F21). Best-effort.
             release_orphaned_claim(&state, &req, &run_id).await;
-            return Err(ServeError::Internal(e.to_string()));
+            return Err(match e {
+                crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
+                e => ServeError::Internal(e.to_string()),
+            });
         }
         // The admission lock is per instance, so two instances can both have
         // admitted the last slot: re-count with the record in place and back
@@ -1869,8 +1873,8 @@ async fn execute_run(
             // correct status for that path. But if the flush itself FAILS within
             // the grace window, surface that real failure — never mask it behind
             // the trigger label, which would hide a data error / partial write.
-            trigger_terminal
-                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
+            let grace = state.cluster().flush_grace(RUN_FLUSH_GRACE);
+            trigger_terminal.after_interrupt(tokio::time::timeout(grace, &mut work).await.ok())
         }
     };
 
@@ -1982,6 +1986,31 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         record_tenant_run(&rec);
         crate::serve::callback::fire(&rec).await;
     }
+}
+
+/// Finalize every `sharded` parent whose shards are all terminal but which no
+/// shard task finalized inline (F11), firing the completion side effects for
+/// each one this call won. Returns how many it finalized.
+pub(crate) async fn sweep_sharded_parents(
+    state: &ServerState,
+) -> Result<usize, crate::serve::history::HistoryError> {
+    let done = state
+        .history()
+        .finalize_completed_sharded_parents_records()
+        .await?;
+    for rec in &done {
+        finalized_elsewhere(rec).await;
+    }
+    Ok(done.len())
+}
+
+/// The completion side effects of a run finalized outside `finalize` (a
+/// sharded parent, by the last shard or by the cluster sweep): tenant
+/// accounting and the completion callback. Called only by the writer that
+/// won the status-fenced finalize, so each fires once.
+pub(crate) async fn finalized_elsewhere(rec: &RunRecord) {
+    record_tenant_run(rec);
+    crate::serve::callback::fire(rec).await;
 }
 
 /// Count a finished tenant run (#709).
@@ -3539,6 +3568,45 @@ mod tests {
                 0,
                 "already-terminal parent is not re-finalized"
             );
+        }
+
+        /// The sweep fires the parent's completion callback when it is the
+        /// one that finalizes it (no shard task finalized it inline).
+        #[tokio::test]
+        async fn the_sweep_fires_the_parents_completion_callback() {
+            use wiremock::matchers::method;
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = sqlite_state(dir.path()).await;
+            seed_sharded_with_shards(&state, "r", 2).await;
+            let mut rec = state.history().get("r").await.unwrap().unwrap();
+            rec.callback = Some(
+                serde_json::from_value(
+                    serde_json::json!({ "url": format!("{}/done", server.uri()) }),
+                )
+                .unwrap(),
+            );
+            state.history().upsert(&rec).await.unwrap();
+            for i in 0..2 {
+                state
+                    .history()
+                    .finalize_shard(
+                        "r",
+                        &i.to_string(),
+                        crate::serve::history::ShardOutcome::Completed,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(sweep_sharded_parents(&state).await.unwrap(), 1);
+            assert_eq!(sweep_sharded_parents(&state).await.unwrap(), 0);
+            server.verify().await;
         }
 
         #[tokio::test]

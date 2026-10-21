@@ -581,11 +581,26 @@ pub async fn maintain_leases(
         renewed = false;
     }
     state.cluster().set_history_reachable(renewed);
+    if renewed && state.cluster().enabled() {
+        state.cluster().set_fenced(None);
+        // A renewal only extends the rows this instance still owns. A run a
+        // peer reclaimed (this instance's lease lapsed while it was alive:
+        // clock skew, a stall) is no longer among them, and must stop here
+        // rather than run on beside the peer's execution.
+        let lost = cancel_lost_leases(state).await;
+        if lost > 0 {
+            return lost;
+        }
+    }
     if !health.observe(renewed, std::time::Instant::now(), fence_after)
         || !state.cluster().enabled()
     {
         return 0;
     }
+    // The fence fires `fence_after` into the outage, short of the lease TTL;
+    // a cancelled run gets a fraction of the remaining time to flush, so it
+    // has stopped writing before a peer may reclaim it.
+    state.cluster().set_fenced(Some(fence_after / 4));
     let cancelled = state.registry().cancel_all();
     tracing::error!(
         cancelled,
@@ -593,6 +608,33 @@ pub async fn maintain_leases(
         "cluster: could not renew run leases; cancelling every local run and shard before \
          the leases expire so a peer that reclaims them never runs them concurrently"
     );
+    cancelled
+}
+
+/// Cancel every local run and shard whose lease a peer now holds (the row is
+/// live but owned by another instance, or requeued). Returns how many.
+async fn cancel_lost_leases(state: &ServerState) -> usize {
+    let mut cancelled = 0usize;
+    for key in state.registry().live_keys() {
+        let lost = match key.split_once("::") {
+            Some((run_id, shard_id)) => state.history().shard_lease_lost(run_id, shard_id).await,
+            None => state.history().lease_lost(&key).await,
+        };
+        match lost {
+            Ok(true) => {
+                tracing::error!(
+                    key = %key,
+                    "cluster: another instance holds this run's lease; cancelling the local execution"
+                );
+                state.registry().cancel(&key);
+                cancelled += 1;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "cluster: lease ownership check failed")
+            }
+        }
+    }
     cancelled
 }
 
@@ -643,7 +685,7 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                     // completed on another instance). Status-fenced + metric
                     // recorded inside the backend, so a parent already finalized by
                     // `maybe_finalize_parent` is not re-finalized or double-counted.
-                    match state.history().finalize_completed_sharded_parents().await {
+                    match crate::serve::runner::sweep_sharded_parents(&state).await {
                         Ok(n) if n > 0 => tracing::info!(
                             finalized = n,
                             "cluster: finalized completed sharded parent run(s) via sweep"

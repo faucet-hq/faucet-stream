@@ -222,6 +222,11 @@ impl Registry {
         fired
     }
 
+    /// Every live token's key: a run id, or `{run_id}::{shard_id}` for a shard.
+    pub fn live_keys(&self) -> Vec<String> {
+        self.tokens.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Run ids with a live cancellation token — i.e. runs this instance has
     /// registered and not yet finished.
     ///

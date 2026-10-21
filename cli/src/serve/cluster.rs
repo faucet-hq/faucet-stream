@@ -6,7 +6,7 @@
 use crate::serve::config::ServeConfig;
 use crate::serve::state::ServerState;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +52,9 @@ struct ClusterInner {
     state_format: std::sync::atomic::AtomicU32,
     /// Whether the last lease renewal reached the run-history backend (#905).
     history_reachable: AtomicBool,
+    /// While fenced (leases not renewed), how long a cancelled run may take
+    /// to flush, in milliseconds; `0` = not fenced.
+    fence_grace_ms: AtomicU64,
 }
 
 impl ClusterHandle {
@@ -70,6 +73,7 @@ impl ClusterHandle {
                     faucet_core::state_version::STATE_FORMAT,
                 ),
                 history_reachable: AtomicBool::new(true),
+                fence_grace_ms: AtomicU64::new(0),
             }),
         }
     }
@@ -116,6 +120,23 @@ impl ClusterHandle {
     pub fn history_reachable(&self) -> bool {
         self.inner.history_reachable.load(Ordering::Acquire)
     }
+    /// Enter (`Some(grace)`) or leave (`None`) the fenced state: while
+    /// fenced, a cancelled run gets only `grace` to flush, so it stops writing
+    /// before its lease expires and a peer may reclaim it.
+    pub fn set_fenced(&self, grace: Option<Duration>) {
+        let ms = grace.map_or(0, |g| (g.as_millis() as u64).max(1));
+        self.inner.fence_grace_ms.store(ms, Ordering::Release);
+    }
+
+    /// How long a cancelled run may take to flush: `normal`, or the shorter
+    /// fence grace while this instance cannot renew its leases.
+    pub fn flush_grace(&self, normal: Duration) -> Duration {
+        match self.inner.fence_grace_ms.load(Ordering::Acquire) {
+            0 => normal,
+            ms => normal.min(Duration::from_millis(ms)),
+        }
+    }
+
     pub fn set_history_reachable(&self, reachable: bool) {
         self.inner
             .history_reachable

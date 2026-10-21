@@ -91,6 +91,15 @@ impl RunHistory for Flaky {
         self.check()?;
         Ok(0)
     }
+    /// A run (or shard) named `taken…` has been reclaimed by a peer.
+    async fn lease_lost(&self, run_id: &str) -> Result<bool, HistoryError> {
+        self.check()?;
+        Ok(run_id.starts_with("taken"))
+    }
+    async fn shard_lease_lost(&self, run_id: &str, _shard: &str) -> Result<bool, HistoryError> {
+        self.check()?;
+        Ok(run_id.starts_with("taken"))
+    }
     async fn template_list(
         &self,
     ) -> Result<Vec<faucet_cli::serve::history::templates::TemplateSummary>, HistoryError> {
@@ -341,4 +350,65 @@ async fn readyz_turns_not_ready_while_a_strict_backend_is_unreachable() {
         (200, true),
         "the first heartbeat that gets through clears it"
     );
+}
+
+/// A run a peer reclaimed while this instance was still running it (its lease
+/// lapsed: clock skew, a stall) is cancelled here on the next heartbeat, so the
+/// two executions do not run side by side; runs this instance still owns are
+/// left alone.
+#[tokio::test]
+async fn a_run_whose_lease_a_peer_took_is_cancelled_locally() {
+    let (fb, _mode) = flaky();
+    let history: Arc<dyn RunHistory> = Arc::new(fb);
+    let cfg = config();
+    let state = ServerState::new(
+        &cfg,
+        None,
+        CancellationToken::new(),
+        history,
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    let taken = CancellationToken::new();
+    let mine = CancellationToken::new();
+    let taken_shard = CancellationToken::new();
+    state.registry().register("taken-1".into(), taken.clone());
+    state.registry().register("mine-1".into(), mine.clone());
+    state
+        .registry()
+        .register_shard("taken-2", "0", taken_shard.clone());
+    let mut health = LeaseHealth::new(std::time::Instant::now());
+    let n = maintain_leases(&state, &mut health, Duration::from_secs(3600)).await;
+    assert_eq!(n, 2);
+    assert!(taken.is_cancelled());
+    assert!(taken_shard.is_cancelled());
+    assert!(!mine.is_cancelled());
+}
+
+/// While fenced, a cancelled run gets only a fraction of the time left
+/// before its lease expires to flush, not the full flush grace.
+#[tokio::test]
+async fn a_fenced_instance_shortens_the_flush_grace() {
+    let (fb, mode) = flaky();
+    let history: Arc<dyn RunHistory> = Arc::new(fb);
+    let cfg = config();
+    let state = ServerState::new(
+        &cfg,
+        None,
+        CancellationToken::new(),
+        history,
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    let normal = Duration::from_secs(30);
+    assert_eq!(state.cluster().flush_grace(normal), normal);
+    mode.store(UNREACHABLE, Ordering::SeqCst);
+    let mut health = LeaseHealth::new(std::time::Instant::now() - Duration::from_secs(60));
+    maintain_leases(&state, &mut health, Duration::from_secs(20)).await;
+    assert_eq!(state.cluster().flush_grace(normal), Duration::from_secs(5));
+    mode.store(HEALTHY, Ordering::SeqCst);
+    maintain_leases(&state, &mut health, Duration::from_secs(20)).await;
+    assert_eq!(state.cluster().flush_grace(normal), normal);
 }
