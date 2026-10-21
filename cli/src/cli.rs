@@ -2433,10 +2433,12 @@ pub struct ServeArgs {
 #[cfg(feature = "mcp")]
 #[derive(Debug, Clone, Parser)]
 pub struct McpArgs {
-    /// Allow mutating tools (`run_pipeline`). Off by default — only read-only
-    /// tools (list / schema / scaffold / validate / preview) are exposed.
-    /// stdio is local-trust: there is no bearer/RBAC layer, so enable this only
-    /// for a trusted local agent.
+    /// Allow mutating tools (`run_pipeline`) and trust the client's configs.
+    /// Off by default — only read-only tools (list / schema / scaffold /
+    /// validate / preview) are exposed, and configs are screened like a body
+    /// submitted to `faucet serve` (no subprocess connectors, `${env:}` /
+    /// `${file:}` / secret directives or local paths). Enable only for a
+    /// trusted local agent.
     #[arg(long)]
     pub allow_mutations: bool,
     /// Optional `.env` file to load before starting (for `${env:…}` in configs

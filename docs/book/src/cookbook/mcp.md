@@ -43,9 +43,14 @@ Claude Desktop config (`claude_desktop_config.json`):
 }
 ```
 
-stdio is **local-trust**: there is no bearer/RBAC layer, so `run_pipeline` is
-gated only by `--allow-mutations`. Do not expose it remotely — use the HTTP
-transport with auth for that.
+stdio has no bearer/RBAC layer. Without `--allow-mutations` the server treats
+every config the client sends as untrusted, because `preview` builds and reads
+the source it is handed: configs are screened like a body submitted to
+`faucet serve` — subprocess connectors (`singer`), `${env:}` / `${file:}` /
+secret-manager directives and local file paths are refused. Pass
+`--allow-mutations` only for a trusted local agent: its configs then run with
+your user's access and `run_pipeline` is exposed. Do not expose stdio remotely —
+use the HTTP transport with auth for that.
 
 ### Streamable HTTP — `faucet serve --mcp`
 
@@ -126,6 +131,8 @@ A JSON-RPC 2.0 subset: `initialize`, `tools/list`, `tools/call`,
 
 - **Read-only by default.** `run_pipeline`, `register_template`, and
   `run_template` are absent from `tools/list` unless mutations are enabled.
+  `preview` still executes the source it is given, so without mutations the
+  stdio server screens configs as untrusted (see above).
 - **HTTP inherits serve auth.** Bearer/RBAC + audit apply to `/mcp` as to any
   route; mutations additionally require the `RunWrite` scope.
 - **`preview` is bounded** (≤100 rows) — never a full extract. It reads pages
