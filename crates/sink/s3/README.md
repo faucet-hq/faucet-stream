@@ -317,7 +317,7 @@ Keys are never reused, so re-runs add new objects rather than overwriting — tr
 
 ## Lineage dataset URI
 
-`s3://<bucket>/<prefix>` — e.g. `s3://my-data-lake/events/raw/`.
+`s3://<bucket>/<prefix><path>` — e.g. `s3://my-data-lake/events/raw/` or, with `path: orders/part-{part}.parquet`, `s3://my-data-lake/events/raw/orders/part-{part}.parquet`. The `path` template is part of the identity, so pipelines writing different paths are different datasets in lineage and the catalog.
 
 ## Feature flags
 

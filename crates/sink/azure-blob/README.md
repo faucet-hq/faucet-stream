@@ -229,6 +229,10 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 
 See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
 
+## Lineage dataset URI
+
+`az://<account>/<container>/<prefix><path>` — e.g. `az://prodeu/exports/orders/part-{part}.parquet`. Container names are unique only within a storage account, so the account (from `account`, a connection string's `AccountName`, or `devstoreaccount1` for the emulator) is part of the identity; without one the URI is `az://<container>/<prefix><path>`.
+
 ## Timeouts, cancellation and retries
 
 Every Blob Storage request — `Put Blob`, blocks and the block list, listings,

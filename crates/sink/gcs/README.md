@@ -274,7 +274,7 @@ The `faucet doctor` preflight probe (`Sink::check`) builds a control-plane `Stor
 
 ## Lineage dataset URI
 
-`gs://<bucket>/<prefix>` — e.g. `gs://my-bucket/events/`.
+`gs://<bucket>/<prefix><path>` — e.g. `gs://my-bucket/events/` or, with `path: users.csv`, `gs://my-bucket/events/users.csv`. The `path` template is part of the identity, so pipelines writing different paths are different datasets in lineage and the catalog.
 
 ## Feature flags
 
