@@ -298,6 +298,71 @@ pipeline:
     assert_eq!(store.get(&unit(&second)).await.unwrap(), Some(json!(500)));
 }
 
+/// A row's own `state:` block is the store the backfill seeds and marks
+/// progress in — the one its unit runs read — not the pipeline's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_level_state_block_holds_the_backfill_seed_and_marker() {
+    use faucet_core::StateStore;
+    let dir = tempfile::tempdir().unwrap();
+    let (src, dst) = seed(dir.path()).await;
+    let state_dir = dir.path().join("row-state");
+    let yaml = format!(
+        r#"
+version: 1
+name: bf
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: "sqlite://{src}"
+      query: "SELECT id, day, amount FROM events"
+  sink:
+    type: sqlite
+    config:
+      database_url: "sqlite://{dst}?mode=rwc"
+      table_name: events_out
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+matrix:
+  - id: orders
+    state:
+      type: file
+      config: {{ path: "{state}" }}
+"#,
+        state = state_dir.display(),
+    );
+    let cfg = faucet_cli::config::parse_with_extension(&yaml, "yaml").expect("config parses");
+    let out = run_backfill(
+        &cfg,
+        opts(BackfillRange::Bookmark {
+            from: json!(7),
+            to: None,
+            field: None,
+        }),
+    )
+    .await
+    .expect("backfill");
+    assert_eq!(out.failed, 0);
+    let hash = faucet_cli::backfill::plan::range_hash(&out.descriptor);
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    assert_eq!(
+        store
+            .get(&unit_state_key("bf", &hash, "bookmark"))
+            .await
+            .unwrap(),
+        Some(json!(7))
+    );
+    assert!(
+        store
+            .get(&faucet_cli::backfill::state::marker_key("bf", &hash))
+            .await
+            .unwrap()
+            .is_some(),
+        "the progress marker is durable in the row's store"
+    );
+}
+
 /// #789: a unit refused by another run's live lease fails the whole backfill
 /// rather than being recorded as one failed unit among successes.
 #[tokio::test(flavor = "multi_thread")]

@@ -364,10 +364,11 @@ pub async fn run_backfill(
                 root.source.kind
             )));
         }
-    } else if root.state.is_none() {
+    } else if root.state.as_ref().is_none_or(|s| s.kind == "memory") {
         return Err(CliError::Config(
-            "--from-bookmark requires a `state:` block — the bookmark is seeded into the \
-             backfill's scoped state key"
+            "--from-bookmark requires a durable `state:` block (not `memory`) on the row — the \
+             bookmark is seeded into the backfill's scoped state key, which the unit reads back \
+             from that store"
                 .into(),
         ));
     }
@@ -425,7 +426,9 @@ pub async fn run_backfill(
     let marker_k = marker_key(&opts.pipeline_name, &rhash);
 
     // ── Marker (durable when a state store is configured) ────────────────────
-    let store: Arc<dyn StateStore> = match cfg.pipeline.state.as_ref() {
+    // The row's own store (`row.state` over `pipeline.state`): the one the
+    // unit runs read their scoped bookmarks from.
+    let store: Arc<dyn StateStore> = match root.state.as_ref() {
         Some(spec) => crate::state::build_state_store(spec).await?,
         None => {
             tracing::warn!(
@@ -1014,9 +1017,23 @@ pipeline:
     }
 
     #[tokio::test]
-    async fn to_bookmark_requires_field() {
+    async fn bookmark_mode_refuses_memory_state() {
         let cfg = parse_cfg(&format!(
             "{SCOPED}  state: {{ type: memory, config: {{}} }}\n"
+        ));
+        let opts = base_opts(BackfillRange::Bookmark {
+            from: json!(1),
+            to: None,
+            field: None,
+        });
+        let err = run_backfill(&cfg, opts).await.unwrap_err().to_string();
+        assert!(err.contains("not `memory`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn to_bookmark_requires_field() {
+        let cfg = parse_cfg(&format!(
+            "{SCOPED}  state: {{ type: file, config: {{ path: ./st }} }}\n"
         ));
         let opts = base_opts(BackfillRange::Bookmark {
             from: json!(1),
