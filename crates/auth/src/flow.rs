@@ -839,10 +839,19 @@ impl AuthProvider for FlowProvider {
         {
             let mut state = self.state.lock().await;
             // A caller naming an older session than the live one hit a 401
-            // another caller already re-logged for: keep the new session.
+            // another caller already re-logged for: keep the new session. A
+            // token that names no session (empty, or not a session number)
+            // invalidates the live one.
             let superseded = match (state.as_ref(), stale) {
                 (Some(s), Credential::Token(sent)) => {
-                    s.valid() && s.ctx.get(FLOW_SESSION_KEY).is_some_and(|cur| cur != sent)
+                    s.valid()
+                        && match (
+                            sent.parse::<u64>(),
+                            s.ctx.get(FLOW_SESSION_KEY).map(|c| c.parse::<u64>()),
+                        ) {
+                            (Ok(sent), Some(Ok(cur))) => sent < cur,
+                            _ => false,
+                        }
                 }
                 _ => false,
             };
@@ -1249,6 +1258,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_token_naming_no_session_re_logs_in() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(CountingLogin(hits.clone()))
+            .mount(&server)
+            .await;
+        let cfg = json!({
+            "steps": [ { "request": { "method": "POST", "url": format!("{}/login", server.uri()) },
+                         "capture": { "sid": "$.sid" } } ],
+            "apply": [ { "into": "header", "name": "X", "value": "${sid}" } ]
+        });
+        let p = FlowProvider::from_config(&cfg).unwrap();
+        let first = p.credential().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // A connector that cannot name the session (empty token) re-logs in.
+        let second = p
+            .invalidate(&Credential::Token(String::new()))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_ne!(first, second, "the rejected session must not be returned");
+        p.invalidate(&Credential::Token("not-a-session".into()))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
