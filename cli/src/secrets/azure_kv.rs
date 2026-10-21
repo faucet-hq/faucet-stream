@@ -145,6 +145,50 @@ impl Default for AzureKvResolver {
     }
 }
 
+/// Split `<vault>/<secret>[/<version>]`, validating each part against Key
+/// Vault's naming rules so the vault name can only ever form a
+/// `<vault>.vault.azure.net` host (a `@`, `:`, `?` or `/` would move the URL
+/// authority elsewhere) and the secret name / version only a path segment.
+fn parse_reference(reference: &str) -> CliResult<(&str, &str, Option<&str>)> {
+    let bad = |why: String| CliError::SecretFetchFailed {
+        scheme: "azure-kv".into(),
+        reference: reference.into(),
+        source: why.into(),
+    };
+    let mut parts = reference.splitn(3, '/');
+    let (Some(vault), Some(secret)) = (
+        parts.next().filter(|s| !s.is_empty()),
+        parts.next().filter(|s| !s.is_empty()),
+    ) else {
+        return Err(bad("expected '<vault>/<secret>[/<version>]'".into()));
+    };
+    let version = parts.next().filter(|s| !s.is_empty());
+    let word = |s: &str, max: usize| {
+        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !(vault.len() >= 3 && word(vault, 24)) {
+        return Err(bad(format!(
+            "vault name '{vault}' must be 3-24 letters, digits or hyphens"
+        )));
+    }
+    if !word(secret, 127) {
+        return Err(bad(format!(
+            "secret name '{secret}' must be 1-127 letters, digits or hyphens"
+        )));
+    }
+    if let Some(v) = version
+        && !word(v, 127)
+    {
+        return Err(bad(format!("version '{v}' must be letters, digits or hyphens")));
+    }
+    Ok((vault, secret, version))
+}
+
+/// The vault's endpoint; `vault` is a validated name ([`parse_reference`]).
+fn vault_url(vault: &str) -> String {
+    format!("https://{vault}.vault.azure.net/")
+}
+
 #[async_trait]
 impl SecretResolver for AzureKvResolver {
     fn scheme(&self) -> &'static str {
@@ -153,32 +197,11 @@ impl SecretResolver for AzureKvResolver {
 
     async fn resolve(&self, reference: &str) -> CliResult<String> {
         super::reject_field("azure-kv", reference)?;
-        // reference = "<vault>/<secret>[/<version>]"
-        let mut parts = reference.splitn(3, '/');
-
-        let vault =
-            parts
-                .next()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| CliError::SecretFetchFailed {
-                    scheme: "azure-kv".into(),
-                    reference: reference.into(),
-                    source: "expected '<vault>/<secret>[/<version>]'".into(),
-                })?;
-        let secret_name =
-            parts
-                .next()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| CliError::SecretFetchFailed {
-                    scheme: "azure-kv".into(),
-                    reference: reference.into(),
-                    source: "expected '<vault>/<secret>[/<version>]'".into(),
-                })?;
-        let version = parts.next().filter(|s| !s.is_empty());
+        let (vault, secret_name, version) = parse_reference(reference)?;
 
         let credential = self.credential().await?;
 
-        let vault_url = format!("https://{vault}.vault.azure.net/");
+        let vault_url = vault_url(vault);
         let client =
             azure_security_keyvault_secrets::SecretClient::new(&vault_url, credential, None)
                 .map_err(|e| CliError::SecretFetchFailed {
@@ -300,6 +323,23 @@ mod tests {
                 .contains("All Azure credential sources failed"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn references_are_validated_before_they_form_a_url() {
+        let (v, s, ver) = parse_reference("my-vault/db-pass/abc123").unwrap();
+        assert_eq!((v, s, ver), ("my-vault", "db-pass", Some("abc123")));
+        assert_eq!(vault_url(v), "https://my-vault.vault.azure.net/");
+        for bad in [
+            "x@example.org:443?/db",
+            "example.org/db",
+            "ab/db",
+            "vault/db?x=1",
+            "vault/../x",
+            "a234567890123456789012345/db",
+        ] {
+            assert!(parse_reference(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
