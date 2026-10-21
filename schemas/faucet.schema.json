@@ -8379,8 +8379,9 @@
               "type": "object",
               "properties": {
                 "connection_string": {
-                  "description": "Connection string.",
-                  "type": "string"
+                  "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 }
               }
             }
@@ -9570,7 +9571,8 @@
           "type": "object",
           "properties": {
             "pattern": {
-              "type": "string"
+              "type": "string",
+              "x-faucet-resource": "path"
             },
             "type": {
               "type": "string",
@@ -10426,11 +10428,12 @@
           "default": "WRITE_APPEND"
         },
         "storage_host": {
-          "description": "Optional GCS storage endpoint override (e.g. a fake-gcs-server host for\ntests). `None` uses the real Google endpoint.",
+          "description": "Optional GCS storage endpoint override (e.g. a fake-gcs-server host for\ntests). `None` uses the real Google endpoint.\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use an anonymous `gcs_auth` elsewhere.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         }
       }
     },
@@ -14552,8 +14555,9 @@
               "type": "object",
               "properties": {
                 "connection_string": {
-                  "description": "Connection string.",
-                  "type": "string"
+                  "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 }
               }
             }
@@ -16533,7 +16537,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -17095,7 +17100,8 @@
                       },
                       "default": [
                         "nats://127.0.0.1:4222"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).",
@@ -17292,7 +17298,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
@@ -17593,7 +17600,8 @@
                   "properties": {
                     "host": {
                       "description": "Server hostname or IP address.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Server port (default: 22).",
@@ -18486,7 +18494,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -18661,7 +18670,8 @@
                   "properties": {
                     "host": {
                       "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Port. Defaults to [`DEFAULT_PORT`] (5439).",
@@ -18858,7 +18868,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "How to authenticate. Defaults to Application Default Credentials.",
@@ -19022,7 +19033,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "http_port": {
                       "description": "HTTP-interface port used with [`host`](Self::host). Defaults to\n[`DEFAULT_HTTP_PORT`] (`8123`).",
@@ -20244,59 +20256,13 @@
                   "description": "Configuration for the Elasticsearch search source.",
                   "properties": {
                     "auth": {
-                      "$ref": "#/$defs/source_elasticsearch__AuthSpec",
-                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog."
+                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
+                      "$ref": "#/$defs/source_elasticsearch__AuthSpec"
                     },
                     "base_url": {
                       "description": "Base URL of the Elasticsearch cluster (e.g. `\"http://localhost:9200\"`).",
                       "type": "string",
                       "x-faucet-resource": "url"
-                    },
-                    "batch_size": {
-                      "default": 1000,
-                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage), which is\nalso the `size` parameter passed to the Elasticsearch scroll API\n(`POST /{index}/_search?scroll={timeout}&size={batch_size}`). Each\nscroll response becomes exactly one `StreamPage`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the whole result set\nis drained through the scroll API (10 000 documents per request) and\nemitted as one `StreamPage`. Use it for small indices or for sinks\n(e.g. SQL `COPY`, BigQuery load jobs) that prefer one large request to\nmany small ones.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "connect_timeout_secs": {
-                      "default": 10,
-                      "description": "Seconds to wait for a TCP/TLS connection to the cluster. Default `10`.",
-                      "format": "uint64",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "index": {
-                      "description": "Index name to search.",
-                      "type": "string"
-                    },
-                    "query": {
-                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
-                    },
-                    "scroll_timeout": {
-                      "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",
-                      "type": "string",
-                      "default": "5m"
-                    },
-                    "auth": {
-                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
-                      "$ref": "#/$defs/source_elasticsearch__AuthSpec"
-                    },
-                    "max_pages": {
-                      "description": "Maximum number of scroll pages to fetch. `None` means no limit.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage), which is\nalso the `size` parameter passed to the Elasticsearch scroll API\n(`POST /{index}/_search?scroll={timeout}&size={batch_size}`). Each\nscroll response becomes exactly one `StreamPage`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the whole result set\nis drained through the scroll API (10 000 documents per request) and\nemitted as one `StreamPage`. Use it for small indices or for sinks\n(e.g. SQL `COPY`, BigQuery load jobs) that prefer one large request to\nmany small ones.",
@@ -20317,6 +20283,28 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 10
+                    },
+                    "index": {
+                      "description": "Index name to search.",
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
+                    },
+                    "scroll_timeout": {
+                      "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",
+                      "type": "string",
+                      "default": "5m"
+                    },
+                    "max_pages": {
+                      "description": "Maximum number of scroll pages to fetch. `None` means no limit.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
                     },
                     "request_timeout_secs": {
                       "description": "Seconds one search or scroll request may take end to end before it\nfails the run (the source does not retry it). Default `300`, so a\nhalf-open connection or a wedged node cannot hang a run forever.",
@@ -20395,7 +20383,8 @@
                   "properties": {
                     "brokers": {
                       "description": "Comma-separated bootstrap server list, e.g. `\"broker1:9092,broker2:9092\"`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "topics": {
                       "description": "One or more topics to subscribe to.",
@@ -20805,7 +20794,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "query": {
                       "description": "GoogleSQL query to run. Use named parameters (`@name`) for\n[`params`](Self::params), and the named parameter `@bookmark` to bind\nthe incremental cursor server-side.",
@@ -21066,12 +21056,24 @@
                       }
                     },
                     "storage_options": {
-                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys.",
+                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an\nauthority host) or a local file (`*_file`, `*_path`, a service-account\nor application-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
                       },
-                      "default": {}
+                      "default": {},
+                      "x-faucet-resource-keys": {
+                        "*endpoint*": "url",
+                        "*_url": "url",
+                        "url": "url",
+                        "*proxy": "url",
+                        "*authority_host": "url",
+                        "*_file": "path",
+                        "*_path": "path",
+                        "*application_credentials": "path",
+                        "google_service_account": "path",
+                        "service_account": "path"
+                      }
                     },
                     "version": {
                       "description": "Time travel: read the table as of this version. Mutually exclusive with\n`timestamp`.",
@@ -21449,11 +21451,12 @@
                       "default": false
                     },
                     "storage_host": {
-                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
@@ -22406,7 +22409,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "external_auth": {
                       "default": false,
@@ -22421,7 +22425,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "json_columns": {
                       "description": "Output columns whose text holds JSON (a `JSON_SERIALIZE(...)` or an\n`IS JSON` `VARCHAR2`/`CLOB`); their values are emitted as parsed JSON.",
@@ -22620,7 +22625,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "external_auth": {
                       "default": false,
@@ -22640,7 +22646,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "idle_timeout": {
                       "default": 30,
@@ -23703,11 +23710,12 @@
                       "default": false
                     },
                     "storage_host": {
-                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
@@ -24854,7 +24862,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -25462,7 +25471,8 @@
                       },
                       "default": [
                         "nats://127.0.0.1:4222"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).",
@@ -25599,7 +25609,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
@@ -25872,7 +25883,8 @@
                   "properties": {
                     "host": {
                       "description": "Server hostname or IP address.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Server port (default: 22).",
@@ -27018,7 +27030,8 @@
                   "properties": {
                     "brokers": {
                       "description": "Comma-separated `host:port` bootstrap brokers, passed straight through\nas librdkafka's `bootstrap.servers` (e.g. `\"b1:9092,b2:9092\"`).\nRequired; a blank value is rejected at config load.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "topic": {
                       "description": "Destination topic. Either a fixed name\n(`{ type: fixed, name: events }`) or a per-record JSONPath lookup\n(`{ type: from_path, path: \"$.dest\" }`) for multi-topic routing.\nRequired.",
@@ -27495,7 +27508,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "table_name": {
                       "description": "Target table name.",
@@ -28195,12 +28209,24 @@
                       }
                     },
                     "storage_options": {
-                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys.",
+                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an\nauthority host) or a local file (`*_file`, `*_path`, a service-account\nor application-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
                       },
-                      "default": {}
+                      "default": {},
+                      "x-faucet-resource-keys": {
+                        "*endpoint*": "url",
+                        "*_url": "url",
+                        "url": "url",
+                        "*proxy": "url",
+                        "*authority_host": "url",
+                        "*_file": "path",
+                        "*_path": "path",
+                        "*application_credentials": "path",
+                        "google_service_account": "path",
+                        "service_account": "path"
+                      }
                     },
                     "create_table": {
                       "description": "Create the table (and its schema, from the inferred record shape) on the\nfirst write when it does not already exist. When `false`, an absent\ntable fails the first write with a typed error.\n\nSpelled `create_table` on the wire since #580, matching every other\ntable sink; the historical `create_if_not_missing` stays accepted as an\nalias. Same default (`true`): a first-ever sync cannot assume the\ndestination exists.",
@@ -28389,11 +28415,12 @@
                       "default": 1000
                     },
                     "storage_host": {
-                      "description": "Optional storage-host override (integration-test escape hatch).",
+                      "description": "Optional storage-host override (integration-test escape hatch).\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "compression": {
                       "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
@@ -28533,7 +28560,8 @@
                   "properties": {
                     "host": {
                       "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Port. Defaults to [`DEFAULT_PORT`] (5439).",
@@ -28784,7 +28812,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "How to authenticate. Defaults to Application Default Credentials.",
@@ -28906,7 +28935,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "http_port": {
                       "description": "HTTP-interface port used with [`host`](Self::host). Defaults to\n[`DEFAULT_HTTP_PORT`] (`8123`).",
@@ -29795,7 +29825,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "create_table": {
                       "default": true,
@@ -29829,7 +29860,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "identifier_case": {
                       "$ref": "#/$defs/sink_oracle__IdentifierCase",
