@@ -47,6 +47,7 @@ jobs:
       code: ${{ steps.gate.outputs.code }}
       ui: ${{ steps.filter.outputs.ui }}
       deploy: ${{ steps.filter.outputs.deploy }}
+      docsync: ${{ steps.filter.outputs.docsync }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,6 +83,13 @@ jobs:
             # PR skips the heavy suite (like docs), and validated by `helm-lint`.
             deploy:
               - 'deploy/helm/**'
+            # Docs that Rust tests read (generated reference pages, the OpenAPI
+            # spec, YAML blocks in the book). They are excluded from `code`, so a
+            # docs-only PR edit to them runs the `doc-sync` job below instead of
+            # the full suite.
+            docsync:
+              - 'docs/openapi.yaml'
+              - 'docs/book/src/**'
       # The release-plz "chore: release" PR is auto-updated on every push to main
       # (version + changelog bumps), which would otherwise re-run the full CI on
       # it after every normal merge. Force `code=false` for that PR so all heavy
@@ -443,6 +451,39 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Serve-ui + serve-openapi isolation tests
         run: cargo test -p faucet-cli --features serve-ui --test serve_ui --test serve_openapi
+
+  # Safety net for docs-only PRs that touch a file a Rust test reads. The full
+  # `test` job skips on those PRs (code == false), so without this a hand edit to
+  # a generated page or docs/openapi.yaml would merge green and turn main red.
+  doc-sync:
+    name: Docs in sync with code
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.docsync == 'true' && needs.changes.outputs.code != 'true' }}
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.96.0"
+      - name: Install librdkafka prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Tests that read docs
+        run: >-
+          cargo test -p faucet-cli --all-features
+          --test serve_openapi --test compat_doc --test capability_matrix
+          --test hub_catalog --test docs_config_blocks --test shipped_features
 
   # Lint + render the Helm chart on chart-only PRs (which skip the Rust suite).
   # Pushes to main always run it so the chart stays verified.
