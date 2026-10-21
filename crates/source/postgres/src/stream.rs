@@ -1230,7 +1230,7 @@ impl faucet_core::Source for PostgresSource {
                     .await?
             }
         };
-        let inner = bounds.wrap(&base, quote_ident);
+        let inner = bounds.wrap(&for_subquery(&base), quote_ident);
         let sql = digest_query(&inner, key, columns);
         let query = bind_params(sqlx::query(&sql), &self.config.params, &binds)?;
         let row = self

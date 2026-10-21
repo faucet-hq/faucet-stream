@@ -129,3 +129,29 @@ async fn range_digest_reflects_content_and_bounds() {
     assert!(only_n.same(&only_n_after), "v is not digested");
     pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shard_bounds_and_digests_accept_a_trailing_semicolon_and_comment() {
+    let (_c, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 40) g")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut cfg = PostgresSourceConfig::new(&url, "SELECT id, v FROM t; -- every row");
+    cfg.shard = Some(faucet_source_postgres::ShardConfig { key: "id".into() });
+    let source = PostgresSource::new(cfg).await.unwrap();
+    let shards = source.enumerate_shards(4).await.expect("shard bounds");
+    assert!(shards.len() > 1, "{shards:?}");
+    let digest = source
+        .range_digest(&KeyRange::ALL, "id", &["v".to_string()])
+        .await
+        .expect("digest")
+        .unwrap();
+    assert_eq!(digest.rows, 40);
+    pool.close().await;
+}
