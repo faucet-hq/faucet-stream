@@ -378,13 +378,38 @@ impl SqsDriver {
         let backup = (chunk.len() > 1 && total > LEGACY_BATCH_BYTES).then(|| chunk.clone());
         match self.put_chunk(calls, chunk).await {
             Err(e) if backup.is_some() && e.to_string().contains("BatchRequestTooLong") => {
+                // Each part keeps its own outcome: a part that fails as a
+                // whole fails only its entries, never those of parts SQS
+                // already accepted. On a FIFO queue a group with a failed
+                // message sends nothing more, as `ship` does across chunks.
+                let fifo = faucet_common_sqs::is_fifo(&self.config.queue_url);
                 let mut merged = BTreeMap::new();
+                let mut failed_groups: HashSet<Option<String>> = HashSet::new();
                 for part in chunk_requests(
                     backup.unwrap_or_default(),
                     self.config.batch_size,
                     LEGACY_BATCH_BYTES,
                 ) {
-                    merged.extend(self.put_chunk(calls, part).await?);
+                    let (send, held): (Vec<Encoded>, Vec<Encoded>) = part
+                        .into_iter()
+                        .partition(|e| !(fifo && failed_groups.contains(&e.group_id)));
+                    for e in held {
+                        merged.insert(
+                            e.index,
+                            Err(FaucetError::Sink(
+                                "sqs: not sent — an earlier message of its FIFO group failed"
+                                    .into(),
+                            )),
+                        );
+                    }
+                    if send.is_empty() {
+                        continue;
+                    }
+                    let indices: Vec<usize> = send.iter().map(|e| e.index).collect();
+                    let groups: Vec<Option<String>> =
+                        send.iter().map(|e| e.group_id.clone()).collect();
+                    let result = self.put_chunk(calls, send).await;
+                    merge_chunk(&mut merged, &mut failed_groups, indices, groups, result);
                 }
                 Ok(merged)
             }

@@ -45,7 +45,9 @@ Each record is serialized to a JSON string as the message body. A body over
 `MaximumMessageSize` is lower rejects the entry per row. Requests are
 re-chunked to both the 10-entry and 1 MiB request ceilings, and re-split to
 256 KiB requests when a service still enforcing the older request limit
-refuses a batch as too long.
+refuses a batch as too long. Each such part keeps its own outcome: a part that
+fails fails only its messages, and on a FIFO queue a group with a failed
+message sends nothing more.
 
 Only transient request failures (transport errors, 5xx/429, throttling) are
 retried; a missing queue or denied access fails at once. A request that fails

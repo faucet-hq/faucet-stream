@@ -260,3 +260,53 @@ async fn a_retriable_request_failure_is_retried_after_the_backoff() {
     assert_eq!(sink.write_batch(&[json!({"n": 1})]).await.unwrap(), 1);
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
+
+fn refused(kind: &str) -> ResponseTemplate {
+    ResponseTemplate::new(400)
+        .insert_header("content-type", "application/x-amz-json-1.0")
+        .set_body_json(json!({
+            "__type": format!("com.amazonaws.sqs#{kind}"),
+            "message": kind
+        }))
+}
+
+/// A batch a 256 KiB-limited queue refuses as too long is re-sent in parts;
+/// when a later part fails as a whole, the parts the queue accepted stay
+/// written, so they never reach the DLQ (or a replay) as failed.
+#[tokio::test]
+async fn a_failed_legacy_part_keeps_the_parts_already_delivered() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(refused("BatchRequestTooLong"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    for id in ["0", "1"] {
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", TARGET))
+            .and(body_string_contains(format!(r#""Id":"{id}""#)))
+            .respond_with(reply(&[id], json!([])))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(refused("InvalidParameterValue"))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+    let sink = SqsSink::new(config(&server.uri(), "orders", 10))
+        .await
+        .unwrap();
+
+    let body = "x".repeat(150 * 1024);
+    let rows: Vec<Value> = (0..3).map(|n| json!({"n": n, "body": body})).collect();
+    let out = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(out[0].is_ok() && out[1].is_ok(), "{out:?}");
+    let err = out[2].as_ref().unwrap_err().to_string();
+    assert!(err.contains("InvalidParameterValue"), "{err}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+}
