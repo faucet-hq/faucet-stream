@@ -605,6 +605,30 @@ async fn a_widened_parquet_schema_carries_the_open_file_and_leaves_no_scratch() 
 
 #[cfg(feature = "file-format-parquet")]
 #[tokio::test]
+async fn a_big_integer_and_a_fraction_on_one_page_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = local(
+        dir.path(),
+        "one.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    let e = w
+        .write_rows(&[json!({"v": 9_007_199_254_740_993_i64}), json!({"v": 1.5})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("'v'") && e.contains("2^53"), "{e}");
+    // Whole numbers a float holds exactly still mix with fractions.
+    w.write_rows(&[json!({"v": 7}), json!({"v": 1.5})])
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
+    let bytes = std::fs::read(dir.path().join("one.parquet")).unwrap();
+    assert_eq!(parquet_shape(bytes), (2, 1));
+}
+
+#[cfg(feature = "file-format-parquet")]
+#[tokio::test]
 async fn a_float_widening_that_would_round_integers_is_refused() {
     let big = 9_007_199_254_740_993_i64;
     let dir = tempfile::tempdir().unwrap();

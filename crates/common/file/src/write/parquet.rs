@@ -52,9 +52,9 @@ fn inexact_as_f64(array: &dyn arrow::array::Array) -> bool {
 
 fn rounding_err(column: &str) -> FaucetError {
     FaucetError::Sink(format!(
-        "parquet: column '{column}' holds whole numbers beyond 2^53 and a fraction on another \
-         page; widening it to a float would round those integers — cast it to one type (a \
-         `cast` transform to string or number) or roll to a new file"
+        "parquet: column '{column}' holds whole numbers beyond 2^53 and a fraction; storing it \
+         as a float would round those integers — cast it to one type (a `cast` transform to \
+         string or number) or roll to a new file"
     ))
 }
 
@@ -94,11 +94,14 @@ impl ParquetState {
             Some(current) => merge(current, &inferred)?,
             None => nullable(&inferred),
         };
+        // Every column landing as a float is checked, not only those this
+        // page inferred as integers: one page holding a big whole number and
+        // a fraction infers `Float64` itself.
         for field in inferred.fields() {
             let to_float = schema
                 .field_with_name(field.name())
                 .is_ok_and(|f| f.data_type() == &DataType::Float64);
-            if to_float && field.data_type().is_integer() {
+            if to_float {
                 let inexact = records.iter().any(|r| {
                     r.get(field.name()).is_some_and(|v| {
                         v.as_i64().map_or_else(
