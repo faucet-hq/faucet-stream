@@ -1211,6 +1211,10 @@ impl SqlDriver for PostgresDriver {
         run_staging_base(&self.config.table_name)
     }
 
+    fn legacy_staging_table(&self) -> String {
+        overwrite_staging_table_name(&self.config.table_name)
+    }
+
     async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
         self.tokened_staging_tables().await
     }

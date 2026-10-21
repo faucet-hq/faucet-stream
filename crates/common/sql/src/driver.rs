@@ -345,6 +345,19 @@ pub trait SqlDriver: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The untokened staging name (`<table>__faucet_ovw`) a release before
+    /// overwrite run tokens, or a run without one, stages in. A tokened
+    /// `begin` drops it: such a run never had per-run isolation. Default: the
+    /// destination table plus the suffix; a backend that shortens long names
+    /// returns the shortened form.
+    fn legacy_staging_table(&self) -> String {
+        format!(
+            "{}{}",
+            self.layout().table,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
+    }
+
     /// The table part of a tokened staging name (`<base>__faucet_ovw_<token>`).
     /// Default: the destination table; a backend that shortens long names
     /// returns the shortened form.
@@ -711,6 +724,15 @@ impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
         self.op(calls, "begin_overwrite", async {
             let layout = self.layout();
             self.driver.drop_staging(true).await?;
+            if layout.overwrite_run.is_some() {
+                let legacy = self.driver.target(&self.driver.legacy_staging_table());
+                self.driver
+                    .ddl(
+                        &format!("DROP TABLE IF EXISTS {}", legacy.reference),
+                        "overwrite: drop stale staging",
+                    )
+                    .await?;
+            }
             self.drop_abandoned_staging().await?;
             if layout.create_table && !self.driver.table_exists(&layout.table).await? {
                 return Ok(());
@@ -746,12 +768,26 @@ impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
             .await
     }
 
+    /// A run's own staging; without a run token (the `faucet status` probe)
+    /// the untokened staging or any run's tokened staging of the table.
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
-        self.op(
-            calls,
-            "overwrite_staging_exists",
-            self.driver.staging_exists(),
-        )
+        self.op(calls, "overwrite_staging_exists", async {
+            if self.driver.staging_exists().await? {
+                return Ok(true);
+            }
+            if self.layout().overwrite_run.is_some() {
+                return Ok(false);
+            }
+            let base = self.driver.staging_base();
+            Ok(self
+                .driver
+                .overwrite_staging_tables()
+                .await?
+                .iter()
+                .any(|name| {
+                    faucet_core::idempotency::overwrite_staging_token(&base, name).is_some()
+                }))
+        })
         .await
     }
 }
@@ -1033,9 +1069,33 @@ mod tests {
             sink.driver().driver().log(),
             [
                 format!("DROP TABLE IF EXISTS `t__faucet_ovw_{own}`"),
+                "DROP TABLE IF EXISTS `t__faucet_ovw`".to_string(),
                 format!("DROP TABLE IF EXISTS `t__faucet_ovw_{abandoned}`"),
             ]
         );
+    }
+
+    /// The untokened probe (`faucet status`) sees any run's tokened staging;
+    /// a run's own probe sees only its own.
+    #[tokio::test]
+    async fn the_untokened_probe_reports_any_runs_staging() {
+        use faucet_core::idempotency::new_overwrite_run_token;
+        let other = format!("t__faucet_ovw_{}", new_overwrite_run_token());
+        let mut mem = Mem::new(SqlLayout::new("t"), false);
+        mem.siblings = vec!["t__faucet_ovw_old".into()];
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
+        let mut mem = Mem::new(SqlLayout::new("t"), false);
+        mem.siblings = vec![other.clone()];
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(true));
+        let mut mem = Mem::new(
+            SqlLayout::new("t").overwrite_run(Some(new_overwrite_run_token())),
+            false,
+        );
+        mem.siblings = vec![other];
+        let sink = DriverSink::new(SqlSinkDriver::new(mem));
+        assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
     }
 
     #[tokio::test]

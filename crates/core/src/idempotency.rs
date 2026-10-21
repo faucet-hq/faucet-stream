@@ -365,6 +365,18 @@ pub fn overwrite_staging_suffix(run: Option<&str>) -> String {
     }
 }
 
+/// The run token of `name` when it is a tokened staging of `table`
+/// (`<table>__faucet_ovw_<token>`, compared ignoring ASCII case), lowercased;
+/// `None` for any other name, including the untokened staging.
+pub fn overwrite_staging_token(table: &str, name: &str) -> Option<String> {
+    let prefix = overwrite_staging_prefix(table);
+    let token = (name.len() == prefix.len() + OVERWRITE_RUN_TOKEN_LEN
+        && name.is_char_boundary(prefix.len())
+        && name[..prefix.len()].eq_ignore_ascii_case(&prefix))
+    .then(|| name[prefix.len()..].to_ascii_lowercase())?;
+    is_overwrite_run_token(&token).then_some(token)
+}
+
 /// Whether `name` is the tokened staging of `table` that another run left
 /// behind long enough ago ([`ABANDONED_OVERWRITE_STAGING`]) to be dropped:
 /// `<table>__faucet_ovw_<token>` with a token other than `own`, started
@@ -377,14 +389,9 @@ pub fn abandoned_overwrite_staging(
     own: Option<&str>,
     now_secs: u64,
 ) -> bool {
-    let prefix = overwrite_staging_prefix(table);
-    if name.len() != prefix.len() + OVERWRITE_RUN_TOKEN_LEN
-        || !name.is_char_boundary(prefix.len())
-        || !name[..prefix.len()].eq_ignore_ascii_case(&prefix)
-    {
+    let Some(token) = overwrite_staging_token(table, name) else {
         return false;
-    }
-    let token = name[prefix.len()..].to_ascii_lowercase();
+    };
     if own.is_some_and(|o| o == token) {
         return false;
     }
@@ -733,6 +740,11 @@ mod overwrite_run_tests {
             Some("67000000aaaaaa"),
             start + 2 * day
         ));
+        assert_eq!(
+            overwrite_staging_token("t", "T__FAUCET_OVW_67000000AAAAAA").as_deref(),
+            Some("67000000aaaaaa")
+        );
+        assert_eq!(overwrite_staging_token("t", "t__faucet_ovw"), None);
         // Not a tokened staging of this table.
         for name in [
             "t__faucet_ovw",
