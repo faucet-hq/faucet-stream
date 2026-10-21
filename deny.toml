@@ -30,6 +30,15 @@ ignore = [
     { id = "RUSTSEC-2026-0099", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
     { id = "RUSTSEC-2026-0104", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
     { id = "RUSTSEC-2026-0346", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
+    # 2026-10-21: emSign distrust (RUSTSEC-2026-0382). rustls-webpki 0.103 is on
+    # the patched 0.103.16; only tiberius 0.12's 0.101.7 remains, with no fixed
+    # 0.101.x release. Drop with the tiberius 0.13 move (#919).
+    { id = "RUSTSEC-2026-0382", reason = "only tiberius 0.12's rustls-webpki 0.101.7 remains; needs tiberius 0.13 (2026-10-21)" },
+    # 2026-10-21: emSign distrust (RUSTSEC-2026-0381). webpki-roots 0.26.11 is
+    # the last 0.26 release, a shim that re-exports webpki-roots 1.x, which the
+    # lockfile has at the patched 1.0.10. sqlx 0.8 and pgwire-replication pin
+    # ^0.26; drop this when they move to webpki-roots 1.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 shim re-exports the patched 1.0.10 (2026-10-21)" },
     { id = "RUSTSEC-2026-0349", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
     # 2026-10-07 — quick-xml: faucet's own parsers and calamine are on >= 0.41
     # (RUSTSEC-2026-0194/0195 fixed). Two older copies remain transitively and
