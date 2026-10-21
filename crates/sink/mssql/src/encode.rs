@@ -178,14 +178,28 @@ pub(crate) fn build_insert_sql_cast(
 /// to the one column matching it ignoring case — SQL Server's default
 /// collation compares identifiers that way (#862 M-044). A field matching
 /// several columns only by case (a case-sensitive collation) is left as is.
-pub(crate) fn fold_to_columns(insertable: &[String], records: &[Value]) -> Vec<Value> {
-    records
-        .iter()
-        .map(|r| match r.as_object() {
-            Some(obj) => Value::Object(fold_record(insertable, obj)),
-            None => r.clone(),
-        })
-        .collect()
+/// Borrows `records` when every field already names a column exactly.
+pub(crate) fn fold_to_columns<'a>(
+    insertable: &[String],
+    records: &'a [Value],
+) -> std::borrow::Cow<'a, [Value]> {
+    let exact: std::collections::HashSet<&str> = insertable.iter().map(String::as_str).collect();
+    let needs_fold = records.iter().any(|r| {
+        r.as_object()
+            .is_some_and(|o| o.keys().any(|k| !exact.contains(k.as_str())))
+    });
+    if !needs_fold {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| match r.as_object() {
+                Some(obj) => Value::Object(fold_record(insertable, obj)),
+                None => r.clone(),
+            })
+            .collect(),
+    )
 }
 /// Indices of the object records in `records` with no field naming a writable
 /// column: writing one would insert an all-`NULL` row, or nothing at all.
@@ -361,16 +375,15 @@ pub(crate) fn group_by_present_columns<'a>(
     records: &'a [Value],
     columns: &[String],
 ) -> Vec<(Vec<String>, Vec<&'a Value>)> {
-    let mut groups: Vec<(Vec<String>, Vec<&'a Value>)> = Vec::new();
+    let mut groups: Vec<(Vec<bool>, Vec<&'a Value>)> = Vec::new();
     for record in records {
-        let present: Vec<String> = columns
+        let present: Vec<bool> = columns
             .iter()
-            .filter(|c| {
+            .map(|c| {
                 record
                     .as_object()
                     .is_some_and(|o| o.contains_key(c.as_str()))
             })
-            .cloned()
             .collect();
         match groups.iter_mut().find(|(p, _)| *p == present) {
             Some((_, rows)) => rows.push(record),
@@ -378,6 +391,17 @@ pub(crate) fn group_by_present_columns<'a>(
         }
     }
     groups
+        .into_iter()
+        .map(|(mask, rows)| {
+            let names = columns
+                .iter()
+                .zip(&mask)
+                .filter(|(_, p)| **p)
+                .map(|(c, _)| c.clone())
+                .collect();
+            (names, rows)
+        })
+        .collect()
 }
 
 pub(crate) fn auto_row_params_typed(
@@ -429,16 +453,14 @@ mod tests {
     #[test]
     fn fields_fold_to_columns_and_unmatched_rows_are_named() {
         let cols: Vec<String> = vec!["UserID".into(), "Kind".into(), "a".into(), "A".into()];
-        let folded = fold_to_columns(
-            &cols,
-            &[
-                json!({"userid": 1, "kind": "x"}),
-                json!({"a": 1, "zz": 2}),
-                json!({"Ux": 1}),
-                json!({"userid": 1, "UserID": 2}),
-                json!(3),
-            ],
-        );
+        let records = [
+            json!({"userid": 1, "kind": "x"}),
+            json!({"a": 1, "zz": 2}),
+            json!({"Ux": 1}),
+            json!({"userid": 1, "UserID": 2}),
+            json!(3),
+        ];
+        let folded = fold_to_columns(&cols, &records);
         assert_eq!(folded[0], json!({"UserID": 1, "Kind": "x"}));
         assert_eq!(folded[1], json!({"a": 1, "zz": 2}));
         assert_eq!(folded[3], json!({"userid": 1, "UserID": 2}));
@@ -446,6 +468,11 @@ mod tests {
             fold_to_columns(&cols, &[json!({"A": 1})])[0],
             json!({"A": 1})
         );
+        assert!(matches!(
+            fold_to_columns(&cols, &[json!({"A": 1, "a": 2})]),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(folded, std::borrow::Cow::Owned(_)));
         assert_eq!(unmatched_rows(&cols, &folded), vec![2]);
         assert!(unmatched_row_error(2).to_string().contains("record 2"));
     }
