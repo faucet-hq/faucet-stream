@@ -5966,7 +5966,7 @@
           }
         },
         "next": {
-          "description": "JSONPath to the next listing page's URL (absolute, or a path relative to\n`base_url`) in each response, e.g. `$.next`. Pages are followed until it\nis absent, null, empty or repeats. Without it only the first page is\nread, so set it for a paginated listing.",
+          "description": "JSONPath to the next listing page's URL (absolute, a path relative to\n`base_url` — a root-relative path that already starts with `base_url`'s\npath is not prefixed twice — or a query-only `?…` for the same listing)\nin each response, e.g. `$.next`. Pages are followed until it\nis absent, null, empty or repeats. Without it only the first page is\nread, so set it for a paginated listing.",
           "type": [
             "string",
             "null"

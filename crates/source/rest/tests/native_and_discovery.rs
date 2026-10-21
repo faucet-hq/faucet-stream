@@ -839,3 +839,48 @@ async fn discovery_recipe_follows_list_pages() {
     assert_eq!(names, vec!["a", "b", "c"]);
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn discovery_list_links_resolve_under_a_versioned_base_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/objects"))
+        .and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "c"}], "next": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/objects"))
+        .and(query_param("cursor", "abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "b"}], "next": "?page=3"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/objects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "a"}], "next": "/v2/objects?cursor=abc"
+        })))
+        .mount(&server)
+        .await;
+    let mut cfg = RestStreamConfig::new(&format!("{}/v2", server.uri()), "/");
+    cfg.discovery = Some(
+        serde_json::from_value(json!({
+            "list": { "get": "/objects", "items": "$.items[*]", "name": "$.name", "next": "$.next" },
+            "emit": { "config": { "path": "/${name}" } }
+        }))
+        .unwrap(),
+    );
+    let names: Vec<String> = RestStream::new(cfg)
+        .unwrap()
+        .discover()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(names, vec!["a", "b", "c"]);
+}

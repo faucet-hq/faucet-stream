@@ -74,8 +74,10 @@ pub struct DiscoveryList {
     /// `[ChangeEvent, Feed, Share, History]`). Vendor-neutral name filtering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_name_suffixes: Vec<String>,
-    /// JSONPath to the next listing page's URL (absolute, or a path relative to
-    /// `base_url`) in each response, e.g. `$.next`. Pages are followed until it
+    /// JSONPath to the next listing page's URL (absolute, a path relative to
+    /// `base_url` — a root-relative path that already starts with `base_url`'s
+    /// path is not prefixed twice — or a query-only `?…` for the same listing)
+    /// in each response, e.g. `$.next`. Pages are followed until it
     /// is absent, null, empty or repeats. Without it only the first page is
     /// read, so set it for a paginated listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +89,18 @@ pub const MAX_LIST_PAGES: usize = 1000;
 
 /// The next listing page's URL from `response`, resolved against `base`.
 pub fn next_list_url(response: &Value, list: &DiscoveryList, base: &str) -> Option<String> {
+    next_list_url_from(response, list, base, None)
+}
+
+/// [`next_list_url`] with the URL of the page that returned `response`, so a
+/// query-only link (`?page=2`) addresses the same listing. A root-relative
+/// link that already carries `base`'s path is not prefixed twice.
+pub fn next_list_url_from(
+    response: &Value,
+    list: &DiscoveryList,
+    base: &str,
+    current: Option<&str>,
+) -> Option<String> {
     let next = match extract_one(response, list.next.as_deref()?)? {
         Value::String(s) => s,
         _ => return None,
@@ -95,13 +109,11 @@ pub fn next_list_url(response: &Value, list: &DiscoveryList, base: &str) -> Opti
     if next.is_empty() {
         return None;
     }
-    Some(
-        if next.starts_with("http://") || next.starts_with("https://") {
-            next.to_string()
-        } else {
-            format!("{base}/{}", next.trim_start_matches('/'))
-        },
-    )
+    if let (Some(query), Some(current)) = (next.strip_prefix('?'), current) {
+        let path = current.split(['?', '#']).next().unwrap_or(current);
+        return Some(format!("{path}?{query}"));
+    }
+    Some(crate::url_util::resolve_job_url(base, next))
 }
 
 /// A keep-if predicate: keep a listing item when the value at `path` equals
@@ -458,6 +470,25 @@ mod tests {
         assert_eq!(
             next_list_url(&json!({"next": "https://cdn.example.com/p2"}), &list, base).as_deref(),
             Some("https://cdn.example.com/p2")
+        );
+        let versioned = "https://api.example.com/v2";
+        assert_eq!(
+            next_list_url(&json!({"next": "/v2/objects?cursor=abc"}), &list, versioned).as_deref(),
+            Some("https://api.example.com/v2/objects?cursor=abc")
+        );
+        assert_eq!(
+            next_list_url(&json!({"next": "objects?page=3"}), &list, versioned).as_deref(),
+            Some("https://api.example.com/v2/objects?page=3")
+        );
+        assert_eq!(
+            next_list_url_from(
+                &json!({"next": "?page=2"}),
+                &list,
+                versioned,
+                Some("https://api.example.com/v2/objects?page=1")
+            )
+            .as_deref(),
+            Some("https://api.example.com/v2/objects?page=2")
         );
         for end in [
             json!({"next": null}),

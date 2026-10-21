@@ -4065,7 +4065,7 @@ impl RestDriver {
                 seen.insert(url.clone());
                 let resp = self.discover_get_json(&url, "discovery list").await?;
                 names.extend(crate::discovery::dataset_names_unsorted(&resp, list));
-                match crate::discovery::next_list_url(&resp, list, base) {
+                match crate::discovery::next_list_url_from(&resp, list, base, Some(&url)) {
                     Some(next) if !seen.contains(&next) => url = next,
                     _ => break,
                 }
