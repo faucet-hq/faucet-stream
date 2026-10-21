@@ -893,6 +893,17 @@ async fn run_expanded_unredacted(
                             .as_ref()
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
+                        // Every keyless parent would share one bookmark, so a
+                        // later parent would resume from another's watermark.
+                        if let Err(e) = check_parent_key(&node.id, parent_key, pk_value.as_ref(), uses_state) {
+                            pre_outcomes.push(synthetic_outcome(
+                                &node.id,
+                                Some(pk_string),
+                                e.to_string(),
+                                InvocationErrorKind::Other,
+                            ));
+                            continue;
+                        }
                         let (state_key, legacy_state_keys) = child_state_keys(
                             opts.state_scope.key(&opts.pipeline_name),
                             &node.id,
@@ -2148,6 +2159,25 @@ fn validate_unit_state_key(node_id: &str, uses_state: bool, state_key: &str) -> 
                 reason: e.to_string(),
             }
         })?;
+    }
+    Ok(())
+}
+
+/// A child invocation that keeps state needs its parent record's
+/// `parent_key`: without one its state key would be shared by every keyless
+/// parent, across runs as well as within one.
+fn check_parent_key(
+    row: &str,
+    parent_key: &str,
+    value: Option<&Value>,
+    uses_state: bool,
+) -> CliResult<()> {
+    let keyless = value.is_none_or(|v| v.is_null() || v.as_str().is_some_and(str::is_empty));
+    if uses_state && keyless {
+        return Err(CliError::Config(format!(
+            "row '{row}': a parent record has no `{parent_key}` (missing, null or empty); a child \
+             that keeps state needs it to name its bookmark, so this invocation is skipped"
+        )));
     }
     Ok(())
 }
@@ -5580,6 +5610,52 @@ matrix:
         assert_eq!(summary.invocations.len(), 2);
         assert!(out_a.exists());
         assert!(out_b.exists());
+    }
+
+    #[tokio::test]
+    async fn a_keyless_parent_is_refused_for_a_child_that_keeps_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_csv = dir.path().join("parents.csv");
+        let child_csv = dir.path().join("child.csv");
+        std::fs::write(&parent_csv, "id,name\n1,alice\n,bob\n").unwrap();
+        std::fs::write(&child_csv, "x\nA\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {parent} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}/parents.jsonl }} }}
+  state:  {{ type: file, config: {{ path: {out}/state }} }}
+matrix:
+  - id: parents
+  - id: child
+    parent: parents
+    source: {{ config: {{ path: {child} }} }}
+    sink:   {{ config: {{ path: '{out}/child-${{parents.id}}.jsonl' }} }}
+"#,
+            parent = parent_csv.display(),
+            child = child_csv.display(),
+            out = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), ExecuteOptions::for_tests("keyless"))
+            .await
+            .unwrap();
+        let children: Vec<_> = summary
+            .invocations
+            .iter()
+            .filter(|i| i.row_id == "child")
+            .collect();
+        assert_eq!(children.len(), 2, "{summary:?}");
+        assert_eq!(children.iter().filter(|i| i.error.is_none()).count(), 1);
+        let refused = children.iter().find(|i| i.error.is_some()).unwrap();
+        assert!(
+            refused.error.as_deref().unwrap().contains("has no `id`"),
+            "{refused:?}"
+        );
+        assert!(check_parent_key("c", "id", None, false).is_ok());
+        assert!(check_parent_key("c", "id", Some(&Value::Null), true).is_err());
+        assert!(check_parent_key("c", "id", Some(&serde_json::json!("")), true).is_err());
+        assert!(check_parent_key("c", "id", Some(&serde_json::json!(7)), true).is_ok());
     }
 
     #[tokio::test]
