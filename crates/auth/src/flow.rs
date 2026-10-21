@@ -646,19 +646,16 @@ impl FlowProvider {
         })
     }
 
-    /// A fresh clock context (`ts`, `nonce`) for signing.
+    /// A fresh clock context for signing: `ts` (Unix seconds) and `nonce`
+    /// (32 random hex characters, unique per signature).
     fn clock_ctx() -> HashMap<String, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
         let mut ctx = HashMap::new();
         ctx.insert("ts".to_owned(), now.to_string());
-        ctx.insert("nonce".to_owned(), format!("{now}{nanos}"));
+        ctx.insert("nonce".to_owned(), uuid::Uuid::new_v4().simple().to_string());
         ctx
     }
 
