@@ -335,14 +335,12 @@ pub async fn verify_node_guarded(
     // what is reported, below.
     let repair = inputs.repair || spec.repair;
     if repair && !report.differences.is_empty() {
-        let allow_delete = inputs.allow_delete || spec.allow_delete;
         let (ups, dels) = repair_node(
             node,
             &key,
             &report.differences,
             &source_rows,
-            allow_delete,
-            &spec.normalize,
+            spec,
             inputs,
             guards,
         )
@@ -764,11 +762,12 @@ async fn repair_node(
     key: &[String],
     differences: &[Difference],
     source_rows: &HashMap<String, Value>,
-    allow_delete: bool,
-    norm: &Normalizer,
+    spec: &VerifySpec,
     inputs: &VerifyInputs,
     guards: &RunGuards,
 ) -> CliResult<(u64, u64)> {
+    let allow_delete = inputs.allow_delete || spec.allow_delete;
+    let norm = &spec.normalize;
     if !crate::registry::sink_capabilities(&node.sink.kind, &node.sink.config)
         .supports_write_mode(faucet_core::WriteMode::Upsert)
     {
