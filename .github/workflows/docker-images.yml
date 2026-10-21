@@ -6,7 +6,8 @@ name: Docker images
 # profile your deployment needs.
 #
 # Triggers:
-#   - manual (workflow_dispatch), optional push: `:<profile>-<sha>` only
+#   - manual (workflow_dispatch), optional push: `:<profile>-<sha>` only (the
+#     chart as `<appVersion>-g<sha>`)
 #   - on a published `faucet-cli-v*` GitHub release (pushes :<profile> and
 #     :<version>-<profile>). release-plz publishes a GitHub release per crate
 #     tag, so both jobs gate on the faucet-cli tag to build ONCE per app
@@ -369,15 +370,28 @@ jobs:
   # Publish the Helm chart as an OCI artifact on GHCR and attach a
   # Dockerfile+chart deploy bundle to the release. Gated to the faucet-cli
   # release so the chart gets ONE version per app release (not one per crate
-  # tag). Manual runs use the chart's appVersion and only push when push=true.
+  # tag). A chart is published only after its images built and published.
+  # Manual runs (push=true) publish the chart under a pre-release version
+  # `<appVersion>-g<sha>`, so a released chart version is never replaced; with
+  # `release: X.Y.Z` the chart goes out as X.Y.Z only when the chart directory
+  # is identical to the faucet-cli-vX.Y.Z tag's.
   helm:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'faucet-cli-v')
+    needs: [build, merge]
+    if: >-
+      always()
+      && needs.build.result == 'success'
+      && (needs.merge.result == 'success' || needs.merge.result == 'skipped')
+      && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'faucet-cli-v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write   # upload the release asset
       packages: write   # push the OCI chart
+    env:
+      RELEASE: ${{ inputs.release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
@@ -386,18 +400,28 @@ jobs:
       - name: Derive version
         id: v
         run: |
+          set -euo pipefail
+          app="$(sed -n 's/^appVersion:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' deploy/helm/faucet-stream/Chart.yaml)"
           if [ "${{ github.event_name }}" = "release" ]; then
-            v="${GITHUB_REF_NAME#faucet-cli-v}"; v="${v#v}"
+            v="${GITHUB_REF_NAME#faucet-cli-v}"; v="${v#v}"; app="$v"
+          elif [ -n "$RELEASE" ] && git diff --quiet "faucet-cli-v$RELEASE" HEAD -- deploy/helm/faucet-stream; then
+            # The build job checked RELEASE against this commit; the chart is
+            # byte-identical to the released one, so re-pushing it is a no-op.
+            v="$RELEASE"; app="$RELEASE"
           else
-            v="$(sed -n 's/^appVersion:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' deploy/helm/faucet-stream/Chart.yaml)"
+            if [ -n "$RELEASE" ]; then
+              echo "::notice::the chart differs from faucet-cli-v$RELEASE; publishing it as a pre-release version"
+            fi
+            v="${app}-g${GITHUB_SHA::12}"
           fi
           echo "v=$v" >>"$GITHUB_OUTPUT"
+          echo "app=$app" >>"$GITHUB_OUTPUT"
 
       - name: Package chart
         run: |
           helm package deploy/helm/faucet-stream \
             --version "${{ steps.v.outputs.v }}" \
-            --app-version "${{ steps.v.outputs.v }}"
+            --app-version "${{ steps.v.outputs.app }}"
 
       - name: Push chart to GHCR (OCI)
         if: github.event_name == 'release' || inputs.push
