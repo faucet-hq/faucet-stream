@@ -1091,6 +1091,8 @@ select {
 .annotate-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; margin: 10px 0; }
 .annotate-fields label { display: flex; flex-direction: column; justify-content: flex-end; gap: 4px; font-size: 0.78rem; color: var(--ink-dim); min-width: 0; }
 .annotate-fields input { width: 100%; min-width: 0; }
+.annotate-fields label.inline-check { flex-direction: row; align-items: center; justify-content: flex-start; gap: 6px; }
+.annotate-fields .inline-check input { width: auto; }
 /* The graph scrolls both ways inside its card. The SVG keeps its natural pixel
    size (set as width/height attributes) rather than stretching to 100% — that
    is what lets wide labels overflow and scroll left/right instead of squashing. */

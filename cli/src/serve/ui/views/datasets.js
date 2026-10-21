@@ -321,7 +321,7 @@ export async function renderLocalOutputs(host, scope = {}) {
       preview_max_rows: previewMax,
     } = data;
     // Either cap may be null — the server's way of saying "no limit".
-    const caps = { defaultRows: previewDefault, maxRows: previewMax, total: scope.totalRecords };
+    const caps = { defaultRows: previewDefault, maxRows: previewMax };
     body.innerHTML = `
       <div class="lo-bar">
         <span class="run-meta">${outputs.length} tracked${
@@ -617,21 +617,12 @@ function rowsParam(raw, caps) {
 
 function previewStatus(d, caps) {
   const n = d.row_count;
-  const total = caps && caps.total;
   const ms = `${d.elapsed_ms} ms`;
-  // When the dataset's total row count is known, say "N of M" outright — far
-  // clearer than "N rows … the dataset has more". Otherwise fall back to the
-  // capped/whole wording.
   if (d.truncated) {
-    if (total != null) {
-      return `showing ${fmtInt(n)} of ${fmtInt(total)} rows · ${ms}`;
-    }
     const cap = caps && caps.maxRows ? ` (UI cap ${fmtInt(caps.maxRows)})` : "";
-    return `${fmtInt(n)} row${n === 1 ? "" : "s"}${cap} · ${ms} · dataset has more`;
+    return `${fmtInt(n)} row${n === 1 ? "" : "s"}${cap} · ${ms} · output has more`;
   }
-  return total != null && Number(total) > n
-    ? `showing all ${fmtInt(n)} of ${fmtInt(total)} rows · ${ms}`
-    : `${fmtInt(n)} row${n === 1 ? "" : "s"} · ${ms} · whole dataset`;
+  return `${fmtInt(n)} row${n === 1 ? "" : "s"} · ${ms} · whole output`;
 }
 
 function previewTable(d) {
@@ -810,7 +801,6 @@ export async function renderDatasetDetail(container, params) {
   // This dataset's own local files, with the same controls scoped to it.
   const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {
     datasetId: d.id,
-    totalRecords: d.total_records,
   });
   container.querySelectorAll(".edge-link").forEach((a) => {
     a.onclick = () => navigate(`#/catalog/${a.dataset.id}`);
@@ -872,6 +862,7 @@ function renderStewardship(el, d, reload) {
           <label>owners (comma-separated; empty = unchanged)
             <input id="an-owners" value="${escapeHtml(owners.join(", "))}" placeholder="team-data, alice@example.com" />
           </label>
+          <label class="inline-check"><input type="checkbox" id="an-clear-owners" /> clear all owners</label>
           <label>consumer name <input id="an-name" placeholder="revenue-dashboard" /></label>
           <label>kind <input id="an-kind" placeholder="dashboard / model / export" /></label>
           <label>contact <input id="an-contact" placeholder="#bi-team" /></label>
@@ -889,7 +880,11 @@ function renderStewardship(el, d, reload) {
     const ownersRaw = el.querySelector("#an-owners").value;
     const body = {};
     const nextOwners = split(ownersRaw);
-    if (nextOwners.join("|") !== owners.join("|")) body.owners = nextOwners;
+    if (el.querySelector("#an-clear-owners").checked) {
+      if (owners.length) body.owners = [];
+    } else if (nextOwners.length && nextOwners.join("|") !== owners.join("|")) {
+      body.owners = nextOwners;
+    }
     const name = el.querySelector("#an-name").value.trim();
     if (name) {
       const c = { name };
