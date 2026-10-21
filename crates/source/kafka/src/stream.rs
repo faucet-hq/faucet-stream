@@ -198,12 +198,15 @@ impl KafkaSource {
     /// Returns `(positions, floors)`: concrete consumer positions, and the
     /// watermark floors of partitions without one, which rank below the prior
     /// bookmark in [`Bookmark::merged_with_floors`].
-    async fn resolve_assigned_offsets(&self) -> (Vec<PartitionOffset>, Vec<PartitionOffset>) {
+    async fn resolve_assigned_offsets(
+        &self,
+        consumed: &HashMap<(String, i32), i64>,
+    ) -> Result<(Vec<PartitionOffset>, Vec<PartitionOffset>), FaucetError> {
         let assigned = match self.consumer.assignment() {
             Ok(tpl) => tpl,
             Err(e) => {
                 tracing::warn!(error = %e, "kafka source: assignment() failed; bookmark falls back to consumed/carry-forward offsets");
-                return (Vec::new(), Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             }
         };
         let positions: HashMap<(String, i32), rdkafka::Offset> = self
@@ -271,24 +274,63 @@ impl KafkaSource {
             let to_fetch = need_watermark.clone();
             // `fetch_watermarks` is a blocking librdkafka broker call — run it
             // off the async runtime.
+            // A lookup is retried before giving up on a partition.
             let lookup = tokio::task::spawn_blocking(move || {
                 to_fetch
                     .into_iter()
                     .filter_map(|(topic, partition)| {
-                        consumer
-                            .fetch_watermarks(&topic, partition, Duration::from_secs(5))
-                            .ok()
-                            .map(|(low, high)| {
-                                (topic, partition, if earliest { low } else { high })
-                            })
+                        let mut last = None;
+                        for _ in 0..WATERMARK_ATTEMPTS {
+                            match consumer.fetch_watermarks(
+                                &topic,
+                                partition,
+                                Duration::from_secs(5),
+                            ) {
+                                Ok((low, high)) => {
+                                    return Some((
+                                        topic,
+                                        partition,
+                                        if earliest { low } else { high },
+                                    ));
+                                }
+                                Err(e) => last = Some(e),
+                            }
+                        }
+                        if let Some(e) = last {
+                            tracing::warn!(
+                                topic = %topic,
+                                partition,
+                                error = %e,
+                                "kafka source: watermark lookup failed"
+                            );
+                        }
+                        None
                     })
                     .collect::<Vec<_>>()
             });
             let resolved = self
                 .calls
-                .call_once("metadata", async { Ok(lookup.await.unwrap_or_default()) })
-                .await
-                .unwrap_or_default();
+                .call_once("metadata", async {
+                    lookup.await.map_err(|e| {
+                        FaucetError::Source(format!(
+                            "kafka source: watermark lookup task failed: {e}"
+                        ))
+                    })
+                })
+                .await?;
+            let missing = unrecorded_partitions(
+                &need_watermark,
+                &resolved,
+                self.start_bookmark().as_ref(),
+                consumed,
+            );
+            if !missing.is_empty() {
+                return Err(FaucetError::Source(format!(
+                    "kafka source: could not resolve a start offset for assigned partition(s) \
+                     {missing:?}; failing the page rather than persisting a bookmark without \
+                     them (they would restart at `auto.offset.reset` and skip records)"
+                )));
+            }
 
             if let Ok(mut cache) = self.assigned_floor.lock() {
                 for (topic, partition, floor) in resolved {
@@ -301,7 +343,7 @@ impl KafkaSource {
                 }
             }
         }
-        (out, floors)
+        Ok((out, floors))
     }
 
     /// The start bookmark applied via [`apply_start_bookmark`], retained for
@@ -330,7 +372,7 @@ impl KafkaSource {
         &self,
         consumed: &HashMap<(String, i32), i64>,
     ) -> Result<Option<Value>, FaucetError> {
-        let (positions, floors) = self.resolve_assigned_offsets().await;
+        let (positions, floors) = self.resolve_assigned_offsets(consumed).await?;
         let merged = Bookmark::merged_with_floors(
             self.start_bookmark().as_ref(),
             &floors,
@@ -1186,8 +1228,58 @@ impl Source for KafkaSource {
     }
 }
 
+/// Attempts per partition at a watermark lookup before giving up.
+const WATERMARK_ATTEMPTS: usize = 3;
+
+/// Assigned partitions whose position a bookmark would not record: no
+/// watermark resolved, nothing consumed this run and no entry in the start
+/// bookmark. Persisting a bookmark without them would restart them at
+/// `auto.offset.reset`.
+fn unrecorded_partitions(
+    needed: &[(String, i32)],
+    resolved: &[(String, i32, i64)],
+    start: Option<&Bookmark>,
+    consumed: &HashMap<(String, i32), i64>,
+) -> Vec<(String, i32)> {
+    needed
+        .iter()
+        .filter(|(t, p)| {
+            !resolved.iter().any(|(rt, rp, _)| rt == t && rp == p)
+                && !consumed.contains_key(&(t.clone(), *p))
+                && !start.is_some_and(|b| {
+                    b.partition_offsets
+                        .iter()
+                        .any(|o| &o.topic == t && o.partition == *p)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// A partition whose watermark lookup failed is reported unless the
+    /// bookmark records it anyway (consumed this run, or in the start
+    /// bookmark).
+    #[test]
+    fn unresolved_partitions_without_any_position_are_reported() {
+        let t = |p| ("t".to_string(), p);
+        let needed = vec![t(0), t(1), t(2), t(3)];
+        let resolved = vec![("t".to_string(), 0, 10)];
+        let start = Bookmark {
+            partition_offsets: vec![PartitionOffset {
+                topic: "t".into(),
+                partition: 2,
+                offset: 5,
+            }],
+        };
+        let consumed = HashMap::from([(t(1), 7)]);
+        assert_eq!(
+            unrecorded_partitions(&needed, &resolved, Some(&start), &consumed),
+            vec![t(3)]
+        );
+        assert!(unrecorded_partitions(&needed[..1], &resolved, None, &HashMap::new()).is_empty());
+    }
 
     #[test]
     fn partition_lag_counts_from_the_next_offset() {
