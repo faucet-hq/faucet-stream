@@ -556,3 +556,55 @@ async fn scoped_cleanup_deletes_are_journaled_and_restored_by_rollback() {
         "the cleaned-up row is back and the upsert is undone"
     );
 }
+
+/// A scoped (windowed) overwrite replaced only its window, so rolling it back
+/// is guarded and restored over the window alone: rows outside it carry
+/// earlier runs' ids without blocking the rollback, and stay as they are.
+#[tokio::test]
+async fn scoped_overwrite_rollback_covers_only_the_window() {
+    let (_c, url) = start_postgres().await;
+    exec(&url, CREATE_USERS).await;
+    exec(
+        &url,
+        "INSERT INTO users VALUES (1, 'old-1', 'r0'), (2, 'old-2', 'r0'), (10, 'outside', 'r0')",
+    )
+    .await;
+    let mut cfg = config(
+        &url,
+        WriteSpec {
+            write_mode: WriteMode::Overwrite,
+            key: vec![],
+            delete_marker: None,
+            rollback: Some(rollback_spec("r1", false, true)),
+        },
+    );
+    cfg.scope = Some(
+        serde_json::from_value(json!({"window": {"column": "id", "from": 1, "to": 5}})).unwrap(),
+    );
+    let sink = PostgresSink::new(cfg.clone()).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[user(3, "new-3", "r1")]).await.unwrap();
+    sink.commit_overwrite().await.unwrap();
+    // Outside the window a later write happens; it is not the rollback's concern.
+    exec(&url, "UPDATE users SET name = 'edited' WHERE id = 10").await;
+
+    cfg.write = WriteSpec::default();
+    let sink = PostgresSink::new(cfg).await.unwrap();
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Overwrite))
+        .await
+        .unwrap();
+    assert_eq!(
+        (out.conflicts, out.restored, out.applied),
+        (0, 2, true),
+        "{out:?}"
+    );
+    assert_eq!(
+        rows(&url).await,
+        vec![
+            (1, "old-1".into(), Some("r0".into())),
+            (2, "old-2".into(), Some("r0".into())),
+            (10, "edited".into(), Some("r0".into())),
+        ]
+    );
+}

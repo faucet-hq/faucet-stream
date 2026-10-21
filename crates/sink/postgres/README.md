@@ -558,7 +558,9 @@ table as `<table>__faucet_prev` (a `CREATE TABLE … AS SELECT` inside the swap 
 deletes the run's appended rows, restores the journaled before-images, or
 swaps the previous table back — refusing (unless `--force`) when a later run
 changed the same keys — and rewinds the row's bookmark and exactly-once
-watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
+watermark. For a scoped overwrite (`scope:`) only the window is checked and
+restored: rows outside it keep their earlier run ids without blocking the
+rollback, and stay as they are. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `postgres` source config
 `faucet verify` reads the destination back with). See the [rollback
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).

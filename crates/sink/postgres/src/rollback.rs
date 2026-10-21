@@ -468,11 +468,27 @@ impl PostgresDriver {
         let target = self.target_ref();
         let prev = self.previous_ref();
         let col = &opts.run_id_column;
+        // A scoped (windowed) overwrite replaced only its window: the rows
+        // outside it carry earlier runs' ids and are not this run's to undo,
+        // so the guard and the restore cover the window alone.
+        let window = self
+            .config
+            .scope
+            .as_ref()
+            .map(|scope| scope.render_where_literal(&quote_ident(scope.column())));
+        let in_window = window
+            .as_deref()
+            .map(|w| format!(" AND ({w})"))
+            .unwrap_or_default();
+        let where_window = window
+            .as_deref()
+            .map(|w| format!(" WHERE {w}"))
+            .unwrap_or_default();
         // The kept copy is the image before the *latest* overwrite; if the
         // target no longer holds this run's rows, a later run replaced them.
         let conflicts: i64 = if self.has_column(&mut *conn, col).await? {
             sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM {target} WHERE {c} IS DISTINCT FROM $1",
+                "SELECT count(*) FROM {target} WHERE {c} IS DISTINCT FROM $1{in_window}",
                 c = quote_ident(col)
             ))
             .bind(run_id)
@@ -485,10 +501,11 @@ impl PostgresDriver {
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts as u64));
         }
-        let restored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {prev}"))
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| sink_err("count previous rows", e))?;
+        let restored: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {prev}{where_window}"))
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| sink_err("count previous rows", e))?;
         if opts.dry_run {
             return Ok(RollbackOutcome {
                 restored: restored as u64,
@@ -508,11 +525,16 @@ impl PostgresDriver {
             .map(|(c, _)| c)
             .collect();
         let roles = crate::sink::column_roles(&mut *conn, &target).await?;
-        let clear = crate::sink::clear_statements(
-            &target,
-            &crate::sink::referencing_foreign_keys(&mut *conn, &target).await?,
-        )?;
-        let copy = roles.copy_statements(&target, &prev, None, |c| kept.iter().any(|k| k == c));
+        let clear = match &window {
+            Some(pred) => vec![format!("DELETE FROM {target} WHERE {pred}")],
+            None => crate::sink::clear_statements(
+                &target,
+                &crate::sink::referencing_foreign_keys(&mut *conn, &target).await?,
+            )?,
+        };
+        let copy = roles.copy_statements(&target, &prev, window.as_deref(), |c| {
+            kept.iter().any(|k| k == c)
+        });
         let statements = clear
             .into_iter()
             .chain(copy)
