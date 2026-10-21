@@ -847,7 +847,11 @@ later), `not_on_disk` (already gone — a no-op, and the record is marked expire
 `already_deleted`, `delete_failed`, `relative_path` (a row recorded before paths
 were stored absolute — it would resolve against the sweeper's directory, not the
 writer's), or `other_host` (another host wrote the file; each row records its
-writer's host, and only a sweeper there deletes it).
+writer's host, and only a sweeper there deletes it). The host identity is the
+`FAUCET_HOST_ID` environment variable when set, else the host name: set it to a
+stable value (e.g. the StatefulSet pod name or the volume's name) when a
+container's host name changes on restart but its output volume persists, or
+outputs written before a restart are never collected.
 
 `in_flight` covers two cases, because one is not enough: the output's ledger row
 names a run that is currently executing, **or** the file itself was touched
