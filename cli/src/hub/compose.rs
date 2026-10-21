@@ -1074,14 +1074,22 @@ per_stream:
         assert!(compose_with(&src(), &plugin, &[WriteMode::Append]).is_ok());
         let mut bad: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
         bad.write_mode_aliases
-            .insert("overwrite".into(), WriteMode::Delete);
-        let err = compose_with(&src(), &bad, &[WriteMode::Append])
+            .insert("overwrite".into(), WriteMode::Append);
+        let err = compose_with(&src(), &bad, &[WriteMode::Upsert])
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("maps to `delete`, which sink 'jsonl' does not support"),
+            err.contains("maps to `append`, which sink 'jsonl' does not support"),
             "{err}"
         );
+        let mut keyed: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        keyed
+            .write_mode_aliases
+            .insert("overwrite".into(), WriteMode::Delete);
+        let err = compose_with(&src(), &keyed, &[WriteMode::Delete])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the only alias is `overwrite: append`"), "{err}");
         let mut s = src();
         s.streams[0].write = WriteChoice::One(WriteMode::Upsert);
         let err = compose_with(&s, &sink, &[WriteMode::Append])

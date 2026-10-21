@@ -602,6 +602,19 @@ impl SinkTemplate {
                     self.name
                 )));
             }
+            // A keyed target turns every fetched row into an upsert or a
+            // delete (`overwrite: delete` deletes exactly the rows the source
+            // returned); an `overwrite` target replaces the destination with
+            // what was asked to be appended. Only a full refresh written as an
+            // append keeps its rows.
+            if !(from_mode == WriteMode::Overwrite && *to == WriteMode::Append) {
+                return Err(CliError::Config(format!(
+                    "sink-template '{}': `write_mode_aliases.{from}: {}` is not allowed — the \
+                     only alias is `overwrite: append` (a full refresh written as an append)",
+                    self.name,
+                    to.as_str()
+                )));
+            }
         }
         check_param_refs(
             &self.name,
@@ -1146,6 +1159,20 @@ per_stream:
             })
             .contains("maps a mode to itself")
         );
+        for (from, to) in [
+            ("overwrite", WriteMode::Delete),
+            ("overwrite", WriteMode::Upsert),
+            ("append", WriteMode::Delete),
+            ("append", WriteMode::Overwrite),
+        ] {
+            assert!(
+                err(&|t| {
+                    t.write_mode_aliases.insert(from.into(), to);
+                })
+                .contains("the only alias is `overwrite: append`"),
+                "{from} -> {to:?}"
+            );
+        }
         let mut ok = base.clone();
         ok.write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);

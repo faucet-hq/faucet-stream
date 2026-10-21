@@ -232,8 +232,10 @@ write_mode_aliases:
 The composer records the substitution (`overwrite→append` in `faucet hub
 check`) and validates it against the connector registry: the target mode must
 be one the connector supports, an alias for a natively supported mode is
-refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
-only a sink that dedups by key can honour them. `overwrite: append` is refused
+refused as redundant, and `overwrite: append` is the only alias: keyed modes
+(`upsert`, `delete`) can neither be aliased — only a sink that dedups by key can
+honour them — nor be an alias's target (`overwrite: delete` would delete
+exactly the rows each run fetched), and no mode may stand in for `overwrite`. `overwrite: append` is refused
 for a built-in sink that, as configured, keeps what earlier runs wrote (an
 appending file, a queue, an object store with unique names, a warehouse): every
 overwrite stream would re-append the whole table on each run. A plugin sink is
