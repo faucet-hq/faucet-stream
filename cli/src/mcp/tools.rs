@@ -710,7 +710,22 @@ async fn validate_config(ctx: &McpContext, args: &Value) -> Result<String, Strin
     })))
 }
 
+/// Preview a config. A caller's config is sampled under the caller reference
+/// policy, so every request its source decides at run time (a next-page link
+/// from a response, a discovery or poll URL) is checked, not only the URLs
+/// written in the config.
 async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
+    match ctx.submitted {
+        Some(origin) => {
+            let policy =
+                std::sync::Arc::new(crate::serve::references::installed().for_origin(origin, None));
+            faucet_core::http::with_reference_policy(policy, preview_unscoped(ctx, args)).await
+        }
+        None => preview_unscoped(ctx, args).await,
+    }
+}
+
+async fn preview_unscoped(ctx: &McpContext, args: &Value) -> Result<String, String> {
     use faucet_core::stage::compile_stage;
 
     let text = str_arg(args, "config")?;
@@ -1525,6 +1540,34 @@ mod tests {
             err.contains("template_launch") && err.contains("propose_template"),
             "{err}"
         );
+    }
+
+    /// A caller's preview runs under the caller reference policy, so a next
+    /// page link the API returns is checked like a URL in the config.
+    #[cfg(feature = "source-rest")]
+    #[tokio::test]
+    async fn a_callers_preview_checks_urls_the_source_decides_at_run_time() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": 1}],
+                "links": {"next": "http://169.254.169.254/latest/meta-data/"}
+            })))
+            .mount(&server)
+            .await;
+        let config = format!(
+            "version: 1\npipeline:\n  source: {{ type: rest, config: {{ base_url: \"{}\", path: /items, records_path: \"$.data\", pagination: {{ type: NextLinkInBody, next_link_path: \"$.links.next\" }} }} }}\n  sink: {{ type: stdout, config: {{}} }}\n",
+            server.uri()
+        );
+        let c = ctx(true).with_submitted_origin(crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        });
+        let out = call_tool(&c, "preview", &json!({"config": config, "limit": 5})).await;
+        assert_eq!(out["isError"], true, "{out}");
+        assert!(out.to_string().contains("refused"), "{out}");
     }
 
     #[tokio::test]
