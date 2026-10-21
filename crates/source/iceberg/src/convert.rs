@@ -21,6 +21,222 @@ pub fn batch_to_rows(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
         .map_err(|e| FaucetError::Source(format!("iceberg: encoding rows as JSON failed: {e}")))
 }
 
+/// The Arrow field metadata key iceberg-rust stamps every scanned field with.
+const FIELD_ID_KEY: &str = "PARQUET:field_id";
+
+/// The `uuid` columns of a table schema. iceberg-rust reads a `uuid` as a
+/// 16-byte `FixedSizeBinary`, which a `fixed(16)` column also becomes, so the
+/// Iceberg field ids (or, for a top-level field without id metadata, its
+/// name) tell them apart.
+#[derive(Debug, Default, Clone)]
+pub struct UuidColumns {
+    ids: HashSet<i32>,
+    top_level: HashSet<String>,
+}
+
+impl UuidColumns {
+    pub fn of(schema: &Schema) -> Self {
+        fn walk(ty: &Type, id: i32, out: &mut HashSet<i32>) {
+            match ty {
+                Type::Primitive(PrimitiveType::Uuid) => {
+                    out.insert(id);
+                }
+                Type::Primitive(_) => {}
+                Type::Struct(s) => {
+                    for f in s.fields() {
+                        walk(&f.field_type, f.id, out);
+                    }
+                }
+                Type::List(l) => walk(&l.element_field.field_type, l.element_field.id, out),
+                Type::Map(m) => {
+                    walk(&m.key_field.field_type, m.key_field.id, out);
+                    walk(&m.value_field.field_type, m.value_field.id, out);
+                }
+            }
+        }
+        let mut ids = HashSet::new();
+        let mut top_level = HashSet::new();
+        for f in schema.as_struct().fields() {
+            if matches!(*f.field_type, Type::Primitive(PrimitiveType::Uuid)) {
+                top_level.insert(f.name.clone());
+            }
+            walk(&f.field_type, f.id, &mut ids);
+        }
+        Self { ids, top_level }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    fn matches(&self, field: &arrow::datatypes::Field, top: bool) -> bool {
+        match field
+            .metadata()
+            .get(FIELD_ID_KEY)
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            Some(id) => self.ids.contains(&id),
+            None => top && self.top_level.contains(field.name()),
+        }
+    }
+
+    /// Rewrite every `uuid` column (nested ones too) as hyphenated UUID text,
+    /// so the row and columnar paths carry what the schema advertises.
+    pub fn apply(&self, batch: RecordBatch) -> Result<RecordBatch, FaucetError> {
+        if self.is_empty() {
+            return Ok(batch);
+        }
+        let schema = batch.schema();
+        let mut changed = false;
+        let mut fields = Vec::with_capacity(schema.fields().len());
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            match self.convert(field, column, true)? {
+                Some((f, c)) => {
+                    changed = true;
+                    fields.push(f);
+                    columns.push(c);
+                }
+                None => {
+                    fields.push(field.clone());
+                    columns.push(column.clone());
+                }
+            }
+        }
+        if !changed {
+            return Ok(batch);
+        }
+        let schema = arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone());
+        RecordBatch::try_new(std::sync::Arc::new(schema), columns).map_err(|e| {
+            FaucetError::Source(format!("iceberg: rendering uuid columns failed: {e}"))
+        })
+    }
+
+    fn convert(
+        &self,
+        field: &arrow::datatypes::FieldRef,
+        array: &arrow::array::ArrayRef,
+        top: bool,
+    ) -> Result<Option<(arrow::datatypes::FieldRef, arrow::array::ArrayRef)>, FaucetError> {
+        use arrow::array::{
+            Array, AsArray, LargeListArray, ListArray, MapArray, StringArray, StructArray,
+        };
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+        let err = |e: arrow::error::ArrowError| {
+            FaucetError::Source(format!("iceberg: rendering uuid columns failed: {e}"))
+        };
+        Ok(match field.data_type() {
+            DataType::FixedSizeBinary(16) if self.matches(field, top) => {
+                let bin = array.as_fixed_size_binary();
+                let text: StringArray = (0..bin.len())
+                    .map(|i| (!bin.is_null(i)).then(|| uuid_text(bin.value(i))))
+                    .collect();
+                let f = Field::new(field.name(), DataType::Utf8, field.is_nullable())
+                    .with_metadata(field.metadata().clone());
+                Some((Arc::new(f), Arc::new(text)))
+            }
+            DataType::Struct(children) => {
+                let st = array.as_struct();
+                let mut changed = false;
+                let mut fields = Vec::with_capacity(children.len());
+                let mut cols = Vec::with_capacity(children.len());
+                for (child, col) in children.iter().zip(st.columns()) {
+                    match self.convert(child, col, false)? {
+                        Some((f, c)) => {
+                            changed = true;
+                            fields.push(f);
+                            cols.push(c);
+                        }
+                        None => {
+                            fields.push(child.clone());
+                            cols.push(col.clone());
+                        }
+                    }
+                }
+                if !changed {
+                    return Ok(None);
+                }
+                let st = StructArray::try_new(fields.clone().into(), cols, st.nulls().cloned())
+                    .map_err(err)?;
+                let f = field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Struct(fields.into()));
+                Some((Arc::new(f), Arc::new(st)))
+            }
+            DataType::List(item) => {
+                let list = array.as_list::<i32>();
+                let Some((item, values)) = self.convert(item, list.values(), false)? else {
+                    return Ok(None);
+                };
+                let out = ListArray::try_new(
+                    item.clone(),
+                    list.offsets().clone(),
+                    values,
+                    list.nulls().cloned(),
+                )
+                .map_err(err)?;
+                let f = field.as_ref().clone().with_data_type(DataType::List(item));
+                Some((Arc::new(f), Arc::new(out)))
+            }
+            DataType::LargeList(item) => {
+                let list = array.as_list::<i64>();
+                let Some((item, values)) = self.convert(item, list.values(), false)? else {
+                    return Ok(None);
+                };
+                let out = LargeListArray::try_new(
+                    item.clone(),
+                    list.offsets().clone(),
+                    values,
+                    list.nulls().cloned(),
+                )
+                .map_err(err)?;
+                let f = field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::LargeList(item));
+                Some((Arc::new(f), Arc::new(out)))
+            }
+            DataType::Map(entries_field, sorted) => {
+                let map = array.as_map();
+                let entries: arrow::array::ArrayRef = Arc::new(map.entries().clone());
+                let Some((entries_field, entries)) =
+                    self.convert(entries_field, &entries, false)?
+                else {
+                    return Ok(None);
+                };
+                let out = MapArray::try_new(
+                    entries_field.clone(),
+                    map.offsets().clone(),
+                    entries.as_struct().clone(),
+                    map.nulls().cloned(),
+                    *sorted,
+                )
+                .map_err(err)?;
+                let f = field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Map(entries_field, *sorted));
+                Some((Arc::new(f), Arc::new(out)))
+            }
+            _ => None,
+        })
+    }
+}
+
+/// `8-4-4-4-12` lower-case hex of a 16-byte UUID.
+fn uuid_text(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 /// JSON Schema fragment for an Iceberg type (matching the row encoding).
 pub fn type_to_json_schema(ty: &Type) -> Value {
     match ty {
@@ -194,6 +410,82 @@ mod tests {
             batch_to_rows(&batch).unwrap()[0]["d"],
             "12345678901234567890123456.7890"
         );
+    }
+
+    /// A `uuid` column (top level, in a struct and in a list) arrives as
+    /// hyphenated text; a `fixed(16)` column with the same Arrow type stays
+    /// binary.
+    #[test]
+    fn uuid_columns_render_as_uuid_text() {
+        use arrow::array::{FixedSizeBinaryArray, ListArray, StructArray};
+        let p = |t| Type::Primitive(t);
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "id", p(PrimitiveType::Uuid))),
+                Arc::new(NestedField::optional(2, "raw", p(PrimitiveType::Fixed(16)))),
+                Arc::new(NestedField::optional(
+                    3,
+                    "s",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                        4,
+                        "owner",
+                        p(PrimitiveType::Uuid),
+                    ))])),
+                )),
+                Arc::new(NestedField::optional(
+                    5,
+                    "tags",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        6,
+                        p(PrimitiveType::Uuid),
+                        false,
+                    )))),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&schema).unwrap());
+        let bytes: [u8; 16] = [
+            0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
+            0x90, 0x12,
+        ];
+        let bin = || {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some(bytes), None].into_iter(),
+                    16,
+                )
+                .unwrap(),
+            ) as arrow::array::ArrayRef
+        };
+        let DataType::Struct(sf) = arrow_schema.field(2).data_type().clone() else {
+            panic!("struct")
+        };
+        let st = StructArray::new(sf, vec![bin()], None);
+        let DataType::List(item) = arrow_schema.field(3).data_type().clone() else {
+            panic!("list")
+        };
+        let list = ListArray::new(
+            item,
+            arrow::buffer::OffsetBuffer::from_lengths([1, 1]),
+            bin(),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![bin(), bin(), Arc::new(st), Arc::new(list)],
+        )
+        .unwrap();
+        let out = UuidColumns::of(&schema).apply(batch).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+        let rows = batch_to_rows(&out).unwrap();
+        let text = "12345678-9012-3456-7890-123456789012";
+        assert_eq!(rows[0]["id"], text);
+        assert_eq!(rows[0]["s"]["owner"], text);
+        assert_eq!(rows[0]["tags"], json!([text]));
+        assert_eq!(rows[1]["id"], Value::Null);
+        assert_eq!(rows[1]["tags"], json!([null]));
+        assert_eq!(rows[0]["raw"], "EjRWeJASNFZ4kBI0VniQEg==");
     }
 
     fn table_schema() -> Schema {

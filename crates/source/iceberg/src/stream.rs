@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 
 use crate::config::{IcebergSourceConfig, ReadMode, parse_timestamp_ms};
-use crate::convert::{batch_to_rows, descriptor, select_tasks};
+use crate::convert::{UuidColumns, batch_to_rows, descriptor, select_tasks};
 use crate::filter::{self, Expr};
 use crate::snapshots::{PlanOptions, SnapshotInfo, Step, bookmark_value, parse_bookmark, plan};
 
@@ -165,7 +165,7 @@ impl IcebergSource {
         table: &Table,
         snapshot_id: i64,
         added: Option<&HashSet<String>>,
-    ) -> Result<ArrowRecordBatchStream, FaucetError> {
+    ) -> Result<(ArrowRecordBatchStream, UuidColumns), FaucetError> {
         let metadata = table.metadata();
         let snapshot = metadata
             .snapshot_by_id(snapshot_id)
@@ -217,7 +217,7 @@ impl IcebergSource {
             .build()
             .read(futures::stream::iter(tasks.into_iter().map(Ok)).boxed())
             .map_err(|e| source_err("could not start reading data files", e))?;
-        Ok(result.stream())
+        Ok((result.stream(), UuidColumns::of(&schema)))
     }
 
     fn events(&self) -> EventStream<'_> {
@@ -243,12 +243,12 @@ impl IcebergSource {
                         true,
                     ),
                 };
-                let mut batches = self.scan(&table, snapshot_id, added.as_ref()).await?;
+                let (mut batches, uuids) = self.scan(&table, snapshot_id, added.as_ref()).await?;
                 let reads = self.calls.get().with_roundtrip_metering(false);
                 while let Some(batch) = batches.next().within_ctx(&reads, "read").await? {
                     let batch = batch.map_err(|e| source_err("read error", e))?;
                     if batch.num_rows() > 0 {
-                        yield Event::Batch(batch);
+                        yield Event::Batch(uuids.apply(batch)?);
                     }
                 }
                 if checkpoint {
