@@ -492,3 +492,104 @@ fn offset_rows_path_advances_by_server_rows_not_child_records() {
             .unwrap()
     );
 }
+
+#[test]
+fn cursor_two_cycle_stops() {
+    let style = PaginationStyle::Cursor {
+        next_token_path: "$.next".into(),
+        param_name: "cursor".into(),
+    };
+    let mut state = PaginationState::default();
+    assert!(
+        style
+            .advance(&json!({"next": "A"}), &no_headers(), &mut state, 1)
+            .unwrap()
+    );
+    assert!(
+        style
+            .advance(&json!({"next": "B"}), &no_headers(), &mut state, 1)
+            .unwrap()
+    );
+    // B's page points back at A: a cycle, not a new page.
+    assert!(
+        !style
+            .advance(&json!({"next": "A"}), &no_headers(), &mut state, 1)
+            .unwrap()
+    );
+}
+
+#[test]
+fn link_header_two_cycle_stops() {
+    use reqwest::header::HeaderValue;
+    let link = |u: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "link",
+            HeaderValue::from_str(&format!("<{u}>; rel=\"next\"")).unwrap(),
+        );
+        h
+    };
+    let style = PaginationStyle::LinkHeader;
+    let mut state = PaginationState::default();
+    assert!(
+        style
+            .advance(&json!({}), &link("https://h/p2"), &mut state, 1)
+            .unwrap()
+    );
+    assert!(
+        style
+            .advance(&json!({}), &link("https://h/p3"), &mut state, 1)
+            .unwrap()
+    );
+    assert!(
+        !style
+            .advance(&json!({}), &link("https://h/p2"), &mut state, 1)
+            .unwrap()
+    );
+    assert!(state.next_link.is_none());
+}
+
+#[test]
+fn next_link_back_to_the_fetched_url_stops() {
+    use reqwest::header::HeaderValue;
+    let style = PaginationStyle::NextLinkInBody {
+        next_link_path: "$.next".into(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        faucet_source_rest::url_util::REQUEST_URL_HEADER,
+        HeaderValue::from_static("https://h/p1"),
+    );
+    let mut state = PaginationState::default();
+    assert!(
+        style
+            .advance(&json!({"next": "https://h/p2"}), &headers, &mut state, 1)
+            .unwrap()
+    );
+    headers.insert(
+        faucet_source_rest::url_util::REQUEST_URL_HEADER,
+        HeaderValue::from_static("https://h/p2"),
+    );
+    assert!(
+        !style
+            .advance(&json!({"next": "https://h/p1"}), &headers, &mut state, 1)
+            .unwrap()
+    );
+}
+
+#[test]
+fn page_number_alternating_pages_stop() {
+    let style = PaginationStyle::PageNumber {
+        param_name: "page".into(),
+        start_page: 1,
+        page_size: None,
+        page_size_param: None,
+    };
+    let mut state = PaginationState::default();
+    let a = json!({"items": [{"id": 1}]});
+    let b = json!({"items": [{"id": 2}]});
+    assert!(style.advance(&a, &no_headers(), &mut state, 1).unwrap());
+    assert!(style.advance(&b, &no_headers(), &mut state, 1).unwrap());
+    assert!(!style.advance(&a, &no_headers(), &mut state, 1).unwrap());
+    assert!(state.current_page_is_duplicate);
+}

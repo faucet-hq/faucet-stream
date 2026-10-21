@@ -963,8 +963,13 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
-| `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |
+| `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or a body already returned earlier in the pass (content-stagnation detection for APIs that clamp out-of-range pages). |
 | `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path`, `stop_when_short` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it; set `stop_when_short: true` for a server that never caps a page but rejects an offset past the end (`400`/`416`). The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
+
+"Repeats" means any cursor, link or page already seen in the same pass, not
+only the previous one, so a server alternating between two cursors or two
+pages (A→B→A) stops instead of looping; a next link pointing back at a URL
+already fetched counts as a repeat.
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 

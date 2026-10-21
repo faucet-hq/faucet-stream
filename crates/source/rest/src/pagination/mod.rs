@@ -207,6 +207,44 @@ pub struct PaginationState {
     /// (request ids, timestamps) would never repeat. Consumed per page.
     #[doc(hidden)]
     pub current_records_fingerprint: Option<u64>,
+    /// Every token / next-link this pass has followed. The loop guards stop on
+    /// a repeat of **any** earlier value, not just the previous one, so a
+    /// server cycling A→B→A cannot paginate forever.
+    #[doc(hidden)]
+    pub seen_tokens: std::collections::HashSet<String>,
+    /// Every page fingerprint the content-stagnation guards have seen this
+    /// pass (same reason as [`Self::seen_tokens`]).
+    #[doc(hidden)]
+    pub seen_page_fingerprints: std::collections::HashSet<u64>,
+}
+
+impl PaginationState {
+    /// Record `token` as followed; `true` when it was already followed this
+    /// pass (a pagination cycle).
+    fn token_repeats(&mut self, token: Option<&String>) -> bool {
+        match token {
+            Some(t) => {
+                Some(t) == self.previous_token.as_ref() || !self.seen_tokens.insert(t.clone())
+            }
+            None => false,
+        }
+    }
+
+    /// Record the URL just fetched (when the transport tagged it), so a next
+    /// link pointing back at an earlier page is caught too.
+    fn note_request_url(&mut self, headers: &HeaderMap) {
+        if let Some(url) = headers
+            .get(crate::url_util::REQUEST_URL_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            self.seen_tokens.insert(url.to_owned());
+        }
+    }
+
+    /// Record `fp` as seen; `true` when an earlier page this pass had it.
+    fn page_repeats(&mut self, fp: u64) -> bool {
+        self.previous_page_fingerprint == Some(fp) || !self.seen_page_fingerprints.insert(fp)
+    }
 }
 
 /// Fingerprint of a page's extracted records for
@@ -312,8 +350,8 @@ impl PaginationStyle {
     /// Advance pagination state based on the response body and headers.
     /// Returns `true` if there is a next page to fetch.
     ///
-    /// Includes **loop detection**: if a cursor or next-link value is identical
-    /// to the previous page's value, pagination stops with a warning instead of
+    /// Includes **loop detection**: if a cursor or next-link value repeats one
+    /// already followed this pass (or a page repeats an earlier page's content), pagination stops with a warning instead of
     /// looping forever.
     pub fn advance(
         &self,
@@ -329,7 +367,8 @@ impl PaginationStyle {
             } => {
                 let has_next = cursor::advance(body, next_token_path, &mut state.next_token)?;
                 if has_next {
-                    if state.next_token == state.previous_token {
+                    let next = state.next_token.clone();
+                    if state.token_repeats(next.as_ref()) {
                         tracing::warn!(
                             "pagination loop detected: cursor {:?} repeated — stopping",
                             state.next_token
@@ -347,7 +386,8 @@ impl PaginationStyle {
                 // from `Cursor` is where the cursor is applied (body, not param).
                 let has_next = cursor::advance(body, next_token_path, &mut state.next_token)?;
                 if has_next {
-                    if state.next_token == state.previous_token {
+                    let next = state.next_token.clone();
+                    if state.token_repeats(next.as_ref()) {
                         tracing::warn!(
                             "pagination loop detected: body cursor {:?} repeated — stopping",
                             state.next_token
@@ -361,7 +401,8 @@ impl PaginationStyle {
             PaginationStyle::LinkHeader => match link_header::extract_next_link(headers) {
                 Some(link) => {
                     let link = resolve_against_request(headers, &link)?;
-                    if Some(&link) == state.previous_token.as_ref() {
+                    state.note_request_url(headers);
+                    if state.token_repeats(Some(&link)) {
                         tracing::warn!(
                             "pagination loop detected: link {link:?} repeated — stopping"
                         );
@@ -388,7 +429,9 @@ impl PaginationStyle {
                                 ))
                             })?);
                     }
-                    if state.next_link == state.previous_token {
+                    state.note_request_url(headers);
+                    let next = state.next_link.clone();
+                    if state.token_repeats(next.as_ref()) {
                         tracing::warn!(
                             "pagination loop detected: next_link {:?} repeated — stopping",
                             state.next_link
@@ -409,7 +452,7 @@ impl PaginationStyle {
                 // would loop until `max_pages` and duplicate records. Stop if
                 // this page's body is identical to the previous one (#78/#15).
                 let fp = page_fingerprint(state, body);
-                if state.previous_page_fingerprint == Some(fp) {
+                if state.page_repeats(fp) {
                     tracing::warn!(
                         "pagination loop detected: PageNumber returned an identical page — stopping"
                     );
@@ -462,7 +505,7 @@ impl PaginationStyle {
                 // be mistaken for stagnation.
                 if has_next && total_path.is_none() {
                     let fp = page_fingerprint(state, body);
-                    if state.previous_page_fingerprint == Some(fp) {
+                    if state.page_repeats(fp) {
                         tracing::warn!(
                             "pagination loop detected: Offset returned an identical page \
                              (server likely ignoring the offset parameter) — stopping"
@@ -507,7 +550,7 @@ impl PaginationStyle {
                 // Content-stagnation guard: a server ignoring the body offset
                 // would re-return the identical page forever.
                 let fp = page_fingerprint(state, body);
-                if state.previous_page_fingerprint == Some(fp) {
+                if state.page_repeats(fp) {
                     tracing::warn!(
                         "pagination loop detected: OffsetInBody returned an identical page \
                          (server likely ignoring the body offset) — stopping"
