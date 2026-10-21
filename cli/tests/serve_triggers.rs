@@ -1039,6 +1039,47 @@ async fn webhook_debounce_coalesces_second_fire() {
     );
 }
 
+/// A fire that does not go through leaves the debounce window open: the
+/// caller's retry is attempted again rather than answered `coalesced`.
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_debounce_is_not_consumed_by_a_failed_fire() {
+    let dir = tempfile::tempdir().unwrap();
+    let inline = serde_json::json!({
+        "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "no-such-sink", "config": {} }
+        }
+    });
+    let yaml = format!(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    debounce_secs: 60\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    );
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(&triggers, yaml).unwrap();
+
+    let token = "test-token";
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/v1/triggers/hook");
+    for attempt in 0..2 {
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert!(
+            status.is_server_error() || status.is_client_error(),
+            "attempt {attempt}: a failed fire must not be acknowledged: {status} {body}"
+        );
+        assert!(!body.contains("coalesced"), "attempt {attempt}: {body}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_query_values_are_percent_decoded() {
     let dir = tempfile::tempdir().unwrap();

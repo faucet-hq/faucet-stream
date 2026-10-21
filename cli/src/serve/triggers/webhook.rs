@@ -49,16 +49,27 @@ pub async fn handle(
     // Leading-edge debounce: coalesce fires that arrive within `debounce_secs` of
     // the last accepted fire for this trigger. The first fire (and any after the
     // window has fully elapsed) is accepted; the rest return `coalesced`.
+    // The window is armed now and undone below when the fire does not go
+    // through, so a retry of a dropped or failed fire is not coalesced.
+    let mut armed: Option<(i64, i64)> = None;
     if debounce_secs > 0 {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if !state
+        match state
             .triggers()
-            .allow_fire(&name, (debounce_secs as i64) * 1000, now_ms)
+            .arm_fire(&name, (debounce_secs as i64) * 1000, now_ms)
         {
-            crate::serve::triggers::metrics::coalesced(&name);
-            return Ok((StatusCode::OK, Json(json!({ "status": "coalesced" }))));
+            Some(previous) => armed = Some((now_ms, previous)),
+            None => {
+                crate::serve::triggers::metrics::coalesced(&name);
+                return Ok((StatusCode::OK, Json(json!({ "status": "coalesced" }))));
+            }
         }
     }
+    let disarm = || {
+        if let Some((now_ms, previous)) = armed {
+            state.triggers().disarm_fire(&name, now_ms, previous);
+        }
+    };
 
     // Idempotency key: dedupe header value, else a per-request UUID.
     let idem = dedupe_header
@@ -96,12 +107,14 @@ pub async fn handle(
         }
         FireOutcome::Coalesced => Ok((StatusCode::OK, Json(json!({ "status": "coalesced" })))),
         FireOutcome::Dropped(reason) => {
+            disarm();
             tracing::warn!(trigger = %name, %reason, "webhook fire dropped");
             Err(ServeError::QueueFull {
                 retry_after_secs: 5,
             })
         }
         FireOutcome::Error(msg) | FireOutcome::Failed(msg) => {
+            disarm();
             state
                 .triggers()
                 .record_err(&name, msg.clone(), super::watcher::UNHEALTHY_THRESHOLD);

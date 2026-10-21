@@ -82,8 +82,15 @@ impl TriggersHandle {
     /// may fire now — i.e. it has never fired or `>= window_ms` elapsed since its
     /// last accepted fire. Returns false (coalesce) otherwise. window_ms == 0 always allows.
     pub fn allow_fire(&self, name: &str, window_ms: i64, now_ms: i64) -> bool {
+        self.arm_fire(name, window_ms, now_ms).is_some()
+    }
+
+    /// [`allow_fire`](Self::allow_fire) that returns the stamp it replaced, so
+    /// a fire that does not go through can be undone with
+    /// [`disarm_fire`](Self::disarm_fire). `None` = coalesce.
+    pub fn arm_fire(&self, name: &str, window_ms: i64, now_ms: i64) -> Option<i64> {
         if window_ms <= 0 {
-            return true;
+            return Some(i64::MIN);
         }
         let mut e = self
             .inner
@@ -91,10 +98,22 @@ impl TriggersHandle {
             .entry(name.to_string())
             .or_insert(i64::MIN);
         if now_ms.saturating_sub(*e) >= window_ms {
+            let previous = *e;
             *e = now_ms;
-            true
+            Some(previous)
         } else {
-            false
+            None
+        }
+    }
+
+    /// Undo an [`arm_fire`](Self::arm_fire) whose fire was dropped or failed,
+    /// so the caller's retry is not coalesced into a run that never started.
+    /// A later accepted fire (a different stamp) is left alone.
+    pub fn disarm_fire(&self, name: &str, armed_ms: i64, previous: i64) {
+        if let Some(mut e) = self.inner.debounce.get_mut(name)
+            && *e == armed_ms
+        {
+            *e = previous;
         }
     }
 
@@ -205,5 +224,22 @@ mod tests {
         assert!(h.allow_fire("b", 0, 1));
         // A negative window also always allows.
         assert!(h.allow_fire("c", -5, 1));
+    }
+
+    #[test]
+    fn a_disarmed_fire_lets_the_retry_through() {
+        let h = TriggersHandle::from_compiled(&[webhook("a")]);
+        let window = 60_000;
+        let previous = h.arm_fire("a", window, 1_000).unwrap();
+        // The fire was dropped: undo it, and the retry inside the window fires.
+        h.disarm_fire("a", 1_000, previous);
+        let previous = h.arm_fire("a", window, 6_000).unwrap();
+        assert!(h.arm_fire("a", window, 7_000).is_none());
+        // A stale disarm (a later fire re-armed) leaves the newer stamp.
+        h.disarm_fire("a", 1_000, previous);
+        assert!(h.arm_fire("a", window, 8_000).is_none());
+        // Disarming an unknown trigger is a no-op.
+        h.disarm_fire("nope", 1, 0);
+        assert_eq!(h.arm_fire("b", 0, 1), Some(i64::MIN));
     }
 }
