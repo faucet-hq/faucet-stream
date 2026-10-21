@@ -39,6 +39,7 @@ jobs:
       - name: Dispatch faucet-release to the site
         env:
           GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN || secrets.RELEASE_PLZ_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || 'manual' }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::Set SITE_DISPATCH_TOKEN (or RELEASE_PLZ_TOKEN) with contents:write on faucet-hq/faucet-hq.github.io"
@@ -46,5 +47,5 @@ jobs:
           fi
           gh api --method POST repos/faucet-hq/faucet-hq.github.io/dispatches \
             -f event_type=faucet-release \
-            -f "client_payload[tag]=${{ github.event.release.tag_name || 'manual' }}"
+            -f "client_payload[tag]=$TAG"
           echo "Site rebuild requested."
