@@ -96,16 +96,32 @@ impl ElasticsearchSource {
     }
 
     /// Extract `hits.hits[*]._source` from an Elasticsearch search response.
-    fn extract_hits(body: &Value) -> Vec<Value> {
-        body.get("hits")
+    ///
+    /// A hit without `_source` (an index mapped with `_source.enabled: false`)
+    /// fails the read: the document cannot be emitted, and skipping it would
+    /// both lose it silently and make a page of such hits look like the end
+    /// of the scroll.
+    fn extract_hits(body: &Value) -> Result<Vec<Value>, FaucetError> {
+        let Some(hits) = body
+            .get("hits")
             .and_then(|h| h.get("hits"))
             .and_then(|h| h.as_array())
-            .map(|hits| {
-                hits.iter()
-                    .filter_map(|hit| hit.get("_source").cloned())
-                    .collect()
+        else {
+            return Ok(Vec::new());
+        };
+        hits.iter()
+            .map(|hit| {
+                hit.get("_source").cloned().ok_or_else(|| {
+                    let field = |k: &str| hit.get(k).and_then(Value::as_str).unwrap_or("?");
+                    FaucetError::Source(format!(
+                        "elasticsearch: hit {}/{} has no `_source` (is `_source` disabled in \
+                         the index mapping?); the document cannot be read",
+                        field("_index"),
+                        field("_id")
+                    ))
+                })
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Extract the `_scroll_id` from an Elasticsearch response.
@@ -225,7 +241,7 @@ impl faucet_core::Source for ElasticsearchSource {
                 })
                 .await?;
 
-            let records = Self::extract_hits(&body);
+            let records = Self::extract_hits(&body)?;
             guard.update(Self::extract_scroll_id(&body));
             let mut pages_fetched: usize = 1;
             let mut total = records.len();
@@ -260,7 +276,7 @@ impl faucet_core::Source for ElasticsearchSource {
                         })
                         .await?;
 
-                    let records = Self::extract_hits(&body);
+                    let records = Self::extract_hits(&body)?;
                     guard.update(Self::extract_scroll_id(&body));
                     pages_fetched += 1;
                     total += records.len();

@@ -486,3 +486,37 @@ async fn stream_pages_counts_scroll_calls_on_the_installed_recorder() {
         ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test")).unwrap();
     faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
 }
+
+/// A scroll page whose hits carry no `_source` (an index mapped with
+/// `_source.enabled: false`) fails the read instead of ending the scroll
+/// early with the documents silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_of_hits_without_source_fails_the_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_scroll_id": "s1",
+            "hits": {"hits": [{"_index": "test", "_id": "a", "_source": {"id": 1}}]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_search/scroll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_scroll_id": "s1",
+            "hits": {"hits": [{"_index": "nosrc", "_id": "b"}, {"_index": "nosrc", "_id": "c"}]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/_search/scroll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded": true})))
+        .mount(&server)
+        .await;
+
+    let source =
+        ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test")).unwrap();
+    let err = source.fetch_all().await.unwrap_err().to_string();
+    assert!(err.contains("nosrc/b") && err.contains("_source"), "{err}");
+}
