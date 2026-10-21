@@ -59,6 +59,16 @@ pub struct MssqlSink {
 }
 
 impl MssqlSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        self.inner.driver_mut().set_overwrite_run(token)?;
+        Ok(self)
+    }
+
     /// Connect, validate, build the pool, and (in `json_column` + `create_table`
     /// mode) create the table if it doesn't exist.
     pub async fn new(config: MssqlSinkConfig) -> Result<Self, FaucetError> {
@@ -81,6 +91,9 @@ pub(crate) struct MssqlDriver {
     /// Pre-quoted staging table (`[schema].[table__faucet_ovw]`) used while a
     /// `write_mode: overwrite` run is in flight (#492).
     staging_table_quoted: String,
+    /// The overwrite run this instance belongs to (#930): staging is then
+    /// `<table>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
     /// Cached columns of the relation writes target, as `sys.columns` declares them.
     columns_cache: Mutex<Option<Vec<ColumnInfo>>>,
     /// Set when a timed-out statement's connection could not be replaced
@@ -136,6 +149,7 @@ impl MssqlDriver {
             pool,
             table_quoted,
             staging_table_quoted,
+            overwrite_run: None,
             columns_cache: Mutex::new(None),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             calls: faucet_core::CallSlot::new(faucet_common_mssql::statement_call_context(
@@ -330,8 +344,68 @@ impl MssqlDriver {
         format!(
             "{}{}",
             self.config.table,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+            faucet_core::idempotency::overwrite_staging_suffix(self.overwrite_run.as_deref())
         )
+    }
+
+    /// Join overwrite run `token`: stage under its own name.
+    pub(crate) fn set_overwrite_run(&mut self, token: &str) -> Result<(), FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.overwrite_run = Some(token.to_string());
+        self.staging_table_quoted = quote_table(&self.staging_literal())?;
+        Ok(())
+    }
+
+    /// Drop the staging other overwrite runs of this table abandoned
+    /// ([`faucet_core::idempotency::abandoned_overwrite_staging`]); a live
+    /// run's staging and this run's own are never touched.
+    async fn drop_abandoned_staging(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<(), FaucetError> {
+        let (schema, table) = split_table(&self.config.table);
+        let list = staging_sweep_query(schema, table);
+        let rows = self
+            .on_conn(conn, "query", true, async |c| {
+                c.simple_query(list.as_str())
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("mssql overwrite: list staging: {e}")))?
+                    .into_first_result()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("mssql overwrite: list staging: {e}")))
+            })
+            .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for row in rows {
+            let Some(name) = row.try_get::<&str, _>(0).ok().flatten().map(str::to_string) else {
+                continue;
+            };
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                table,
+                &name,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                let qualified = match schema {
+                    Some(s) => format!("{s}.{name}"),
+                    None => name.clone(),
+                };
+                tracing::warn!(staging = %qualified, "mssql overwrite: dropping staging an earlier run abandoned");
+                self.control(
+                    conn,
+                    &format!(
+                        "IF OBJECT_ID(N'{}', N'U') IS NOT NULL DROP TABLE {}",
+                        qualified.replace('\'', "''"),
+                        quote_table(&qualified)?
+                    ),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The bracket-quoted relation the append/insert path targets. For
@@ -1092,6 +1166,33 @@ fn mssql_type_to_json_schema(type_name: &str, max_length: i16, nullable: bool) -
 }
 
 /// Quote a (possibly schema-qualified) table name: `dbo.events` → `[dbo].[events]`.
+/// A configured table name as `(schema, table)`: the last dot-separated part
+/// is the table, the one before it (if any) the schema.
+fn split_table(table: &str) -> (Option<&str>, &str) {
+    match table.rsplit_once('.') {
+        Some((before, name)) => (Some(before.rsplit('.').next().unwrap_or(before)), name),
+        None => (None, table),
+    }
+}
+
+/// The catalog query listing tables named like a tokened staging of `table`
+/// in `schema` (the user's default schema when `None`).
+fn staging_sweep_query(schema: Option<&str>, table: &str) -> String {
+    let pattern = faucet_core::idempotency::like_literal(
+        &faucet_core::idempotency::overwrite_staging_prefix(table),
+        '\\',
+    )
+    .replace('\'', "''");
+    let schema_id = match schema {
+        Some(s) => format!("SCHEMA_ID(N'{}')", s.replace('\'', "''")),
+        None => "SCHEMA_ID()".to_string(),
+    };
+    format!(
+        "SELECT name FROM sys.tables WHERE name LIKE N'{pattern}%' ESCAPE N'\\' \
+         AND schema_id = {schema_id}"
+    )
+}
+
 fn quote_table(table: &str) -> Result<String, FaucetError> {
     let parts: Vec<String> = table
         .split('.')
@@ -1470,6 +1571,7 @@ impl MssqlDriver {
             &format!("IF OBJECT_ID(N'{staging_lit}', N'U') IS NOT NULL DROP TABLE {staging}"),
         )
         .await?;
+        self.drop_abandoned_staging(&mut conn).await?;
         if first_run {
             return Ok(());
         }
@@ -2114,6 +2216,19 @@ mod tests {
         let cols = faucet_core::plan_columns(&[serde_json::json!({ "a": 1 })]).unwrap();
         let sql = build_create_table_sql("t", "[t]", &cols, &[]).unwrap();
         assert!(!sql.contains("PRIMARY KEY"), "{sql}");
+    }
+
+    #[test]
+    fn staging_sweep_lists_this_tables_tokened_staging() {
+        assert_eq!(split_table("dbo.events"), (Some("dbo"), "events"));
+        assert_eq!(split_table("db.dbo.events"), (Some("dbo"), "events"));
+        assert_eq!(split_table("events"), (None, "events"));
+        assert_eq!(
+            staging_sweep_query(Some("dbo"), "o'rders"),
+            "SELECT name FROM sys.tables WHERE name LIKE N'o''rders\\_\\_faucet\\_ovw\\_%' \
+             ESCAPE N'\\' AND schema_id = SCHEMA_ID(N'dbo')"
+        );
+        assert!(staging_sweep_query(None, "t").ends_with("schema_id = SCHEMA_ID()"));
     }
 
     #[test]
