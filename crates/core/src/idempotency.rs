@@ -392,10 +392,18 @@ pub fn abandoned_overwrite_staging(
     let Some(token) = overwrite_staging_token(table, name) else {
         return false;
     };
+    overwrite_run_abandoned(&token, own, now_secs)
+}
+
+/// Whether overwrite run `token` belongs to another run than `own` that
+/// started more than [`ABANDONED_OVERWRITE_STAGING`] before `now_secs`: its
+/// staging is a crashed run's and may be dropped. For a backend whose staging
+/// names do not follow `<table>__faucet_ovw_<token>`.
+pub fn overwrite_run_abandoned(token: &str, own: Option<&str>, now_secs: u64) -> bool {
     if own.is_some_and(|o| o == token) {
         return false;
     }
-    let Some(started) = overwrite_run_started(&token) else {
+    let Some(started) = overwrite_run_started(token) else {
         return false;
     };
     // Tokens keep 32 bits of seconds; read one from the future as one era
@@ -745,6 +753,17 @@ mod overwrite_run_tests {
             Some("67000000aaaaaa")
         );
         assert_eq!(overwrite_staging_token("t", "t__faucet_ovw"), None);
+        assert!(overwrite_run_abandoned(
+            "67000000aaaaaa",
+            None,
+            start + 2 * day
+        ));
+        assert!(!overwrite_run_abandoned(
+            "67000000aaaaaa",
+            Some("67000000aaaaaa"),
+            start + 2 * day
+        ));
+        assert!(!overwrite_run_abandoned("nope", None, start + 2 * day));
         // Not a tokened staging of this table.
         for name in [
             "t__faucet_ovw",

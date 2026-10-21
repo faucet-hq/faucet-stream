@@ -97,7 +97,8 @@ dataset and a failed/cancelled run leaves the previous data intact:
    counts, `refresh_interval`, index sorting, `mapping.*`, ingest pipelines,
    lifecycle policy, shard allocation / routing, `auto_expand_replicas`,
    `hidden`, minus identity keys such as `uuid`) behind a marker alias
-   `{index}-faucet-ovw-staging`,
+   `{index}-faucet-ovw-staging` (`{index}-faucet-ovw-staging-<token>` under the
+   CLI, which gives each overwrite run its own token),
    and the run's documents are indexed through that marker (`_bulk` with
    `require_alias=true`, so a write without a staging index fails instead of
    creating one);
@@ -108,8 +109,14 @@ dataset and a failed/cancelled run leaves the previous data intact:
 
 The staging index is found through the marker alias, not kept in the sink, so
 begin, the writes and the commit may run on different sink instances (the CLI
-does exactly that). A staging index left behind by a crashed run is dropped by
-the next `begin`. Two overwrite runs against the same alias must not overlap.
+does exactly that). Under the CLI every instance of one run shares its run
+token, so two overwrite runs against the same alias each resolve their own
+staging index: neither drops nor swaps in the other's, and the last commit
+wins. A tokened `begin` drops the staging behind the untokened marker, and
+another run's staging only once that run's token is more than 24 hours old (a
+crashed run's). Without a token (a library caller) the single untokened marker
+is used, and a `begin` drops whatever staging it finds behind it, so two such
+runs against one alias must not overlap.
 
 **The configured `index` must be an alias** (or a not-yet-existing name — the
 first run creates the alias). A *concrete* index of that name is rejected, because

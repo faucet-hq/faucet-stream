@@ -197,3 +197,59 @@ async fn commit_refuses_a_marker_on_several_indices() {
         .expect_err("ambiguous staging");
     assert!(err.to_string().contains("points at 2 indices"), "{err}");
 }
+
+/// Two overwrite runs of one alias at once: each run's begin, writer and
+/// commit instances share its run token and its own marker alias, so neither
+/// begin drops the other's staging index and neither commit swaps in the
+/// other's documents. A tokened begin drops the untokened marker's staging
+/// and staging a run abandoned more than a day ago.
+#[tokio::test]
+async fn concurrent_overwrite_runs_keep_their_own_documents() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (server, fake) = cluster().await;
+    fake.add_index("orders-old", vec![json!({"id": 0})], Some(INDEX));
+    fake.add_index(
+        "orders-faucet-ovw-legacy",
+        vec![json!({"id": 98})],
+        Some("orders-faucet-ovw-staging"),
+    );
+    fake.add_index(
+        "orders-faucet-ovw-dead",
+        vec![json!({"id": 99})],
+        Some("orders-faucet-ovw-staging-10000000aaaaaa"),
+    );
+    let sink = |token: &str| {
+        overwrite_sink(&server.uri())
+            .with_overwrite_run(token)
+            .unwrap()
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    sink(&a).begin_overwrite().await.expect("begin a");
+    sink(&b).begin_overwrite().await.expect("begin b");
+    let names = fake.index_names();
+    assert!(
+        !names.contains(&"orders-faucet-ovw-legacy".to_string()),
+        "{names:?}"
+    );
+    assert!(
+        !names.contains(&"orders-faucet-ovw-dead".to_string()),
+        "{names:?}"
+    );
+    sink(&a)
+        .write_batch(&[json!({"id": 1}), json!({"id": 2})])
+        .await
+        .expect("write a");
+    sink(&b)
+        .write_batch(&[json!({"id": 3})])
+        .await
+        .expect("write b");
+    sink(&a).commit_overwrite().await.expect("commit a");
+    assert_eq!(
+        fake.alias_docs(INDEX),
+        vec![json!({"id": 1}), json!({"id": 2})]
+    );
+    sink(&b).commit_overwrite().await.expect("commit b");
+    assert_eq!(fake.alias_docs(INDEX), vec![json!({"id": 3})]);
+    assert_eq!(fake.alias_names(), vec![INDEX.to_string()]);
+    assert_eq!(fake.index_names().len(), 1);
+}

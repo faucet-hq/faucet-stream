@@ -46,6 +46,9 @@ pub(crate) struct EsDriver {
     /// log emitted by [`evolve_schema`](faucet_core::Sink::evolve_schema) when an
     /// evolution carries widenings / nullability relaxations (no-ops on ES).
     evolve_noop_warned: AtomicBool,
+    /// The overwrite run this instance belongs to (see
+    /// [`ElasticsearchSink::with_overwrite_run`]).
+    overwrite_run: Option<String>,
 }
 
 /// The alias that marks an overwrite run's staging index. `begin_overwrite`
@@ -57,6 +60,24 @@ fn staging_alias(alias: &str) -> String {
     format!("{alias}-faucet-ovw-staging")
 }
 
+/// The staging marker alias of overwrite run `run`: `<alias>-faucet-ovw-staging`
+/// without a token, `<alias>-faucet-ovw-staging-<token>` with one, so two
+/// concurrent runs of one alias never resolve each other's staging index.
+/// Pure.
+fn run_staging_alias(alias: &str, run: Option<&str>) -> String {
+    match run {
+        Some(token) => format!("{}-{token}", staging_alias(alias)),
+        None => staging_alias(alias),
+    }
+}
+
+/// The run token of a tokened staging marker alias of `alias`; `None` for
+/// any other name. Pure.
+fn staging_alias_token(alias: &str, name: &str) -> Option<String> {
+    let token = name.strip_prefix(&format!("{}-", staging_alias(alias)))?;
+    faucet_core::idempotency::is_overwrite_run_token(token).then(|| token.to_string())
+}
+
 /// Unique staging physical-index name for an overwrite run — the alias target's
 /// stand-in until the atomic swap. Pure so it can be unit-tested.
 fn staging_index_name(alias: &str, nonce: u128) -> String {
@@ -66,14 +87,18 @@ fn staging_index_name(alias: &str, nonce: u128) -> String {
 /// Build the body for an atomic `POST /_aliases` swap: detach `alias` from every
 /// `previous` physical index and attach it to `staging`, all applied atomically
 /// by Elasticsearch. Pure.
-fn build_alias_swap_actions(alias: &str, staging: &str, previous: &[String]) -> Value {
+fn build_alias_swap_actions(
+    alias: &str,
+    marker: &str,
+    staging: &str,
+    previous: &[String],
+) -> Value {
     let mut actions: Vec<Value> = previous
         .iter()
         .map(|idx| serde_json::json!({ "remove": { "index": idx, "alias": alias } }))
         .collect();
     actions.push(serde_json::json!({ "add": { "index": staging, "alias": alias } }));
-    actions
-        .push(serde_json::json!({ "remove": { "index": staging, "alias": staging_alias(alias) } }));
+    actions.push(serde_json::json!({ "remove": { "index": staging, "alias": marker } }));
     serde_json::json!({ "actions": actions })
 }
 
@@ -95,6 +120,17 @@ impl ElasticsearchSink {
     pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
         self.inner.driver_mut().auth_provider = Some(provider);
         self
+    }
+
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages behind
+    /// `<index>-faucet-ovw-staging-<token>`, so a concurrent overwrite run of
+    /// the same alias neither drops nor swaps in the other's staging index.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.inner.driver_mut().overwrite_run = Some(token.to_string());
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -134,6 +170,7 @@ impl EsDriver {
             auth_provider: None,
             resume_dup_warned: AtomicBool::new(false),
             evolve_noop_warned: AtomicBool::new(false),
+            overwrite_run: None,
         })
     }
 
@@ -141,7 +178,7 @@ impl EsDriver {
     /// overwrite`, otherwise the configured `index` (which may be an alias).
     fn write_index(&self) -> String {
         if self.config.write.is_overwrite() {
-            staging_alias(&self.config.index)
+            self.marker()
         } else {
             self.config.index.clone()
         }
@@ -174,13 +211,81 @@ impl EsDriver {
         ))
     }
 
-    /// The overwrite run's staging index, resolved through [`staging_alias`].
+    /// This run's staging marker alias (see [`run_staging_alias`]).
+    fn marker(&self) -> String {
+        run_staging_alias(&self.config.index, self.overwrite_run.as_deref())
+    }
+
+    /// At a tokened begin: drop the staging indices behind the untokened
+    /// marker (an earlier release's, or a run's without a token) and behind
+    /// another run's tokened marker once that run's token is more than a day
+    /// old ([`faucet_core::idempotency::overwrite_run_abandoned`]). A live
+    /// run's staging, this run's own and the live read alias's indices are
+    /// never touched.
+    async fn sweep_staging(
+        &self,
+        calls: &CallSlot,
+        previous: &[String],
+        auth: &ElasticsearchAuth,
+    ) -> Result<(), FaucetError> {
+        if self.overwrite_run.is_none() {
+            return Ok(());
+        }
+        let alias = &self.config.index;
+        let mut stale = self
+            .alias_targets(calls, &staging_alias(alias), auth)
+            .await?
+            .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let url = format!("{}/_alias/{}-*", self.config.base_url, staging_alias(alias));
+        let resp = self
+            .send_once(
+                calls,
+                "request",
+                Self::apply_auth_value(self.client.get(&url), auth),
+            )
+            .await?;
+        if resp.status().as_u16() != 404 {
+            let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+            let body: Value = resp.json().await?;
+            for (index, entry) in body.as_object().into_iter().flatten() {
+                let abandoned = entry
+                    .get("aliases")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(name, _)| staging_alias_token(alias, name))
+                    .any(|token| {
+                        faucet_core::idempotency::overwrite_run_abandoned(
+                            &token,
+                            self.overwrite_run.as_deref(),
+                            now,
+                        )
+                    });
+                if abandoned {
+                    stale.push(index.clone());
+                }
+            }
+        }
+        for index in stale {
+            if !previous.contains(&index) {
+                tracing::warn!(index = %index, "overwrite: dropping a staging index an earlier run abandoned");
+                self.overwrite_delete_index(calls, &index, auth).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The overwrite run's staging index, resolved through its marker alias.
     async fn overwrite_staging(
         &self,
         calls: &CallSlot,
         auth: &ElasticsearchAuth,
     ) -> Result<String, FaucetError> {
-        let marker = staging_alias(&self.config.index);
+        let marker = self.marker();
         match self.alias_targets(calls, &marker, auth).await?.as_deref() {
             Some([staging]) => Ok(staging.clone()),
             Some(many) if !many.is_empty() => Err(FaucetError::Sink(format!(
@@ -1540,7 +1645,7 @@ impl StagingDriver for EsDriver {
     async fn stage(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let auth = self.resolve_auth().await?;
         let alias = self.config.index.clone();
-        let marker = staging_alias(&alias);
+        let marker = self.marker();
 
         // Discover the alias's current physical targets (if any) and reject a
         // concrete index of the same name.
@@ -1565,6 +1670,7 @@ impl StagingDriver for EsDriver {
                 self.overwrite_delete_index(calls, &stale, &auth).await?;
             }
         }
+        self.sweep_staging(calls, &previous, &auth).await?;
 
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1594,7 +1700,7 @@ impl StagingDriver for EsDriver {
         // Make the staged docs searchable before the swap.
         self.overwrite_refresh(calls, &staging, &auth).await?;
 
-        let body = build_alias_swap_actions(&alias, &staging, &previous);
+        let body = build_alias_swap_actions(&alias, &self.marker(), &staging, &previous);
         let url = format!("{}/_aliases", self.config.base_url);
         let req = self
             .client
@@ -1622,7 +1728,7 @@ impl StagingDriver for EsDriver {
     /// and its current target are left untouched.
     async fn discard(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let auth = self.resolve_auth().await?;
-        let marker = staging_alias(&self.config.index);
+        let marker = self.marker();
         let live = self
             .alias_targets(calls, &self.config.index, &auth)
             .await?
@@ -2609,6 +2715,7 @@ mod tests {
     fn alias_swap_actions_remove_all_previous_then_add_staging() {
         let body = build_alias_swap_actions(
             "orders",
+            "orders-faucet-ovw-staging",
             "orders-faucet-ovw-1",
             &["orders-old-a".to_string(), "orders-old-b".to_string()],
         );
@@ -2628,8 +2735,34 @@ mod tests {
     }
 
     #[test]
+    fn a_tokened_run_has_its_own_marker_alias() {
+        let t = "67000000abcdef";
+        assert_eq!(
+            run_staging_alias("orders", None),
+            "orders-faucet-ovw-staging"
+        );
+        let m = run_staging_alias("orders", Some(t));
+        assert_eq!(m, "orders-faucet-ovw-staging-67000000abcdef");
+        assert_eq!(staging_alias_token("orders", &m).as_deref(), Some(t));
+        for other in [
+            "orders-faucet-ovw-staging",
+            "orders-faucet-ovw-staging-nope",
+            "orders2-faucet-ovw-staging-67000000abcdef",
+        ] {
+            assert_eq!(staging_alias_token("orders", other), None, "{other}");
+        }
+        let body = build_alias_swap_actions("orders", &m, "orders-faucet-ovw-1", &[]);
+        assert_eq!(body["actions"][1]["remove"]["alias"], m.as_str());
+    }
+
+    #[test]
     fn alias_swap_first_run_only_adds() {
-        let body = build_alias_swap_actions("orders", "orders-faucet-ovw-1", &[]);
+        let body = build_alias_swap_actions(
+            "orders",
+            "orders-faucet-ovw-staging",
+            "orders-faucet-ovw-1",
+            &[],
+        );
         let actions = body["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 2);
         assert!(actions[0].get("add").is_some());

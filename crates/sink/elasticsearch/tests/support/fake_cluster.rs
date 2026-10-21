@@ -58,6 +58,20 @@ impl Respond for FakeCluster {
         let parts: Vec<&str> = path.split('/').collect();
         let method = req.method.as_str();
         match (method, parts.as_slice()) {
+            // A wildcard alias lookup answers 200 with every match (maybe none).
+            ("GET", ["_alias", pattern]) if pattern.ends_with('*') => {
+                let prefix = pattern.trim_end_matches('*');
+                let mut body = serde_json::Map::new();
+                for (alias, targets) in st.aliases.iter().filter(|(a, _)| a.starts_with(prefix)) {
+                    for t in targets {
+                        let entry = body
+                            .entry(t.clone())
+                            .or_insert_with(|| json!({"aliases": {}}));
+                        entry["aliases"][alias.as_str()] = json!({});
+                    }
+                }
+                ResponseTemplate::new(200).set_body_json(Value::Object(body))
+            }
             ("GET", ["_alias", name]) => match st.aliases.get(*name) {
                 Some(targets) if !targets.is_empty() => {
                     let mut body = serde_json::Map::new();
