@@ -278,6 +278,17 @@ fn never_sent(e: &mongodb::error::Error) -> bool {
     )
 }
 
+/// Whether the driver refused a document of the batch before sending it (an
+/// invalid or oversized document): re-sending cannot succeed, so the batch is
+/// split to find the offending document instead.
+fn refused_document(e: &mongodb::error::Error) -> bool {
+    matches!(
+        e.kind.as_ref(),
+        mongodb::error::ErrorKind::InvalidArgument { .. }
+            | mongodb::error::ErrorKind::BsonSerialization(_)
+    )
+}
+
 /// How many times [`insert_partial`](MongoSink) re-sends a batch whose
 /// `insert_many` failed without per-document write errors.
 const INSERT_RESENDS: u32 = 3;
@@ -600,13 +611,20 @@ impl MongoDriver {
             self.config.batch_size
         };
         let mut resends = 0u32;
+        // Documents still to send one at a time after the driver refused a
+        // document of their batch.
+        let mut isolate = 0usize;
         // Whether any document may already be in the collection: confirmed
         // inserts, or an insert that failed or was cut without telling which
         // documents landed. While false, a failure is an outer `Err`.
         let mut maybe_committed = false;
         let mut pending: &[(usize, Document)] = &docs;
         while !pending.is_empty() {
-            let take = chunk.min(pending.len());
+            let take = if isolate > 0 {
+                1
+            } else {
+                chunk.min(pending.len())
+            };
             let batch = &pending[..take];
             // A re-send is unordered: the documents that landed before the
             // failure come back as duplicate keys, which must not stop it.
@@ -661,6 +679,22 @@ impl MongoDriver {
                         .flatten()
                         .map(|we| (we.index, we.code, we.message.clone()))
                         .collect(),
+                    // The driver refused a document before sending anything:
+                    // send the batch one document at a time so only the
+                    // offending document fails.
+                    _ if refused_document(&e) => {
+                        if take > 1 {
+                            isolate = take;
+                            continue;
+                        }
+                        outcomes[batch[0].0] = Err(FaucetError::Sink(format!(
+                            "MongoDB refused the document: {e}"
+                        )));
+                        isolate = isolate.saturating_sub(1);
+                        resends = 0;
+                        pending = &pending[1..];
+                        continue;
+                    }
                     // A transport or server failure says nothing about which
                     // documents of the batch landed: re-send it a few times
                     // before giving up (#862 L-104).
@@ -699,6 +733,7 @@ impl MongoDriver {
                 )));
             }
             resends = 0;
+            isolate = isolate.saturating_sub(step.consumed);
             pending = &pending[step.consumed..];
         }
         Ok(outcomes)

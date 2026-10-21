@@ -270,21 +270,20 @@ async fn a_partial_insert_cut_before_anything_landed_fails_whole() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_re_send_backoff_past_the_deadline_fails_whole() {
+async fn an_oversized_document_fails_alone() {
     let (_container, uri) = start_mongo().await;
     let sink = MongoSink::new(MongoSinkConfig::new(&uri, "testdb", "big"))
         .await
         .unwrap();
-    sink.set_call_context(
-        faucet_core::CallContext::new()
-            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(300)),
-    );
-    // Larger than the server's document limit: refused by the driver, not
-    // per document, so the batch is re-sent after a backoff the deadline cuts.
+    // Larger than the server's document limit: refused by the driver before
+    // anything is sent, so only that document fails.
     let huge = "x".repeat(17 * 1024 * 1024);
-    assert!(
-        sink.write_batch_partial(&[json!({"blob": huge})])
-            .await
-            .is_err()
-    );
+    let outcomes = sink
+        .write_batch_partial(&[json!({"a": 1}), json!({"blob": huge}), json!({"a": 3})])
+        .await
+        .expect("per-row outcomes");
+    assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+    let err = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(err.contains("refused the document"), "{err}");
+    assert_eq!(count_docs(&uri, "testdb", "big").await, 2);
 }
