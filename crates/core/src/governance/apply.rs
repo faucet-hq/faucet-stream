@@ -70,6 +70,7 @@ impl GovernanceSpecs<'_> {
 pub(crate) struct GovernanceState {
     pub dest_schema_cache: Option<Option<Value>>,
     pub warned_drift_inert: bool,
+    pub warned_drift: bool,
     #[cfg(feature = "contract")]
     pub warned_contract_breach: bool,
 }
@@ -276,6 +277,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                             row,
                             &mut state.dest_schema_cache,
                             &mut drift_envelopes,
+                            &mut state.warned_drift,
                         )
                         .await?
                     }
@@ -362,6 +364,7 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
     row: &str,
     dest_schema_cache: &mut Option<Option<Value>>,
     drift_envelopes: &mut Vec<Value>,
+    warned_drift: &mut bool,
 ) -> Result<(Vec<Value>, Option<FaucetError>), FaucetError> {
     use crate::drift::{OnDrift, OnIncompatible};
     use crate::observability::schema_drift as emit_drift;
@@ -408,11 +411,15 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
 
     match policy.on_drift {
         OnDrift::Warn => {
-            tracing::warn!(
-                connector = sink_name,
-                columns = ?diff.changed_columns(),
-                "schema-drift detected (on_drift=warn); writing page unchanged"
-            );
+            if !*warned_drift {
+                tracing::warn!(
+                    connector = sink_name,
+                    columns = ?diff.changed_columns(),
+                    "schema-drift detected (on_drift=warn); writing pages unchanged \
+                     (logged once per run; faucet_schema_drift_total counts every page)"
+                );
+                *warned_drift = true;
+            }
             Ok((records, None))
         }
         OnDrift::Fail => Ok((
@@ -596,4 +603,57 @@ pub(crate) fn quarantine_drift_rows(
         }
     }
     (kept, envelopes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Null;
+    #[async_trait::async_trait]
+    impl Sink for Null {
+        async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+            Ok(r.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_warn_latches_after_the_first_page() {
+        let policy = crate::drift::SchemaDriftPolicy::compile(&crate::drift::SchemaDriftSpec {
+            on_drift: crate::drift::OnDrift::Warn,
+            allow_type_widening: true,
+            on_incompatible: crate::drift::OnIncompatible::Fail,
+            relax_nullability_on_missing: false,
+        });
+        let dest = json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        let page = vec![json!({"id": 1, "extra": "x"})];
+        let inferred = crate::drift::infer_page_schema(&dest, &page);
+        let diff = crate::drift::diff_schema(&dest, &inferred, true);
+        assert!(!diff.is_empty());
+        let mut cache = None;
+        let mut envelopes = Vec::new();
+        let mut warned = false;
+        for _ in 0..2 {
+            let (out, abort) = apply_drift_policy(
+                &policy,
+                &diff,
+                &dest,
+                page.clone(),
+                &[0],
+                &Null,
+                "null",
+                "p",
+                "",
+                &mut cache,
+                &mut envelopes,
+                &mut warned,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, page);
+            assert!(abort.is_none());
+            assert!(warned, "the warning latch is set once and stays set");
+        }
+    }
 }
