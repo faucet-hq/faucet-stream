@@ -257,12 +257,86 @@ async fn oracle_sink_end_to_end() {
     assert!(missing.begin_overwrite().await.is_err());
     let empty_first = OracleSink::new(OracleSinkConfig {
         table: "EMPTY_OW".into(),
-        ..ow_cfg
+        ..ow_cfg.clone()
     })
     .await
     .unwrap();
     empty_first.begin_overwrite().await.unwrap();
     empty_first.commit_overwrite().await.unwrap();
+
+    // An overwrite of a table other tables reference is refused before any
+    // row is staged: the swap's DELETE would cascade into the child table.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE FK_PARENT (ID NUMBER(19) PRIMARY KEY)",
+            "CREATE TABLE FK_CHILD (ID NUMBER(19) PRIMARY KEY, PID NUMBER(19) \
+             REFERENCES FK_PARENT (ID) ON DELETE CASCADE)",
+            "INSERT INTO FK_PARENT (ID) VALUES (1)",
+            "INSERT INTO FK_CHILD (ID, PID) VALUES (10, 1)",
+        ],
+    )
+    .await;
+    let referenced = OracleSink::new(OracleSinkConfig {
+        table: "FK_PARENT".into(),
+        ..ow_cfg.clone()
+    })
+    .await
+    .unwrap();
+    let err = referenced.begin_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("referenced by a foreign key") && err.contains("FK_CHILD"),
+        "{err}"
+    );
+    // A foreign key added after staging is caught at the swap.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE FK_LATE (ID NUMBER(19) PRIMARY KEY)",
+            "INSERT INTO FK_LATE (ID) VALUES (1)",
+        ],
+    )
+    .await;
+    let late = OracleSink::new(OracleSinkConfig {
+        table: "FK_LATE".into(),
+        ..ow_cfg.clone()
+    })
+    .await
+    .unwrap();
+    late.begin_overwrite().await.unwrap();
+    late.write_batch(&[json!({"ID": 2})]).await.unwrap();
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE FK_LATE_CHILD (ID NUMBER(19), PID NUMBER(19) \
+             REFERENCES FK_LATE (ID) ON DELETE SET NULL)",
+            "INSERT INTO FK_LATE_CHILD (ID, PID) VALUES (1, 1)",
+        ],
+    )
+    .await;
+    let err = late.commit_overwrite().await.unwrap_err().to_string();
+    assert!(err.contains("FK_LATE_CHILD"), "{err}");
+    late.abort_overwrite().await.unwrap();
+    assert_eq!(count(&conn, "FK_CHILD").await, 1, "no cascade");
+    let pids = common::query_strings(&conn, "SELECT TO_CHAR(PID) FROM FK_LATE_CHILD").await;
+    assert_eq!(pids, vec![Some("1".into())], "no SET NULL");
+    // A self-reference is not a refusal: the swap replaces every row at once.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE FK_SELF (ID NUMBER(19) PRIMARY KEY, PARENT NUMBER(19) \
+             REFERENCES FK_SELF (ID))",
+        ],
+    )
+    .await;
+    let selfref = OracleSink::new(OracleSinkConfig {
+        table: "FK_SELF".into(),
+        ..ow_cfg.clone()
+    })
+    .await
+    .unwrap();
+    selfref.begin_overwrite().await.unwrap();
+    selfref.abort_overwrite().await.unwrap();
 
     // Schema drift: live schema, add / widen / relax.
     common::exec(

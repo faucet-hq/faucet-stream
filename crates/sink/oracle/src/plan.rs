@@ -385,6 +385,30 @@ pub(crate) fn dictionary_binds(table: &str) -> Result<(Option<String>, String), 
 pub(crate) const TABLE_EXISTS_SQL: &str = "SELECT COUNT(*) FROM ALL_TABLES \
     WHERE OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND TABLE_NAME = :2";
 
+/// Tables other than the target whose enabled foreign keys reference it
+/// (`:1` owner or NULL for the current schema, `:2` table), as `OWNER.TABLE`.
+/// Self-references are excluded: the swap replaces every row of the table at
+/// once, so they cannot cascade elsewhere.
+pub(crate) const REFERENCING_TABLES_SQL: &str = "SELECT DISTINCT c.OWNER || '.' || c.TABLE_NAME \
+    FROM ALL_CONSTRAINTS c JOIN ALL_CONSTRAINTS p \
+      ON p.OWNER = c.R_OWNER AND p.CONSTRAINT_NAME = c.R_CONSTRAINT_NAME \
+    WHERE c.CONSTRAINT_TYPE = 'R' AND c.STATUS = 'ENABLED' \
+      AND p.OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND p.TABLE_NAME = :2 \
+      AND NOT (c.OWNER = p.OWNER AND c.TABLE_NAME = p.TABLE_NAME) \
+    ORDER BY 1";
+
+/// The refusal for an overwrite whose target other tables reference: the
+/// swap's `DELETE FROM target` would cascade into them (`ON DELETE CASCADE` /
+/// `SET NULL`) or fail after the whole staging load (`NO ACTION`).
+pub(crate) fn referenced_overwrite_error(table: &str, referenced_by: &[String]) -> FaucetError {
+    FaucetError::Config(format!(
+        "oracle overwrite: table '{table}' is referenced by a foreign key from {}; replacing \
+         its rows would cascade into, break or be blocked by those tables. Use write_mode: \
+         upsert, or drop or disable the foreign key",
+        referenced_by.join(", ")
+    ))
+}
+
 /// Column metadata (`:1` owner or NULL, `:2` table).
 pub(crate) const COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.DATA_PRECISION, \
     c.DATA_SCALE, c.NULLABLE, c.VIRTUAL_COLUMN, NVL(i.GENERATION_TYPE, 'NONE'), c.DATA_DEFAULT, \
@@ -806,6 +830,19 @@ pub(crate) fn no_columns_error(table: &str, records: &[Value]) -> FaucetError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn referenced_overwrite_is_refused_naming_the_children() {
+        let e = referenced_overwrite_error("ORDERS_PARENT", &["APP.ORDERS".into(), "APP.X".into()]);
+        let msg = e.to_string();
+        assert!(matches!(e, FaucetError::Config(_)));
+        assert!(
+            msg.contains("'ORDERS_PARENT'") && msg.contains("APP.ORDERS, APP.X"),
+            "{msg}"
+        );
+        assert!(REFERENCING_TABLES_SQL.contains("CONSTRAINT_TYPE = 'R'"));
+        assert!(REFERENCING_TABLES_SQL.contains("STATUS = 'ENABLED'"));
+    }
+
     use super::*;
 
     #[test]

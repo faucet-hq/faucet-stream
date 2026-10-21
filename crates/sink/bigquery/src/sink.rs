@@ -646,6 +646,34 @@ fn is_direct_overwrite(config: &BigQuerySinkConfig) -> bool {
     config.media_load && !config.overwrite_staging && config.scope.is_none()
 }
 
+/// Refuse to open a new resumable session over one whose load job was
+/// never confirmed: replacing it would forget a load that may have failed.
+fn unconfirmed_load(sess: Option<&UploadSession>) -> Result<(), FaucetError> {
+    match sess {
+        Some(s) if s.finalized && !s.confirmed => {
+            Err(FaucetError::Sink(s.poisoned.clone().unwrap_or_else(|| {
+                "BigQuery: the previous load job was never confirmed; flush again to \
+                 confirm it before writing more rows"
+                    .to_string()
+            })))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The load job a resumable finalize response names.
+fn finalize_job_ref(text: &str) -> Result<(String, Option<String>), FaucetError> {
+    let job: Job = serde_json::from_str(text)
+        .map_err(|e| FaucetError::Sink(format!("resumable finalize: parse job response: {e}")))?;
+    let job_ref = job.job_reference.as_ref().ok_or_else(|| {
+        FaucetError::Sink("resumable finalize response missing jobReference".to_string())
+    })?;
+    let job_id = job_ref.job_id.clone().ok_or_else(|| {
+        FaucetError::Sink("resumable finalize jobReference missing jobId".to_string())
+    })?;
+    Ok((job_id, job_ref.location.clone()))
+}
+
 /// The disposition a resumable session opens with. A `WRITE_TRUNCATE` session
 /// that re-opens after an earlier one on this writer was finalized appends
 /// instead: truncating again would discard the rows the first load committed.
@@ -732,9 +760,21 @@ struct UploadSession {
     http: reqwest::Client,
     /// The sink's call context (#880): every chunk PUT runs through it.
     calls: CallContext,
-    /// Set once the terminating chunk has been accepted, so a second
-    /// flush/commit is a no-op.
+    /// Set once the terminating chunk has been accepted. The load job it
+    /// started is confirmed separately ([`Self::confirmed`]).
     finalized: bool,
+    /// The compressed tail not yet accepted by the terminating PUT, kept so
+    /// a retried finalize re-sends the same final range.
+    tail: Option<Vec<u8>>,
+    /// The load job the terminating PUT started, until it is confirmed: a
+    /// finalize re-entered after a failed wait polls this job again rather
+    /// than reporting success.
+    job: Option<(String, Option<String>)>,
+    /// Set only once the load job reached `DONE` without an error.
+    confirmed: bool,
+    /// A terminal failure after the data was handed over (an unreadable job
+    /// response): every later finalize reports it.
+    poisoned: Option<String>,
     /// Whether this session is a `WRITE_APPEND` load.
     appending: bool,
     /// Compressed-buffer size at which a mid-stream chunk is PUT. Production uses
@@ -1031,6 +1071,7 @@ impl faucet_core::Sink for BigQuerySink {
 impl BigQueryDriver {
     async fn new(config: BigQuerySinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        idempotent::validate_table_path(&config.project_id, &config.dataset_id, &config.table_id)?;
         config.write.validate()?;
         #[cfg(feature = "arrow")]
         if let Some(load) = &config.bulk_load {
@@ -1414,10 +1455,15 @@ impl BigQueryDriver {
             }
             self.create_target_from_sample(calls, records).await?;
             self.table_ready.store(true, Ordering::Release);
+            // `IF NOT EXISTS`, never `OR REPLACE`: the writers of a grouped
+            // overwrite share this staging table, and one whose probe raced
+            // another's create must not drop the pages that one already
+            // staged. A stale staging table from a crashed run was dropped by
+            // `stage`.
             self.run_ddl(
                 calls,
                 format!(
-                    "CREATE OR REPLACE TABLE {} LIKE {}",
+                    "CREATE TABLE IF NOT EXISTS {} LIKE {}",
                     self.overwrite_temp_ref(),
                     self.table_ref()
                 ),
@@ -1769,6 +1815,10 @@ impl BigQueryDriver {
             http,
             calls,
             finalized: false,
+            tail: None,
+            job: None,
+            confirmed: false,
+            poisoned: None,
             appending: write_disposition == "WRITE_APPEND",
             chunk_threshold: self.config.resumable_chunk.unwrap_or(RESUMABLE_CHUNK),
         })
@@ -1790,6 +1840,7 @@ impl BigQueryDriver {
         }
         let (need_open, reopening) = {
             let guard = self.upload_session.lock().await;
+            unconfirmed_load(guard.as_ref())?;
             (
                 guard.as_ref().is_none_or(|s| s.finalized),
                 guard.as_ref().is_some_and(|s| s.finalized),
@@ -1846,6 +1897,7 @@ impl BigQueryDriver {
         }
         let need_open = {
             let guard = self.upload_session.lock().await;
+            unconfirmed_load(guard.as_ref())?;
             guard.as_ref().is_none_or(|s| s.finalized)
         };
         if need_open {
@@ -1874,47 +1926,74 @@ impl BigQueryDriver {
             let Some(sess) = guard.as_mut() else {
                 return Ok(());
             };
-            if sess.finalized {
+            if let Some(err) = &sess.poisoned {
+                return Err(FaucetError::Sink(err.clone()));
+            }
+            if sess.confirmed {
                 return Ok(());
             }
-            let remaining = sess.finish()?;
-            let total = sess.offset + remaining.len() as u64;
-            let resp = sess
-                .put_range(sess.offset, &remaining, Some(total))
-                .await
-                .map_err(|e| FaucetError::Sink(format!("resumable finalize PUT failed: {e}")))?;
-            let status = resp.status();
-            let text = resp.text().await.map_err(|e| {
-                FaucetError::Sink(format!("resumable finalize: read response: {e}"))
-            })?;
-            if !status.is_success() {
-                return Err(FaucetError::Sink(format!(
-                    "resumable finalize returned HTTP {status}: {text}"
-                )));
+            match sess.job.clone() {
+                // The terminating PUT was accepted but its load job was never
+                // confirmed: poll that job again.
+                Some(job) => job,
+                None => {
+                    if sess.tail.is_none() {
+                        sess.tail = Some(sess.finish()?);
+                    }
+                    let remaining = sess.tail.clone().unwrap_or_default();
+                    let total = sess.offset + remaining.len() as u64;
+                    let resp = sess
+                        .put_range(sess.offset, &remaining, Some(total))
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("resumable finalize PUT failed: {e}"))
+                        })?;
+                    let status = resp.status();
+                    let text = resp.text().await.map_err(|e| {
+                        FaucetError::Sink(format!("resumable finalize: read response: {e}"))
+                    })?;
+                    if !status.is_success() {
+                        return Err(FaucetError::Sink(format!(
+                            "resumable finalize returned HTTP {status}: {text}"
+                        )));
+                    }
+                    sess.finalized = true;
+                    sess.tail = None;
+                    if sess.appending && !self.stream_appends.swap(true, Ordering::AcqRel) {
+                        tracing::info!(
+                            table = %self.config.table_id,
+                            "BigQuery: the pipeline flushed an append load mid-run (the source \
+                             bookmarks every page); later appends stream via insertAll so the \
+                             run does not spend one load job per page"
+                        );
+                    }
+                    match finalize_job_ref(&text) {
+                        Ok(job) => {
+                            sess.job = Some(job.clone());
+                            job
+                        }
+                        Err(e) => {
+                            // The data was handed over but its load job cannot be
+                            // identified, so it can never be confirmed.
+                            sess.poisoned = Some(match &e {
+                                FaucetError::Sink(m) => m.clone(),
+                                other => other.to_string(),
+                            });
+                            return Err(e);
+                        }
+                    }
+                }
             }
-            sess.finalized = true;
-            if sess.appending && !self.stream_appends.swap(true, Ordering::AcqRel) {
-                tracing::info!(
-                    table = %self.config.table_id,
-                    "BigQuery: the pipeline flushed an append load mid-run (the source \
-                     bookmarks every page); later appends stream via insertAll so the run \
-                     does not spend one load job per page"
-                );
-            }
-            let job: Job = serde_json::from_str(&text).map_err(|e| {
-                FaucetError::Sink(format!("resumable finalize: parse job response: {e}"))
-            })?;
-            let job_ref = job.job_reference.as_ref().ok_or_else(|| {
-                FaucetError::Sink("resumable finalize response missing jobReference".to_string())
-            })?;
-            let job_id = job_ref.job_id.clone().ok_or_else(|| {
-                FaucetError::Sink("resumable finalize jobReference missing jobId".to_string())
-            })?;
-            (job_id, job_ref.location.clone())
         };
         self.await_load_job(calls, &job_id, location.as_deref())
-            .await
-            .map(|_| ())
+            .await?;
+        let mut guard = self.upload_session.lock().await;
+        if let Some(sess) = guard.as_mut()
+            && sess.job.as_ref().is_some_and(|(id, _)| *id == job_id)
+        {
+            sess.confirmed = true;
+        }
+        Ok(())
     }
 
     /// Append `records` to the target. Via a bucket-free load job when
@@ -2750,6 +2829,19 @@ impl BigQueryDriver {
         ) {
             return Vec::new();
         }
+        // A byte load truncates the whole table and never runs the staged
+        // commit, so a scoped overwrite (replace only the rows in `scope`) or
+        // a grouped one (several writers into one staging table) must take the
+        // row path, whose commit honours them.
+        let ndjson_modes: &'static [faucet_core::WriteMode] =
+            if self.config.scope.is_some() || self.config.overwrite_staging {
+                &[faucet_core::WriteMode::Append]
+            } else {
+                &[
+                    faucet_core::WriteMode::Append,
+                    faucet_core::WriteMode::Overwrite,
+                ]
+            };
         vec![
             // NDJSON feeds one resumable session finalized only by the terminal
             // `flush`, so it satisfies the all-or-nothing overwrite contract:
@@ -2757,10 +2849,7 @@ impl BigQueryDriver {
             faucet_core::NativeLoadCapability {
                 format: faucet_core::NativeFormat::NdJson,
                 mechanism: "bigquery-load-job",
-                write_modes: &[
-                    faucet_core::WriteMode::Append,
-                    faucet_core::WriteMode::Overwrite,
-                ],
+                write_modes: ndjson_modes,
             },
             // CSV runs a discrete load job per batch, each committing on its
             // own — a multi-batch overwrite would be truncate + partial appends
@@ -2782,6 +2871,15 @@ impl BigQueryDriver {
         ctx: faucet_core::NativeLoadContext,
     ) -> Result<usize, FaucetError> {
         let _ = scope; // v1: no per-scope isolation on the native load path.
+        if ctx.write_mode == faucet_core::WriteMode::Overwrite
+            && (self.config.scope.is_some() || self.config.overwrite_staging)
+        {
+            return Err(FaucetError::Sink(
+                "BigQuery: a scoped or grouped `write_mode: overwrite` cannot take the \
+                 native byte path (it would truncate the whole table)"
+                    .into(),
+            ));
+        }
         // Overwrite truncates on the first batch (which opens the session), appends
         // thereafter. Because every page of an object feeds ONE resumable session
         // finalized in `flush`, this is one atomic WRITE_TRUNCATE load per object —
@@ -3148,9 +3246,16 @@ impl StagingDriver for BigQueryDriver {
             // are created by the first page's write (which supplies the schema
             // `CREATE … LIKE` needs), on whichever sink instance handles it — see
             // `insert_overwrite_page`'s self-heal. No in-memory flag is set here
-            // because begin and write run on different instances.
+            // because begin and write run on different instances. A staging
+            // table left by a crashed run is dropped now, because the writers
+            // create it with `IF NOT EXISTS` and would otherwise append to it.
             self.ensure_dataset(calls).await?;
-            return Ok(());
+            return self
+                .run_ddl(
+                    calls,
+                    format!("DROP TABLE IF EXISTS {}", self.overwrite_temp_ref()),
+                )
+                .await;
         }
         Err(FaucetError::Sink(format!(
             "BigQuery overwrite target {}.{}.{} does not exist (or has no schema) and \

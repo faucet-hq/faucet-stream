@@ -256,7 +256,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                     (records, None)
                 }
                 Some(dest) => {
-                    let inferred = crate::schema::infer_schema(&records);
+                    let inferred = crate::drift::infer_page_schema(dest, &records);
                     let diff = crate::drift::diff_schema(dest, &inferred, policy.allow_widening);
                     if diff.is_empty() {
                         (records, None)

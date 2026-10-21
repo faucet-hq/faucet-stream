@@ -401,7 +401,7 @@ async fn overwrite_creates_dataset_table_and_staging_when_missing() {
     );
     assert!(
         qs.iter()
-            .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t__faucet_ovw` LIKE `p.d.t`")),
+            .any(|q| q.contains("CREATE TABLE IF NOT EXISTS `p.d.t__faucet_ovw` LIKE `p.d.t`")),
         "staging clone missing: {qs:?}"
     );
     assert!(
@@ -461,13 +461,68 @@ async fn overwrite_creates_missing_target_across_sink_instances() {
     );
     assert!(
         qs.iter()
-            .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t__faucet_ovw` LIKE `p.d.t`")),
+            .any(|q| q.contains("CREATE TABLE IF NOT EXISTS `p.d.t__faucet_ovw` LIKE `p.d.t`")),
         "write sink must create the staging clone: {qs:?}"
+    );
+    assert!(
+        qs.iter()
+            .any(|q| q.contains("DROP TABLE IF EXISTS `p.d.t__faucet_ovw`")),
+        "begin must drop a stale staging table when the target is missing: {qs:?}"
+    );
+    assert!(
+        !qs.iter()
+            .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t__faucet_ovw`")),
+        "a writer must never replace the shared staging table: {qs:?}"
     );
     assert!(
         qs.iter().any(|q| q.contains("TRUNCATE TABLE `p.d.t`")
             && q.contains("INSERT INTO `p.d.t` SELECT * FROM `p.d.t__faucet_ovw`")),
         "commit swap missing: {qs:?}"
+    );
+}
+
+/// Two writers of a grouped first-run overwrite whose probes both saw the
+/// target missing: the second writer must not replace the staging table the
+/// first already loaded a page into.
+#[tokio::test]
+async fn grouped_first_run_writers_share_the_staging_table() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    // begin + both writers' self-heal probes see 404 (each writer re-probes in
+    // create_target_from_sample, then reads the schema).
+    mount_table_missing(&server, Some(3)).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-g").await;
+    mount_staging_present(&server).await;
+
+    let mut config = config_overwrite();
+    config.overwrite_staging = true;
+    let (begin_sink, _b) = build_sink(&server, config.clone()).await;
+    let (a, _a) = build_sink(&server, config.clone()).await;
+    let (b, _bb) = build_sink(&server, config.clone()).await;
+    let (commit_sink, _c) = build_sink(&server, config).await;
+
+    begin_sink.begin_overwrite().await.expect("begin");
+    a.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("writer a");
+    b.write_batch(&[json!({"id": 2, "name": "b"})])
+        .await
+        .expect("writer b");
+    commit_sink.commit_overwrite().await.expect("commit");
+
+    let qs = queries(&server).await;
+    assert!(
+        !qs.iter()
+            .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t__faucet_ovw`")),
+        "no writer may replace the shared staging table: {qs:?}"
+    );
+    assert_eq!(
+        qs.iter()
+            .filter(|q| q.contains("INSERT INTO `p.d.t__faucet_ovw`"))
+            .count(),
+        2,
+        "both writers' pages are staged: {qs:?}"
     );
 }
 
@@ -1505,6 +1560,152 @@ async fn await_load_job_reports_job_error() {
         .await
         .expect_err("job errorResult must surface");
     assert!(err.to_string().contains("failed"), "got: {err}");
+}
+
+/// A load job that failed stays failed: a retried flush must not report
+/// success for it, and no later write may replace the unconfirmed session.
+#[tokio::test]
+async fn retried_flush_after_a_failed_load_job_still_fails() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/jf").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/jf"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-jf")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/load-jf")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "load-jf"},
+            "status": {"state": "DONE", "errorResult": {"reason": "invalid", "message": "bad load"}}
+        })))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("write");
+    sink.flush().await.expect_err("first flush fails");
+    let err = sink
+        .flush()
+        .await
+        .expect_err("a retried flush must fail too");
+    assert!(err.to_string().contains("bad load"), "{err}");
+    assert!(
+        sink.write_batch(&[json!({"id": 2})]).await.is_err(),
+        "an unconfirmed load must not be replaced by a new session"
+    );
+    assert_eq!(
+        session_puts(&server, "/rz/jf").await.len(),
+        1,
+        "one finalize PUT"
+    );
+}
+
+/// A load-job poll that fails transiently is re-polled by the retried flush
+/// (no second PUT), and succeeds only once the job is confirmed DONE.
+#[tokio::test]
+async fn retried_flush_repolls_an_unconfirmed_load_job() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/rp").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/rp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-rp")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/load-rp")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("backend error"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_jobs_get_done(&server, "load-rp").await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("write");
+    sink.flush().await.expect_err("the job poll failed");
+    sink.flush()
+        .await
+        .expect("the retried flush confirms the job");
+    sink.flush().await.expect("then a no-op");
+    assert_eq!(
+        session_puts(&server, "/rz/rp").await.len(),
+        1,
+        "one finalize PUT"
+    );
+    let polls = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/jobs/load-rp"))
+        .count();
+    assert!(
+        polls >= 2,
+        "the job was polled again, not re-uploaded ({polls})"
+    );
+}
+
+/// A terminating PUT that failed is re-sent with the same tail by the retried
+/// flush (it used to panic: the encoder was already consumed).
+#[tokio::test]
+async fn retried_flush_resends_a_failed_terminating_put() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/fp").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/fp"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/fp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-fp")))
+        .mount(&server)
+        .await;
+    mount_jobs_get_done(&server, "load-fp").await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("write");
+    sink.flush().await.expect_err("the PUT failed");
+    sink.flush()
+        .await
+        .expect("the retried flush re-sends and confirms");
+    let puts = session_puts(&server, "/rz/fp").await;
+    assert_eq!(puts.len(), 2);
+    assert_eq!(puts[0], puts[1], "the same final range is re-sent");
+}
+
+/// A finalize response naming no job poisons the session.
+#[tokio::test]
+async fn unreadable_finalize_response_poisons_later_flushes() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/po").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/po"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": {}})))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("write");
+    let first = sink.flush().await.expect_err("no job reference");
+    let second = sink.flush().await.expect_err("still poisoned");
+    assert_eq!(first.to_string(), second.to_string());
+    let third = sink
+        .write_batch(&[json!({"id": 2})])
+        .await
+        .expect_err("poisoned");
+    assert_eq!(first.to_string(), third.to_string());
 }
 
 /// `await_load_job` errors when the polled job has no `status` at all.

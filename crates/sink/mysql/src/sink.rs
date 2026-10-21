@@ -79,6 +79,25 @@ impl SqlExecutor for MysqlExec<'_> {
     /// Full type specs plus character set and collation, so the cleanup key
     /// table compares with the destination's key columns without a collation
     /// mismatch. Empty when the table is missing.
+    /// Each key column's `DATA_TYPE`, so a keyed delete decodes a binary key
+    /// the way the upsert stored it.
+    async fn key_types(
+        &mut self,
+        target: &TableTarget,
+        key: &[String],
+    ) -> Result<Vec<Option<String>>, FaucetError> {
+        let columns = table_columns(&mut *self.conn, &target.name).await?;
+        Ok(key
+            .iter()
+            .map(|k| {
+                columns
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(k))
+                    .map(|(_, t)| t.clone())
+            })
+            .collect())
+    }
+
     async fn cleanup_columns(
         &mut self,
         _target: &TableTarget,
@@ -98,19 +117,19 @@ impl SqlExecutor for MysqlExec<'_> {
     async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
         let mut q = sqlx::query(&stmt.sql);
         for p in &stmt.params {
-            let typed_write = matches!(stmt.kind, StatementKind::Insert | StatementKind::Upsert);
+            // Every statement kind that binds a binary column — inserts,
+            // upserts, keyed deletes, the cleanup key load and scope — decodes
+            // the value the same way, or a delete would compare the encoded
+            // text against the stored bytes and match nothing.
             q = match p.value.as_ref() {
-                Value::String(s) if typed_write && p.sql_type.is_some_and(is_binary_type) => {
-                    match self.binary.resolve(s) {
-                        Ok(BinaryValue::Bytes(bytes)) => q.bind(bytes),
-                        Ok(BinaryValue::Text(t)) => q.bind(t.to_string()),
-                        Err(e) => {
-                            return Err(FaucetError::Sink(format!(
-                                "MySQL insert failed: column {}: {e}",
-                                p.column
-                            )));
-                        }
-                    }
+                Value::String(s) if p.sql_type.is_some_and(is_binary_type) => {
+                    bind_binary(q, s, self.binary).map_err(|e| {
+                        FaucetError::Sink(format!(
+                            "{}: column {}: {e}",
+                            statement_context(stmt.kind),
+                            p.column
+                        ))
+                    })?
                 }
                 _ if p.non_integer_text().is_some() => {
                     q.bind(p.non_integer_text().expect("checked"))
@@ -118,18 +137,7 @@ impl SqlExecutor for MysqlExec<'_> {
                 v => bind_value(q, v),
             };
         }
-        let context = match stmt.kind {
-            StatementKind::Insert | StatementKind::InsertJson | StatementKind::Upsert => {
-                "MySQL insert failed".to_string()
-            }
-            StatementKind::Delete => "MySQL delete failed".to_string(),
-            StatementKind::CleanupDrop => "cleanup: temp table drop failed".to_string(),
-            StatementKind::CleanupCreate => "cleanup: temp table creation failed".to_string(),
-            StatementKind::CleanupLoad => "cleanup: loading keys failed".to_string(),
-            StatementKind::CleanupDelete => "cleanup: delete failed".to_string(),
-            StatementKind::TokenTable => "MySQL commit-table create failed".to_string(),
-            _ => "MySQL token upsert failed".to_string(),
-        };
+        let context = statement_context(stmt.kind);
         q.execute(&mut *self.conn)
             .await
             .map(|r| r.rows_affected())
@@ -671,12 +679,60 @@ fn split_writable(
     (split.outcomes, split.writable, split.positions)
 }
 
-/// Whether a MySQL `DATA_TYPE` stores raw bytes.
-fn is_binary_type(data_type: &str) -> bool {
+/// Whether a MySQL `DATA_TYPE` (or a full `COLUMN_TYPE` such as
+/// `varbinary(32)`) stores raw bytes.
+pub(crate) fn is_binary_type(data_type: &str) -> bool {
+    let base = data_type
+        .trim()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     matches!(
-        data_type,
+        base.as_str(),
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
     )
+}
+
+/// Bind a string bound for a binary column, decoded per `binary_encoding`.
+pub(crate) fn bind_binary<'q>(
+    q: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    s: &str,
+    binary: BinaryEncoding,
+) -> Result<sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>, String> {
+    match binary.resolve(s) {
+        Ok(BinaryValue::Bytes(bytes)) => Ok(q.bind(bytes)),
+        Ok(BinaryValue::Text(t)) => Ok(q.bind(t.to_string())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Bind a key value: decoded when its column is binary, else natively.
+pub(crate) fn bind_key<'q>(
+    q: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    v: &Value,
+    binary_column: bool,
+    binary: BinaryEncoding,
+) -> Result<sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>, String> {
+    match v {
+        Value::String(s) if binary_column => bind_binary(q, s, binary),
+        v => Ok(bind_value(q, v)),
+    }
+}
+
+fn statement_context(kind: StatementKind) -> &'static str {
+    match kind {
+        StatementKind::Insert | StatementKind::InsertJson | StatementKind::Upsert => {
+            "MySQL insert failed"
+        }
+        StatementKind::Delete => "MySQL delete failed",
+        StatementKind::CleanupDrop => "cleanup: temp table drop failed",
+        StatementKind::CleanupCreate => "cleanup: temp table creation failed",
+        StatementKind::CleanupLoad => "cleanup: loading keys failed",
+        StatementKind::CleanupDelete => "cleanup: delete failed",
+        StatementKind::TokenTable => "MySQL commit-table create failed",
+        _ => "MySQL token upsert failed",
+    }
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580): key text
@@ -940,6 +996,14 @@ impl MysqlConn<'_> {
 impl SqlExecutor for MysqlConn<'_> {
     async fn columns(&mut self, target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
         self.exec().columns(target).await
+    }
+
+    async fn key_types(
+        &mut self,
+        target: &TableTarget,
+        key: &[String],
+    ) -> Result<Vec<Option<String>>, FaucetError> {
+        self.exec().key_types(target, key).await
     }
 
     async fn cleanup_columns(
@@ -2054,6 +2118,18 @@ mod tests {
         assert!(is_binary_type("varbinary"));
         assert!(is_binary_type("longblob"));
         assert!(!is_binary_type("text"));
+        // A full COLUMN_TYPE, as the cleanup key table is typed from.
+        assert!(is_binary_type("varbinary(32)"));
+        assert!(is_binary_type("BINARY(16)"));
+        assert!(!is_binary_type("varchar(32)"));
+        assert_eq!(
+            statement_context(StatementKind::Delete),
+            "MySQL delete failed"
+        );
+        assert_eq!(
+            statement_context(StatementKind::CleanupLoad),
+            "cleanup: loading keys failed"
+        );
     }
 
     // dataset_uri test is skipped: MysqlSink::new() requires a live pool

@@ -43,6 +43,12 @@ bucketed as an **addition** (in the page, not in the destination), a **widening*
 narrowing or unrelated type swap), or a **droppable-required** column (a NOT NULL
 destination column the page never provides).
 
+A column whose values are already acceptable is not drift: an integer into a
+`number` column, and — because exact decimals and integers past 64 bits travel
+as strings ([value fidelity](../reference/value-fidelity.md)) — a string of
+exact numeric text (`"12.50"`, `"-1.5E-3"`) into a `number` (`NUMERIC` /
+`DECIMAL` / `FLOAT`) column. A string that is not numeric text still is.
+
 ## The five modes
 
 ### `warn` (default)
