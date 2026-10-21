@@ -452,10 +452,10 @@ impl CompiledFilter {
         let resolved = self.path.resolve(rec)?;
         Ok(match self.op {
             FilterOp::Eq => resolved
-                .map(|v| v == self.value.as_ref().unwrap())
+                .map(|v| json_eq(v, self.value.as_ref().unwrap()))
                 .unwrap_or(false),
             FilterOp::Ne => resolved
-                .map(|v| v != self.value.as_ref().unwrap())
+                .map(|v| !json_eq(v, self.value.as_ref().unwrap()))
                 .unwrap_or(true), // missing → keep
             FilterOp::Exists => matches!(resolved, Some(v) if !v.is_null()),
             FilterOp::In => match resolved {
@@ -466,7 +466,7 @@ impl CompiledFilter {
                         .unwrap()
                         .as_array()
                         .expect("compile validated");
-                    arr.contains(v)
+                    arr.iter().any(|x| json_eq(v, x))
                 }
                 None => false,
             },
@@ -478,12 +478,53 @@ impl CompiledFilter {
                         .unwrap()
                         .as_array()
                         .expect("compile validated");
-                    !arr.contains(v)
+                    !arr.iter().any(|x| json_eq(v, x))
                 }
                 None => true, // missing → keep
             },
         })
     }
+}
+
+/// JSON equality with one number type: `1` equals `1.0`, however a source
+/// rendered it. Strings and numbers stay distinct (`"1"` is not `1`).
+#[cfg(feature = "transform-filter")]
+fn json_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => number_eq(x, y),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| json_eq(p, q))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, p)| y.get(k).is_some_and(|q| json_eq(p, q)))
+        }
+        _ => a == b,
+    }
+}
+
+#[cfg(feature = "transform-filter")]
+fn number_eq(x: &serde_json::Number, y: &serde_json::Number) -> bool {
+    let int = |n: &serde_json::Number| {
+        n.as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))
+    };
+    match (int(x), int(y)) {
+        (Some(a), Some(b)) => a == b,
+        (Some(i), None) => float_is_int(y.as_f64(), i),
+        (None, Some(i)) => float_is_int(x.as_f64(), i),
+        (None, None) => x.as_f64() == y.as_f64(),
+    }
+}
+
+/// Whether the float `f` is exactly the integer `i` (no rounding either way).
+#[cfg(feature = "transform-filter")]
+fn float_is_int(f: Option<f64>, i: i128) -> bool {
+    f.is_some_and(|f| {
+        f.fract() == 0.0 && f.abs() < 2f64.powi(100) && f as i128 == i && i as f64 == f
+    })
 }
 
 // ── Explode spec ──
@@ -1533,6 +1574,51 @@ mod tests {
             apply_stages(json!({"v": 5}), &stages).unwrap(),
             vec![json!({"v": 5})]
         );
+    }
+
+    #[cfg(feature = "transform-filter")]
+    #[test]
+    fn filter_compares_numbers_numerically_across_renderings() {
+        let keep = |stage: TransformStage, rec: Value| {
+            !apply_stages(rec, &compile(&[stage])).unwrap().is_empty()
+        };
+        assert!(keep(
+            filter("c", FilterOp::Eq, Some(json!(2))),
+            json!({"c": 2.0})
+        ));
+        assert!(keep(
+            filter("c", FilterOp::Eq, Some(json!(2.0))),
+            json!({"c": 2})
+        ));
+        assert!(!keep(
+            filter("c", FilterOp::Ne, Some(json!(2))),
+            json!({"c": 2.0})
+        ));
+        assert!(!keep(
+            filter("c", FilterOp::Eq, Some(json!(2))),
+            json!({"c": 2.5})
+        ));
+        assert!(keep(
+            filter("c", FilterOp::In, Some(json!([1, 2]))),
+            json!({"c": 2.0})
+        ));
+        assert!(!keep(
+            filter("c", FilterOp::NotIn, Some(json!([1, 2]))),
+            json!({"c": 1.0})
+        ));
+        assert!(keep(
+            filter("c", FilterOp::Eq, Some(json!([1, {"a": 2}]))),
+            json!({"c": [1.0, {"a": 2.0}]})
+        ));
+        // Integers past 2^53 still compare exactly.
+        assert!(!keep(
+            filter("c", FilterOp::Eq, Some(json!(9_007_199_254_740_993_u64))),
+            json!({"c": 9_007_199_254_740_992.0})
+        ));
+        assert!(keep(
+            filter("c", FilterOp::Eq, Some(json!(-3))),
+            json!({"c": -3.0})
+        ));
     }
 
     #[cfg(feature = "transform-filter")]
