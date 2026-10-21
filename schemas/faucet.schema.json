@@ -12985,7 +12985,7 @@
       ]
     },
     "sink_kafka__KafkaExactlyOnceSpec": {
-      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese four apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
+      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
       "type": "object",
       "properties": {
         "transactional_id_prefix": {
@@ -13017,6 +13017,14 @@
           ],
           "format": "int32",
           "default": -1
+        },
+        "migrate_unprefixed_token": {
+          "description": "With a `transactional_id_prefix`, resume from the bare-scope token an\nunprefixed sink wrote until this sink commits its own (default `false`).\nTurn it on only for the one deployment that is adding a prefix to an\nexisting pipeline; another environment's token would skip its pages.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
         }
       },
       "additionalProperties": true

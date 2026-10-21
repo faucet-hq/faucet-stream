@@ -325,7 +325,7 @@ fn default_queue_full_max_retries() -> u32 {
 // SQL sinks' `_faucet_commit_token` table constant in faucet_core::idempotency.
 /// Exactly-once delivery knobs for the Kafka sink (#654 M20).
 ///
-/// These four apply **only** under `delivery: exactly_once` — the transactional
+/// These apply **only** under `delivery: exactly_once` — the transactional
 /// producer and its compacted commit-token side-topic. They used to sit flat
 /// beside `brokers` / `linger_ms`, where nothing said they were inert in the
 /// default at-least-once mode; grouping them is what makes that legible.
@@ -349,6 +349,12 @@ pub struct KafkaExactlyOnceSpec {
     /// `-1` means "use the broker default".
     #[serde(default = "default_commit_token_topic_replication")]
     pub commit_token_topic_replication: i32,
+    /// With a `transactional_id_prefix`, resume from the bare-scope token an
+    /// unprefixed sink wrote until this sink commits its own (default `false`).
+    /// Turn it on only for the one deployment that is adding a prefix to an
+    /// existing pipeline; another environment's token would skip its pages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub migrate_unprefixed_token: bool,
 }
 
 impl Default for KafkaExactlyOnceSpec {
@@ -358,6 +364,7 @@ impl Default for KafkaExactlyOnceSpec {
             commit_token_topic: default_commit_token_topic(),
             commit_token_topic_partitions: default_commit_token_topic_partitions(),
             commit_token_topic_replication: default_commit_token_topic_replication(),
+            migrate_unprefixed_token: false,
         }
     }
 }
@@ -387,6 +394,7 @@ impl KafkaSinkConfig {
                 commit_token_topic: self.commit_token_topic.clone(),
                 commit_token_topic_partitions: self.commit_token_topic_partitions,
                 commit_token_topic_replication: self.commit_token_topic_replication,
+                migrate_unprefixed_token: false,
             })
     }
 

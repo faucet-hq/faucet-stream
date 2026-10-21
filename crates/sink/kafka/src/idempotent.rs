@@ -153,10 +153,11 @@ pub(crate) async fn read_last_token(
     // what `poll` delivers. librdkafka defaults to this, but it is load-bearing
     // for exactly-once correctness, so pin it explicitly.
     cfg.set("isolation.level", "read_committed");
-    let topic = config.exactly_once_spec().commit_token_topic;
-    let prefix = config.exactly_once_spec().transactional_id_prefix;
+    let spec = config.exactly_once_spec();
+    let topic = spec.commit_token_topic;
+    let prefix = spec.transactional_id_prefix;
     let key = token_key(prefix.as_deref(), scope);
-    let legacy = prefix.is_some().then(|| scope.to_string());
+    let legacy = (prefix.is_some() && spec.migrate_unprefixed_token).then(|| scope.to_string());
     let timeout = config.message_timeout;
 
     tokio::task::spawn_blocking(move || {
