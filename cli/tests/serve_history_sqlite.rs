@@ -1299,6 +1299,7 @@ async fn local_output_backends_agree() {
         replaced: false,
         retention_days: None,
         observed_at: at(when),
+        file_id: None,
     };
 
     // Deliberately includes three rows sharing one `last_written_at` — the tie

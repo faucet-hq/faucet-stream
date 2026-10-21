@@ -64,6 +64,10 @@ pub async fn record(
                 }
             }
         };
+        let file_id = tokio::fs::metadata(&path)
+            .await
+            .ok()
+            .and_then(|m| super::ledger::FileIdentity::of(&m));
         let obs = LocalOutputObservation {
             path,
             dataset_uri: ctx.dataset_uri.clone(),
@@ -76,6 +80,7 @@ pub async fn record(
             replaced: out.replaced,
             retention_days: ctx.retention_days,
             observed_at: ctx.observed_at,
+            file_id,
         };
         match store.local_output_record(&obs).await {
             Ok(()) => written += 1,
@@ -153,6 +158,24 @@ mod tests {
         // beside it.
         let expected = crate::serve::history::catalog::dataset_id("file:///tmp/out.jsonl");
         assert!(rows.iter().all(|r| r.dataset_id == expected));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_file_is_recorded_with_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let store = MemoryHistory::new(Duration::from_secs(60));
+        record(&store, &[LocalOutput::created(path.clone())], &ctx()).await;
+        let rows = store
+            .local_output_list(&LocalOutputFilter::default())
+            .await
+            .unwrap();
+        let expected =
+            crate::local_outputs::FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        assert!(expected.is_some());
+        assert_eq!(rows[0].file_id, expected);
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ pub fn describe() {
         "faucet_local_outputs_skipped_total",
         "Local sink outputs a sweep declined to delete, by scope and reason \
          (pre_existing / already_deleted / not_on_disk / in_flight / delete_failed / \
-         relative_path / other_host)."
+         relative_path / other_host / changed)."
     );
     metrics::describe_counter!(
         "faucet_local_outputs_sweeps_total",

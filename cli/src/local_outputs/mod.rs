@@ -62,7 +62,7 @@ pub mod spec;
 pub mod sweep;
 
 pub use ledger::{
-    LocalOutputFilter, LocalOutputObservation, LocalOutputRecord, LocalOutputState, SkipReason,
+    FileIdentity, LocalOutputFilter, LocalOutputObservation, LocalOutputRecord, LocalOutputState, SkipReason,
     SweepOutcome, SweepReport, SweepScope,
 };
 pub use record::{RecordContext, record};

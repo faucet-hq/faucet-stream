@@ -213,6 +213,9 @@ fn explain(reason: SkipReason, outcome: &crate::local_outputs::SweepOutcome) -> 
         SkipReason::OtherHost => {
             "written on another host; only a sweep there may delete it".to_string()
         }
+        SkipReason::Changed => {
+            "a different file now sits at this path, so it is left alone".to_string()
+        }
     }
 }
 
@@ -401,6 +404,7 @@ mod tests {
         // The guardrail's explanation must actually explain it.
         assert!(explain(SkipReason::PreExisting, &outcome).contains("did not create"));
         assert!(explain(SkipReason::OtherHost, &outcome).contains("another host"));
+        assert!(explain(SkipReason::Changed, &outcome).contains("different file"));
     }
 
     #[test]

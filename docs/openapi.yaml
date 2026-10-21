@@ -3497,6 +3497,13 @@ components:
         deleted_at: { type: string, format: date-time, nullable: true, description: "When the GC collected the file. The record is kept." }
         deleted_bytes: { type: integer, nullable: true, description: "Bytes reclaimed when it was collected." }
         host: { type: string, nullable: true, description: "The host that last wrote the file; a sweeper on another host never deletes it." }
+        file_id:
+          type: object
+          nullable: true
+          description: Device and inode of the file faucet last wrote; a sweep leaves a file with a different identity alone.
+          properties:
+            dev: { type: integer }
+            ino: { type: integer }
         state:
           type: string
           enum: [present, expired, external, replaced]
@@ -3530,7 +3537,7 @@ components:
         skipped:
           type: string
           nullable: true
-          enum: [pre_existing, already_deleted, not_on_disk, in_flight, delete_failed, relative_path, other_host]
+          enum: [pre_existing, already_deleted, not_on_disk, in_flight, delete_failed, relative_path, other_host, changed]
           description: >
             Why the file was left alone. `pre_existing` = faucet did not create
             it; `not_on_disk` = already gone (a no-op, and the record is marked
@@ -3539,7 +3546,8 @@ components:
             in-flight grace window — so it is retried later; `relative_path` =
             a row recorded before paths were stored absolute (it would resolve
             against the sweeper's directory); `other_host` = another host wrote
-            it.
+            it; `changed` = a different file (another device / inode) now sits
+            at the recorded path.
         error: { type: string, nullable: true, description: "Detail for a delete_failed outcome." }
     SweepReport:
       type: object
