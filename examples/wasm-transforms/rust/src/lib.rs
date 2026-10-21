@@ -18,9 +18,10 @@ use serde_json::Value;
 use std::alloc::{alloc as sys_alloc, dealloc, Layout};
 use std::slice;
 
-/// The last error message, kept as a leaked (ptr, len) pair for `error_ptr` /
-/// `error_len`. Single-threaded wasm, so the `static mut` access is sound.
-static mut LAST_ERROR: (usize, usize) = (0, 0);
+/// The last error message, read by the host through `error_ptr` / `error_len`.
+/// One buffer is reused for every error, so failing records never grow the
+/// heap. Single-threaded wasm, so the `static mut` access is sound.
+static mut LAST_ERROR: Vec<u8> = Vec::new();
 
 /// Allocate `len` bytes for the host to write the input into.
 ///
@@ -50,13 +51,13 @@ pub unsafe extern "C" fn free(ptr: *mut u8, len: usize) {
 /// Offset of the last error message in linear memory.
 #[no_mangle]
 pub extern "C" fn error_ptr() -> *const u8 {
-    unsafe { LAST_ERROR.0 as *const u8 }
+    unsafe { (*std::ptr::addr_of!(LAST_ERROR)).as_ptr() }
 }
 
 /// Length of the last error message.
 #[no_mangle]
 pub extern "C" fn error_len() -> usize {
-    unsafe { LAST_ERROR.1 }
+    unsafe { (*std::ptr::addr_of!(LAST_ERROR)).len() }
 }
 
 /// Transform one record. Returns the packed `(out_ptr << 32) | out_len`, `0`
@@ -109,13 +110,9 @@ fn emit(bytes: Vec<u8>) -> u64 {
 
 /// Store `msg` for the host to read and return the error sentinel.
 fn set_error(msg: &str) -> u64 {
-    let bytes = msg.as_bytes().to_vec();
-    let len = bytes.len();
-    let ptr = alloc(len.max(1));
-    // SAFETY: `ptr` has room for `len` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
-        LAST_ERROR = (ptr as usize, len);
-    }
+    // SAFETY: single-threaded; no other reference to LAST_ERROR is live.
+    let buf = unsafe { &mut *std::ptr::addr_of_mut!(LAST_ERROR) };
+    buf.clear();
+    buf.extend_from_slice(msg.as_bytes());
     u64::MAX
 }
