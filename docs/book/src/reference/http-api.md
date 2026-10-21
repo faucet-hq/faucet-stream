@@ -895,7 +895,10 @@ this file" cannot be reconstructed after the fact.
 
 An output in state `external` is **never** previewed (`403`). faucet wrote to that
 file but did not create it, so its contents are not faucet's to hand out — the
-read-side twin of the retention GC's refusal to delete it.
+read-side twin of the retention GC's refusal to delete it. The GC's other two
+refusals apply as well (`409`): an output recorded with a relative path, and one
+written on another host (in a cluster, the same path on this host is a
+different file — preview it from the writing instance).
 
 The request names a **ledger id**, never a path: the path comes from the row the
 sink wrote, so a preview cannot be aimed at another file.
