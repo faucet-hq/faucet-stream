@@ -498,3 +498,45 @@ async fn undecodable_records_follow_on_decode_error() {
             .is_err()
     );
 }
+
+/// A shard that delivers nothing in a `latest` run is bookmarked at the time it
+/// was read up to its tip, so the next run reads what was written to it in
+/// between instead of restarting at LATEST and skipping it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_shard_under_latest_does_not_skip_records_written_between_runs() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "quiet", 2).await;
+
+    let mut cfg = source_config(&endpoint, "quiet");
+    cfg.start_position = faucet_source_kinesis::StartPosition::Latest;
+    let first = KinesisSource::new(cfg.clone()).await.expect("source");
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = first.stream_pages(&ctx, 25);
+    let mut bookmark = None;
+    while let Some(page) = pages.next().await {
+        let page = page.expect("page");
+        assert!(page.records.is_empty());
+        bookmark = page.bookmark.or(bookmark);
+    }
+    drop(pages);
+    let bookmark = bookmark.expect("quiet shards are bookmarked");
+    assert_eq!(
+        bookmark["resume_at"].as_object().map(|m| m.len()),
+        Some(2),
+        "{bookmark}"
+    );
+
+    put_records(&client, "quiet", 0, 10).await;
+    let second = KinesisSource::new(cfg).await.expect("source");
+    second.apply_start_bookmark(bookmark).await.expect("apply");
+    let mut is: Vec<i64> = second
+        .fetch_all()
+        .await
+        .expect("resume fetch")
+        .iter()
+        .map(|r| r["data"]["i"].as_i64().unwrap())
+        .collect();
+    is.sort_unstable();
+    assert_eq!(is, (0..10).collect::<Vec<i64>>());
+}

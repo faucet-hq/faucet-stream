@@ -238,6 +238,11 @@ impl faucet_core::Source for KinesisSource {
                 }
                 let shard_id = shard.id.clone();
                 let bookmark = bookmarks.get(&shard_id).map(str::to_string);
+                if bookmark.is_none()
+                    && let Some(timestamp_secs) = bookmarks.resume_time(&shard_id)
+                {
+                    config.start_position = StartPosition::AtTimestamp { timestamp_secs };
+                }
                 let tx = tx.clone();
                 let behind = Arc::clone(&self.behind);
                 let parents: Vec<tokio::sync::watch::Receiver<bool>> = shard
@@ -275,9 +280,12 @@ impl faucet_core::Source for KinesisSource {
             let mut done_shards = 0usize;
             let mut failure: Option<FaucetError> = None;
 
+            // Idle termination counts from the last record: caught-up
+            // notices from quiet shards are not activity.
+            let mut last_record = tokio::time::Instant::now();
             'consume: loop {
                 let event = match idle {
-                    Some(window) => match tokio::time::timeout(window, rx.recv()).await {
+                    Some(window) => match tokio::time::timeout_at(last_record + window, rx.recv()).await {
                         Ok(ev) => ev,
                         Err(_) => {
                             tracing::info!(
@@ -292,6 +300,7 @@ impl faucet_core::Source for KinesisSource {
                 };
                 match event {
                     Some(ShardEvent::Records { shard_id, records }) => {
+                        last_record = tokio::time::Instant::now();
                         for (sequence, record) in records {
                             let Some(record) = record else {
                                 cumulative.advance(&shard_id, &sequence);
@@ -326,6 +335,9 @@ impl faucet_core::Source for KinesisSource {
                             }
                         }
                     }
+                    Some(ShardEvent::CaughtUp { shard_id, unix_secs }) => {
+                        cumulative.caught_up(&shard_id, unix_secs);
+                    }
                     Some(ShardEvent::Done { shard_id }) => {
                         done_shards += 1;
                         tracing::debug!(shard = %shard_id, done_shards, total_shards,
@@ -349,7 +361,7 @@ impl faucet_core::Source for KinesisSource {
             if let Some(error) = failure {
                 Err(error)?;
             }
-            if !buffer.is_empty() || !cumulative.shards.is_empty() {
+            if !buffer.is_empty() || !cumulative.is_empty() {
                 yield StreamPage {
                     records: buffer,
                     bookmark: Some(cumulative.to_value()),
