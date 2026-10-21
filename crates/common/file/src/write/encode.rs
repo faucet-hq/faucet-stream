@@ -440,9 +440,10 @@ enum Enc {
     #[cfg(feature = "file-format-csv")]
     Csv(Box<CsvState>),
     /// CSV of an encrypted output after it was published: the plaintext body
-    /// is gone, and the next write reopens the sealed file.
+    /// is gone, and the next write reopens the sealed file. Keeps the column
+    /// order, which a file without a header row cannot tell.
     #[cfg(feature = "file-format-csv")]
-    CsvSealed,
+    CsvSealed(Vec<String>),
     /// Whole-document formats (JSON array, XML, Excel, Avro): the file's
     /// records, encoded together each time the file is closed.
     Doc(Vec<Value>),
@@ -544,7 +545,8 @@ impl OpenFile {
             }
             #[cfg(feature = "file-format-csv")]
             FileFormat::Csv => {
-                let (state, carried) = CsvState::create(ctx, &file.label, &file.tmp, existing)?;
+                let (state, carried) =
+                    CsvState::create(ctx, &file.label, &file.tmp, existing, None)?;
                 file.records = carried;
                 Enc::Csv(Box::new(state))
             }
@@ -564,7 +566,7 @@ impl OpenFile {
         match &self.enc {
             Enc::Lines(slot) => slot.is_none() && self.delta.is_none(),
             #[cfg(feature = "file-format-csv")]
-            Enc::CsvSealed => true,
+            Enc::CsvSealed(_) => true,
             #[cfg(feature = "file-format-parquet")]
             Enc::Parquet(state) => !state.is_open(),
             _ => false,
@@ -618,9 +620,10 @@ impl OpenFile {
             #[cfg(feature = "file-format-csv")]
             Enc::Csv(state) => state.write(records, ctx.opts.csv.on_unknown_field)?,
             #[cfg(feature = "file-format-csv")]
-            Enc::CsvSealed => {
+            Enc::CsvSealed(header) => {
                 let (mut state, _) =
-                    CsvState::create(ctx, &self.label, &tmp, existing).map_err(clean)?;
+                    CsvState::create(ctx, &self.label, &tmp, existing, Some(header))
+                        .map_err(clean)?;
                 let written = state.write(records, ctx.opts.csv.on_unknown_field);
                 self.enc = Enc::Csv(Box::new(state));
                 written?;
@@ -684,7 +687,7 @@ impl OpenFile {
             #[cfg(feature = "file-format-csv")]
             Enc::Csv(state) => state.finish_into(ctx.codec, &tmp, ctx.private())?,
             #[cfg(feature = "file-format-csv")]
-            Enc::CsvSealed => return Ok(Closed::Nothing),
+            Enc::CsvSealed(_) => return Ok(Closed::Nothing),
             Enc::Doc(records) => {
                 let body = faucet_core::file_format::encode(records, ctx.format, ctx.opts)?;
                 let body = faucet_core::compress_buf(&body, ctx.codec)?;
@@ -723,8 +726,10 @@ impl OpenFile {
         self.continued = true;
         self.parts = None;
         #[cfg(feature = "file-format-csv")]
-        if ctx.encrypted() && matches!(self.enc, Enc::Csv(_)) {
-            self.enc = Enc::CsvSealed;
+        if ctx.encrypted()
+            && let Enc::Csv(state) = &self.enc
+        {
+            self.enc = Enc::CsvSealed(state.header.clone());
             let _ = std::fs::remove_file(tmp_path(&self.tmp, BODY_ROLE));
         }
         let _ = ctx;
@@ -944,12 +949,15 @@ pub(crate) struct CsvState {
 #[cfg(feature = "file-format-csv")]
 impl CsvState {
     /// Start a body file; with `existing`, carry the stored file's header and
-    /// rows over. Returns the state and the number of carried rows.
+    /// rows over. `header` is the column order this run already wrote the
+    /// stored file in, for a file without a header row. Returns the state and
+    /// the number of carried rows.
     fn create(
         ctx: &Ctx<'_>,
         label: &str,
         tmp: &Path,
         existing: Option<&Path>,
+        header: Option<&[String]>,
     ) -> Result<(Self, usize), FaucetError> {
         let delimiter = ctx.opts.csv.delimiter_byte()?;
         let quote = ctx.opts.csv.quote_byte()?;
@@ -973,6 +981,11 @@ impl CsvState {
             narrowest: usize::MAX,
         };
         let mut carried = 0;
+        if !has_headers {
+            for h in header.unwrap_or_default() {
+                state.add_column(h);
+            }
+        }
         if let Some(existing) = existing {
             let stored = ctx.read_stored(existing, label);
             remove_fetched(existing);

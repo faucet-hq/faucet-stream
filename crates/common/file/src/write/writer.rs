@@ -194,6 +194,19 @@ impl WriteSettings {
                 self.format.as_str()
             )));
         }
+        if self.format == FileFormat::Csv
+            && !self.opts.csv.has_headers
+            && self.if_exists == IfExists::Append
+            && !template.numbered()
+        {
+            return Err(FaucetError::Config(
+                "file sink: `if_exists: append` cannot add to a CSV file without a header row \
+                 (`csv.has_headers: false`): nothing records the order of its columns, so new \
+                 rows could land under other columns — keep the header, use \
+                 `if_exists: replace`, or a `{part}` template so each run adds new files"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }

@@ -1319,3 +1319,41 @@ fn writer_sink_capabilities_agree_with_the_config_helper() {
         );
     }
 }
+
+#[cfg(feature = "file-format-csv")]
+#[test]
+fn appending_to_a_headerless_csv_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.opts.csv.has_headers = false;
+    s.if_exists = IfExists::Append;
+    let full = dir.path().join("x.csv");
+    let (_, t) =
+        NameTemplate::from_path(full.to_str().unwrap(), s.format, s.codec, s.rolls_over()).unwrap();
+    let e = s.validate_for(&t).unwrap_err().to_string();
+    assert!(e.contains("without a header row"), "{e}");
+    s.opts.csv.has_headers = true;
+    assert!(s.validate_for(&t).is_ok());
+}
+
+#[cfg(all(feature = "file-format-csv", feature = "encryption"))]
+#[tokio::test]
+async fn an_encrypted_headerless_csv_keeps_its_column_order_after_a_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.opts.csv.has_headers = false;
+    let spec: faucet_core::EncryptionSpec = serde_json::from_value(json!({"key": "k"})).unwrap();
+    s.encryption = Some(spec.clone());
+    let w = local(dir.path(), "e.csv", s);
+    w.write_rows(&[json!({"b": 1})]).await.unwrap();
+    w.flush().await.unwrap();
+    w.write_rows(&[json!({"a": 2, "b": 3})]).await.unwrap();
+    w.flush().await.unwrap();
+    let sealed = std::fs::read(dir.path().join("e.csv")).unwrap();
+    let plain = faucet_core::CompiledEncryption::compile(&spec)
+        .unwrap()
+        .decrypt(&sealed)
+        .unwrap();
+    // Row 1 is padded to the grown header; `b` stays the first column.
+    assert_eq!(String::from_utf8(plain).unwrap(), "1,\n3,2\n");
+}

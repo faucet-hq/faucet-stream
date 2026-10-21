@@ -31,7 +31,7 @@ sink:
 | `max_bytes_per_file` | none | Roll once a file holds this many bytes, counted as the records' JSON size before compression (on the columnar Parquet path, their in-memory Arrow size). |
 | `create_dirs` | `true` | Create missing directories. |
 | `batch_size` | 1000 | Page-size hint; the sink writes whatever page it is handed. |
-| `csv` | `{delimiter: ",", has_headers: true, quote: "\""}` | CSV dialect. `has_headers` writes the header row; `quote` is the quote character; `on_unknown_field` is `widen` (default: a field that appears later becomes a new column, and earlier rows are padded with empty cells), `warn` (the header is fixed by the first page and a later field is dropped with a warning) or `error` (fail the write naming the field). |
+| `csv` | `{delimiter: ",", has_headers: true, quote: "\""}` | CSV dialect. `has_headers` writes the header row; `quote` is the quote character; `on_unknown_field` is `widen` (default: a field that appears later becomes a new column, and earlier rows are padded with empty cells), `warn` (the header is fixed by the first page and a later field is dropped with a warning) or `error` (fail the write naming the field). `if_exists: append` to a single file needs `has_headers: true`: a file without a header row does not record its column order, so appended rows could land under other columns. |
 | `excel` | `{}` | `sheet` name for the workbook. |
 | `xml` | `{root_element: records, record_element: record}` | XML framing. |
 | `avro` | `{}` | Writer `schema` (inferred from the records when unset) and block `codec` (`null`, `deflate`, `snappy`, `zstd`). |
