@@ -23,8 +23,13 @@ pub async fn decode(
             jsonschema::validator_for(&schema_value)
                 .map_err(|e| FaucetError::Source(format!("json-schema compile: {e}")))
         })?;
+        // Validate the payload as the producer wrote it: the fidelity parse
+        // turns numbers JSON cannot hold exactly into strings, which a schema
+        // declaring `integer` / `number` would refuse. A number beyond the
+        // parser's range falls back to the decoded value.
+        let as_written: Option<Value> = serde_json::from_slice(body).ok();
         let messages: Vec<String> = validator
-            .iter_errors(&json)
+            .iter_errors(as_written.as_ref().unwrap_or(&json))
             .map(|e| e.to_string())
             .collect();
         if !messages.is_empty() {

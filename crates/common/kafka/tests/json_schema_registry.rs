@@ -8,8 +8,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const SCHEMA: &str =
-    r#"{"type":"object","properties":{"id":{"type":["integer","string"]}},"required":["id"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"id":{"type":"integer"},"amount":{"type":"number"},"small":{"type":"integer"}},"required":["id"]}"#;
 
 async fn registry() -> (MockServer, SchemaRegistryClient) {
     let server = MockServer::start().await;
