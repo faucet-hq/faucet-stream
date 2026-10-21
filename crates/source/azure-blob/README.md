@@ -182,6 +182,10 @@ pipeline:
       file_format: json_lines
 ```
 
+## Lineage dataset URI
+
+`az://<account>/<container>/<prefix>` — e.g. `az://prodeu/exports/orders/`, the same shape the Azure Blob sink names what it writes, so lineage and the catalog see one dataset when a pipeline reads another's output. The account comes from `account`, a connection string's `AccountName`, or `devstoreaccount1` for the emulator; without one the URI is `az://<container>/<prefix>`.
+
 ## Timeouts, cancellation and retries
 
 Every Blob Storage request — listings, blob reads, each ranged Parquet read —

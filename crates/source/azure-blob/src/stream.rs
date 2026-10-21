@@ -588,6 +588,52 @@ fn value_type_name(v: &Value) -> &'static str {
     }
 }
 
+/// The dataset a run reads: `az://<account>/<container>/<prefix>` — the shape
+/// the Azure Blob sink names what it writes, so lineage and the catalog see one
+/// dataset when a pipeline reads what another wrote. Container names are
+/// unique only within a storage account, so the account is part of the
+/// identity whenever the config names one (explicitly, in a connection
+/// string, or through the emulator).
+fn dataset_uri(config: &AzureBlobSourceConfig) -> String {
+    let prefix = config.prefix.as_deref().unwrap_or_default();
+    match account_name(&config.connection) {
+        Some(account) => format!("az://{account}/{}/{prefix}", config.container()),
+        None => format!("az://{}/{prefix}", config.container()),
+    }
+}
+
+/// The storage account a connection addresses, when the config says.
+fn account_name(conn: &faucet_common_azure::AzureConnection) -> Option<String> {
+    if let Some(account) = conn.account.as_deref().map(str::trim)
+        && !account.is_empty()
+    {
+        return Some(account.to_string());
+    }
+    if let faucet_common_azure::AzureCredentials::ConnectionString { connection_string } =
+        &conn.auth
+    {
+        let mut dev_storage = false;
+        for segment in connection_string.split(';') {
+            match segment.trim().split_once('=') {
+                Some((k, v)) if k.trim() == "AccountName" && !v.trim().is_empty() => {
+                    return Some(v.trim().to_string());
+                }
+                Some((k, v)) if k.trim() == "UseDevelopmentStorage" => {
+                    dev_storage = v.trim().eq_ignore_ascii_case("true");
+                }
+                _ => {}
+            }
+        }
+        if dev_storage {
+            return Some(EMULATOR_ACCOUNT.to_string());
+        }
+    }
+    conn.use_emulator.then(|| EMULATOR_ACCOUNT.to_string())
+}
+
+/// The account name of the Azurite storage emulator.
+const EMULATOR_ACCOUNT: &str = "devstoreaccount1";
+
 #[async_trait]
 impl faucet_core::Source for AzureBlobSource {
     async fn fetch_with_context(
@@ -956,10 +1002,7 @@ impl faucet_core::Source for AzureBlobSource {
     }
 
     fn dataset_uri(&self) -> String {
-        match &self.config.prefix {
-            Some(p) => format!("az://{}/{}", self.config.container(), p),
-            None => format!("az://{}", self.config.container()),
-        }
+        dataset_uri(&self.config)
     }
 
     /// Preflight probe: confirm the container is reachable and the credentials
@@ -1144,23 +1187,25 @@ mod tests {
     // dataset_uri logic mirrors the built source without needing an Azure
     // client (construction builds the object store).
     #[test]
-    fn dataset_uri_no_prefix_logic() {
+    fn dataset_uri_names_the_account_like_the_sink() {
         let config = AzureBlobSourceConfig::new("my-container");
-        let uri = match &config.prefix {
-            Some(p) => format!("az://{}/{}", config.container(), p),
-            None => format!("az://{}", config.container()),
+        assert_eq!(dataset_uri(&config), "az://my-container/");
+        let config = AzureBlobSourceConfig::new("exports")
+            .account("prodeu")
+            .prefix("orders/");
+        assert_eq!(dataset_uri(&config), "az://prodeu/exports/orders/");
+        let mut config = AzureBlobSourceConfig::new("cont").prefix("p/");
+        config.connection.auth = faucet_common_azure::AzureCredentials::ConnectionString {
+            connection_string: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=k=="
+                .into(),
         };
-        assert_eq!(uri, "az://my-container");
-    }
-
-    #[test]
-    fn dataset_uri_with_prefix_logic() {
-        let config = AzureBlobSourceConfig::new("my-container").prefix("data/2026/");
-        let uri = match &config.prefix {
-            Some(p) => format!("az://{}/{}", config.container(), p),
-            None => format!("az://{}", config.container()),
+        assert_eq!(dataset_uri(&config), "az://acct/cont/p/");
+        config.connection.auth = faucet_common_azure::AzureCredentials::ConnectionString {
+            connection_string: "UseDevelopmentStorage=true".into(),
         };
-        assert_eq!(uri, "az://my-container/data/2026/");
+        assert_eq!(dataset_uri(&config), "az://devstoreaccount1/cont/p/");
+        let config = AzureBlobSourceConfig::new("cont").use_emulator(true);
+        assert_eq!(dataset_uri(&config), "az://devstoreaccount1/cont/");
     }
 
     // ---- read-integrity verification (#161) ----
@@ -1264,7 +1309,7 @@ mod tests {
             .allow_http(true);
         let source = AzureBlobSource::new(config).await.unwrap();
         assert_eq!(source.connector_name(), "azure-blob");
-        assert_eq!(source.dataset_uri(), "az://c");
+        assert_eq!(source.dataset_uri(), "az://devstoreaccount1/c/");
     }
 
     #[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
