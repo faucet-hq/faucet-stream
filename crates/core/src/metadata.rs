@@ -240,7 +240,9 @@ impl MetadataSink {
                     .columns
                     .iter()
                     .map(|&c| (self.meta.column_name(c), c))
-                    .filter(|(name, _)| props.is_none_or(|p| !p.contains_key(name)))
+                    .filter(|(name, _)| {
+                        props.is_none_or(|p| !p.keys().any(|k| k.eq_ignore_ascii_case(name)))
+                    })
                     .map(|(name, c)| crate::drift::ColumnChange {
                         name,
                         from: None,
@@ -463,6 +465,27 @@ mod tests {
         );
         let err = rigid.write_batch(&[json!({"id": 1})]).await.unwrap_err();
         assert!(err.to_string().contains("_faucet_run_id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_differently_cased_existing_column_is_not_added_again() {
+        struct Upper;
+        #[async_trait::async_trait]
+        impl Sink for Upper {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+            async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+                Ok(Some(json!({"type": "object", "properties": {
+                    "id": {"type": "integer"}, "_FAUCET_RUN_ID": {"type": "string"}
+                }})))
+            }
+        }
+        let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
+            .unwrap()
+            .unwrap();
+        let sink = MetadataSink::new(Box::new(Upper), meta, ctx());
+        assert_eq!(sink.write_batch(&[json!({"id": 1})]).await.unwrap(), 1);
     }
 
     #[test]
