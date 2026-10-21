@@ -946,6 +946,9 @@ pub(crate) struct BigQueryDriver {
     /// target at its terminal flush, so an empty source empties the table as
     /// the staged path does.
     overwrite_rows: AtomicBool,
+    /// The overwrite run this instance belongs to: staging is then
+    /// `<table>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
     /// Set once this instance has created (or found) the commit-token table,
     /// so the exactly-once path issues its `CREATE TABLE IF NOT EXISTS` job
     /// once per instance rather than once per page.
@@ -1002,6 +1005,17 @@ impl BigQuerySink {
         Ok(Self {
             inner: DriverSink::new(BigQueryDriver::new(config).await?),
         })
+    }
+
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.inner.driver_mut().overwrite_run = Some(token.to_string());
+        Ok(self)
     }
 
     /// Construct a sink from a pre-built BigQuery client.
@@ -1103,6 +1117,7 @@ impl BigQueryDriver {
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
             overwrite_rows: AtomicBool::new(false),
+            overwrite_run: None,
             commit_table_ready: AtomicBool::new(false),
             #[cfg(feature = "arrow")]
             columnar_loaded: AtomicBool::new(false),
@@ -1122,6 +1137,7 @@ impl BigQueryDriver {
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
             overwrite_rows: AtomicBool::new(false),
+            overwrite_run: None,
             commit_table_ready: AtomicBool::new(false),
             #[cfg(feature = "arrow")]
             columnar_loaded: AtomicBool::new(false),
@@ -1388,7 +1404,93 @@ impl BigQueryDriver {
 
     /// Temp table id used while an overwrite run is in flight.
     fn overwrite_temp_id(&self) -> String {
-        format!("{}__faucet_ovw", self.config.table_id)
+        format!(
+            "{}{}",
+            self.config.table_id,
+            faucet_core::idempotency::overwrite_staging_suffix(self.overwrite_run.as_deref())
+        )
+    }
+
+    /// At a tokened begin: drop the untokened staging an earlier release (or
+    /// a run without a token) left, and every tokened staging another run
+    /// abandoned ([`faucet_core::idempotency::abandoned_overwrite_staging`]).
+    /// A live run's staging and this run's own are never touched.
+    async fn sweep_staging(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.overwrite_run.is_none() {
+            return Ok(());
+        }
+        let table =
+            |id: &str| idempotent::table_ref(&self.config.project_id, &self.config.dataset_id, id);
+        let legacy = format!(
+            "{}{}",
+            self.config.table_id,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        );
+        self.run_ddl(calls, format!("DROP TABLE IF EXISTS {}", table(&legacy)))
+            .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for name in self.tokened_staging(calls).await? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                &self.config.table_id,
+                &name,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                tracing::warn!(staging = %name, "BigQuery overwrite: dropping staging an earlier run abandoned");
+                self.run_ddl(calls, format!("DROP TABLE IF EXISTS {}", table(&name)))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The dataset's tables named like any run's tokened staging of the
+    /// target (`INFORMATION_SCHEMA.TABLES`). A listing BigQuery does not
+    /// finish inline is skipped with a warning: the sweep is housekeeping.
+    async fn tokened_staging(&self, calls: &CallSlot) -> Result<Vec<String>, FaucetError> {
+        let mut req = QueryRequest::new(format!(
+            "SELECT table_name FROM `{}.{}`.INFORMATION_SCHEMA.TABLES \
+             WHERE STARTS_WITH(table_name, @prefix)",
+            self.config.project_id, self.config.dataset_id
+        ));
+        req.use_legacy_sql = false;
+        req.location = self.config.location.clone();
+        req.parameter_mode = Some("NAMED".to_string());
+        req.query_parameters = Some(vec![Self::string_param(
+            "prefix",
+            &faucet_core::idempotency::overwrite_staging_prefix(&self.config.table_id),
+        )]);
+        self.roundtrips.record("query");
+        let resp = call_once(&calls.get(), "query", async {
+            self.client
+                .job()
+                .query(&self.config.project_id, req)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("BigQuery staging listing failed: {e}")))
+        })
+        .await?;
+        if !resp.job_complete.unwrap_or(false) || resp.schema.is_none() {
+            tracing::warn!("BigQuery overwrite: staging listing did not complete inline; skipped");
+            return Ok(Vec::new());
+        }
+        let mut rs = ResultSet::new_from_query_response(resp);
+        let mut out = Vec::new();
+        while rs.next_row() {
+            if let Some(name) = rs.get_string(0).map_err(|e| {
+                FaucetError::Sink(format!("BigQuery staging listing decode failed: {e}"))
+            })? && faucet_core::idempotency::overwrite_staging_token(
+                &self.config.table_id,
+                &name,
+            )
+            .is_some()
+            {
+                out.push(name);
+            }
+        }
+        Ok(out)
     }
 
     /// Backtick-quoted reference to the overwrite staging table.
@@ -3298,6 +3400,7 @@ impl StagingDriver for BigQueryDriver {
             }
             return Ok(());
         }
+        self.sweep_staging(calls).await?;
         if self.target_has_schema(calls).await? {
             self.table_ready.store(true, Ordering::Release);
             return self
