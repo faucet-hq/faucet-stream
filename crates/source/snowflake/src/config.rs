@@ -44,11 +44,12 @@ pub struct SnowflakeSourceConfig {
     pub auth: AuthSpec<SnowflakeAuth>,
     /// SQL statement to execute. May contain `${field.path}` placeholders that
     /// are resolved against the parent-record context at runtime; resolved
-    /// values are sent as positional bind parameters appended after
-    /// [`params`](Self::params).
+    /// values are sent as positional bind parameters at the position of their
+    /// token, interleaved with [`params`](Self::params) in textual order.
     pub query: String,
-    /// Positional bind parameters for the query, applied in order before any
-    /// context-derived values. Snowflake's SQL REST API uses 1-based positional
+    /// Positional bind parameters for the query, one per `?` marker the query
+    /// holds, in order (a `?` inside a string literal, quoted identifier or
+    /// comment is not a marker). Snowflake's SQL REST API uses 1-based positional
     /// binds in the JSON request body (see the `bindings` field in the
     /// [SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).
     #[serde(default)]

@@ -21863,11 +21863,11 @@
                       "$ref": "#/$defs/source_snowflake__AuthSpec"
                     },
                     "query": {
-                      "description": "SQL statement to execute. May contain `${field.path}` placeholders that\nare resolved against the parent-record context at runtime; resolved\nvalues are sent as positional bind parameters appended after\n[`params`](Self::params).",
+                      "description": "SQL statement to execute. May contain `${field.path}` placeholders that\nare resolved against the parent-record context at runtime; resolved\nvalues are sent as positional bind parameters at the position of their\ntoken, interleaved with [`params`](Self::params) in textual order.",
                       "type": "string"
                     },
                     "params": {
-                      "description": "Positional bind parameters for the query, applied in order before any\ncontext-derived values. Snowflake's SQL REST API uses 1-based positional\nbinds in the JSON request body (see the `bindings` field in the\n[SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).",
+                      "description": "Positional bind parameters for the query, one per `?` marker the query\nholds, in order (a `?` inside a string literal, quoted identifier or\ncomment is not a marker). Snowflake's SQL REST API uses 1-based positional\nbinds in the JSON request body (see the `bindings` field in the\n[SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).",
                       "type": "array",
                       "items": true,
                       "default": []

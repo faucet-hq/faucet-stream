@@ -254,19 +254,20 @@ impl SnowflakeSource {
     /// parent-record context.
     ///
     /// `{key}` tokens whose key matches `context` are replaced with `?`
-    /// markers (Snowflake's positional binding form) and their values are
-    /// appended to the returned `Vec` after any [`config.params`](SnowflakeSourceConfig::params).
+    /// markers (Snowflake's positional binding form). Snowflake binds `?`
+    /// markers in textual order, so the returned values follow the markers'
+    /// order in the SQL: each [`config.params`](SnowflakeSourceConfig::params)
+    /// value goes to the next `?` the query itself holds, each context value
+    /// to the marker that replaced its token.
     fn resolve_query(&self, context: &HashMap<String, Value>) -> (String, Vec<Value>) {
-        let mut bindings = self.config.params.clone();
-        let (rewritten, context_values) = if context.is_empty() {
-            (self.config.query.clone(), Vec::new())
-        } else {
-            substitute_context_bind_params(&self.config.query, context, bindings.len() + 1, |_| {
-                "?".to_string()
-            })
-        };
-        bindings.extend(context_values);
-        (rewritten, bindings)
+        if context.is_empty() {
+            return (self.config.query.clone(), self.config.params.clone());
+        }
+        let (marked, context_values) =
+            substitute_context_bind_params(&self.config.query, context, 0, |i| {
+                format!("{CONTEXT_MARK}{i}{CONTEXT_MARK}")
+            });
+        order_bindings(&marked, &self.config.params, context_values)
     }
 
     /// Issue the initial `POST /api/v2/statements` request for the configured
@@ -904,6 +905,130 @@ impl faucet_core::Source for SnowflakeSource {
     }
 }
 
+/// Delimits a context token's index while [`order_bindings`] places it.
+const CONTEXT_MARK: char = '\u{1}';
+
+/// Turn `marked` — the query with each context token replaced by
+/// `CONTEXT_MARK<i>CONTEXT_MARK` — into SQL with `?` markers and the bind
+/// values in the markers' textual order. A `?` inside a string literal, a
+/// quoted identifier, a `$$` string or a comment is not a marker. Params left
+/// over when the query holds fewer `?` than params are appended, so
+/// Snowflake reports the count mismatch rather than this code hiding it.
+fn order_bindings(
+    marked: &str,
+    params: &[Value],
+    context_values: Vec<Value>,
+) -> (String, Vec<Value>) {
+    let mut out = BindOrder {
+        sql: String::with_capacity(marked.len()),
+        bindings: Vec::with_capacity(params.len() + context_values.len()),
+        context_values,
+    };
+    let mut params = params.iter();
+    let mut chars = marked.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            CONTEXT_MARK => out.context(&mut chars),
+            '?' => {
+                out.sql.push('?');
+                if let Some(p) = params.next() {
+                    out.bindings.push(p.clone());
+                }
+            }
+            '\'' => {
+                out.sql.push(c);
+                out.skip(&mut chars, "'", true);
+            }
+            '"' => {
+                out.sql.push(c);
+                out.skip(&mut chars, "\"", false);
+            }
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                out.sql.push_str("$$");
+                out.skip(&mut chars, "$$", false);
+            }
+            '-' | '/' if chars.peek() == Some(&c) => {
+                chars.next();
+                out.sql.push(c);
+                out.sql.push(c);
+                out.skip(&mut chars, "\n", false);
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.sql.push_str("/*");
+                out.skip(&mut chars, "*/", false);
+            }
+            _ => out.sql.push(c),
+        }
+    }
+    out.bindings.extend(params.cloned());
+    (out.sql, out.bindings)
+}
+
+/// The output [`order_bindings`] builds.
+struct BindOrder {
+    sql: String,
+    bindings: Vec<Value>,
+    context_values: Vec<Value>,
+}
+
+impl BindOrder {
+    /// A context mark becomes `?` bound to its value wherever it sits, as the
+    /// token it replaced always did.
+    fn context(&mut self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        let index: String = chars.by_ref().take_while(|&d| d != CONTEXT_MARK).collect();
+        let value = index
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| self.context_values.get_mut(i))
+            .map(std::mem::take)
+            .unwrap_or(Value::Null);
+        self.sql.push('?');
+        self.bindings.push(value);
+    }
+
+    /// Copy through the end of a quoted or commented run closed by `close`.
+    /// With `escapes`, a backslash carries the next character; a doubled
+    /// single-character delimiter (`''`, `""`) stays inside the run.
+    fn skip(
+        &mut self,
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        close: &str,
+        escapes: bool,
+    ) {
+        let mut run = String::new();
+        while let Some(d) = chars.next() {
+            if d == CONTEXT_MARK {
+                self.context(chars);
+                run.clear();
+                continue;
+            }
+            self.sql.push(d);
+            if escapes && d == '\\' {
+                if let Some(e) = chars.next() {
+                    self.sql.push(e);
+                }
+                run.clear();
+                continue;
+            }
+            run.push(d);
+            if run.ends_with(close) {
+                let mut delim = close.chars();
+                if let (Some(only), None) = (delim.next(), delim.next())
+                    && chars.peek() == Some(&only)
+                {
+                    chars.next();
+                    self.sql.push(only);
+                    run.clear();
+                    continue;
+                }
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1188,53 @@ mod tests {
             "position 1 must be a NULL binding"
         );
         assert_eq!(b["2"]["value"], "42", "position 2 must still be 42");
+    }
+
+    #[test]
+    fn a_context_token_before_a_param_marker_binds_in_textual_order() {
+        let mut c = cfg();
+        c.query = "SELECT * FROM orders WHERE customer_id = {customers.ID} AND status = ?".into();
+        c.params = vec![json!("open")];
+        let src = SnowflakeSource::new(c).unwrap();
+        let mut ctx = HashMap::new();
+        ctx.insert("customers.ID".to_string(), json!(42));
+        let (q, binds) = src.resolve_query(&ctx);
+        assert_eq!(
+            q,
+            "SELECT * FROM orders WHERE customer_id = ? AND status = ?"
+        );
+        assert_eq!(binds, vec![json!(42), json!("open")]);
+    }
+
+    #[test]
+    fn markers_interleave_and_quoted_question_marks_are_not_markers() {
+        let params = [json!("p1"), json!("p2")];
+        let marked = format!(
+            "SELECT '?', 'it''s ?', 'a\\'?', \"col?\", $$?$$ -- ?\n\
+             , ? /* ? */ , {m}0{m} // ?\n , ? , {m}1{m}",
+            m = CONTEXT_MARK
+        );
+        let (sql, binds) = order_bindings(&marked, &params, vec![json!("c0"), json!("c1")]);
+        assert_eq!(
+            sql,
+            "SELECT '?', 'it''s ?', 'a\\'?', \"col?\", $$?$$ -- ?\n\
+             , ? /* ? */ , ? // ?\n , ? , ?"
+        );
+        assert_eq!(
+            binds,
+            vec![json!("p1"), json!("c0"), json!("p2"), json!("c1")]
+        );
+    }
+
+    #[test]
+    fn a_context_token_inside_a_literal_still_binds_and_extra_params_trail() {
+        let marked = format!("SELECT '{m}0{m}'", m = CONTEXT_MARK);
+        let (sql, binds) = order_bindings(&marked, &[json!(1)], vec![json!("c")]);
+        assert_eq!(sql, "SELECT '?'");
+        assert_eq!(binds, vec![json!("c"), json!(1)]);
+        let (sql, binds) = order_bindings("SELECT $$$$, ?", &[json!(1)], vec![]);
+        assert_eq!(sql, "SELECT $$$$, ?");
+        assert_eq!(binds, vec![json!(1)]);
     }
 
     #[test]

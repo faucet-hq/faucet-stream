@@ -77,7 +77,7 @@ faucet run pipeline.yaml
 | `role` | string | *(unset)* | Optional role to assume for the session. When unset, the user's default role is used. |
 | `auth` | `AuthSpec<SnowflakeAuth>` | — *(required)* | Authentication — see [Authentication](#authentication). Accepts an inline `{ type, config }` block or `{ ref: <name> }` pointing at a shared provider. |
 | `query` | string | — *(required)* | SQL to execute. May contain positional `?` bind markers (bound from `params` + matrix context) and, in a matrix child, `${parent.field}` tokens that are bound as query parameters (never spliced into the SQL). |
-| `params` | array | `[]` | Positional bind parameters, applied in order **before** any context-derived values. Each entry is typed from its JSON value. |
+| `params` | array | `[]` | Positional bind parameters, one per `?` marker in the query, in order. Snowflake binds markers in textual order, so a `${parent.field}` token's value takes the position of its token: `WHERE a = ${parent.id} AND b = ?` binds the parent value first and `params[0]` second. A `?` inside a string literal, quoted identifier, `$$` string or comment is not a marker. Each entry is typed from its JSON value. |
 
 ### Reliability & timeouts
 
