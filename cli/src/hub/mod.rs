@@ -358,11 +358,12 @@ pub async fn compose_across(
     let s = parse_source_file(&source_file)?;
     let k = parse_sink_file(&sink_file)?;
     if let Some(hub) = &source_hub {
-        let official = s.is_official() && is_official_hub(hub);
+        let official =
+            s.is_official() && is_official_file(hub, &source_file, catalog::SOURCE_DIR);
         refuse_untrusted_directives(&source_file, &s.id(), official, &sides.trusted)?;
     }
     if let Some(hub) = &sink_hub {
-        let official = k.is_official() && is_official_hub(hub);
+        let official = k.is_official() && is_official_file(hub, &sink_file, catalog::SINK_DIR);
         refuse_untrusted_directives(&sink_file, &k.id(), official, &sides.trusted)?;
     }
     let mut c = compose(&s, &k)?;
@@ -372,7 +373,8 @@ pub async fn compose_across(
         let (file, hub) = locate_in(o, &sides.overlay, DEPLOYMENT_DIR).await?;
         let d = parse_deployment_file(&file)?;
         if let Some(h) = &hub {
-            let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER) && is_official_hub(h);
+            let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER)
+                && is_official_file(h, &file, DEPLOYMENT_DIR);
             refuse_untrusted_directives(&file, &d.id(), official, &sides.trusted)?;
         }
         c = c.apply_overlay(&d)?;
@@ -382,16 +384,38 @@ pub async fn compose_across(
 }
 
 /// Whether a hub (as [`HubLocation::describe`] names it) is the faucet-hq
-/// catalog repository. Only there does `owner: faucet-hq` mean the template
-/// is maintained by faucet-hq; any other hub can claim that owner.
+/// catalog repository at its default branch and root. Only there does
+/// `owner: faucet-hq` mean the template is maintained by faucet-hq: any other
+/// hub can claim that owner, and another ref of the repository (a tag, a
+/// branch, a commit id — which can name a pull request's head) has not been
+/// through its review.
 fn is_official_hub(hub: &str) -> bool {
     let official = HubLocation::parse(DEFAULT_REMOTE_HUB);
     match (HubLocation::parse(hub), official) {
-        (Ok(HubLocation::Github { repo, .. }), Ok(HubLocation::Github { repo: want, .. })) => {
-            repo.eq_ignore_ascii_case(&want)
-        }
+        (
+            Ok(HubLocation::Github { repo, r#ref, path }),
+            Ok(HubLocation::Github {
+                repo: want,
+                r#ref: want_ref,
+                path: want_path,
+            }),
+        ) => repo.eq_ignore_ascii_case(&want) && r#ref == want_ref && path == want_path,
         _ => false,
     }
+}
+
+/// Whether `file`, found in `hub`, is a document of the official catalog:
+/// the hub is official and the file lies in its `<subdir>/faucet-hq/`
+/// namespace, which only the catalog's owners can write. A document's own
+/// `owner:` claim is not enough.
+fn is_official_file(hub: &str, file: &Path, subdir: &str) -> bool {
+    let dir = file.parent();
+    let owner = dir.and_then(Path::file_name).and_then(|n| n.to_str());
+    let kind = dir
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str());
+    is_official_hub(hub) && owner == Some(spec::OFFICIAL_OWNER) && kind == Some(subdir)
 }
 
 /// Directive schemes that read the operator's environment, files or secrets.
@@ -1129,9 +1153,33 @@ mod tests {
     #[test]
     fn only_the_faucet_hq_catalog_repo_is_official() {
         assert!(is_official_hub("github:faucet-hq/template-hub@main"));
-        assert!(is_official_hub("github:Faucet-HQ/template-hub@v2/sub"));
+        assert!(is_official_hub("github:Faucet-HQ/template-hub"));
+        assert!(!is_official_hub("github:faucet-hq/template-hub@v2/sub"));
+        assert!(!is_official_hub("github:faucet-hq/template-hub@0123abcd"));
         assert!(!is_official_hub("github:evil/template-hub@main"));
         assert!(!is_official_hub("/tmp/hub"));
+        let hub = "github:faucet-hq/template-hub";
+        let snap = Path::new("/cache/hub/x/sha");
+        assert!(is_official_file(
+            hub,
+            &snap.join("source-templates/faucet-hq/stats.yaml"),
+            catalog::SOURCE_DIR
+        ));
+        assert!(!is_official_file(
+            hub,
+            &snap.join("source-templates/acme/stats.yaml"),
+            catalog::SOURCE_DIR
+        ));
+        assert!(!is_official_file(
+            hub,
+            &snap.join("source-templates/stats.yaml"),
+            catalog::SOURCE_DIR
+        ));
+        assert!(!is_official_file(
+            hub,
+            &snap.join("sink-templates/faucet-hq/stats.yaml"),
+            catalog::SOURCE_DIR
+        ));
     }
 
     const SRC: &str = "kind: source-template\nname: acme\nsource: {type: rest, config: {base_url: \"https://a\", path: /}}\nstreams: [{name: t}]\n";
