@@ -46,7 +46,7 @@ predicate := column ("=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">=") literal
 literal   := integer | decimal | 'string' | "string" | true | false
 ```
 
-Keywords are case-insensitive. Column names may be dot paths into structs (`address.city`) or back-quoted (`` `order id` ``). Literals are typed against the column: integers widen to `long` / `float` / `double` / `decimal` (rescaled, never rounded); dates, times, timestamps and UUIDs are written as strings (`dt = '2026-01-31'`, `ts >= '2026-01-31T00:00:00'`, `tz < '2026-01-31T00:00:00Z'`), and an integer compared with a timestamp column means epoch microseconds. A literal that cannot represent the column type (`int_col = 1.5`, a `decimal(10,2)` compared with `1.234`) is a config error, never a silent mismatch.
+Keywords are case-insensitive. Column names may be dot paths into structs (`address.city`) or back-quoted (`` `order id` ``). Literals are typed against the column: integers widen to `long` / `float` / `double` / `decimal` (rescaled, never rounded); dates, times, timestamps and UUIDs are written as strings (`dt = '2026-01-31'`, `ts >= '2026-01-31T00:00:00'`, `tz < '2026-01-31T00:00:00Z'`), and an integer compared with a timestamp column means epoch microseconds. A literal that cannot represent the column type (`int_col = 1.5`, a `decimal(10,2)` compared with `1.234`) is a config error, never a silent mismatch. An expression may nest (`not`, parentheses) and chain (`and` / `or`) at most 256 levels deep; write long value lists as `in (…)`.
 
 ```yaml
 filter: "status = 'active' and (amount >= 10.5 or vip is not null) and region in ('eu', 'us')"
