@@ -30,6 +30,7 @@ use duckdb::arrow::datatypes::{
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::arrow::temporal_conversions as tc;
 use faucet_core::FaucetError;
+use faucet_core::fidelity::TimePrecision;
 use serde_json::{Map, Value, json};
 
 /// Convert one batch into JSON objects. `duck_types[i]` is the DuckDB type
@@ -70,19 +71,26 @@ fn infinity(v: i64) -> Value {
     Value::String(if v > 0 { "infinity" } else { "-infinity" }.into())
 }
 
-fn naive_ts(dt: Option<chrono::NaiveDateTime>, v: i64, tz: bool) -> Value {
+fn precision(unit: &TimeUnit) -> TimePrecision {
+    match unit {
+        TimeUnit::Second => TimePrecision::Seconds,
+        TimeUnit::Millisecond => TimePrecision::Millis,
+        TimeUnit::Microsecond => TimePrecision::Micros,
+        TimeUnit::Nanosecond => TimePrecision::Nanos,
+    }
+}
+
+fn naive_ts(dt: Option<chrono::NaiveDateTime>, v: i64, tz: bool, unit: &TimeUnit) -> Value {
     match dt {
-        Some(dt) => {
-            let text = dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
-            Value::String(if tz { format!("{text}Z") } else { text })
-        }
+        Some(dt) if tz => faucet_core::fidelity::timestamp(&dt.and_utc(), precision(unit)),
+        Some(dt) => faucet_core::fidelity::timestamp_naive(&dt, precision(unit)),
         None => infinity(v),
     }
 }
 
-fn time_text(t: Option<chrono::NaiveTime>) -> Value {
+fn time_text(t: Option<chrono::NaiveTime>, unit: &TimeUnit) -> Value {
     t.map_or(Value::Null, |t| {
-        Value::String(t.format("%H:%M:%S%.f").to_string())
+        faucet_core::fidelity::time(&t, precision(unit))
     })
 }
 
@@ -171,31 +179,46 @@ pub(crate) fn array_to_values(array: &ArrayRef, duck_type: &str) -> Result<Vec<V
             let tz = tz.is_some();
             match unit {
                 TimeUnit::Second => prim::<TimestampSecondType, _>(array, |v| {
-                    naive_ts(tc::timestamp_s_to_datetime(v), v, tz)
+                    naive_ts(tc::timestamp_s_to_datetime(v), v, tz, &TimeUnit::Second)
                 }),
                 TimeUnit::Millisecond => prim::<TimestampMillisecondType, _>(array, |v| {
-                    naive_ts(tc::timestamp_ms_to_datetime(v), v, tz)
+                    naive_ts(
+                        tc::timestamp_ms_to_datetime(v),
+                        v,
+                        tz,
+                        &TimeUnit::Millisecond,
+                    )
                 }),
                 TimeUnit::Microsecond => prim::<TimestampMicrosecondType, _>(array, |v| {
-                    naive_ts(tc::timestamp_us_to_datetime(v), v, tz)
+                    naive_ts(
+                        tc::timestamp_us_to_datetime(v),
+                        v,
+                        tz,
+                        &TimeUnit::Microsecond,
+                    )
                 }),
                 TimeUnit::Nanosecond => prim::<TimestampNanosecondType, _>(array, |v| {
-                    naive_ts(tc::timestamp_ns_to_datetime(v), v, tz)
+                    naive_ts(
+                        tc::timestamp_ns_to_datetime(v),
+                        v,
+                        tz,
+                        &TimeUnit::Nanosecond,
+                    )
                 }),
             }
         }
-        DataType::Time32(TimeUnit::Second) => {
-            prim::<Time32SecondType, _>(array, |v| time_text(tc::time32s_to_time(v)))
-        }
-        DataType::Time32(_) => {
-            prim::<Time32MillisecondType, _>(array, |v| time_text(tc::time32ms_to_time(v)))
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            prim::<Time64NanosecondType, _>(array, |v| time_text(tc::time64ns_to_time(v)))
-        }
-        DataType::Time64(_) => {
-            prim::<Time64MicrosecondType, _>(array, |v| time_text(tc::time64us_to_time(v)))
-        }
+        DataType::Time32(TimeUnit::Second) => prim::<Time32SecondType, _>(array, |v| {
+            time_text(tc::time32s_to_time(v), &TimeUnit::Second)
+        }),
+        DataType::Time32(_) => prim::<Time32MillisecondType, _>(array, |v| {
+            time_text(tc::time32ms_to_time(v), &TimeUnit::Millisecond)
+        }),
+        DataType::Time64(TimeUnit::Nanosecond) => prim::<Time64NanosecondType, _>(array, |v| {
+            time_text(tc::time64ns_to_time(v), &TimeUnit::Nanosecond)
+        }),
+        DataType::Time64(_) => prim::<Time64MicrosecondType, _>(array, |v| {
+            time_text(tc::time64us_to_time(v), &TimeUnit::Microsecond)
+        }),
         DataType::Interval(IntervalUnit::MonthDayNano) => prim::<IntervalMonthDayNanoType, _>(
             array,
             |v| json!({ "months": v.months, "days": v.days, "nanos": v.nanoseconds }),
@@ -340,7 +363,7 @@ mod tests {
         BinaryViewArray, Date64Array, Decimal256Array, DurationSecondArray, FixedSizeBinaryArray,
         IntervalDayTimeArray, IntervalYearMonthArray, LargeBinaryArray, LargeListArray,
         LargeStringArray, NullArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
-        Time64NanosecondArray, TimestampMillisecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMillisecondArray,
     };
     use duckdb::arrow::datatypes::{Int32Type as I32, IntervalDayTime, i256};
     use std::sync::Arc;
@@ -396,6 +419,20 @@ mod tests {
             vec![json!("1970-01-01T00:00:01.500")]
         );
         assert_eq!(
+            conv(Arc::new(TimestampMillisecondArray::from(vec![1_000]))),
+            vec![json!("1970-01-01T00:00:01.000")]
+        );
+        assert_eq!(
+            conv(Arc::new(
+                TimestampMillisecondArray::from(vec![1_000]).with_timezone("UTC")
+            )),
+            vec![json!("1970-01-01T00:00:01.000Z")]
+        );
+        assert_eq!(
+            conv(Arc::new(Time64MicrosecondArray::from(vec![1_000_000]))),
+            vec![json!("00:00:01.000000")]
+        );
+        assert_eq!(
             conv(Arc::new(Time32SecondArray::from(vec![61]))),
             vec![json!("00:01:01")]
         );
@@ -446,7 +483,7 @@ mod tests {
             conv(Arc::new(Date64Array::from(vec![i64::MAX]))),
             vec![json!("infinity")]
         );
-        assert_eq!(time_text(None), Value::Null);
+        assert_eq!(time_text(None, &TimeUnit::Second), Value::Null);
         assert_eq!(slice(&[json!(1)], 3, 4), json!([]));
     }
 }

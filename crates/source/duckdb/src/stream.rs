@@ -889,10 +889,10 @@ mod tests {
         .await;
         assert_eq!(row["ts_s"], json!("2024-01-01T10:00:00"));
         assert_eq!(row["ts_ns"], json!("2024-01-01T10:00:00.123456789"));
-        assert_eq!(row["ts"], json!("2024-01-01T10:00:00.500"));
-        assert_eq!(row["tz"], json!("2024-01-01T04:30:00Z"));
+        assert_eq!(row["ts"], json!("2024-01-01T10:00:00.500000"));
+        assert_eq!(row["tz"], json!("2024-01-01T04:30:00.000000Z"));
         assert_eq!(row["d"], json!("2024-01-02"));
-        assert_eq!(row["t"], json!("10:11:12.500"));
+        assert_eq!(row["t"], json!("10:11:12.500000"));
         assert_eq!(row["ttz"], json!("10:00:00+05"));
         assert_eq!(row["i"], json!({"months": 0, "days": 3, "nanos": 0}));
         assert_eq!(row["inf"], json!("infinity"));
