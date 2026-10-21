@@ -391,7 +391,10 @@ impl std::fmt::Display for StateKey {
 /// made only of state-key characters is kept as is; anything else (an email, a
 /// space, non-ASCII, `::`, an over-long value) becomes a readable prefix plus a
 /// stable 64-bit hash of the raw value. `allow_separators` admits `:` and `/`
-/// (a child's parent key, which stands alone after `::`).
+/// (a child's parent key, which stands alone after `::`); a path-like value
+/// whose `/` segments a state key may not hold (empty, `.`, `..`, dot-leading)
+/// is hashed too, so the rendered key always passes
+/// [`validate_state_key`](crate::state::validate_state_key).
 pub fn encode_component(raw: &str, allow_separators: bool) -> String {
     let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
     let legal = |c: char| plain(c) || (allow_separators && matches!(c, ':' | '/'));
@@ -401,6 +404,10 @@ pub fn encode_component(raw: &str, allow_separators: bool) -> String {
         && !raw.contains(KEY_SEPARATOR)
         && !raw.starts_with(':')
         && !raw.ends_with(':')
+        && (!raw.contains('/')
+            || raw
+                .split('/')
+                .all(|seg| !seg.is_empty() && !seg.starts_with('.')))
     {
         return raw.to_owned();
     }
@@ -478,6 +485,24 @@ mod tests {
     use super::*;
     use crate::state::MemoryStateStore;
     use serde_json::json;
+
+    #[test]
+    fn a_path_like_parent_key_always_renders_a_valid_state_key() {
+        for raw in ["exports/2026/", "a//b", "a/./b", "a/../b", "x/.cfg", "/abs"] {
+            let key = StateKey::invocation("p", "files")
+                .with_parent_key(raw)
+                .render();
+            crate::state::validate_state_key(&key).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert!(key.contains(".h"), "{raw} is hashed: {key}");
+        }
+        // A well-formed path is still kept readable.
+        assert_eq!(
+            StateKey::invocation("p", "files")
+                .with_parent_key("exports/2026")
+                .render(),
+            "p::files::exports/2026"
+        );
+    }
 
     #[test]
     fn renders_every_kind() {
