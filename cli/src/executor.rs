@@ -5428,7 +5428,11 @@ mod tests {
         let mut opts = exec_opts("ow");
         opts.execution = cfg.execution.clone();
         let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
-        let b = summary.invocations.iter().find(|o| o.row_id == "b").unwrap();
+        let b = summary
+            .invocations
+            .iter()
+            .find(|o| o.row_id == "b")
+            .unwrap();
         assert!(b.error.is_some(), "the sibling must fail: {summary:?}");
         let a = summary
             .invocations
