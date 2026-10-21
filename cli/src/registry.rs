@@ -778,7 +778,11 @@ async fn build_source_inner(
             let cfg = decode::<faucet_source_bigquery::BigQuerySourceConfig>(
                 "source", "bigquery", config,
             )?;
-            boxed_source(faucet_source_bigquery::BigQuerySource::new(cfg)).await
+            let mut s = Box::pin(faucet_source_bigquery::BigQuerySource::new(cfg)).await?;
+            if let Some(rp) = retry_policy {
+                s = s.with_retry_policy(rp.clone());
+            }
+            Ok(Box::new(s))
         }
         #[cfg(feature = "source-snowflake")]
         "snowflake" => {

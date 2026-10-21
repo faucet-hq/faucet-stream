@@ -264,8 +264,18 @@ discovery listings and the Storage Read gRPC session and row streams — runs
 through the pipeline's `CallContext` (#880): each is bounded by the default
 300 s call timeout and any caller deadline, and the run's cancel token stops an
 in-flight request or the job-poll pause. Round trips are still metered as
-`query` / `poll` / `job` (see Usage signals); nothing is retried by faucet —
-`poll_timeout` still caps how long an unfinished job is polled.
+`query` / `poll` / `job` (see Usage signals); `poll_timeout` still caps how
+long an unfinished job is polled.
+
+A transient failure of a REST call — HTTP 429 or 5xx, or a
+`rateLimitExceeded` / `backendError` / `internalError` reason (BigQuery sends
+`rateLimitExceeded` as a 403) — is retried: five attempts, 200 ms doubling to
+at most 30 s. A pipeline's `resilience.retry` replaces that policy (or call
+`BigQuerySource::with_retry_policy`). Every call is safe to repeat: result
+pages, `jobs.get` and the discovery calls only read, and `jobs.query` carries a
+`requestId`, so a retried query returns the job the first attempt started
+instead of running (and billing) the query again. Once the retries are spent
+the error is the same `jobs.<call> failed: …` source error as before.
 
 ## License
 

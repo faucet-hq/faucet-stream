@@ -63,10 +63,91 @@ pub struct BigQuerySource {
     results: tokio::sync::OnceCell<QueryResultsReader>,
 }
 
-/// The source's call slot: the default attempt timeout, no retry, and no
-/// round-trip metering (the `roundtrips` slot counts them).
-fn call_slot() -> faucet_core::CallSlot {
-    faucet_core::CallSlot::new(faucet_core::CallContext::new().with_roundtrip_metering(false))
+/// The source's call slot: the default attempt timeout, `retry` for the
+/// transient failures [`bq_error`] marks, and no round-trip metering (the
+/// `roundtrips` slot counts them).
+///
+/// Every call the source makes is safe to repeat: `jobs.getQueryResults`,
+/// `jobs.get`, `tables.get` and the listings only read, and `jobs.query`
+/// carries a `requestId`, which makes BigQuery answer a repeated request with
+/// the job the first one started instead of running the query again.
+fn call_slot(retry: faucet_core::RetryPolicy) -> faucet_core::CallSlot {
+    faucet_core::CallSlot::new(
+        faucet_core::CallContext::new()
+            .with_roundtrip_metering(false)
+            .with_retry(retry),
+    )
+}
+
+/// The retry policy a source starts with: five attempts, 200 ms doubling to
+/// at most 30 s, on HTTP 5xx / 429 and timeouts.
+fn default_retry() -> faucet_core::RetryPolicy {
+    faucet_core::RetryPolicy::default()
+}
+
+/// Marks a transient BigQuery failure inside the call slot (see [`bq_error`]).
+const TRANSIENT_MARKER: &str = "bigquery-transient";
+
+/// The error-reason codes BigQuery reports for a transient failure, whatever
+/// the HTTP status (a `rateLimitExceeded` comes back as 403).
+const TRANSIENT_REASONS: [&str; 3] = ["rateLimitExceeded", "backendError", "internalError"];
+
+/// The HTTP status a BigQuery failure should be retried as, when it is
+/// transient: a 429 or 5xx response, or a transient error reason.
+fn transient_status(e: &gcp_bigquery_client::error::BQError) -> Option<u16> {
+    use gcp_bigquery_client::error::BQError;
+    match e {
+        BQError::ResponseError { error } => {
+            let code = u16::try_from(error.error.code).unwrap_or(0);
+            if code == 429 || code >= 500 {
+                return Some(code);
+            }
+            let reason = |r: &str| {
+                error
+                    .error
+                    .errors
+                    .iter()
+                    .any(|item| item.get("reason").is_some_and(|v| v == r))
+            };
+            if reason(TRANSIENT_REASONS[0]) {
+                Some(429)
+            } else if TRANSIENT_REASONS[1..].iter().any(|r| reason(r)) {
+                Some(503)
+            } else {
+                None
+            }
+        }
+        BQError::RequestError(e) => e
+            .status()
+            .map(|s| s.as_u16())
+            .filter(|s| *s == 429 || *s >= 500),
+        _ => None,
+    }
+}
+
+/// A BigQuery API failure as the call slot sees it: a transient one is an
+/// [`FaucetError::HttpStatus`] so the slot's retry policy repeats the call;
+/// anything else is the [`FaucetError::Source`] `message`. [`settle`] turns a
+/// transient failure the retries did not clear back into that `Source` error.
+fn bq_error(message: String, e: &gcp_bigquery_client::error::BQError) -> FaucetError {
+    match transient_status(e) {
+        Some(status) => FaucetError::HttpStatus {
+            status,
+            url: TRANSIENT_MARKER.into(),
+            body: message,
+        },
+        None => FaucetError::Source(message),
+    }
+}
+
+/// The error a call returns once its retries are spent (see [`bq_error`]).
+fn settle(e: FaucetError) -> FaucetError {
+    match e {
+        FaucetError::HttpStatus { url, body, .. } if url == TRANSIENT_MARKER => {
+            FaucetError::Source(body)
+        }
+        other => other,
+    }
 }
 
 impl BigQuerySource {
@@ -77,7 +158,15 @@ impl BigQuerySource {
     }
 
     /// `jobs.query` for `req` as one backend call.
+    ///
+    /// The request gets a `requestId` (unless it has one), so a retried
+    /// `jobs.query` returns the job the first attempt started.
     async fn run_query(&self, req: &QueryRequest) -> Result<QueryResponse, FaucetError> {
+        let mut req = req.clone();
+        if req.request_id.is_none() {
+            req.request_id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        let req = &req;
         self.calls
             .call("query", || async {
                 faucet_common_bigquery::raw::tolerant_query(
@@ -87,9 +176,18 @@ impl BigQuerySource {
                     req.clone(),
                 )
                 .await
-                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))
+                .map_err(|e| bq_error(format!("BigQuery jobs.query failed: {e}"), &e))
             })
             .await
+            .map_err(settle)
+    }
+
+    /// Retry transient BigQuery failures with `policy` instead of the
+    /// default (five attempts) — how the CLI applies a pipeline's
+    /// `resilience.retry`. Call before the pipeline installs its context.
+    pub fn with_retry_policy(mut self, policy: faucet_core::RetryPolicy) -> Self {
+        self.calls = call_slot(policy);
+        self
     }
 
     /// Where schema-tolerant fallback requests go (SQL-172).
@@ -127,7 +225,7 @@ impl BigQuerySource {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
-            calls: call_slot(),
+            calls: call_slot(default_retry()),
             tokens: Some(tokens),
             results: tokio::sync::OnceCell::new(),
         })
@@ -205,9 +303,10 @@ impl BigQuerySource {
                         job_ref.location.as_deref(),
                     )
                     .await
-                    .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))
+                    .map_err(|e| bq_error(format!("BigQuery jobs.get failed: {e}"), &e))
                 })
-                .await?;
+                .await
+                .map_err(settle)?;
             if job_finished(job.status.as_ref(), job_id)? {
                 break job;
             }
@@ -266,7 +365,7 @@ impl BigQuerySource {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
-            calls: call_slot(),
+            calls: call_slot(default_retry()),
             tokens: None,
             results: tokio::sync::OnceCell::new(),
         }
@@ -313,10 +412,11 @@ impl BigQuerySource {
                     .get(&self.config.project_id, job_id, params.clone())
                     .await
                     .map_err(|e| {
-                        FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
+                        bq_error(format!("BigQuery jobs.getQueryResults failed: {e}"), &e)
                     })
             })
             .await
+            .map_err(settle)
     }
 
     /// Resolve the final SQL statement and ordered bind values for a given
@@ -350,7 +450,7 @@ impl BigQuerySource {
     ) -> Result<Vec<DatasetDescriptor>, FaucetError> {
         let project = &self.config.project_id;
         let discovery_err = |e: gcp_bigquery_client::error::BQError| -> FaucetError {
-            FaucetError::Source(format!("bigquery: catalog discovery failed: {e}"))
+            bq_error(format!("bigquery: catalog discovery failed: {e}"), &e)
         };
 
         // 1. Enumerate every dataset in the project (paged).
@@ -371,7 +471,8 @@ impl BigQuerySource {
                         .await
                         .map_err(discovery_err)
                 })
-                .await?;
+                .await
+                .map_err(settle)?;
             dataset_ids.extend(
                 resp.datasets
                     .iter()
@@ -403,7 +504,8 @@ impl BigQuerySource {
                             .await
                             .map_err(discovery_err)
                     })
-                    .await?;
+                    .await
+                    .map_err(settle)?;
                 for table in resp.tables.unwrap_or_default() {
                     // Physical tables only — views / materialized views /
                     // external tables are not `SELECT *`-scannable datasets in
@@ -459,7 +561,8 @@ impl BigQuerySource {
                         .await
                         .map_err(discovery_err)
                     })
-                    .await?;
+                    .await
+                    .map_err(settle)?;
                 let fields = table.schema.fields.unwrap_or_default();
                 out.push(table_descriptor(
                     project,

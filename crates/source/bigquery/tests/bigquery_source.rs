@@ -1410,3 +1410,131 @@ async fn get_query_results_falls_back_and_keeps_an_error_status() {
     .to_string();
     assert!(err.contains("502"), "{err}");
 }
+
+/// A `jobs.query` whose first page hands over to `getQueryResults` for `job`.
+async fn mount_first_page_with_token(server: &MockServer, job: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": schema_two_cols(),
+            "jobReference": {"projectId": PROJECT_ID, "jobId": job},
+            "rows": rows(0, 2),
+            "pageToken": "tok-1",
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_transient_result_page_failure_is_retried() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_first_page_with_token(&server, "job-flaky").await;
+    // One 503 backendError, then a 403 rateLimitExceeded, then the page.
+    Mock::given(method("GET"))
+        .and(path(results_path("job-flaky")))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": {"code": 503, "message": "backend", "errors": [{"reason": "backendError"}]}
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(results_path("job-flaky")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": 403, "message": "slow down", "errors": [{"reason": "rateLimitExceeded"}]}
+        })))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(results_path("job-flaky")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": schema_two_cols(),
+            "rows": rows(2, 3),
+        })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+
+    let (src, _f) = build_source(&server, default_config()).await;
+    let rows = src.fetch_all().await.unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[4]["id"], 4);
+    let results = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == results_path("job-flaky"))
+        .count();
+    assert_eq!(results, 3, "two retries, then the page");
+}
+
+#[tokio::test]
+async fn a_permanent_result_page_failure_is_not_retried() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_first_page_with_token(&server, "job-denied").await;
+    Mock::given(method("GET"))
+        .and(path(results_path("job-denied")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": 403, "message": "Access Denied", "errors": [{"reason": "accessDenied"}]}
+        })))
+        .mount(&server)
+        .await;
+
+    let (src, _f) = build_source(&server, default_config()).await;
+    let err = src.fetch_all().await.unwrap_err();
+    assert!(
+        matches!(&err, faucet_core::FaucetError::Source(m) if m.contains("getQueryResults failed")),
+        "{err:?}"
+    );
+    let results = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == results_path("job-denied"))
+        .count();
+    assert_eq!(results, 1);
+}
+
+#[tokio::test]
+async fn jobs_query_carries_a_request_id_and_a_retry_policy_is_honoured() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_first_page_with_token(&server, "job-policy").await;
+    Mock::given(method("GET"))
+        .and(path(results_path("job-policy")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let (src, _f) = build_source(&server, default_config()).await;
+    let src = src.with_retry_policy(faucet_core::RetryPolicy {
+        max_attempts: 2,
+        base: std::time::Duration::from_millis(1),
+        ..Default::default()
+    });
+    assert!(src.fetch_all().await.is_err());
+    let requests = server.received_requests().await.unwrap();
+    let results = requests
+        .iter()
+        .filter(|r| r.url.path() == results_path("job-policy"))
+        .count();
+    assert_eq!(results, 2, "max_attempts from the injected policy");
+    let query = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/queries"))
+        .expect("jobs.query sent");
+    let body: Value = serde_json::from_slice(&query.body).unwrap();
+    assert!(
+        body["requestId"].as_str().is_some_and(|s| !s.is_empty()),
+        "{body}"
+    );
+}
