@@ -417,3 +417,35 @@ async fn capability_readback_and_token_rewind() {
         .unwrap_err();
     assert!(err.to_string().contains(RUN_COL), "{err}");
 }
+
+#[tokio::test]
+async fn overwrite_rollback_of_a_referenced_table_is_refused() {
+    let (_c, url) = start_mysql().await;
+    exec(&url, CREATE_USERS).await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    overwrite_run(&url, "r1", true, &[user(9, "new-9", "r1")]).await;
+    exec(
+        &url,
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, \
+         FOREIGN KEY (user_id) REFERENCES users (id))",
+    )
+    .await;
+    exec(&url, "INSERT INTO orders VALUES (1, 9)").await;
+    let sink = MysqlSink::new(config(&url, "users", WriteSpec::default()))
+        .await
+        .unwrap();
+    let err = sink
+        .rollback_run("r1", &opts(RollbackMode::Overwrite))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("referenced by a foreign key from orders"),
+        "{err}"
+    );
+    assert_eq!(
+        rows(&url).await,
+        vec![(9, "new-9".into(), Some("r1".into()))]
+    );
+    assert!(table_exists(&url, "users__faucet_prev").await);
+}
