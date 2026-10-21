@@ -274,9 +274,20 @@ impl LogHub {
             buf.finish();
         }
         if let Some(tx) = self.persist.get() {
-            let _ = tx.try_send(PersistMsg::End {
+            let end = PersistMsg::End {
                 run_id: run_id.to_string(),
-            });
+            };
+            // `End` closes the writer's state for the run (truncation marker,
+            // dropped count, delivery mark): a full queue — a log burst as the
+            // run ends — must delay it, never lose it.
+            if let Err(mpsc::error::TrySendError::Full(end)) = tx.try_send(end)
+                && let Ok(rt) = tokio::runtime::Handle::try_current()
+            {
+                let tx = tx.clone();
+                rt.spawn(async move {
+                    let _ = tx.send(end).await;
+                });
+            }
         }
     }
 
@@ -794,6 +805,22 @@ mod tests {
         );
         hub.shutdown_persistence(std::time::Duration::from_secs(5))
             .await;
+    }
+
+    /// A run's `End` reaches the writer even when the queue is full as the
+    /// run ends (a log burst), so its writer state is closed, not leaked.
+    #[tokio::test]
+    async fn end_is_delivered_when_the_queue_is_full() {
+        let hub = LogHub::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(hub.persist.set(tx).is_ok());
+        hub.capture("r1", "INFO", "t".into(), "burst".into());
+        hub.finish("r1");
+        assert!(matches!(rx.recv().await, Some(PersistMsg::Line { .. })));
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("End arrives once there is room");
+        assert!(matches!(end, Some(PersistMsg::End { run_id }) if run_id == "r1"));
     }
 
     #[test]
