@@ -92,6 +92,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
     "record_table",
     "position_le",
     "record_covered",
+    "read_completeness",
     "position_min",
     "connector_name",
     "set_roundtrip_recorder",
@@ -715,6 +716,10 @@ impl Source for HookSource {
         self.hit("record_covered");
         Some(true)
     }
+    fn read_completeness(&self) -> Option<faucet_core::ReadCompleteness> {
+        self.hit("read_completeness");
+        Some(faucet_core::ReadCompleteness::new())
+    }
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         self.hit("position_min");
         positions.first().cloned()
@@ -806,6 +811,7 @@ pub async fn assert_source_forwards_every_hook(
     let _ = source.record_table(&record);
     let _ = source.position_le(&json!(1), &json!(2));
     let _ = source.record_covered(&record, &json!(1));
+    let _ = source.read_completeness();
     let _ = source.position_min(&[json!(2), json!(1)]);
     let _ = source.connector_name();
     source.set_roundtrip_recorder(recorder(RoundtripSide::Source));

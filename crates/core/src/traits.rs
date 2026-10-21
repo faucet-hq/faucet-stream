@@ -440,6 +440,14 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// The signal through which this source reports, during a run, that it is
+    /// reading its **whole dataset** (see [`crate::cleanup`]). After such a
+    /// run the pipeline may delete destination rows the run did not write.
+    /// Default `None`: the source never makes that claim.
+    fn read_completeness(&self) -> Option<crate::cleanup::ReadCompleteness> {
+        None
+    }
+
     /// The earliest stream position every one of `positions` can resume from
     /// (#731): the shared change stream restarts there and each table skips
     /// what it has already applied. The default picks the position that
@@ -890,6 +898,8 @@ pub trait Sink: Send + Sync {
     /// successfully and uncancelled — see [`crate::cleanup`] for why the timing
     /// is load-bearing. `scope` is a set of equality predicates in destination
     /// column terms, AND-ed together; `seen` holds the key tuples this run wrote.
+    /// An **empty** `scope` is the whole destination: a complete-read cleanup
+    /// ([`CleanupPolicy::for_complete_read`](crate::CleanupPolicy::for_complete_read)).
     ///
     /// Returns the number of rows deleted. Implementations **must** be
     /// all-or-nothing where the backend allows it: a partial delete would remove

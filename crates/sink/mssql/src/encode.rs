@@ -268,8 +268,8 @@ pub(crate) fn build_cleanup_key_insert_sql(
 
 /// Build the scoped-cleanup `DELETE`: every row matching `scope` whose key is
 /// **not** in the session-scoped `#faucet_cleanup_keys` table. Scope predicates bind `@P1..@Pn` in
-/// `scope_cols` order. An empty scope or key is refused — an empty predicate
-/// would match every row.
+/// `scope_cols` order. An empty scope is the whole table (a complete-read
+/// cleanup); an empty key is refused.
 pub(crate) fn build_cleanup_delete_sql(
     table_quoted: &str,
     scope_cols: &[&str],
@@ -764,10 +764,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_delete_refuses_an_empty_scope() {
-        // An empty predicate is a truncate, not a cleanup.
-        let err = build_cleanup_delete_sql("[t]", &[], &["id".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("every row"), "{err}");
+    fn cleanup_delete_over_an_empty_scope_covers_the_whole_table() {
+        // A complete-read cleanup: every row whose key was not written.
+        let sql = build_cleanup_delete_sql("[t]", &[], &["id".to_string()]).unwrap();
+        assert_eq!(
+            sql,
+            "DELETE t FROM [t] AS t WHERE NOT EXISTS (SELECT 1 FROM #faucet_cleanup_keys c \
+             WHERE c.[id] = t.[id])"
+        );
     }
 
     #[test]

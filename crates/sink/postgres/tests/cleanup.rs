@@ -114,6 +114,21 @@ async fn write_then_cleanup(sink: &PostgresSink, page: &[Value], contact_id: i64
 }
 
 #[tokio::test]
+async fn a_complete_read_cleans_up_the_whole_table() {
+    let (_c, url) = start_postgres().await;
+    create_assoc_table(&url).await;
+    let sink = PostgresSink::new(sink_config(&url)).await.expect("sink");
+    let p = CleanupPolicy::for_complete_read(vec!["id".to_string()], 1000).expect("policy");
+    let page = [json!({"id": 3, "contact_id": 7, "label": "keep-me"})];
+    sink.write_batch(&page).await.expect("write");
+    let mut seen = faucet_core::SeenKeys::new();
+    seen.record_page(&page, &p.key, p.max_keys);
+    let deleted = sink.cleanup_scope(&p.scope, &seen).await.expect("cleanup");
+    assert_eq!(deleted, 4, "every row the run did not write, in any scope");
+    assert_eq!(ids(&url).await, vec![(3, 7)]);
+}
+
+#[tokio::test]
 async fn deletes_only_unwritten_rows_inside_the_scope() {
     let (_c, url) = start_postgres().await;
     create_assoc_table(&url).await;

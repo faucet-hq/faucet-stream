@@ -327,12 +327,33 @@ has no columns to predicate on.
 incompatible with `delivery: exactly_once` (the scoped delete happens outside the commit-token
 transaction, so it cannot be replayed idempotently).
 
+### Complete reads (DynamoDB `on_gap: resnapshot`)
+
+A DynamoDB Streams source with `on_gap: resnapshot` re-reads the whole table
+when its bookmark has fallen past the stream's retention. That run is a
+**complete read**, so it needs no `complete_for` claim: after it, the
+destination rows of items the scan did not see — items deleted while their
+stream records were trimmed — are deleted, over the whole destination. An
+ordinary streams run deletes nothing.
+
+- The same sinks and gates apply: a cleanup-capable sink, `write_mode: upsert`
+  with a `key` (the table's key attributes, after `cdc_unwrap`), no
+  `delivery: exactly_once`, no quarantining policy. `faucet validate` refuses
+  the row otherwise, and a node graph (`pipeline.nodes`) refuses the source.
+- The run's bookmarks are held back until the delete succeeds. A crash, a
+  cancel or a failed delete leaves the old bookmark, so the next run
+  re-reads the table and deletes again rather than skipping it.
+- Up to 1,000,000 keys are tracked (`DEFAULT_COMPLETE_READ_MAX_KEYS`); a
+  larger table fails the run with nothing deleted, as does a sink whose
+  delete request cannot carry every key (MongoDB, Elasticsearch, BigQuery and
+  Spanner bound it). Rebuild such a destination with an overwrite snapshot.
+
 ### Metrics
 
 | Metric | Meaning |
 |---|---|
 | `faucet_cleanup_deleted_total{pipeline,row,connector}` | Rows deleted. Emitted even at zero — zero is the steady state a healthy mirror shows. |
-| `faucet_cleanup_runs_total{pipeline,row,outcome}` | `applied` / `skipped_cancelled` / `refused_overflow` / `failed` (the sink's delete errored). A non-zero `refused_overflow` or `failed` means stale rows were left behind — worth alerting on. |
+| `faucet_cleanup_runs_total{pipeline,row,outcome}` | `applied` / `skipped_cancelled` / `skipped_incomplete` (a complete read that ended before it finished) / `refused_overflow` / `failed` (the sink's delete errored). A non-zero `refused_overflow` or `failed` means stale rows were left behind — worth alerting on. |
 
 ## Overwrite (full refresh)
 

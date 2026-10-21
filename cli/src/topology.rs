@@ -306,7 +306,7 @@ fn refuse_stateless_cdc_sources(cfg: &PipelineConfig) -> CliResult<()> {
         else {
             continue;
         };
-        let Ok((kind, _)) = resolve_connector(
+        let Ok((kind, resolved)) = resolve_connector(
             &cfg.pipeline.sources,
             &cfg.pipeline.source,
             template.as_deref(),
@@ -317,6 +317,16 @@ fn refuse_stateless_cdc_sources(cfg: &PipelineConfig) -> CliResult<()> {
         ) else {
             continue;
         };
+        // A graph runs no cleanup, so the destination rows of records a
+        // complete read did not see would silently survive.
+        if crate::registry::source_capabilities(&kind, &resolved).complete_reads() {
+            return Err(CliError::Config(format!(
+                "topology source node '{id}': source '{kind}' can read its whole dataset in one \
+                 run (for dynamodb: `on_gap: resnapshot`) and then delete the destination rows it \
+                 did not see, which a node graph cannot do — use a matrix pipeline, or \
+                 `on_gap: fail`"
+            )));
+        }
         crate::expand::check_postgres_cdc_state(
             &format!("topology source node '{id}'"),
             &kind,
@@ -2803,6 +2813,27 @@ pipeline:
         let err = validate_topology_spec(&c).unwrap_err().to_string();
         assert!(err.contains("sink node 'w'"), "{err}");
         assert!(err.contains("write_mode: overwrite"), "{err}");
+    }
+
+    #[test]
+    fn a_complete_read_source_node_is_refused() {
+        let graph = |on_gap: &str| {
+            format!(
+                "version: 1\nname: p\npipeline:\n  state: {{ type: file, config: {{ path: ./st }} }}\n  \
+                 sources:\n    a: {{ type: dynamodb, config: {{ table_name: t, mode: streams, \
+                 on_gap: {on_gap} }} }}\n  sinks:\n    o: {{ type: stdout, config: {{}} }}\n  \
+                 nodes:\n    s: {{ kind: source, ref: a }}\n    w: {{ kind: sink, ref: o }}\n  \
+                 edges:\n    - {{ from: s, to: w }}\n"
+            )
+        };
+        let err = validate_topology_spec(&cfg(&graph("resnapshot")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("topology source node 's'") && err.contains("whole dataset"),
+            "{err}"
+        );
+        validate_topology_spec(&cfg(&graph("fail"))).unwrap();
     }
 
     #[test]

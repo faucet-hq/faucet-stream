@@ -637,16 +637,6 @@ impl EsDriver {
                 "cleanup requires a non-empty `key`".to_string(),
             ));
         }
-        if scope.is_empty() {
-            // Defence in depth: `CleanupPolicy::new` already refuses this. With
-            // no scope predicate the query would match the whole index — the
-            // difference between a cleanup and a wipe.
-            return Err(FaucetError::Sink(
-                "cleanup: refusing an empty completeness claim — with no scope predicate the \
-                 delete would match every document in the index"
-                    .to_string(),
-            ));
-        }
         check_key_alignment(key, seen.keys())?;
 
         let ids = cleanup_doc_ids(seen.keys());
@@ -831,6 +821,9 @@ fn check_cleanup_id_count(ids: usize) -> Result<(), FaucetError> {
 /// no mapping, works unchanged for composite keys, and cannot be defeated by an
 /// analyzed key field.
 ///
+/// An empty scope (a complete-read cleanup over the whole index) omits the
+/// `filter` clause.
+///
 /// An empty `seen` set omits the `must_not` clause entirely, leaving the scope
 /// predicate alone so **every** document in the scope is deleted. That is not a
 /// degenerate case but the motivating one: the source claimed the scope is
@@ -845,8 +838,13 @@ fn build_cleanup_query(scope: &std::collections::BTreeMap<String, Value>, ids: &
         })
         .collect();
 
+    if filter.is_empty() && ids.is_empty() {
+        return serde_json::json!({ "query": { "match_all": {} } });
+    }
     let mut bool_query = serde_json::Map::with_capacity(2);
-    bool_query.insert("filter".to_string(), Value::Array(filter));
+    if !filter.is_empty() {
+        bool_query.insert("filter".to_string(), Value::Array(filter));
+    }
     if !ids.is_empty() {
         bool_query.insert(
             "must_not".to_string(),
@@ -2351,6 +2349,19 @@ mod tests {
         assert!(
             q["query"]["bool"].get("must_not").is_none(),
             "an empty id list must omit must_not, not send an empty ids query"
+        );
+    }
+
+    #[test]
+    fn cleanup_query_over_an_empty_scope_covers_the_whole_index() {
+        let q = build_cleanup_query(&scope_of(&[]), &["1".to_string()]);
+        assert_eq!(
+            q,
+            json!({"query": {"bool": {"must_not": [{"ids": {"values": ["1"]}}]}}})
+        );
+        assert_eq!(
+            build_cleanup_query(&scope_of(&[]), &[]),
+            json!({"query": {"match_all": {}}})
         );
     }
 

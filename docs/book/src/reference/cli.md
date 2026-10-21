@@ -525,9 +525,11 @@ against (RFC 0013): `write_modes`, `idempotent_writes` (exactly-once watermark),
 `scoped_overwrite`, `direct_overwrite`, `staged_load` for sinks and
 `exactly_once`, `discover`, `shardable`, `range_read`, `range_digest`,
 `reports_lag`, `table_routing` (names each record's table, so it can drive a
-multi-table `faucet mirror`) and `read_side_effects` (reading creates or
+multi-table `faucet mirror`), `read_side_effects` (reading creates or
 advances a slot, joins a consumer group or opens a listener, so `faucet plan
---live` refuses it) for sources, plus `columnar` / `native` for both. The listing
+--live` refuses it) and `complete_reads` (a run can read the whole dataset,
+after which destination rows it did not write are deleted — the sink must
+support cleanup) for sources, plus `columnar` / `native` for both. The listing
 shows the kind-level view — every capability some config enables; a few depend
 on the config (a SQL sink cleans up and rolls back only with
 `column_mapping: auto_map`), and `faucet validate` reads them from your config.

@@ -97,6 +97,7 @@ pub struct Capabilities {
     native: bool,
     table_routing: bool,
     read_side_effects: bool,
+    complete_reads: bool,
 }
 
 const MODE_ORDER: [WriteMode; 4] = [
@@ -194,6 +195,7 @@ impl Capabilities {
             .reports_lag(inner.reports_lag)
             .table_routing(inner.table_routing)
             .read_side_effects(inner.read_side_effects)
+            .complete_reads(inner.complete_reads)
             .build()
     }
 
@@ -328,6 +330,13 @@ impl Capabilities {
         self.read_side_effects
     }
 
+    /// A run can read the whole dataset (`Source::read_completeness`), after
+    /// which destination rows it did not write are deleted — so the sink must
+    /// support keyed cleanup.
+    pub fn complete_reads(&self) -> bool {
+        self.complete_reads
+    }
+
     /// The source's typed replay guarantee.
     pub fn replay_guarantee(&self) -> ReplayGuarantee {
         if self.exactly_once {
@@ -408,6 +417,7 @@ impl CapabilitiesBuilder {
         native,
         table_routing,
         read_side_effects,
+        complete_reads,
     );
 
     /// Finish.
@@ -663,6 +673,7 @@ mod tests {
             .reports_lag(true)
             .table_routing(true)
             .read_side_effects(true)
+            .complete_reads(true)
             .schema_report(SchemaReport::DropsUnknownFields)
             .scoped_overwrite(true)
             .direct_overwrite(true)
@@ -670,7 +681,7 @@ mod tests {
             .build();
         let src = Capabilities::decorated_source(&Plain, &inner);
         assert!(src.range_read() && src.range_digest() && src.reports_lag());
-        assert!(src.table_routing() && src.read_side_effects());
+        assert!(src.table_routing() && src.read_side_effects() && src.complete_reads());
         assert!(!src.discover(), "derived from the outer connector");
         let sink = Capabilities::decorated_sink(&Plain, &inner);
         assert_eq!(sink.schema_report(), SchemaReport::DropsUnknownFields);

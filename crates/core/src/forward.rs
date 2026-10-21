@@ -451,6 +451,14 @@ macro_rules! forward_source {
                 self.$inner.record_covered(record, position)
             }
         });
+        $crate::__faucet_forward_filter!(read_completeness [$($skip)*] {
+            fn read_completeness(&self) -> ::core::option::Option<$crate::cleanup::ReadCompleteness>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.read_completeness()
+            }
+        });
         $crate::__faucet_forward_filter!(position_min [$($skip)*] {
             fn position_min(
                 &self,
@@ -1165,6 +1173,7 @@ macro_rules! __faucet_forward_filter {
     (record_table [record_table $($rest:ident)*] $item:tt) => {};
     (position_le [position_le $($rest:ident)*] $item:tt) => {};
     (record_covered [record_covered $($rest:ident)*] $item:tt) => {};
+    (read_completeness [read_completeness $($rest:ident)*] $item:tt) => {};
     (position_min [position_min $($rest:ident)*] $item:tt) => {};
     (connector_name [connector_name $($rest:ident)*] $item:tt) => {};
     (set_roundtrip_recorder [set_roundtrip_recorder $($rest:ident)*] $item:tt) => {};
@@ -1256,6 +1265,7 @@ macro_rules! __faucet_forward_known {
     (@source [record_table $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [position_le $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [record_covered $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
+    (@source [read_completeness $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [position_min $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [connector_name $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [set_roundtrip_recorder $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };

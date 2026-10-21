@@ -141,6 +141,23 @@ async fn empty_seen_set_deletes_the_whole_scope() {
     assert_eq!(remaining(&url).await, vec![(2, 20)]);
 }
 
+// An empty scope is the whole table: a complete-read cleanup deletes every row
+// whose key the run did not write.
+#[tokio::test]
+async fn an_empty_scope_cleans_up_the_whole_table() {
+    let (_dir, url) = fresh_db(&[(1, 10, "kept"), (1, 11, "gone"), (2, 20, "gone")]).await;
+    let sink = SqliteSink::new(sink_config(&url, &["contact_id", "id"]))
+        .await
+        .unwrap();
+    let written = [json!({"contact_id": 1, "id": 10})];
+    let deleted = sink
+        .cleanup_scope(&BTreeMap::new(), &seen(&written, &["contact_id", "id"]))
+        .await
+        .expect("cleanup");
+    assert_eq!(deleted, 2);
+    assert_eq!(remaining(&url).await, vec![(1, 10)]);
+}
+
 // ---------------------------------------------------------------------------
 // Test 3: a scope that matches nothing deletes nothing (and does not error)
 // ---------------------------------------------------------------------------

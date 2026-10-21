@@ -237,6 +237,28 @@ async fn cleanup_posts_one_scoped_delete_with_two_json_params() {
 }
 
 #[tokio::test]
+async fn a_complete_read_cleanup_deletes_across_the_whole_table() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-w").await;
+    mount_job_done(&server, "job-w", Some("4")).await;
+
+    let (sink, _sa) = build_sink(&server, cleanup_config()).await;
+    let deleted = sink
+        .cleanup_scope(&std::collections::BTreeMap::new(), &seen_with(&[1]))
+        .await
+        .expect("cleanup");
+    assert_eq!(deleted, 4);
+    let body = captured_delete(&server).await;
+    let q = body["query"].as_str().unwrap();
+    assert!(q.contains("T WHERE NOT EXISTS"), "{q}");
+    let params = body["queryParameters"].as_array().expect("params");
+    assert_eq!(params.len(), 1, "no scope parameter: {params:?}");
+    assert_eq!(params[0]["name"], "keys");
+}
+
+#[tokio::test]
 async fn cleanup_with_no_written_keys_still_deletes_the_scope() {
     // The motivating case: the source reported the scope empty, so every row in
     // it is stale. An empty `seen` set must NOT short-circuit.

@@ -587,3 +587,71 @@ pipeline:
     let cfg = PipelineConfig::from_text(&yaml(""), std::path::Path::new("p.yaml")).unwrap();
     assert!(expand(&cfg).is_ok());
 }
+
+// ── Complete reads (DynamoDB `on_gap: resnapshot`) ──────────────────────────
+
+fn dynamodb_resnapshot(sink: &str) -> String {
+    format!(
+        r#"
+version: 1
+pipeline:
+  source:
+    type: dynamodb
+    config: {{ table_name: orders, mode: streams, on_gap: resnapshot, idle_termination_secs: 5 }}
+  transforms:
+    - type: cdc_unwrap
+  sink:
+{sink}
+  state:
+    type: file
+    config: {{ path: "./state" }}
+"#
+    )
+}
+
+#[test]
+fn a_complete_read_into_a_sink_without_cleanup_is_rejected() {
+    let err = expand_err(&dynamodb_resnapshot(
+        "    type: jsonl\n    config: { path: \"./out.jsonl\" }",
+    ));
+    assert!(
+        err.contains("whole dataset") && err.contains("cleanup-capable"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_complete_read_needs_a_keyed_upsert() {
+    let err = expand_err(&dynamodb_resnapshot(
+        "    type: sqlite\n    config: { database_url: \"sqlite://x.db\", table_name: t, \
+         column_mapping: auto_map, write_mode: append }",
+    ));
+    assert!(err.contains("write_mode: upsert"), "{err}");
+}
+
+#[test]
+fn a_complete_read_into_a_keyed_cleanup_sink_is_accepted() {
+    let path = std::path::PathBuf::from("p.yaml");
+    let cfg = PipelineConfig::from_text(
+        &dynamodb_resnapshot(
+            "    type: sqlite\n    config: { database_url: \"sqlite://x.db\", table_name: t, \
+             column_mapping: auto_map, write_mode: upsert, key: [pk] }",
+        ),
+        &path,
+    )
+    .expect("config parses");
+    let nodes = expand(&cfg).expect("a keyed cleanup sink is accepted");
+    assert!(
+        nodes[0].cleanup_scope.is_none(),
+        "no scoped claim is involved"
+    );
+}
+
+#[test]
+fn on_gap_fail_needs_no_cleanup_capable_sink() {
+    let yaml = dynamodb_resnapshot("    type: jsonl\n    config: { path: \"./out.jsonl\" }")
+        .replace("on_gap: resnapshot", "on_gap: fail");
+    let path = std::path::PathBuf::from("p.yaml");
+    let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
+    expand(&cfg).expect("a stream that fails on a gap never deletes");
+}

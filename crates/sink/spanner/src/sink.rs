@@ -271,6 +271,10 @@ fn build_scope_select_sql(table: &str, pk: &[String], preds: &[(String, String)]
         .map(|(col, expr)| format!("{} = {expr}", quote_ident_spanner(col)))
         .collect::<Vec<_>>()
         .join(" AND ");
+    // No predicate: a complete-read cleanup covers the whole table.
+    if where_clause.is_empty() {
+        return format!("SELECT {cols} FROM {}", quote_ident_spanner(table));
+    }
     format!(
         "SELECT {cols} FROM {} WHERE {where_clause}",
         quote_ident_spanner(table)
@@ -1859,6 +1863,14 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT `tenant`, `id` FROM `orders` WHERE `region` = @scope_0 AND `kind` = @scope_1"
+        );
+    }
+
+    #[test]
+    fn scope_select_sql_without_a_scope_reads_the_whole_table() {
+        assert_eq!(
+            build_scope_select_sql("orders", &["id".into()], &[]),
+            "SELECT `id` FROM `orders`"
         );
     }
 

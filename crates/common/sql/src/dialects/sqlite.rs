@@ -158,7 +158,8 @@ impl SqlDialect for Sqlite {
             .collect::<Vec<_>>()
             .join(" AND ");
         Ok(format!(
-            "DELETE FROM {t} WHERE {scope_pred} AND NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            "DELETE FROM {t} WHERE {}NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            crate::dialect::scope_and(&scope_pred),
             self.cleanup_keys_table()
         ))
     }

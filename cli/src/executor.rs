@@ -2394,21 +2394,24 @@ async fn build_pipeline<'a>(
                 .as_object()
                 .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            let key: Vec<String> = node
-                .sink
-                .config
-                .get("key")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let key = sink_key(&node.sink.config);
             let policy = faucet_core::CleanupPolicy::new(map, key, faucet_core::DEFAULT_MAX_KEYS)
                 .map_err(|e| CliError::Config(format!("cleanup: {e}")))?;
             pipeline = pipeline.with_cleanup(Arc::new(policy));
         }
+    } else if !(opts.dry_run || opts.limit.is_some() || opts.shard.is_some())
+        && crate::registry::source_capabilities(&node.source.kind, &node.source.config)
+            .complete_reads()
+    {
+        // A run in which the source reads its whole dataset (a DynamoDB
+        // `on_gap: resnapshot`) deletes the destination rows it did not write;
+        // any other run of it deletes nothing. Gated at load time in `expand`.
+        let policy = faucet_core::CleanupPolicy::for_complete_read(
+            sink_key(&node.sink.config),
+            faucet_core::DEFAULT_COMPLETE_READ_MAX_KEYS,
+        )
+        .map_err(|e| CliError::Config(format!("cleanup: {e}")))?;
+        pipeline = pipeline.with_cleanup(Arc::new(policy));
     }
     // Execution-level adaptive batch-size controller (shared by all rows).
     if let Some(ab) = opts
@@ -3660,6 +3663,19 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::Timeout { .. } => "timeout",
         _ => "error",
     }
+}
+
+/// The sink's `key` columns (empty when it has none).
+fn sink_key(config: &Value) -> Vec<String> {
+    config
+        .get("key")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// In-place `${now.*}` resolution against the run clock. Walks every string
