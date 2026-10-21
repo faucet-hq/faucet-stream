@@ -275,6 +275,7 @@ All lineage metrics are automatically registered when `lineage:` is configured:
 | `faucet_lineage_events_total` | `event_type`, `outcome` | Total events emitted (`outcome` = `ok` or `err`). |
 | `faucet_lineage_emit_duration_seconds` | `event_type` | Histogram of emission latency per event type. |
 | `faucet_lineage_dropped_total` | `reason` | Events dropped due to transport errors or serialization failures. |
+| `faucet_lineage_events_skipped_total` | `event_type` | Events turned off by `emit_on` (skipped on purpose, not a failure). |
 
 `event_type` values: `START`, `RUNNING`, `COMPLETE`, `FAIL`, `ABORT`.
 

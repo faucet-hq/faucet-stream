@@ -64,10 +64,13 @@ impl LineageEmitter {
     }
 
     /// Emit one lifecycle event. Never returns an error — failures are logged
-    /// and counted via `faucet_lineage_dropped_total`.
+    /// and counted via `faucet_lineage_dropped_total`. An event turned off by
+    /// `emit_on` is not a failure: it is counted in
+    /// `faucet_lineage_events_skipped_total` instead.
     pub async fn emit(&self, ev: EventType, ctx: &RunLifecycle) {
         if !self.enabled(ev) {
-            counter!("faucet_lineage_dropped_total", "reason" => "disabled").increment(1);
+            counter!("faucet_lineage_events_skipped_total", "event_type" => event_label(ev))
+                .increment(1);
             return;
         }
         let event = self.build(ev, ctx);
@@ -394,6 +397,50 @@ mod tests {
         let em = LineageEmitter::new(c).unwrap();
         em.emit(EventType::Running, &lifecycle()).await; // disabled → nothing written
         assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabled_event_counts_as_skipped_not_dropped() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path().join("ol.jsonl"));
+        c.emit_on.start = false;
+        let em = LineageEmitter::new(c).unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(em.emit(EventType::Start, &lifecycle()));
+        });
+        let counters: Vec<(String, Vec<String>, u64)> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(n) => Some((
+                    k.key().name().to_string(),
+                    k.key().labels().map(|l| l.value().to_string()).collect(),
+                    n,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !counters
+                .iter()
+                .any(|(name, _, _)| name == "faucet_lineage_dropped_total"),
+            "{counters:?}"
+        );
+        assert!(
+            counters.iter().any(
+                |(name, labels, n)| name == "faucet_lineage_events_skipped_total"
+                    && labels == &["start".to_string()]
+                    && *n == 1
+            ),
+            "{counters:?}"
+        );
     }
 
     async fn emitted(

@@ -273,12 +273,13 @@ lineage:
 Emitted via the [`metrics`](https://docs.rs/metrics) facade (scraped through the standard faucet-stream observability exporter):
 
 - `faucet_lineage_events_total{event_type, outcome}` — events sent; `outcome` ∈ `ok | err`.
-- `faucet_lineage_dropped_total{reason}` — dropped events; `reason` ∈ `disabled | transport_error`.
+- `faucet_lineage_dropped_total{reason}` — events lost to a transport or serialization failure; `reason` = `transport_error`.
+- `faucet_lineage_events_skipped_total{event_type}` — events turned off by `emit_on` (not a failure).
 - `faucet_lineage_emit_duration_seconds{event_type}` — per-event send-latency histogram.
 
 ## Emission never fails a run
 
-Lineage is observability, not a data path. [`LineageEmitter::emit`] returns no error: a transport failure (HTTP non-2xx, unreachable file, Kafka send error), a serialization failure, or a disabled event is logged and counted (`faucet_lineage_dropped_total`), then dropped. A broken lineage backend can never abort or stall a pipeline.
+Lineage is observability, not a data path. [`LineageEmitter::emit`] returns no error: a transport failure (HTTP non-2xx, unreachable file, Kafka send error), or a serialization failure is logged and counted (`faucet_lineage_dropped_total`), then dropped. An event turned off by `emit_on` is skipped and counted separately (`faucet_lineage_events_skipped_total`), so it never looks like a failure. A broken lineage backend can never abort or stall a pipeline.
 
 ## Library usage
 

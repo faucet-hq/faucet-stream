@@ -35,6 +35,7 @@ wiremock = "0.6"
 faucet-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+metrics-util.workspace = true
 
 [features]
 default = []
