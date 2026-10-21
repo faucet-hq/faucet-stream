@@ -20,6 +20,11 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
+/// How long the startup pull of one template-sync origin may take before the
+/// server opens its listener without it.
+#[cfg(feature = "templates-sync")]
+const INITIAL_TEMPLATE_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Build the full router: unauthenticated probes + the bearer-guarded `/v1` API.
 pub fn build_router(
     state: ServerState,
@@ -898,9 +903,21 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             let store: crate::templates::TemplateStore = state.history();
             for origin in &file.origins {
                 let synced = crate::templates::sync::sync_origin(&store, origin, false, None);
-                let synced = match state.test_policy() {
-                    Some(p) => crate::template_tests::trust::with_server_policy(p, synced).await,
-                    None => synced.await,
+                let synced = async {
+                    match state.test_policy() {
+                        Some(p) => {
+                            crate::template_tests::trust::with_server_policy(p, synced).await
+                        }
+                        None => synced.await,
+                    }
+                };
+                let synced = match tokio::time::timeout(INITIAL_TEMPLATE_SYNC_TIMEOUT, synced).await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(CliError::Config(format!(
+                        "no answer within {}s; the periodic pull retries it",
+                        INITIAL_TEMPLATE_SYNC_TIMEOUT.as_secs()
+                    ))),
                 };
                 match synced {
                     Ok(r) => tracing::info!(

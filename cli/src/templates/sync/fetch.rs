@@ -335,16 +335,33 @@ struct ContentsEntry {
     sha: Option<String>,
 }
 
+/// How long a GitHub connection may take to open.
+pub const GITHUB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one GitHub request (headers and body) may take.
+pub const GITHUB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl GithubFetcher {
     pub fn new(cfg: &GithubSource) -> CliResult<Self> {
+        Self::with_timeout(cfg, GITHUB_REQUEST_TIMEOUT)
+    }
+
+    /// [`new`](Self::new) with a per-request timeout.
+    pub fn with_timeout(
+        cfg: &GithubSource,
+        request_timeout: std::time::Duration,
+    ) -> CliResult<Self> {
         if cfg.repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
             return Err(CliError::Config(format!(
                 "templates-sync github: `repo` must be `owner/name`, got '{}'",
                 cfg.repo
             )));
         }
+        // Bounded: `faucet serve` pulls every origin before its listener
+        // opens, so a connection that never answers must fail, not hang.
         let client = faucet_core::http::Client::builder()
             .user_agent(concat!("faucet-stream/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+            .timeout(request_timeout)
             .build_reqwest()
             .map_err(|e| io_err("github", format!("building HTTP client: {e}")))?;
         Ok(Self {
@@ -1357,6 +1374,31 @@ mod tests {
         let bad = GithubFetcher::new(&src(vec!["s".into()], "acme/bad")).unwrap();
         let err = bad.catalog_index().await.unwrap_err().to_string();
         assert!(err.contains("decoding index.json"), "{err}");
+    }
+
+    /// A GitHub endpoint that never answers fails the request instead of
+    /// hanging the pull (and with it `faucet serve` startup).
+    #[tokio::test]
+    async fn a_github_request_that_never_answers_times_out() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let src = GithubSource {
+            repo: "acme/hub".into(),
+            r#ref: "main".into(),
+            path: String::new(),
+            paths: vec!["s".into()],
+            token: None,
+            api_base: server.uri(),
+        };
+        let f = GithubFetcher::with_timeout(&src, std::time::Duration::from_millis(200)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(f.catalog_index().await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     /// The ref is resolved to a commit once and every listing and download
