@@ -281,15 +281,19 @@ pub async fn replay(
     )
     .await?;
 
+    let records_written = summary.invocations.iter().map(|i| i.records_written).sum();
     if summary.had_failures() {
-        let detail = summary
+        let error = summary
             .invocations
             .iter()
             .find_map(|i| i.error.clone())
             .unwrap_or_else(|| "unknown error".to_string());
-        return Err(CliError::Internal(format!("dlq replay failed: {detail}")));
+        return Err(CliError::ReplayFailed {
+            records_written,
+            candidates,
+            error,
+        });
     }
-    let records_written = summary.invocations.iter().map(|i| i.records_written).sum();
 
     Ok(ReplayOutcome {
         candidates,

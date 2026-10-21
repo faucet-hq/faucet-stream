@@ -1145,6 +1145,12 @@ pub(crate) mod replay {
             match outcome {
                 Ok(o) => rec.records_written = o.records_written as u64,
                 Err(e) => {
+                    if let CliError::ReplayFailed {
+                        records_written, ..
+                    } = e
+                    {
+                        rec.records_written = *records_written as u64;
+                    }
                     rec.error = Some(crate::secrets::registry::redact_message(&e.to_string()))
                 }
             }

@@ -94,6 +94,46 @@ async fn replay_lands_payloads_in_the_sink() {
 }
 
 #[tokio::test]
+async fn a_failed_replay_reports_how_many_rows_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let out = dir.path().join("out.jsonl");
+    write_file(
+        &dlq,
+        &format!(
+            "{}\n{}\n",
+            envelope("quality", "QualityFailure", json!({"id": 1})),
+            envelope("quality", "QualityFailure", json!({"id": 2})),
+        ),
+    );
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n",
+        out.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let mut inputs = inputs("replay", false).await;
+    inputs.budget = Some(serde_json::from_value(json!({"max_records": 1})).unwrap());
+    let err = dlq_replay::replay(&cfg, dlq.to_str().unwrap(), inputs)
+        .await
+        .unwrap_err();
+    match &err {
+        faucet_cli::error::CliError::ReplayFailed {
+            records_written,
+            candidates,
+            ..
+        } => {
+            assert_eq!(*records_written, read_lines(&out).len());
+            assert_eq!(*candidates, 2);
+        }
+        other => panic!("expected ReplayFailed, got {other:?}"),
+    }
+    assert!(
+        err.to_string().contains("of 2 candidate record(s)"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn replay_dry_run_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let dlq = dir.path().join("dlq.jsonl");
