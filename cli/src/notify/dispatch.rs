@@ -34,7 +34,7 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// A compiled, ready-to-fire set of notification rules.
 pub struct Notifier {
     rules: Vec<NotificationSpec>,
-    client: reqwest::Client,
+    client: faucet_core::http::Client,
     timeout: Duration,
     /// (rule.name + dedupe_key) → last leading-edge send instant.
     dedupe: Mutex<HashMap<String, Instant>>,
@@ -56,7 +56,7 @@ impl Notifier {
             // A generous ceiling; the per-attempt `timeout` below is the real
             // bound. Never let a hung notifier wedge the process on drop.
             .timeout(DEFAULT_TIMEOUT * MAX_ATTEMPTS + Duration::from_secs(5))
-            .build_reqwest()
+            .build()
             .map_err(|e| crate::error::CliError::Internal(format!("notify http client: {e}")))?;
         Ok(Some(Arc::new(Notifier {
             rules: specs.to_vec(),

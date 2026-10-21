@@ -262,7 +262,8 @@ typed fields. A transform's config is read the same way (a `sql` transform's
 lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,
 a `flow` provider's `steps[].request.url` and `base_url_from`, a service
 account's `token_uri` — in the config or inside `key_json`), a transform that
-reads a file (`lookup`'s `jsonl`), and the `reconcile:` count probe (a SQL probe
+reads a file (`lookup`'s `jsonl`), every notification channel URL (a webhook
+`url`, a Slack `webhook_url`, a PagerDuty `endpoint`), and the `reconcile:` count probe (a SQL probe
 runs sandboxed like every other SQL connector). An `auth:` provider in a
 caller's config may not name a local file at all: pass a service-account key
 inline as `key_json` rather than `key_file`, and leave out `oauth2_refresh`'s

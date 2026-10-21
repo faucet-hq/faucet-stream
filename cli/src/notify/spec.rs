@@ -280,6 +280,18 @@ impl NotificationSpec {
             ChannelSpec::Pagerduty(c) if c.routing_key.trim().is_empty() => bad("routing_key"),
             ChannelSpec::Webhook(c) if c.url.trim().is_empty() => bad("url"),
             ChannelSpec::Webhook(c) if c.method.trim().is_empty() => bad("method"),
+            ChannelSpec::Webhook(c)
+                if !WEBHOOK_METHODS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(c.method.trim())) =>
+            {
+                Err(CliError::Config(format!(
+                    "notifications rule `{}`: `method` must be one of {} (got `{}`)",
+                    self.name,
+                    WEBHOOK_METHODS.join(", "),
+                    c.method
+                )))
+            }
             ChannelSpec::Webhook(c) => {
                 // Reject a reserved key rather than silently dropping it at
                 // render time: `extra_fields: { event: "ok" }` would otherwise
@@ -297,6 +309,21 @@ impl NotificationSpec {
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+}
+
+/// The HTTP methods a webhook channel may use: a notification delivers a
+/// body, it never reads or deletes.
+pub const WEBHOOK_METHODS: &[&str] = &["POST", "PUT", "PATCH"];
+
+impl ChannelSpec {
+    /// The URL this channel sends to (`None` = the PagerDuty default).
+    pub fn target_url(&self) -> Option<&str> {
+        match self {
+            ChannelSpec::Slack(c) => Some(&c.webhook_url),
+            ChannelSpec::Webhook(c) => Some(&c.url),
+            ChannelSpec::Pagerduty(c) => c.endpoint.as_deref(),
         }
     }
 }
@@ -346,6 +373,29 @@ mod tests {
     #[test]
     fn channel_kind_labels() {
         assert_eq!(slack("a", "u").channel.kind(), "slack");
+    }
+
+    #[test]
+    fn a_webhook_method_must_deliver_a_body() {
+        let hook = |method: &str| NotificationSpec {
+            channel: ChannelSpec::Webhook(
+                serde_json::from_value(serde_json::json!({"url": "http://h", "method": method}))
+                    .unwrap(),
+            ),
+            ..slack("w", "u")
+        };
+        for ok in ["POST", "put", "PATCH"] {
+            hook(ok).validate().unwrap();
+        }
+        for bad in ["DELETE", "GET", "HEAD"] {
+            let err = hook(bad).validate().unwrap_err().to_string();
+            assert!(err.contains("must be one of"), "{err}");
+        }
+        assert_eq!(hook("POST").channel.target_url(), Some("http://h"));
+        assert_eq!(
+            slack("s", "http://s").channel.target_url(),
+            Some("http://s")
+        );
     }
 
     #[test]

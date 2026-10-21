@@ -8,8 +8,8 @@
 use super::render::{self, PdAction};
 use super::spec::{PagerdutyConfig, SlackConfig, WebhookConfig};
 use crate::notify::event::NotifyEvent;
+use faucet_core::http::Client;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
 use serde_json::Value;
 use sha2::Sha256;
 
@@ -60,7 +60,7 @@ pub async fn send_webhook(
         ));
     }
 
-    let method = reqwest::Method::from_bytes(cfg.method.as_bytes())
+    let method = reqwest::Method::from_bytes(cfg.method.trim().to_ascii_uppercase().as_bytes())
         .map_err(|_| format!("invalid HTTP method `{}`", cfg.method))?;
     let mut req = client
         .request(method, &cfg.url)
@@ -69,7 +69,7 @@ pub async fn send_webhook(
     for (k, v) in &headers {
         req = req.header(k, v);
     }
-    let resp = req.send().await.map_err(request_failed)?;
+    let resp = client.send(req).await.map_err(request_failed)?;
     check_status(resp).await
 }
 
@@ -84,14 +84,22 @@ async fn post_json(
     for (k, v) in headers {
         req = req.header(k, v);
     }
-    let resp = req.send().await.map_err(request_failed)?;
+    let resp = client.send(req).await.map_err(request_failed)?;
     check_status(resp).await
 }
 
-/// A transport error, without the request URL: a channel URL (a Slack
-/// incoming webhook) is itself a credential, and this text is logged.
-fn request_failed(e: reqwest::Error) -> String {
-    format!("request failed: {}", e.without_url())
+/// A failed request, without the request URL: a channel URL (a Slack
+/// incoming webhook) is itself a credential, and this text is logged. Sent
+/// through [`Client::send`], so the reference policy in scope (a run a caller
+/// submitted to `faucet serve`) applies to every channel URL and redirect.
+fn request_failed(e: faucet_core::FaucetError) -> String {
+    match e {
+        faucet_core::FaucetError::Http(e) => format!("request failed: {}", e.without_url()),
+        faucet_core::FaucetError::Config(_) => {
+            "request refused: the channel URL is outside the server's reference policy".into()
+        }
+        _ => "request failed".into(),
+    }
 }
 
 /// A 2xx is success; anything else is an error carrying the status + a short
@@ -132,7 +140,7 @@ mod tests {
             username: None,
         };
         let err = send_slack(
-            &Client::new(),
+            &Client::new().unwrap(),
             &cfg,
             &crate::notify::NotifyEvent::run_failure("p", "", "s", "m"),
         )
@@ -141,6 +149,30 @@ mod tests {
         assert!(err.starts_with("request failed"), "{err}");
         assert!(!err.contains("SECRETTOKEN"), "{err}");
         assert!(!err.contains("127.0.0.1"), "{err}");
+    }
+
+    /// A channel URL outside the reference policy in scope is refused
+    /// before any request is made.
+    #[tokio::test]
+    async fn a_channel_url_outside_the_scoped_reference_policy_is_refused() {
+        let cfg: WebhookConfig = serde_json::from_value(serde_json::json!({
+            "url": "http://169.254.169.254/latest/meta-data/",
+            "method": "POST"
+        }))
+        .unwrap();
+        let policy = std::sync::Arc::new(faucet_core::resolve::ReferencePolicy::deny_all());
+        let err = faucet_core::http::with_reference_policy(
+            policy,
+            send_webhook(
+                &Client::new().unwrap(),
+                &cfg,
+                &crate::notify::NotifyEvent::run_failure("p", "", "s", "m"),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.starts_with("request refused"), "{err}");
+        assert!(!err.contains("169.254"), "{err}");
     }
 
     #[test]

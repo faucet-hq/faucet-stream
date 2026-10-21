@@ -134,7 +134,7 @@ channel:
   type: webhook
   config:
     url: "https://ops.example.com/hooks/faucet"
-    method: POST                              # default POST
+    method: POST                              # POST (default), PUT or PATCH
     headers: { X-Env: prod }                  # optional extra headers
     hmac_secret: "${env:FAUCET_WEBHOOK_SECRET}"
     signature_header: "X-Faucet-Signature"    # default

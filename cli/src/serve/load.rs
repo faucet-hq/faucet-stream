@@ -1284,6 +1284,39 @@ pub fn screen_auth_providers<'a>(
     )))
 }
 
+/// Refuse a notification channel whose URL the reference policy does not
+/// allow: a submitted config's `notifications:` are requests the server makes.
+#[cfg(feature = "notify")]
+pub fn screen_notifications(
+    cfg: &PipelineConfig,
+    policy: &ReferencePolicy,
+) -> Result<(), ServeError> {
+    let mut refused: Vec<String> = cfg
+        .notifications
+        .iter()
+        .filter_map(|n| {
+            let url = n.channel.target_url()?;
+            let e = policy.check_url(url).err()?;
+            Some(format!(
+                "notifications `{}` ({}): {}",
+                n.name,
+                n.channel.kind(),
+                e.reason
+            ))
+        })
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    refused.sort();
+    Err(ServeError::Forbidden(format!(
+        "the config's notification channels send to URLs a submitted config may not reach \
+         under the server's reference policy: {}; the operator can allow them with \
+         --allow-url-host / --allow-url-scheme",
+        refused.join(", ")
+    )))
+}
+
 /// Refuse the connectors in `doc` that run a program (#881: a `command`
 /// field in their schema) unless `policy` allows it.
 pub fn screen_subprocess(
@@ -1629,6 +1662,10 @@ pub async fn load_submission_with(
             by_caller,
         )?;
     }
+
+    // Notification channels send to URLs from the body too.
+    #[cfg(feature = "notify")]
+    screen_notifications(&cfg, &refs)?;
 
     // 5a. A tenant's connections join the auth catalog (#709), after secrets
     // resolution so an unsealed credential is never scanned for directives.
@@ -2780,6 +2817,31 @@ schedule:
         screen_auth_catalog(&cfg, &open).unwrap();
         let hosts = ReferencePolicy::open().with_url_hosts(["other.example.com"]);
         assert!(screen_auth_catalog(&cfg, &hosts).is_err());
+    }
+
+    #[cfg(feature = "notify")]
+    #[test]
+    fn notification_channel_urls_follow_the_url_policy() {
+        let cfg = PipelineConfig::from_value(serde_json::json!({
+            "version": 1,
+            "notifications": [
+                {"name": "ok", "channel": {"type": "webhook", "config": {"url": "https://hooks.example.com/x"}}},
+                {"name": "meta", "channel": {"type": "slack", "config": {"webhook_url": "http://169.254.169.254/x"}}},
+                {"name": "pd", "channel": {"type": "pagerduty", "config": {"routing_key": "k"}}}
+            ],
+            "pipeline": {"source": {"type": "rest", "config": {}}, "sink": {"type": "stdout", "config": {}}}
+        }))
+        .unwrap();
+        let hosts = ReferencePolicy::open().with_url_hosts(["hooks.example.com"]);
+        let err = screen_notifications(&cfg, &hosts).unwrap_err().to_string();
+        assert!(
+            err.contains("notifications `meta` (slack)") && !err.contains("`ok`"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("`pd`"),
+            "the default endpoint is not a caller URL: {err}"
+        );
     }
 
     #[test]
