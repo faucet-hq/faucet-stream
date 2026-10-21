@@ -858,6 +858,23 @@ mod templates {
         }
     }
 
+    /// A version number is never handed out twice: deleting the newest
+    /// version (or the whole template) does not let a new body take it.
+    #[tokio::test]
+    async fn a_deleted_version_number_is_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-hwm.db").await;
+        for _ in 0..2 {
+            s.template_register(&draft("orders", None)).await.unwrap();
+        }
+        s.template_delete("orders", Some(2)).await.unwrap();
+        let next = s.template_register(&draft("orders", None)).await.unwrap();
+        assert_eq!(next.version, 3);
+        s.template_delete("orders", None).await.unwrap();
+        let again = s.template_register(&draft("orders", None)).await.unwrap();
+        assert_eq!(again.version, 4);
+    }
+
     #[tokio::test]
     async fn launch_log_drives_stable_previous_and_status() {
         let dir = tempfile::tempdir().unwrap();

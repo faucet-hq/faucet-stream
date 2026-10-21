@@ -67,6 +67,9 @@ pub struct MemoryHistory {
     /// Pipeline-template registry (#444): id → version → record. One `Mutex`
     /// keeps version assignment atomic (read-max-then-insert).
     templates: Mutex<std::collections::HashMap<String, BTreeMap<u32, templates::TemplateRecord>>>,
+    /// The highest version ever assigned per template id, kept past deletes
+    /// so a number is never handed out twice.
+    template_hwm: Mutex<std::collections::HashMap<String, u32>>,
     /// Named channel pointers (#444): template id → tag → version. Guarded by
     /// the same lock as `templates` would be if it mattered; a separate `Mutex` is
     /// fine because a tag is only ever written after its version exists.
@@ -154,6 +157,7 @@ impl MemoryHistory {
             audit: Mutex::new(VecDeque::new()),
             catalog: Mutex::new(CatalogState::default()),
             templates: Mutex::new(std::collections::HashMap::new()),
+            template_hwm: Mutex::new(std::collections::HashMap::new()),
             template_tags: Mutex::new(std::collections::HashMap::new()),
             template_launches: Mutex::new(std::collections::HashMap::new()),
             template_deprecations: Mutex::new(std::collections::HashMap::new()),
@@ -1317,8 +1321,14 @@ impl RunHistory for MemoryHistory {
                 .lock()
                 .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
             let id = draft.id.to_string();
+            let mut hwm = self
+                .template_hwm
+                .lock()
+                .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
             let versions = store.entry(id.clone()).or_default();
-            let next = versions.keys().copied().max().unwrap_or(0) + 1;
+            let high = hwm.entry(id.clone()).or_default();
+            let next = versions.keys().copied().max().unwrap_or(0).max(*high) + 1;
+            *high = next;
             let record = templates::TemplateRecord {
                 id,
                 version: next,
@@ -1819,6 +1829,29 @@ fn version_results(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_deleted_version_number_is_never_reused() {
+        use crate::serve::history::templates::{TemplateDraft, TemplateId};
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        let draft = TemplateDraft {
+            id: TemplateId::parse("orders").unwrap(),
+            name: None,
+            description: None,
+            body: "version: 1\n".into(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+            kind: crate::hub::TemplateKind::Pipeline,
+        };
+        for _ in 0..2 {
+            h.template_register(&draft).await.unwrap();
+        }
+        h.template_delete("orders", Some(2)).await.unwrap();
+        assert_eq!(h.template_register(&draft).await.unwrap().version, 3);
+        h.template_delete("orders", None).await.unwrap();
+        assert_eq!(h.template_register(&draft).await.unwrap().version, 4);
+    }
+
     use super::*;
     use crate::serve::history::RunStatus;
     use std::collections::BTreeMap;

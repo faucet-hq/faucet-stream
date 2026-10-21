@@ -1646,8 +1646,10 @@ impl Stmts {
             catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
             catalog_delete_config_snapshot:
                 "DELETE FROM faucet_config_snapshots WHERE pipeline=$1".into(),
-            template_max_version: "SELECT COALESCE(MAX(CAST(version AS BIGINT)), 0) AS v \
-                FROM faucet_templates WHERE id=$1"
+            template_max_version: "SELECT GREATEST(\
+                COALESCE((SELECT MAX(CAST(version AS BIGINT)) FROM faucet_templates WHERE id=$1), 0), \
+                COALESCE((SELECT CAST(value AS BIGINT) FROM faucet_serve_meta \
+                    WHERE key='template_hwm:' || $1), 0)) AS v"
                 .into(),
             template_insert: "INSERT INTO faucet_templates \
                 (id, version, name, created_at, body) VALUES ($1,$2,$3,$4,$5)"
@@ -2198,8 +2200,10 @@ impl Stmts {
             catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
             catalog_delete_config_snapshot:
                 "DELETE FROM faucet_config_snapshots WHERE pipeline=?".into(),
-            template_max_version: "SELECT COALESCE(MAX(CAST(version AS INTEGER)), 0) AS v \
-                FROM faucet_templates WHERE id=?"
+            template_max_version: "SELECT MAX(\
+                COALESCE((SELECT MAX(CAST(version AS INTEGER)) FROM faucet_templates WHERE id=?1), 0), \
+                COALESCE((SELECT CAST(value AS INTEGER) FROM faucet_serve_meta \
+                    WHERE key='template_hwm:' || ?1), 0)) AS v"
                 .into(),
             template_insert: "INSERT INTO faucet_templates \
                 (id, version, name, created_at, body) VALUES (?,?,?,?,?)"
@@ -5372,6 +5376,18 @@ macro_rules! impl_sql_history {
                         .bind(sql::encode_json(&record, "pipeline template")?)
                         .execute(&mut *tx)
                         .await;
+                    // The high-water mark outlives a deleted newest version,
+                    // so its number is never reassigned to another body.
+                    let insert = match insert {
+                        Ok(done) => sqlx::query(&self.stmts.meta_upsert)
+                            .bind(format!("template_hwm:{id}"))
+                            .bind(next.to_string())
+                            .bind(sql::fmt_ts(record.created_at))
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| done),
+                        Err(e) => Err(e),
+                    };
                     match insert {
                         Ok(_) => {
                             // The commit is as contention-prone as every other

@@ -628,8 +628,19 @@ async fn plan_template_launch(
     )
     .await
     .map_err(template_err)?;
+    // The body is part of the material: approval covers the document the
+    // reviewer saw, not just its version number.
+    let body = store
+        .template_get(&payload.id, Some(version))
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map(|r| sha_hex(&r.body))
+        .unwrap_or_default();
     Ok(ChangePlan {
-        material: sha_hex(&format!("{}\n{}\n{:?}", payload.id, version, st.stable)),
+        material: sha_hex(&format!(
+            "{}\n{}\n{:?}\n{}",
+            payload.id, version, st.stable, body
+        )),
         summary: json!({
             "template": payload.id,
             "target_version": version,
