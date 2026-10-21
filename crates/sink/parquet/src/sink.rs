@@ -110,9 +110,35 @@ struct WriterState {
     published: bool,
     /// The one-time warning about rewriting the single file was logged.
     warned_rewrite: bool,
+    /// Set when writing into the current file failed: the file lost or
+    /// duplicated bytes, so it was discarded together with rows already
+    /// accepted into it. Every later write and flush fails with this message,
+    /// so the run fails and no bookmark moves past those rows.
+    poisoned: Option<String>,
 }
 
 impl WriterState {
+    fn check_poisoned(&self) -> Result<(), FaucetError> {
+        match &self.poisoned {
+            Some(msg) => Err(FaucetError::Sink(format!(
+                "parquet sink: an earlier write into the current file failed and the file \
+                 was discarded ({msg}); the run cannot complete"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Discard the current file after a failed write and refuse everything
+    /// after it.
+    async fn poison(&mut self, msg: &str) {
+        if let Some(writer) = self.writer.take()
+            && let Err(e) = writer.into_inner().abort().await
+        {
+            tracing::warn!(error = %e, "parquet sink: aborting the failed upload also failed");
+        }
+        self.poisoned = Some(msg.to_string());
+    }
+
     fn new() -> Self {
         Self {
             schema: None,
@@ -122,6 +148,7 @@ impl WriterState {
             warned_fields: std::collections::HashSet::new(),
             published: false,
             warned_rewrite: false,
+            poisoned: None,
         }
     }
 }
@@ -365,6 +392,7 @@ impl ParquetDriver {
         state: &mut WriterState,
         batch: &RecordBatch,
     ) -> Result<usize, FaucetError> {
+        state.check_poisoned()?;
         if state.schema.is_none() {
             state.schema = Some(batch.schema());
         }
@@ -378,10 +406,12 @@ impl ParquetDriver {
 
         let estimated_size = {
             let writer = state.writer.as_mut().expect("writer set above");
-            writer
-                .write(batch)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("parquet write failed: {e}")))?;
+            if let Err(e) = writer.write(batch).await {
+                let msg = format!("parquet write failed: {e}");
+                state.poison(&msg).await;
+                return Err(FaucetError::Sink(msg));
+            }
+            let writer = state.writer.as_mut().expect("writer still set");
             // `bytes_written` only counts data already flushed to the
             // underlying sink; `in_progress_size` counts what is still
             // buffered in the active row group. We must sum both to know when
@@ -417,6 +447,7 @@ impl ParquetDriver {
     /// mid-file. `warned_fields` is reset too so a new file re-warns about any
     /// fields it still drops.
     async fn close_current(&self, state: &mut WriterState) -> Result<(), FaucetError> {
+        state.check_poisoned()?;
         if let Some(writer) = state.writer.take() {
             finish_or_abort(writer).await?;
             state.files_written += 1;
@@ -431,6 +462,7 @@ impl ParquetDriver {
     /// The object store renames the finished upload over the fixed path, so a
     /// reader (or a crash) sees either the previous complete file or this one.
     async fn publish(&self, state: &mut WriterState) -> Result<(), FaucetError> {
+        state.check_poisoned()?;
         let Some(writer) = state.writer.take() else {
             return Ok(());
         };
@@ -1754,6 +1786,31 @@ mod tests {
     /// `close_current` must reset the per-file state so the next file
     /// re-infers its own schema: `state.schema` and `warned_fields` cleared,
     /// `rows_in_current_file` reset, `files_written` incremented.
+    /// A failed write discards the current file and fails every later write
+    /// and flush, so a file missing bytes is never published and no bookmark
+    /// moves past the rows it held.
+    #[tokio::test]
+    async fn a_failed_write_poisons_the_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = ParquetSink::new(cfg(tmp.path())).await.unwrap();
+        sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+        {
+            let mut state = sink.d().state.lock().await;
+            state.poison("parquet write failed: disk full").await;
+            assert!(state.writer.is_none(), "the broken file is discarded");
+        }
+        let err = sink.write_batch(&[json!({"id": 2})]).await.unwrap_err();
+        assert!(err.to_string().contains("disk full"), "{err}");
+        let err = sink.flush().await.unwrap_err();
+        assert!(err.to_string().contains("the run cannot complete"), "{err}");
+        let published: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+            .collect();
+        assert!(published.is_empty(), "{published:?}");
+    }
+
     #[tokio::test]
     async fn close_current_resets_per_file_state() {
         let tmp = tempfile::tempdir().unwrap();

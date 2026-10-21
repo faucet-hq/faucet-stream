@@ -74,6 +74,9 @@ enum State {
     Buffer(Vec<u8>),
     Multipart(Multipart),
     Done,
+    /// A write failed: bytes may be missing or doubled, so the object must
+    /// never complete.
+    Failed(String),
 }
 
 /// An [`AsyncFileWriter`] over one object that can always be aborted.
@@ -111,8 +114,19 @@ impl AbortableUpload {
     pub(crate) async fn abort(&mut self) -> Result<(), object_store::Error> {
         match std::mem::replace(&mut self.state, State::Done) {
             State::Multipart(upload) => upload.abort().await,
-            State::Buffer(_) | State::Done => Ok(()),
+            State::Buffer(_) | State::Done | State::Failed(_) => Ok(()),
         }
+    }
+
+    /// Mark the upload failed after `e`, aborting a started multipart.
+    async fn fail(&mut self, e: object_store::Error) -> ParquetError {
+        let msg = e.to_string();
+        if let State::Multipart(upload) = std::mem::replace(&mut self.state, State::Failed(msg))
+            && let Err(abort) = upload.abort().await
+        {
+            tracing::warn!(error = %abort, "parquet sink: aborting the failed upload also failed");
+        }
+        external(e)
     }
 }
 
@@ -123,15 +137,16 @@ impl AsyncFileWriter for AbortableUpload {
                 State::Buffer(buf) => {
                     buf.extend_from_slice(&bs);
                     if buf.len() >= self.part_size {
-                        let buffer = std::mem::take(buf);
-                        let upload = self
-                            .store
-                            .put_multipart(&self.path)
-                            .await
-                            .map_err(external)?;
+                        let upload = match self.store.put_multipart(&self.path).await {
+                            Ok(upload) => upload,
+                            Err(e) => return Err(self.fail(e).await),
+                        };
+                        let State::Buffer(buf) = &mut self.state else {
+                            unreachable!("state is Buffer")
+                        };
                         let mut multipart = Multipart {
                             upload,
-                            buffer,
+                            buffer: std::mem::take(buf),
                             in_flight: JoinSet::new(),
                         };
                         multipart.send_part();
@@ -140,13 +155,14 @@ impl AsyncFileWriter for AbortableUpload {
                     Ok(())
                 }
                 State::Multipart(upload) => {
-                    upload.reap_finished().map_err(external)?;
+                    if let Err(e) = upload.reap_finished() {
+                        return Err(self.fail(e).await);
+                    }
                     upload.buffer.extend_from_slice(&bs);
                     if upload.buffer.len() >= self.part_size {
-                        upload
-                            .wait_until_below(MAX_CONCURRENT_PARTS - 1)
-                            .await
-                            .map_err(external)?;
+                        if let Err(e) = upload.wait_until_below(MAX_CONCURRENT_PARTS - 1).await {
+                            return Err(self.fail(e).await);
+                        }
                         upload.send_part();
                     }
                     Ok(())
@@ -154,6 +170,9 @@ impl AsyncFileWriter for AbortableUpload {
                 State::Done => Err(ParquetError::General(
                     "parquet upload already finished".into(),
                 )),
+                State::Failed(msg) => Err(ParquetError::General(format!(
+                    "parquet upload failed earlier: {msg}"
+                ))),
             }
         })
     }
@@ -185,6 +204,9 @@ impl AsyncFileWriter for AbortableUpload {
                     Ok(())
                 }
                 State::Done => Ok(()),
+                State::Failed(msg) => Err(ParquetError::General(format!(
+                    "parquet upload failed earlier: {msg}"
+                ))),
             }
         })
     }
@@ -272,6 +294,38 @@ mod tests {
         assert!(err.to_string().contains("put_part"), "{err}");
         failing.send_part();
         failing.abort().await.unwrap();
+    }
+
+    /// After a part fails, the upload never completes: a later write and
+    /// `complete` both fail, and no object appears, so a file missing (or
+    /// doubling) bytes is never published.
+    #[tokio::test]
+    async fn a_failed_part_poisons_the_upload() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("out.parquet");
+        let mut upload = AbortableUpload::with_part_size(store.clone(), path.clone(), 4);
+        upload.state = State::Multipart(Multipart {
+            upload: Box::new(Counting {
+                started: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            buffer: Vec::new(),
+            in_flight: JoinSet::new(),
+        });
+        upload.write(Bytes::from_static(b"abcd")).await.unwrap();
+        let mut failed = None;
+        for _ in 0..100 {
+            if let Err(e) = upload.write(Bytes::from_static(b"e")).await {
+                failed = Some(e);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(failed.is_some(), "the failed part surfaces");
+        assert!(matches!(upload.state, State::Failed(_)));
+        assert!(upload.write(Bytes::from_static(b"f")).await.is_err());
+        assert!(upload.complete().await.is_err());
+        assert!(store.head(&path).await.is_err(), "nothing was published");
     }
 
     #[test]
