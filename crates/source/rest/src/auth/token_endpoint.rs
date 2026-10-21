@@ -281,7 +281,7 @@ async fn fetch_token(
         };
         if !is_success {
             let status_code = status.as_u16();
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_text = super::token_error_body(resp).await;
             if attempt < TOKEN_MAX_ATTEMPTS && is_transient_token_status(status_code, &body_text) {
                 tracing::warn!(
                     status = status_code,

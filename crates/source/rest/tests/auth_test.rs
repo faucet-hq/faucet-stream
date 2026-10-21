@@ -198,3 +198,45 @@ fn token_endpoint_expiry_ratio_valid_accepted() {
     ));
     assert!(result.is_ok());
 }
+
+#[tokio::test]
+async fn failed_token_responses_are_bounded_and_masked_in_the_error() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let padding = "x".repeat(10_000);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+            r#"{{"error":"invalid_request","access_token":"LIVE-TOKEN","pad":"{padding}"}}"#
+        )))
+        .mount(&server)
+        .await;
+    let url = format!("{}/token", server.uri());
+
+    let err = faucet_source_rest::fetch_token_from_endpoint(
+        &url,
+        &reqwest::Method::POST,
+        &HeaderMap::new(),
+        None,
+        "$.token",
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(!err.contains("LIVE-TOKEN"), "{err}");
+    assert!(
+        err.contains("invalid_request") && err.contains("(truncated)"),
+        "{err}"
+    );
+    assert!(err.len() < 3_000, "{} bytes", err.len());
+
+    let err = faucet_source_rest::fetch_oauth2_token(&url, "id", "secret", &[])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("LIVE-TOKEN"), "{err}");
+    assert!(err.len() < 3_000, "{} bytes", err.len());
+}

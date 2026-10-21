@@ -159,7 +159,7 @@ async fn fetch_oauth2_token_inner_with_client(
         };
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = super::token_error_body(resp).await;
             if !last && is_transient_token_status(status, &body) {
                 tracing::warn!(
                     status,
