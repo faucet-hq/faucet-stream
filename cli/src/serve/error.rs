@@ -125,12 +125,11 @@ impl ServeError {
     }
 
     pub fn api_error(&self) -> ApiError {
-        // Scrub any resolved secret that reached the message or details.
-        let message = crate::secrets::registry::redact(&self.message()).into_owned();
-        let details = self.details().map(|d| {
-            let scrubbed = crate::secrets::registry::redact(&d.to_string()).into_owned();
-            serde_json::from_str(&scrubbed)
-                .unwrap_or_else(|_| serde_json::json!({ "redacted": true }))
+        // Scrub resolved secrets and URL credentials from the message and details.
+        let message = crate::secrets::registry::redact_message(&self.message());
+        let details = self.details().map(|mut d| {
+            redact_strings(&mut d);
+            d
         });
         ApiError {
             error: ApiErrorBody {
@@ -139,6 +138,15 @@ impl ServeError {
                 details,
             },
         }
+    }
+}
+
+fn redact_strings(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => *s = crate::secrets::registry::redact_message(s),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(redact_strings),
+        _ => {}
     }
 }
 
@@ -193,6 +201,20 @@ mod tests {
             ServeError::Internal("boom".into()).status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn url_credentials_are_scrubbed_from_message_and_details() {
+        let e = ServeError::Unprocessable {
+            message: "connect postgres://svc:hunter2@db/x failed".into(),
+            details: Some(serde_json::json!({
+                "rows": [{ "error": "GET https://h.example/p?api_key=k1 refused" }]
+            })),
+        };
+        let body = serde_json::to_string(&e.api_error()).unwrap();
+        assert!(!body.contains("hunter2"), "{body}");
+        assert!(!body.contains("k1 "), "{body}");
+        assert!(body.contains("db/x"), "{body}");
     }
 
     #[test]
