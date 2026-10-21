@@ -452,6 +452,9 @@ pub(crate) struct MongoDriver {
     /// must exist up front on MongoDB < 4.4; pre-creating keeps the
     /// exactly-once path portable and removes a first-run failure mode.
     eo_collections_ready: tokio::sync::OnceCell<()>,
+    /// The overwrite run this instance belongs to: staging is then
+    /// `<collection>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
 }
 
 impl MongoSink {
@@ -460,6 +463,17 @@ impl MongoSink {
         Ok(Self {
             inner: DriverSink::new(MongoDriver::new(config).await?),
         })
+    }
+
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in
+    /// `<collection>__faucet_ovw_<token>`, so a concurrent overwrite run of the
+    /// same collection neither drops nor shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.inner.driver_mut().overwrite_run = Some(token.to_string());
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -493,6 +507,7 @@ impl MongoDriver {
             config,
             client,
             eo_collections_ready: tokio::sync::OnceCell::new(),
+            overwrite_run: None,
         })
     }
 
@@ -694,8 +709,65 @@ impl MongoDriver {
         format!(
             "{}{}",
             self.config.collection,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+            faucet_core::idempotency::overwrite_staging_suffix(self.overwrite_run.as_deref())
         )
+    }
+
+    /// The database's collections named like any run's tokened staging of
+    /// the destination.
+    async fn tokened_staging(&self) -> Result<Vec<String>, FaucetError> {
+        let names = self
+            .client
+            .database(&self.config.database)
+            .list_collection_names()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("mongodb staging listing failed: {e}")))?;
+        Ok(names
+            .into_iter()
+            .filter(|n| {
+                faucet_core::idempotency::overwrite_staging_token(&self.config.collection, n)
+                    .is_some()
+            })
+            .collect())
+    }
+
+    /// At a tokened begin: drop the untokened staging an earlier release (or
+    /// a run without a token) left, and every tokened staging another run
+    /// abandoned ([`faucet_core::idempotency::abandoned_overwrite_staging`]).
+    /// A live run's staging and this run's own are never touched.
+    async fn sweep_staging(&self) -> Result<(), FaucetError> {
+        if self.overwrite_run.is_none() {
+            return Ok(());
+        }
+        let db = self.client.database(&self.config.database);
+        let legacy = format!(
+            "{}{}",
+            self.config.collection,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        );
+        ignore_error(
+            "mongodb overwrite: untokened staging drop before begin (ignored)",
+            db.collection::<Document>(&legacy).drop().await,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for name in self.tokened_staging().await? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                &self.config.collection,
+                &name,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                tracing::warn!(staging = %name, "mongodb overwrite: dropping staging an earlier run abandoned");
+                ignore_error(
+                    "mongodb overwrite: abandoned staging drop (ignored)",
+                    db.collection::<Document>(&name).drop().await,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The collection the append/insert path targets. For `write_mode:
@@ -1146,6 +1218,7 @@ impl StagingDriver for MongoDriver {
                         .drop()
                         .await,
                 );
+                self.sweep_staging().await?;
                 self.clone_destination_shape().await
             })
             .await
@@ -1197,7 +1270,8 @@ impl StagingDriver for MongoDriver {
             .await
     }
 
-    /// Probe for the `<collection>__faucet_ovw` staging collection (read-only).
+    /// Probe for this run's staging collection (read-only); without a run
+    /// token (the `faucet status` probe) the untokened staging or any run's.
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
         calls
             .call_once("overwrite_staging_exists", async {
@@ -1208,7 +1282,10 @@ impl StagingDriver for MongoDriver {
                     .filter(bson::doc! { "name": self.staging_collection() })
                     .await
                     .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
-                Ok(!names.is_empty())
+                if !names.is_empty() {
+                    return Ok(true);
+                }
+                Ok(self.overwrite_run.is_none() && !self.tokened_staging().await?.is_empty())
             })
             .await
     }

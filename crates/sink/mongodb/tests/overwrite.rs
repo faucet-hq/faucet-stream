@@ -316,3 +316,54 @@ async fn committing_without_staging_names_the_failed_swap() {
         "{err}"
     );
 }
+
+/// Two overwrite runs of one collection at once: each run's begin, writer
+/// and commit instances share its run token, so neither begin drops the
+/// other's staging and neither commit swaps in the other's documents. A
+/// tokened begin also drops the untokened staging and staging a crashed run
+/// abandoned.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_overwrite_runs_keep_their_own_documents() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (_c, uri) = start_mongo().await;
+    insert_docs(&uri, "docs", vec![doc! {"_id": 0, "name": "old"}]).await;
+    let abandoned = "docs__faucet_ovw_10000000aaaaaa";
+    insert_docs(&uri, abandoned, vec![doc! {"_id": 9, "name": "x"}]).await;
+    insert_docs(&uri, "docs__faucet_ovw", vec![doc! {"_id": 9, "name": "x"}]).await;
+    let sink = |token: String| {
+        let cfg = overwrite_config(&uri);
+        async move {
+            MongoSink::new(cfg)
+                .await
+                .unwrap()
+                .with_overwrite_run(&token)
+                .unwrap()
+        }
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    sink(a.clone()).await.begin_overwrite().await.unwrap();
+    sink(b.clone()).await.begin_overwrite().await.unwrap();
+    assert!(!collection_exists(&uri, abandoned).await);
+    assert!(!collection_exists(&uri, "docs__faucet_ovw").await);
+    let (wa, wb) = (sink(a.clone()).await, sink(b.clone()).await);
+    wa.write_batch(&[
+        serde_json::json!({"_id": 1, "name": "a1"}),
+        serde_json::json!({"_id": 2, "name": "a2"}),
+    ])
+    .await
+    .unwrap();
+    wb.write_batch(&[serde_json::json!({"_id": 3, "name": "b1"})])
+        .await
+        .unwrap();
+    // The status probe (no token) sees the live runs' staging.
+    let probe = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    assert_eq!(probe.overwrite_staging_exists().await.unwrap(), Some(true));
+    sink(a.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names(&uri, "docs").await, vec!["a1", "a2"]);
+    sink(b.clone()).await.commit_overwrite().await.unwrap();
+    assert_eq!(names(&uri, "docs").await, vec!["b1"]);
+    for t in [&a, &b] {
+        assert!(!collection_exists(&uri, &format!("docs__faucet_ovw_{t}")).await);
+    }
+    assert_eq!(probe.overwrite_staging_exists().await.unwrap(), Some(false));
+}
