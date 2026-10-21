@@ -751,7 +751,15 @@ async fn run_expanded_unredacted(
                     let uses_state = node.state.is_some() || opts.state_path_override.is_some();
                     let key = opts.state_scope.key(&opts.pipeline_name);
                     let state_key = key.clone().with_row(node.id.as_str()).render();
-                    validate_unit_state_key(&node.id, uses_state, &state_key)?;
+                    if let Err(e) = validate_unit_state_key(&node.id, uses_state, &state_key) {
+                        pre_outcomes.push(synthetic_outcome(
+                            &node.id,
+                            None,
+                            e.to_string(),
+                            classify_error(&e),
+                        ));
+                        continue;
+                    }
                     let legacy_state_keys = node
                         .legacy_state_ids
                         .iter()
@@ -787,10 +795,19 @@ async fn run_expanded_unredacted(
                     } else {
                         // Chained discovery (#531): fan out over the upstream
                         // dimensions, running the enumeration once per tuple.
-                        let resolved = match resolve_product_dims(dims, &discovered, id).await? {
-                            Some(r) => r,
-                            None => {
+                        let resolved = match resolve_product_dims(dims, &discovered, id).await {
+                            Ok(Some(r)) => r,
+                            Ok(None) => {
                                 skipped_subtrees.insert(id.clone());
+                                continue;
+                            }
+                            Err(e) => {
+                                pre_outcomes.push(synthetic_outcome(
+                                    id,
+                                    None,
+                                    e.to_string(),
+                                    classify_error(&e),
+                                ));
                                 continue;
                             }
                         };
@@ -822,10 +839,19 @@ async fn run_expanded_unredacted(
                     // are guaranteed present: each dim is in this row's
                     // `depends_on`, so a skipped/failed dim already skipped this
                     // row above. The guard inside is defensive.
-                    let resolved = match resolve_product_dims(dims, &discovered, id).await? {
-                        Some(r) => r,
-                        None => {
+                    let resolved = match resolve_product_dims(dims, &discovered, id).await {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
                             skipped_subtrees.insert(id.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            pre_outcomes.push(synthetic_outcome(
+                                id,
+                                None,
+                                e.to_string(),
+                                classify_error(&e),
+                            ));
                             continue;
                         }
                     };
@@ -948,7 +974,17 @@ async fn run_expanded_unredacted(
         let (overwrite_groups, overwrite_task_group) = if opts.dry_run {
             (Vec::new(), HashMap::new())
         } else {
-            plan_overwrite_groups(&units, opts.as_ref()).await?
+            let (plan, failed) = plan_overwrite_units(&units, opts.as_ref()).await;
+            if !failed.is_empty() {
+                let keys: HashSet<(String, Option<String>)> =
+                    failed.iter().map(|(k, _)| k.clone()).collect();
+                units.retain(|u| !keys.contains(&(u.node.id.clone(), u.parent_record_key.clone())));
+                for ((row, parent_key), e) in failed {
+                    let kind = classify_error(&e);
+                    pre_outcomes.push(synthetic_outcome(&row, parent_key, e.to_string(), kind));
+                }
+            }
+            plan
         };
         // A group whose begin fails does not run; the error becomes its
         // members' outcome rather than aborting the whole run (#789 CLI-80).
@@ -1595,7 +1631,29 @@ type OverwriteTaskGroup = HashMap<(String, Option<String>), usize>;
 /// (#552) The planned overwrite groups plus the invocation → group-index map.
 type OverwritePlan = (Vec<OverwriteGroup>, OverwriteTaskGroup);
 
+/// [`plan_overwrite_units`] that fails on the first unit whose destination
+/// does not resolve.
+#[cfg(test)]
 async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<OverwritePlan> {
+    let (plan, failed) = plan_overwrite_units(units, opts).await;
+    match failed.into_iter().next() {
+        Some((_, e)) => Err(e),
+        None => Ok(plan),
+    }
+}
+
+/// An invocation, by `(row_id, parent_key)`, whose overwrite destination did
+/// not resolve, with why.
+type OverwritePlanFailure = ((String, Option<String>), CliError);
+
+/// Plan the overwrite groups. A unit whose destination does not resolve (a
+/// parent record missing a field its sink names) is returned as a failure of
+/// that one invocation, not of the whole run.
+async fn plan_overwrite_units(
+    units: &[Unit],
+    opts: &ExecuteOptions,
+) -> (OverwritePlan, Vec<OverwritePlanFailure>) {
+    let mut failed: Vec<OverwritePlanFailure> = Vec::new();
     let mut groups: Vec<OverwriteGroup> = Vec::new();
     let mut task_group: HashMap<(String, Option<String>), usize> = HashMap::new();
     let mut index_by_key: HashMap<String, usize> = HashMap::new();
@@ -1609,7 +1667,13 @@ async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResu
             continue;
         }
         let kind = unit.node.sink.kind.clone();
-        let cfg = resolved_sink_destination(unit, opts)?;
+        let cfg = match resolved_sink_destination(unit, opts) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                failed.push(((unit.node.id.clone(), unit.parent_record_key.clone()), e));
+                continue;
+            }
+        };
         // Keyed on the destination identity, not the whole config: two rows
         // on one table that differ only in a write knob (`batch_size`, `key`)
         // stage into the same `{table}__faucet_ovw`, so they must share one
@@ -1654,7 +1718,7 @@ async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResu
         }
         task_group.insert((unit.node.id.clone(), unit.parent_record_key.clone()), gi);
     }
-    Ok((groups, task_group))
+    ((groups, task_group), failed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5238,6 +5302,38 @@ mod tests {
             vec!["OLD".to_string()],
             "destination must be unchanged: {vs:?}"
         );
+    }
+
+    /// A parent record missing a field an overwrite child's sink names fails
+    /// that one invocation; the run still returns every other outcome.
+    #[tokio::test]
+    async fn an_unresolvable_overwrite_destination_fails_only_its_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite:{}", dir.path().join("ow.db").display());
+        std::fs::write(
+            dir.path().join("parents.jsonl"),
+            "{\"id\":\"1\",\"region\":\"eu\"}\n{\"id\":\"2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("child.csv"), "id,v\n1,A\n").unwrap();
+        let yaml = format!(
+            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\npipeline:\n  sources:\n    parents: {{ type: file, config: {{ path: '{p}' }} }}\n    child: {{ type: csv, config: {{ path: '{c}' }} }}\n  sinks:\n    trash: {{ type: jsonl, config: {{ path: '{t}' }} }}\n    dst: {{ type: sqlite, config: {{ database_url: '{db_url}?mode=rwc', table_name: 't_${{p.region}}', column_mapping: auto_map, create_table: true, write_mode: overwrite }} }}\nmatrix:\n  - id: p\n    source: {{ ref: parents }}\n    sink: {{ ref: trash }}\n  - id: c\n    parent: p\n    parent_key: id\n    source: {{ ref: child }}\n    sink: {{ ref: dst }}\n",
+            p = dir.path().join("parents.jsonl").display(),
+            c = dir.path().join("child.csv").display(),
+            t = dir.path().join("trash.jsonl").display(),
+        );
+        let summary = run_yaml(&yaml, &dir.path().join("ow.yaml")).await;
+        let row = |id: &str, key: Option<&str>| {
+            summary
+                .invocations
+                .iter()
+                .find(|o| o.row_id == id && o.parent_record_key.as_deref() == key)
+                .unwrap_or_else(|| panic!("{id} {key:?}: {summary:?}"))
+        };
+        assert!(row("p", None).error.is_none(), "{summary:?}");
+        assert!(row("c", Some("1")).error.is_none(), "{summary:?}");
+        let failed = row("c", Some("2"));
+        assert!(failed.error.as_deref().unwrap().contains("region"), "{failed:?}");
     }
 
     /// The invocation future must stay small enough to be *constructed* on a
