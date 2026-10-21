@@ -820,3 +820,52 @@ async fn a_cycle_ending_on_an_undecided_xa_names_it_for_xa_commit() {
     assert!(out.contains("undecided XA transaction"), "{out}");
     assert!(out.contains("xid=X'68656c64',X'',1"), "{out}");
 }
+
+/// A busy server whose changes are all filtered out by `include_tables`
+/// still ends the cycle after `idle_timeout`, and the filtered commits move
+/// the emitted bookmark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_traffic_ends_the_cycle_and_moves_the_bookmark() {
+    let (_container, url) = start_mysql_cdc().await;
+    let mut conn = connect(&url).await;
+    conn.query_drop("CREATE TABLE quiet (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE busy (id INT AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    let start = MysqlCdcSource::new(build_config(&url))
+        .await
+        .unwrap()
+        .capture_resume_position()
+        .await
+        .unwrap()
+        .expect("position");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (stop, url) = (stop.clone(), url.clone());
+        tokio::spawn(async move {
+            let mut conn = connect(&url).await;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                conn.query_drop("INSERT INTO busy (v) VALUES (1)")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
+
+    let mut cfg = build_config(&url);
+    cfg.include_tables = vec!["test.quiet".into()];
+    cfg.idle_timeout = Duration::from_secs(3);
+    let source = MysqlCdcSource::new(cfg).await.unwrap();
+    source.apply_start_bookmark(start.clone()).await.unwrap();
+    let drained = tokio::time::timeout(Duration::from_secs(60), drain(&source)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+    let (records, bookmark) = drained.expect("the cycle ends despite filtered traffic");
+    assert!(records.is_empty(), "{records:?}");
+    let bookmark = bookmark.expect("filtered commits move the bookmark");
+    assert_ne!(bookmark, start);
+}

@@ -4,7 +4,9 @@
 //! transactions are coalesced into one page until it holds `batch_size`
 //! records (a transaction is never split) or the oldest one has waited
 //! `max_age`. A transaction with no captured rows only moves the pending
-//! bookmark. While an XA transaction is prepared but not yet decided, later
+//! bookmark; a page holding only such progress is emitted after
+//! [`PROGRESS_MAX_AGE`], so the persisted position keeps up with a busy
+//! server whose changes are all filtered out. While an XA transaction is prepared but not yet decided, later
 //! transactions are held back in commit order, so no bookmark is ever emitted
 //! past rows whose outcome is unknown.
 
@@ -13,6 +15,10 @@ use crate::state::Bookmark;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+
+/// How long bookmark-only progress (transactions with no captured rows) may
+/// wait before it is emitted on its own page.
+pub(crate) const PROGRESS_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// A page ready to be yielded.
 #[derive(Debug, PartialEq)]
@@ -29,6 +35,8 @@ pub(crate) struct PageBuilder {
     records: Vec<Value>,
     bookmark: Option<Bookmark>,
     oldest: Option<Instant>,
+    /// When the pending bookmark first moved (with or without rows).
+    progress_since: Option<Instant>,
     /// Prepared XA transactions: their rows and the txid they were given.
     prepared: BTreeMap<XaId, Vec<Value>>,
     /// When each prepared XA transaction was seen.
@@ -49,6 +57,7 @@ impl PageBuilder {
             records: Vec::new(),
             bookmark: None,
             oldest: None,
+            progress_since: None,
             prepared: BTreeMap::new(),
             prepared_at: BTreeMap::new(),
             held: Vec::new(),
@@ -113,6 +122,7 @@ impl PageBuilder {
         if !rows.is_empty() && self.oldest.is_none() {
             self.oldest = Some(now);
         }
+        self.progress_since.get_or_insert(now);
         self.records.extend(rows);
         self.bookmark = Some(bookmark);
         if self.batch_size != 0 && self.records.len() >= self.batch_size {
@@ -182,28 +192,37 @@ impl PageBuilder {
         (known, pages)
     }
 
-    /// Whether the pending page has waited `max_age` (never in accumulate-all
-    /// mode).
+    /// When the pending page falls due: `max_age` after its oldest records,
+    /// or [`PROGRESS_MAX_AGE`] after bookmark-only progress began. Never in
+    /// accumulate-all mode.
+    fn due_at(&self) -> Option<Instant> {
+        if self.batch_size == 0 {
+            return None;
+        }
+        match self.oldest {
+            Some(t) => Some(t + self.max_age),
+            None => self
+                .progress_since
+                .filter(|_| self.bookmark.is_some())
+                .map(|t| t + PROGRESS_MAX_AGE),
+        }
+    }
+
+    /// Whether the pending page is due.
     pub(crate) fn due(&self, now: Instant) -> bool {
-        self.batch_size != 0
-            && self
-                .oldest
-                .is_some_and(|t| now.duration_since(t) >= self.max_age)
+        self.due_at().is_some_and(|t| now >= t)
     }
 
     /// How long until the pending page is due, if one is pending.
     pub(crate) fn time_left(&self, now: Instant) -> Option<Duration> {
-        if self.batch_size == 0 {
-            return None;
-        }
-        self.oldest
-            .map(|t| self.max_age.saturating_sub(now.duration_since(t)))
+        self.due_at().map(|t| t.saturating_duration_since(now))
     }
 
     /// Take the pending page: records plus the newest committed bookmark
     /// (a bookmark-only page when only empty transactions committed).
     pub(crate) fn take(&mut self) -> Option<ReadyPage> {
         self.oldest = None;
+        self.progress_since = None;
         let bookmark = self.bookmark.take()?;
         Some(ReadyPage {
             records: std::mem::take(&mut self.records),
@@ -216,6 +235,31 @@ impl PageBuilder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Bookmark-only progress is emitted on its own page after
+    /// `PROGRESS_MAX_AGE`, so filtered-out traffic still moves the persisted
+    /// position; rows keep the short `max_age`.
+    #[test]
+    fn bookmark_only_progress_falls_due_after_the_progress_age() {
+        let t0 = Instant::now();
+        let mut b = PageBuilder::new(100, Duration::from_secs(1), None);
+        assert!(b.commit(Vec::new(), bm(10), t0).is_empty());
+        assert!(!b.due(t0 + Duration::from_secs(5)));
+        assert_eq!(b.time_left(t0), Some(PROGRESS_MAX_AGE));
+        assert!(
+            b.commit(Vec::new(), bm(20), t0 + Duration::from_secs(10))
+                .is_empty()
+        );
+        assert!(b.due(t0 + PROGRESS_MAX_AGE));
+        let page = b.take().unwrap();
+        assert!(page.records.is_empty());
+        assert_eq!(page.bookmark, bm(20));
+        assert_eq!(b.time_left(t0), None);
+        // A row-bearing commit after progress uses `max_age`.
+        b.commit(Vec::new(), bm(30), t0);
+        b.commit(vec![json!({"a": 1})], bm(40), t0 + Duration::from_secs(2));
+        assert!(b.due(t0 + Duration::from_secs(3)));
+    }
 
     fn bm(pos: u64) -> Bookmark {
         Bookmark::FilePos {
@@ -254,8 +298,8 @@ mod tests {
         let now = Instant::now();
         let mut b = PageBuilder::new(100, Duration::from_secs(1), None);
         b.commit(Vec::new(), bm(5), now);
-        assert!(!b.due(now), "nothing pending ages");
-        assert_eq!(b.time_left(now), None);
+        assert!(!b.due(now), "bookmark-only progress waits PROGRESS_MAX_AGE");
+        assert_eq!(b.time_left(now), Some(PROGRESS_MAX_AGE));
         b.commit(vec![json!(1)], bm(6), now);
         assert_eq!(b.time_left(now), Some(Duration::from_secs(1)));
         assert!(b.due(now + Duration::from_secs(2)));

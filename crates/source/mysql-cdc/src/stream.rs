@@ -430,7 +430,6 @@ impl MysqlCdcSource {
                 }
                 match next {
                     Ok(Some(Ok(event))) => {
-                        last_event = std::time::Instant::now();
                         let header = event.header();
                         let ts_ms = u64::from(header.timestamp()) * 1_000;
                         // Events decompressed from a Transaction_payload carry
@@ -580,6 +579,10 @@ impl MysqlCdcSource {
                                 if !self.config.table_included(&db, &table) {
                                     continue;
                                 }
+                                // Only captured changes keep the cycle alive:
+                                // a busy server whose changes are all filtered
+                                // out still reaches `idle_timeout`.
+                                last_event = std::time::Instant::now();
 
                                 let op = op_from_rows_event(&re);
                                 let lsn = json!({ "file": &current_file, "pos": log_pos });
@@ -654,6 +657,12 @@ impl MysqlCdcSource {
                         }
                         if pages.due(std::time::Instant::now()) {
                             emit!(pages.take());
+                        }
+                        // A stream that never pauses never lets the wait
+                        // above fire, so the idle timeout is checked here too.
+                        if std::time::Instant::now().duration_since(last_event) >= idle_timeout {
+                            emit!(pages.take());
+                            break;
                         }
                     }
                     Ok(Some(Err(e))) => {

@@ -193,7 +193,7 @@ Both lists must use fully-qualified names (e.g. `appdb.users`); an unqualified e
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `idle_timeout` | int (seconds) | `30` | End the fetch cycle after this long with no new events. The accumulated page is flushed and the bookmark saved. Must be `> 0`. |
+| `idle_timeout` | int (seconds) | `30` | End the fetch cycle after this long with no captured change (events of tables excluded by `include_tables` / `exclude_tables` do not count, so a busy server still ends the cycle). The accumulated page is flushed and the bookmark saved. Transactions with no captured rows still move the bookmark: on their own they are emitted as a bookmark-only page at most every 30 s. Must be `> 0`. |
 | `max_staged_records` | int \| null | `null` | Abort if a single in-progress transaction buffers more than this many rows. `null` = unbounded. Set it to guard against OOM on bulk transactions. Also caps the rows of transactions held behind an undecided XA transaction — not that transaction's own rows (1,000,000 when `null`). |
 | `batch_size` | int | `1000` | Records per page: committed transactions are coalesced until a page holds at least this many (a transaction is never split) or its oldest transaction has waited one second. `0` = accumulate all committed transactions into one trailing page (useful for tiny lookup tables). |
 
