@@ -27,9 +27,9 @@ use crate::miner::{Assembler, LogRow, Miner, TableMeta, to_envelope};
 use crate::sql::{
     ADD_LOGFILE_SQL, ARCHIVED_LOGS_SQL, CONTAINER_SQL, CURRENT_SCN_SQL, DatabaseLogging,
     END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, PDB_INCARNATION_SQL,
-    POSITION_SQL, RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, THREADS_SQL,
-    columns_sql, contents_sql, flush_sql, flush_table_ddl, in_pdb, log_groups_sql, logging_report,
-    needs_logfiles,
+    POSITION_LOCAL_SQL, POSITION_SQL, RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL,
+    SUPPLEMENTAL_SQL, THREADS_SQL, columns_sql, contents_sql, flush_sql, flush_table_ddl, in_pdb,
+    log_groups_sql, logging_report, needs_logfiles,
 };
 use crate::state::Position;
 
@@ -140,9 +140,20 @@ impl Shared {
     }
 
     fn position_now(&self, conn: &Connection) -> Result<Position, FaucetError> {
-        let (current, oldest): (u64, Option<u64>) = conn
-            .query_row_as(POSITION_SQL, &[])
-            .map_err(|e| src_err("current SCN", &e))?;
+        let (current, oldest): (u64, Option<u64>) = match conn.query_row_as(POSITION_SQL, &[]) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "oracle-cdc: GV$TRANSACTION is not readable; looking for open \
+                     transactions on the connected instance only. On RAC, grant \
+                     SELECT_CATALOG_ROLE so a transaction open on another instance \
+                     is captured from its start"
+                );
+                conn.query_row_as(POSITION_LOCAL_SQL, &[])
+                    .map_err(|e| src_err("current SCN", &e))?
+            }
+        };
         Ok(Position::resume_from(current, oldest))
     }
 

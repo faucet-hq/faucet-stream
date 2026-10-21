@@ -66,12 +66,19 @@ pub(crate) const ONLINE_LOGS_SQL: &str = "SELECT MIN(f.MEMBER), l.THREAD#, l.SEQ
     l.FIRST_CHANGE#, l.NEXT_CHANGE# FROM V$LOG l JOIN V$LOGFILE f ON f.GROUP# = l.GROUP# \
     GROUP BY l.THREAD#, l.SEQUENCE#, l.FIRST_CHANGE#, l.NEXT_CHANGE#";
 
-/// Current SCN plus the oldest open transaction's start. A transaction that
-/// reports `START_SCN` 0 (seen on a freshly restarted database) has no real
-/// start position — anchoring at it would ask LogMiner for SCN 1 onwards,
-/// which no redo log covers (#843) — so it is ignored, as NULL is by `MIN`.
+/// Current SCN plus the oldest open transaction's start, across every RAC
+/// instance (`GV$TRANSACTION`; `V$TRANSACTION` lists only the connected
+/// instance's). A transaction that reports `START_SCN` 0 (seen on a freshly
+/// restarted database) has no real start position — anchoring at it would ask
+/// LogMiner for SCN 1 onwards, which no redo log covers (#843) — so it is
+/// ignored, as NULL is by `MIN`.
 pub(crate) const POSITION_SQL: &str = "SELECT d.CURRENT_SCN, (SELECT MIN(t.START_SCN) FROM \
-    V$TRANSACTION t WHERE t.START_SCN > 0) FROM V$DATABASE d";
+    GV$TRANSACTION t WHERE t.START_SCN > 0) FROM V$DATABASE d";
+
+/// [`POSITION_SQL`] over the connected instance only, for a user who cannot
+/// read `GV$TRANSACTION`.
+pub(crate) const POSITION_LOCAL_SQL: &str = "SELECT d.CURRENT_SCN, (SELECT MIN(t.START_SCN) \
+    FROM V$TRANSACTION t WHERE t.START_SCN > 0) FROM V$DATABASE d";
 
 /// The database's current SCN, for source lag.
 pub(crate) const CURRENT_SCN_SQL: &str = "SELECT CURRENT_SCN FROM V$DATABASE";
@@ -221,8 +228,12 @@ mod tests {
         assert!(ARCHIVED_LOGS_SQL.contains("RESETLOGS_CHANGE# = (SELECT RESETLOGS_CHANGE#"));
         // #843: a START_SCN of 0 is excluded from the oldest-open lookup.
         assert!(
-            POSITION_SQL.contains("FROM V$TRANSACTION t WHERE t.START_SCN > 0"),
+            POSITION_SQL.contains("FROM GV$TRANSACTION t WHERE t.START_SCN > 0"),
             "{POSITION_SQL}"
+        );
+        assert!(
+            POSITION_LOCAL_SQL.contains("FROM V$TRANSACTION t WHERE t.START_SCN > 0"),
+            "{POSITION_LOCAL_SQL}"
         );
         assert!(columns_sql(1).ends_with("IN ((:1, :2))"));
         assert!(log_groups_sql(2).contains("(:1, :2), (:3, :4)"));
