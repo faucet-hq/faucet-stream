@@ -710,7 +710,7 @@ pub async fn verify(
     )
     .await?;
     let loaded = &admitted.loaded;
-    let _permit = runner::inline_permit(state)?;
+    let permit = runner::inline_permit(state)?;
     let auth = loaded.auth_catalog().map_err(cli_to_serve)?;
     let pipeline_name = loaded
         .cfg
@@ -721,22 +721,23 @@ pub async fn verify(
     if let Some(n) = req.max_differences {
         spec.max_differences = n;
     }
-    let outcome = super::local::verify(
-        principal,
-        &loaded.cfg,
-        &spec,
-        crate::verify::VerifyInputs {
-            row: req.row,
-            repair: req.repair,
-            allow_delete: req.allow_delete,
-            dry_run: req.dry_run,
-            pipeline_name,
-            execution: loaded.cfg.execution.clone(),
-            auth,
-            clock: chrono::Utc::now().fixed_offset(),
-        },
-    )
-    .await
+    let (run_as, cfg) = (principal.clone(), loaded.cfg.clone());
+    let inputs = crate::verify::VerifyInputs {
+        row: req.row,
+        repair: req.repair,
+        allow_delete: req.allow_delete,
+        dry_run: req.dry_run,
+        pipeline_name,
+        execution: loaded.cfg.execution.clone(),
+        auth,
+        clock: chrono::Utc::now().fixed_offset(),
+    };
+    // A repair writes: it finishes even if the client goes away.
+    let outcome = detached(None, async move {
+        let _permit = permit;
+        super::local::verify(&run_as, &cfg, &spec, inputs).await
+    })
+    .await?
     .map_err(cli_to_serve)?;
     crate::serve::audit::write(
         state,
@@ -848,7 +849,7 @@ pub async fn rollback(
     .await?;
     let loaded = &admitted.loaded;
     loaded.require_matrix()?;
-    let _permit = runner::inline_permit(state)?;
+    let permit = runner::inline_permit(state)?;
     let auth = loaded
         .auth_catalog()
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
@@ -858,19 +859,22 @@ pub async fn rollback(
         .map(|t| t.state_scope())
         .unwrap_or_default()
         .prefix(loaded.cfg.name.as_deref().unwrap_or("serve"));
-    let report = super::local::rollback_nodes(
-        &run_as,
-        &loaded.nodes,
-        &crate::rollback::RollbackInputs {
-            run_id: invocation_id,
-            row: req.row,
-            dry_run: req.dry_run,
-            force: req.force,
-            pipeline_name,
-            auth,
-        },
-    )
-    .await
+    let inputs = crate::rollback::RollbackInputs {
+        run_id: invocation_id,
+        row: req.row,
+        dry_run: req.dry_run,
+        force: req.force,
+        pipeline_name,
+        auth,
+    };
+    let nodes = loaded.nodes.clone();
+    // A rollback undoes the destination and then rewinds the bookmark: it
+    // finishes even if the client goes away, so it never stops between them.
+    let report = detached(None, async move {
+        let _permit = permit;
+        super::local::rollback_nodes(&run_as, &nodes, &inputs).await
+    })
+    .await?
     .map_err(cli_to_serve)?;
     let result = if req.dry_run {
         "dry_run"
@@ -933,7 +937,7 @@ pub async fn replay_dlq(
         admission,
         budget,
     } = admitted;
-    let _permit = runner::inline_permit(state)?;
+    let permit = runner::inline_permit(state)?;
     let auth = loaded.auth_catalog().map_err(cli_to_serve)?;
     let pipeline_name = loaded
         .cfg
@@ -950,8 +954,8 @@ pub async fn replay_dlq(
             "a run or replay with id '{id}' is already in flight"
         )));
     };
-    let _token = replay::Token {
-        state,
+    let token = replay::Token {
+        state: state.clone(),
         id: id.clone(),
         claim,
     };
@@ -964,29 +968,40 @@ pub async fn replay_dlq(
     } else {
         Some(replay::start(state, &id, &req.from, tenant.as_deref(), admission).await?)
     };
-    let outcome = super::local::replay_dlq(
-        &principal,
-        &loaded.cfg,
-        &req.from,
-        crate::dlq_replay::ReplayInputs {
-            reason: req.reason.as_deref(),
-            failed_dlq: req.failed_dlq.as_deref(),
-            row: req.row.as_deref(),
-            all_rows: req.all_rows,
-            dry_run: req.dry_run,
-            pipeline_name,
-            execution: loaded.cfg.execution.clone(),
-            auth,
-            clock: chrono::Utc::now().fixed_offset(),
-            decryptor,
-            budget,
-            cancel: Some(cancel.clone()),
-        },
-    )
-    .await;
-    if let Some(rec) = started {
-        rec.finish(&outcome, cancel.is_cancelled()).await;
-    }
+    // The replay runs on its own task: a client that goes away cancels it
+    // cooperatively (it stops at a page boundary and flushes) instead of
+    // dropping it mid-write, and its run record is still closed.
+    let (run_as, cfg, from) = (principal.clone(), loaded.cfg.clone(), req.from.clone());
+    let (reason, failed_dlq, row) = (req.reason.clone(), req.failed_dlq.clone(), req.row.clone());
+    let (all_rows, dry_run, task_cancel) = (req.all_rows, req.dry_run, cancel.clone());
+    let outcome = detached(Some(cancel.clone()), async move {
+        let (_permit, _token) = (permit, token);
+        let outcome = super::local::replay_dlq(
+            &run_as,
+            &cfg,
+            &from,
+            crate::dlq_replay::ReplayInputs {
+                reason: reason.as_deref(),
+                failed_dlq: failed_dlq.as_deref(),
+                row: row.as_deref(),
+                all_rows,
+                dry_run,
+                pipeline_name,
+                execution: cfg.execution.clone(),
+                auth,
+                clock: chrono::Utc::now().fixed_offset(),
+                decryptor,
+                budget,
+                cancel: Some(task_cancel.clone()),
+            },
+        )
+        .await;
+        if let Some(rec) = started {
+            rec.finish(&outcome, task_cancel.is_cancelled()).await;
+        }
+        outcome
+    })
+    .await?;
     let result_label = if outcome.is_ok() { "ok" } else { "error" };
     crate::serve::audit::write(
         state,
@@ -1008,6 +1023,28 @@ pub async fn replay_dlq(
     Ok(body)
 }
 
+/// Run `work` on a task of its own and await it. The request future that
+/// awaits it may be dropped (the client went away): the work keeps running,
+/// and when `cancel` is given it is cancelled cooperatively — a pipeline stops
+/// at its next page boundary and flushes — instead of being dropped mid-write.
+async fn detached<T: Send + 'static>(
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, ServeError> {
+    struct CancelOnDrop(Option<tokio_util::sync::CancellationToken>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if let Some(t) = self.0.take() {
+                t.cancel();
+            }
+        }
+    }
+    let mut guard = CancelOnDrop(cancel);
+    let joined = tokio::spawn(work).await;
+    guard.0 = None;
+    joined.map_err(|e| ServeError::Internal(format!("server task failed: {e}")))
+}
+
 /// The run record of a DLQ replay while it runs.
 pub(crate) mod replay {
     use super::Admission;
@@ -1018,13 +1055,13 @@ pub(crate) mod replay {
     use chrono::Utc;
 
     /// Removes a replay's cancel token from the registry when it ends.
-    pub(crate) struct Token<'a> {
-        pub state: &'a ServerState,
+    pub(crate) struct Token {
+        pub state: ServerState,
         pub id: String,
         pub claim: u64,
     }
 
-    impl Drop for Token<'_> {
+    impl Drop for Token {
         fn drop(&mut self) {
             self.state.registry().release_claim(&self.id, self.claim);
         }
@@ -1433,5 +1470,32 @@ mod templates {
             deprecated,
             selection: body.selection,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dropped request cancels detached work cooperatively and lets it
+    /// finish (here: record that it saw the cancel) instead of dropping it.
+    #[tokio::test]
+    async fn dropping_the_request_cancels_detached_work_without_dropping_it() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let seen = cancel.clone();
+        let request = detached(Some(cancel.clone()), async move {
+            seen.cancelled().await;
+            let _ = done_tx.send("flushed");
+        });
+        let aborted = tokio::time::timeout(std::time::Duration::from_millis(50), request).await;
+        assert!(aborted.is_err(), "the request was dropped while the work ran");
+        assert!(cancel.is_cancelled());
+        assert_eq!(done_rx.await.unwrap(), "flushed");
+
+        let ok = detached(Some(tokio_util::sync::CancellationToken::new()), async { 7 })
+            .await
+            .unwrap();
+        assert_eq!(ok, 7);
     }
 }
