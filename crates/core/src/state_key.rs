@@ -23,7 +23,12 @@ use crate::state::StateStore;
 /// * `1` — a child invocation's parent-key value rendered verbatim.
 /// * `2` — the parent-key value is encoded by [`encode_component`] (#840), so a
 ///   value holding `::`, spaces or non-ASCII cannot split or break the key.
-pub const KEY_SCHEME_VERSION: u32 = 2;
+/// * `3` — the parent-key value is typed: a non-string value is tagged by its
+///   JSON type (`_n.42` for the number 42, `_b.true`, `_z.null`, `_a.`/`_o.`
+///   for arrays and objects), so the number `1` and the string `"1"` no longer
+///   share one key. A string renders as in scheme 2 unless it starts like a
+///   tag (`_n.`, `_s.`, …), which is prefixed `_s.`.
+pub const KEY_SCHEME_VERSION: u32 = 3;
 
 /// Separator between key components.
 pub const KEY_SEPARATOR: &str = "::";
@@ -108,6 +113,9 @@ enum Sub {
     Parent(String),
     /// A component already in key form (a product tuple, a parsed segment).
     Encoded(String),
+    /// A child invocation's parent-key value with its JSON type: its scheme-3
+    /// rendering and the text earlier schemes rendered it from.
+    Typed { typed: String, text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -176,11 +184,39 @@ impl StateKey {
         self
     }
 
-    /// A child invocation's parent-key value, raw; rendered through
-    /// [`encode_component`].
+    /// A child invocation's parent-key value, raw (a string); rendered through
+    /// [`encode_component`] (and tagged `_s.` under scheme 3 when it starts
+    /// like a type tag). Prefer [`with_parent_value`](Self::with_parent_value)
+    /// when the value's JSON type is known.
     pub fn with_parent_key(mut self, raw: impl Into<String>) -> Self {
         if let Head::Parts { sub, .. } = &mut self.head {
             *sub = Some(Sub::Parent(raw.into()));
+        }
+        self
+    }
+
+    /// A child invocation's parent-key value, typed: the number `1` and the
+    /// string `"1"` render as different keys (scheme 3). Earlier schemes
+    /// rendered both from the value's text (a string unquoted, anything else
+    /// as JSON), which [`legacy_renderings`](Self::legacy_renderings) keeps.
+    pub fn with_parent_value(mut self, value: &serde_json::Value) -> Self {
+        use serde_json::Value;
+        let (typed, text) = match value {
+            Value::String(s) => (typed_string(s), s.clone()),
+            other => {
+                let tag = match other {
+                    Value::Number(_) => 'n',
+                    Value::Bool(_) => 'b',
+                    Value::Null => 'z',
+                    Value::Array(_) => 'a',
+                    _ => 'o',
+                };
+                let text = other.to_string();
+                (encode_component(&format!("_{tag}.{text}"), true), text)
+            }
+        };
+        if let Head::Parts { sub, .. } = &mut self.head {
+            *sub = Some(Sub::Typed { typed, text });
         }
         self
     }
@@ -375,9 +411,31 @@ impl StateKey {
 
 fn render_sub(sub: &Sub, version: u32) -> String {
     match sub {
+        Sub::Parent(raw) if version >= 3 => typed_string(raw),
         Sub::Parent(raw) if version >= 2 => encode_component(raw, true),
         Sub::Parent(raw) => raw.clone(),
+        Sub::Typed { typed, .. } if version >= 3 => typed.clone(),
+        Sub::Typed { text, .. } if version >= 2 => encode_component(text, true),
+        Sub::Typed { text, .. } => text.clone(),
         Sub::Encoded(s) => s.clone(),
+    }
+}
+
+/// The type tags scheme 3 renders a non-string parent key with (`_n.42`).
+const TYPE_TAGS: &[char] = &['s', 'n', 'b', 'z', 'a', 'o'];
+
+/// A string parent key under scheme 3: as scheme 2 rendered it, unless it
+/// starts like a type tag, which would let it collide with a non-string
+/// value — then it is tagged `_s.` itself.
+fn typed_string(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let tag_like = chars.next() == Some('_')
+        && chars.next().is_some_and(|c| TYPE_TAGS.contains(&c))
+        && chars.next() == Some('.');
+    if tag_like {
+        encode_component(&format!("_s.{raw}"), true)
+    } else {
+        encode_component(raw, true)
     }
 }
 
@@ -594,6 +652,41 @@ mod tests {
         assert_eq!(k.legacy_renderings(), vec!["p::r::x::y".to_string()]);
         let k = StateKey::invocation("p", "r").with_parent_key("plain");
         assert!(k.legacy_renderings().is_empty());
+    }
+
+    #[test]
+    fn typed_parent_keys_keep_numbers_and_strings_apart() {
+        let inv = || StateKey::invocation("p", "r");
+        let num = inv().with_parent_value(&json!(1));
+        let text = inv().with_parent_value(&json!("1"));
+        assert_eq!(num.render(), "p::r::_n.1");
+        assert_eq!(text.render(), "p::r::1");
+        assert_ne!(num.render(), text.render());
+        // Both rendered `p::r::1` under scheme 2, where the number migrates from.
+        assert_eq!(num.render_scheme(2), "p::r::1");
+        assert_eq!(num.legacy_renderings(), vec!["p::r::1".to_string()]);
+        assert!(
+            text.legacy_renderings().is_empty(),
+            "a plain string never moves"
+        );
+        // A string parent key equals `with_parent_key` of the same text.
+        assert_eq!(text, inv().with_parent_value(&json!("1")));
+        assert_eq!(text.render(), inv().with_parent_key("1").render());
+        // A string shaped like a tag is tagged itself.
+        let fake = inv().with_parent_value(&json!("_n.1"));
+        assert_eq!(fake.render(), "p::r::_s._n.1");
+        assert_eq!(fake.legacy_renderings(), vec!["p::r::_n.1".to_string()]);
+        assert_eq!(inv().with_parent_key("_n.1").render(), "p::r::_s._n.1");
+        for (v, want) in [
+            (json!(true), "p::r::_b.true"),
+            (json!(-2.5), "p::r::_n.-2.5"),
+        ] {
+            assert_eq!(inv().with_parent_value(&v).render(), want);
+        }
+        let obj = inv().with_parent_value(&json!({"a": 1})).render();
+        assert!(obj.starts_with("p::r::_o.a1.h"), "{obj}");
+        crate::state::validate_state_key(&obj).unwrap();
+        assert_eq!(num.render_scheme(1), "p::r::1");
     }
 
     #[test]

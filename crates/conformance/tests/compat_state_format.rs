@@ -366,6 +366,9 @@ fn key_from(entry: &Value) -> faucet_core::StateKey {
     if let Some(parent) = field("parent_key") {
         key = key.with_parent_key(parent);
     }
+    if let Some(parent) = entry.get("parent_value") {
+        key = key.with_parent_value(parent);
+    }
     if let Some(sub) = field("sub") {
         key = key.with_sub(sub);
     }
@@ -398,8 +401,8 @@ fn key_fixture(name: &str) -> (u32, Vec<Value>) {
 
 #[test]
 fn every_key_the_current_scheme_wrote_still_renders_the_same() {
-    let (scheme, keys) = key_fixture("key-renderings-v2.json");
-    assert!(scheme <= faucet_core::KEY_SCHEME_VERSION);
+    let (scheme, keys) = key_fixture("key-renderings-v3.json");
+    assert_eq!(scheme, faucet_core::KEY_SCHEME_VERSION);
     for entry in &keys {
         let want = entry["key"].as_str().unwrap();
         let key = key_from(entry);
@@ -428,18 +431,57 @@ fn every_key_the_current_scheme_wrote_still_renders_the_same() {
 
 #[test]
 fn every_key_an_earlier_scheme_wrote_is_migrated_from() {
-    let (scheme, keys) = key_fixture("key-renderings-v1.json");
-    assert!(scheme < faucet_core::KEY_SCHEME_VERSION);
-    for entry in &keys {
-        let want = entry["key"].as_str().unwrap();
-        let key = key_from(entry);
-        assert_eq!(key.render_scheme(scheme), want, "{}", entry["name"]);
-        assert!(
-            key.render() == want || key.legacy_renderings().iter().any(|k| k == want),
-            "{}: a bookmark under '{want}' would be orphaned",
-            entry["name"]
-        );
+    for name in ["key-renderings-v1.json", "key-renderings-v2.json"] {
+        let (scheme, keys) = key_fixture(name);
+        assert!(scheme < faucet_core::KEY_SCHEME_VERSION);
+        for entry in &keys {
+            let want = entry["key"].as_str().unwrap();
+            let key = key_from(entry);
+            assert_eq!(key.render_scheme(scheme), want, "{name}: {}", entry["name"]);
+            assert!(
+                key.render() == want || key.legacy_renderings().iter().any(|k| k == want),
+                "{name}: {}: a bookmark under '{want}' would be orphaned",
+                entry["name"]
+            );
+        }
     }
+}
+
+/// Scheme 2 rendered a number parent key from its text, so the number `42`
+/// and the string `"42"` shared `orders::lines::42`. Under scheme 3 the
+/// number has its own key, which adopts the bookmark scheme 2 left.
+#[tokio::test]
+async fn a_scheme_2_bookmark_of_a_number_parent_key_moves_to_its_typed_key() {
+    use faucet_core::StateStore;
+    let store = faucet_core::MemoryStateStore::new();
+    let key = faucet_core::StateKey::invocation("orders", "lines")
+        .with_parent_value(&serde_json::json!(42));
+    assert_eq!(key.render(), "orders::lines::_n.42");
+    assert_eq!(key.render_scheme(2), "orders::lines::42");
+    store
+        .put("orders::lines::42", &fixture("bare-bookmark-v1.json"))
+        .await
+        .unwrap();
+    let moved = faucet_core::migrate_state_key(&store, &key.render(), &key.legacy_renderings())
+        .await
+        .unwrap();
+    assert_eq!(
+        moved,
+        faucet_core::KeyMigration::Moved {
+            from: "orders::lines::42".into()
+        }
+    );
+    assert_eq!(
+        store.get("orders::lines::_n.42").await.unwrap(),
+        Some(fixture("bare-bookmark-v1.json"))
+    );
+    let text = faucet_core::StateKey::invocation("orders", "lines")
+        .with_parent_value(&serde_json::json!("42"));
+    assert_ne!(
+        text.render(),
+        key.render(),
+        "a string key no longer collides"
+    );
 }
 
 #[tokio::test]

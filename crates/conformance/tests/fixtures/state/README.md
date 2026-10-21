@@ -35,10 +35,11 @@ catch it, because both sides change together.
   wrapper (the wrapper lives inside `data`).
 - `scalar-state-envelope-v1.json` — the versioned envelope around a scalar
   bookmark.
-- `key-renderings-v1.json` / `key-renderings-v2.json` — state **key**
-  renderings (#882), named after the key scheme (`KEY_SCHEME_VERSION`) that
-  wrote them: each entry gives a key's components (`tenant`, `pipeline`,
-  `row`, `parent_key`, `sub`, `shard`, `suffix` + `arg`) and the key that scheme
-  rendered. The current scheme's keys must render byte-for-byte; every key an
+- `key-renderings-v1.json` / `key-renderings-v2.json` / `key-renderings-v3.json`
+  — state **key** renderings (#882), named after the key scheme
+  (`KEY_SCHEME_VERSION`) that wrote them: each entry gives a key's components
+  (`tenant`, `pipeline`, `row`, `parent_key` (a string) or `parent_value` (a
+  typed JSON value, scheme 3), `sub`, `shard`, `suffix` + `arg`) and the key
+  that scheme rendered. The current scheme's keys must render byte-for-byte; every key an
   earlier scheme rendered must render again or be one of `legacy_renderings()`
   — the keys the run-start migration moves a bookmark from.

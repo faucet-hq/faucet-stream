@@ -946,6 +946,7 @@ async fn run_expanded_unredacted(
                         let (state_key, legacy_state_keys) = child_state_keys(
                             opts.state_scope.key(&opts.pipeline_name),
                             &node.id,
+                            pk_value.as_ref(),
                             &pk_string,
                         );
                         if let Err(e) =
@@ -2049,13 +2050,20 @@ fn boxed_run_one_invocation<'a>(
 /// `None` for preview / `--limit` / shard runs and memory or absent state,
 /// whose markers would describe nothing durable.
 /// A child invocation's state key, and the keys earlier key schemes rendered
-/// for it (the pre-#840 verbatim parent key, #862 M-021).
+/// for it (the pre-#840 verbatim parent key, #862 M-021; the untyped parent
+/// key that let the number `1` and the string `"1"` share a key). `parent` is
+/// the parent record's key value; without one, `fallback` names the key.
 fn child_state_keys(
     base: impl Into<StateKeyBase>,
     row: &str,
-    parent_key: &str,
+    parent: Option<&Value>,
+    fallback: &str,
 ) -> (String, Vec<String>) {
-    let key = base.into().0.with_row(row).with_parent_key(parent_key);
+    let key = base.into().0.with_row(row);
+    let key = match parent {
+        Some(v) => key.with_parent_value(v),
+        None => key.with_parent_key(fallback),
+    };
     (key.render(), key.legacy_renderings())
 }
 
@@ -5855,6 +5863,48 @@ matrix:
         assert!(out_b.exists());
     }
 
+    /// A bookmark a scheme-2 run left under a number parent key's untyped key
+    /// is adopted by its typed key on the first scheme-3 run.
+    #[tokio::test]
+    async fn a_number_parent_keys_scheme_2_bookmark_is_adopted() {
+        use faucet_core::StateStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parents.jsonl"), "{\"id\":1}\n").unwrap();
+        std::fs::write(dir.path().join("child.csv"), "x\nA\n").unwrap();
+        let state = dir.path().join("state");
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: file, config: {{ path: {out}/parents.jsonl }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}/parents-out.jsonl }} }}
+  state:  {{ type: file, config: {{ path: {state} }} }}
+matrix:
+  - id: parents
+  - id: child
+    parent: parents
+    source: {{ type: csv, config: {{ path: {out}/child.csv }} }}
+    sink:   {{ config: {{ path: '{out}/child-${{parents.id}}.jsonl' }} }}
+"#,
+            out = dir.path().display(),
+            state = state.display(),
+        );
+        let store = faucet_core::FileStateStore::new(&state);
+        store
+            .put("adopt::child::1", &json!({"cursor": 7}))
+            .await
+            .unwrap();
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), ExecuteOptions::for_tests("adopt"))
+            .await
+            .unwrap();
+        assert!(!summary.had_failures(), "{summary:?}");
+        assert_eq!(
+            store.get("adopt::child::_n.1").await.unwrap(),
+            Some(json!({"cursor": 7}))
+        );
+        assert_eq!(store.get("adopt::child::1").await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn a_keyless_parent_is_refused_for_a_child_that_keeps_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -7774,14 +7824,29 @@ matrix:
 
     #[test]
     fn child_state_keys_name_the_pre_840_key_only_when_it_differs() {
-        let (cur, legacy) = child_state_keys("p", "kid", "42");
+        let (cur, legacy) = child_state_keys("p", "kid", Some(&json!("42")), "42");
         assert_eq!((cur.as_str(), legacy.len()), ("p::kid::42", 0));
         let long = "a".repeat(80);
-        let (cur, legacy) = child_state_keys("p", "kid", &long);
+        let (cur, legacy) = child_state_keys("p", "kid", Some(&json!(long)), &long);
         assert_ne!(cur, format!("p::kid::{long}"));
         assert_eq!(legacy, vec![format!("p::kid::{long}")]);
-        let (_, legacy) = child_state_keys("p", "kid", "a b");
+        let (_, legacy) = child_state_keys("p", "kid", Some(&json!("a b")), "a b");
         assert!(legacy.is_empty(), "the verbatim form was never a valid key");
+    }
+
+    #[test]
+    fn number_and_string_parent_keys_get_different_child_keys() {
+        let (num, legacy) = child_state_keys("p", "kid", Some(&json!(1)), "1");
+        let (text, _) = child_state_keys("p", "kid", Some(&json!("1")), "1");
+        assert_ne!(num, text);
+        assert_eq!(num, "p::kid::_n.1");
+        assert_eq!(
+            legacy,
+            vec!["p::kid::1".to_string()],
+            "migrates from scheme 2"
+        );
+        let (none, _) = child_state_keys("p", "kid", None, "(missing)");
+        assert!(none.starts_with("p::kid::"), "{none}");
     }
 
     #[tokio::test]

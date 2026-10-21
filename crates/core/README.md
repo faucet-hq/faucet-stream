@@ -356,6 +356,9 @@ let key = StateKey::invocation("orders", "lines").with_parent_key("42");
 assert_eq!(key.render(), "orders::lines::42");
 let sla = key.with_suffix(KeySuffix::Sla);
 assert_eq!(sla.render(), "orders::lines::42::__sla__");
+// A typed parent key (scheme 3): the number 42 and the string "42" differ.
+let num = StateKey::invocation("orders", "lines").with_parent_value(&serde_json::json!(42));
+assert_eq!(num.render(), "orders::lines::_n.42");
 ```
 
 The pipeline stores each bookmark in a **versioned envelope** (#736,

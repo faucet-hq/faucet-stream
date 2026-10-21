@@ -175,6 +175,24 @@ fn every_cli_key_keeps_its_rendering() {
             faucet_cli::discovery_matrix::state_key_component("a b", true),
             "ab.he63f991904833892",
         ),
+        // A child's parent key is typed (key scheme 3): a number and a
+        // string of the same text get different keys.
+        (
+            scope
+                .key("orders")
+                .with_row("lines")
+                .with_parent_value(&serde_json::json!(42))
+                .render(),
+            "acme::orders::lines::_n.42",
+        ),
+        (
+            scope
+                .key("orders")
+                .with_row("lines")
+                .with_parent_value(&serde_json::json!("42"))
+                .render(),
+            "acme::orders::lines::42",
+        ),
     ];
     for (got, want) in cases {
         assert_eq!(got, want);
