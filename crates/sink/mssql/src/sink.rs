@@ -36,7 +36,7 @@ fn legacy_scope_key(scope: &str) -> Option<String> {
 }
 
 use crate::coltype::{COLUMN_INFO_SQL, ColumnInfo};
-use crate::config::{MssqlColumnMapping, MssqlSinkConfig};
+use crate::config::{MssqlColumnMapping, MssqlSinkConfig, OnUnknownField};
 use crate::encode::{
     BoundParam, build_cleanup_delete_sql, build_cleanup_temp_create_sql,
     build_cleanup_temp_drop_sql, max_rows_per_insert,
@@ -103,6 +103,8 @@ pub(crate) struct MssqlDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// Whether the `on_unknown_field: warn` warning has been logged.
+    unknown_warned: std::sync::atomic::AtomicBool,
     /// Per-sink run id for staged-object keys (#528).
     #[cfg(feature = "staging")]
     pub(crate) stage_run_id: String,
@@ -156,6 +158,7 @@ impl MssqlDriver {
                 statement_timeout_secs,
             )),
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            unknown_warned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "staging")]
             stage_run_id: crate::staged::new_stage_run_id(),
             #[cfg(feature = "staging")]
@@ -558,7 +561,15 @@ impl MssqlDriver {
             MssqlColumnMapping::AutoColumns { .. } => self.column_infos().await?,
             MssqlColumnMapping::JsonColumn { .. } => Vec::new(),
         };
-        prepare_rows(&self.config.column_mapping, &infos, chunk)
+        let mapping = match &self.config.column_mapping {
+            MssqlColumnMapping::AutoColumns { on_unknown_field } => {
+                MssqlColumnMapping::AutoColumns {
+                    on_unknown_field: warn_once(*on_unknown_field, &self.unknown_warned),
+                }
+            }
+            other => other.clone(),
+        };
+        prepare_rows(&mapping, &infos, chunk)
     }
 
     /// Insert rows within an **already-open** transaction — caller owns
@@ -763,7 +774,7 @@ impl MssqlDriver {
             &self.table_quoted,
             &self.config.write.key,
             &infos,
-            *on_unknown_field,
+            warn_once(*on_unknown_field, &self.unknown_warned),
             upserts,
         )
         .map_err(|e| (e, false))?;
@@ -1322,6 +1333,15 @@ pub(crate) fn classify_chunk_failure(e: &tiberius::error::Error) -> ChunkFailure
 /// without a server: a rejected identifier is **infrastructure**, not a row
 /// rejection — it is a config/schema problem that every row in the chunk shares,
 /// so blaming one row (and DLQ-ing it) would be wrong.
+/// `mode`, or `Drop` once the `warn` mode has logged its one warning.
+fn warn_once(mode: OnUnknownField, warned: &std::sync::atomic::AtomicBool) -> OnUnknownField {
+    if mode == OnUnknownField::Warn && warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        OnUnknownField::Drop
+    } else {
+        mode
+    }
+}
+
 pub(crate) fn quote_columns(cols: &[String]) -> Result<Vec<String>, ChunkError> {
     cols.iter()
         .map(|c| quote_ident_mssql(c))
@@ -2156,6 +2176,32 @@ impl SchemaDriver for MssqlDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unknown_field_warning_is_logged_once_per_sink() {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            warn_once(OnUnknownField::Warn, &warned),
+            OnUnknownField::Warn
+        );
+        assert_eq!(
+            warn_once(OnUnknownField::Warn, &warned),
+            OnUnknownField::Drop
+        );
+        assert_eq!(
+            warn_once(OnUnknownField::Error, &warned),
+            OnUnknownField::Error
+        );
+        let fresh = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            warn_once(OnUnknownField::Drop, &fresh),
+            OnUnknownField::Drop
+        );
+        assert_eq!(
+            warn_once(OnUnknownField::Warn, &fresh),
+            OnUnknownField::Warn
+        );
+    }
 
     #[test]
     fn a_page_splits_into_op_runs_only_on_a_collation_collision() {
