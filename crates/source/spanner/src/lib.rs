@@ -15,7 +15,7 @@
 //!     project_id: my-project
 //!     instance: my-instance
 //!     database: my-db
-//!     query: "SELECT * FROM orders WHERE updated_at > TIMESTAMP(@bookmark)"
+//!     query: "SELECT * FROM orders WHERE updated_at >= TIMESTAMP(@bookmark)"
 //!     replication:
 //!       type: incremental
 //!       column: updated_at
@@ -29,7 +29,7 @@
 mod config;
 mod stream;
 
-pub use config::{ShardConfig, SpannerReplication, SpannerSourceConfig};
+pub use config::{BOOKMARK_TOKEN, ShardConfig, SpannerReplication, SpannerSourceConfig};
 pub use faucet_common_spanner::{SpannerConnection, SpannerCredentials};
 pub use stream::SpannerSource;
 

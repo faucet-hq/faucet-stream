@@ -13,7 +13,7 @@ Oracle Database **query source** for the [faucet-stream](https://github.com/fauc
 
 - **Streaming fetch** — the fetch array size is the `batch_size`; rows are decoded on a blocking thread and handed over one page at a time, so memory stays at `O(batch_size)`.
 - **Exact types** — `NUMBER` never loses precision (big values arrive as decimal strings); dates, timestamps, intervals, RAW/BLOB and CLOB are mapped explicitly ([type table](https://crates.io/crates/faucet-common-oracle#type-mapping)).
-- **Incremental replication** — a bookmark column, pushed down with `:bookmark`.
+- **Incremental replication** — reads only rows not yet delivered, in cursor order, without skipping rows that share a cursor value; a crash replays at most one page.
 - **PK-range sharding** — `shard: { key }` splits the query across cluster workers.
 - **Discovery** — `faucet discover` lists tables from `ALL_TAB_COLUMNS` / `ALL_TABLES`.
 
@@ -45,14 +45,18 @@ source:
     password: ${secret:ORACLE_PASSWORD}
     query: >
       SELECT ID, STATUS, UPDATED_AT FROM APP.ORDERS
-      WHERE UPDATED_AT > :bookmark AND REGION = :1
+      WHERE UPDATED_AT >= :bookmark AND REGION = :1
     params: ["EMEA"]
     replication: { type: incremental, column: UPDATED_AT, initial_value: "1970-01-01T00:00:00" }
 ```
 
 ### Incremental replication
 
-Rows whose `column` exceeds the stored bookmark (or `initial_value` on the first run) are emitted; the new maximum is persisted with the final page, after everything before it was written. Put `:bookmark` in the `WHERE` clause to filter server-side — without it the source still filters client-side but re-reads the whole result set (a warning is logged). A bookmark from a `DATE` / `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` column (`YYYY-MM-DDTHH:MI:SS[.f][offset]`, the form this source emits) is bound as a timestamp, so the comparison does not depend on the session's `NLS_DATE_FORMAT`; any other bookmark binds as its JSON type. A text (`VARCHAR2`) cursor holding ISO-8601 strings produces the same shape: Oracle then converts the column to a timestamp and refuses the `T` before returning any row, and the source re-runs the query with the bookmark bound as text. A session whose `NLS_TIMESTAMP_FORMAT` accepts ISO strings compares such a column as timestamps instead; wrap the column (`TO_CHAR(col)`) or the bind (`TO_CHAR(:bookmark)`) to force a text comparison.
+The source wraps the query as `SELECT * FROM (<query>) q WHERE q."<column>" >= :bookmark ORDER BY q."<column>"`, so Oracle filters and orders by the cursor (index it); `initial_value` is the inclusive lower bound for the first run. To apply the cursor further inside the query, write `:bookmark` there with `>=`; a `> :bookmark` is refused at load time because it would skip rows that share the bookmark value.
+
+**Rows that share a cursor value are never skipped.** The bookmark stores the last cursor value **and** a 128-bit fingerprint of every row already emitted at it — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read re-reads that value with `>=` and drops only the rows it already emitted, so a row committed later with the same cursor value (common with `DATE`'s one-second resolution) is delivered, and a boundary row updated in place is emitted again. Above 10,000 rows at one value the set is dropped and the value is re-read in full: duplicates, never loss. Every page carries the bookmark after its last row, so a crash replays at most one page. A bare bookmark stored by an earlier release reads as that value with an empty boundary (its rows are re-delivered once). Rows whose cursor is `NULL` are never read, and a row that commits with a cursor *below* the stored bookmark is not seen — use the CDC source when that matters.
+
+A bookmark from a `DATE` / `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` column (`YYYY-MM-DDTHH:MI:SS[.f][offset]`, the form this source emits) is bound as a timestamp, so the comparison does not depend on the session's `NLS_DATE_FORMAT`; any other bookmark binds as its JSON type. A text (`VARCHAR2`) cursor holding ISO-8601 strings produces the same shape: Oracle then converts the column to a timestamp and refuses the `T` before returning any row, and the source re-runs the query with the bookmark bound as text. A session whose `NLS_TIMESTAMP_FORMAT` accepts ISO strings compares such a column as timestamps instead; wrap the column (`TO_CHAR(col)`) or the bind (`TO_CHAR(:bookmark)`) to force a text comparison.
 
 ### Sharding
 

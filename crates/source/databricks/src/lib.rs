@@ -24,7 +24,7 @@ mod convert;
 mod stream;
 
 pub use config::{
-    DatabricksAuth, DatabricksParam, DatabricksReplication, DatabricksSourceConfig,
+    BOOKMARK_TOKEN, DatabricksAuth, DatabricksParam, DatabricksReplication, DatabricksSourceConfig,
     ResultDisposition,
 };
 pub use stream::DatabricksSource;

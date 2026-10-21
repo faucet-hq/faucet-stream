@@ -236,7 +236,7 @@ async fn incremental_pushes_down_bookmark_and_resumes() {
 
     let mut config = full_config(
         port,
-        "SELECT id, val FROM inc WHERE id > ${bookmark} ORDER BY id",
+        "SELECT id, val FROM inc WHERE id >= ${bookmark} ORDER BY id",
         1000,
     );
     config.replication = RedshiftReplication::Incremental {
@@ -251,9 +251,14 @@ async fn incremental_pushes_down_bookmark_and_resumes() {
     let (records, bookmark) = drain(&source).await;
     let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 5]);
-    assert_eq!(bookmark, Some(json!(5)), "final page carries max(id)");
+    assert_eq!(
+        bookmark.as_ref().unwrap()["value"],
+        json!(5),
+        "final page carries max(id)"
+    );
 
-    // Resume run: apply bookmark 3 → server-side pushdown returns 4, 5 only.
+    // Resume run on a bare bookmark 3 (an earlier release's shape): the
+    // value is re-read once, nothing below it is.
     let resumed = RedshiftSource::new(config).expect("source");
     resumed
         .apply_start_bookmark(json!(3))
@@ -263,49 +268,69 @@ async fn incremental_pushes_down_bookmark_and_resumes() {
     let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(
         ids,
-        vec![4, 5],
-        "resume yields only rows above the bookmark"
+        vec![3, 4, 5],
+        "resume yields rows from the bookmark on"
     );
-    assert_eq!(bookmark, Some(json!(5)));
+    assert_eq!(bookmark.unwrap()["value"], json!(5));
 }
 
-/// Incremental without a `${bookmark}` token: the server returns everything and
-/// the **client-side** filter drops rows at or below the applied bookmark, while
-/// the running max (tracked over the full scan, before the filter) is emitted.
+/// A row committed after a run with the cursor value that run ended on (a
+/// second COPY batch stamped with the same load time) is delivered by the next
+/// run; the row already emitted at that value is not.
 #[tokio::test(flavor = "multi_thread")]
-async fn incremental_client_side_filter_drops_seen_rows() {
+async fn incremental_keeps_rows_tied_at_the_bookmark() {
     let _guard = serial().lock().await;
     let (_container, port) = start_postgres().await;
     let pool = seed_pool(port).await;
-    sqlx::query("CREATE TABLE inc (id BIGINT PRIMARY KEY, val TEXT)")
+    sqlx::query("CREATE TABLE inc (id BIGINT PRIMARY KEY, ts TIMESTAMP)")
         .execute(&pool)
         .await
         .expect("create table");
-    sqlx::query("INSERT INTO inc (id, val) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
-        .execute(&pool)
-        .await
-        .expect("seed");
-    pool.close().await;
+    sqlx::query(
+        "INSERT INTO inc (id, ts) VALUES (1, '2026-10-01 11:00:00'), (2, '2026-10-01 12:00:00')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
 
-    // No ${bookmark} token → no pushdown; the client filter does the work.
-    let mut config = full_config(port, "SELECT id, val FROM inc ORDER BY id", 1000);
+    // No `${bookmark}` token: the outer `>=` filter, cast to TIMESTAMP.
+    let mut config = full_config(port, "SELECT id, ts FROM inc", 1000);
     config.replication = RedshiftReplication::Incremental {
-        column: "id".into(),
-        initial_value: json!(0),
+        column: "ts".into(),
+        initial_value: json!("2026-01-01T00:00:00"),
     };
-
     let source = RedshiftSource::new(config).expect("source");
+    let (records, bookmark) = drain(&source).await;
+    assert_eq!(records.len(), 2);
     source
-        .apply_start_bookmark(json!(3))
+        .apply_start_bookmark(bookmark.expect("bookmark"))
         .await
         .expect("apply bookmark");
-    let (records, bookmark) = drain(&source).await;
+
+    sqlx::query(
+        "INSERT INTO inc (id, ts) VALUES (3, '2026-10-01 12:00:00'), (4, '2026-10-02 00:00:00')",
+    )
+    .execute(&pool)
+    .await
+    .expect("late rows");
+    pool.close().await;
+
+    // The buffered convenience path returns the same rows and bookmark.
+    let (records, bookmark) = source
+        .fetch_with_context_incremental(&HashMap::new())
+        .await
+        .expect("fetch");
     let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
-    assert_eq!(ids, vec![4, 5], "client filter drops id <= 3");
     assert_eq!(
-        bookmark,
-        Some(json!(5)),
-        "running max is tracked over the full scan, before the filter"
+        ids,
+        vec![3, 4],
+        "the tied row is kept, the emitted one dropped"
+    );
+    assert!(
+        bookmark.unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-10-02")
     );
 }
 
@@ -438,7 +463,7 @@ async fn incremental_bookmark_never_moves_backwards() {
         .expect("bookmark");
     let (records, bookmark) = drain(&source).await;
     assert!(records.is_empty());
-    assert_eq!(bookmark, Some(json!(9)));
+    assert_eq!(bookmark.unwrap()["value"], json!(9));
 }
 
 /// The `check` preflight probe passes against a reachable database.

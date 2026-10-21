@@ -10,12 +10,14 @@ use async_trait::async_trait;
 use faucet_common_spanner::decode::row_to_json;
 use faucet_common_spanner::quote_ident_spanner;
 use faucet_common_spanner::types::{parse_spanner_type, spanner_type_to_json_schema};
-use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
 };
 use faucet_core::{FaucetError, Source, StreamPage};
 use futures::Stream;
+use gcloud_googleapis::spanner::v1::TypeCode;
+use gcloud_googleapis::spanner::v1::struct_type::Field;
 use gcloud_spanner::client::Client;
 use gcloud_spanner::statement::Statement;
 use gcloud_spanner::transaction::QueryOptions;
@@ -23,7 +25,7 @@ use gcloud_spanner::transaction_ro::ReadOnlyTransaction;
 use gcloud_spanner::value::TimestampBound;
 use serde_json::Value;
 
-use crate::config::{SpannerReplication, SpannerSourceConfig};
+use crate::config::{BOOKMARK_TOKEN, SpannerReplication, SpannerSourceConfig};
 
 use faucet_core::CallExt as _;
 
@@ -33,7 +35,7 @@ pub struct SpannerSource {
     client: Client,
     /// Bookmark loaded via [`Source::apply_start_bookmark`]; overrides the
     /// configured `initial_value` for incremental runs.
-    start_bookmark: Mutex<Option<Value>>,
+    start_bookmark: Mutex<Option<CursorBookmark>>,
     /// Shard applied by the cluster coordinator (Mode B), if any. `None` (or
     /// the whole-dataset shard) means the full query is streamed.
     applied_shard: Mutex<Option<PkShardBounds>>,
@@ -56,7 +58,7 @@ impl SpannerSource {
         })
     }
 
-    fn current_start(&self) -> Option<Value> {
+    fn current_start(&self) -> Option<CursorBookmark> {
         self.start_bookmark
             .lock()
             .expect("start_bookmark mutex poisoned")
@@ -93,14 +95,92 @@ impl SpannerSource {
             .await?
             .map_err(|e| FaucetError::Source(format!("spanner: transaction begin failed: {e}")))
     }
+
+    /// The Spanner type of the cursor `column` in the query's output, read
+    /// from the result metadata of a `LIMIT 0` probe.
+    async fn cursor_type(
+        &self,
+        query: &str,
+        params: &[(String, Value)],
+        column: &str,
+    ) -> Result<&'static str, FaucetError> {
+        let probe = format!(
+            "SELECT q.{} FROM ({query}\n) AS q LIMIT 0",
+            quote_ident_spanner(column)
+        );
+        let map_err = |e: String| {
+            FaucetError::Source(format!(
+                "spanner: cannot read the type of the incremental cursor column {column:?} \
+                 (it must be a column of the query's output): {e}"
+            ))
+        };
+        let stmt = build_statement(&probe, params)?;
+        let mut tx = self.read_txn().await?;
+        let mut iter = tx
+            .query(stmt)
+            .within(&self.calls, "query")
+            .await?
+            .map_err(|e| map_err(e.to_string()))?;
+        iter.next()
+            .within(&self.calls, "read")
+            .await?
+            .map_err(|e| map_err(e.to_string()))?;
+        cursor_cast_type(iter.columns_metadata(), column)
+    }
 }
 
 /// Incremental-replication context resolved for one run.
 #[derive(Debug, Clone, PartialEq)]
 struct IncrementalCtx {
     column: String,
-    start: Value,
+    start: CursorBookmark,
 }
+
+/// The type a bookmark parameter is cast to before it is compared with the
+/// cursor column (Spanner does not coerce parameter types).
+fn cursor_cast_type(fields: &[Field], column: &str) -> Result<&'static str, FaucetError> {
+    let code = fields
+        .first()
+        .and_then(|f| f.r#type.as_ref())
+        .and_then(|t| TypeCode::try_from(t.code).ok())
+        .unwrap_or(TypeCode::Unspecified);
+    Ok(match code {
+        TypeCode::Int64 => "INT64",
+        TypeCode::Float64 => "FLOAT64",
+        TypeCode::Float32 => "FLOAT32",
+        TypeCode::Numeric => "NUMERIC",
+        TypeCode::String => "STRING",
+        TypeCode::Bool => "BOOL",
+        TypeCode::Date => "DATE",
+        TypeCode::Timestamp => "TIMESTAMP",
+        TypeCode::Bytes => "BYTES",
+        other => {
+            return Err(FaucetError::Config(format!(
+                "spanner: the incremental cursor column {column:?} has type {}, which \
+                 cannot order a cursor",
+                other.as_str_name()
+            )));
+        }
+    })
+}
+
+/// Wrap `query` so it reads only rows at or past the bookmark, in cursor
+/// order: `SELECT * FROM (<query>) AS q WHERE q.<column> >= <bookmark> ORDER
+/// BY q.<column>`. The bookmark binds as `@_faucet_bookmark`, cast to `ty`
+/// (a BYTES bookmark is base64 text).
+fn cursor_wrap(query: &str, column: &str, ty: &str) -> String {
+    let c = quote_ident_spanner(column);
+    let bookmark = if ty == "BYTES" {
+        format!("FROM_BASE64(@{CURSOR_PARAM})")
+    } else {
+        format!("CAST(@{CURSOR_PARAM} AS {ty})")
+    };
+    let inner = query.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
+    format!("SELECT * FROM ({inner}\n) AS q WHERE q.{c} >= {bookmark} ORDER BY q.{c}")
+}
+
+/// The parameter the outer cursor filter binds the bookmark as.
+const CURSOR_PARAM: &str = "_faucet_bookmark";
 
 /// Build the final query string, the named bind values, and (for incremental
 /// runs) the client-side filter context.
@@ -108,11 +188,12 @@ struct IncrementalCtx {
 /// Pure function (no client) so it is unit-testable. Named parameters:
 /// `config.params` keep their user-chosen names, parent-context placeholders
 /// become `@_faucet_ctx_N`, and the incremental cursor binds as `@bookmark`
-/// (only when the query mentions it).
+/// (only when the query mentions it). The outer cursor filter is added by
+/// [`cursor_wrap`].
 fn build_query_and_params(
     config: &SpannerSourceConfig,
     context: &HashMap<String, Value>,
-    start_bookmark: Option<&Value>,
+    start_bookmark: Option<&CursorBookmark>,
 ) -> (String, Vec<(String, Value)>, Option<IncrementalCtx>) {
     let mut params: Vec<(String, Value)> = config
         .params
@@ -143,11 +224,9 @@ fn build_query_and_params(
         } => {
             let start = start_bookmark
                 .cloned()
-                .unwrap_or_else(|| initial_value.clone());
-            // Server-side pushdown: bind the cursor where the user wrote
-            // `@bookmark`. If absent, only the client-side filter applies.
-            if query.contains("@bookmark") {
-                params.push(("bookmark".to_string(), start.clone()));
+                .unwrap_or_else(|| CursorBookmark::initial(initial_value.clone()));
+            if query.contains(BOOKMARK_TOKEN) {
+                params.push(("bookmark".to_string(), start.value.clone()));
             }
             Some(IncrementalCtx {
                 column: column.clone(),
@@ -301,6 +380,18 @@ impl Source for SpannerSource {
         let query = self.shard_wrap(query);
 
         Box::pin(async_stream::try_stream! {
+            let (query, params) = match &incr {
+                None => (query, params),
+                Some(ic) => {
+                    let ty = self.cursor_type(&query, &params, &ic.column).await?;
+                    let mut params = params;
+                    params.push((CURSOR_PARAM.to_string(), ic.start.value.clone()));
+                    (cursor_wrap(&query, &ic.column, ty), params)
+                }
+            };
+            let mut tracker = incr
+                .as_ref()
+                .map(|ic| CursorTracker::new(ic.column.clone(), ic.start.clone()));
             let stmt = build_statement(&query, &params)?;
             let mut tx = self.read_txn().await?;
             // `enable_resume: false`: the resume path buffers up to 128 MiB
@@ -319,7 +410,6 @@ impl Source for SpannerSource {
 
             let mut fields: Option<std::sync::Arc<Vec<_>>> = None;
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
-            let mut running_max: Option<Value> = None;
             let mut total = 0usize;
             let reads = self.calls.get().with_roundtrip_metering(false);
 
@@ -345,14 +435,14 @@ impl Source for SpannerSource {
                 let fields = fields.get_or_insert_with(|| iter.columns_metadata().clone());
                 let record = row_to_json(&row, fields)
                     .map_err(|e| FaucetError::Source(format!("spanner: row decode failed: {e}")))?;
-                buffer.push(record);
+                if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
+                    buffer.push(record);
+                }
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-                    let kept = apply_incremental(page, incr.as_ref(), &mut running_max);
-                    total += kept.len();
-                    if !kept.is_empty() {
-                        yield StreamPage { records: kept, bookmark: None };
-                    }
+                    total += page.len();
+                    let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                    yield StreamPage { records: page, bookmark };
                 }
             }
             if exhausted {
@@ -360,13 +450,19 @@ impl Source for SpannerSource {
             }
             }
 
-            // Final page carries the bookmark so the pipeline persists only
-            // after everything before it has been written.
-            let kept = apply_incremental(buffer, incr.as_ref(), &mut running_max);
-            total += kept.len();
-            let bookmark = if incr.is_some() { running_max.clone() } else { None };
-            if !kept.is_empty() || bookmark.is_some() {
-                yield StreamPage { records: kept, bookmark };
+            // In incremental mode every page carries the position after its
+            // last row (the final page carries one even when empty).
+            total += buffer.len();
+            if !buffer.is_empty() || tracker.is_some() {
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                yield StreamPage { records: buffer, bookmark };
+            }
+            if let Some(missing) = tracker.as_ref().map(CursorTracker::missing).filter(|n| *n > 0) {
+                tracing::warn!(
+                    missing,
+                    "spanner incremental read: rows without a cursor value were emitted \
+                     without moving the bookmark"
+                );
             }
 
             tracing::info!(rows = total, query = %self.config.query, "spanner source stream complete");
@@ -416,10 +512,11 @@ impl Source for SpannerSource {
     }
 
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        let start = CursorBookmark::from_state(bookmark)?;
         *self
             .start_bookmark
             .lock()
-            .expect("start_bookmark mutex poisoned") = Some(bookmark);
+            .expect("start_bookmark mutex poisoned") = Some(start);
         Ok(())
     }
 
@@ -570,29 +667,6 @@ impl SpannerSource {
     }
 }
 
-/// Filter a page for incremental replication and advance `running_max`.
-/// For full replication the page passes through unchanged.
-fn apply_incremental(
-    page: Vec<Value>,
-    incr: Option<&IncrementalCtx>,
-    running_max: &mut Option<Value>,
-) -> Vec<Value> {
-    match incr {
-        None => page,
-        Some(ctx) => {
-            let kept = filter_incremental(page, &ctx.column, &ctx.start);
-            if let Some(m) = max_replication_value(&kept, &ctx.column) {
-                let m = m.clone();
-                *running_max = Some(match running_max.take() {
-                    Some(prev) => max_value(prev, m),
-                    None => m,
-                });
-            }
-            kept
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,75 +695,74 @@ mod tests {
         assert!(incr.is_none());
     }
 
-    #[test]
-    fn timestamp_cursors_compare_as_instants_across_fraction_widths() {
-        // Spanner trims trailing fractional zeros, so `…:00Z` and `…:00.5Z`
-        // differ in width and `'.' < 'Z'` reverses their text order (SQL-30).
-        let ctx = IncrementalCtx {
-            column: "ts".into(),
-            start: json!("2024-01-01T00:00:00Z"),
-        };
-        let page = vec![
-            json!({"ts": "2024-01-01T00:00:00.5Z"}),
-            json!({"ts": "2024-01-01T00:00:00Z"}),
-            json!({"ts": "2024-01-01T00:00:01Z"}),
-        ];
-        let mut max = None;
-        let kept = apply_incremental(page, Some(&ctx), &mut max);
-        assert_eq!(
-            kept,
-            vec![
-                json!({"ts": "2024-01-01T00:00:00.5Z"}),
-                json!({"ts": "2024-01-01T00:00:01Z"})
-            ]
-        );
-        assert_eq!(max, Some(json!("2024-01-01T00:00:01Z")));
-
-        let mut max = Some(json!("2024-01-01T00:00:00.25Z"));
-        apply_incremental(
-            vec![json!({"ts": "2024-01-01T00:00:00.5Z"})],
-            Some(&ctx),
-            &mut max,
-        );
-        assert_eq!(max, Some(json!("2024-01-01T00:00:00.5Z")));
+    fn field(code: TypeCode) -> Field {
+        Field {
+            name: "c".into(),
+            r#type: Some(gcloud_googleapis::spanner::v1::Type {
+                code: code as i32,
+                ..Default::default()
+            }),
+        }
     }
 
     #[test]
-    fn numeric_cursors_compare_as_decimals() {
-        let ctx = IncrementalCtx {
-            column: "n".into(),
-            start: json!("9.5"),
-        };
-        let mut max = None;
-        let kept = apply_incremental(
-            vec![
-                json!({"n": "10"}),
-                json!({"n": "9"}),
-                json!({"n": "100.25"}),
-            ],
-            Some(&ctx),
-            &mut max,
+    fn cursor_types_cast_the_bookmark() {
+        for (code, ty) in [
+            (TypeCode::Int64, "INT64"),
+            (TypeCode::Float64, "FLOAT64"),
+            (TypeCode::Float32, "FLOAT32"),
+            (TypeCode::Numeric, "NUMERIC"),
+            (TypeCode::String, "STRING"),
+            (TypeCode::Bool, "BOOL"),
+            (TypeCode::Date, "DATE"),
+            (TypeCode::Timestamp, "TIMESTAMP"),
+            (TypeCode::Bytes, "BYTES"),
+        ] {
+            assert_eq!(cursor_cast_type(&[field(code)], "c").unwrap(), ty);
+        }
+        for code in [TypeCode::Json, TypeCode::Array, TypeCode::Struct] {
+            let err = cursor_cast_type(&[field(code)], "c")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot order a cursor"), "{err}");
+        }
+        assert!(cursor_cast_type(&[], "c").is_err());
+    }
+
+    #[test]
+    fn cursor_wrap_filters_and_orders_on_the_cast_bookmark() {
+        assert_eq!(
+            cursor_wrap(
+                "SELECT * FROM t WHERE ts >= TIMESTAMP(@bookmark);\n",
+                "ts",
+                "TIMESTAMP"
+            ),
+            "SELECT * FROM (SELECT * FROM t WHERE ts >= TIMESTAMP(@bookmark)\n) AS q \
+             WHERE q.`ts` >= CAST(@_faucet_bookmark AS TIMESTAMP) ORDER BY q.`ts`"
         );
-        assert_eq!(kept, vec![json!({"n": "10"}), json!({"n": "100.25"})]);
-        assert_eq!(max, Some(json!("100.25")));
+        assert_eq!(
+            cursor_wrap("SELECT * FROM t", "we`ird", "BYTES"),
+            "SELECT * FROM (SELECT * FROM t\n) AS q WHERE q.`we``ird` >= \
+             FROM_BASE64(@_faucet_bookmark) ORDER BY q.`we``ird`"
+        );
     }
 
     #[test]
     fn build_incremental_binds_bookmark_param() {
         let mut cfg = base();
-        cfg.query = "SELECT * FROM t WHERE updated_at > @bookmark".into();
+        cfg.query = "SELECT * FROM t WHERE updated_at >= @bookmark".into();
         cfg.replication = SpannerReplication::Incremental {
             column: "updated_at".into(),
             initial_value: json!("1970-01-01"),
         };
         let (q, p, incr) = build_query_and_params(&cfg, &HashMap::new(), None);
-        assert_eq!(q, "SELECT * FROM t WHERE updated_at > @bookmark");
+        assert_eq!(q, "SELECT * FROM t WHERE updated_at >= @bookmark");
         assert_eq!(p, vec![("bookmark".to_string(), json!("1970-01-01"))]);
         assert_eq!(
             incr,
             Some(IncrementalCtx {
                 column: "updated_at".into(),
-                start: json!("1970-01-01")
+                start: CursorBookmark::initial(json!("1970-01-01"))
             })
         );
     }
@@ -697,15 +770,15 @@ mod tests {
     #[test]
     fn build_incremental_uses_stored_bookmark_over_initial() {
         let mut cfg = base();
-        cfg.query = "SELECT * FROM t WHERE c > @bookmark".into();
+        cfg.query = "SELECT * FROM t WHERE c >= @bookmark".into();
         cfg.replication = SpannerReplication::Incremental {
             column: "c".into(),
             initial_value: json!(0),
         };
-        let stored = json!(500);
+        let stored = CursorBookmark::from_state(json!({"value": 500, "boundary": ["x"]})).unwrap();
         let (_q, p, incr) = build_query_and_params(&cfg, &HashMap::new(), Some(&stored));
         assert_eq!(p, vec![("bookmark".to_string(), json!(500))]);
-        assert_eq!(incr.unwrap().start, json!(500));
+        assert_eq!(incr.unwrap().start, stored);
     }
 
     #[test]
@@ -718,7 +791,7 @@ mod tests {
         let (q, p, incr) = build_query_and_params(&cfg, &HashMap::new(), None);
         assert_eq!(q, "SELECT * FROM t");
         assert!(p.is_empty());
-        assert!(incr.is_some(), "client-side filter must still run");
+        assert!(incr.is_some(), "the outer cursor filter still applies");
     }
 
     #[test]
@@ -751,28 +824,6 @@ mod tests {
         assert!(matches!(err, Err(FaucetError::Config(_))));
         let err = build_statement("SELECT 1", &[("u".to_string(), json!(u64::MAX))]);
         assert!(matches!(err, Err(FaucetError::Config(_))));
-    }
-
-    #[test]
-    fn apply_incremental_filters_and_tracks_max() {
-        let ctx = IncrementalCtx {
-            column: "c".into(),
-            start: json!(10),
-        };
-        let mut running = None;
-        let page = vec![json!({"c": 5}), json!({"c": 15}), json!({"c": 20})];
-        let kept = apply_incremental(page, Some(&ctx), &mut running);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, Some(json!(20)));
-    }
-
-    #[test]
-    fn apply_incremental_full_passes_through() {
-        let mut running = None;
-        let page = vec![json!({"c": 1}), json!({"c": 2})];
-        let kept = apply_incremental(page, None, &mut running);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, None);
     }
 
     #[test]
@@ -827,7 +878,7 @@ mod tests {
         // The @name parameters of a resolved incremental query survive the
         // wrap — Spanner binds them by name, not by textual position.
         let mut cfg = base();
-        cfg.query = "SELECT * FROM t WHERE c > @bookmark".into();
+        cfg.query = "SELECT * FROM t WHERE c >= @bookmark".into();
         cfg.replication = SpannerReplication::Incremental {
             column: "c".into(),
             initial_value: json!(0),

@@ -29,7 +29,7 @@ pipeline:
         config:
           token: ${env:DATABRICKS_TOKEN}
       # Incremental replication (uncomment to only pull new rows each run):
-      # sql includes `AND o_orderdate > ${bookmark}`
+      # sql may include `AND o_orderdate >= ${bookmark}` (a strict `>` is refused)
       # replication: { type: incremental, column: o_orderdate, initial_value: "1990-01-01" }
       # state: persist the bookmark across runs (required for incremental)
 

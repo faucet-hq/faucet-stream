@@ -19,7 +19,7 @@ pipeline:
       query: >
         SELECT ID, CUSTOMER_ID, STATUS, TOTAL, UPDATED_AT
         FROM APP.ORDERS
-        WHERE UPDATED_AT > :bookmark
+        WHERE UPDATED_AT >= :bookmark
       replication: { type: incremental, column: UPDATED_AT, initial_value: "1970-01-01T00:00:00" }
   sink:
     type: postgres

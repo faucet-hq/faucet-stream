@@ -6,15 +6,15 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use faucet_common_clickhouse::{apply_auth, query_params, sql_literal};
+use faucet_common_clickhouse::{apply_auth, query_params, quote_ident, sql_literal};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
-use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::config::{ClickHouseReplication, ClickHouseSourceConfig};
+use crate::config::{BOOKMARK_TOKEN, ClickHouseReplication, ClickHouseSourceConfig};
 
 /// ClickHouse query source (HTTP interface, typed compact JSON rows).
 pub struct ClickHouseSource {
@@ -26,14 +26,73 @@ pub struct ClickHouseSource {
     base_url: String,
     /// Bookmark loaded via [`Source::apply_start_bookmark`]; overrides the
     /// configured `initial_value` for incremental runs.
-    start_bookmark: Mutex<Option<Value>>,
+    start_bookmark: Mutex<Option<CursorBookmark>>,
 }
 
 /// Incremental-replication context resolved for one run.
 #[derive(Debug, Clone, PartialEq)]
 struct IncrementalCtx {
     column: String,
-    start: Value,
+    start: CursorBookmark,
+}
+
+impl IncrementalCtx {
+    fn tracker(&self) -> CursorTracker {
+        CursorTracker::new(self.column.clone(), self.start.clone())
+    }
+}
+
+/// `query` filtered to `column >= <bookmark>` and ordered by the cursor;
+/// full replication passes through unchanged. Built after the template's
+/// tokens are substituted, so the literal is never re-scanned.
+///
+/// With `typed`, a bookmark in the RFC 3339 form this source emits for
+/// `DateTime` / `DateTime64` columns is parsed server-side
+/// (`parseDateTime64BestEffort`): ClickHouse refuses to compare those columns
+/// with a `T…Z` string literal. A `String` column holding such text refuses
+/// the parsed value instead, so the read is retried untyped
+/// ([`is_type_mismatch`]).
+fn cursor_wrap(query: String, incr: Option<&IncrementalCtx>, typed: bool) -> String {
+    let Some(ctx) = incr else {
+        return query;
+    };
+    let c = quote_ident(&ctx.column);
+    let inner = query.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
+    let lit = sql_literal(&ctx.start.value);
+    let bound = if typed && is_instant(&ctx.start.value) {
+        format!("parseDateTime64BestEffort({lit}, 9)")
+    } else {
+        lit
+    };
+    format!("SELECT * FROM ({inner}) AS q WHERE q.{c} >= {bound} ORDER BY q.{c}")
+}
+
+/// Whether `v` is an RFC 3339 instant (`YYYY-MM-DDTHH:MM:SS[.f](Z|±HH:MM)`).
+fn is_instant(v: &Value) -> bool {
+    let Value::String(s) = v else {
+        return false;
+    };
+    let b = s.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    b.len() >= 20
+        && digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && b[10] == b'T'
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19)
+        && (s.ends_with('Z') || matches!(b[b.len().saturating_sub(6)], b'+' | b'-'))
+}
+
+/// A ClickHouse `TYPE_MISMATCH` (53) or `NO_COMMON_TYPE` (386) refusal.
+fn is_type_mismatch(e: &FaucetError) -> bool {
+    matches!(e, FaucetError::HttpStatus { status: 400, body, .. }
+        if body.contains("Code: 53.") || body.contains("Code: 386."))
 }
 
 impl ClickHouseSource {
@@ -51,7 +110,7 @@ impl ClickHouseSource {
         })
     }
 
-    fn current_start(&self) -> Option<Value> {
+    fn current_start(&self) -> Option<CursorBookmark> {
         self.start_bookmark
             .lock()
             .expect("start_bookmark mutex poisoned")
@@ -65,14 +124,29 @@ impl ClickHouseSource {
         apply_auth(req, &self.config.connection)
     }
 
-    /// Run the query and collect all decoded rows plus (for incremental) the new
-    /// bookmark. Used by the non-streaming convenience methods.
-    async fn collect_all(
+    /// Every page of an incremental read, and its last bookmark.
+    async fn collect_incremental(
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        let start = self.current_start();
-        let (query, incr) = build_effective_query(&self.config, context, start.as_ref());
+        let mut pages = self.stream_pages(context, 0);
+        let mut records = Vec::new();
+        let mut bookmark = None;
+        while let Some(page) = pages.next().await {
+            let page = page?;
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
+        }
+        Ok((records, bookmark))
+    }
+
+    /// Run a full-replication query and collect all decoded rows. Used by the
+    /// non-streaming convenience methods.
+    async fn collect_all(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        let (query, _) = build_effective_query(&self.config, context, None);
 
         let resp = self
             .client
@@ -82,12 +156,7 @@ impl ClickHouseSource {
         let body = resp.text().await.map_err(|e| {
             FaucetError::Source(format!("ClickHouse: reading response failed: {e}"))
         })?;
-        let records = crate::decode::CompactDecoder::decode_all(&body)?;
-
-        let mut running_max: Option<Value> = None;
-        let records = apply_incremental(records, incr.as_ref(), &mut running_max);
-        let bookmark = if incr.is_some() { running_max } else { None };
-        Ok((records, bookmark))
+        crate::decode::CompactDecoder::decode_all(&body)
     }
 }
 
@@ -109,8 +178,6 @@ where
 /// the *same* single pass. Substituting them in two passes let either one's
 /// output be re-scanned by the other, which is the injection hazard #654 M14
 /// describes.
-const BOOKMARK_TOKEN: &str = "@bookmark";
-
 /// Reserved placeholder key that [`BOOKMARK_TOKEN`] is rewritten to. Named (not
 /// inlined) because it is a reserved word in the substitution namespace: a
 /// parent-context key of the same name is shadowed by the bookmark.
@@ -128,7 +195,7 @@ const BOOKMARK_KEY: &str = "__faucet_bookmark";
 fn build_effective_query(
     config: &ClickHouseSourceConfig,
     context: &HashMap<String, Value>,
-    start_bookmark: Option<&Value>,
+    start_bookmark: Option<&CursorBookmark>,
 ) -> (String, Option<IncrementalCtx>) {
     let mut template = config.query.clone();
     let mut literals: HashMap<String, Value> = HashMap::new();
@@ -141,12 +208,15 @@ fn build_effective_query(
         } => {
             let start = start_bookmark
                 .cloned()
-                .unwrap_or_else(|| initial_value.clone());
-            // Server-side pushdown where the user wrote `@bookmark`; absent
-            // that, only the client-side filter applies.
+                .unwrap_or_else(|| CursorBookmark::initial(initial_value.clone()));
+            // The cursor also applies where the user wrote `@bookmark`; the
+            // outer `>=` filter ([`cursor_wrap`]) always applies.
             if template.contains(BOOKMARK_TOKEN) {
                 template = template.replace(BOOKMARK_TOKEN, &format!("{{{BOOKMARK_KEY}}}"));
-                literals.insert(BOOKMARK_KEY.to_owned(), Value::String(sql_literal(&start)));
+                literals.insert(
+                    BOOKMARK_KEY.to_owned(),
+                    Value::String(sql_literal(&start.value)),
+                );
             }
             Some(IncrementalCtx {
                 column: column.clone(),
@@ -204,29 +274,6 @@ fn substitute_context_sql(
     faucet_core::util::substitute_context(query, &literals)
 }
 
-/// Filter a page for incremental replication and advance `running_max`.
-/// For full replication the page passes through unchanged.
-fn apply_incremental(
-    page: Vec<Value>,
-    incr: Option<&IncrementalCtx>,
-    running_max: &mut Option<Value>,
-) -> Vec<Value> {
-    match incr {
-        None => page,
-        Some(ctx) => {
-            let kept = filter_incremental(page, &ctx.column, &ctx.start);
-            if let Some(m) = max_replication_value(&kept, &ctx.column) {
-                let m = m.clone();
-                *running_max = Some(match running_max.take() {
-                    Some(prev) => max_value(prev, m),
-                    None => m,
-                });
-            }
-            kept
-        }
-    }
-}
-
 /// Drain every complete `\n`-terminated line from `buf`, returning each line's
 /// bytes (without the trailing newline). Splitting on the `0x0A` byte is safe
 /// for UTF-8 because a newline never appears inside a multi-byte sequence, so a
@@ -278,22 +325,25 @@ impl Source for ClickHouseSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        Ok(self.collect_all(context).await?.0)
+        Ok(self.fetch_with_context_incremental(context).await?.0)
     }
 
     async fn fetch_with_context_incremental(
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        self.collect_all(context).await
+        if matches!(self.config.replication, ClickHouseReplication::Full) {
+            return Ok((self.collect_all(context).await?, None));
+        }
+        self.collect_incremental(context).await
     }
 
     /// Stream rows straight off the HTTP response body without buffering the
     /// whole result set: bytes are accumulated, split into complete
     /// response lines, and yielded in [`ClickHouseSourceConfig::batch_size`]
-    /// pages. The final page carries the incremental bookmark (when replicating
-    /// incrementally) so the pipeline persists only after everything before it
-    /// is written.
+    /// pages. In incremental mode rows arrive in cursor order and every page
+    /// carries the bookmark after its last row (the final page carries one
+    /// even when empty).
     fn stream_pages<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
@@ -308,49 +358,64 @@ impl Source for ClickHouseSource {
         let cap = if batch_size == 0 { 1024 } else { batch_size };
         let start = self.current_start();
         let (query, incr) = build_effective_query(&self.config, context, start.as_ref());
+        let typed = cursor_wrap(query.clone(), incr.as_ref(), true);
+        let text = cursor_wrap(query, incr.as_ref(), false);
+        let mut tracker = incr.as_ref().map(IncrementalCtx::tracker);
 
         Box::pin(async_stream::try_stream! {
             let calls = self.calls.get();
-            let resp = self.client.call(&calls, "query", self.request(query)).await?;
-            let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+            let resp = self.client.call(&calls, "query", self.request(typed.clone())).await?;
+            let resp = match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
+                Err(e) if typed != text && is_type_mismatch(&e) => {
+                    tracing::debug!(error = %e, "ClickHouse: retrying with the bookmark as text");
+                    let resp = self.client.call(&calls, "query", self.request(text)).await?;
+                    check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?
+                }
+                other => other?,
+            };
             let mut body = resp.bytes_stream();
             let reads = calls.with_roundtrip_metering(false);
 
             let mut buf: Vec<u8> = Vec::new();
             let mut decoder = crate::decode::CompactDecoder::default();
             let mut page: Vec<Value> = Vec::with_capacity(cap);
-            let mut running_max: Option<Value> = None;
             let mut total = 0usize;
 
             while let Some(chunk_result) = next_chunk(&reads, &mut body).await? {
                 let bytes = chunk_result.map_err(FaucetError::Http)?;
                 buf.extend_from_slice(&bytes);
                 for line in split_complete_lines(&mut buf) {
-                    if let Some(value) = decoder.push_line(&line)? {
+                    let Some(value) = decoder.push_line(&line)? else { continue };
+                    if tracker.as_mut().is_none_or(|t| t.admit(&value)) {
                         page.push(value);
                         if page.len() >= chunk {
                             let ready = std::mem::replace(&mut page, Vec::with_capacity(cap));
-                            let kept = apply_incremental(ready, incr.as_ref(), &mut running_max);
-                            total += kept.len();
-                            if !kept.is_empty() {
-                                yield StreamPage { records: kept, bookmark: None };
-                            }
+                            total += ready.len();
+                            let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                            yield StreamPage { records: ready, bookmark };
                         }
                     }
                 }
             }
             // Trailing line without a terminating newline (ClickHouse always
             // newline-terminates, but be robust).
-            if let Some(value) = decoder.push_line(&buf)? {
+            if let Some(value) = decoder.push_line(&buf)?
+                .filter(|v| tracker.as_mut().is_none_or(|t| t.admit(v)))
+            {
                 page.push(value);
             }
 
-            // Final page carries the bookmark.
-            let kept = apply_incremental(page, incr.as_ref(), &mut running_max);
-            total += kept.len();
-            let bookmark = if incr.is_some() { running_max.clone() } else { None };
-            if !kept.is_empty() || bookmark.is_some() {
-                yield StreamPage { records: kept, bookmark };
+            if !page.is_empty() || tracker.is_some() {
+                total += page.len();
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                yield StreamPage { records: page, bookmark };
+            }
+            if let Some(missing) = tracker.as_ref().map(CursorTracker::missing).filter(|n| *n > 0) {
+                tracing::warn!(
+                    missing,
+                    "ClickHouse incremental read: rows without a cursor value were emitted \
+                     without moving the bookmark"
+                );
             }
 
             tracing::info!(rows = total, batch_size, query = %self.config.query, "ClickHouse source stream complete");
@@ -398,10 +463,11 @@ impl Source for ClickHouseSource {
     }
 
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        let start = CursorBookmark::from_state(bookmark)?;
         *self
             .start_bookmark
             .lock()
-            .expect("start_bookmark mutex poisoned") = Some(bookmark);
+            .expect("start_bookmark mutex poisoned") = Some(start);
         Ok(())
     }
 
@@ -445,16 +511,16 @@ mod tests {
     fn build_incremental_substitutes_bookmark_literal() {
         let cfg = ClickHouseSourceConfig::new(
             "http://h:8123",
-            "SELECT * FROM t WHERE updated_at > @bookmark",
+            "SELECT * FROM t WHERE updated_at >= @bookmark",
         )
         .incremental("updated_at", json!("1970-01-01"));
         let (q, incr) = build_effective_query(&cfg, &HashMap::new(), None);
-        assert_eq!(q, "SELECT * FROM t WHERE updated_at > '1970-01-01'");
+        assert_eq!(q, "SELECT * FROM t WHERE updated_at >= '1970-01-01'");
         assert_eq!(
             incr,
             Some(IncrementalCtx {
                 column: "updated_at".into(),
-                start: json!("1970-01-01"),
+                start: CursorBookmark::initial(json!("1970-01-01")),
             })
         );
     }
@@ -462,12 +528,12 @@ mod tests {
     #[test]
     fn build_incremental_prefers_stored_bookmark_over_initial() {
         let cfg =
-            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c > @bookmark")
+            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c >= @bookmark")
                 .incremental("c", json!(0));
-        let stored = json!(500);
+        let stored = CursorBookmark::initial(json!(500));
         let (q, incr) = build_effective_query(&cfg, &HashMap::new(), Some(&stored));
-        assert_eq!(q, "SELECT * FROM t WHERE c > 500");
-        assert_eq!(incr.unwrap().start, json!(500));
+        assert_eq!(q, "SELECT * FROM t WHERE c >= 500");
+        assert_eq!(incr.unwrap().start.value, json!(500));
     }
 
     #[test]
@@ -520,13 +586,13 @@ mod tests {
         ctx.insert("a".to_string(), json!("x@bookmark"));
         let cfg = ClickHouseSourceConfig::new(
             "http://h:8123",
-            "SELECT * FROM t WHERE x = {a} AND c > @bookmark",
+            "SELECT * FROM t WHERE x = {a} AND c >= @bookmark",
         )
         .incremental("c", json!("2024-01-01"));
         let (q, _incr) = build_effective_query(&cfg, &ctx, None);
         assert_eq!(
             q,
-            "SELECT * FROM t WHERE x = 'x@bookmark' AND c > '2024-01-01'"
+            "SELECT * FROM t WHERE x = 'x@bookmark' AND c >= '2024-01-01'"
         );
     }
 
@@ -537,11 +603,12 @@ mod tests {
         let mut ctx = HashMap::new();
         ctx.insert("a".to_string(), json!("SECRET"));
         let cfg =
-            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c > @bookmark")
+            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c >= @bookmark")
                 .incremental("c", json!(0));
-        let stored = json!("{a}");
-        let (q, _incr) = build_effective_query(&cfg, &ctx, Some(&stored));
-        assert_eq!(q, "SELECT * FROM t WHERE c > '{a}'");
+        let stored = CursorBookmark::initial(json!("{a}"));
+        let (q, incr) = build_effective_query(&cfg, &ctx, Some(&stored));
+        assert_eq!(q, "SELECT * FROM t WHERE c >= '{a}'");
+        let q = cursor_wrap(q, incr.as_ref(), true);
         assert!(!q.contains("SECRET"), "bookmark output was re-scanned: {q}");
     }
 
@@ -587,10 +654,10 @@ mod tests {
         let mut ctx = HashMap::new();
         ctx.insert(BOOKMARK_KEY.to_string(), json!("HIJACKED"));
         let cfg =
-            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c > @bookmark")
+            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c >= @bookmark")
                 .incremental("c", json!(42));
         let (q, _incr) = build_effective_query(&cfg, &ctx, None);
-        assert_eq!(q, "SELECT * FROM t WHERE c > 42");
+        assert_eq!(q, "SELECT * FROM t WHERE c >= 42");
         assert!(!q.contains("HIJACKED"), "reserved key was shadowed: {q}");
     }
 
@@ -607,25 +674,75 @@ mod tests {
     }
 
     #[test]
-    fn apply_incremental_filters_and_tracks_max() {
+    fn cursor_wrap_filters_with_ge_and_orders() {
         let ctx = IncrementalCtx {
-            column: "c".into(),
-            start: json!(10),
+            column: "up`d".into(),
+            start: CursorBookmark::initial(json!("2026-10-20 12:00:00")),
         };
-        let mut running = None;
-        let page = vec![json!({"c": 5}), json!({"c": 15}), json!({"c": 20})];
-        let kept = apply_incremental(page, Some(&ctx), &mut running);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, Some(json!(20)));
+        assert_eq!(
+            cursor_wrap("SELECT * FROM t;".into(), Some(&ctx), true),
+            "SELECT * FROM (SELECT * FROM t) AS q WHERE q.\"up`d\" >= '2026-10-20 12:00:00' \
+             ORDER BY q.\"up`d\""
+        );
+        assert_eq!(cursor_wrap("SELECT 1".into(), None, true), "SELECT 1");
+        let at = IncrementalCtx {
+            column: "at".into(),
+            start: CursorBookmark::initial(json!("2024-01-01T04:30:00Z")),
+        };
+        assert!(cursor_wrap("SELECT 1".into(), Some(&at), true).ends_with(
+            ">= parseDateTime64BestEffort('2024-01-01T04:30:00Z', 9) ORDER BY q.\"at\""
+        ));
+        assert!(
+            cursor_wrap("SELECT 1".into(), Some(&at), false)
+                .ends_with(">= '2024-01-01T04:30:00Z' ORDER BY q.\"at\"")
+        );
     }
 
     #[test]
-    fn apply_incremental_full_passes_through() {
-        let mut running = None;
-        let page = vec![json!({"c": 1}), json!({"c": 2})];
-        let kept = apply_incremental(page, None, &mut running);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, None);
+    fn instants_and_type_mismatches_are_recognised() {
+        for yes in [
+            "2024-01-01T04:30:00Z",
+            "2024-01-01T04:30:00.123456Z",
+            "2024-01-01T04:30:00+05:30",
+        ] {
+            assert!(is_instant(&json!(yes)), "{yes}");
+        }
+        for no in [
+            json!("2024-01-01"),
+            json!("2024-01-01 04:30:00"),
+            json!(5),
+            json!("2024-01-01T04:30:00"),
+        ] {
+            assert!(!is_instant(&no), "{no}");
+        }
+        let err = |status, body: &str| FaucetError::HttpStatus {
+            status,
+            url: String::new(),
+            body: body.into(),
+        };
+        assert!(is_type_mismatch(&err(400, "Code: 53. DB::Exception: x")));
+        assert!(is_type_mismatch(&err(400, "Code: 386. DB::Exception: x")));
+        assert!(!is_type_mismatch(&err(400, "Code: 62. DB::Exception: x")));
+        assert!(!is_type_mismatch(&err(500, "Code: 53.")));
+        assert!(!is_type_mismatch(&FaucetError::Source("Code: 53.".into())));
+    }
+
+    #[test]
+    fn tracker_keeps_rows_tied_at_the_bookmark() {
+        let mut first = IncrementalCtx {
+            column: "c".into(),
+            start: CursorBookmark::initial(json!(0)),
+        }
+        .tracker();
+        let a = json!({"id": 1, "c": 10});
+        assert!(first.admit(&a));
+        let mut second = IncrementalCtx {
+            column: "c".into(),
+            start: CursorBookmark::from_state(first.bookmark().to_value()).unwrap(),
+        }
+        .tracker();
+        assert!(!second.admit(&a));
+        assert!(second.admit(&json!({"id": 2, "c": 10})));
     }
 
     #[test]
@@ -675,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn apply_start_bookmark_overrides_initial() {
         let cfg =
-            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c > @bookmark")
+            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c >= @bookmark")
                 .incremental("c", json!(0));
         let source = ClickHouseSource::new(cfg).unwrap();
         source.apply_start_bookmark(json!(999)).await.unwrap();
@@ -684,8 +801,8 @@ mod tests {
             &HashMap::new(),
             source.current_start().as_ref(),
         );
-        assert_eq!(q, "SELECT * FROM t WHERE c > 999");
-        assert_eq!(incr.unwrap().start, json!(999));
+        assert_eq!(q, "SELECT * FROM t WHERE c >= 999");
+        assert_eq!(incr.unwrap().start.value, json!(999));
     }
 
     #[test]

@@ -20,18 +20,23 @@ pub enum ClickHouseReplication {
     /// Every run fetches the full result set (default).
     #[default]
     Full,
-    /// Only rows whose `column` is strictly greater than the stored bookmark
-    /// (or `initial_value` on the first run) are emitted.
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
     ///
-    /// The bookmark is applied two ways: if the query contains the literal
-    /// token `@bookmark`, it is substituted as an injection-safe SQL literal so
-    /// the server filters (efficient pushdown); the source *also* filters
-    /// client-side as a correctness backstop. The new maximum of `column` is
-    /// persisted on the final page.
+    /// The source wraps the query as
+    /// `SELECT * FROM (<query>) AS q WHERE q."column" >= <bookmark> ORDER BY q."column"`
+    /// and drops the rows it already emitted at the bookmark value, so rows
+    /// that share a cursor value (ties, late inserts in the same second,
+    /// async-insert flushes) are never skipped. Every page carries a bookmark,
+    /// so a crash replays at most one page. Write `@bookmark` in the query
+    /// (with `>=`) to apply the cursor further inside it; it is substituted as
+    /// an injection-safe SQL literal, and a strict `>` is refused. Rows whose
+    /// `column` is NULL are never read.
     Incremental {
         /// Column whose value is the replication cursor (e.g. `updated_at`).
         column: String,
-        /// Lower bound used on the first run, before any bookmark is stored.
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
         initial_value: Value,
     },
 }
@@ -106,38 +111,37 @@ impl ClickHouseSourceConfig {
     pub fn validate(&self) -> Result<(), FaucetError> {
         self.connection.validate()?;
         validate_batch_size(self.batch_size)?;
-        if let ClickHouseReplication::Incremental { column, .. } = &self.replication
-            && column.trim().is_empty()
-        {
+        let ClickHouseReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
+        else {
+            return Ok(());
+        };
+        if column.trim().is_empty() {
             return Err(FaucetError::Config(
                 "ClickHouse incremental replication requires a non-empty `column`".into(),
             ));
         }
-        if self.incremental_without_bookmark_pushdown() {
-            tracing::warn!(
-                "ClickHouse incremental replication query has no `@bookmark` token: the \
-                 cursor is applied client-side only, so the server returns the ENTIRE \
-                 result set on every run (correctness is preserved, but it is a full \
-                 re-scan). Add `@bookmark` to the WHERE clause to push the cursor down, \
-                 e.g. `... WHERE {column} > @bookmark`",
-                column = match &self.replication {
-                    ClickHouseReplication::Incremental { column, .. } => column.as_str(),
-                    _ => "<column>",
-                }
-            );
+        if initial_value.is_null() {
+            return Err(FaucetError::Config(
+                "ClickHouse incremental replication requires a non-null `initial_value`".into(),
+            ));
+        }
+        if faucet_core::replication::cursor::strict_comparison(&self.query, BOOKMARK_TOKEN) {
+            return Err(FaucetError::Config(format!(
+                "ClickHouse: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source re-reads \
+                 the bookmark value and drops the rows it already emitted, and a strict \
+                 comparison skips rows that share it"
+            )));
         }
         Ok(())
     }
-
-    /// `true` when replication is `Incremental` but the query omits the
-    /// `@bookmark` token, so the cursor cannot be pushed down and every run
-    /// re-scans the whole result set. Pure predicate so the load-time warning's
-    /// condition is unit-testable.
-    pub(crate) fn incremental_without_bookmark_pushdown(&self) -> bool {
-        matches!(self.replication, ClickHouseReplication::Incremental { .. })
-            && !self.query.contains("@bookmark")
-    }
 }
+
+/// The token a query uses to read the incremental bookmark
+/// (`WHERE updated_at >= @bookmark`).
+pub const BOOKMARK_TOKEN: &str = "@bookmark";
 
 #[cfg(test)]
 mod tests {
@@ -207,21 +211,20 @@ mod tests {
     }
 
     #[test]
-    fn incremental_without_bookmark_pushdown_flags_missing_token() {
-        let missing = ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t")
-            .incremental("updated_at", json!("1970-01-01"));
-        assert!(missing.incremental_without_bookmark_pushdown());
-        assert!(missing.validate().is_ok(), "warn, not hard error");
-
-        let with_token = ClickHouseSourceConfig::new(
-            "http://h:8123",
-            "SELECT * FROM t WHERE updated_at > @bookmark",
-        )
-        .incremental("updated_at", json!("1970-01-01"));
-        assert!(!with_token.incremental_without_bookmark_pushdown());
-
-        let full = ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t");
-        assert!(!full.incremental_without_bookmark_pushdown());
+    fn validate_rejects_bad_incremental_settings() {
+        for (query, initial, needle) in [
+            ("SELECT * FROM t", json!(null), "initial_value"),
+            ("SELECT * FROM t WHERE c > @bookmark", json!(0), ">="),
+        ] {
+            let cfg = ClickHouseSourceConfig::new("http://h:8123", query).incremental("c", initial);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+        for query in ["SELECT * FROM t", "SELECT * FROM t WHERE c >= @bookmark"] {
+            let cfg =
+                ClickHouseSourceConfig::new("http://h:8123", query).incremental("c", json!(0));
+            assert!(cfg.validate().is_ok(), "{query}");
+        }
     }
 
     #[test]

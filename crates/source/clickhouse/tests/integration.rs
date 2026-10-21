@@ -5,7 +5,7 @@
 //! Docker is present and count toward patch coverage. They exercise the
 //! streaming HTTP I/O paths in `src/stream.rs` — the `JSONEachRow` streaming
 //! decoder, line-buffering across chunks, `batch_size` paging, incremental
-//! `@bookmark` pushdown + resume, and the live `check()` probe — that the pure
+//! `>=` cursor read + resume, and the live `check()` probe — that the pure
 //! unit tests can't reach. Mirrors the postgres/mssql integration-test pattern.
 //!
 //! Run explicitly with:
@@ -153,7 +153,7 @@ async fn incremental_pushdown_and_resume() {
     let source = ClickHouseSource::new(
         ClickHouseSourceConfig::new(
             &base,
-            "SELECT id, updated_at FROM events WHERE updated_at > @bookmark ORDER BY updated_at",
+            "SELECT id, updated_at FROM events WHERE updated_at >= @bookmark ORDER BY updated_at",
         )
         .incremental("updated_at", json!("2024-01-15")),
     )
@@ -162,32 +162,31 @@ async fn incremental_pushdown_and_resume() {
     let (rows, bookmark) = source.fetch_all_incremental().await.expect("run 1");
     let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![2, 3], "run 1 honours initial_value pushdown");
-    assert_eq!(bookmark, Some(json!("2024-03-01")));
+    assert_eq!(bookmark.as_ref().unwrap()["value"], json!("2024-03-01"));
 
-    // Persist the bookmark, add a newer row, run again — no duplicates.
+    // Persist the bookmark, add a newer row and a row tied at the bookmark
+    // value (inserted after run 1 read it), run again.
     source
         .apply_start_bookmark(bookmark.unwrap())
         .await
         .expect("apply bookmark");
     http_exec(
         &base,
-        "INSERT INTO events FORMAT JSONEachRow {\"id\":4,\"updated_at\":\"2024-04-01\"}",
+        "INSERT INTO events FORMAT JSONEachRow {\"id\":4,\"updated_at\":\"2024-04-01\"} \
+         {\"id\":5,\"updated_at\":\"2024-03-01\"}",
     )
     .await;
 
     let (rows2, bookmark2) = source.fetch_all_incremental().await.expect("run 2");
     let ids2: Vec<i64> = rows2.iter().map(|r| r["id"].as_i64().unwrap()).collect();
-    assert_eq!(ids2, vec![4], "run 2 resumes from bookmark, no duplicates");
-    assert_eq!(bookmark2, Some(json!("2024-04-01")));
+    assert_eq!(ids2, vec![5, 4], "run 2 keeps the tie, no duplicates");
+    assert_eq!(bookmark2.unwrap()["value"], json!("2024-04-01"));
 
     // The streaming path carries the incremental bookmark on its final page.
     // A fresh source (initial_value 2024-01-15) sees rows 2,3,4.
     let stream_source = ClickHouseSource::new(
-        ClickHouseSourceConfig::new(
-            &base,
-            "SELECT id, updated_at FROM events WHERE updated_at > @bookmark ORDER BY updated_at",
-        )
-        .incremental("updated_at", json!("2024-01-15")),
+        ClickHouseSourceConfig::new(&base, "SELECT id, updated_at FROM events")
+            .incremental("updated_at", json!("2024-01-15")),
     )
     .expect("stream source");
     let ctx: HashMap<String, Value> = HashMap::new();
@@ -196,15 +195,16 @@ async fn incremental_pushdown_and_resume() {
         .map(|p| p.expect("page"))
         .collect()
         .await;
-    let streamed: Vec<i64> = pages
+    let mut streamed: Vec<i64> = pages
         .iter()
         .flat_map(|p| p.records.iter())
         .map(|r| r["id"].as_i64().unwrap())
         .collect();
-    assert_eq!(streamed, vec![2, 3, 4]);
+    streamed.sort();
+    assert_eq!(streamed, vec![2, 3, 4, 5]);
     assert_eq!(
-        pages.last().and_then(|p| p.bookmark.clone()),
-        Some(json!("2024-04-01")),
+        pages.last().and_then(|p| p.bookmark.clone()).unwrap()["value"],
+        json!("2024-04-01"),
         "final streamed page carries the incremental bookmark"
     );
 
@@ -235,13 +235,13 @@ async fn a_uint64_cursor_orders_numerically_across_runs() {
 
     let source = ClickHouseSource::new(
         ClickHouseSourceConfig::new(&base, "SELECT id, v FROM seq ORDER BY id")
-            .incremental("id", json!(9)),
+            .incremental("id", json!(10)),
     )
     .expect("source");
     let (rows, bookmark) = source.fetch_all_incremental().await.expect("run 1");
     let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().unwrap()).collect();
     assert_eq!(ids, vec![99, 100, 101]);
-    assert_eq!(bookmark, Some(json!(101)));
+    assert_eq!(bookmark.as_ref().unwrap()["value"], json!(101));
     assert_eq!(rows[2]["v"], json!(9_223_372_036_854_775_807i64));
 
     source
@@ -338,15 +338,44 @@ async fn datetimes_carry_their_zone_and_denormals_survive() {
     let incremental = ClickHouseSource::new(
         ClickHouseSourceConfig::new(
             &base,
-            "SELECT id, at FROM zoned WHERE at > parseDateTime64BestEffort(@bookmark) ORDER BY at",
+            "SELECT id, at FROM zoned WHERE at >= parseDateTime64BestEffort(@bookmark)",
         )
         .incremental("at", json!("2024-01-01T04:30:00Z")),
     )
     .expect("source");
     let (rows, bookmark) = incremental.fetch_all_incremental().await.expect("run");
     let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert_eq!(
+        bookmark.as_ref().unwrap()["value"],
+        json!("2024-01-03T04:30:00Z")
+    );
+    // Resumed on that bookmark, the emitted boundary row is not read again.
+    incremental
+        .apply_start_bookmark(bookmark.unwrap())
+        .await
+        .expect("bookmark");
+    let (again, _) = incremental.fetch_all_incremental().await.expect("run 2");
+    assert!(again.is_empty(), "{again:?}");
+
+    // Without the in-query parse the source binds the instant itself, and a
+    // `String` column holding the same text is read too (typed bind refused,
+    // retried as text).
+    let typed = ClickHouseSource::new(
+        ClickHouseSourceConfig::new(&base, "SELECT id, at FROM zoned")
+            .incremental("at", json!("2024-01-02T04:30:00Z")),
+    )
+    .expect("source");
+    let (rows, _) = typed.fetch_all_incremental().await.expect("typed run");
+    let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![2, 3]);
-    assert_eq!(bookmark, Some(json!("2024-01-03T04:30:00Z")));
+    let text = ClickHouseSource::new(
+        ClickHouseSourceConfig::new(&base, "SELECT id, toString(id) AS s, 'x' AS k FROM zoned")
+            .incremental("k", json!("2024-01-02T04:30:00Z")),
+    )
+    .expect("source");
+    let (rows, _) = text.fetch_all_incremental().await.expect("text run");
+    assert_eq!(rows.len(), 3, "'x' >= '2024-…' as text");
 }
 
 #[tokio::test(flavor = "multi_thread")]

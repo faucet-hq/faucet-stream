@@ -15,7 +15,7 @@ source:
     project_id: my-project
     instance: my-instance
     database: my-db
-    query: "SELECT * FROM orders WHERE updated_at > TIMESTAMP(@bookmark)"
+    query: "SELECT * FROM orders WHERE updated_at >= TIMESTAMP(@bookmark)"
     replication:
       type: incremental
       column: updated_at
@@ -63,30 +63,52 @@ Each row becomes one JSON object keyed by column name:
 ## Incremental replication
 
 ```yaml
-query: "SELECT * FROM orders WHERE updated_at > TIMESTAMP(@bookmark)"
+query: "SELECT * FROM orders WHERE updated_at >= TIMESTAMP(@bookmark)"
 replication:
   type: incremental
   column: updated_at
   initial_value: "1970-01-01T00:00:00Z"
 ```
 
-Only rows whose `column` is strictly greater than the stored bookmark (or
-`initial_value` on the first run) are emitted; the new maximum is persisted on
-the final page via the pipeline's `state:` store. When the query contains the
-named parameter `@bookmark`, the cursor is bound server-side (efficient);
-without it the source still filters client-side but the server re-scans the
-whole table every run (a warning is logged at config load).
+Each run reads the rows not yet read, in `column` order, from the stored
+bookmark (or `initial_value`, an inclusive lower bound, on the first run). The
+source wraps the query as
 
-**Type casts:** Spanner does not implicitly coerce parameter types. A string
-bookmark compared against a `TIMESTAMP` column needs an explicit cast in the
-query — `updated_at > TIMESTAMP(@bookmark)` — and likewise `DATE(@bookmark)`
-for `DATE` columns. Integer bookmarks bind as `INT64` and compare directly.
+```sql
+SELECT * FROM (<query>) AS q
+WHERE q.`updated_at` >= CAST(@_faucet_bookmark AS TIMESTAMP)
+ORDER BY q.`updated_at`
+```
 
-**Cursor column type:** `INT64`, `TIMESTAMP`, `DATE` and `NUMERIC` all work.
-Cursors are compared by value, not as text: `TIMESTAMP` values as instants
-(Spanner trims trailing fractional zeros, so `…:00Z` sorts after `…:00.5Z` as
-text) and `NUMERIC` strings as exact decimals (`"9" < "10"`). Bind a `NUMERIC`
-cursor with `amount > CAST(@bookmark AS NUMERIC)`.
+(the cast type is the cursor column's type, read from the result metadata of
+a `LIMIT 0` probe query at the start of each run) and drops the rows it already
+emitted at the bookmark value. So rows that share a cursor value — ties, or a
+row committed late at the boundary — are never skipped. Every page carries a
+bookmark `{value, boundary}` (the boundary lists fingerprints of the rows read
+at `value`), so a crash replays at most one page. Above 10,000 rows at one
+value the boundary is dropped and the next run re-reads that value
+(duplicates, never loss). Rows whose `column` is NULL are never read.
+
+Writing `@bookmark` in the query is optional; use it to apply the cursor
+inside the query (e.g. before a join), with `>=`. A strict comparison
+(`> @bookmark`, `> TIMESTAMP(@bookmark)`, `@bookmark < c`) is refused at load
+time, because it skips rows that share the bookmark value.
+
+**Upgrading:** a bookmark stored by an earlier release (a bare value) reads as
+a bookmark with an empty boundary, so the first run after upgrading
+re-delivers the rows at that value once. Queries written with `>` must switch
+to `>=`.
+
+**Type casts:** Spanner does not implicitly coerce parameter types. Inside
+your query, `@bookmark` binds by its JSON type, so a string bookmark compared
+against a `TIMESTAMP` column needs an explicit cast — `updated_at >=
+TIMESTAMP(@bookmark)` — and likewise `DATE(@bookmark)` for `DATE` columns or
+`CAST(@bookmark AS NUMERIC)` for `NUMERIC`. Integer bookmarks bind as `INT64`
+and compare directly. The outer filter casts for you.
+
+**Cursor column type:** `INT64`, `FLOAT64`, `FLOAT32`, `NUMERIC`, `STRING`,
+`BOOL`, `DATE`, `TIMESTAMP` and `BYTES` work; `JSON`, `ARRAY` and `STRUCT`
+columns are refused when the run starts.
 
 ## Stale reads
 

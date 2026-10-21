@@ -26,17 +26,24 @@ pub enum MssqlReplication {
     /// Every run fetches the full result set (default).
     #[default]
     Full,
-    /// Only rows whose `column` is strictly greater than the stored bookmark
-    /// (or `initial_value` on the first run) are emitted.
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
     ///
-    /// The bookmark is applied two ways: if the query contains the literal
-    /// token `@bookmark`, it is bound as a parameter so the server filters
-    /// (efficient); the source *also* filters client-side as a correctness
-    /// backstop. The new maximum of `column` is persisted on the final page.
+    /// The source wraps the query as
+    /// `SELECT * FROM (<query>) AS q WHERE q.[column] >= <bookmark> ORDER BY q.[column]`
+    /// and drops the rows it already emitted at the bookmark value, so rows
+    /// that share a cursor value (ties, late commits, `DATETIME`'s 1/300 s
+    /// ticks) are never skipped. Every page carries a bookmark, so a crash
+    /// replays at most one page. Write `@bookmark` in the query (with `>=`)
+    /// to apply the cursor further inside it, e.g. in a CTE; a strict `>` is
+    /// refused. The query must not end in a top-level `ORDER BY` (T-SQL
+    /// forbids it in a derived table). Rows whose `column` is NULL are never
+    /// read.
     Incremental {
         /// Column whose value is the replication cursor (e.g. `updated_at`).
         column: String,
-        /// Lower bound used on the first run, before any bookmark is stored.
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
         initial_value: Value,
     },
 }
@@ -142,38 +149,42 @@ impl MssqlSourceConfig {
     pub fn validate(&self) -> Result<(), FaucetError> {
         self.connection.validate()?;
         validate_batch_size(self.batch_size)?;
-        if let MssqlReplication::Incremental { column, .. } = &self.replication
-            && column.trim().is_empty()
-        {
+        let MssqlReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
+        else {
+            return Ok(());
+        };
+        if column.trim().is_empty() {
             return Err(FaucetError::Config(
                 "MSSQL incremental replication requires a non-empty `column`".into(),
             ));
         }
-        if self.incremental_without_bookmark_pushdown() {
-            tracing::warn!(
-                "MSSQL incremental replication query has no `@bookmark` token: the \
-                 cursor is applied client-side only, so the server returns the ENTIRE \
-                 table on every run (correctness is preserved, but it is a full re-scan). \
-                 Add `@bookmark` to the WHERE clause to push the cursor down, e.g. \
-                 `... WHERE {column} > @bookmark`",
-                column = match &self.replication {
-                    MssqlReplication::Incremental { column, .. } => column.as_str(),
-                    _ => "<column>",
-                }
-            );
+        if column.contains('\0') {
+            return Err(FaucetError::Config(
+                "MSSQL incremental replication: `column` must not contain a NUL byte".into(),
+            ));
+        }
+        if initial_value.is_null() {
+            return Err(FaucetError::Config(
+                "MSSQL incremental replication requires a non-null `initial_value`".into(),
+            ));
+        }
+        if faucet_core::replication::cursor::strict_comparison(&self.query, BOOKMARK_TOKEN) {
+            return Err(FaucetError::Config(format!(
+                "MSSQL: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source re-reads the \
+                 bookmark value and drops the rows it already emitted, and a strict comparison \
+                 skips rows that share it"
+            )));
         }
         Ok(())
     }
-
-    /// `true` when replication is `Incremental` but the query omits the
-    /// `@bookmark` token, so the cursor cannot be pushed down to the server and
-    /// every run re-scans the whole table (F53). Pure predicate so the
-    /// load-time warning's condition is unit-testable.
-    pub(crate) fn incremental_without_bookmark_pushdown(&self) -> bool {
-        matches!(self.replication, MssqlReplication::Incremental { .. })
-            && !self.query.contains("@bookmark")
-    }
 }
+
+/// The token a query uses to read the incremental bookmark
+/// (`WHERE updated_at >= @bookmark`).
+pub const BOOKMARK_TOKEN: &str = "@bookmark";
 
 #[cfg(test)]
 mod tests {
@@ -233,35 +244,33 @@ mod tests {
     }
 
     #[test]
-    fn incremental_without_bookmark_pushdown_flags_missing_token() {
-        // F53: Incremental + query lacking `@bookmark` → full re-scan warning.
-        let missing = MssqlSourceConfig {
-            replication: MssqlReplication::Incremental {
-                column: "updated_at".into(),
-                initial_value: json!("1970-01-01"),
-            },
-            ..MssqlSourceConfig::new("mssql://sa:pw@h/db", "SELECT * FROM t")
-        };
-        assert!(missing.incremental_without_bookmark_pushdown());
-        // validate still succeeds (warn, not hard-error).
-        assert!(missing.validate().is_ok());
-
-        // With the token present, no warning.
-        let with_token = MssqlSourceConfig {
-            replication: MssqlReplication::Incremental {
-                column: "updated_at".into(),
-                initial_value: json!("1970-01-01"),
-            },
-            ..MssqlSourceConfig::new(
-                "mssql://sa:pw@h/db",
-                "SELECT * FROM t WHERE updated_at > @bookmark",
-            )
-        };
-        assert!(!with_token.incremental_without_bookmark_pushdown());
-
-        // Full replication never warns.
-        let full = MssqlSourceConfig::new("mssql://sa:pw@h/db", "SELECT * FROM t");
-        assert!(!full.incremental_without_bookmark_pushdown());
+    fn validate_rejects_bad_incremental_settings() {
+        for (query, column, initial, needle) in [
+            ("SELECT * FROM t", "c\0", json!(0), "NUL"),
+            ("SELECT * FROM t", "c", json!(null), "initial_value"),
+            ("SELECT * FROM t WHERE c > @bookmark", "c", json!(0), ">="),
+            ("SELECT * FROM t WHERE @bookmark < c", "c", json!(0), ">="),
+        ] {
+            let cfg = MssqlSourceConfig {
+                replication: MssqlReplication::Incremental {
+                    column: column.into(),
+                    initial_value: initial,
+                },
+                ..MssqlSourceConfig::new("mssql://sa:pw@h/db", query)
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+        for query in ["SELECT * FROM t", "SELECT * FROM t WHERE c >= @bookmark"] {
+            let cfg = MssqlSourceConfig {
+                replication: MssqlReplication::Incremental {
+                    column: "c".into(),
+                    initial_value: json!(0),
+                },
+                ..MssqlSourceConfig::new("mssql://sa:pw@h/db", query)
+            };
+            assert!(cfg.validate().is_ok(), "{query}");
+        }
     }
 
     #[test]

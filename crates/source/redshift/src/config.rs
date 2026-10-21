@@ -16,16 +16,23 @@ pub enum RedshiftReplication {
     /// Every run re-fetches the full result set (default).
     #[default]
     Full,
-    /// Only rows whose `column` is strictly greater than the stored bookmark
-    /// (or `initial_value` on the first run) are emitted. If the SQL contains
-    /// the literal token `${bookmark}`, it is replaced with a positional bind
-    /// parameter so Redshift filters server-side (efficient); the source also
-    /// filters client-side as a correctness backstop. The new maximum of
-    /// `column` is persisted on the final page.
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
+    ///
+    /// The source wraps the query as
+    /// `SELECT * FROM (<query>) AS q WHERE q."column" >= CAST($n AS <type>) ORDER BY q."column"`
+    /// (the column's type as the server describes it) and drops the rows it
+    /// already emitted at the bookmark value, so rows that share a cursor
+    /// value (batch loads stamped with one `updated_at`, COPY jobs landing in
+    /// several commits) are never skipped. Every page carries a bookmark, so
+    /// a crash replays at most one page. Write `${bookmark}` in the query
+    /// (with `>=`) to apply the cursor further inside it; a strict `>` is
+    /// refused. Rows whose `column` is NULL are never read.
     Incremental {
         /// Column whose value is the replication cursor (e.g. `updated_at`).
         column: String,
-        /// Lower bound used on the first run, before any bookmark is stored.
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
         initial_value: Value,
     },
 }
@@ -81,17 +88,38 @@ impl RedshiftSourceConfig {
                 "redshift: `query` must not be empty".into(),
             ));
         }
-        if let RedshiftReplication::Incremental { column, .. } = &self.replication
-            && column.trim().is_empty()
-        {
+        faucet_core::validate_batch_size(self.batch_size)?;
+        let RedshiftReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
+        else {
+            return Ok(());
+        };
+        if column.trim().is_empty() {
             return Err(FaucetError::Config(
                 "redshift: incremental replication `column` must not be empty".into(),
             ));
         }
-        faucet_core::validate_batch_size(self.batch_size)?;
+        if initial_value.is_null() {
+            return Err(FaucetError::Config(
+                "redshift: incremental replication requires a non-null `initial_value`".into(),
+            ));
+        }
+        if faucet_core::replication::cursor::strict_comparison(&self.query, BOOKMARK_TOKEN) {
+            return Err(FaucetError::Config(format!(
+                "redshift: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source re-reads \
+                 the bookmark value and drops the rows it already emitted, and a strict \
+                 comparison skips rows that share it"
+            )));
+        }
         Ok(())
     }
 }
+
+/// The token a query uses to read the incremental bookmark
+/// (`WHERE updated_at >= ${bookmark}`).
+pub const BOOKMARK_TOKEN: &str = "${bookmark}";
 
 #[cfg(test)]
 mod tests {
@@ -134,6 +162,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bad_incremental_settings() {
+        for (query, initial, needle) in [
+            ("SELECT * FROM t", json!(null), "initial_value"),
+            ("SELECT * FROM t WHERE ts > ${bookmark}", json!(0), ">="),
+        ] {
+            let mut c = base();
+            c.query = query.into();
+            c.replication = RedshiftReplication::Incremental {
+                column: "ts".into(),
+                initial_value: initial,
+            };
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
     fn rejects_oversized_batch() {
         let mut c = base();
         c.batch_size = faucet_core::MAX_BATCH_SIZE + 1;
@@ -165,7 +210,7 @@ mod tests {
             "database": "db",
             "user": "u",
             "credentials": {"type": "password", "config": {"password": "pw"}},
-            "query": "SELECT * FROM t WHERE ts > ${bookmark}",
+            "query": "SELECT * FROM t WHERE ts >= ${bookmark}",
             "replication": {"type": "incremental", "column": "ts", "initial_value": "2026-01-01"},
             "state_key": "my-key"
         }"#;

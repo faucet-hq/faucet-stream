@@ -1,9 +1,10 @@
 # Microsoft SQL Server -> JSONL, with incremental replication.
 #
-# Each run emits only rows whose `updated_at` is greater than the bookmark
-# persisted in the file state store, so re-runs continue where they left off.
-# The `@bookmark` token is bound as a parameter for server-side filtering; the
-# source also filters client-side as a correctness backstop.
+# Each run reads rows from the bookmark persisted in the file state store
+# onward, in `updated_at` order, so re-runs continue where they left off. The
+# source wraps the query as `updated_at >= @bookmark` and drops the rows it
+# already emitted at the bookmark value, so rows sharing a timestamp are never
+# skipped. `@bookmark` in the query (with `>=`) filters further inside it.
 #
 # Run:
 #   faucet run cli/examples/mssql_to_jsonl.yaml
@@ -20,7 +21,7 @@ pipeline:
     type: mssql
     config:
       connection_url: "mssql://sa:Str0ng%40Pass@localhost:1433/sales"
-      query: "SELECT id, email, updated_at FROM dbo.users WHERE updated_at > @bookmark ORDER BY updated_at"
+      query: "SELECT id, email, updated_at FROM dbo.users WHERE updated_at >= @bookmark"
       batch_size: 1000
       # Self-signed dev cert: trust it. Use `prefer`/`require` in production.
       tls:

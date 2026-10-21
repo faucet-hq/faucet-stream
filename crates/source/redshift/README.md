@@ -29,13 +29,28 @@ rows as JSON objects with `O(batch_size)` memory. It supports **full** and
 
 ## Incremental replication
 
-With `replication.type = incremental`, only rows whose `column` is strictly
-greater than the stored bookmark (or `initial_value` on the first run) are
-emitted. If the query contains the literal `${bookmark}` token it is replaced
-with a positional bind so Redshift filters server-side; the source also filters
-client-side as a correctness backstop. The new maximum of `column` is persisted
-on the final page; it starts from the stored bookmark, so it never moves
-backwards even when the row that held the old maximum is gone.
+With `replication.type = incremental` the source reads only the rows not yet
+delivered, in cursor order. It wraps the query as
+`SELECT * FROM (<query>) AS q WHERE q."<column>" >= CAST($n AS <type>) ORDER BY q."<column>"`,
+where `<type>` is the cursor column's type as the server describes the query
+(so a string bookmark compares as a `TIMESTAMP`, a number as an `INT8`, …);
+`initial_value` is the inclusive lower bound for the first run. To apply the
+cursor further inside the query, write `${bookmark}` there with `>=`; it binds
+the same way, and a `> ${bookmark}` is refused at load time because it would
+skip rows that share the bookmark value.
+
+**Rows that share a cursor value are never skipped.** The bookmark stores the
+last cursor value **and** a 128-bit fingerprint of every row already emitted at
+it — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read
+re-reads that value with `>=` and drops only the rows it already emitted, so a
+second COPY batch stamped with the same load time, or any row committed later
+with the last `updated_at`, is delivered. Above 10,000 rows at one value the
+set is dropped and the value is re-read in full: duplicates, never loss. Every
+page carries the bookmark after its last row, so a crash replays at most one
+page, and the bookmark never moves backwards (a run that reads nothing keeps
+it). A bare bookmark stored by an earlier release reads as that value with an
+empty boundary (its rows are re-delivered once). Rows whose cursor is `NULL`
+are never read.
 
 ## Type decoding
 
@@ -57,7 +72,7 @@ credentials:
   type: password
   config:
     password: ${env:REDSHIFT_PASSWORD}
-query: "SELECT * FROM events WHERE updated_at > ${bookmark} ORDER BY updated_at"
+query: "SELECT * FROM events"
 replication:
   type: incremental
   column: updated_at

@@ -36,9 +36,9 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | PostgreSQL CDC | T1 ✅ | `source-postgres-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | logical replication (pgoutput), LSN bookmarks; PostgreSQL 14+ |
 | MySQL | T1 ✅ | `source-mysql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query, rows as JSON; incremental `@bookmark` replication in cursor order |
 | MySQL CDC | T1 ✅ | `source-mysql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | binlog row events, file/pos or GTID bookmarks |
-| Microsoft SQL Server | T1 ✅ | `source-mssql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (tiberius), rows as JSON |
+| Microsoft SQL Server | T1 ✅ | `source-mssql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (tiberius), rows as JSON; incremental `@bookmark` replication in cursor order |
 | Microsoft SQL Server CDC | T1 ✅ | `source-mssql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | CDC change tables (`fn_cdc_get_all_changes`), LSN bookmarks, `__op`-normalized |
-| Oracle Database | T1 ✅ | `source-oracle` | ✓ | ✓ | ✗ | ✗ | ✓ | SQL query (ODPI-C), exact `NUMBER`/temporal typing, incremental `:bookmark` replication, PK-range sharding; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
+| Oracle Database | T1 ✅ | `source-oracle` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (ODPI-C), exact `NUMBER`/temporal typing, incremental `:bookmark` replication in cursor order, PK-range sharding; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
 | Oracle CDC | T1 ✅ | `source-oracle-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | LogMiner over online + archived redo; committed transactions only, SCN bookmarks, `cdc_unwrap`-compatible envelopes; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
 | SQLite | T1 ✅ | `source-sqlite` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL query, rows as JSON |
 | DuckDB | T2 | `source-duckdb` | ✓ | ✗ | ✗ | ✗ | ✗ | SQL query (file or `:memory:`), rows as JSON; blocking-task + channel streaming |
@@ -62,14 +62,14 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | Google Cloud Pub/Sub | T1 ✅ᵉ | `source-pubsub` | ✓ | ✓ | ✗ | ✗ | ✗ | streaming pull; per-message records + attributes, ack at durable page boundary (at-least-once), idle/max-messages termination |
 | Apache Parquet *(deprecated: use `file`)* | T1 ✅ | `source-parquet` | ✓ | ✗ | ✗ | ✗ | ✗ | local/glob/S3, vectorized Arrow reader, projection |
 | Apache Delta Lake | T1 ✅ | `source-delta` | ✓ | ✗ | ✗ | ✗ | ✗ | local FS or S3/Azure/GCS; time travel (version/timestamp), projection pushdown, partition reconstruction |
-| Databricks SQL | T1 ✅ᵐ | `source-databricks` | ✓ | ✓ | ✗ | ✗ | ✗ | Statement Execution API; async poll, chunk pagination, typed decode, incremental `${bookmark}` |
+| Databricks SQL | T1 ✅ᵐ | `source-databricks` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | Statement Execution API; async poll, chunk pagination, typed decode, incremental `${bookmark}` replication in cursor order |
 | Apache Iceberg | T1 ✅ | `source-iceberg` | ✓ | ✓ | ✗ | ✗ | ✓ | REST/Glue/SQL/HMS catalog; Arrow scan with column projection + filter pushdown, snapshot / timestamp time travel, `mode: incremental` reads only snapshots appended since the bookmark; file-task sharding |
 | Amazon DynamoDB | T1 ✅ᵉ | `source-dynamodb` | ✓ | ✓ | ✗ | ✗ | ✓ | `mode: scan` (parallel segments, shardable) / `query` / `streams` (DynamoDB Streams change capture, per-shard sequence bookmarks, `__op` envelope; anchors a [`faucet mirror`](../cookbook/replication.md) handoff) |
-| Amazon Redshift | T1 ✅ | `source-redshift` | ✓ | ✓ | ✗ | ✗ | ✗ | PostgreSQL wire; SQL query, rows as JSON; incremental replication |
-| ClickHouse | T1 ✅ | `source-clickhouse` | ✓ | ✓ | ✗ | ✗ | ✗ | HTTP interface, `FORMAT JSONEachRow` streaming; incremental replication |
+| Amazon Redshift | T1 ✅ | `source-redshift` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | PostgreSQL wire; SQL query, rows as JSON; incremental `${bookmark}` replication in cursor order |
+| ClickHouse | T1 ✅ | `source-clickhouse` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | HTTP interface, `FORMAT JSONEachRow` streaming; incremental `@bookmark` replication in cursor order |
 | BigQuery | T1 ✅ᵐ | `source-bigquery` | ✓ | ✗ | ✗ | ✗ | ✓ | `jobs.query` + pageToken pagination |
 | Snowflake | T1 ✅ᵐ | `source-snowflake` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL REST API, server-side partitions |
-| Cloud Spanner | T1 ✅ᵉ | `source-spanner` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | streaming SQL (gRPC), incremental `@bookmark` replication, stale reads, PK-range sharding |
+| Cloud Spanner | T1 ✅ᵉ | `source-spanner` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | streaming SQL (gRPC), incremental `@bookmark` replication in cursor order, stale reads, PK-range sharding |
 | Singer bridge ⚠️ | T2 ⚠️ | `source-singer` | ✓ | ✓⁹ | ✗ | ✗ | ✗ | runs an external Singer tap; NDJSON over stdout, STATE→bookmark. **Tier-2 / experimental** |
 
 ¹⁰ **Discover** = enumerates the datasets behind the connection for
@@ -92,11 +92,12 @@ partition offsets); required for the atomic-watermark mechanism behind
 ⁴ gRPC streams natively in *server-streaming* mode; unary buffers the
 single response. ⁵ S3/GCS stream in JSONL and raw-text modes; JSON-array mode
 buffers one object. ⁶ Webhook is buffer-shaped by nature (it collects POSTs over
-a window). ⁸ MSSQL, PostgreSQL and MySQL are resumable only in
+a window). ⁸ The SQL query sources (PostgreSQL, MySQL, MSSQL, Oracle,
+Redshift, ClickHouse, Databricks, Cloud Spanner) are resumable only in
 `replication: incremental` mode (they persist a tracking-column bookmark); in
-`full` mode they are not. PostgreSQL and MySQL read in cursor order, bookmark
-every page and never skip rows that share a cursor value — see
-[Incremental SQL queries](../cookbook/state.md#incremental-sql-queries-postgres-mysql).
+`full` mode they are not. In incremental mode they read in cursor order,
+bookmark every page and never skip rows that share a cursor value — see
+[Incremental SQL queries](../cookbook/state.md#incremental-sql-queries).
 ⁹ The Singer bridge is resumable via the tap's `STATE` messages, but the
 *granularity* of resume (and whether re-emitted rows overlap) depends on the
 individual tap — pair it with a keyed/upsert sink for clean, effectively-once

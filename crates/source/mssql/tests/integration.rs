@@ -173,7 +173,7 @@ async fn incremental_resumes_without_duplicates() {
 
     let mut scfg = MssqlSourceConfig::new(
         cfg.connection_url.clone().unwrap(),
-        "SELECT id, updated_at FROM dbo.events WHERE updated_at > @bookmark ORDER BY updated_at",
+        "SELECT id, updated_at FROM dbo.events WHERE updated_at >= @bookmark",
     );
     scfg.connection.tls = cfg.tls.clone();
     scfg.replication = MssqlReplication::Incremental {
@@ -186,24 +186,28 @@ async fn incremental_resumes_without_duplicates() {
     let (rows, bookmark) = source.fetch_all_incremental().await.expect("run 1");
     let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![2, 3], "run 1 honours initial_value");
-    assert_eq!(bookmark, Some(Value::from("2024-03-01")));
+    assert_eq!(
+        bookmark.as_ref().unwrap()["value"],
+        Value::from("2024-03-01")
+    );
 
-    // Persist the bookmark, add a newer row, run again.
+    // Persist the bookmark, add a newer row and a row tied at the bookmark
+    // value (a late commit), run again.
     source
         .apply_start_bookmark(bookmark.unwrap())
         .await
         .unwrap();
     exec(
         &pool,
-        "INSERT INTO dbo.events (id, updated_at) VALUES (4, '2024-04-01')",
+        "INSERT INTO dbo.events (id, updated_at) VALUES (4, '2024-04-01'), (5, '2024-03-01')",
     )
     .await;
 
-    // Run 2: only the strictly-newer row, no duplicates of 2/3.
+    // Run 2: the tied row and the newer row, no duplicates of 2/3.
     let (rows2, bookmark2) = source.fetch_all_incremental().await.expect("run 2");
     let ids2: Vec<i64> = rows2.iter().map(|r| r["id"].as_i64().unwrap()).collect();
-    assert_eq!(ids2, vec![4], "run 2 resumes from bookmark, no duplicates");
-    assert_eq!(bookmark2, Some(Value::from("2024-04-01")));
+    assert_eq!(ids2, vec![5, 4], "run 2 keeps the tie, no duplicates");
+    assert_eq!(bookmark2.unwrap()["value"], Value::from("2024-04-01"));
 }
 
 /// SQL-40: a legacy `DATETIME` cursor renders as milliseconds, so the bookmark
@@ -228,7 +232,7 @@ async fn a_legacy_datetime_cursor_resumes_on_the_next_run() {
     .await;
     let mut scfg = MssqlSourceConfig::new(
         cfg.connection_url.clone().unwrap(),
-        "SELECT id, updated_at FROM dbo.legacy WHERE updated_at > @bookmark ORDER BY updated_at",
+        "SELECT id, updated_at FROM dbo.legacy",
     );
     scfg.connection.tls = cfg.tls.clone();
     scfg.replication = MssqlReplication::Incremental {
@@ -243,7 +247,10 @@ async fn a_legacy_datetime_cursor_resumes_on_the_next_run() {
         rows[0]["updated_at"],
         Value::from("2024-03-01T12:30:45.003")
     );
-    assert_eq!(bookmark, Some(Value::from("2024-03-01T12:30:45.007")));
+    assert_eq!(
+        bookmark.as_ref().unwrap()["value"],
+        Value::from("2024-03-01T12:30:45.007")
+    );
 
     source
         .apply_start_bookmark(bookmark.unwrap())
@@ -251,12 +258,13 @@ async fn a_legacy_datetime_cursor_resumes_on_the_next_run() {
         .unwrap();
     exec(
         &pool,
-        "INSERT INTO dbo.legacy VALUES (3, '2024-03-01T12:30:46.000')",
+        "INSERT INTO dbo.legacy VALUES (3, '2024-03-01T12:30:46.000'), \
+         (4, '2024-03-01T12:30:45.007')",
     )
     .await;
     let (rows2, _) = source.fetch_all_incremental().await.expect("run 2");
     let ids: Vec<i64> = rows2.iter().map(|r| r["id"].as_i64().unwrap()).collect();
-    assert_eq!(ids, vec![3]);
+    assert_eq!(ids, vec![4, 3], "a row sharing the DATETIME tick is kept");
 }
 
 // ── PK-range sharding (Mode B, #262) ────────────────────────────────────────

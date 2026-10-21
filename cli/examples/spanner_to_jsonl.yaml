@@ -1,8 +1,9 @@
 # Google Cloud Spanner → JSON Lines (#304).
 #
 # Streams a SQL query out of Spanner with incremental replication: on each
-# run only rows whose `updated_at` is past the persisted bookmark are read
-# (the `@bookmark` named parameter is bound from the state store).
+# run reads from the persisted bookmark onward, in `updated_at` order, and
+# drops the rows it already emitted at the bookmark value (the `@bookmark`
+# named parameter is bound from the state store).
 #
 # Works against the Spanner emulator out of the box:
 #
@@ -25,8 +26,7 @@ pipeline:
       emulator_host: localhost:9010   # remove for real Spanner
       query: >-
         SELECT id, name, updated_at FROM users
-        WHERE updated_at > TIMESTAMP(@bookmark)
-        ORDER BY updated_at
+        WHERE updated_at >= TIMESTAMP(@bookmark)
       replication:
         type: incremental
         column: updated_at

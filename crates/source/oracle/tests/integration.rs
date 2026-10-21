@@ -88,23 +88,33 @@ async fn oracle_query_source_end_to_end() {
     // Incremental with server pushdown and a resumed bookmark.
     let mut inc = OracleSourceConfig::new(
         conn.clone(),
-        "SELECT ID, UPDATED_AT FROM T_TYPES WHERE UPDATED_AT > :bookmark AND ID < :1",
+        "SELECT ID, UPDATED_AT FROM T_TYPES WHERE UPDATED_AT >= :bookmark AND ID < :1",
     );
     inc.params = vec![json!(100)];
     inc.replication = OracleReplication::Incremental {
         column: "UPDATED_AT".into(),
-        initial_value: json!(10),
+        initial_value: json!(11),
     };
     let source = OracleSource::new(inc).await.expect("source");
     assert!(source.state_key().unwrap().starts_with("oracle:FREEPDB1:"));
     let pages = drain(&source).await;
     let rows: Vec<Value> = pages.iter().flat_map(|p| p.records.clone()).collect();
     assert_eq!(rows.len(), 2);
-    assert_eq!(pages.last().unwrap().bookmark, Some(json!(30)));
+    assert_eq!(
+        pages.last().unwrap().bookmark.as_ref().unwrap()["value"],
+        json!(30)
+    );
+    // A bare bookmark from an earlier release re-reads its value once.
     source.apply_start_bookmark(json!(20)).await.unwrap();
     let (rows, bm) = source.fetch_all_incremental().await.unwrap();
-    assert_eq!(rows, vec![json!({"ID": 3, "UPDATED_AT": 30})]);
-    assert_eq!(bm, Some(json!(30)));
+    assert_eq!(
+        rows,
+        vec![
+            json!({"ID": 2, "UPDATED_AT": 20}),
+            json!({"ID": 3, "UPDATED_AT": 30})
+        ]
+    );
+    assert_eq!(bm.unwrap()["value"], json!(30));
 
     // SQL-41: the documented push-down on a DATE / TIMESTAMP cursor binds the
     // ISO bookmark (with its `T`) as a timestamp, not NLS-formatted text.
@@ -115,7 +125,7 @@ async fn oracle_query_source_end_to_end() {
     ] {
         let mut temporal = OracleSourceConfig::new(
             conn.clone(),
-            format!("SELECT ID, {column} FROM T_TYPES WHERE {column} > :bookmark"),
+            format!("SELECT ID, {column} FROM T_TYPES WHERE {column} >= :bookmark"),
         );
         temporal.replication = OracleReplication::Incremental {
             column: column.into(),
@@ -144,7 +154,7 @@ async fn oracle_query_source_end_to_end() {
     .await;
     let mut iso = OracleSourceConfig::new(
         conn.clone(),
-        "SELECT ID, STAMP FROM T_ISO WHERE STAMP > :bookmark ORDER BY ID",
+        "SELECT ID, STAMP FROM T_ISO WHERE STAMP >= :bookmark ORDER BY ID",
     );
     iso.replication = OracleReplication::Incremental {
         column: "STAMP".into(),
@@ -156,7 +166,43 @@ async fn oracle_query_source_end_to_end() {
         rows,
         vec![json!({"ID": 2, "STAMP": "2024-02-01T00:00:00Z"})]
     );
-    assert_eq!(bm, Some(json!("2024-02-01T00:00:00Z")));
+    assert_eq!(bm.unwrap()["value"], json!("2024-02-01T00:00:00Z"));
+
+    // A row committed after a run with the cursor value that run ended on
+    // (DATE has one-second resolution) is delivered by the next run.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE T_INC (ID NUMBER, UPDATED_AT DATE)",
+            "INSERT INTO T_INC VALUES (1, DATE '2024-01-01')",
+            "INSERT INTO T_INC VALUES (2, TIMESTAMP '2024-01-02 12:00:00')",
+        ],
+    )
+    .await;
+    let mut ties = OracleSourceConfig::new(conn.clone(), "SELECT ID, UPDATED_AT FROM T_INC");
+    ties.replication = OracleReplication::Incremental {
+        column: "UPDATED_AT".into(),
+        initial_value: json!("1970-01-01T00:00:00"),
+    };
+    let source = OracleSource::new(ties).await.expect("source");
+    let (rows, bm) = source.fetch_all_incremental().await.expect("run 1");
+    assert_eq!(rows.len(), 2);
+    source.apply_start_bookmark(bm.unwrap()).await.unwrap();
+    common::exec(
+        &conn,
+        &[
+            "INSERT INTO T_INC VALUES (3, TIMESTAMP '2024-01-02 12:00:00')",
+            "INSERT INTO T_INC VALUES (4, DATE '2024-01-03')",
+        ],
+    )
+    .await;
+    let (rows, _) = source.fetch_all_incremental().await.expect("run 2");
+    let ids: Vec<i64> = rows.iter().map(|r| r["ID"].as_i64().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![3, 4],
+        "the tied row is kept, the emitted one dropped"
+    );
 
     // PK-range sharding covers every row exactly once.
     let mut sharded = OracleSourceConfig::new(conn.clone(), "SELECT ID FROM T_TYPES");

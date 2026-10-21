@@ -14,6 +14,7 @@ use faucet_common_oracle::{
     row_to_json, shard_bounds_query, shard_wrap, trim_statement,
 };
 use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::replication::cursor::CursorBookmark;
 use faucet_core::shard::{PkShardBounds, ShardSpec, parse_pk_shard, pk_shards_from_bounds};
 use faucet_core::{FaucetError, Source, StreamPage};
 use futures::Stream;
@@ -21,7 +22,7 @@ use serde_json::Value;
 
 use crate::config::{OracleReplication, OracleSourceConfig};
 use crate::query::{
-    CatalogRow, OwnedBind, PlannedQuery, apply_incremental, default_state_key,
+    CatalogRow, IncrementalCtx, OwnedBind, PlannedQuery, cursor_wrap, default_state_key,
     descriptors_from_catalog, is_datetime_conversion_error, owned_binds, plan_query, resolve_binds,
     text_binds,
 };
@@ -30,7 +31,7 @@ use crate::query::{
 pub struct OracleSource {
     config: OracleSourceConfig,
     pool: OraclePool,
-    start_bookmark: Mutex<Option<Value>>,
+    start_bookmark: Mutex<Option<CursorBookmark>>,
     applied_shard: Mutex<Option<PkShardBounds>>,
     /// Backend-call context (#880): the run's deadline, cancel token and
     /// round-trip recorder.
@@ -191,7 +192,7 @@ impl OracleSource {
         })
     }
 
-    fn current_start(&self) -> Option<Value> {
+    fn current_start(&self) -> Option<CursorBookmark> {
         self.start_bookmark.lock().expect("bookmark mutex").clone()
     }
 
@@ -201,6 +202,7 @@ impl OracleSource {
             Some(bounds) => shard_wrap(bounds, &sql),
             None => sql,
         };
+        let sql = cursor_wrap(&sql, planned.incremental.as_ref(), true);
         let batch = self.config.batch_size;
         QueryJob {
             pool: self.pool.clone(),
@@ -218,12 +220,28 @@ impl OracleSource {
         }
     }
 
-    async fn collect_all(
+    /// Every page of an incremental read, and its last bookmark.
+    async fn collect_incremental(
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        let start = self.current_start();
-        let planned = plan_query(&self.config, context, start.as_ref());
+        use futures::TryStreamExt as _;
+        let mut pages = self.stream_pages(context, 0);
+        let mut records = Vec::new();
+        let mut bookmark = None;
+        while let Some(page) = pages.try_next().await? {
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
+        }
+        Ok((records, bookmark))
+    }
+
+    /// Run a full-replication query in one call.
+    async fn collect_all(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        let planned = plan_query(&self.config, context, None);
         let mut job = self.job(&planned);
         job.chunk = usize::MAX;
         let records = self
@@ -240,10 +258,7 @@ impl OracleSource {
                 }),
             )
             .await?;
-        let mut running = None;
-        let records = apply_incremental(records, planned.incremental.as_ref(), &mut running);
-        let bookmark = planned.incremental.as_ref().and(running);
-        Ok((records, bookmark))
+        Ok(records)
     }
 }
 
@@ -264,14 +279,17 @@ impl Source for OracleSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        Ok(self.collect_all(context).await?.0)
+        Ok(self.fetch_with_context_incremental(context).await?.0)
     }
 
     async fn fetch_with_context_incremental(
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        self.collect_all(context).await
+        if matches!(self.config.replication, OracleReplication::Full) {
+            return Ok((self.collect_all(context).await?, None));
+        }
+        self.collect_incremental(context).await
     }
 
     fn stream_pages<'a>(
@@ -292,21 +310,32 @@ impl Source for OracleSource {
             // A page of the running query is not a round trip of its own; the
             // run's deadline and cancel token end the wait for it (#880).
             let steps = calls.with_roundtrip_metering(false);
-            let mut running = None;
+            let mut tracker = planned.incremental.as_ref().map(IncrementalCtx::tracker);
             let mut total = 0usize;
             while let Some(page) = steps.call_once("query", async { Ok(rx.recv().await) }).await? {
-                let kept = apply_incremental(page, planned.incremental.as_ref(), &mut running);
+                let kept: Vec<Value> = match tracker.as_mut() {
+                    None => page,
+                    Some(t) => page.into_iter().filter(|r| t.admit(r)).collect(),
+                };
                 total += kept.len();
-                if !kept.is_empty() {
-                    yield StreamPage { records: kept, bookmark: None };
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                if !kept.is_empty() || bookmark.is_some() {
+                    yield StreamPage { records: kept, bookmark };
                 }
             }
             handle
                 .await
                 .map_err(|e| FaucetError::Source(format!("oracle fetch task failed: {e}")))??;
-            let bookmark = planned.incremental.as_ref().and(running);
-            if bookmark.is_some() {
-                yield StreamPage { records: Vec::new(), bookmark };
+            if let Some(t) = tracker.as_ref() {
+                // The final page carries the position even when it is empty.
+                yield StreamPage { records: Vec::new(), bookmark: Some(t.bookmark().to_value()) };
+                if t.missing() > 0 {
+                    tracing::warn!(
+                        missing = t.missing(),
+                        "oracle incremental read: rows without a cursor value were emitted \
+                         without moving the bookmark"
+                    );
+                }
             }
             tracing::info!(rows = total, query = %self.config.query, "oracle source stream complete");
         })
@@ -342,7 +371,8 @@ impl Source for OracleSource {
     }
 
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        *self.start_bookmark.lock().expect("bookmark mutex") = Some(bookmark);
+        let start = CursorBookmark::from_state(bookmark)?;
+        *self.start_bookmark.lock().expect("bookmark mutex") = Some(start);
         Ok(())
     }
 
@@ -448,7 +478,12 @@ impl Source for OracleSource {
         let start = self.current_start();
         let planned = plan_query(&self.config, &HashMap::new(), start.as_ref());
         let key = quote_ident_oracle(&shard_cfg.key)?;
-        let sql = shard_bounds_query(&planned.sql, &key);
+        let base = cursor_wrap(
+            trim_statement(&planned.sql),
+            planned.incremental.as_ref(),
+            false,
+        );
+        let sql = shard_bounds_query(&base, &key);
         let pool = self.pool.clone();
         let timeout = call_timeout(self.config.statement_timeout_secs);
         let (lo, hi) = self.calls.call_once("query", blocking(move || {

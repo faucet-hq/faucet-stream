@@ -3,18 +3,40 @@
 
 use std::collections::HashMap;
 
-use faucet_common_oracle::{TypeFamily, quote_ident_oracle};
-use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
+use faucet_common_oracle::{TypeFamily, quote_ident_oracle, quote_validated};
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::{DatasetDescriptor, FaucetError};
 use serde_json::{Value, json};
 
-use crate::config::{OracleReplication, OracleSourceConfig, has_bookmark_placeholder};
+use crate::config::{OracleReplication, OracleSourceConfig};
 
 /// Incremental-replication context resolved for one run.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IncrementalCtx {
     pub column: String,
-    pub start: Value,
+    pub start: CursorBookmark,
+}
+
+impl IncrementalCtx {
+    pub fn tracker(&self) -> CursorTracker {
+        CursorTracker::new(self.column.clone(), self.start.clone())
+    }
+}
+
+/// `inner` filtered to `column >= :bookmark`, ordered by the cursor when
+/// `ordered`; full replication passes through unchanged. The column was
+/// validated with [`quote_ident_oracle`] at load time.
+pub(crate) fn cursor_wrap(inner: &str, incr: Option<&IncrementalCtx>, ordered: bool) -> String {
+    let Some(ctx) = incr else {
+        return inner.to_string();
+    };
+    let c = quote_validated(&ctx.column);
+    let filtered = format!("SELECT * FROM ({inner}) q WHERE q.{c} >= :bookmark");
+    if ordered {
+        format!("{filtered} ORDER BY q.{c}")
+    } else {
+        filtered
+    }
 }
 
 /// A planned query: the SQL, the positional values for `:1..:n`, and the
@@ -31,7 +53,7 @@ pub(crate) struct PlannedQuery {
 pub(crate) fn plan_query(
     config: &OracleSourceConfig,
     context: &HashMap<String, Value>,
-    start_bookmark: Option<&Value>,
+    start_bookmark: Option<&CursorBookmark>,
 ) -> PlannedQuery {
     let (sql, ctx_values) = faucet_core::util::substitute_context_bind_params(
         &config.query,
@@ -51,13 +73,11 @@ pub(crate) fn plan_query(
             column: column.clone(),
             start: start_bookmark
                 .cloned()
-                .unwrap_or_else(|| initial_value.clone()),
+                .unwrap_or_else(|| CursorBookmark::initial(initial_value.clone())),
         }),
     };
-    let bookmark = match &incremental {
-        Some(ctx) if has_bookmark_placeholder(&sql) => Some(ctx.start.clone()),
-        _ => None,
-    };
+    // The cursor filter around the query always binds `:bookmark`.
+    let bookmark = incremental.as_ref().map(|ctx| ctx.start.value.clone());
     PlannedQuery {
         sql,
         params,
@@ -202,26 +222,6 @@ impl OwnedBind {
         }
         Self::from_value(v)
     }
-}
-
-/// Filter a page for incremental replication and advance `running_max`.
-pub(crate) fn apply_incremental(
-    page: Vec<Value>,
-    incr: Option<&IncrementalCtx>,
-    running_max: &mut Option<Value>,
-) -> Vec<Value> {
-    let Some(ctx) = incr else {
-        return page;
-    };
-    let kept = filter_incremental(page, &ctx.column, &ctx.start);
-    if let Some(m) = max_replication_value(&kept, &ctx.column) {
-        let m = m.clone();
-        *running_max = Some(match running_max.take() {
-            Some(prev) => max_value(prev, m),
-            None => m,
-        });
-    }
-    kept
 }
 
 /// Derive a stable state key from the database scope and a query fingerprint.
@@ -417,22 +417,59 @@ mod tests {
 
     #[test]
     fn plan_incremental_uses_bookmark_or_initial() {
-        let mut c = cfg("SELECT * FROM T WHERE U > :bookmark");
+        let mut c = cfg("SELECT * FROM T WHERE U >= :bookmark");
         c.replication = OracleReplication::Incremental {
             column: "U".into(),
             initial_value: json!(0),
         };
         let p = plan_query(&c, &HashMap::new(), None);
         assert_eq!(p.bookmark, Some(json!(0)));
-        let stored = json!(42);
+        let stored = CursorBookmark::initial(json!(42));
         let p = plan_query(&c, &HashMap::new(), Some(&stored));
         assert_eq!(p.bookmark, Some(json!(42)));
-        assert_eq!(p.incremental.unwrap().start, json!(42));
+        assert_eq!(p.incremental.unwrap().start.value, json!(42));
 
+        // Without the token the outer cursor filter still binds `:bookmark`.
         c.query = "SELECT * FROM T".into();
         let p = plan_query(&c, &HashMap::new(), None);
-        assert_eq!(p.bookmark, None);
+        assert_eq!(p.bookmark, Some(json!(0)));
         assert!(p.incremental.is_some());
+    }
+
+    #[test]
+    fn cursor_wrap_filters_with_ge_and_orders() {
+        let ctx = IncrementalCtx {
+            column: "UPDATED_AT".into(),
+            start: CursorBookmark::initial(json!(0)),
+        };
+        assert_eq!(
+            cursor_wrap("SELECT * FROM T", Some(&ctx), true),
+            "SELECT * FROM (SELECT * FROM T) q WHERE q.\"UPDATED_AT\" >= :bookmark \
+             ORDER BY q.\"UPDATED_AT\""
+        );
+        assert!(!cursor_wrap("SELECT 1 FROM DUAL", Some(&ctx), false).contains("ORDER BY"));
+        assert_eq!(
+            cursor_wrap("SELECT 1 FROM DUAL", None, true),
+            "SELECT 1 FROM DUAL"
+        );
+    }
+
+    #[test]
+    fn tracker_keeps_rows_tied_at_the_bookmark() {
+        let mut first = IncrementalCtx {
+            column: "U".into(),
+            start: CursorBookmark::initial(json!(0)),
+        }
+        .tracker();
+        let a = json!({"ID": 1, "U": "2024-01-01T00:00:00"});
+        assert!(first.admit(&a));
+        let mut second = IncrementalCtx {
+            column: "U".into(),
+            start: CursorBookmark::from_state(first.bookmark().to_value()).unwrap(),
+        }
+        .tracker();
+        assert!(!second.admit(&a));
+        assert!(second.admit(&json!({"ID": 2, "U": "2024-01-01T00:00:00"})));
     }
 
     #[test]
@@ -472,28 +509,6 @@ mod tests {
             OwnedBind::from_value(&json!({"a": 1})),
             OwnedBind::Text("{\"a\":1}".into())
         );
-    }
-
-    #[test]
-    fn incremental_filter_tracks_max() {
-        let ctx = IncrementalCtx {
-            column: "C".into(),
-            start: json!(10),
-        };
-        let mut running = None;
-        let kept = apply_incremental(
-            vec![json!({"C": 5}), json!({"C": 15}), json!({"C": 12})],
-            Some(&ctx),
-            &mut running,
-        );
-        assert_eq!(kept.len(), 2);
-        assert_eq!(running, Some(json!(15)));
-        let kept = apply_incremental(vec![json!({"C": 20})], Some(&ctx), &mut running);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(running, Some(json!(20)));
-        let mut none = None;
-        assert_eq!(apply_incremental(vec![json!({})], None, &mut none).len(), 1);
-        assert_eq!(none, None);
     }
 
     #[test]
