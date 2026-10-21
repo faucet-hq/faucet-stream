@@ -13,6 +13,7 @@ use crate::replication::compiled::{CompiledReplication, CompiledTables};
 use crate::replication::feed::{self, LiveStats};
 use crate::replication::multi_state::{
     self, FailureAction, MirrorState, TablePhase, due_for_snapshot, reconcile_discovery,
+    resume_paused,
 };
 use crate::replication::orchestrator::{
     ReplicationOptions, build_snapshot_node, make_opts, spawn_cancel_on_signal,
@@ -1012,6 +1013,13 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
         warned_lag: BTreeSet::new(),
         failed: BTreeMap::new(),
     };
+    {
+        let resumed = resume_paused(&mut *d.shared.state.lock().await, Utc::now());
+        if !resumed.is_empty() {
+            tracing::info!(tables = ?resumed, "mirror: retrying paused tables on start");
+            d.shared.persist().await?;
+        }
+    }
     let interval = d.shared.tables.spec.discover_interval_secs;
     let continuous = d.shared.continuous;
     let retry_paused = if continuous {

@@ -1503,7 +1503,7 @@ table) and `snapshot.source` the discovery connection.
 | `tables.destination` | mapping | per sink kind | Sink-config patch per table; strings may use `{table}`, `{table_name}`, `{schema}`. Required for sinks without a single table field (file sinks). |
 | `tables.on_table_error` | `pause` / `fail` | `pause` | A table whose pipeline keeps failing is paused (the rest continue) or fails the mirror. |
 | `tables.max_table_failures` | int | `3` | Consecutive failed cycles before a table is paused. |
-| `tables.retry_paused_secs` | int | `300` | Seconds before a paused table is re-snapshotted (`0` = stay paused until restart). |
+| `tables.retry_paused_secs` | int | `300` | Seconds before a paused table is re-snapshotted (`0` = stay paused until restart). Every start of `faucet mirror` — including each one-shot (`continuous: false`) run — retries paused tables. |
 | `tables.lag_warning_secs` | int | `300` | Flag an active table as lagging past this many seconds without a confirmed position. |
 | `per_table.<table>.key` | list | discovered PK | Upsert key. |
 | `per_table.<table>.write_mode` | string | template's, else `upsert` | Destination write mode. |

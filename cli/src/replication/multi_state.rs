@@ -288,6 +288,25 @@ pub fn reconcile_discovery(
     diff
 }
 
+/// A mirror (re)starting gives its paused tables another chance, as
+/// `retry_paused_secs: 0` promises ("paused until the mirror restarts"): each
+/// goes back to `Pending` with a fresh failure count, so it is snapshotted
+/// again. Returns the tables resumed.
+pub fn resume_paused(state: &mut MirrorState, now: DateTime<Utc>) -> Vec<String> {
+    let mut resumed = Vec::new();
+    for (name, t) in state.tables.iter_mut() {
+        if t.phase == TablePhase::Paused {
+            t.set_phase(TablePhase::Pending, now);
+            t.consecutive_failures = 0;
+            resumed.push(name.clone());
+        }
+    }
+    if !resumed.is_empty() {
+        state.updated_at = now;
+    }
+    resumed
+}
+
 /// Tables due for a snapshot: pending, interrupted mid-snapshot, and paused
 /// ones whose retry delay (`retry_paused_secs`, `0` = never) has elapsed.
 pub fn due_for_snapshot(
@@ -690,6 +709,12 @@ mod tests {
             record_failure(&mut s, "missing", "x", 1, t0()),
             FailureAction::Retry
         );
+        // A restart resumes the paused table with a fresh failure count.
+        assert_eq!(resume_paused(&mut s, later), vec!["a".to_string()]);
+        assert_eq!(s.tables["a"].phase, TablePhase::Pending);
+        assert_eq!(s.tables["a"].consecutive_failures, 0);
+        assert_eq!(due_for_snapshot(&s, 0, later), vec!["a"]);
+        assert!(resume_paused(&mut s, later).is_empty());
     }
 
     #[test]
