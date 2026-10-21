@@ -7,7 +7,7 @@
 //! staging table. See `docs/superpowers/specs/2026-06-13-bigquery-upsert-design.md`.
 
 use crate::idempotent::{
-    FieldSpec, build_merge_token, column_expr, json_path_segment, quote_ident, table_ref,
+    FieldSpec, build_merge_token, column_expr, json_path_segment, quote_ident, sql_str, table_ref,
 };
 use faucet_core::FaucetError;
 
@@ -43,7 +43,8 @@ fn build_merge_source(columns: &[FieldSpec], key: &[String], payload_param: &str
         }
         let path = format!("${}", json_path_segment(&f.name));
         exprs.push(format!(
-            "JSON_QUERY(r, '{path}') IS NOT NULL AS {}",
+            "JSON_QUERY(r, {}) IS NOT NULL AS {}",
+            sql_str(&path),
             presence_alias(i)
         ));
     }
@@ -349,6 +350,20 @@ mod tests {
             sql,
             "SELECT CAST(JSON_VALUE(r, '$.id') AS INT64) AS `id`, JSON_VALUE(r, '$.name') AS `name`, JSON_QUERY(r, '$.name') IS NOT NULL AS `__faucet_has_1` FROM UNNEST(JSON_QUERY_ARRAY(@payload)) AS r"
         );
+    }
+
+    #[test]
+    fn merge_presence_flag_quotes_a_bracketed_path() {
+        let cols = vec![
+            scalar("id", BqType::Int64),
+            scalar("order-id", BqType::String),
+        ];
+        let sql = build_merge_source(&cols, &["id".into()], "@payload");
+        assert!(
+            sql.contains(r"JSON_QUERY(r, '$[\'order-id\']') IS NOT NULL AS `__faucet_has_1`"),
+            "{sql}"
+        );
+        assert!(!sql.contains("'$['order-id']'"), "{sql}");
     }
 
     #[test]
