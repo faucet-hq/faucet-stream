@@ -491,10 +491,14 @@ pub(crate) fn fnv1a_64(s: &str) -> u64 {
 impl AuthProvider for OAuth2RefreshProvider {
     async fn credential(&self) -> Result<Credential, FaucetError> {
         let mut state = self.state.lock().await;
-        if let (Some(tok), Some(exp)) = (&state.access_token, state.expires_at)
-            && Instant::now() < exp
-        {
-            return Ok(Credential::Bearer(tok.clone()));
+        // A token without `expires_in` (optional in RFC 6749 §5.1) is reused
+        // until a 401 invalidates it, like every other provider.
+        match (&state.access_token, state.expires_at) {
+            (Some(tok), Some(exp)) if Instant::now() < exp => {
+                return Ok(Credential::Bearer(tok.clone()));
+            }
+            (Some(tok), None) => return Ok(Credential::Bearer(tok.clone())),
+            _ => {}
         }
         let token = self.refresh(&mut state).await?;
         Ok(Credential::Bearer(token))
@@ -641,6 +645,43 @@ mod tests {
         let again = provider.invalidate(&first).await.unwrap();
         assert_eq!(again, Credential::Bearer("A2".into()));
         assert_eq!(hits.load(Ordering::SeqCst), 2, "stale CAS must not refetch");
+    }
+
+    #[tokio::test]
+    async fn refresh_provider_reuses_a_token_without_expires_in() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": format!("A{n}"),
+                    "refresh_token": format!("rt{n}"),
+                }))
+            })
+            .mount(&server)
+            .await;
+        let provider = OAuth2RefreshProvider::from_config(&serde_json::json!({
+            "token_url": server.uri(),
+            "client_id": "id",
+            "client_secret": "secret",
+            "refresh_token": "rt0",
+        }))
+        .unwrap();
+        for _ in 0..5 {
+            assert_eq!(
+                provider.credential().await.unwrap(),
+                Credential::Bearer("A1".into())
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no grant per credential()");
+        let fresh = provider
+            .invalidate(&Credential::Bearer("A1".into()))
+            .await
+            .unwrap();
+        assert_eq!(fresh, Credential::Bearer("A2".into()));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[test]
