@@ -914,6 +914,27 @@ pub(crate) mod source_tests {
         Labels::new("p", "r", "rid")
     }
 
+    /// Every counter in one snapshot, keyed by (name, connector label).
+    pub(crate) fn connector_counters(snap: &Snapshotter) -> HashMap<(String, String), u64> {
+        let mut out = HashMap::new();
+        for (k, _u, _d, v) in snap.snapshot().into_vec() {
+            if let DebugValue::Counter(c) = v
+                && let Some(conn) = k.key().labels().find(|l| l.key() == "connector")
+            {
+                *out.entry((k.key().name().to_string(), conn.value().to_string()))
+                    .or_default() += c;
+            }
+        }
+        out
+    }
+
+    /// Counter `name` for `connector` in a [`connector_counters`] map.
+    pub(crate) fn counter_in(m: &HashMap<(String, String), u64>, name: &str, connector: &str) -> u64 {
+        m.get(&(name.to_string(), connector.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     struct MockSource(Vec<Value>);
     #[async_trait]
     impl Source for MockSource {
@@ -985,28 +1006,14 @@ pub(crate) mod source_tests {
     async fn records_records_counter_per_page() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let snap = snapshotter();
+        connector_counters(snap); // a snapshot drains the counters seen so far
         let inner = MockSource((0..5).map(|i| json!({"i": i})).collect());
         let wrapped = InstrumentedSource::new(&inner, labels());
         let ctx = HashMap::new();
         let mut s = wrapped.stream_pages(&ctx, 2);
         while s.next().await.is_some() {}
-        let snapshot = snap.snapshot();
-        let records: u64 = snapshot
-            .into_vec()
-            .into_iter()
-            .filter_map(|(key, _u, _d, v)| {
-                if key.key().name() == "faucet_source_records_total"
-                    && let DebugValue::Counter(c) = v
-                {
-                    return Some(c);
-                }
-                None
-            })
-            .sum();
-        assert!(
-            records >= 5,
-            "expected at least 5 records counted, got {records}"
-        );
+        let records = counter_in(&connector_counters(snap), "faucet_source_records_total", "mock");
+        assert_eq!(records, 5, "every record counted exactly once");
     }
 
     // Source with a unique connector name so the page-duration histogram for
@@ -1265,7 +1272,7 @@ pub(crate) mod source_tests {
 #[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod sink_tests {
-    use super::source_tests::{LOCK, labels, snapshotter};
+    use super::source_tests::{LOCK, connector_counters, counter_in, labels, snapshotter};
     use super::*;
     use async_trait::async_trait;
     use metrics_util::debugging::DebugValue;
@@ -1417,26 +1424,16 @@ mod sink_tests {
     async fn records_writes_and_records_counters() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let snap = snapshotter();
+        connector_counters(snap); // a snapshot drains the counters seen so far
         let inner = MockSink(std::sync::Mutex::new(Vec::new()));
         let wrapped = InstrumentedSink::new(&inner, labels());
         wrapped
             .write_batch(&[json!({"a": 1}), json!({"a": 2})])
             .await
             .unwrap();
-        let snapshot = snap.snapshot();
-        let writes: u64 = snapshot
-            .into_vec()
-            .into_iter()
-            .filter_map(|(key, _u, _d, v)| {
-                if key.key().name() == "faucet_sink_writes_total"
-                    && let DebugValue::Counter(c) = v
-                {
-                    return Some(c);
-                }
-                None
-            })
-            .sum();
-        assert!(writes >= 1, "expected at least one write counted");
+        let c = connector_counters(snap);
+        assert_eq!(counter_in(&c, "faucet_sink_writes_total", "mock-sink"), 1);
+        assert_eq!(counter_in(&c, "faucet_sink_records_total", "mock-sink"), 2);
     }
 
     #[tokio::test]
@@ -1463,7 +1460,6 @@ mod sink_tests {
     #[allow(clippy::await_holding_lock)]
     async fn instrumented_sink_write_batch_partial_counts_successful_outcomes() {
         use crate::traits::RowOutcome;
-        use metrics_util::debugging::DebugValue;
 
         // Sink that returns 2 Ok + 1 Err.
         struct MixedSink;
@@ -1489,6 +1485,7 @@ mod sink_tests {
 
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let snap = snapshotter();
+        connector_counters(snap); // a snapshot drains the counters seen so far
 
         let inner = MixedSink;
         let wrapped = InstrumentedSink::new(&inner, labels());
@@ -1497,34 +1494,9 @@ mod sink_tests {
             .await
             .unwrap();
 
-        // faucet_sink_records_total should reflect 2 (Ok count), not 3.
-        // Filter to this test's own labels (connector="mixed") — prior tests in
-        // the same `mod sink_tests` (e.g. records_writes_and_records_counters
-        // for connector="mock-sink") leave entries in the shared global
-        // recorder, and the HashMap-iteration order of `Snapshot::into_vec()`
-        // is non-deterministic, so a naïve `find_map` returns an arbitrary
-        // entry.
-        let snapshot = snap.snapshot();
-        let records: u64 = snapshot
-            .into_vec()
-            .into_iter()
-            .filter_map(|(k, _u, _d, v): (metrics_util::CompositeKey, _, _, _)| {
-                if k.key().name() == "faucet_sink_records_total"
-                    && k.key()
-                        .labels()
-                        .any(|l| l.key() == "connector" && l.value() == "mixed")
-                    && let DebugValue::Counter(c) = v
-                {
-                    Some(c)
-                } else {
-                    None
-                }
-            })
-            .sum();
-        assert!(
-            records >= 2,
-            "expected faucet_sink_records_total{{connector=mixed}} >= 2, got {records}"
-        );
+        // faucet_sink_records_total reflects the 2 Ok outcomes, not all 3.
+        let records = counter_in(&connector_counters(snap), "faucet_sink_records_total", "mixed");
+        assert_eq!(records, 2, "only accepted rows are counted");
     }
 
     // ── flush error path ─────────────────────────────────────────────────────
