@@ -1,5 +1,6 @@
 # A changed explicit token or inline RBAC principal list must roll the serve
 # pods, since the server reads both once at startup.
+# expect-not: generated a random serve token
 # expect: checksum/serve-auth: 467f61fcb0f1734bee6b3ee9933e43700c39357e00f420f70318239d2a128f34
 serve:
   enabled: true

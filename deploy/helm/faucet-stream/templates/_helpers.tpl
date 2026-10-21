@@ -78,6 +78,21 @@ Stable serve auth token: an explicit value wins; otherwise reuse the token
 already stored in the auth Secret (so upgrades don't rotate it); otherwise mint
 a fresh random one.
 */}}
+{{/*
+"true" when this render mints a new random token: token mode, no explicit token
+or existingSecret, and no stored token found. `lookup` is empty under
+`helm template` and client-side dry runs (Argo CD renders that way), so such a
+renderer mints a new token on every sync.
+*/}}
+{{- define "faucet-stream.serveAuthTokenGenerated" -}}
+{{- if and .Values.serve.enabled (eq .Values.serve.auth.mode "token") (not .Values.serve.auth.token) (not .Values.serve.auth.existingSecret) -}}
+{{- $sec := (lookup "v1" "Secret" .Release.Namespace (include "faucet-stream.authSecretName" .)) -}}
+{{- if not (and $sec (hasKey (default dict $sec.data) .Values.serve.auth.existingSecretKey)) -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "faucet-stream.serveAuthToken" -}}
 {{- if .Values.serve.auth.token -}}
 {{- .Values.serve.auth.token -}}

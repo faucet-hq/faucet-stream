@@ -18,6 +18,14 @@ Port-forward and probe it:
   curl -s localhost:{{ .Values.service.port }}/metrics | head
 
 {{- if eq .Values.serve.auth.mode "token" }}
+{{- if include "faucet-stream.serveAuthTokenGenerated" . }}
+
+WARNING: the chart generated a random serve token in this render. `helm
+install` / `helm upgrade` keep it across upgrades, but `helm template`, client
+dry runs and Argo CD render without cluster access and mint a NEW token every
+time, overwriting the Secret while running pods keep the old one (clients get
+401). With such a renderer, set serve.auth.existingSecret (or serve.auth.token).
+{{- end }}
 
 Auth: bearer token. Read it with:
   kubectl -n {{ .Release.Namespace }} get secret {{ .Values.serve.auth.existingSecret | default (include "faucet-stream.authSecretName" .) }} -o jsonpath='{.data.{{ .Values.serve.auth.existingSecretKey }}}' | base64 -d; echo

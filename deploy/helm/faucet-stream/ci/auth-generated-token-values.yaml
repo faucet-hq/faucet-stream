@@ -1,0 +1,8 @@
+# Token mode with no token or existingSecret: the chart mints one, and the
+# NOTES warn that renderers without cluster access mint a new one every time.
+# expect: generated a random serve token
+# expect-not: checksum/serve-auth
+serve:
+  enabled: true
+  auth:
+    mode: token
