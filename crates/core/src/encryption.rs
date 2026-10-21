@@ -120,6 +120,8 @@ pub struct CompiledEncryption {
     write: Aes256Gcm,
     /// Ciphers tried on read: the write key first, then previous keys.
     read: Vec<Aes256Gcm>,
+    /// Refuse legacy unbound payloads in `decrypt_bound`.
+    bound_only: bool,
 }
 
 impl std::fmt::Debug for CompiledEncryption {
@@ -128,6 +130,12 @@ impl std::fmt::Debug for CompiledEncryption {
             .field("read_keys", &self.read.len())
             .finish()
     }
+}
+
+/// `true` when `data` is a sealed payload in the legacy format that binds no
+/// identity, so it opens under any context until re-sealed.
+pub fn is_unbound(data: &[u8]) -> bool {
+    is_encrypted(data) && data.get(MAGIC.len()) == Some(&FORMAT_AES256GCM)
 }
 
 /// `true` when `data` carries the sealed-payload magic. Free function so
@@ -160,7 +168,30 @@ impl CompiledEncryption {
         let write = derive_key(&spec.key);
         let mut read = vec![derive_key(&spec.key)];
         read.extend(spec.previous_keys.iter().map(|k| derive_key(k)));
-        Ok(Self { write, read })
+        Ok(Self {
+            write,
+            read,
+            bound_only: false,
+        })
+    }
+
+    /// When `on`, [`decrypt_bound`](Self::decrypt_bound) refuses a legacy
+    /// unbound payload instead of opening it under any context. Turn it on
+    /// once every stored value has been re-sealed (see
+    /// [`reseal_bound`](Self::reseal_bound)).
+    pub fn bound_only(mut self, on: bool) -> Self {
+        self.bound_only = on;
+        self
+    }
+
+    /// Re-seal a legacy unbound payload under `context`. Returns `None` when
+    /// `data` is already bound (nothing to do); fails when it does not open.
+    pub fn reseal_bound(&self, data: &[u8], context: &[u8]) -> Result<Option<Vec<u8>>, FaucetError> {
+        if !is_unbound(data) {
+            return Ok(None);
+        }
+        let plain = self.open(data, None)?;
+        Ok(Some(self.encrypt_bound(&plain, context)))
     }
 
     /// Seal `plaintext` with the current key under a fresh random nonce.
@@ -225,6 +256,13 @@ impl CompiledEncryption {
         }
         let format = data[MAGIC.len()];
         let aad = match (format, context) {
+            (FORMAT_AES256GCM, Some(_)) if self.bound_only => {
+                return Err(FaucetError::State(
+                    "encrypted payload is in the legacy unbound format, which this store no \
+                     longer accepts — re-seal it bound to its identity"
+                        .into(),
+                ));
+            }
             (FORMAT_AES256GCM, _) => Vec::new(),
             (FORMAT_AES256GCM_BOUND, Some(context)) => bound_aad(context),
             (FORMAT_AES256GCM_BOUND, None) => {
@@ -353,6 +391,28 @@ mod tests {
             previous_keys: vec![],
             algorithm: EncryptionAlgorithm::default(),
         }
+    }
+
+    #[test]
+    fn bound_only_refuses_unbound_payloads_and_reseal_upgrades_them() {
+        let enc = CompiledEncryption::compile(&spec("k1")).unwrap();
+        let legacy = enc.encrypt(b"old");
+        assert!(is_unbound(&legacy));
+        let resealed = enc.reseal_bound(&legacy, b"tenant:a").unwrap().unwrap();
+        assert!(!is_unbound(&resealed));
+        assert!(enc.reseal_bound(&resealed, b"tenant:a").unwrap().is_none());
+        let strict = CompiledEncryption::compile(&spec("k1"))
+            .unwrap()
+            .bound_only(true);
+        let err = strict
+            .decrypt_bound(&legacy, b"tenant:b")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("legacy unbound"), "{err}");
+        assert_eq!(strict.decrypt_bound(&resealed, b"tenant:a").unwrap(), b"old");
+        assert!(strict.decrypt_bound(&resealed, b"tenant:b").is_err());
+        assert_eq!(strict.decrypt(&legacy).unwrap(), b"old");
+        assert!(enc.reseal_bound(b"FCT1\x01short", b"x").is_err());
     }
 
     #[test]

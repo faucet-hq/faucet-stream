@@ -838,23 +838,7 @@ impl FileStateStore {
             .then(|| self.root.join(format!("{stem}.key")))
     }
 
-    /// Returns the root directory this store writes into.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-#[async_trait]
-impl StateStore for FileStateStore {
-    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
-        validate_state_key(key)?;
-        self.migrate_legacy_names().await?;
-        self.read_entry(key, &self.entry_path(key)).await
-    }
-
-    async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
-        validate_state_key(key)?;
-        let _guard = self.write_lock.lock().await;
+    async fn put_unlocked(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
         self.ensure_root().await?;
         let bytes = serde_json::to_vec(value).map_err(|e| {
             FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
@@ -947,6 +931,59 @@ impl StateStore for FileStateStore {
             "state file written"
         );
         Ok(())
+    }
+
+    /// Rewrite a state file still sealed in the legacy unbound format bound to
+    /// its key, so it can no longer be read under another key. Best effort: a
+    /// failure leaves the file as it was.
+    #[cfg(feature = "encryption")]
+    async fn reseal_legacy(&self, key: &str, path: &Path) {
+        let Some(enc) = &self.encryption else { return };
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            return;
+        };
+        if !crate::encryption::is_unbound(&bytes) {
+            return;
+        }
+        let _guard = self.write_lock.lock().await;
+        match tokio::fs::read(path).await {
+            Ok(now) if now == bytes => {}
+            _ => return,
+        }
+        let resealed = match enc.decrypt(&bytes) {
+            Ok(plain) => serde_json::from_slice::<Value>(&plain),
+            Err(_) => return,
+        };
+        let Ok(value) = resealed else { return };
+        if let Err(e) = self.put_unlocked(key, &value).await {
+            tracing::warn!(key, error = %e, "could not re-seal a legacy state file");
+        }
+    }
+
+    /// Returns the root directory this store writes into.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[async_trait]
+impl StateStore for FileStateStore {
+    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+        validate_state_key(key)?;
+        self.migrate_legacy_names().await?;
+        let path = self.entry_path(key);
+        let value = self.read_entry(key, &path).await?;
+        #[cfg(feature = "encryption")]
+        if value.is_some() {
+            self.reseal_legacy(key, &path).await;
+        }
+        Ok(value)
+    }
+
+    async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+        validate_state_key(key)?;
+        let _guard = self.write_lock.lock().await;
+        self.put_unlocked(key, value).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
@@ -1838,6 +1875,21 @@ mod tests {
             rotated.put("bk", &json!("v2")).await.unwrap();
             let new_only = FileStateStore::new(dir.path()).with_encryption(enc("new"));
             assert_eq!(new_only.get("bk").await.unwrap(), Some(json!("v2")));
+        }
+
+        #[tokio::test]
+        async fn a_legacy_unbound_file_is_resealed_bound_on_read() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileStateStore::new(dir.path()).with_encryption(enc("k1"));
+            store.put("bk", &json!({"v": 1})).await.unwrap();
+            let path = store.entry_path("bk");
+            std::fs::write(&path, enc("k1").encrypt(br#"{"v":1}"#)).unwrap();
+            assert!(crate::encryption::is_unbound(&std::fs::read(&path).unwrap()));
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 1})));
+            let after = std::fs::read(&path).unwrap();
+            assert!(is_encrypted(&after));
+            assert!(!crate::encryption::is_unbound(&after));
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 1})));
         }
 
         #[tokio::test]
