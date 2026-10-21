@@ -671,6 +671,45 @@ async fn claim_pending_is_exclusive_across_instances() {
     assert_eq!(claimed.config_body.as_deref(), Some("version: 1"));
 }
 
+/// A pending record this binary cannot read (a newer instance's, mid-upgrade)
+/// does not stop the runs behind it from being claimed, and is left pending
+/// for an instance that can read it; orphan recovery and reclaim skip it too.
+#[tokio::test]
+async fn an_unreadable_record_does_not_block_claims() {
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let h = store_with(&dir, "hol.db", std::time::Duration::ZERO, "inst-a").await;
+    let old = Utc::now() - chrono::Duration::seconds(60);
+    let mut good = rec("good", RunStatus::Pending, Utc::now());
+    good.config_body = Some("version: 1".into());
+    h.upsert(&good).await.unwrap();
+    let mut bad = rec("bad", RunStatus::Pending, old);
+    bad.config_body = Some("version: 1".into());
+    h.upsert(&bad).await.unwrap();
+    let mut orphan = rec("orphan-bad", RunStatus::Running, old);
+    orphan.started_at = Some(old);
+    h.upsert(&orphan).await.unwrap();
+    {
+        let url = format!("sqlite:{}", dir.path().join("hol.db").display());
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("UPDATE faucet_serve_runs SET body = '{\"from\":\"the future\"}' WHERE run_id IN ('bad', 'orphan-bad')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let claimed = h.claim_pending(1).await.unwrap();
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        ["good"]
+    );
+    // The unreadable rows are skipped, not fatal.
+    h.recover_orphans().await.unwrap();
+    h.reclaim_orphans(3).await.unwrap();
+}
+
 /// reclaim re-queues an expired-lease run, bumping attempt; at the cap it fails.
 #[tokio::test]
 async fn reclaim_requeues_then_poisons_at_cap() {
