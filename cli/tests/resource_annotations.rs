@@ -50,6 +50,7 @@ const SUFFIXES: &[&str] = &[
     "_endpoint",
     "_command",
     "_cert",
+    "_pkcs12",
     "_location",
     "_executable",
     "_host",

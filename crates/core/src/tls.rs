@@ -24,6 +24,7 @@ pub struct TlsClientConfig {
     pub client_key: Option<String>,
     /// Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the
     /// PEM pair.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub client_identity_pkcs12: Option<String>,
     /// Password for the PKCS#12 file (omit or empty if the file is unencrypted).
     pub pkcs12_password: Option<String>,
@@ -86,6 +87,18 @@ impl TlsClientConfig {
 #[cfg(test)]
 mod tests {
     use super::TlsClientConfig;
+
+    #[test]
+    fn the_pkcs12_path_is_a_declared_resource() {
+        let schema = serde_json::to_value(schemars::schema_for!(TlsClientConfig)).unwrap();
+        let config = serde_json::json!({"client_identity_pkcs12": "/etc/id.p12"});
+        let refs = crate::resolve::annotated_resources(&schema, &config);
+        assert!(
+            refs.iter()
+                .any(|r| r.kind == crate::resolve::ResourceKind::Path && r.value == "/etc/id.p12"),
+            "{refs:?}"
+        );
+    }
 
     #[test]
     fn debug_never_prints_key_material() {
