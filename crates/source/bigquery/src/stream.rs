@@ -726,8 +726,10 @@ fn bq_param_type(v: &Value) -> &'static str {
     match v {
         Value::Bool(_) => "BOOL",
         Value::Number(n) => {
-            if n.is_i64() || n.is_u64() {
+            if n.is_i64() {
                 "INT64"
+            } else if n.is_u64() {
+                "NUMERIC"
             } else {
                 "FLOAT64"
             }

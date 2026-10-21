@@ -584,7 +584,13 @@ async fn submits_typed_bool_and_float_param_types() {
         .mount(&server)
         .await;
 
-    let cfg = default_config().with_params(vec![json!(true), json!(2.5), json!(7), json!(null)]);
+    let cfg = default_config().with_params(vec![
+        json!(true),
+        json!(2.5),
+        json!(7),
+        json!(null),
+        json!(u64::MAX),
+    ]);
     let (src, _f) = build_source(&server, cfg).await;
     src.fetch_all().await.unwrap();
 
@@ -595,7 +601,9 @@ async fn submits_typed_bool_and_float_param_types() {
         .expect("captured jobs.query request");
     let body: Value = serde_json::from_slice(&query_req.body).unwrap();
     let params = body["queryParameters"].as_array().unwrap();
-    assert_eq!(params.len(), 4);
+    assert_eq!(params.len(), 5);
+    assert_eq!(params[4]["parameterType"]["type"], "NUMERIC");
+    assert_eq!(params[4]["parameterValue"]["value"], "18446744073709551615");
     assert_eq!(params[0]["parameterType"]["type"], "BOOL");
     assert_eq!(params[0]["parameterValue"]["value"], "true");
     assert_eq!(params[1]["parameterType"]["type"], "FLOAT64");
