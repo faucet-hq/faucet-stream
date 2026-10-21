@@ -1395,7 +1395,12 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
         toast("choose at least one row to run", "error");
         return;
       }
-      if (picked.length !== rowData.length || parentsSel.value !== "off") {
+      // A run without a selection takes only the default rows, so the
+      // selection may be left out only when exactly those are checked.
+      const defaults = rowData.filter((r) => r.default_selected).map((r) => r.id);
+      const isDefault =
+        picked.length === defaults.length && defaults.every((d) => picked.includes(d));
+      if (!isDefault || parentsSel.value !== "off") {
         body.selection = { select: picked, include_parents: parentsSel.value };
       }
     }
