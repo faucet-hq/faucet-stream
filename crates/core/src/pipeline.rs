@@ -346,7 +346,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
     /// writes into its staging target (it routes there off its own config), so
     /// the orchestrator must call `begin_overwrite` before, and
     /// `commit_overwrite`/`abort_overwrite` after, all the suppressed
-    /// invocations that share the destination.
+    /// invocations that share the destination. A suppressed run does not
+    /// persist its bookmark either (it would claim delivery before the swap):
+    /// the orchestrator persists each invocation's [`PipelineResult::bookmark`]
+    /// after `commit_overwrite` succeeds.
     pub fn with_suppress_overwrite(mut self, suppress: bool) -> Self {
         self.suppress_overwrite_lifecycle = suppress;
         self
@@ -1065,23 +1068,23 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 source_drains_on_cancel,
                 row_accounts: self.row_accounts.clone(),
             };
+            let cleanup = self.cleanup.clone().filter(|p| {
+                p.trigger != crate::cleanup::CleanupTrigger::CompleteRead || complete_read.is_some()
+            });
+            if cleanup.is_some() && !wrapped_sink.supports_cleanup() {
+                return Err(FaucetError::Config(format!(
+                    "cleanup is configured but sink '{}' does not support scoped cleanup",
+                    wrapped_sink.connector_name()
+                )));
+            }
             let overwriting = wrapped_sink.is_overwrite() && !self.suppress_overwrite_lifecycle;
             if overwriting {
                 wrapped_sink.begin_overwrite().await?;
             }
 
-            let cleanup = self.cleanup.clone().filter(|p| {
-                p.trigger != crate::cleanup::CleanupTrigger::CompleteRead || complete_read.is_some()
-            });
             let run_result = match cleanup {
                 None => Box::pin(run_stream_with(pages, &wrapped_sink, opts, extras)).await,
                 Some(policy) => {
-                    if !wrapped_sink.supports_cleanup() {
-                        return Err(FaucetError::Config(format!(
-                            "cleanup is configured but sink '{}' does not support scoped cleanup",
-                            wrapped_sink.connector_name()
-                        )));
-                    }
                     let mut tracker = crate::cleanup::CleanupTracker::new(&wrapped_sink, &policy);
                     if let Some(signal) = complete_read.clone() {
                         tracker = tracker.gated_by(signal);
@@ -1642,6 +1645,13 @@ where
 /// their bookmark after seeing every record emit `Some` on the final page;
 /// CDC-style sources emit `Some` per committed transaction and get
 /// per-transaction durability automatically.
+///
+/// Exception: when the sink [`is_overwrite`](Sink::is_overwrite), no bookmark
+/// is persisted here, because the destination only becomes visible at the
+/// staging swap. `run_stream` neither begins nor commits that swap: the caller
+/// calls [`Sink::begin_overwrite`] before, [`Sink::commit_overwrite`] after a
+/// successful return, and only then persists [`PipelineResult::bookmark`]
+/// itself. [`Pipeline::run`] does all of this.
 ///
 /// Returns the cumulative [`PipelineResult`] — `records_written` is the sum
 /// across all pages and `bookmark` is the last per-page bookmark observed.
@@ -8041,6 +8051,44 @@ mod cleanup_tests {
         assert!(
             sink.written.lock().unwrap().is_empty(),
             "must fail before writing anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_cleanup_is_refused_before_overwrite_staging_begins() {
+        struct OverwriteNoCleanup(Arc<Mutex<Vec<String>>>);
+        #[async_trait]
+        impl Sink for OverwriteNoCleanup {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+            fn is_overwrite(&self) -> bool {
+                true
+            }
+            async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().push("begin".into());
+                Ok(())
+            }
+            async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().push("abort".into());
+                Ok(())
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = OverwriteNoCleanup(events.clone());
+        let source = src(vec![json!({"id": 1})]);
+        let err = Pipeline::new(&source, &sink)
+            .with_cleanup(policy(100))
+            .run()
+            .await
+            .expect_err("unsupported sink must be rejected");
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.contains("scoped cleanup")),
+            "{err}"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no staging may be created"
         );
     }
 
