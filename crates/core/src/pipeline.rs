@@ -429,6 +429,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         &self,
         is_overwrite: bool,
         dedups_by_key: bool,
+        per_row_sink: bool,
     ) -> Vec<crate::compat::Feature> {
         use crate::compat::Feature as F;
         #[allow(unused_mut)]
@@ -459,6 +460,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     .is_some_and(|d| d.on_batch_error != crate::dlq::OnBatchError::Propagate),
                 F::DlqAll,
             ),
+            (self.dlq.is_some() && per_row_sink, F::DlqPerRowSink),
         ];
         #[cfg(feature = "quality")]
         on.push((self.quality.is_some(), F::Quality));
@@ -876,6 +878,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         &self.compat_features(
                             wrapped_sink.is_overwrite(),
                             wrapped_sink.dedups_by_key(),
+                            wrapped_sink.batch_atomicity() == crate::dlq::BatchAtomicity::PerRow,
                         ),
                     );
                 // No record pass is configured here (the planner refuses them), hence the clearance.
@@ -927,6 +930,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                 wrapped_sink.connector_name(),
                                 self.batch_outcomes.clone(),
                             ),
+                            self.row_accounts.clone(),
                         ))
                         .await;
                     }
@@ -936,10 +940,12 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             // Columnar (Arrow) fast path — feature `arrow`, RFC 0002 / #375.
             // When both the source and sink speak Arrow *and* no `Value`-shaped
             // stage needs to observe the records, drive the columnar loop and
-            // skip `Value` materialization entirely. Any complicating feature
-            // (DLQ, exactly-once, masking/quality/contract/drift, adaptive,
-            // resilience) falls through to the `Value` path below. Bookmark
-            // resume above already ran, so a columnar source resumes correctly.
+            // skip `Value` materialization entirely. Governance runs inside the
+            // columnar loop; a feature that needs per-row outcomes (a DLQ in
+            // front of a per-row sink, `dlq_all`, exactly-once, adaptive,
+            // resilience — see `compat::RULES`) falls through to the `Value`
+            // path below. Bookmark resume above already ran, so a columnar
+            // source resumes correctly.
             #[cfg(feature = "arrow")]
             {
                 let columnar_ok = wrapped_source.supports_columnar()
@@ -949,6 +955,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         &self.compat_features(
                             wrapped_sink.is_overwrite(),
                             wrapped_sink.dedups_by_key(),
+                            wrapped_sink.batch_atomicity() == crate::dlq::BatchAtomicity::PerRow,
                         ),
                     );
                 // Governance no longer disqualifies the fast path (#636) — it
@@ -1485,6 +1492,7 @@ async fn run_stream_native<S, Si>(
     pipeline: &str,
     row: &str,
     outcomes: crate::dlq::BatchOutcomeSink,
+    row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
 ) -> Result<PipelineResult, FaucetError>
 where
     S: crate::Source + ?Sized,
@@ -1548,12 +1556,15 @@ where
         let batch = crate::governance::GovernedNative::passthrough(batch, &clearance);
         let n = outcomes.observe(gate::native(sink, batch, &scope, load_ctx).await)?;
         first_batch = false;
+        // Every batch folds into the run's row accounts like the other paths;
+        // a batch with no source count is credited as offered = loaded.
+        let mut page = crate::accounting::PageAccount::new(offered.map_or(n, |o| o as usize));
+        page.accepted = n;
+        page.settle(
+            row_accounts.as_deref(),
+            (pipeline, row, sink.connector_name()),
+        )?;
         match offered {
-            Some(offered) if (n as u64) < offered => {
-                let mut page = crate::accounting::PageAccount::new(offered as usize);
-                page.accepted = n;
-                page.settle(None, (pipeline, row, sink.connector_name()))?;
-            }
             Some(_) => {}
             None if !warned_unchecked => {
                 warned_unchecked = true;
@@ -8239,6 +8250,21 @@ mod cleanup_tests {
             value_path_events(&events).is_empty(),
             "no Value writes: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn native_path_fills_the_run_row_accounts() {
+        let source = NativeCsvSource::new(3);
+        let sink = NativeRecordingSink::new(false);
+        let accounts = Arc::new(crate::accounting::RowAccounts::default());
+        let result = Pipeline::new(&source, &sink)
+            .with_row_accounts(Arc::clone(&accounts))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(result.records_written, 3);
+        let snap = accounts.snapshot();
+        assert_eq!((snap.offered, snap.accepted, snap.unaccounted), (3, 3, 0));
     }
 
     /// A source whose native batches carry no row count.

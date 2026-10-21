@@ -795,3 +795,105 @@ async fn columnar_governance_matches_the_value_path() {
         "governance output must be identical across paths"
     );
 }
+
+/// A DLQ in front of a sink that reports per-row outcomes keeps the run on the
+/// row path: the one rejected row goes to the DLQ and the rest are written,
+/// exactly as when the pair could not speak Arrow.
+#[tokio::test]
+async fn a_dlq_before_a_per_row_sink_keeps_rejected_rows_out_of_the_columnar_path() {
+    use faucet_core::dlq::{BatchAtomicity, DlqConfig};
+
+    struct PerRowSink {
+        columnar_calls: AtomicUsize,
+        written: std::sync::Mutex<Vec<Value>>,
+    }
+    #[async_trait]
+    impl Sink for PerRowSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.written.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        async fn write_batch_partial(
+            &self,
+            records: &[Value],
+        ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+            let mut out = Vec::new();
+            for r in records {
+                if r["id"] == json!(2) {
+                    out.push(Err(FaucetError::Sink("rejected".into())));
+                } else {
+                    self.written.lock().unwrap().push(r.clone());
+                    out.push(Ok(()));
+                }
+            }
+            Ok(out)
+        }
+        fn batch_atomicity(&self) -> BatchAtomicity {
+            BatchAtomicity::PerRow
+        }
+        fn supports_columnar(&self) -> bool {
+            true
+        }
+        async fn write_batch_columnar(
+            &self,
+            _batch: &arrow::array::RecordBatch,
+        ) -> Result<usize, FaucetError> {
+            self.columnar_calls.fetch_add(1, Ordering::SeqCst);
+            Err(FaucetError::Sink(
+                "one row rejected; the whole load fails".into(),
+            ))
+        }
+    }
+    struct Both(Vec<Value>);
+    #[async_trait]
+    impl Source for Both {
+        async fn fetch_with_context(
+            &self,
+            _c: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(self.0.clone())
+        }
+        fn supports_columnar(&self) -> bool {
+            true
+        }
+        fn stream_batches<'a>(
+            &'a self,
+            _context: &'a HashMap<String, Value>,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>> {
+            let batch = values_to_record_batch_inferred(&self.0).unwrap();
+            Box::pin(futures::stream::once(async move {
+                Ok(ColumnarPage::new(batch, None))
+            }))
+        }
+    }
+    struct Dlq(std::sync::Mutex<Vec<Value>>);
+    #[async_trait]
+    impl Sink for Dlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.0.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+    }
+
+    let source = Both(vec![json!({"id": 1}), json!({"id": 2}), json!({"id": 3})]);
+    let sink = PerRowSink {
+        columnar_calls: AtomicUsize::new(0),
+        written: std::sync::Mutex::new(Vec::new()),
+    };
+    let dlq = Arc::new(Dlq(std::sync::Mutex::new(Vec::new())));
+    let result = Pipeline::new(&source, &sink)
+        .with_dlq(DlqConfig::new(Arc::clone(&dlq) as Arc<dyn Sink>))
+        .run()
+        .await
+        .expect("the rejected row is dead-lettered, not fatal");
+    assert_eq!(sink.columnar_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(result.records_written, 2);
+    assert_eq!(
+        *sink.written.lock().unwrap(),
+        vec![json!({"id": 1}), json!({"id": 3})]
+    );
+    let envelopes = dlq.0.lock().unwrap().clone();
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0]["payload"], json!({"id": 2}));
+}

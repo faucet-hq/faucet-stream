@@ -70,6 +70,10 @@ pub enum Feature {
     Profiling,
     /// `_faucet_*` metadata columns (`metadata_columns:`).
     MetadataColumns,
+    /// A DLQ in front of a sink that reports per-row outcomes
+    /// ([`BatchAtomicity::PerRow`](crate::dlq::BatchAtomicity)): a row it
+    /// rejects goes to the DLQ, which only the row path can do.
+    DlqPerRowSink,
 }
 
 impl Feature {
@@ -85,6 +89,7 @@ impl Feature {
         Feature::SchemaDriftEvolve,
         Feature::DlqPropagate,
         Feature::DlqAll,
+        Feature::DlqPerRowSink,
         Feature::ExactlyOnce,
         Feature::KeyedWrites,
         Feature::Overwrite,
@@ -124,6 +129,7 @@ impl Feature {
             Feature::Budget => "`budget:`",
             Feature::Profiling => "`profiling:`",
             Feature::MetadataColumns => "`metadata_columns:`",
+            Feature::DlqPerRowSink => "`dlq:` with a sink reporting per-row outcomes",
         }
     }
 }
@@ -321,6 +327,7 @@ pub const RULES: &[Rule] = &[
     // Columnar: governance runs inside the loop; per-row outcomes do not.
     path(F::MaskingRetypesByValue, P::Columnar, D),
     path(F::DlqAll, P::Columnar, D),
+    path(F::DlqPerRowSink, P::Columnar, D),
     path(F::ExactlyOnce, P::Columnar, D),
     path(F::Overwrite, P::Columnar, D),
     path(F::GroupedOverwrite, P::Columnar, D),
@@ -534,6 +541,10 @@ mod tests {
         assert!(path_allowed(P::Native, &[F::Overwrite]));
         assert!(!path_allowed(P::Native, &[F::Overwrite, F::KeyedWrites]));
         assert!(path_allowed(P::Columnar, &[F::Masking, F::DlqPropagate]));
+        assert!(!path_allowed(
+            P::Columnar,
+            &[F::DlqPropagate, F::DlqPerRowSink]
+        ));
         assert!(!path_allowed(P::Columnar, &[F::DlqAll]));
         assert!(!path_allowed(P::Columnar, &[F::PolicyQuarantine]));
         assert!(path_allowed(P::Native, &[]));
