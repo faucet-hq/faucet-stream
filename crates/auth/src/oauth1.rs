@@ -50,7 +50,7 @@ impl std::fmt::Debug for OAuth1Provider {
         f.debug_struct("OAuth1Provider")
             .field("consumer_key", &self.consumer_key)
             .field("consumer_secret", &"***")
-            .field("token", &self.token)
+            .field("token", &"***")
             .field("token_secret", &"***")
             .field("realm", &self.realm)
             .finish()
@@ -371,9 +371,17 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_secrets() {
-        let s = format!("{:?}", provider());
-        assert!(!s.contains("cs") || !s.contains("\"cs\""));
-        assert!(s.contains("***"));
-        assert!(!s.contains("token_secret\": \"ts"));
+        let p = OAuth1Provider::from_config(&serde_json::json!({
+            "consumer_key": "ck",
+            "consumer_secret": "CONSUMER-SECRET-VALUE",
+            "token": "ACCESS-TOKEN-VALUE",
+            "token_secret": "TOKEN-SECRET-VALUE",
+        }))
+        .unwrap();
+        let s = format!("{p:?}");
+        assert!(!s.contains("CONSUMER-SECRET-VALUE"), "{s}");
+        assert!(!s.contains("TOKEN-SECRET-VALUE"), "{s}");
+        assert!(!s.contains("ACCESS-TOKEN-VALUE"), "{s}");
+        assert!(s.contains("ck"));
     }
 }
