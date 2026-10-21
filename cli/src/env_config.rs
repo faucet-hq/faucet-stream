@@ -447,13 +447,99 @@ fn register_secret_values(env: &HashMap<String, String>) {
         if !k.starts_with("FAUCET_") {
             continue;
         }
+        let secret_name = SECRET_NAME_PARTS.iter().any(|p| k.contains(p));
         let url_with_userinfo = k.contains("URL")
             && v.split_once("://")
                 .is_some_and(|(_, rest)| rest.split(['/', '?']).next().unwrap_or("").contains('@'));
-        if url_with_userinfo || SECRET_NAME_PARTS.iter().any(|p| k.contains(p)) {
+        if url_with_userinfo || secret_name {
             crate::secrets::registry::register(v);
         }
+        // A credential is often echoed on its own (an auth error, a header
+        // dump), so register the parts that hold one too.
+        for part in embedded_secrets(k, v) {
+            crate::secrets::registry::register(&part);
+        }
     }
+}
+
+/// Lower-case key names that hold a credential inside a JSON value or a URL
+/// query / connection string.
+const SECRET_KEY_PARTS: &[&str] = &[
+    "password", "passwd", "pwd", "secret", "token", "key", "credential", "auth", "private",
+    "sig", "signature",
+];
+
+fn is_secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    // A bare `key` / `keys` names columns (an upsert key, a message key).
+    k != "key" && k != "keys" && SECRET_KEY_PARTS.iter().any(|p| k.contains(p))
+}
+
+/// Name parts that mark a whole `*_JSON` value as a credential block (an
+/// `auth` or `credentials` object), not just a value holding a key list.
+const CREDENTIAL_BLOCK_PARTS: &[&str] =
+    &["AUTH", "CREDENTIAL", "SECRET", "PASSWORD", "PASSWD", "TOKEN", "PRIVATE"];
+
+/// The credentials embedded in one `FAUCET_*` value: every string leaf of a
+/// credential-block `*_JSON` value (`*_AUTH_JSON`, `*_CREDENTIALS_JSON`, but
+/// not a `type` discriminator), the leaves under secret-looking keys of any
+/// other `*_JSON` value, a URL's userinfo password, and the values of
+/// secret-looking `key=value` pairs in a query or connection string. Values
+/// shorter than four characters are skipped. Pure.
+fn embedded_secrets(name: &str, value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if name.ends_with("_JSON")
+        && let Ok(json) = serde_json::from_str::<Value>(value)
+    {
+        let block = CREDENTIAL_BLOCK_PARTS.iter().any(|p| name.contains(p));
+        collect_json_secrets(&json, block, &mut out);
+    }
+    if let Ok(url) = url::Url::parse(value) {
+        if let Some(pw) = url.password() {
+            out.push(pw.to_string());
+            if let Ok(decoded) = urlencoding_decode(pw) {
+                out.push(decoded);
+            }
+        }
+    }
+    for pair in value.split(['?', '&', ';']) {
+        if let Some((k, v)) = pair.split_once('=')
+            && is_secret_key(k.trim())
+        {
+            let v = v.trim();
+            out.push(v.to_string());
+            if let Ok(decoded) = urlencoding_decode(v) {
+                out.push(decoded);
+            }
+        }
+    }
+    out.retain(|s| s.len() >= 4);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_json_secrets(v: &Value, under_secret: bool, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if under_secret => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| collect_json_secrets(x, under_secret, out)),
+        Value::Object(o) => o.iter().for_each(|(k, x)| {
+            if k != "type" {
+                collect_json_secrets(x, under_secret || is_secret_key(k), out)
+            }
+        }),
+        _ => {}
+    }
+}
+
+/// Percent-decode `s`; `Err` when it decodes to the same text or not UTF-8.
+fn urlencoding_decode(s: &str) -> Result<String, ()> {
+    let decoded: Vec<u8> = url::form_urlencoded::parse(format!("x={s}").as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned().into_bytes())
+        .ok_or(())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| ())?;
+    if decoded == s { Err(()) } else { Ok(decoded) }
 }
 
 #[cfg(test)]
@@ -523,6 +609,38 @@ mod tests {
             out,
             "*** orders-table-4417 *** https://api-4417.example.com"
         );
+    }
+
+    #[test]
+    fn credentials_inside_json_and_urls_are_registered_on_their_own() {
+        let env: HashMap<String, String> = [
+            (
+                "FAUCET_SOURCE_REST_AUTH_JSON",
+                r#"{"type":"bearer","config":{"token":"sk_live_tok_5521"}}"#,
+            ),
+            (
+                "FAUCET_SOURCE_REST_HEADERS_JSON",
+                r#"{"x-api-key":"hdr-key-5521","accept":"application/json"}"#,
+            ),
+            (
+                "FAUCET_SOURCE_POSTGRES_CONNECTION_URL",
+                "postgres://h-5521/db?user=u&password=q%2Fpw-5521",
+            ),
+            ("FAUCET_SINK_PG_DATABASE_URL", "postgres://u:url-pw-5521@db/x"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        register_secret_values(&env);
+        assert!(embedded_secrets("FAUCET_SINK_PG_KEY_JSON", r#"["account_5521"]"#).is_empty());
+        assert!(
+            embedded_secrets("FAUCET_SINK_KAFKA_CONFIG_JSON", r#"{"key":"account_5521"}"#)
+                .is_empty()
+        );
+        let out = crate::secrets::registry::redact(
+            "Bearer sk_live_tok_5521 hdr-key-5521 application/json q/pw-5521 url-pw-5521 h-5521",
+        );
+        assert_eq!(out, "Bearer *** *** application/json *** *** h-5521");
     }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
