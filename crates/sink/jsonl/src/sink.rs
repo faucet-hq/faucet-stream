@@ -272,33 +272,62 @@ async fn refuse_sealed_file(
 /// top-level value (a complete line starting at column 0 that does not open
 /// an object or array).
 async fn trim_partial_pretty_record(path: &std::path::Path) -> std::io::Result<()> {
-    let raw = match tokio::fs::read(path).await {
-        Ok(r) => r,
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = match OpenOptions::new().read(true).write(true).open(path).await {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    let mut keep = 0usize;
-    let mut start = 0usize;
-    while let Some(i) = raw[start..].iter().position(|b| *b == b'\n') {
-        let line = &raw[start..start + i];
-        let ends_value =
-            line.first().is_some_and(|b| !b.is_ascii_whitespace()) && line != b"{" && line != b"[";
-        start += i + 1;
-        if ends_value {
-            keep = start;
+    let len = file.metadata().await?.len();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut tail_start = len;
+    let mut chunk = vec![0u8; 8192];
+    let keep = loop {
+        if let Some(end) = last_value_end(&tail, tail_start == 0) {
+            break tail_start + end as u64;
         }
-    }
-    if keep < raw.len() {
+        if tail_start == 0 {
+            break 0;
+        }
+        let start = tail_start.saturating_sub(chunk.len() as u64);
+        let n = (tail_start - start) as usize;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        file.read_exact(&mut chunk[..n]).await?;
+        tail.splice(0..0, chunk[..n].iter().copied());
+        tail_start = start;
+    };
+    if keep < len {
         tracing::warn!(
             path = %path.display(),
-            bytes = raw.len() - keep,
+            bytes = len - keep,
             "jsonl sink: cutting a partial last record left by an interrupted write"
         );
-        let file = std::fs::OpenOptions::new().write(true).open(path)?;
-        file.set_len(keep as u64)?;
-        file.sync_all()?;
+        file.set_len(keep).await?;
+        file.sync_all().await?;
     }
     Ok(())
+}
+
+/// The offset just past the newline of the last complete line in `buf` that
+/// ends a top-level value; a line counts only when its start is known (after
+/// a newline in `buf`, or at offset 0 when `at_file_start`).
+fn last_value_end(buf: &[u8], at_file_start: bool) -> Option<usize> {
+    let mut end = buf.iter().rposition(|b| *b == b'\n')?;
+    loop {
+        let line_start = match buf[..end].iter().rposition(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            None if at_file_start => 0,
+            None => return None,
+        };
+        let line = &buf[line_start..end];
+        if line.first().is_some_and(|b| !b.is_ascii_whitespace()) && line != b"{" && line != b"[" {
+            return Some(end + 1);
+        }
+        if line_start == 0 {
+            return None;
+        }
+        end = line_start - 1;
+    }
 }
 
 /// Cut a torn last line (bytes after the final newline) left by a write that
@@ -526,6 +555,35 @@ mod tests {
         trim_partial_pretty_record(&dir.path().join("missing.jsonl"))
             .await
             .unwrap();
+    }
+
+    /// The pretty repair reads the file backwards in chunks: a torn record
+    /// larger than one chunk is cut, and a record before it is kept.
+    #[tokio::test]
+    async fn a_pretty_repair_scans_back_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        let torn_body = format!("{{\n  \"blob\": \"{}\",\n", "y".repeat(30_000));
+        std::fs::write(&path, format!("{{\n  \"id\": 1\n}}\n{torn_body}")).unwrap();
+        trim_partial_pretty_record(&path).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"id\": 1\n}\n"
+        );
+
+        let only_torn = dir.path().join("torn.jsonl");
+        std::fs::write(&only_torn, &torn_body).unwrap();
+        trim_partial_pretty_record(&only_torn).await.unwrap();
+        assert_eq!(std::fs::read(&only_torn).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn last_value_end_needs_a_known_line_start() {
+        assert_eq!(last_value_end(b"}\n", true), Some(2));
+        assert_eq!(last_value_end(b"}\n", false), None);
+        assert_eq!(last_value_end(b"x\n}\n  \"a\": 1\n", false), Some(4));
+        assert_eq!(last_value_end(b"{\n  \"a\": 1\n", true), None);
+        assert_eq!(last_value_end(b"no newline", true), None);
     }
 
     #[test]
