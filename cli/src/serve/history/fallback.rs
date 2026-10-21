@@ -747,10 +747,10 @@ impl RunHistory for FallbackHistory {
 
     // ── Pipeline-template registry (#444) ────────────────────────────────────
     //
-    // Forwarded like every other method: while the SQL backend is reachable
-    // templates persist; once degraded they land in the in-memory fallback, so
-    // the control plane keeps serving (a registration made while degraded is
-    // process-lifetime only — the same trade-off as a degraded run record).
+    // Strict (`strict!`): while the SQL backend is reachable templates persist;
+    // once degraded every template call fails with `Degraded` (a 503) rather
+    // than reading or writing the in-memory fallback, so a registration is
+    // never silently process-lifetime only.
     async fn template_register(
         &self,
         draft: &crate::serve::history::templates::TemplateDraft,
