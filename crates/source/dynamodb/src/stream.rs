@@ -41,6 +41,7 @@ pub struct DynamoDbSource {
     lag: Mutex<LagTracker>,
     lag_warned: std::sync::atomic::AtomicBool,
     calls: CallSlot,
+    complete_read: faucet_core::ReadCompleteness,
 }
 
 /// Parse a `{segment, total_segments}` shard descriptor. Pure.
@@ -114,6 +115,7 @@ impl DynamoDbSource {
             lag: Mutex::new(LagTracker::default()),
             lag_warned: std::sync::atomic::AtomicBool::new(false),
             calls: CallSlot::new(CallContext::new()),
+            complete_read: faucet_core::ReadCompleteness::new(),
         })
     }
 
@@ -286,6 +288,11 @@ impl DynamoDbSource {
         Ok(tracker.lag(now_ms()))
     }
 
+    /// Whether a run that finds a gap reads the whole table (`on_gap: resnapshot`).
+    fn resnapshots(&self) -> bool {
+        self.config.mode == ReadMode::Streams && self.config.on_gap == OnGap::Resnapshot
+    }
+
     fn with_lag(&self, f: impl FnOnce(&mut LagTracker)) {
         if let Ok(mut t) = self.lag.lock() {
             f(&mut t);
@@ -296,6 +303,7 @@ impl DynamoDbSource {
         let chunk = chunk_size(self.config.batch_size);
         Box::pin(async_stream::try_stream! {
             self.with_lag(|t| *t = LagTracker::default());
+            self.complete_read.reset();
             let calls = self.calls.get();
             let arn = self.resolve_stream_arn().await?;
             let described = describe_shards_in(&calls, &self.streams, &arn).await?;
@@ -340,15 +348,19 @@ impl DynamoDbSource {
                     )))?,
                     OnGap::Resnapshot => {
                         tracing::warn!(table = %self.config.table_name, reasons = %reasons,
-                            "dynamodb streams: bookmark is past the trim horizon; resnapshotting");
+                            "dynamodb streams: bookmark is past the trim horizon; resnapshotting \
+                             (a complete read: destination rows of items it does not see are \
+                             deleted after the run)");
                         let keys = key_schema(&self.describe_table().await?)?;
                         let capture = capture_bookmark(&arn, &described);
                         let mut snap = self.scan_stream(
                             vec![0], 1, BTreeMap::new(), Some(keys), false, capture.to_value(),
                         );
+                        self.complete_read.begin();
                         while let Some(page) = futures::StreamExt::next(&mut snap).await {
                             yield page?;
                         }
+                        self.complete_read.complete();
                         bm = capture;
                     }
                 }
@@ -548,7 +560,12 @@ impl faucet_core::Source for DynamoDbSource {
             .to_builder()
             .reports_lag(self.config.mode == ReadMode::Streams)
             .table_routing(self.config.mode == ReadMode::Streams)
+            .complete_reads(self.resnapshots())
             .build()
+    }
+
+    fn read_completeness(&self) -> Option<faucet_core::ReadCompleteness> {
+        self.resnapshots().then(|| self.complete_read.clone())
     }
 
     /// Streams mode: now minus the creation time of the newest record read
@@ -1020,6 +1037,7 @@ mod tests {
             lag: Mutex::new(LagTracker::default()),
             lag_warned: std::sync::atomic::AtomicBool::new(false),
             calls: CallSlot::default(),
+            complete_read: faucet_core::ReadCompleteness::new(),
         }
     }
 

@@ -311,8 +311,14 @@ pub(crate) fn build_cleanup_delete(
         .map(|k| format!("T.{} = {}", quote_ident(k), typed(k, "k")))
         .collect::<Vec<_>>()
         .join(" AND ");
+    // An empty scope is the whole table (a complete-read cleanup).
+    let scope_and = if scope_pred.is_empty() {
+        String::new()
+    } else {
+        format!("{scope_pred} AND ")
+    };
     format!(
-        "DELETE FROM {t} T WHERE {scope_pred} AND NOT EXISTS \
+        "DELETE FROM {t} T WHERE {scope_and}NOT EXISTS \
          (SELECT 1 FROM UNNEST(JSON_QUERY_ARRAY(@keys)) AS k WHERE {key_pred})",
         t = table_ref(project, dataset, table),
     )
@@ -488,6 +494,16 @@ mod tests {
             scalar("contact_id", BqType::Int64),
             scalar("name", BqType::String),
         ]
+    }
+
+    #[test]
+    fn cleanup_delete_over_an_empty_scope_covers_the_whole_table() {
+        let sql = build_cleanup_delete(&id_name_cols(), &[], &["id".into()], "p", "d", "t");
+        assert!(
+            sql.starts_with("DELETE FROM `p.d.t` T WHERE NOT EXISTS"),
+            "{sql}"
+        );
+        assert!(!sql.contains("@scope"), "{sql}");
     }
 
     #[test]

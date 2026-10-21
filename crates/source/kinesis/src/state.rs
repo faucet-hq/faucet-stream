@@ -1,9 +1,15 @@
-//! Per-shard bookmark format: `{ "shards": { "<shard-id>": "<sequence>" } }`.
+//! Per-shard bookmark format: `{ "shards": { "<shard-id>": "<sequence>" },
+//! "resume_at": { "<shard-id>": <unix-secs> } }`.
 //!
 //! Every emitted page carries the **cumulative** map, so any page's bookmark
 //! is a valid resume point. On resume, a bookmarked shard restarts at
-//! `AFTER_SEQUENCE_NUMBER(<persisted>)`; shards absent from the map use the
-//! configured start position.
+//! `AFTER_SEQUENCE_NUMBER(<persisted>)`. A shard that delivered no record yet
+//! but was read up to its tip has a `resume_at` time instead and restarts at
+//! `AT_TIMESTAMP(<persisted>)` — without it a quiet shard would restart at the
+//! configured start position, which under `latest` skips everything written
+//! between runs. Shards absent from both maps use the start position.
+//! `resume_at` is omitted when empty, so a bookmark without it keeps the
+//! original shape (and an older release reading the new one ignores it).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +21,10 @@ pub struct ShardBookmarks {
     /// Shard id → last durably-emitted sequence number.
     #[serde(default)]
     pub shards: BTreeMap<String, String>,
+    /// Shard id → Unix seconds a shard with no sequence was read up to its
+    /// tip: no record of it arrived before then.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resume_at: BTreeMap<String, i64>,
 }
 
 impl ShardBookmarks {
@@ -22,6 +32,31 @@ impl ShardBookmarks {
     pub fn advance(&mut self, shard_id: &str, sequence: &str) {
         self.shards
             .insert(shard_id.to_string(), sequence.to_string());
+        self.resume_at.remove(shard_id);
+    }
+
+    /// Record that a shard with no sequence was read up to its tip at
+    /// `unix_secs`. Ignored once the shard has a sequence (the more exact
+    /// position); never moves an earlier time later than a newer one.
+    pub fn caught_up(&mut self, shard_id: &str, unix_secs: i64) {
+        if self.shards.contains_key(shard_id) {
+            return;
+        }
+        let at = self
+            .resume_at
+            .entry(shard_id.to_string())
+            .or_insert(unix_secs);
+        *at = (*at).max(unix_secs);
+    }
+
+    /// The time a sequence-less shard resumes at, if any.
+    pub fn resume_time(&self, shard_id: &str) -> Option<i64> {
+        self.resume_at.get(shard_id).copied()
+    }
+
+    /// Whether the bookmark records no shard at all.
+    pub fn is_empty(&self) -> bool {
+        self.shards.is_empty() && self.resume_at.is_empty()
     }
 
     /// The persisted sequence for a shard, if any.
@@ -55,6 +90,7 @@ impl ShardBookmarks {
     /// reshard), so the map does not grow forever (#789 MSG-91).
     pub fn retain_listed(&mut self, listed: &std::collections::HashSet<String>) {
         self.shards.retain(|id, _| listed.contains(id));
+        self.resume_at.retain(|id, _| listed.contains(id));
     }
 }
 
@@ -103,6 +139,27 @@ mod tests {
         b.retain_listed(&["a".to_string()].into());
         assert_eq!(b.shards.len(), 1);
         assert_eq!(b.get("a"), Some("1"));
+    }
+
+    #[test]
+    fn a_quiet_shard_resumes_at_the_time_it_was_caught_up() {
+        let mut b = ShardBookmarks::default();
+        b.caught_up("quiet", 100);
+        b.caught_up("quiet", 90);
+        assert_eq!(b.resume_time("quiet"), Some(100));
+        assert!(!b.is_empty());
+        let v = b.to_value();
+        assert_eq!(v, json!({"shards": {}, "resume_at": {"quiet": 100}}));
+        assert_eq!(ShardBookmarks::from_value(&v), b);
+        // A sequence supersedes the time, and a time never replaces it.
+        b.advance("quiet", "7");
+        b.caught_up("quiet", 200);
+        assert_eq!(b.resume_time("quiet"), None);
+        assert_eq!(b.to_value(), json!({"shards": {"quiet": "7"}}));
+        b.caught_up("gone", 5);
+        b.retain_listed(&["quiet".to_string()].into());
+        assert_eq!(b.resume_time("gone"), None);
+        assert!(ShardBookmarks::default().is_empty());
     }
 
     #[test]

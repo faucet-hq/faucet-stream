@@ -367,6 +367,9 @@ fn staging_index_specs(indexes: Vec<Document>) -> Vec<Document> {
 /// field(s) — deliberately: a document with no key cannot have been written by
 /// this run, so within a claimed-complete scope it is stale by definition.
 ///
+/// An empty scope (a complete-read cleanup, `CleanupPolicy::for_complete_read`)
+/// drops the scope predicate, so the delete covers the whole collection.
+///
 /// An empty `seen` set drops the "not written" clause entirely, leaving the
 /// scope predicate alone so **every** document in the scope is deleted. That is
 /// not a degenerate case but the motivating one: the source claimed the scope is
@@ -411,7 +414,11 @@ fn cleanup_filter_json(
     }
 
     let mut root = Map::with_capacity(1);
-    root.insert("$and".to_string(), Value::Array(clauses));
+    // `$and` refuses an empty array: no scope and no written key is the
+    // whole collection.
+    if !clauses.is_empty() {
+        root.insert("$and".to_string(), Value::Array(clauses));
+    }
     Value::Object(root)
 }
 
@@ -812,16 +819,6 @@ impl MongoDriver {
         if key.is_empty() {
             return Err(FaucetError::Sink(
                 "cleanup requires a non-empty `key`".to_string(),
-            ));
-        }
-        if scope.is_empty() {
-            // Defence in depth: `CleanupPolicy::new` already refuses this. With
-            // no scope predicate the filter would match the whole collection —
-            // the difference between a cleanup and a truncate.
-            return Err(FaucetError::Sink(
-                "cleanup: refusing an empty completeness claim — with no scope predicate the \
-                 delete would match every document in the collection"
-                    .to_string(),
             ));
         }
         check_key_alignment(key, seen.keys())?;
@@ -1871,6 +1868,18 @@ mod tests {
             &[],
         );
         assert_eq!(filter, json!({"$and": [{"contact_id": 7}]}));
+    }
+
+    #[test]
+    fn cleanup_filter_over_an_empty_scope_covers_the_whole_collection() {
+        let filter = super::cleanup_filter_json(
+            &scope_of(&[]),
+            &["id".to_string()],
+            &[kt(&[("id", json!(1))])],
+        );
+        assert_eq!(filter, json!({"$and": [{"id": {"$nin": [1]}}]}));
+        let all = super::cleanup_filter_json(&scope_of(&[]), &["id".to_string()], &[]);
+        assert_eq!(all, json!({}), "an empty `$and` is refused by the server");
     }
 
     #[test]

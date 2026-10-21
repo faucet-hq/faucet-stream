@@ -51,6 +51,17 @@
 //! ([`CleanupPolicy::max_keys`]) guards the pathological case: on breach the
 //! cleanup **aborts with a typed error and deletes nothing**, rather than issuing
 //! a partial delete that would destroy rows it simply forgot about.
+//!
+//! ## Complete reads
+//!
+//! A source that sometimes reads its **whole dataset** in one run (a change
+//! stream that fell past its retention and re-reads the table) declares it
+//! through [`ReadCompleteness`], returned by `Source::read_completeness`. A
+//! policy built with [`CleanupPolicy::for_complete_read`] has an empty scope
+//! (the whole destination) and fires only when that run's read finished.
+//! Keys are tracked only once the read has begun, and the run's bookmarks are
+//! held back until the delete succeeds, so a crash or a failed delete makes
+//! the next run read the whole dataset again instead of skipping the delete.
 
 use crate::error::FaucetError;
 use crate::traits::Sink;
@@ -58,6 +69,11 @@ use crate::write_mode::KeyTuple;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Default ceiling on accumulated keys for a [complete-read](CleanupPolicy::for_complete_read)
+/// cleanup: every key of the dataset is tracked, so it is sized for tables
+/// rather than per-parent scopes.
+pub const DEFAULT_COMPLETE_READ_MAX_KEYS: usize = 1_000_000;
 
 /// Default ceiling on accumulated keys for one invocation's cleanup.
 ///
@@ -77,6 +93,74 @@ pub enum CleanupMode {
     DeleteMissing,
 }
 
+/// When a [`CleanupPolicy`] deletes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CleanupTrigger {
+    /// After every successful, uncancelled run.
+    #[default]
+    Always,
+    /// Only after a run in which the source read its whole dataset
+    /// ([`ReadCompleteness`] reached [`ReadState::Complete`]).
+    CompleteRead,
+}
+
+/// How far a source got through reading its whole dataset in the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReadState {
+    /// The run is not a complete read.
+    Partial,
+    /// A complete read has started and not finished.
+    Reading,
+    /// The run read every record of the dataset.
+    Complete,
+}
+
+/// A shared signal through which a source reports a complete read of its
+/// dataset. Cheap to clone; the source keeps one and hands out clones.
+#[derive(Debug, Clone, Default)]
+pub struct ReadCompleteness(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl ReadCompleteness {
+    const PARTIAL: u8 = 0;
+    const READING: u8 = 1;
+    const COMPLETE: u8 = 2;
+
+    /// A signal in [`ReadState::Partial`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Back to [`ReadState::Partial`] (start of a run).
+    pub fn reset(&self) {
+        self.set(Self::PARTIAL);
+    }
+
+    /// A complete read has started. Call before its first record is yielded.
+    pub fn begin(&self) {
+        self.set(Self::READING);
+    }
+
+    /// The complete read has yielded every record.
+    pub fn complete(&self) {
+        self.set(Self::COMPLETE);
+    }
+
+    /// The current state.
+    pub fn state(&self) -> ReadState {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            Self::READING => ReadState::Reading,
+            Self::COMPLETE => ReadState::Complete,
+            _ => ReadState::Partial,
+        }
+    }
+
+    fn set(&self, v: u8) {
+        self.0.store(v, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A compiled cleanup instruction for one invocation.
 #[derive(Debug, Clone)]
 pub struct CleanupPolicy {
@@ -92,6 +176,8 @@ pub struct CleanupPolicy {
     pub key: Vec<String>,
     /// Ceiling on accumulated keys before the cleanup refuses (see module docs).
     pub max_keys: usize,
+    /// When the delete fires.
+    pub trigger: CleanupTrigger,
 }
 
 impl CleanupPolicy {
@@ -129,6 +215,25 @@ impl CleanupPolicy {
             scope,
             key,
             max_keys: max_keys.max(1),
+            trigger: CleanupTrigger::Always,
+        })
+    }
+
+    /// A policy over the **whole destination** that fires only after a run in
+    /// which the source read its whole dataset (see the module docs).
+    pub fn for_complete_read(key: Vec<String>, max_keys: usize) -> Result<Self, FaucetError> {
+        if key.is_empty() {
+            return Err(FaucetError::Config(
+                "cleanup: a complete-read cleanup requires a non-empty `key` so a written row \
+                 can be told apart from a deleted one"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            scope: BTreeMap::new(),
+            key,
+            max_keys: max_keys.max(1),
+            trigger: CleanupTrigger::CompleteRead,
         })
     }
 }
@@ -238,6 +343,7 @@ pub struct CleanupTracker<'a, S: Sink + ?Sized> {
     key: Vec<String>,
     max_keys: usize,
     seen: std::sync::Mutex<SeenKeys>,
+    gate: Option<ReadCompleteness>,
 }
 
 impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
@@ -247,10 +353,26 @@ impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
             key: policy.key.clone(),
             max_keys: policy.max_keys,
             seen: std::sync::Mutex::new(SeenKeys::new()),
+            gate: None,
         }
     }
 
+    /// Record keys only while `signal` reports a complete read under way or
+    /// finished, so an ordinary run tracks nothing.
+    #[must_use]
+    pub fn gated_by(mut self, signal: ReadCompleteness) -> Self {
+        self.gate = Some(signal);
+        self
+    }
+
     fn record(&self, records: &[Value]) {
+        if self
+            .gate
+            .as_ref()
+            .is_some_and(|g| g.state() == ReadState::Partial)
+        {
+            return;
+        }
         if let Ok(mut seen) = self.seen.lock() {
             seen.record_page(records, &self.key, self.max_keys);
         }
@@ -287,6 +409,65 @@ impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
     /// Number of keys tracked so far (for logging).
     pub fn tracked(&self) -> usize {
         self.seen.lock().map(|g| g.len()).unwrap_or(0)
+    }
+}
+
+/// Holds every bookmark write back while a complete read is under way, so
+/// the run's position becomes durable only after its cleanup succeeded: a
+/// crash, a cancel or a failed delete leaves the previous bookmark, and the
+/// next run reads the whole dataset again instead of skipping the delete.
+pub(crate) struct HoldingStateStore {
+    inner: std::sync::Arc<dyn crate::state::StateStore>,
+    signal: ReadCompleteness,
+    held: std::sync::Mutex<BTreeMap<String, Value>>,
+}
+
+impl HoldingStateStore {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn crate::state::StateStore>,
+        signal: ReadCompleteness,
+    ) -> Self {
+        Self {
+            inner,
+            signal,
+            held: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Value>> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write the held bookmarks through. Call only after the cleanup succeeded.
+    pub(crate) async fn release(&self) -> Result<(), FaucetError> {
+        let held = std::mem::take(&mut *self.held());
+        for (key, value) in held {
+            self.inner.put(&key, &value).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::state::StateStore for HoldingStateStore {
+    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+        if let Some(v) = self.held().get(key) {
+            return Ok(Some(v.clone()));
+        }
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+        if self.signal.state() == ReadState::Partial {
+            return self.inner.put(key, value).await;
+        }
+        self.held().insert(key.to_string(), value.clone());
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+        self.held().remove(key);
+        self.inner.delete(key).await
     }
 }
 
@@ -370,6 +551,31 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_holding_store_holds_writes_only_during_a_complete_read() {
+        use crate::state::{MemoryStateStore, StateStore};
+        let inner: std::sync::Arc<dyn StateStore> = std::sync::Arc::new(MemoryStateStore::new());
+        let signal = ReadCompleteness::new();
+        let store = HoldingStateStore::new(std::sync::Arc::clone(&inner), signal.clone());
+        store.put("k", &serde_json::json!(1)).await.unwrap();
+        assert_eq!(inner.get("k").await.unwrap(), Some(serde_json::json!(1)));
+        signal.begin();
+        assert_eq!(signal.state(), ReadState::Reading);
+        store.put("k", &serde_json::json!(2)).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(serde_json::json!(2)));
+        assert_eq!(inner.get("k").await.unwrap(), Some(serde_json::json!(1)));
+        signal.complete();
+        assert_eq!(signal.state(), ReadState::Complete);
+        store.release().await.unwrap();
+        assert_eq!(inner.get("k").await.unwrap(), Some(serde_json::json!(2)));
+        store.put("gone", &serde_json::json!(3)).await.unwrap();
+        store.delete("gone").await.unwrap();
+        store.release().await.unwrap();
+        assert_eq!(inner.get("gone").await.unwrap(), None);
+        signal.reset();
+        assert_eq!(signal.state(), ReadState::Partial);
+    }
     use serde_json::json;
 
     fn scope() -> BTreeMap<String, Value> {

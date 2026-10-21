@@ -171,6 +171,42 @@ fn cleanup_sink(uri: &str) -> ElasticsearchSink {
     ElasticsearchSink::new(cfg).unwrap()
 }
 
+/// An empty scope (a complete-read cleanup) deletes across the whole index,
+/// keeping only the documents the run wrote.
+#[tokio::test]
+async fn a_complete_read_cleanup_spans_the_whole_index() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/contacts/_mapping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "contacts": {"mappings": {"properties": {"id": {"type": "keyword"}}}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/contacts/_delete_by_query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deleted": 5})))
+        .mount(&server)
+        .await;
+    let sink = cleanup_sink(&server.uri());
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": "a"})], &["id".to_string()], 10);
+    assert_eq!(
+        sink.cleanup_scope(&BTreeMap::new(), &seen).await.unwrap(),
+        5
+    );
+    let reqs = server.received_requests().await.unwrap();
+    let dbq = reqs
+        .iter()
+        .find(|r| r.url.path() == "/contacts/_delete_by_query")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&dbq.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"query": {"bool": {"must_not": [{"ids": {"values": ["a"]}}]}}})
+    );
+}
+
 /// A scope field dynamically mapped as `text` is matched through its
 /// `keyword` sub-field; a `text` field without one is refused rather than
 /// deleting nothing (MSG-29).

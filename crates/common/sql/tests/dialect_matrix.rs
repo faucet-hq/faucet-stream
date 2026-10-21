@@ -666,6 +666,73 @@ fn matrix_journaling_cleanup() {
     every_cleanup_dialect!(journaling_cleanup_records_the_rows_it_deletes);
 }
 
+fn whole_destination_cleanup_has_no_scope_predicate<D: SqlDialect>(d: D) {
+    let name = d.name();
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Upsert, &["id"]));
+    let mut rec = Recorder::new(&[("id", "int")]);
+    let t = target(engine.dialect(), "t");
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": 1})], &["id".to_string()], 100);
+    futures_lite_block_on(engine.cleanup(&mut rec, &t, &BTreeMap::new(), &seen)).unwrap();
+    let delete = rec
+        .statements
+        .iter()
+        .find(|s| s.0 == StatementKind::CleanupDelete)
+        .unwrap();
+    assert!(
+        delete.1.contains("WHERE NOT EXISTS"),
+        "{name}: {}",
+        delete.1
+    );
+    assert!(
+        !delete.1.contains(" AND NOT EXISTS"),
+        "{name}: {}",
+        delete.1
+    );
+    assert!(delete.2.is_empty(), "{name}: no scope parameters");
+}
+
+#[test]
+fn matrix_whole_destination_cleanup() {
+    every_cleanup_dialect!(whole_destination_cleanup_has_no_scope_predicate);
+}
+
+/// A rollback-enabled whole-destination cleanup (empty scope) journals with
+/// the same unscoped predicate the delete uses.
+fn journaling_whole_destination_cleanup<D: SqlDialect>(d: D) {
+    let name = d.name();
+    if d.journal_sql().is_none() {
+        return;
+    }
+    let mut s = spec(WriteMode::Upsert, &["id"]);
+    s.rollback = Some(faucet_core::rollback::RollbackWriteSpec {
+        run_id: "r1".into(),
+        run_id_column: "_faucet_run_id".into(),
+        journal: true,
+        keep_previous: false,
+    });
+    let engine = SqlSinkEngine::new(d, s);
+    let mut rec = Recorder::new(&[("id", "int")]);
+    rec.absent = vec![r#"{"id": 5}"#.into()];
+    let t = target(engine.dialect(), "t");
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": 1})], &["id".to_string()], 100);
+    futures_lite_block_on(engine.cleanup(&mut rec, &t, &BTreeMap::new(), &seen)).unwrap();
+    let (_, sql, params) = rec
+        .statements
+        .iter()
+        .find(|s| s.0 == StatementKind::CleanupJournal)
+        .unwrap_or_else(|| panic!("{name}: journals before the delete"));
+    assert!(sql.contains("WHERE NOT EXISTS"), "{name}: {sql}");
+    assert!(params.is_empty(), "{name}: no scope parameters");
+    assert_eq!(rec.journaled_keys, vec![vec![json!(5)]], "{name}");
+}
+
+#[test]
+fn matrix_journaling_whole_destination_cleanup() {
+    every_cleanup_dialect!(journaling_whole_destination_cleanup);
+}
+
 fn token_and_journal_sql_use_the_dialect<D: SqlDialect>(d: D) {
     let name = d.name();
     assert!(
@@ -817,10 +884,13 @@ fn backend_specific_text() {
     );
     assert_eq!(Mssql.cleanup_table_display(&t), "dbo.t");
     assert!(Mssql.cleanup_create_sql(&t, &[], &[]).is_err());
-    assert!(
+    assert_eq!(
         Mssql
             .cleanup_delete_sql(&t, &[], &[], &["k".into()])
-            .is_err()
+            .unwrap(),
+        "DELETE t FROM [dbo].[t] AS t WHERE NOT EXISTS (SELECT 1 FROM #faucet_cleanup_keys c \
+         WHERE c.[k] = t.[k])",
+        "an empty scope is the whole destination (a complete-read cleanup)"
     );
     assert!(
         Mssql

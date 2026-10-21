@@ -178,9 +178,9 @@ impl SqlDialect for Postgres {
             .collect::<Vec<_>>()
             .join(" AND ");
         Ok(format!(
-            "DELETE FROM {} t WHERE {scope_pred} \
-             AND NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            "DELETE FROM {} t WHERE {}NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
             target.reference,
+            crate::dialect::scope_and(&scope_pred),
             self.cleanup_keys_table()
         ))
     }

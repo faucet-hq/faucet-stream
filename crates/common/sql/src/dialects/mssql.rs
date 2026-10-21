@@ -280,13 +280,6 @@ impl SqlDialect for Mssql {
         _scope_types: &[Option<&str>],
         key: &[String],
     ) -> Result<String, FaucetError> {
-        if scope.is_empty() {
-            return Err(FaucetError::Sink(
-                "cleanup: the completeness claim is empty — an empty scope would match every \
-                 row in the destination"
-                    .into(),
-            ));
-        }
         if key.is_empty() {
             return Err(FaucetError::Sink(
                 "cleanup: requires a non-empty `key` so a written row can be told apart from a \
@@ -309,9 +302,10 @@ impl SqlDialect for Mssql {
             .collect::<Result<Vec<_>, FaucetError>>()?
             .join(" AND ");
         Ok(format!(
-            "DELETE t FROM {} AS t WHERE {scope_pred} \
-             AND NOT EXISTS (SELECT 1 FROM {CLEANUP_TEMP_TABLE} c WHERE {join_pred})",
-            target.reference
+            "DELETE t FROM {} AS t WHERE {}NOT EXISTS (SELECT 1 FROM {CLEANUP_TEMP_TABLE} c \
+             WHERE {join_pred})",
+            target.reference,
+            crate::dialect::scope_and(&scope_pred),
         ))
     }
 

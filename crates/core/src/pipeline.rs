@@ -796,6 +796,23 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     )),
                     (store, _) => store,
                 };
+            // A complete-read cleanup (see `crate::cleanup`) needs the source's
+            // signal; without one the policy can never fire.
+            let complete_read = self
+                .cleanup
+                .as_ref()
+                .filter(|p| p.trigger == crate::cleanup::CleanupTrigger::CompleteRead)
+                .and_then(|_| wrapped_source.read_completeness());
+            let holding = match (&complete_read, wrapped_state_store.clone()) {
+                (Some(signal), Some(store)) => Some(Arc::new(
+                    crate::cleanup::HoldingStateStore::new(store, signal.clone()),
+                )),
+                _ => None,
+            };
+            let wrapped_state_store: Option<Arc<dyn StateStore>> = match &holding {
+                Some(h) => Some(Arc::clone(h) as Arc<dyn StateStore>),
+                None => wrapped_state_store,
+            };
             let mut start_seq = 0u64;
             if let (Some(store), Some(key)) = (wrapped_state_store.as_ref(), state_key.as_ref()) {
                 validate_state_key(key)?;
@@ -1046,7 +1063,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 wrapped_sink.begin_overwrite().await?;
             }
 
-            let run_result = match self.cleanup.clone() {
+            let cleanup = self.cleanup.clone().filter(|p| {
+                p.trigger != crate::cleanup::CleanupTrigger::CompleteRead || complete_read.is_some()
+            });
+            let run_result = match cleanup {
                 None => Box::pin(run_stream_with(pages, &wrapped_sink, opts, extras)).await,
                 Some(policy) => {
                     if !wrapped_sink.supports_cleanup() {
@@ -1055,8 +1075,12 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             wrapped_sink.connector_name()
                         )));
                     }
-                    let tracker = crate::cleanup::CleanupTracker::new(&wrapped_sink, &policy);
+                    let mut tracker = crate::cleanup::CleanupTracker::new(&wrapped_sink, &policy);
+                    if let Some(signal) = complete_read.clone() {
+                        tracker = tracker.gated_by(signal);
+                    }
                     let result = Box::pin(run_stream_with(pages, &tracker, opts, extras)).await;
+                    let read_state = complete_read.as_ref().map(|s| s.state());
                     match result {
                         Ok(r) => {
                             let cancelled = self.cancel.as_ref().is_some_and(|c| c.is_cancelled());
@@ -1067,6 +1091,21 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                      remove rows that were never read"
                                 );
                                 crate::observability::cleanup_run(&name, &row, "skipped_cancelled");
+                            } else if read_state
+                                .is_some_and(|s| s != crate::cleanup::ReadState::Complete)
+                            {
+                                if read_state == Some(crate::cleanup::ReadState::Reading) {
+                                    tracing::warn!(
+                                        "complete-read cleanup skipped: the run ended before the \
+                                         source finished reading its whole dataset; its position \
+                                         was not saved, so the next run reads it again"
+                                    );
+                                    crate::observability::cleanup_run(
+                                        &name,
+                                        &row,
+                                        "skipped_incomplete",
+                                    );
+                                }
                             } else {
                                 let tracked = tracker.tracked();
                                 match tracker.finish(&policy).await {
@@ -1078,6 +1117,9 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                             deleted,
                                         );
                                         crate::observability::cleanup_run(&name, &row, "applied");
+                                        if let Some(h) = &holding {
+                                            h.release().await?;
+                                        }
                                         tracing::info!(
                                             deleted,
                                             kept = tracked,
@@ -7555,9 +7597,18 @@ mod cleanup_tests {
         cleanup_calls: Mutex<Vec<Vec<String>>>,
         supports: bool,
         fail_writes: bool,
+        whole_destination: bool,
+        fail_cleanup: bool,
     }
 
     impl CleanupSink {
+        fn whole() -> Self {
+            Self {
+                supports: true,
+                whole_destination: true,
+                ..Default::default()
+            }
+        }
         fn new() -> Self {
             Self {
                 supports: true,
@@ -7597,9 +7648,12 @@ mod cleanup_tests {
             seen: &SeenKeys,
         ) -> Result<u64, FaucetError> {
             assert!(
-                !scope.is_empty(),
-                "the pipeline must never pass an empty scope"
+                self.whole_destination || !scope.is_empty(),
+                "a scoped policy must never pass an empty scope"
             );
+            if self.fail_cleanup {
+                return Err(FaucetError::Sink("cleanup failed".into()));
+            }
             let mut ids: Vec<String> = seen
                 .keys()
                 .iter()
@@ -7642,6 +7696,153 @@ mod cleanup_tests {
 
     fn src(records: Vec<Value>) -> VecSource {
         VecSource(records)
+    }
+
+    // ── Complete-read cleanup ────────────────────────────────────────────────
+
+    /// Yields `[{id:1}]` then `[{id:2}]` (each with a bookmark), driving the
+    /// complete-read signal through `begin` (before the first page) and, when
+    /// `finish`, `complete` (after the last).
+    struct CompleteReadSource {
+        signal: crate::cleanup::ReadCompleteness,
+        begin: bool,
+        finish: bool,
+    }
+
+    #[async_trait]
+    impl Source for CompleteReadSource {
+        async fn fetch_with_context(
+            &self,
+            _context: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(Vec::new())
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _context: &'a std::collections::HashMap<String, Value>,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+            Box::pin(async_stream::try_stream! {
+                self.signal.reset();
+                if self.begin {
+                    self.signal.begin();
+                }
+                yield StreamPage { records: vec![json!({"id": 1})], bookmark: Some(json!(1)) };
+                yield StreamPage { records: vec![json!({"id": 2})], bookmark: Some(json!(2)) };
+                if self.finish {
+                    self.signal.complete();
+                }
+            })
+        }
+        fn state_key(&self) -> Option<String> {
+            Some("cr".into())
+        }
+        fn read_completeness(&self) -> Option<crate::cleanup::ReadCompleteness> {
+            Some(self.signal.clone())
+        }
+    }
+
+    fn complete_read_source(begin: bool, finish: bool) -> CompleteReadSource {
+        CompleteReadSource {
+            signal: crate::cleanup::ReadCompleteness::new(),
+            begin,
+            finish,
+        }
+    }
+
+    fn whole_policy() -> Arc<CleanupPolicy> {
+        Arc::new(CleanupPolicy::for_complete_read(vec!["id".into()], 100).unwrap())
+    }
+
+    async fn stored(store: &Arc<dyn StateStore>) -> Option<Value> {
+        store
+            .get("cr")
+            .await
+            .unwrap()
+            .map(|v| crate::state_version::peel_versioned(&v))
+    }
+
+    #[tokio::test]
+    async fn a_complete_read_deletes_what_it_did_not_write_then_saves_its_position() {
+        let sink = CleanupSink::whole();
+        let source = complete_read_source(true, true);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .with_cleanup(whole_policy())
+            .run()
+            .await
+            .expect("run succeeds");
+        assert_eq!(sink.calls(), vec![vec!["1".to_string(), "2".to_string()]]);
+        assert_eq!(stored(&store).await, Some(json!(2)));
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_run_neither_deletes_nor_holds_its_position() {
+        let sink = CleanupSink::whole();
+        let source = complete_read_source(false, false);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .with_cleanup(whole_policy())
+            .run()
+            .await
+            .expect("run succeeds");
+        assert!(sink.calls().is_empty());
+        assert_eq!(stored(&store).await, Some(json!(2)));
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_complete_read_keeps_the_previous_position() {
+        let sink = CleanupSink::whole();
+        let source = complete_read_source(true, false);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .with_cleanup(whole_policy())
+            .run()
+            .await
+            .expect("run succeeds");
+        assert!(sink.calls().is_empty());
+        assert_eq!(stored(&store).await, None, "the next run must read again");
+    }
+
+    #[tokio::test]
+    async fn a_failed_complete_read_cleanup_keeps_the_previous_position() {
+        let sink = CleanupSink {
+            fail_cleanup: true,
+            ..CleanupSink::whole()
+        };
+        let source = complete_read_source(true, true);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let err = Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .with_cleanup(whole_policy())
+            .run()
+            .await
+            .expect_err("the failed delete fails the run");
+        assert!(err.to_string().contains("cleanup failed"), "{err}");
+        assert_eq!(stored(&store).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_complete_read_policy_is_inert_for_a_source_without_the_signal() {
+        let sink = CleanupSink::unsupported();
+        let source = src(vec![json!({"id": 1})]);
+        Pipeline::new(&source, &sink)
+            .with_cleanup(whole_policy())
+            .run()
+            .await
+            .expect("no signal, no cleanup — and no cleanup-capable sink needed");
+        assert!(sink.calls().is_empty());
+    }
+
+    #[test]
+    fn a_complete_read_policy_needs_a_key() {
+        assert!(CleanupPolicy::for_complete_read(Vec::new(), 1).is_err());
+        let p = CleanupPolicy::for_complete_read(vec!["id".into()], 0).unwrap();
+        assert!(p.scope.is_empty() && p.max_keys == 1);
+        assert_eq!(p.trigger, crate::cleanup::CleanupTrigger::CompleteRead);
     }
 
     // ── CleanupTracker (the accumulator half) ────────────────────────────────

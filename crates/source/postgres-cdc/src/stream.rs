@@ -8,7 +8,8 @@ use crate::pgoutput::messages::{
 use crate::pgoutput::registry::RelationRegistry;
 use crate::pgoutput::values::text_to_json;
 use crate::replication::{
-    self, ReplicationEvent, ReplicationParams, postgres_clock_to_unix_ms, recv, send_status_update,
+    self, ReplicationEvent, ReplicationParams, StreamItem, postgres_clock_to_unix_ms, recv_item,
+    send_status_update,
 };
 use crate::state::{Bookmark, format_lsn, parse_lsn, state_key};
 use async_trait::async_trait;
@@ -637,6 +638,12 @@ impl PostgresCdcSource {
             // not per commit.
             let mut batch = CommitBatch::default();
             let flush_after = self.config.status_update_interval;
+            // The newest position a bookmark of this cycle has claimed (or the
+            // durable start). A keepalive past it while no transaction is open
+            // becomes a bookmark-only page, so a slot whose published tables
+            // are idle still advances past WAL the publication does not cover.
+            let mut claimed = start_lsn.unwrap_or(0);
+            let mut idle_lsn: Option<u64> = None;
 
             loop {
                 // The run's deadline and cancel token end the stream with an
@@ -679,9 +686,18 @@ impl PostgresCdcSource {
                             operation: "postgres-cdc replication stream".into(),
                         });
                     }
-                    ev = recv(&mut duplex) => {
+                    ev = recv_item(&mut duplex) => {
                         match ev {
-                            Ok(Some(event)) => {
+                            Ok(Some(StreamItem::KeepAlive { wal_end })) => {
+                                // Not activity: idle_timeout keeps counting.
+                                if let Some(lsn) = quiet_position(wal_end, state.in_txn, claimed.max(batch.lsn.unwrap_or(0))) {
+                                    idle_lsn = Some(lsn);
+                                    if per_transaction {
+                                        batch.push(lsn, Vec::new());
+                                    }
+                                }
+                            }
+                            Ok(Some(StreamItem::Event(event))) => {
                                 // Reset on any server activity, not just committed
                                 // output, so idle_timeout never fires mid-transaction
                                 // while WAL is still flowing.
@@ -780,6 +796,7 @@ impl PostgresCdcSource {
                 {
                     self.emitted_lsn
                         .fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
+                    claimed = claimed.max(lsn);
                     let bookmark = Some(Bookmark::from_u64(lsn).to_value()?);
                     yield StreamPage { records, bookmark };
                 }
@@ -795,7 +812,7 @@ impl PostgresCdcSource {
             //    must be dropped — Postgres will redeliver after the next
             //    START_REPLICATION.
             if !per_transaction
-                && let Some(lsn) = state.last_committed
+                && let Some(lsn) = state.last_committed.max(idle_lsn)
             {
                 self.emitted_lsn
                     .fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
@@ -815,6 +832,14 @@ impl PostgresCdcSource {
     }
 }
 
+/// The position a keepalive lets a bookmark claim: its `wal_end` when no
+/// transaction is open on our side and it is past everything claimed so far.
+/// Every transaction committed below a keepalive's position has already been
+/// sent, so a bookmark there skips nothing on resume. Pure.
+fn quiet_position(wal_end: u64, in_txn: bool, claimed: u64) -> Option<u64> {
+    (!in_txn && wal_end > claimed).then_some(wal_end)
+}
+
 /// Committed transactions collected into the next page.
 #[derive(Default)]
 struct CommitBatch {
@@ -828,7 +853,7 @@ impl CommitBatch {
     /// the bookmark).
     fn push(&mut self, lsn: u64, records: Vec<Value>) {
         self.records.extend(records);
-        self.lsn = Some(lsn);
+        self.lsn = Some(self.lsn.map_or(lsn, |l| l.max(lsn)));
         self.since.get_or_insert_with(Instant::now);
     }
 
@@ -1261,6 +1286,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_keepalive_claims_its_position_only_outside_a_transaction() {
+        assert_eq!(quiet_position(500, false, 100), Some(500));
+        assert_eq!(
+            quiet_position(500, true, 100),
+            None,
+            "a transaction is open"
+        );
+        assert_eq!(quiet_position(100, false, 100), None, "nothing new");
+        assert_eq!(quiet_position(90, false, 100), None);
+        // A later keepalive never moves a batch's position back.
+        let mut b = CommitBatch::default();
+        b.push(500, Vec::new());
+        b.push(400, Vec::new());
+        assert_eq!(b.take().map(|(_, l)| l), Some(500));
+    }
 
     #[test]
     fn commit_batch_cuts_whole_transactions_by_size_or_age() {

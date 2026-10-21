@@ -41,6 +41,25 @@ fn every_released_bookmark_shape_still_loads() {
 }
 
 #[test]
+fn a_bookmark_with_quiet_shard_times_loads() {
+    let resolved = resolve_with(
+        "p::r",
+        &fixture("bookmark-resume-at.json"),
+        "kinesis",
+        0,
+        |from, _| panic!("schema 0 needs no migration from {from}"),
+    )
+    .unwrap();
+    let (bookmark, _) = unwrap_state(&resolved.data);
+    let bm = faucet_source_kinesis::ShardBookmarks::from_value(&bookmark.unwrap());
+    assert_eq!(
+        bm.get("shardId-000000000000"),
+        Some("49590338271490256608559692538361571095921575989136588898")
+    );
+    assert_eq!(bm.resume_time("shardId-000000000001"), Some(1_700_000_000));
+}
+
+#[test]
 fn a_bookmark_from_another_connector_or_a_newer_release_is_refused() {
     let mut foreign = fixture("bookmark-state-format-1.json");
     foreign["owner"] = Value::from("someone-else");

@@ -123,6 +123,29 @@ async fn deletes_only_unwritten_documents_inside_the_scope() {
 }
 
 #[tokio::test]
+async fn a_complete_read_cleans_up_the_whole_collection() {
+    let (_c, uri) = start_mongo().await;
+    seed(&uri).await;
+    let sink = MongoSink::new(config(&uri, vec!["_id".into()]))
+        .await
+        .expect("sink");
+    let p = CleanupPolicy::for_complete_read(vec!["_id".into()], 1000).expect("policy");
+    let page = [
+        json!({"_id": 3, "contact_id": 7}),
+        json!({"_id": 10, "contact_id": 8}),
+    ];
+    sink.write_batch(&page).await.expect("write");
+    let mut seen = faucet_core::SeenKeys::new();
+    seen.record_page(&page, &p.key, p.max_keys);
+    let deleted = sink.cleanup_scope(&p.scope, &seen).await.expect("cleanup");
+    assert_eq!(
+        deleted, 3,
+        "every document the run did not write, in any scope"
+    );
+    assert_eq!(remaining(&uri).await, vec![3, 10]);
+}
+
+#[tokio::test]
 async fn an_empty_page_clears_the_scope_and_only_the_scope() {
     // The motivating case: contact 7's documents were all removed upstream, so
     // the fetch returns nothing.

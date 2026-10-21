@@ -404,6 +404,22 @@ async fn cleanup_deletes_unseen_keys_in_scope() {
 }
 
 #[tokio::test]
+async fn a_complete_read_cleanup_deletes_without_a_scope_predicate() {
+    let server = TdsServer::start().await.unwrap();
+    script_table(&server);
+    let sink = MssqlSink::new(auto(&server, WriteMode::Upsert, &["id"]))
+        .await
+        .unwrap();
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": 1})], &["id".to_string()], 100);
+    server.on("AS t WHERE NOT EXISTS", Reply::Done(4));
+    assert_eq!(
+        sink.cleanup_scope(&BTreeMap::new(), &seen).await.unwrap(),
+        4
+    );
+}
+
+#[tokio::test]
 async fn a_missing_target_without_create_table_is_named() {
     let server = TdsServer::start().await.unwrap();
     server.on(TABLE_PROBE, table_exists(false));

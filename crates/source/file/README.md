@@ -169,6 +169,9 @@ says so.
 
 `stable_for_secs: N` skips files modified in the last N seconds, leaving them
 for a later run once they settle.
+With `incremental: {by: name}` a run also stops before the first unsettled
+file in name order: reading a later name would move the bookmark past it and
+skip it for good, so the files after it wait for the same later run.
 
 Formats read whole into memory (JSON arrays, XML, Excel, and Avro/ORC/Parquet
 when compressed, remote or encrypted) stop at `max_object_bytes` (default

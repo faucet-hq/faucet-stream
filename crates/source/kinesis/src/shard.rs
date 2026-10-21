@@ -161,6 +161,9 @@ pub(crate) enum ShardEvent {
         shard_id: String,
         records: Vec<(String, Option<Value>)>,
     },
+    /// A shard that has delivered no record was read up to its tip: nothing
+    /// arrived on it before `unix_secs`.
+    CaughtUp { shard_id: String, unix_secs: i64 },
     /// The shard is fully consumed (closed shard reached its end).
     Done { shard_id: String },
     /// Unrecoverable failure after the retry budget.
@@ -233,6 +236,7 @@ pub(crate) async fn run_shard(
             .acquire()
             .await
             .expect("the shard permit semaphore is never closed");
+        let requested_at = resume_time(std::time::SystemTime::now());
         let response = calls
             .call("get_records", || async {
                 Ok(client
@@ -305,6 +309,19 @@ pub(crate) async fn run_shard(
                 // Behind records arrive back-to-back; caught-up shards wait
                 // the poll interval (the 5 reads/sec/shard API budget).
                 let behind_ms = out.millis_behind_latest().unwrap_or(0);
+                if records.is_empty()
+                    && behind_ms == 0
+                    && last_sequence.is_none()
+                    && tx
+                        .send(ShardEvent::CaughtUp {
+                            shard_id: shard_id.clone(),
+                            unix_secs: requested_at,
+                        })
+                        .await
+                        .is_err()
+                {
+                    return false;
+                }
                 if let Ok(mut m) = behind.lock() {
                     m.insert(shard_id.clone(), behind_ms);
                 }
@@ -374,6 +391,22 @@ pub(crate) async fn run_shard(
             }
         }
     }
+}
+
+/// Margin taken off a caught-up time before it is persisted: the time is the
+/// reader's clock, Kinesis compares it with its own arrival timestamps.
+/// Resuming a little early is free — the shard delivered nothing this run, so
+/// nothing in the margin is read twice.
+pub(crate) const RESUME_CLOCK_MARGIN_SECS: i64 = 5;
+
+/// The `AT_TIMESTAMP` (Unix seconds, rounded down) a read made at `now` lets a
+/// sequence-less shard resume from. Pure.
+pub(crate) fn resume_time(now: std::time::SystemTime) -> i64 {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (secs - RESUME_CLOCK_MARGIN_SECS).max(0)
 }
 
 /// Whether `error` is the call context running out (cancel / deadline), which
@@ -482,6 +515,13 @@ async fn acquire_iterator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caught_up_read_resumes_a_little_earlier_in_whole_seconds() {
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_900);
+        assert_eq!(resume_time(at), 1_700_000_000 - RESUME_CLOCK_MARGIN_SECS);
+        assert_eq!(resume_time(std::time::UNIX_EPOCH), 0);
+    }
     /// The value-fidelity corpus (#885): every record, serialized the way a
     /// producer sends it, decodes back unchanged.
     #[test]

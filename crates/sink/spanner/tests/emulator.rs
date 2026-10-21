@@ -444,6 +444,25 @@ async fn cleanup_with_no_written_keys_empties_the_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_complete_read_cleanup_spans_the_whole_table() {
+    let (sink, conn) = sink_for("em-cleanup-whole", cleanup_spec()).await;
+    sink.write_batch(&[
+        json!({"id": 1, "v": "acme"}),
+        json!({"id": 2, "v": "acme"}),
+        json!({"id": 3, "v": "other"}),
+    ])
+    .await
+    .expect("seed");
+    let deleted = sink
+        .cleanup_scope(&std::collections::BTreeMap::new(), &seen_ids(&[1]))
+        .await
+        .expect("cleanup");
+    assert_eq!(deleted, 2);
+    assert!(fetch_row(&conn, 1).await.is_some());
+    assert_eq!(support::count_rows(&conn, "t").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cleanup_is_a_no_op_when_the_run_wrote_everything_in_the_scope() {
     let (sink, conn) = sink_for("em-cleanup-noop", cleanup_spec()).await;
     sink.write_batch(&[json!({"id": 1, "v": "acme"}), json!({"id": 2, "v": "acme"})])

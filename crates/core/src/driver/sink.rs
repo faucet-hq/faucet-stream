@@ -150,7 +150,8 @@ pub trait CommitTokenDriver: Send + Sync {
 #[async_trait]
 pub trait CleanupDriver: Send + Sync {
     /// Delete the rows matching `scope` whose key is not in `seen`, all or
-    /// nothing. Returns the rows deleted.
+    /// nothing. Returns the rows deleted. An empty `scope` is the whole
+    /// destination (a complete-read cleanup).
     async fn delete_absent(
         &self,
         calls: &CallSlot,

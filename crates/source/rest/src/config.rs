@@ -194,8 +194,10 @@ pub struct RestStreamConfig {
     /// The feed returns records in ascending `replication_key` order, so an
     /// incremental pass that `max_pages` cuts short may persist the largest key
     /// it read and resume after it next run. Without it such a pass fails the
-    /// run. Ignored for windowed passes, with `persist_cursor`, and across
-    /// `requests:` entries (a truncated entry fails the run).
+    /// run. Requires a `replication_bind` when `max_pages` is set: only a
+    /// bookmark the server filters on moves the next run past the pages
+    /// already read. Ignored for windowed passes, with `persist_cursor`, and
+    /// across `requests:` entries (a truncated entry fails the run).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assume_ordered: bool,
     /// Fixed delay between page requests, in seconds — a politeness knob for
@@ -892,6 +894,21 @@ impl RestStreamConfig {
                         .into(),
                 ));
             }
+        }
+        if self.assume_ordered
+            && self.max_pages.is_some()
+            && !self.persist_cursor
+            && matches!(self.replication_method, ReplicationMethod::Incremental)
+            && self.replication_bind.is_none()
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "rest: `assume_ordered` with `max_pages` needs a `replication_bind`: without \
+                 one the bookmark is only a client-side filter, so every run would start at \
+                 page 1, re-read the same `max_pages` pages and never reach the rest. Push \
+                 the bookmark to the server with `replication_bind`, or raise or remove \
+                 `max_pages`"
+                    .into(),
+            ));
         }
         if self.odata.is_some() && !matches!(self.response_format, ResponseFormat::Json) {
             return Err(faucet_core::FaucetError::Config(

@@ -116,7 +116,10 @@ pub use auth::{
 pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
 pub use capabilities::{Capabilities, CapabilitiesBuilder, ConnectorDescriptor, SchemaReport};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
-pub use cleanup::{CleanupMode, CleanupPolicy, DEFAULT_MAX_KEYS, SeenKeys};
+pub use cleanup::{
+    CleanupMode, CleanupPolicy, CleanupTrigger, DEFAULT_COMPLETE_READ_MAX_KEYS, DEFAULT_MAX_KEYS,
+    ReadCompleteness, ReadState, SeenKeys,
+};
 #[cfg(feature = "arrow")]
 pub use columnar::{
     ColumnarPage, check_integral, infer_arrow_schema, record_batch_to_values,

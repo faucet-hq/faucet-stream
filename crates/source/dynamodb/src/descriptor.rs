@@ -13,13 +13,16 @@ fn capabilities(config: &Value) -> Capabilities {
             .shardable(true)
             .reports_lag(true)
             .table_routing(true)
+            .complete_reads(true)
             .build();
     }
     let mode = str_field(config, "mode").unwrap_or("scan");
+    let resnapshot = mode == "streams" && str_field(config, "on_gap") == Some("resnapshot");
     builder
         .shardable(!matches!(mode, "query" | "streams"))
         .reports_lag(mode == "streams")
         .table_routing(mode == "streams")
+        .complete_reads(resnapshot)
         .build()
 }
 
@@ -45,6 +48,9 @@ mod tests {
         assert!(st.discover() && !st.shardable() && st.reports_lag());
         assert!(st.table_routing() && !q.table_routing());
         assert!(caps(Value::Null).table_routing());
+        assert!(!st.complete_reads() && caps(Value::Null).complete_reads());
+        assert!(caps(json!({"mode": "streams", "on_gap": "resnapshot"})).complete_reads());
+        assert!(!caps(json!({"mode": "scan", "on_gap": "resnapshot"})).complete_reads());
         let kind = caps(Value::Null);
         assert!(kind.discover() && kind.shardable() && kind.reports_lag());
         assert!(!kind.exactly_once() && !kind.columnar() && !kind.native());

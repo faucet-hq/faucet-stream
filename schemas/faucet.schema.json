@@ -14885,7 +14885,7 @@
                       "default": null
                     },
                     "assume_ordered": {
-                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Ignored for windowed passes, with `persist_cursor`, and across\n`requests:` entries (a truncated entry fails the run).",
+                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. Ignored for windowed passes, with `persist_cursor`, and\nacross `requests:` entries (a truncated entry fails the run).",
                       "type": [
                         "boolean",
                         "string"
@@ -30480,7 +30480,7 @@
         },
         {
           "const": "resnapshot",
-          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. Converges on an upsert sink.",
+          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. The run is a complete read: afterwards\nthe destination rows of items it did not see (deleted while their stream\nrecords were trimmed) are deleted, so the sink must support cleanup, with\n`write_mode: upsert` and a `key`.",
           "type": "string"
         }
       ]

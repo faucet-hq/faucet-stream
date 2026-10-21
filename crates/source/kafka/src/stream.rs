@@ -189,11 +189,11 @@ impl KafkaSource {
     /// For a partition that delivered messages, `position()` reports a concrete
     /// next-offset (cheap, local). For one that produced nothing, `position()`
     /// reports `Offset::Invalid` (librdkafka only tracks *consumed* offsets), so
-    /// we fall back to its watermark via `fetch_watermarks`: the **low**
-    /// watermark under `earliest`, the **high** watermark under `latest` — i.e.
-    /// exactly where the consumer is positioned for that reset policy. Those
-    /// watermark lookups are a broker round-trip, so each empty partition's
-    /// floor is resolved once and cached.
+    /// its floor is where the rebalance callback started it — a bookmark seek,
+    /// or the watermark `auto.offset.reset` names, looked up and pinned at
+    /// assignment. Only when that lookup failed (its budget ran out) does this
+    /// fall back to the watermark now: under `latest` that can be newer than
+    /// the real start, so the fallback warns.
     ///
     /// Returns `(positions, floors)`: concrete consumer positions, and the
     /// watermark floors of partitions without one, which rank below the prior
@@ -222,6 +222,7 @@ impl KafkaSource {
         let mut need_watermark: Vec<(String, i32)> = Vec::new();
         {
             let cache = self.assigned_floor.lock().ok();
+            let at_assign = self.context.assign_floors.lock().ok();
             for elem in assigned.elements() {
                 let key = (elem.topic().to_string(), elem.partition());
                 match positions.get(&key) {
@@ -231,9 +232,14 @@ impl KafkaSource {
                         partition: key.1,
                         offset: *n,
                     }),
-                    // No concrete position → use a cached watermark floor, or
-                    // schedule a lookup for it.
-                    _ => match cache.as_ref().and_then(|c| c.get(&key)) {
+                    // No concrete position → where the partition started
+                    // fetching (resolved at assignment), else a cached
+                    // watermark floor, else schedule a lookup for it.
+                    _ => match at_assign
+                        .as_ref()
+                        .and_then(|f| f.get(&key))
+                        .or_else(|| cache.as_ref().and_then(|c| c.get(&key)))
+                    {
                         Some(&floor) => floors.push(PartitionOffset {
                             topic: key.0,
                             partition: key.1,
@@ -246,6 +252,17 @@ impl KafkaSource {
         }
 
         if !need_watermark.is_empty() {
+            if !matches!(
+                self.config.auto_offset_reset,
+                crate::config::OffsetReset::Earliest
+            ) {
+                tracing::warn!(
+                    partitions = ?need_watermark,
+                    "kafka source: the start offset of these partitions was not resolved at \
+                     assignment; recording the current high watermark, which may skip records \
+                     produced since the run started if it stops before they are delivered"
+                );
+            }
             let earliest = matches!(
                 self.config.auto_offset_reset,
                 crate::config::OffsetReset::Earliest

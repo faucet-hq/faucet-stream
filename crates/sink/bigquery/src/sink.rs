@@ -2569,10 +2569,11 @@ impl BigQueryDriver {
         let mut req = QueryRequest::new(sql);
         req.use_legacy_sql = false;
         req.parameter_mode = Some("NAMED".to_string());
-        req.query_parameters = Some(vec![
-            Self::string_param("scope", &scope_to_payload(scope)),
-            Self::string_param("keys", &keys_payload),
-        ]);
+        let mut params = vec![Self::string_param("keys", &keys_payload)];
+        if !scope.is_empty() {
+            params.insert(0, Self::string_param("scope", &scope_to_payload(scope)));
+        }
+        req.query_parameters = Some(params);
 
         let job = self
             .run_transaction(calls, req, "bigquery cleanup delete")

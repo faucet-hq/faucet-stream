@@ -930,9 +930,9 @@ impl Decoder for DynamicDecoder {
 
     fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
         use prost::bytes::Buf;
-        if !buf.has_remaining() {
-            return Ok(None);
-        }
+        // tonic calls `decode` once per complete frame; a zero-length frame is
+        // a valid all-default message and must yield `Some`, or tonic never
+        // leaves the body state and every later frame is dropped.
         let bytes = buf.copy_to_bytes(buf.remaining());
         let msg = DynamicMessage::decode(self.desc.clone(), bytes)
             .map_err(|e| tonic::Status::data_loss(format!("protobuf decode error: {e}")))?;

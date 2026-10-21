@@ -117,7 +117,16 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
   applies from that run on. With
   `on_gap: resnapshot` the source instead scans the whole table (emitted as
   `op: "r"` envelopes, no bookmark until the scan completes) and then replays the
-  retained stream from the trim horizon; on an upsert sink this converges.
+  retained stream from the trim horizon. That run is a **complete read**
+  (`Source::read_completeness`): once it ends, the destination rows of items
+  the scan did not see — items deleted while their stream records were
+  trimmed — are deleted through the sink's keyed cleanup, and only then is
+  the new position saved (a crash or failed delete re-reads the table on the
+  next run). An ordinary streams run never deletes. The sink must support
+  cleanup with `write_mode: upsert` and a `key` (`postgres`, `mysql`, `mssql`,
+  `sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `spanner`); `faucet
+  validate` refuses `on_gap: resnapshot` otherwise. Up to 1,000,000 keys are
+  tracked — see [complete reads](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html#complete-reads-dynamodb-on_gap-resnapshot).
 - **`faucet mirror`** — `capture_resume_position` returns every current shard at
   its trim horizon, so a CDC run after the snapshot replays the retained window
   and converges.
@@ -151,7 +160,7 @@ table with its key attributes as the schema, `ItemCount` as the row estimate and
 
 ## Capabilities
 
-Declares dataset discovery for every mode; sharding only under `mode: scan` (parallel segments) and lag reporting only under `mode: streams`. `faucet list --json` prints the declaration.
+Declares dataset discovery for every mode; sharding only under `mode: scan` (parallel segments), lag reporting and table routing only under `mode: streams`, and complete reads (`complete_reads`) only under `mode: streams` with `on_gap: resnapshot`. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 

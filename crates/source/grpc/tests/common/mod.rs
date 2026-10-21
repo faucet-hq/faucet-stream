@@ -82,6 +82,9 @@ impl EchoService for EchoServer {
                     let _ = tx.send(Err(status)).await;
                     return;
                 }
+                if req.empty_between && tx.send(Ok(Event::default())).await.is_err() {
+                    return;
+                }
                 let event = Event {
                     seq: emitted as u64,
                     payload: format!("event-{emitted}"),

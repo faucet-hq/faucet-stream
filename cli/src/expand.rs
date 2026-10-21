@@ -1410,28 +1410,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 // tracker never sees its key — and the delete would then remove
                 // its destination row, losing data the source still has. Reject
                 // rather than silently delete.
-                let mut quarantines: Vec<&str> = Vec::new();
-                #[cfg(feature = "quality")]
-                if let Some(q) = cfg.pipeline.quality.as_ref()
-                    && faucet_core::CompiledQuality::compile(q)
-                        .map(|c| c.requires_dlq())
-                        .unwrap_or(false)
-                {
-                    quarantines.push("quality");
-                }
-                #[cfg(feature = "contract")]
-                if let Some(c) = cfg.pipeline.contract.as_ref()
-                    && faucet_core::CompiledContract::compile(c)
-                        .map(|c| c.requires_dlq())
-                        .unwrap_or(false)
-                {
-                    quarantines.push("contract");
-                }
-                if let Some(sd) = cfg.pipeline.schema.as_ref()
-                    && faucet_core::SchemaDriftPolicy::compile(sd).requires_dlq()
-                {
-                    quarantines.push("schema");
-                }
+                let quarantines = quarantining_passes(cfg);
                 if !quarantines.is_empty() {
                     return Err(CliError::Config(format!(
                         "row '{}': `complete_for.on_missing: delete` is incompatible with a \
@@ -1454,6 +1433,24 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 Some(claim.scope.clone())
             }
         };
+
+        // A source that may read its whole dataset in one run (a DynamoDB
+        // stream past its retention, `on_gap: resnapshot`) deletes the
+        // destination rows it did not see afterwards, so the scoped-cleanup
+        // preconditions hold for it too.
+        if crate::registry::source_capabilities(&merged_source.kind, &merged_source.config)
+            .complete_reads()
+        {
+            check_complete_read_cleanup(
+                &ids[i],
+                &merged_source.kind,
+                &merged_sink.kind,
+                &sink_caps,
+                requested_mode,
+                matches!(delivery, faucet_core::DeliveryMode::ExactlyOnce),
+                &quarantining_passes(cfg),
+            )?;
+        }
 
         // Schema-drift policy gates (load-time):
         //  - `evolve` requires an evolution-capable sink.
@@ -2404,6 +2401,81 @@ fn row_compat_features(
     .into_iter()
     .filter_map(|(on, f)| on.then_some(f))
     .collect()
+}
+
+/// The pipeline passes that quarantine records, which then never reach the
+/// sink, so a cleanup could not tell them from records deleted at the source.
+fn quarantining_passes(cfg: &PipelineConfig) -> Vec<&'static str> {
+    let mut quarantines: Vec<&'static str> = Vec::new();
+    #[cfg(feature = "quality")]
+    if let Some(q) = cfg.pipeline.quality.as_ref()
+        && faucet_core::CompiledQuality::compile(q)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("quality");
+    }
+    #[cfg(feature = "contract")]
+    if let Some(c) = cfg.pipeline.contract.as_ref()
+        && faucet_core::CompiledContract::compile(c)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("contract");
+    }
+    if let Some(sd) = cfg.pipeline.schema.as_ref()
+        && faucet_core::SchemaDriftPolicy::compile(sd).requires_dlq()
+    {
+        quarantines.push("schema");
+    }
+    quarantines
+}
+
+/// Gates for a source that declares `complete_reads`: after such a run the
+/// destination rows it did not write are deleted, which needs a keyed,
+/// cleanup-capable upsert sink outside the commit-token path and no pass that
+/// keeps records from the sink.
+fn check_complete_read_cleanup(
+    row_id: &str,
+    source_kind: &str,
+    sink_kind: &str,
+    sink_caps: &faucet_core::Capabilities,
+    write_mode: &str,
+    exactly_once: bool,
+    quarantines: &[&str],
+) -> CliResult<()> {
+    let what = format!(
+        "row '{row_id}': source '{source_kind}' can read its whole dataset in one run (for \
+         dynamodb: `on_gap: resnapshot`), after which the destination rows of records it did \
+         not see are deleted"
+    );
+    if !sink_caps.cleanup() {
+        return Err(CliError::Config(format!(
+            "{what}, but sink '{sink_kind}' with this config cannot delete them (cleanup-capable \
+             sinks: {}) — the destination would keep rows of deleted records. Use one of those \
+             sinks, or `on_gap: fail`",
+            crate::registry::sink_kinds_where(|c| c.cleanup()).join(", ")
+        )));
+    }
+    if write_mode != "upsert" {
+        return Err(CliError::Config(format!(
+            "{what}, which requires `write_mode: upsert` with a `key` (got '{write_mode}')"
+        )));
+    }
+    if exactly_once {
+        return Err(CliError::Config(format!(
+            "{what}, which is incompatible with `delivery: exactly_once` — the delete happens \
+             outside the commit-token transaction"
+        )));
+    }
+    if !quarantines.is_empty() {
+        return Err(CliError::Config(format!(
+            "{what}, which is incompatible with a quarantining `{}` policy — a quarantined record \
+             never reaches the sink, so its destination row would be deleted",
+            quarantines.join("`/`")
+        )));
+    }
+    Ok(())
 }
 
 /// `complete_for … on_missing: delete` deletes every in-scope destination row

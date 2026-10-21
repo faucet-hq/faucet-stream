@@ -32,6 +32,16 @@ impl TableTarget {
     }
 }
 
+/// `"<scope_pred> AND "`, or nothing for an empty scope (a complete-read
+/// cleanup over the whole destination).
+pub fn scope_and(scope_pred: &str) -> String {
+    if scope_pred.is_empty() {
+        String::new()
+    } else {
+        format!("{scope_pred} AND ")
+    }
+}
+
 /// How one backend spells SQL. See the module docs.
 pub trait SqlDialect: Send + Sync {
     /// The backend's short name, used in messages (`"postgres"`, `"sqlite"`).
@@ -347,7 +357,8 @@ pub trait SqlDialect: Send + Sync {
             .collect::<Result<Vec<_>, FaucetError>>()?
             .join(" AND ");
         Ok(format!(
-            "DELETE FROM {t} WHERE {scope_pred} AND NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            "DELETE FROM {t} WHERE {}NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            scope_and(&scope_pred),
             self.cleanup_keys_table()
         ))
     }

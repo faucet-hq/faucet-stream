@@ -54,8 +54,13 @@ source:
 State key: `kinesis:<stream_name>`. The bookmark is a per-shard map
 `{ "shards": { "<shard-id>": "<last-sequence>" } }`, attached cumulatively to
 **every** page — any page's bookmark is a valid resume point. On restart a
-bookmarked shard resumes at `AFTER_SEQUENCE_NUMBER`; unbookmarked shards use
-`start_position`. A malformed stored bookmark fails the run instead of quietly
+bookmarked shard resumes at `AFTER_SEQUENCE_NUMBER`. A shard that delivered no
+record but was read up to its tip is recorded too, under
+`"resume_at": { "<shard-id>": <unix-secs> }`, and resumes at `AT_TIMESTAMP` of
+that read (less a 5-second clock margin) — so a quiet shard under `latest` or
+`at_timestamp` neither skips what is written between runs nor re-reads old
+data. Shards in neither map use `start_position`. Idle termination counts from
+the last record received. A malformed stored bookmark fails the run instead of quietly
 restarting every shard at `start_position` (which under `latest` would skip
 everything written since). Shards the stream no longer lists (expired after a
 reshard) are dropped from the map. A shard's first `GetShardIterator` is
