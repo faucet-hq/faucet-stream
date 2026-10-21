@@ -343,7 +343,7 @@ jobs:
             echo "release for ${{ needs.plan.outputs.tag }} not visible yet (attempt $i); waiting 30s"
             sleep 30
           done
-          gh release upload "${{ needs.plan.outputs.tag }}" artifacts/*
+          gh release upload "${{ needs.plan.outputs.tag }}" artifacts/* --clobber
 
           gh release edit "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
 
