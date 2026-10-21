@@ -258,8 +258,10 @@ export async function renderDetail(container, { id }) {
     // be undone. The toggle keeps its own hidden state once revealed.
     const undoable = TERMINAL.includes(rec.status) && (rec.invocations || []).some((i) => i.run_id);
     const toggle = container.querySelector("#rollback-toggle");
-    if (undoable && toggle.hidden && !toggle.dataset.shown) toggle.hidden = false;
-    toggle.dataset.shown = "1";
+    if (undoable && toggle.hidden && !toggle.dataset.shown) {
+      toggle.hidden = false;
+      toggle.dataset.shown = "1";
+    }
     if (!undoable) { toggle.hidden = true; container.querySelector("#rollback-panel").hidden = true; }
     const sel = container.querySelector("#rollback-invocation");
     const wanted = (rec.invocations || []).filter((i) => i.run_id);
