@@ -50,10 +50,10 @@ impl S3Checksums {
     /// present (used to distinguish "no checksum advertised" from "only an
     /// unsupported algorithm advertised").
     pub fn has_verifiable(&self) -> bool {
-        self.sha256.is_some()
-            || self.crc64nvme.is_some()
-            || self.crc32c.is_some()
-            || self.crc32.is_some()
+        full_object(&self.sha256).is_some()
+            || full_object(&self.crc64nvme).is_some()
+            || full_object(&self.crc32c).is_some()
+            || full_object(&self.crc32).is_some()
             || self.etag.as_deref().and_then(non_multipart_md5).is_some()
     }
 }
@@ -61,20 +61,20 @@ impl S3Checksums {
 /// Build a checksum check from the strongest advertised algorithm we can
 /// compute, or `None` when the object carries no checksum we support.
 pub fn checksum_check(c: &S3Checksums) -> Option<Box<dyn IntegrityCheck>> {
-    if let Some(b64) = &c.sha256 {
+    if let Some(b64) = full_object(&c.sha256) {
         return Some(Box::new(Sha256Check::new(b64.clone())));
     }
-    if let Some(b64) = &c.crc64nvme {
+    if let Some(b64) = full_object(&c.crc64nvme) {
         return Some(Box::new(CrcCheck::new_u64(
             &CRC64NVME,
             "CRC64NVME",
             b64.clone(),
         )));
     }
-    if let Some(b64) = &c.crc32c {
+    if let Some(b64) = full_object(&c.crc32c) {
         return Some(Box::new(CrcCheck::new_u32(&CRC32C, "CRC32C", b64.clone())));
     }
-    if let Some(b64) = &c.crc32 {
+    if let Some(b64) = full_object(&c.crc32) {
         return Some(Box::new(CrcCheck::new_u32(&CRC32, "CRC32", b64.clone())));
     }
     if let Some(tag) = &c.etag
@@ -83,6 +83,28 @@ pub fn checksum_check(c: &S3Checksums) -> Option<Box<dyn IntegrityCheck>> {
         return Some(Box::new(Md5HexCheck::new(hex)));
     }
     None
+}
+
+/// A checksum value that covers the whole object body. A multipart upload
+/// with a COMPOSITE checksum advertises the checksum of its part checksums,
+/// suffixed `-<partcount>` (`abcd==-3`); no body digest can equal it, so it is
+/// skipped like a multipart ETag. `-` is not in the base64 alphabet, so a
+/// full-object value never contains it.
+fn full_object(value: &Option<String>) -> Option<&String> {
+    value.as_ref().filter(|v| !v.contains('-'))
+}
+
+/// Drop every checksum S3 marked `COMPOSITE` (`x-amz-checksum-type`), keeping
+/// the ETag. Composite values normally carry a `-N` suffix too; this also
+/// covers a store that reports the type without the suffix.
+pub fn without_composite(mut c: S3Checksums, composite: bool) -> S3Checksums {
+    if composite {
+        c.crc32 = None;
+        c.crc32c = None;
+        c.crc64nvme = None;
+        c.sha256 = None;
+    }
+    c
 }
 
 /// Extract a lowercase hex MD5 from an ETag when it is a simple (non-multipart)
@@ -311,6 +333,46 @@ mod tests {
             ..Default::default()
         };
         assert!(reads_ok(checksum_check(&c), b"hello").await);
+    }
+
+    #[tokio::test]
+    async fn composite_checksum_is_skipped_for_a_full_object_one() {
+        // A composite multipart SHA-256 (`-N` suffix) never equals a body
+        // digest; the full-object CRC32C below it must be used instead.
+        let c = S3Checksums {
+            sha256: Some(format!("{}-3", b64_of_hex("00"))),
+            crc32c: Some(B64.encode(0x9a71bb4cu32.to_be_bytes())),
+            ..Default::default()
+        };
+        assert!(reads_ok(checksum_check(&c), b"hello").await);
+    }
+
+    #[test]
+    fn composite_only_object_has_no_verifiable_checksum() {
+        let c = S3Checksums {
+            crc32: Some("AAAAAA==-7".into()),
+            etag: Some("\"d41d8cd98f00b204e9800998ecf8427e-7\"".into()),
+            ..Default::default()
+        };
+        assert!(!c.has_verifiable());
+        assert!(checksum_check(&c).is_none());
+    }
+
+    #[test]
+    fn checksum_type_composite_drops_every_checksum_but_the_etag() {
+        let c = S3Checksums {
+            crc32: Some("AAAAAA==".into()),
+            crc32c: Some("AAAAAA==".into()),
+            crc64nvme: Some("AAAAAAAAAAA=".into()),
+            sha256: Some("AA==".into()),
+            etag: Some("\"5d41402abc4b2a76b9719d911017c592\"".into()),
+        };
+        let kept = without_composite(c.clone(), false);
+        assert!(kept.crc32.is_some() && kept.sha256.is_some());
+        let dropped = without_composite(c, true);
+        assert!(dropped.crc32.is_none() && dropped.crc32c.is_none());
+        assert!(dropped.crc64nvme.is_none() && dropped.sha256.is_none());
+        assert!(dropped.etag.is_some());
     }
 
     #[test]

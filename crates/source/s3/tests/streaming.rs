@@ -866,3 +866,89 @@ async fn an_object_deleted_after_the_listing_fails_with_its_key() {
         .to_string();
     assert!(err.contains("b.jsonl"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_checksum_reads_a_multipart_object_with_a_composite_checksum() {
+    use aws_sdk_s3::types::{
+        ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart,
+    };
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(&endpoint, &[]).await;
+    let client = build_admin_client(&endpoint).await;
+
+    // Two parts: the first at the 5 MiB minimum, each a run of JSON lines.
+    let line = "{\"id\":1}\n";
+    let part1 = line.repeat(5 * 1024 * 1024 / line.len() + 1);
+    let part2 = line.repeat(10);
+    let key = "multi/data.jsonl";
+    let upload = client
+        .create_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .send()
+        .await
+        .expect("create multipart upload");
+    let id = upload.upload_id().expect("upload id").to_string();
+    let mut parts = Vec::new();
+    for (n, body) in [(1, &part1), (2, &part2)] {
+        let out = client
+            .upload_part()
+            .bucket(TEST_BUCKET)
+            .key(key)
+            .upload_id(&id)
+            .part_number(n)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .body(ByteStream::from(body.clone().into_bytes()))
+            .send()
+            .await
+            .expect("upload part");
+        parts.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .set_e_tag(out.e_tag().map(str::to_string))
+                .set_checksum_crc32(out.checksum_crc32().map(str::to_string))
+                .build(),
+        );
+    }
+    client
+        .complete_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .upload_id(&id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete multipart upload");
+
+    // The store advertises a checksum of part checksums, not of the body.
+    let head = client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("get object");
+    let advertised = head.checksum_crc32().unwrap_or_default().to_string();
+    let composite = advertised.contains('-')
+        || matches!(
+            head.checksum_type(),
+            Some(aws_sdk_s3::types::ChecksumType::Composite)
+        );
+    assert!(
+        composite,
+        "expected a composite checksum, got {advertised:?}"
+    );
+    drop(head);
+
+    let mut config = S3SourceConfig::new(TEST_BUCKET).prefix("multi/");
+    config.verify_checksum = true;
+    let source = build_source(&endpoint, config).await;
+    let records = collect_all(&source, 100_000).await;
+    assert_eq!(records.len(), part1.lines().count() + part2.lines().count());
+}

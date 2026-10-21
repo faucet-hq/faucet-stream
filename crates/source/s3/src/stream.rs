@@ -468,13 +468,19 @@ impl S3Source {
             None => {}
         }
         if self.config.verify_checksum {
-            let advertised = crate::verify::S3Checksums {
-                crc32: response.checksum_crc32().map(str::to_string),
-                crc32c: response.checksum_crc32_c().map(str::to_string),
-                crc64nvme: response.checksum_crc64_nvme().map(str::to_string),
-                sha256: response.checksum_sha256().map(str::to_string),
-                etag: response.e_tag().map(str::to_string),
-            };
+            let advertised = crate::verify::without_composite(
+                crate::verify::S3Checksums {
+                    crc32: response.checksum_crc32().map(str::to_string),
+                    crc32c: response.checksum_crc32_c().map(str::to_string),
+                    crc64nvme: response.checksum_crc64_nvme().map(str::to_string),
+                    sha256: response.checksum_sha256().map(str::to_string),
+                    etag: response.e_tag().map(str::to_string),
+                },
+                matches!(
+                    response.checksum_type(),
+                    Some(aws_sdk_s3::types::ChecksumType::Composite)
+                ),
+            );
             match crate::verify::checksum_check(&advertised) {
                 Some(check) => checks.push(check),
                 None => tracing::warn!(
@@ -1520,9 +1526,14 @@ mod tests {
         );
         for d in &out {
             let prefix = d.config_patch["prefix"].as_str().unwrap();
-            let filter = faucet_common_file::ObjectFilter::new(d.config_patch["include"].as_str())
-                .unwrap();
-            let listed = ["raw/a.json", "raw/a.jsonl", "raw/a.json.gz", "raw/odd[1]*?.json"];
+            let filter =
+                faucet_common_file::ObjectFilter::new(d.config_patch["include"].as_str()).unwrap();
+            let listed = [
+                "raw/a.json",
+                "raw/a.jsonl",
+                "raw/a.json.gz",
+                "raw/odd[1]*?.json",
+            ];
             let read: Vec<&str> = listed
                 .iter()
                 .copied()

@@ -127,6 +127,10 @@ complete object — silent data loss otherwise.
   `ChecksumMode::Enabled` on each `GetObject` and verifies the body against the
   strongest checksum S3 has stored for the object, in order: SHA-256,
   CRC-64-NVME, CRC-32C, CRC-32, then the ETag as MD5 for a non-multipart upload.
+  A multipart object's COMPOSITE checksum (`x-amz-checksum-type: COMPOSITE`, or
+  a value with a `-<parts>` suffix) is a checksum of part checksums, not of the
+  body, so it is skipped like a multipart ETag; the next full-object checksum
+  is used, else only the length check applies.
   Costs a hash over the full body. If the object advertises no checksum this
   source can verify, a one-shot warning is logged and the length check still
   applies.
