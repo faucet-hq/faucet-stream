@@ -413,3 +413,47 @@ pipeline:
 
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfill_that_submits_nothing_leaves_no_range_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.db").display().to_string();
+    seed_sqlite(&src).await;
+    let out_dir = dir.path().join("out").display().to_string();
+    let state_dir = dir.path().join("state");
+    let good = format!(
+        "{}  state:\n    type: file\n    config: {{ path: \"{}\" }}\n",
+        scoped_config(&src, &out_dir),
+        state_dir.display()
+    );
+    let bad = good.replace("part-${backfill.unit}", "part-${backfill.nope}");
+    let (url, client, server) = boot().await;
+    let post = |config: String| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let r = client
+                .post(format!("{url}/v1/backfill"))
+                .json(&json!({
+                    "config": config,
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "window": "1d",
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            (status, r.json::<Value>().await.unwrap())
+        }
+    };
+    let (status, failed) = post(bad).await;
+    assert_eq!(status, 400, "{failed}");
+    let (status, retried) = post(good).await;
+    assert_eq!(
+        status, 202,
+        "a failed first attempt must not block a retry: {retried}"
+    );
+    wait_completed(&client, &url, 2).await;
+    server.abort();
+}
