@@ -178,6 +178,40 @@ pub fn interpolate_record_path(input: &str, ctx: &HashMap<String, Value>) -> Cli
     })
 }
 
+/// [`interpolate_record`] for a field naming a file or object path. A token
+/// embedded in a longer path (`./out/${parent.id}.jsonl`) must stay one
+/// name: a value holding a path separator or NUL, or one that is `.` or
+/// `..`, is refused. A field that is exactly one token takes the value whole
+/// but still may not climb out with a `..` component or carry NUL.
+pub fn interpolate_record_file_path(
+    input: &str,
+    ctx: &HashMap<String, Value>,
+) -> CliResult<String> {
+    if is_single_token(input) {
+        let out = interpolate_record(input, ctx)?;
+        if out.contains('\0') || out.split(['/', '\\']).any(|c| c == "..") {
+            return Err(CliError::Config(format!(
+                "`{input}` resolved to `{out}`, a path that climbs out of its directory or \
+                 holds NUL"
+            )));
+        }
+        return Ok(out);
+    }
+    rewrite(input, |body| match classify_directive(body) {
+        Directive::LoadTime { .. } => Ok(None),
+        Directive::Deferred { id, path } => {
+            let raw = value_to_string_record(&resolve_token(body, id, path, ctx)?);
+            if raw == "." || raw == ".." || raw.contains(['/', '\\', '\0']) {
+                return Err(CliError::Config(format!(
+                    "`${{{body}}}` resolved to `{raw}` inside a file path, which would change \
+                     the directory rather than fill one name"
+                )));
+            }
+            Ok(Some(raw))
+        }
+    })
+}
+
 fn is_single_token(input: &str) -> bool {
     input
         .strip_prefix("${")

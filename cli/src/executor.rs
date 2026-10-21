@@ -2711,7 +2711,8 @@ async fn run_one_invocation(
             crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
         resolve_xml_body_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
-        resolve_url_path_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        resolve_resource_fields(true, &node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        resolve_resource_fields(false, &node.sink.kind, &mut sink_cfg, &fanout_ctx)?;
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
         let is_fanout = |id: &str| fanout_ctx.contains_key(id);
@@ -3866,21 +3867,69 @@ fn resolve_xml_body_fields(
     Ok(())
 }
 
-/// Resolve fan-out tokens in a source's URL path field with percent-encoded
-/// values (#862 L-122): `rest` and `webhook` `path`. The generic pass then
-/// finds no token left in it.
-fn resolve_url_path_fields(
+/// Resolve fan-out tokens in the fields of a connector config that name a
+/// resource, so a value from an upstream record fills one part of it and
+/// cannot re-target it (#862 L-122):
+///
+/// * a request path appended to a base URL (`rest`, `webhook`, `xml` `path`)
+///   and every field the connector schema annotates `x-faucet-resource: url`
+///   take percent-encoded values ([`crate::interpolate::interpolate_record_path`]);
+/// * every field annotated `path` refuses a value holding a path separator or
+///   `..` ([`crate::interpolate::interpolate_record_file_path`]).
+///
+/// The generic pass then finds no token left in them.
+fn resolve_resource_fields(
+    is_source: bool,
     kind: &str,
     cfg: &mut Value,
     ctx: &HashMap<String, Value>,
 ) -> CliResult<()> {
-    if !matches!(kind, "rest" | "webhook") {
-        return Ok(());
-    }
-    if let Some(Value::String(s)) = cfg.pointer_mut("/path") {
+    use faucet_core::resolve::ResourceKind;
+    if is_source
+        && matches!(kind, "rest" | "webhook" | "xml")
+        && let Some(Value::String(s)) = cfg.pointer_mut("/path")
+    {
         *s = crate::interpolate::interpolate_record_path(s, ctx)?;
     }
+    let Some(schema) = connector_schema(is_source, kind) else {
+        return Ok(());
+    };
+    for r in faucet_core::resolve::annotated_resources(&schema, cfg) {
+        if !r.value.contains("${") {
+            continue;
+        }
+        let Some(Value::String(s)) = cfg.pointer_mut(&r.pointer) else {
+            continue;
+        };
+        *s = match r.kind {
+            ResourceKind::Url => crate::interpolate::interpolate_record_path(s, ctx)?,
+            ResourceKind::Path => crate::interpolate::interpolate_record_file_path(s, ctx)?,
+            ResourceKind::Command => continue,
+        };
+    }
     Ok(())
+}
+
+/// A connector's config schema, built once per kind.
+fn connector_schema(is_source: bool, kind: &str) -> Option<Arc<Value>> {
+    type Cache = std::sync::RwLock<HashMap<(bool, String), Option<Arc<Value>>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (is_source, kind.to_string());
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+    let schema = if is_source {
+        crate::registry::source_schema(kind)
+    } else {
+        crate::registry::sink_schema(kind)
+    }
+    .ok()
+    .map(Arc::new);
+    if let Ok(mut c) = cache.write() {
+        c.insert(key, schema.clone());
+    }
+    schema
 }
 
 /// In-place runtime interpolation against a parent-record context. Walks every
@@ -3937,20 +3986,52 @@ mod xml_body_tests {
     fn url_path_fan_out_values_are_percent_encoded() {
         let ctx: HashMap<String, Value> =
             HashMap::from([("p".into(), json!({"id": "a/b", "href": "/x/1"}))]);
-        for kind in ["rest", "webhook"] {
+        for kind in ["rest", "webhook", "xml"] {
             let mut cfg = json!({"path": "/items/${p.id}", "base_url": "https://h/${p.id}"});
-            resolve_url_path_fields(kind, &mut cfg, &ctx).unwrap();
-            assert_eq!(cfg["path"], "/items/a%2Fb");
-            assert_eq!(cfg["base_url"], "https://h/${p.id}");
+            resolve_resource_fields(true, kind, &mut cfg, &ctx).unwrap();
+            assert_eq!(cfg["path"], "/items/a%2Fb", "{kind}");
+        }
+        // `base_url` is annotated as a URL on rest and xml.
+        for kind in ["rest", "xml"] {
+            let mut cfg = json!({"path": "/x", "base_url": "https://h/${p.id}?q=1"});
+            resolve_resource_fields(true, kind, &mut cfg, &ctx).unwrap();
+            assert_eq!(cfg["base_url"], "https://h/a%2Fb?q=1", "{kind}");
         }
         let mut whole = json!({"path": "${p.href}"});
-        resolve_url_path_fields("rest", &mut whole, &ctx).unwrap();
+        resolve_resource_fields(true, "rest", &mut whole, &ctx).unwrap();
         assert_eq!(whole["path"], "/x/1");
-        let mut other = json!({"path": "/items/${p.id}"});
-        resolve_url_path_fields("graphql", &mut other, &ctx).unwrap();
-        assert_eq!(other["path"], "/items/${p.id}");
         let mut no_path = json!({"base_url": "https://h"});
-        resolve_url_path_fields("rest", &mut no_path, &ctx).unwrap();
+        resolve_resource_fields(true, "rest", &mut no_path, &ctx).unwrap();
+        // The http sink's `url`.
+        let mut http = json!({"url": "https://hook/${p.id}/events"});
+        resolve_resource_fields(false, "http", &mut http, &ctx).unwrap();
+        assert_eq!(http["url"], "https://hook/a%2Fb/events");
+        let dots = HashMap::from([("p".into(), json!({"id": ".."}))]);
+        let mut cfg = json!({"path": "/accounts/${p.id}/invoices"});
+        assert!(resolve_resource_fields(true, "xml", &mut cfg, &dots).is_err());
+    }
+
+    #[test]
+    fn file_path_fan_out_values_cannot_leave_their_directory() {
+        let ok = HashMap::from([("p".into(), json!({"name": "acme"}))]);
+        let mut cfg = json!({"path": "./out/${p.name}.jsonl"});
+        resolve_resource_fields(false, "file", &mut cfg, &ok).unwrap();
+        assert_eq!(cfg["path"], "./out/acme.jsonl");
+        for bad in ["../../etc/cron.d/x", "a/b", "..", "a\\b", "x\u{0}y"] {
+            let ctx = HashMap::from([("p".into(), json!({ "name": bad }))]);
+            let mut cfg = json!({"path": "./out/${p.name}.jsonl"});
+            assert!(
+                resolve_resource_fields(false, "file", &mut cfg, &ctx).is_err(),
+                "{bad}"
+            );
+        }
+        let whole = HashMap::from([("p".into(), json!({"name": "out/../../x"}))]);
+        let mut cfg = json!({"path": "${p.name}"});
+        assert!(resolve_resource_fields(false, "file", &mut cfg, &whole).is_err());
+        let fine = HashMap::from([("p".into(), json!({"name": "out/x.jsonl"}))]);
+        let mut cfg = json!({"path": "${p.name}"});
+        resolve_resource_fields(false, "file", &mut cfg, &fine).unwrap();
+        assert_eq!(cfg["path"], "out/x.jsonl");
     }
 }
 
