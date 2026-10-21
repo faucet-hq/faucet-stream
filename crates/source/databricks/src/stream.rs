@@ -65,13 +65,13 @@ struct ExternalLink {
 }
 
 /// The internal link to the next result chunk, checked at both the result
-/// level and (for EXTERNAL_LINKS) the first external-link level.
+/// level and (for EXTERNAL_LINKS) on the last external link of the response.
 fn next_chunk_link(chunk: &ResultChunk) -> Option<String> {
     chunk.next_chunk_internal_link.clone().or_else(|| {
         chunk
             .external_links
             .as_ref()
-            .and_then(|l| l.first())
+            .and_then(|l| l.last())
             .and_then(|e| e.next_chunk_internal_link.clone())
     })
 }
@@ -291,12 +291,7 @@ impl DatabricksSource {
         &self,
         url: &str,
     ) -> Result<Vec<arrow::array::RecordBatch>, FaucetError> {
-        let resp = self.get_external(url).await?;
-        let data = resp.bytes().await.map_err(|e| {
-            FaucetError::Source(format!(
-                "databricks: reading external-link body failed: {e}"
-            ))
-        })?;
+        let data = bytes::Bytes::from(self.get_external(url).await?);
         tokio::task::spawn_blocking(move || decode_arrow_ipc(data))
             .await
             .map_err(|e| {
@@ -309,28 +304,43 @@ impl DatabricksSource {
     /// GET a presigned external link. It is signed for the storage service, so
     /// it is fetched **without** an `Authorization` header (adding one breaks
     /// the signature).
-    async fn get_external(&self, url: &str) -> Result<reqwest::Response, FaucetError> {
-        let resp = self
-            .calls
+    async fn get_external(&self, url: &str) -> Result<Vec<u8>, FaucetError> {
+        self.calls
             .call("chunk", || async {
-                self.client.get(url).send().await.map_err(|e| {
+                let resp = self.client.get(url).send().await.map_err(|e| {
                     FaucetError::Source(format!("databricks: external-link request failed: {e}"))
+                })?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = faucet_core::http::read_body_limited(
+                        resp,
+                        Some(faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN as u64),
+                    )
+                    .await
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                    return Err(FaucetError::Source(format!(
+                        "databricks: external link HTTP {status}: {body}"
+                    )));
+                }
+                faucet_core::http::read_body_limited(
+                    resp,
+                    Some(faucet_core::http::DEFAULT_MAX_RESPONSE_BYTES),
+                )
+                .await
+                .map_err(|e| {
+                    FaucetError::Source(format!(
+                        "databricks: reading external-link body failed: {e}"
+                    ))
                 })
             })
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(FaucetError::Source(format!(
-                "databricks: external link HTTP {status}: {body}"
-            )));
-        }
-        Ok(resp)
+            .await
     }
 
     /// Fetch a presigned `JSON_ARRAY` chunk: a JSON array of row arrays.
     async fn fetch_json_link(&self, url: &str) -> Result<Vec<Vec<Value>>, FaucetError> {
-        self.get_external(url).await?.json().await.map_err(|e| {
+        let body = self.get_external(url).await?;
+        serde_json::from_slice(&body).map_err(|e| {
             FaucetError::Source(format!(
                 "databricks: could not parse an external-link chunk: {e}"
             ))
