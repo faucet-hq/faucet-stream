@@ -359,10 +359,12 @@ impl MssqlDriver {
     /// Drop the staging other overwrite runs of this table abandoned
     /// ([`faucet_core::idempotency::abandoned_overwrite_staging`]); a live
     /// run's staging and this run's own are never touched.
-    async fn drop_abandoned_staging(
+    /// The names of the tables beside the destination named like a tokened
+    /// staging of it.
+    async fn tokened_staging_names(
         &self,
         conn: &mut MssqlPooledConnection<'_>,
-    ) -> Result<(), FaucetError> {
+    ) -> Result<Vec<String>, FaucetError> {
         let (schema, table) = split_table(&self.config.table);
         let list = staging_sweep_query(schema, table);
         let rows = self
@@ -375,14 +377,45 @@ impl MssqlDriver {
                     .map_err(|e| FaucetError::Sink(format!("mssql overwrite: list staging: {e}")))
             })
             .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.try_get::<&str, _>(0).ok().flatten().map(str::to_string))
+            .filter(|name| faucet_core::idempotency::overwrite_staging_token(table, name).is_some())
+            .collect())
+    }
+
+    /// Drop the untokened `<table>__faucet_ovw` an earlier release (or a run
+    /// without a token) left: it never had per-run isolation.
+    async fn drop_legacy_staging(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<(), FaucetError> {
+        let legacy = format!(
+            "{}{}",
+            self.config.table,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        );
+        self.control(
+            conn,
+            &format!(
+                "IF OBJECT_ID(N'{}', N'U') IS NOT NULL DROP TABLE {}",
+                legacy.replace('\'', "''"),
+                quote_table(&legacy)?
+            ),
+        )
+        .await
+    }
+
+    async fn drop_abandoned_staging(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<(), FaucetError> {
+        let (schema, table) = split_table(&self.config.table);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        for row in rows {
-            let Some(name) = row.try_get::<&str, _>(0).ok().flatten().map(str::to_string) else {
-                continue;
-            };
+        for name in self.tokened_staging_names(conn).await? {
             if faucet_core::idempotency::abandoned_overwrite_staging(
                 table,
                 &name,
@@ -1571,6 +1604,9 @@ impl MssqlDriver {
             &format!("IF OBJECT_ID(N'{staging_lit}', N'U') IS NOT NULL DROP TABLE {staging}"),
         )
         .await?;
+        if self.overwrite_run.is_some() {
+            self.drop_legacy_staging(&mut conn).await?;
+        }
         self.drop_abandoned_staging(&mut conn).await?;
         if first_run {
             return Ok(());
@@ -2045,8 +2081,17 @@ impl StagingDriver for MssqlDriver {
     }
 
     /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    /// A run's own staging; without a run token (the `faucet status` probe)
+    /// the untokened staging or any run's tokened staging of the table.
     async fn staged(&self, _calls: &CallSlot) -> Result<bool, FaucetError> {
-        self.table_exists(&self.staging_literal()).await
+        if self.table_exists(&self.staging_literal()).await? {
+            return Ok(true);
+        }
+        if self.overwrite_run.is_some() {
+            return Ok(false);
+        }
+        let mut conn = self.checkout().await?;
+        Ok(!self.tokened_staging_names(&mut conn).await?.is_empty())
     }
 }
 
