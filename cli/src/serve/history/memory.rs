@@ -275,15 +275,16 @@ impl RunHistory for MemoryHistory {
                 .cmp(&a.submitted_at)
                 .then_with(|| b.run_id.cmp(&a.run_id))
         });
-        // Cursor = last run_id seen on the previous page; skip past it.
-        if let Some(cursor) = &filter.cursor
-            && let Some(pos) = rows.iter().position(|r| &r.run_id == cursor)
-        {
-            rows.drain(..=pos);
+        if let Some(cursor) = &filter.cursor {
+            if let Some((ts, id)) = crate::serve::history::decode_run_cursor(cursor) {
+                rows.retain(|r| (r.submitted_at, r.run_id.as_str()) < (ts, id.as_str()));
+            } else if let Some(pos) = rows.iter().position(|r| &r.run_id == cursor) {
+                rows.drain(..=pos);
+            }
         }
         let limit = filter.limit.max(1);
         let next_cursor = if rows.len() > limit {
-            Some(rows[limit - 1].run_id.clone())
+            Some(crate::serve::history::encode_run_cursor(&rows[limit - 1]))
         } else {
             None
         };
@@ -2025,7 +2026,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c", "b"]
         );
-        assert_eq!(page.next_cursor.as_deref(), Some("b"));
+        let cursor = page.next_cursor.clone().unwrap();
+        assert!(cursor.ends_with("~b"), "{cursor}");
         // Next page from the cursor → a.
         let page2 = h
             .list(&ListFilter {
@@ -2044,6 +2046,24 @@ mod tests {
             vec!["a"]
         );
         assert!(page2.next_cursor.is_none());
+        // The cursor carries its position, so it survives the run's deletion.
+        h.delete("b").await.unwrap();
+        let after = h
+            .list(&ListFilter {
+                limit: 2,
+                cursor: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .map(|r| r.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
     }
 
     #[tokio::test]

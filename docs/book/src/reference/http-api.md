@@ -511,10 +511,12 @@ submitted config (submitted values win).
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
 50, max 500), `cursor`. Ordering is `(submitted_at DESC, run_id DESC)`; `cursor`
-is the last `run_id` from the previous page.
+is the previous page's `next_cursor` — the last row's sort key
+(`<submitted_at>~<run_id>`), so paging stays correct when that run is deleted or
+purged between requests. A bare `run_id` is still accepted.
 
 ```json
-{ "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "0192…" }
+{ "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…" }
 ```
 
 ### `GET /v1/runs/{id}` → `RunRecord`

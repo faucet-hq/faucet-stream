@@ -330,6 +330,24 @@ pub struct ListFilter {
     pub tenant: Option<String>,
 }
 
+/// The keyset cursor after `rec`: `<submitted_at>~<run_id>`, so the next page
+/// starts after that position even if the run is deleted or purged meanwhile.
+pub fn encode_run_cursor(rec: &RunRecord) -> String {
+    format!(
+        "{}~{}",
+        rec.submitted_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        rec.run_id
+    )
+}
+
+/// Parse a run-list cursor; `None` for a bare run id (the older form).
+pub fn decode_run_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
+    let (ts, id) = cursor.split_once('~')?;
+    let ts = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    Some((ts, id.to_string()))
+}
+
 /// One page of `list` results, ordered `(submitted_at DESC, run_id DESC)`.
 #[derive(Debug)]
 pub struct ListPage {

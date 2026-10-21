@@ -140,7 +140,8 @@ async fn list_orders_desc_filters_and_paginates() {
             .collect::<Vec<_>>(),
         vec!["c", "b"]
     );
-    assert_eq!(page.next_cursor.as_deref(), Some("b"));
+    let cursor = page.next_cursor.clone().unwrap();
+    assert!(cursor.ends_with("~b"), "{cursor}");
     // Next page from the cursor → [a].
     let page2 = h
         .list(&ListFilter {
@@ -159,6 +160,31 @@ async fn list_orders_desc_filters_and_paginates() {
         vec!["a"]
     );
     assert!(page2.next_cursor.is_none());
+    // The cursor carries its position, so it survives the run's deletion.
+    h.delete("b").await.unwrap();
+    let after = h
+        .list(&ListFilter {
+            limit: 2,
+            cursor: Some(cursor),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after
+            .runs
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a"]
+    );
+    h.upsert(&rec(
+        "b",
+        RunStatus::Completed,
+        t0 + ChronoDuration::seconds(1),
+    ))
+    .await
+    .unwrap();
 
     // Status filter.
     h.upsert(&rec(

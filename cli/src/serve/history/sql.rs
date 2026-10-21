@@ -2865,25 +2865,30 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
 
-                // Resolve the cursor's submitted_at for keyset pagination. An
-                // unknown cursor is ignored (page starts from the top), matching
-                // the memory backend.
-                let cursor_ts: Option<String> = match &filter.cursor {
-                    None => None,
-                    Some(c) => sqlx::query(&self.stmts.select_submitted)
-                        .bind(c)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(backend)?
-                        .map(|r| r.try_get::<String, _>("submitted_at"))
-                        .transpose()
-                        .map_err(backend)?,
+                // Keyset pagination: a `<submitted_at>~<run_id>` cursor carries
+                // its own position; a bare run id (the older form) is looked up,
+                // and an unknown one starts from the top.
+                let decoded = filter
+                    .cursor
+                    .as_deref()
+                    .and_then($crate::serve::history::decode_run_cursor);
+                let (cursor_ts, cur_id): (Option<String>, Option<String>) = match (&filter.cursor, decoded) {
+                    (_, Some((ts, id))) => (Some(sql::fmt_ts(ts)), Some(id)),
+                    (None, None) => (None, None),
+                    (Some(c), None) => {
+                        let ts = sqlx::query(&self.stmts.select_submitted)
+                            .bind(c)
+                            .fetch_optional(&self.pool)
+                            .await
+                            .map_err(backend)?
+                            .map(|r| r.try_get::<String, _>("submitted_at"))
+                            .transpose()
+                            .map_err(backend)?;
+                        let id = ts.as_ref().map(|_| c.clone());
+                        (ts, id)
+                    }
                 };
-                let cur_id = if cursor_ts.is_some() {
-                    filter.cursor.as_deref()
-                } else {
-                    None
-                };
+                let cur_id = cur_id.as_deref();
 
                 // Multi-status via a comma-wrapped membership test: bind
                 // `,completed,failed,` and match `,<status>,` as a substring (the
@@ -2934,7 +2939,7 @@ macro_rules! impl_sql_history {
                     runs.push(sql::decode_body(&body)?);
                 }
                 let next_cursor = if runs.len() > limit {
-                    Some(runs[limit - 1].run_id.clone())
+                    Some($crate::serve::history::encode_run_cursor(&runs[limit - 1]))
                 } else {
                     None
                 };

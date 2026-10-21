@@ -76,7 +76,7 @@ paths:
         - { name: since, in: query, schema: { type: string, format: date-time } }
         - { name: until, in: query, schema: { type: string, format: date-time } }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
-        - { name: cursor, in: query, schema: { type: string }, description: "Last run_id from the previous page." }
+        - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor` (`<submitted_at>~<run_id>`; a bare run_id is still accepted)." }
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
       responses:
         "200":
