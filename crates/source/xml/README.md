@@ -432,6 +432,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 | Pagination never stops / fetches too much | Set `max_pages` as a hard cap. Paging stops on an empty page or an identical repeated page; an API that never returns an empty page past the end needs `max_pages`. |
 | Headers set in code aren't sent from YAML | `headers` is `#[serde(skip)]` and not configurable from YAML/JSON. Use `custom` auth (or `query_params`) to attach headers from config. |
 | Malformed XML / parse error | The body isn't well-formed XML (often an HTML error page returned with a 200). Verify the endpoint and that auth/headers select the XML representation (e.g. `Accept: application/xml`). |
+| `XML nesting exceeds 256 levels` | The response nests elements deeper than `MAX_XML_DEPTH` (256), which no real feed does — it is refused rather than built into a value deep enough to overflow the stack. Applies to the record path, full-document mode and the `decode:` pipeline's `parse: xml` step. |
 
 ## See also
 

@@ -492,7 +492,13 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
             .map_err(|e| FaucetError::Source(format!("decode `parse` xml: {e}")))?;
         match &event {
             Event::Eof => break,
-            Event::Start(e) => stack.push((attrs(e)?, String::new())),
+            Event::Start(e) => {
+                // `stack[0]` is the synthetic document root.
+                if stack.len() > crate::convert::MAX_XML_DEPTH {
+                    return Err(crate::convert::too_deep());
+                }
+                stack.push((attrs(e)?, String::new()))
+            }
             Event::Empty(e) => {
                 let name = local(e.name().as_ref());
                 let val = finish(attrs(e)?, String::new());
@@ -837,6 +843,17 @@ mod tests {
             matches!(err, FaucetError::Source(_)),
             "malformed XML must surface as FaucetError::Source, got {err:?}"
         );
+    }
+
+    #[test]
+    fn xml_to_json_refuses_nesting_beyond_the_limit() {
+        let max = crate::convert::MAX_XML_DEPTH;
+        let doc = |d: usize| format!("{}x{}", "<a>".repeat(d), "</a>".repeat(d));
+        assert!(xml_to_json(doc(max).as_bytes()).is_ok());
+        for d in [max + 1, 500_000] {
+            let err = xml_to_json(doc(d).as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("nesting exceeds"), "{err}");
+        }
     }
 
     #[test]

@@ -10,6 +10,19 @@ use serde_json::{Map, Value, json};
 
 use crate::xmltext::{attributes, event_text};
 
+/// Deepest element nesting the XML converters accept. A deeper document is
+/// refused with a typed error: the JSON value it would build is as deep as the
+/// document, and dropping or serialising such a value recurses once per level,
+/// so a hostile or broken response could overflow the worker's stack.
+pub const MAX_XML_DEPTH: usize = 256;
+
+/// The error for a document nested deeper than [`MAX_XML_DEPTH`].
+pub(crate) fn too_deep() -> FaucetError {
+    FaucetError::Transform(format!(
+        "XML nesting exceeds {MAX_XML_DEPTH} levels — refusing to convert the document"
+    ))
+}
+
 /// Convert an XML string to a JSON value.
 ///
 /// Elements become objects, repeated elements become arrays, attributes
@@ -135,6 +148,9 @@ pub fn stream_extract<F: FnMut(Value)>(
             .map_err(|e| FaucetError::Transform(format!("XML parse error: {e}")))?;
         match &event {
             Event::Start(e) => {
+                if path.len() >= MAX_XML_DEPTH {
+                    return Err(too_deep());
+                }
                 let frame = Frame::open(e)?;
                 path.push(frame.name.clone());
                 if full_doc || start_depth.is_some() {
@@ -552,6 +568,28 @@ mod tests {
         assert_eq!(streamed, eager);
         assert_eq!(streamed.len(), 2);
         assert_eq!(streamed[1]["Name"], "Bob");
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}x{}", "<a>".repeat(depth), "</a>".repeat(depth))
+    }
+
+    #[test]
+    fn nesting_up_to_the_limit_converts() {
+        let v = xml_to_json(&nested(MAX_XML_DEPTH)).unwrap();
+        assert!(v.get("a").is_some());
+    }
+
+    #[test]
+    fn nesting_beyond_the_limit_is_a_typed_error() {
+        for depth in [MAX_XML_DEPTH + 1, 500_000] {
+            let err = xml_to_json(&nested(depth)).unwrap_err();
+            assert!(matches!(err, FaucetError::Transform(_)), "{err}");
+            assert!(err.to_string().contains("nesting exceeds 256"), "{err}");
+        }
+        // A records path does not lift the bound.
+        let err = stream_extract(&nested(500_000), Some("a.a"), |_| {}).unwrap_err();
+        assert!(err.to_string().contains("nesting exceeds"), "{err}");
     }
 
     #[test]

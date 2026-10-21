@@ -496,3 +496,19 @@ async fn offset_stop_when_short_ends_on_a_short_page() {
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     assert_eq!(records.len(), 3);
 }
+
+#[tokio::test]
+async fn a_deeply_nested_response_fails_instead_of_overflowing_the_stack() {
+    let server = MockServer::start().await;
+    let depth = 200_000;
+    let body = format!("{}x{}", "<a>".repeat(depth), "</a>".repeat(depth));
+    Mock::given(method("GET"))
+        .and(path("/deep.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    // Full-document mode: the whole response would become one 200k-deep value.
+    let config = XmlStreamConfig::new(server.uri(), "/deep.xml");
+    let err = XmlStream::new(config).fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("XML nesting exceeds"), "{err}");
+}
