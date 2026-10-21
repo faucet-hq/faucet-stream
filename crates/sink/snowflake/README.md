@@ -438,7 +438,12 @@ written to Parquet, uploaded to an **external** stage's backing cloud storage,
 and loaded with `COPY INTO <table> FROM @stage FILE_FORMAT=(TYPE=PARQUET)`. This
 runs end-to-end without per-row JSON when the source is also columnar (e.g.
 `parquet → snowflake`). It is **append-only** and independent of the row-path
-`INSERT`/exactly-once code, which is unchanged.
+`INSERT`/exactly-once code, which is unchanged. Before the `COPY` it runs the
+row path's table checks on the batch's columns (creates the table, adds a
+missing column with `create_table`, else fails naming it), and after it the
+write fails unless the `COPY` result's `rows_loaded` equals the batch's rows — a
+stage whose location differs from `bulk_load.url` (`Copy executed with 0 files
+processed.`) fails instead of reporting the batch written.
 
 ```yaml
 sink:

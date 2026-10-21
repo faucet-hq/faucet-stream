@@ -109,6 +109,60 @@ struct SnowflakeResponse {
     /// the watermark read.
     #[serde(default)]
     data: Option<Vec<Vec<Value>>>,
+    /// The result's column metadata (`rowType[].name`), read to find the
+    /// `rows_loaded` column of a `COPY INTO` result.
+    #[serde(rename = "resultSetMetaData", default)]
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    result_set_meta_data: Option<Value>,
+}
+
+/// Rows a `COPY INTO` result says it loaded: the sum of its `rows_loaded`
+/// column (one row per file). A result without that column — Snowflake's
+/// `Copy executed with 0 files processed.` — loaded nothing.
+#[cfg(feature = "arrow")]
+fn copy_rows_loaded(resp: &SnowflakeResponse) -> u64 {
+    let names = resp
+        .result_set_meta_data
+        .as_ref()
+        .and_then(|m| m.get("rowType"))
+        .and_then(Value::as_array);
+    let Some(idx) = names.and_then(|cols| {
+        cols.iter().position(|c| {
+            c.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case("rows_loaded"))
+        })
+    }) else {
+        return 0;
+    };
+    resp.data
+        .iter()
+        .flatten()
+        .filter_map(|row| row.get(idx))
+        .filter_map(|v| match v {
+            Value::String(s) => s.parse::<u64>().ok(),
+            Value::Number(n) => n.as_u64(),
+            _ => None,
+        })
+        .sum()
+}
+
+/// What a `COPY INTO` result said besides its row count (its `status` and
+/// `first_error` cells, or the message), for an error naming the cause.
+#[cfg(feature = "arrow")]
+fn copy_outcome_text(resp: &SnowflakeResponse) -> String {
+    let cells: Vec<String> = resp
+        .data
+        .iter()
+        .flatten()
+        .flat_map(|row| row.iter().take(2))
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if cells.is_empty() {
+        resp.message.clone().unwrap_or_default()
+    } else {
+        cells.join(", ")
+    }
 }
 
 /// Map a parsed statement response onto a success/error result. Code
@@ -1286,6 +1340,14 @@ impl faucet_core::driver::ColumnarDriver for SnowflakeDriver {
             )
         })?;
 
+        // The row path's table checks apply here too: `MATCH_BY_COLUMN_NAME`
+        // silently skips a Parquet column the table lacks, so a missing
+        // column is created (with `create_table`) or the write fails naming
+        // it, before anything is staged.
+        let sample = columnar_sample(batch)?;
+        self.ensure_table_ready(calls, &sample).await?;
+        self.ensure_columns(calls, &sample).await?;
+
         // Parquet encode is CPU-bound — keep it off the async runtime.
         let batch_owned = batch.clone();
         let bytes = tokio::task::spawn_blocking(move || crate::bulk::encode_parquet(&batch_owned))
@@ -1310,7 +1372,19 @@ impl faucet_core::driver::ColumnarDriver for SnowflakeDriver {
             stage,
             &file,
         );
-        self.execute_sql(calls, &sql, None).await?;
+        let resp = self.execute_statement(calls, &sql, None, None).await?;
+        // A COPY that found no file (a stage whose location differs from
+        // `bulk_load.url`) or skipped rows still succeeds: count what loaded.
+        let loaded = copy_rows_loaded(&resp);
+        if loaded != batch.num_rows() as u64 {
+            return Err(FaucetError::Sink(format!(
+                "Snowflake COPY INTO loaded {loaded} of {} row(s) from staged file {file} \
+                 ({}); check that stage {} reads `bulk_load.url`",
+                batch.num_rows(),
+                copy_outcome_text(&resp),
+                stage.stage
+            )));
+        }
 
         tracing::info!(
             table = %format!(
@@ -1323,6 +1397,24 @@ impl faucet_core::driver::ColumnarDriver for SnowflakeDriver {
         );
         Ok(batch.num_rows())
     }
+}
+
+/// Records standing in for a columnar batch in the table checks: the first
+/// rows (for their types) and one record naming every column, since a column
+/// null in those rows would otherwise go unnoticed.
+#[cfg(feature = "arrow")]
+fn columnar_sample(batch: &arrow::array::RecordBatch) -> Result<Vec<Value>, FaucetError> {
+    let mut sample =
+        faucet_core::record_batch_to_values(&batch.slice(0, batch.num_rows().min(16)))?;
+    sample.push(Value::Object(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), Value::Null))
+            .collect(),
+    ));
+    Ok(sample)
 }
 
 /// Consecutive transient failures of one statement's status poll before the
@@ -1343,6 +1435,24 @@ fn poll_backoff(attempt: u32) -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn copy_results_count_loaded_rows() {
+        let parse = |v: Value| -> super::SnowflakeResponse { serde_json::from_value(v).unwrap() };
+        let two_files = parse(json!({
+            "resultSetMetaData": {"rowType": [{"name": "file"}, {"name": "status"}, {"name": "ROWS_LOADED"}]},
+            "data": [["a", "LOADED", "2"], ["b", "PARTIALLY_LOADED", "1"]]
+        }));
+        assert_eq!(super::copy_rows_loaded(&two_files), 3);
+        assert_eq!(
+            super::copy_outcome_text(&two_files),
+            "a, LOADED, b, PARTIALLY_LOADED"
+        );
+        let none = parse(json!({"message": "done"}));
+        assert_eq!(super::copy_rows_loaded(&none), 0);
+        assert_eq!(super::copy_outcome_text(&none), "done");
+    }
+
     #[test]
     fn transient_polls_back_off_and_only_gateway_failures_retry() {
         use reqwest::StatusCode;
@@ -1746,6 +1856,7 @@ mod tests {
             code: Some("002003".into()),
             statement_handle: None,
             data: None,
+            result_set_meta_data: None,
         };
         match check_statement_code(&resp) {
             Err(FaucetError::Sink(msg)) => {
@@ -1763,6 +1874,7 @@ mod tests {
             code: Some("090001".into()),
             statement_handle: None,
             data: None,
+            result_set_meta_data: None,
         };
         assert!(check_statement_code(&ok).is_ok());
         let no_code = SnowflakeResponse {
@@ -1770,6 +1882,7 @@ mod tests {
             code: None,
             statement_handle: None,
             data: None,
+            result_set_meta_data: None,
         };
         assert!(check_statement_code(&no_code).is_ok());
     }
