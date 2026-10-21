@@ -253,10 +253,22 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                ("/storage_options/AWS_ENDPOINT_URL".into(), ResourceKind::Url),
-                ("/storage_options/AZURE_FEDERATED_TOKEN_FILE".into(), ResourceKind::Path),
-                ("/storage_options/GOOGLE_SERVICE_ACCOUNT".into(), ResourceKind::Path),
-                ("/storage_options/azure_storage_endpoint".into(), ResourceKind::Url),
+                (
+                    "/storage_options/AWS_ENDPOINT_URL".into(),
+                    ResourceKind::Url
+                ),
+                (
+                    "/storage_options/AZURE_FEDERATED_TOKEN_FILE".into(),
+                    ResourceKind::Path
+                ),
+                (
+                    "/storage_options/GOOGLE_SERVICE_ACCOUNT".into(),
+                    ResourceKind::Path
+                ),
+                (
+                    "/storage_options/azure_storage_endpoint".into(),
+                    ResourceKind::Url
+                ),
                 ("/table_uri".into(), ResourceKind::Path),
             ]
         );

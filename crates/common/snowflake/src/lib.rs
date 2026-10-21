@@ -351,7 +351,12 @@ mod tests {
 
     #[test]
     fn account_identifiers_cannot_leave_snowflake() {
-        for ok in ["xy12345", "xy12345.us-east-1", "myorg-my_acct", "acct.privatelink"] {
+        for ok in [
+            "xy12345",
+            "xy12345.us-east-1",
+            "myorg-my_acct",
+            "acct.privatelink",
+        ] {
             assert!(validate_account(ok).is_ok(), "{ok}");
         }
         for bad in [
@@ -367,7 +372,10 @@ mod tests {
             "-a",
         ] {
             let err = validate_account(bad).unwrap_err();
-            assert!(err.to_string().contains("not an account identifier"), "{bad}");
+            assert!(
+                err.to_string().contains("not an account identifier"),
+                "{bad}"
+            );
         }
     }
     use super::*;

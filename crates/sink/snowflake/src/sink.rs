@@ -1338,7 +1338,10 @@ mod tests {
             SnowflakeAuth::OAuth { token: "t".into() },
         );
         let err = SnowflakeSink::new(config).err().unwrap();
-        assert!(err.to_string().contains("not an account identifier"), "{err}");
+        assert!(
+            err.to_string().contains("not an account identifier"),
+            "{err}"
+        );
     }
 
     #[test]

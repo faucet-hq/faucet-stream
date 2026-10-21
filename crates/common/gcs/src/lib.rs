@@ -225,7 +225,10 @@ mod tests {
             "https://storage.us-central1.rep.googleapis.com",
             "https://private.goog",
         ] {
-            assert!(refuse_held_credentials_off_google(&adc, Some(ok)).is_ok(), "{ok}");
+            assert!(
+                refuse_held_credentials_off_google(&adc, Some(ok)).is_ok(),
+                "{ok}"
+            );
         }
         for bad in [
             "https://attacker.example",
@@ -234,8 +237,14 @@ mod tests {
             "https://169.254.169.254\\@storage.googleapis.com/",
             "",
         ] {
-            assert!(refuse_held_credentials_off_google(&adc, Some(bad)).is_err(), "{bad}");
-            assert!(refuse_held_credentials_off_google(&file, Some(bad)).is_err(), "{bad}");
+            assert!(
+                refuse_held_credentials_off_google(&adc, Some(bad)).is_err(),
+                "{bad}"
+            );
+            assert!(
+                refuse_held_credentials_off_google(&file, Some(bad)).is_err(),
+                "{bad}"
+            );
             assert!(refuse_held_credentials_off_google(&inline, Some(bad)).is_ok());
             assert!(
                 refuse_held_credentials_off_google(&GcsCredentials::Anonymous, Some(bad)).is_ok()

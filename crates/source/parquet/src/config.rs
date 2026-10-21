@@ -285,8 +285,9 @@ mod tests {
     fn a_glob_pattern_is_a_path_resource() {
         use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_resources};
         let schema = serde_json::to_value(faucet_core::schema_for!(ParquetSourceConfig)).unwrap();
-        let config = serde_json::to_value(ParquetSourceConfig::glob("/data/tenants/b/**/*.parquet"))
-            .unwrap();
+        let config =
+            serde_json::to_value(ParquetSourceConfig::glob("/data/tenants/b/**/*.parquet"))
+                .unwrap();
         let found = annotated_resources(&schema, &config);
         let pattern = found
             .iter()
