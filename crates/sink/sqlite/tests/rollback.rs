@@ -642,3 +642,61 @@ async fn rollback_restores_rows_whose_stored_key_differs_from_the_record() {
         pool.close().await;
     }
 }
+
+/// The journal keeps keys as text, while the upsert stored them typed: an
+/// integer in a column with no declared type, `true` as `1` in a BOOLEAN
+/// column. Undoing the run still finds those rows — both to delete what the
+/// run created and to see a later run's change as a conflict.
+#[tokio::test]
+async fn rollback_finds_keys_stored_untyped_or_as_booleans() {
+    for (create, key_value, later_key) in [
+        (
+            "CREATE TABLE users (id PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            json!(7),
+            "7",
+        ),
+        (
+            "CREATE TABLE users (id BOOLEAN PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            json!(true),
+            "1",
+        ),
+    ] {
+        let (_dir, url) = fresh_db(create).await;
+        let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+        sink.write_batch(&[json!({"id": key_value, "name": "new", RUN_COL: "r1"})])
+            .await
+            .unwrap();
+
+        let out = sink
+            .rollback_run("r1", &opts(RollbackMode::Upsert))
+            .await
+            .unwrap();
+        assert_eq!((out.deleted, out.applied), (1, true), "{create}: {out:?}");
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "{create}: the row the run created is gone");
+        pool.close().await;
+
+        // A later run's change to that key blocks the rollback.
+        sink.write_batch(&[json!({"id": key_value, "name": "again", RUN_COL: "r1"})])
+            .await
+            .unwrap();
+        exec(
+            &url,
+            &format!("UPDATE users SET _faucet_run_id = 'r2' WHERE id = {later_key}"),
+        )
+        .await;
+        let out = sink
+            .rollback_run("r1", &opts(RollbackMode::Upsert))
+            .await
+            .unwrap();
+        assert_eq!(
+            (out.conflicts, out.applied),
+            (1, false),
+            "{create}: {out:?}"
+        );
+    }
+}

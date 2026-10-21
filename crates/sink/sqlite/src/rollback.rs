@@ -217,20 +217,17 @@ impl SqliteDriver {
         }
         let key = &self.config.write.key;
         let table_ref = quote_ident_sqlite(&self.config.table_name);
-        let sql = journal_sql();
-        let per = ((MAX_SQLITE_PARAMS - 1) / key.len().max(1)).max(1);
+        let per = ((MAX_SQLITE_PARAMS - 1) / (key.len().max(1) * MAX_KEY_FORMS)).max(1);
         let mut total = 0u64;
         for chunk in entries.chunks(per) {
-            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
+            let (predicate, binds) = stored_keys_predicate(key, chunk);
             let count_sql = format!(
-                "SELECT count(*) FROM {table_ref} WHERE {predicate} AND {c} IS NOT ?",
+                "SELECT count(*) FROM {table_ref} WHERE ({predicate}) AND {c} IS NOT ?",
                 c = quote_ident_sqlite(run_col)
             );
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
-            for e in chunk {
-                for (_, v) in &e.tuple(key).0 {
-                    q = bind_key_value_scalar(q, v);
-                }
+            for v in &binds {
+                q = bind_key_value_scalar(q, v);
             }
             q = q.bind(run_id);
             total += q
@@ -268,17 +265,14 @@ impl SqliteDriver {
             return Ok(0);
         }
         let table_ref = quote_ident_sqlite(&self.config.table_name);
-        let sql = journal_sql();
-        let per = (MAX_SQLITE_PARAMS / key.len().max(1)).max(1);
+        let per = (MAX_SQLITE_PARAMS / (key.len().max(1) * MAX_KEY_FORMS)).max(1);
         let mut present = 0u64;
         for chunk in restorable.chunks(per) {
-            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
+            let (predicate, binds) = stored_keys_predicate(key, chunk);
             let count_sql = format!("SELECT count(*) FROM {table_ref} WHERE {predicate}");
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
-            for e in chunk {
-                for (_, v) in &e.tuple(key).0 {
-                    q = bind_key_value_scalar(q, v);
-                }
+            for v in &binds {
+                q = bind_key_value_scalar(q, v);
             }
             present += q
                 .fetch_one(&mut **tx)
@@ -286,6 +280,35 @@ impl SqliteDriver {
                 .map_err(|e| sink_err("count vanished keys", e))? as u64;
         }
         Ok((restorable.len() as u64).saturating_sub(present))
+    }
+
+    /// Delete the rows of journaled keys the run created. The journal holds
+    /// each key as text; the row holds it as the upsert stored it (`true` as
+    /// `1`, an integer in an untyped column as an integer), so every stored
+    /// form of the text is matched.
+    async fn delete_journaled(
+        &self,
+        tx: &mut Tx<'_>,
+        entries: &[&JournalEntry],
+    ) -> Result<u64, FaucetError> {
+        let key = &self.config.write.key;
+        let table_ref = quote_ident_sqlite(&self.config.table_name);
+        let per = (MAX_SQLITE_PARAMS / (key.len().max(1) * MAX_KEY_FORMS)).max(1);
+        let mut deleted = 0u64;
+        for chunk in entries.chunks(per) {
+            let (predicate, binds) = stored_keys_predicate(key, chunk);
+            let sql = format!("DELETE FROM {table_ref} WHERE {predicate}");
+            let mut q = sqlx::query(&sql);
+            for v in &binds {
+                q = crate::sink::bind_value(q, v);
+            }
+            deleted += q
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| sink_err("delete created rows", e))?
+                .rows_affected();
+        }
+        Ok(deleted)
     }
 
     pub(crate) fn rollback_supported(&self) -> bool {
@@ -412,9 +435,7 @@ impl SqliteDriver {
                 note: Some("dry run".into()),
             });
         }
-        let key = &self.config.write.key;
-        let tuples: Vec<faucet_core::KeyTuple> = deletes.iter().map(|e| e.tuple(key)).collect();
-        let deleted = self.delete_by_keys(tx, &tuples).await? as u64;
+        let deleted = self.delete_journaled(tx, &deletes).await?;
         let restored = if restores.is_empty() {
             0
         } else {
@@ -649,8 +670,75 @@ fn bind_key_value_scalar<'q>(
     match v {
         Value::Null => q.bind(None::<String>),
         Value::String(s) => q.bind(s.clone()),
+        Value::Number(n) if n.is_i64() => q.bind(n.as_i64()),
+        Value::Number(n) => q.bind(n.as_f64()),
         other => q.bind(other.to_string()),
     }
+}
+
+/// Most stored forms one journaled key value can have (text, number, `1`/`0`).
+const MAX_KEY_FORMS: usize = 3;
+
+/// The values a key column may hold for one journaled (text) key value: the
+/// text itself, the number it spells, and `1` / `0` for `true` / `false` —
+/// how an upsert stored it under each column affinity. A journal already
+/// treats these as one key (`7` and `"7"` journal alike).
+fn stored_forms(text: &str) -> Vec<Value> {
+    let mut forms = vec![Value::String(text.to_string())];
+    if let Ok(i) = text.parse::<i64>() {
+        forms.push(Value::from(i));
+    } else if let Some(n) = text
+        .parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
+        .and_then(serde_json::Number::from_f64)
+    {
+        forms.push(Value::Number(n));
+    }
+    match text {
+        "true" => forms.push(Value::from(1)),
+        "false" => forms.push(Value::from(0)),
+        _ => {}
+    }
+    forms
+}
+
+/// `(k1 IN (?, ?) AND k2 IN (?)) OR …` matching every stored form of each
+/// entry's key, with its bind values in order.
+fn stored_keys_predicate<E: std::borrow::Borrow<JournalEntry>>(
+    key: &[String],
+    entries: &[E],
+) -> (String, Vec<Value>) {
+    let mut binds = Vec::new();
+    let rows: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let cols: Vec<String> = e
+                .borrow()
+                .tuple(key)
+                .0
+                .iter()
+                .map(|(c, v)| {
+                    let col = quote_ident_sqlite(c);
+                    match v {
+                        Value::String(text) => {
+                            let forms = stored_forms(text);
+                            let marks = vec!["?"; forms.len()].join(", ");
+                            binds.extend(forms);
+                            format!("{col} IN ({marks})")
+                        }
+                        Value::Null => format!("{col} IS NULL"),
+                        other => {
+                            binds.push(other.clone());
+                            format!("{col} = ?")
+                        }
+                    }
+                })
+                .collect();
+            format!("({})", cols.join(" AND "))
+        })
+        .collect();
+    (rows.join(" OR "), binds)
 }
 
 /// The plan's distinct keys as `(canonical, typed)` pairs: the canonical

@@ -491,7 +491,9 @@ table as `<table>__faucet_prev` (a copy inside the swap transaction). `faucet ro
 deletes the run's appended rows, restores the journaled before-images, or
 swaps the previous table back — refusing (unless `--force`) when a later run
 changed the same keys — and rewinds the row's bookmark and exactly-once
-watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
+watermark. Journaled keys are text; the undo matches every form the upsert may
+have stored them in (the text, the number it spells, `1` / `0` for `true` /
+`false`), so keys in an untyped or `BOOLEAN` column are found too. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `sqlite` source config
 `faucet verify` reads the destination back with). See the [rollback
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).

@@ -565,20 +565,6 @@ impl SqliteDriver {
         self.layout.staging_table()
     }
 
-    /// Delete rows whose key columns match any of `deletes`
-    /// (`DELETE … WHERE (k1, …) IN ((?, …), …)`, chunked at the bind cap), on
-    /// the caller's transaction.
-    pub(crate) async fn delete_by_keys(
-        &self,
-        conn: &mut sqlx::SqliteConnection,
-        deletes: &[faucet_core::KeyTuple],
-    ) -> Result<usize, FaucetError> {
-        let mut exec = SqliteExec { conn, sink: self };
-        self.engine
-            .delete(&mut exec, &target(&self.config.table_name), deletes)
-            .await
-    }
-
     /// Ensure the commit-token watermark table exists.
     pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         sqlx::query(&Sqlite.commit_token_table_sql())
