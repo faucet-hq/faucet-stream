@@ -356,24 +356,21 @@ jobs:
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
-      - name: Run workspace tests (libraries and connectors)
-        # Integration tests boot Docker containers via testcontainers, whose
-        # in-process (bollard) image pull intermittently fails. Only that is
-        # retried: any other failure — a flaky test included — fails at once.
-        # Split from faucet-cli: building every test binary of the workspace
-        # at once, plus the test containers' images, exhausts the runner disk.
-        run: scripts/retry-on-image-pull.sh cargo test --workspace --exclude faucet-cli --all-features
-      - name: Free disk taken by the library test binaries and containers
-        run: |
-          find target/debug/deps -maxdepth 1 -type f -perm -u+x -delete
-          docker ps -aq | xargs -r docker rm -f >/dev/null
-          docker system prune -af --volumes >/dev/null
-          df -h /
-      - name: Run workspace tests (faucet-cli)
-        run: scripts/retry-on-image-pull.sh cargo test -p faucet-cli --all-features
-      - name: Free disk taken by the workspace test binaries
-        # The next step rebuilds faucet-cli with other features; the runner
-        # runs out of disk if the workspace run's test executables stay.
+      # The unit and integration tests themselves run in the Coverage job
+      # (instrumented, same `if:`, same FAUCET_REQUIRE_BACKENDS and the same
+      # image-pull-only retry), so they are not run twice. This job runs only
+      # what Coverage never does: doc tests, the `examples/` builds, the tests
+      # that skip themselves under llvm-cov, and the slim serve-ui build.
+      - name: Doc tests
+        run: cargo test --workspace --all-features --doc
+      - name: Build examples
+        run: cargo build --workspace --all-features --examples
+      - name: Tests skipped under coverage (CARGO_LLVM_COV)
+        # Two-process cluster and TUI-fallback tests: timing-sensitive under
+        # instrumentation, so they guard themselves off in Coverage.
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-cli --all-features --test serve_cluster --test tui_fallback
+      - name: Free disk taken by the all-features build
+        # The next step rebuilds faucet-cli with other features.
         run: |
           find target/debug/deps -maxdepth 1 -type f -perm -u+x -delete
           rm -rf target/debug/incremental
