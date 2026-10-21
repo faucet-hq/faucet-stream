@@ -946,6 +946,10 @@ pub(crate) struct BigQueryDriver {
     /// target at its terminal flush, so an empty source empties the table as
     /// the staged path does.
     overwrite_rows: AtomicBool,
+    /// Set once this instance has created (or found) the commit-token table,
+    /// so the exactly-once path issues its `CREATE TABLE IF NOT EXISTS` job
+    /// once per instance rather than once per page.
+    commit_table_ready: AtomicBool,
     /// Whether a columnar batch has already been loaded with its own job.
     #[cfg(feature = "arrow")]
     columnar_loaded: AtomicBool,
@@ -1099,6 +1103,7 @@ impl BigQueryDriver {
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
             overwrite_rows: AtomicBool::new(false),
+            commit_table_ready: AtomicBool::new(false),
             #[cfg(feature = "arrow")]
             columnar_loaded: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
@@ -1117,6 +1122,7 @@ impl BigQueryDriver {
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
             overwrite_rows: AtomicBool::new(false),
+            commit_table_ready: AtomicBool::new(false),
             #[cfg(feature = "arrow")]
             columnar_loaded: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
@@ -2270,6 +2276,9 @@ impl BigQueryDriver {
 
     /// Create the commit-token watermark table if it does not exist.
     async fn ensure_commit_table(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.commit_table_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let sql =
             idempotent::build_create_commit_table(&self.config.project_id, &self.config.dataset_id);
         let mut req = QueryRequest::new(sql);
@@ -2283,7 +2292,9 @@ impl BigQueryDriver {
                 .map_err(|e| FaucetError::Sink(format!("BigQuery commit-table create failed: {e}")))
         })
         .await?;
-        self.await_query_complete(calls, resp).await
+        self.await_query_complete(calls, resp).await?;
+        self.commit_table_ready.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// [`await_query_job`](Self::await_query_job), discarding the job body —

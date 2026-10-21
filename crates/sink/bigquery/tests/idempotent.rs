@@ -272,6 +272,56 @@ async fn ensure_commit_table_issues_create() {
     // The .expect(1..) on the CREATE mock asserts it was issued.
 }
 
+/// The commit-token table is created once per sink instance, not once per
+/// exactly-once page or token read.
+#[tokio::test]
+async fn commit_table_is_created_once_per_instance() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-c")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("BEGIN TRANSACTION"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-t")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("SELECT token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-sel"},
+            "schema": {"fields": [{"name": "token", "type": "STRING", "mode": "NULLABLE"}]},
+            "totalRows": "0"
+        })))
+        .mount(&server)
+        .await;
+    mount_job_done(&server, "job-c").await;
+    mount_job_done(&server, "job-t").await;
+
+    let (sink, _sa) = build_sink(&server).await;
+    sink.last_committed_token("s").await.expect("token");
+    for seq in 1..=3 {
+        sink.write_batch_idempotent(
+            &[json!({"id": seq, "name": "x"})],
+            "s",
+            &format!("{seq:020}"),
+        )
+        .await
+        .expect("write");
+    }
+    sink.last_committed_token("s").await.expect("token");
+    // `.expect(1)` on the CREATE mock is verified when the server drops.
+}
+
 #[tokio::test]
 async fn last_committed_token_reads_watermark_row() {
     let server = MockServer::start().await;
