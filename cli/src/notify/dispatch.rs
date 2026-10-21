@@ -84,9 +84,10 @@ impl Notifier {
             out.extend(self.resolve(&event).await);
         }
 
-        // 2) Normal delivery.
-        for idx in 0..self.rules.len() {
-            let rule = &self.rules[idx];
+        // 2) Normal delivery. Rules are delivered concurrently, so one slow
+        //    channel costs its own bounded attempts once, not once per rule.
+        let mut due = Vec::new();
+        for rule in &self.rules {
             if !rule_matches(rule, &event) {
                 continue;
             }
@@ -102,8 +103,12 @@ impl Notifier {
                 out.push(DeliveryOutcome::new(rule, "coalesced", None));
                 continue;
             }
-            let err = self.deliver(rule, &event).await.err();
-            out.push(DeliveryOutcome::new(rule, "trigger", err));
+            due.push(rule);
+        }
+        let results =
+            futures::future::join_all(due.iter().map(|rule| self.deliver(rule, &event))).await;
+        for (rule, res) in due.into_iter().zip(results) {
+            out.push(DeliveryOutcome::new(rule, "trigger", res.err()));
         }
         out
     }
@@ -585,6 +590,43 @@ mod tests {
             rules,
             vec![("pd", "resolve", true), ("drift-only", "resolve", true)],
             "{out:?}"
+        );
+    }
+
+    /// Matching rules are delivered concurrently: two slow channels cost one
+    /// delivery's time, not two.
+    #[tokio::test]
+    async fn rules_are_delivered_concurrently() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let hook = |name: &str| {
+            rule(
+                name,
+                vec![],
+                ChannelSpec::Webhook(
+                    serde_json::from_value(serde_json::json!({"url": server.uri()})).unwrap(),
+                ),
+            )
+        };
+        let n = Notifier::from_specs(&[hook("a"), hook("b")])
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        let out = n
+            .emit_report(NotifyEvent::run_failure("p", "", "s", "m"))
+            .await;
+        assert!(out.iter().all(|o| o.error.is_none()), "{out:?}");
+        assert_eq!(out.len(), 2);
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
         );
     }
 
