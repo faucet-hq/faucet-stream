@@ -1640,6 +1640,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    if let Some(sh) = &cfg.shard {
+        sh.validate().map_err(CliError::Config)?;
+    }
     if let Err(e) = check_sharding(cfg, &out) {
         tracing::warn!(
             "{e} (`shard:` takes effect only under `faucet serve --cluster`, which refuses \
@@ -2659,6 +2662,13 @@ pipeline:
         let nodes = expand(&cfg).expect("`faucet run` ignores `shard:`, so it only warns");
         let err = check_sharding(&cfg, &nodes).unwrap_err().to_string();
         assert!(err.contains("`shard:` cannot be combined"), "{err}");
+        let huge = PipelineConfig::from_text(
+            &yaml("postgres", "shard: { count: 500000000 }"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        let err = expand(&huge).unwrap_err().to_string();
+        assert!(err.contains("at most 4096 shards"), "{err}");
         let cfg = PipelineConfig::from_text(&yaml("postgres", ""), std::path::Path::new("t.yaml"))
             .unwrap();
         assert!(check_sharding(&cfg, &expand(&cfg).unwrap()).is_ok());

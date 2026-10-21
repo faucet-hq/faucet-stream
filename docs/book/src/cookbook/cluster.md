@@ -290,6 +290,10 @@ pipeline:
   state: { type: postgres, config: { connection_url: ${env:PG_URL} } }
 ```
 
+`shard.count` is at most 4096; a larger value is refused when the config is
+loaded (`faucet validate` reports it too), and every planner caps its shard
+list there.
+
 When a sharded run is submitted, the instance that claims it acts as an
 (ephemeral) **coordinator**: it enumerates the shards and inserts them into the
 shared `faucet_serve_shards` table (idempotently — no leader election). Every

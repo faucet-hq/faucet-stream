@@ -51,6 +51,11 @@ impl MemberShard {
     }
 }
 
+/// Most membership slots one subscription is split into (the same ceiling as
+/// `faucet_core::shard::MAX_SHARDS`, kept local so this crate builds against
+/// any `faucet-core` 1.x).
+pub const MAX_MEMBERS: usize = 4096;
+
 /// Enumerate `target` group-membership slots, optionally capped at the
 /// subscription's total partition count (a member beyond the partition count
 /// would sit idle — Kafka never assigns one partition to two members of a
@@ -59,6 +64,7 @@ impl MemberShard {
 /// `target`. `target <= 1` yields a single whole-dataset shard (run it as one
 /// plain consumer).
 pub fn plan_member_shards(target: usize, partition_cap: Option<usize>) -> Vec<ShardSpec> {
+    let target = target.min(MAX_MEMBERS);
     let n = match partition_cap {
         Some(cap) => target.min(cap.max(1)),
         None => target,
@@ -133,6 +139,11 @@ pub fn commit_list(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn plan_member_shards_is_capped() {
+        assert_eq!(plan_member_shards(usize::MAX, None).len(), MAX_MEMBERS);
+    }
 
     #[test]
     fn plan_member_shards_returns_target_slots() {
