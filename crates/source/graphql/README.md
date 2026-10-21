@@ -131,6 +131,7 @@ faucet run pipeline.yaml
 | `replication_bind.template` | string | `${bookmark}` | Rendered with `${bookmark}` replaced, e.g. `updated_at:>${bookmark}`. |
 | `replication_bind.format` | `raw` \| `iso8601` \| `epoch_s` \| `epoch_ms` \| `date` | `raw` | How the bookmark is formatted first. |
 | `replication_bind.value_type` | `string` \| `number` | `string` | JSON type of the variable. |
+| `replication_key_ordered` | bool | `false` | Declares that the query returns rows in ascending `replication_key` order. Only then does a run stopped early (`max_pages`, a cursor loop) advance the bookmark. |
 
 The page filter keeps records whose key is **at or after** the bookmark (`>=`): a record written in the bookmark's second (or other unit) after the previous run read it would otherwise be lost. The boundary records are delivered again — at-least-once, absorbed by a keyed upsert sink. Bind with `>=` too (`updated_at:>=${bookmark}`) so the server returns them.
 
@@ -162,7 +163,12 @@ source:
   re-delivers old rows.
 - The bookmark is attached to the **final** page only (and to a trailing empty
   page when `max_pages` truncates), so a crash between cursor pages re-reads
-  the run instead of skipping rows. A GraphQL `errors[]` response fails the
+  the run instead of skipping rows.
+- A run that stops before the last page (`max_pages`, or a tolerated cursor
+  loop) advances the bookmark only with `replication_key_ordered: true`
+  (sort the query ascending by the key, e.g. `sortKey: UPDATED_AT`). Without
+  it the unread pages could hold older keys the next run would filter out,
+  so the bookmark stays where the run started and a warning is logged. A GraphQL `errors[]` response fails the
   run before any bookmark is written.
 - When the bookmark sits inside a query-language string (a string filter such as `query:
   "updated_at:>…"`), escaping it is the template author's job.

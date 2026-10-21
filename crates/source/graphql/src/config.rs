@@ -246,6 +246,12 @@ pub struct GraphqlStreamConfig {
     /// Requires `replication_method: incremental` + `replication_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_bind: Option<GraphqlReplicationBind>,
+    /// Declares that the query returns records in ascending `replication_key`
+    /// order. Only then may a run that stops before the last page (`max_pages`,
+    /// or a cursor loop) advance the bookmark: otherwise unread pages could
+    /// hold older keys the next run would skip, so the bookmark stays put.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replication_key_ordered: bool,
     /// Responses to treat as throttling and retry — including a `200` whose
     /// body reports it (`match_success: true` with
     /// `body_path: "$.errors[*].extensions.code"`, `values: [THROTTLED]`). A
@@ -306,6 +312,7 @@ impl GraphqlStreamConfig {
             start_replication_value: None,
             state_key: None,
             replication_bind: None,
+            replication_key_ordered: false,
             retry_on_response: Vec::new(),
             timeout: default_request_timeout(),
             connect_timeout: default_connect_timeout(),

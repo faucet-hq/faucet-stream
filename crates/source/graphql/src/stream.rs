@@ -577,12 +577,17 @@ impl GraphqlDriver {
             let mut running_max: Option<Value> = start.clone();
             let mut missing_keys = 0usize;
             let mut bookmark_emitted = false;
+            // The run stopped with pages possibly unread (`max_pages`, a
+            // tolerated cursor loop): the max over the pages read is a safe
+            // bookmark only for results ordered by the key.
+            let mut truncated = false;
 
             loop {
                 if let Some(max) = self.config.max_pages
                     && pages_fetched >= max
                 {
                     tracing::warn!("max pages ({max}) reached");
+                    truncated = true;
                     break;
                 }
 
@@ -630,6 +635,7 @@ impl GraphqlDriver {
                             PageStep::Stop => false,
                             PageStep::StopLoop => {
                                 tracing::warn!("cursor loop detected, stopping pagination");
+                                truncated = true;
                                 false
                             }
                             PageStep::Inconsistent(why) => {
@@ -652,6 +658,7 @@ impl GraphqlDriver {
                                     tracing::warn!(
                                         "cursor cycle detected (cursor already seen), stopping pagination"
                                     );
+                                    truncated = true;
                                     false
                                 } else {
                                     cursor = Some(next);
@@ -683,6 +690,13 @@ impl GraphqlDriver {
                     None => false,
                 };
 
+                if !has_next && truncated && key.is_some() {
+                    running_max = truncated_bookmark(
+                        start.clone(),
+                        running_max,
+                        self.config.replication_key_ordered,
+                    );
+                }
                 if has_next {
                     // Intermediate page — bookmark stays `None`.
                     yield StreamPage { records, bookmark: None };
@@ -700,6 +714,13 @@ impl GraphqlDriver {
             // Trailing checkpoint: if the loop exited (e.g. via `max_pages`
             // truncation) without carrying the bookmark on a real page, emit
             // one empty page carrying it so the pipeline persists progress.
+            if truncated && !bookmark_emitted && key.is_some() {
+                running_max = truncated_bookmark(
+                    start.clone(),
+                    running_max,
+                    self.config.replication_key_ordered,
+                );
+            }
             if !bookmark_emitted && running_max.is_some() {
                 yield StreamPage {
                     records: Vec::new(),
@@ -720,6 +741,28 @@ impl GraphqlDriver {
             );
         })
     }
+}
+
+/// The bookmark a run that stopped with pages unread may persist. With results
+/// ordered by the key, the max over the pages read is safe (every unread row
+/// sorts at or after it). Without that, an unread page could hold an older key
+/// the next run would filter out, so the bookmark stays at `start`.
+fn truncated_bookmark(
+    start: Option<Value>,
+    running_max: Option<Value>,
+    ordered: bool,
+) -> Option<Value> {
+    if ordered {
+        return running_max;
+    }
+    if running_max != start {
+        tracing::warn!(
+            "incremental GraphQL run stopped before the last page; the bookmark is not \
+             advanced because the results are not declared ordered by `replication_key` \
+             (set `replication_key_ordered: true` when the query sorts ascending by it)"
+        );
+    }
+    start
 }
 
 #[async_trait]

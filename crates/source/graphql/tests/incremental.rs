@@ -269,3 +269,42 @@ async fn replication_bind_writes_into_defaulted_variables() {
         json!({ "since": "updated_at:>2026-01-01T00:00:00Z" })
     );
 }
+
+/// A run cut short by `max_pages` over results not ordered by the key keeps
+/// the start bookmark: the newest key on page 1 would otherwise make the next
+/// run skip the older keys on the unread pages. Declared-ordered results do
+/// advance it.
+#[tokio::test]
+async fn a_truncated_run_advances_the_bookmark_only_for_ordered_results() {
+    let server = MockServer::start().await;
+    let api = Api::default();
+    // Sorted by id; row 1 was updated last.
+    *api.rows.lock().unwrap() = vec![
+        (1, "2026-01-09T00:00:00Z".into()),
+        (2, "2026-01-02T00:00:00Z".into()),
+        (3, "2026-01-03T00:00:00Z".into()),
+        (4, "2026-01-04T00:00:00Z".into()),
+    ];
+    Mock::given(method("POST"))
+        .respond_with(api.clone())
+        .mount(&server)
+        .await;
+    let start = json!("2026-01-01T00:00:00Z");
+    for (ordered, expected) in [
+        (false, start.clone()),
+        (true, json!("2026-01-09T00:00:00Z")),
+    ] {
+        let mut cfg = config(&server).max_pages(1);
+        cfg.replication_key_ordered = ordered;
+        let source = GraphqlStream::new(cfg);
+        source.apply_start_bookmark(start.clone()).await.unwrap();
+        let ctx = std::collections::HashMap::new();
+        let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
+        let last = pages
+            .into_iter()
+            .filter_map(|p| p.unwrap().bookmark)
+            .last()
+            .expect("a bookmark is emitted");
+        assert_eq!(last, expected, "ordered = {ordered}");
+    }
+}
