@@ -490,9 +490,21 @@ async fn exactly_once_empty_pages_and_bad_tokens() {
         .await
         .unwrap();
     assert!(!wh.writes().iter().any(|w| w.starts_with("DELETE")));
-    s.write_batch_idempotent(&[json!(1)], "p::r", "00000000000000000002")
+    // A page with no object field cannot create the table: it is refused and
+    // the watermark does not move past rows that never landed.
+    let writes_before = wh.writes().len();
+    let err = s
+        .write_batch_idempotent(&[json!(1)], "p::r", "00000000000000000002")
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(err.to_string().contains("nothing was written"), "{err}");
+    assert!(
+        !wh.writes()[writes_before..]
+            .iter()
+            .any(|w| w.contains("_faucet_commit_token")),
+        "{:?}",
+        wh.writes()
+    );
 
     let err = s
         .write_batch_idempotent(&[], "p::r", "garbage")

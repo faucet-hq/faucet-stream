@@ -270,6 +270,16 @@ impl DatabricksDriver {
         *self.columns.lock().await = None;
     }
 
+    /// The refusal for a page that cannot create the missing target: it
+    /// carries no object field to plan a column from, so nothing would land.
+    fn no_columns_error(&self) -> FaucetError {
+        FaucetError::Sink(format!(
+            "databricks sink: table {} does not exist and the page has no object fields \
+             to create it from; nothing was written",
+            self.target().display()
+        ))
+    }
+
     /// The destination's columns, creating the table from `records` when it
     /// is missing (and allowed). `None`: no table and nothing to infer from.
     async fn ensure_table(
@@ -829,10 +839,11 @@ impl CommitTokenDriver for DatabricksDriver {
                     if let Some(e) = Self::first_failure(&plan) {
                         return Err(e);
                     }
-                    if let Some(cols) = self.ensure_table(calls, records, false).await? {
-                        self.write_keyed(calls, &plan, &cols, Some((scope, seq)))
-                            .await?;
-                    }
+                    let Some(cols) = self.ensure_table(calls, records, false).await? else {
+                        return Err(self.no_columns_error());
+                    };
+                    self.write_keyed(calls, &plan, &cols, Some((scope, seq)))
+                        .await?;
                 }
             }
             WriteMode::Append => {
@@ -846,7 +857,13 @@ impl CommitTokenDriver for DatabricksDriver {
                         )
                         .await?;
                     }
-                } else if let Some(cols) = self.ensure_table(calls, records, true).await? {
+                } else {
+                    // A page that names no column cannot create the missing
+                    // table, so nothing would land: refuse it rather than
+                    // advance the watermark past rows that were never written.
+                    let Some(cols) = self.ensure_table(calls, records, true).await? else {
+                        return Err(self.no_columns_error());
+                    };
                     self.write_rows(calls, records, &cols, Some((scope, seq)))
                         .await?;
                 }
