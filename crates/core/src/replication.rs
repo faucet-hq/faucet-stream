@@ -1,7 +1,7 @@
 //! Incremental replication support.
 
 use crate::error::FaucetError;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -754,15 +754,19 @@ fn bookmark_instant(value: &Value) -> Result<DateTime<Utc>, FaucetError> {
     match value {
         Value::String(s) => {
             let s = s.trim();
-            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-                return Ok(dt.with_timezone(&Utc));
+            // The same spellings the bookmark ordering accepts (a space or `T`,
+            // optional fractional seconds), so a value stored as the bookmark
+            // always renders back; a naive instant is read as UTC.
+            match Instant::parse(s) {
+                Some(Instant::Zoned(dt)) => return Ok(dt),
+                Some(Instant::Naive(ndt)) => {
+                    return Ok(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+                }
+                None => {}
             }
             if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 && let Some(ndt) = d.and_hms_opt(0, 0, 0)
             {
-                return Ok(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-            }
-            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
                 return Ok(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
             }
             Err(FaucetError::Config(format!(
@@ -1303,6 +1307,24 @@ mod tests {
             b.render(&json!("2024-06-01T12:34:56Z")).unwrap(),
             "2024-06-01"
         );
+    }
+
+    #[test]
+    fn bind_format_accepts_every_spelling_the_bookmark_ordering_stores() {
+        let ms = bind(BindTarget::Query, "${bookmark}", BindFormat::EpochMs);
+        assert_eq!(
+            ms.render(&json!("2024-06-01T12:00:00.123")).unwrap(),
+            "1717243200123"
+        );
+        assert_eq!(
+            ms.render(&json!("2024-06-01 12:00:00")).unwrap(),
+            "1717243200000"
+        );
+        assert_eq!(
+            ms.render(&json!("2024-06-01 12:00:00.5+02:00")).unwrap(),
+            "1717236000500"
+        );
+        assert!(ms.render(&json!("not a time")).is_err());
     }
 
     #[test]
