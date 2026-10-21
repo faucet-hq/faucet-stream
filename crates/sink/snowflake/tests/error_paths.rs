@@ -191,3 +191,56 @@ async fn check_fails_on_error_response() {
         other => panic!("expected a Fail probe, got {other:?}"),
     }
 }
+
+/// The status poll is a read: a throttled or unavailable status endpoint is
+/// retried, so a blip neither cancels the running statement nor fails the
+/// write.
+#[tokio::test]
+async fn a_transient_poll_failure_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "statementHandle": "blip"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/blip"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/blip"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/blip"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "090001",
+            "message": "Statement executed successfully"
+        })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+
+    let sink = SnowflakeSink::new(sample_config())
+        .unwrap()
+        .with_endpoint(endpoint(&server));
+    sink.write_batch(&record())
+        .await
+        .expect("write survives the blips");
+    let cancels = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/cancel"))
+        .count();
+    assert_eq!(cancels, 0, "the statement is never cancelled");
+}

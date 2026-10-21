@@ -532,6 +532,10 @@ impl SnowflakeDriver {
         let poll_timeout = self.config.poll_timeout;
         let started = std::time::Instant::now();
         let mut guard = CancelOnDrop::new(self.client.clone(), self.api_url(), handle);
+        // Consecutive transient poll failures; the poll is a read, so a blip
+        // of the status endpoint is retried rather than cancelling the
+        // running statement.
+        let mut transient = 0u32;
         loop {
             // Re-resolve auth every iteration: a long-running async statement can
             // outlive a short-lived OAuth token, so we re-ask the (single-flight,
@@ -551,8 +555,32 @@ impl SnowflakeDriver {
                         .send()
                         .await)
                 })
-                .await?
-                .map_err(|e| FaucetError::Sink(format!("Snowflake poll request failed: {e}")))?;
+                .await?;
+            let resp = match resp {
+                Ok(resp) if !transient_poll_status(resp.status()) => resp,
+                failed => {
+                    let reason = match failed {
+                        Ok(resp) => format!("HTTP {}", resp.status()),
+                        Err(e) => e.to_string(),
+                    };
+                    transient += 1;
+                    let out_of_time = !poll_timeout.is_zero() && started.elapsed() >= poll_timeout;
+                    if transient > MAX_TRANSIENT_POLLS || out_of_time {
+                        return Err(FaucetError::Sink(format!(
+                            "Snowflake poll request failed {transient} time(s) in a row: {reason}"
+                        )));
+                    }
+                    tracing::warn!(
+                        handle,
+                        attempt = transient,
+                        reason = %reason,
+                        "Snowflake poll failed transiently; retrying"
+                    );
+                    calls.wait(poll_backoff(transient)).await?;
+                    continue;
+                }
+            };
+            transient = 0;
 
             let status = resp.status();
             if status.as_u16() == 202 {
@@ -1297,8 +1325,44 @@ impl faucet_core::driver::ColumnarDriver for SnowflakeDriver {
     }
 }
 
+/// Consecutive transient failures of one statement's status poll before the
+/// statement is given up on (and cancelled).
+const MAX_TRANSIENT_POLLS: u32 = 6;
+
+/// A poll response worth retrying: throttling or an unavailable gateway in
+/// front of the status endpoint, not an answer about the statement.
+fn transient_poll_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
+
+/// Backoff before the `attempt`-th consecutive retry of a failed poll:
+/// 500 ms doubling, capped at 8 s.
+fn poll_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis((500u64 << attempt.saturating_sub(1).min(4)).min(8_000))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transient_polls_back_off_and_only_gateway_failures_retry() {
+        use reqwest::StatusCode;
+        assert!(super::transient_poll_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(super::transient_poll_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!super::transient_poll_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!super::transient_poll_status(
+            StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        let ms = |a| super::poll_backoff(a).as_millis();
+        assert_eq!(
+            [ms(1), ms(2), ms(3), ms(5), ms(9)],
+            [500, 1000, 2000, 8000, 8000]
+        );
+    }
+
     use super::*;
     use crate::config::SnowflakeAuth;
     use faucet_core::Sink as _;
