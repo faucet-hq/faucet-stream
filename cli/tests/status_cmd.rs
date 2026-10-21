@@ -461,3 +461,75 @@ pipeline:
     assert_eq!(r.rows[0].health, Health::Ok);
     run(&["status", &s(&cfg), "--probe"]).await.unwrap();
 }
+
+/// Each overwrite run stages under its own run token: a rerun swaps in its
+/// own rows, leaves a concurrent run's young staging alone (that run may
+/// still be writing it), and drops the staging a crashed run abandoned more
+/// than a day ago. The status probe keeps reporting the live run's staging.
+#[tokio::test]
+async fn an_overwrite_run_leaves_a_concurrent_runs_staging_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.csv"), "id,name\n1,x\n2,y\n").unwrap();
+    let db = dir.path().join("ovw.db");
+    let text = format!(
+        r#"version: 1
+name: ovw
+pipeline:
+  source: {{ type: csv, config: {{ path: {input} }} }}
+  sink: {{ type: sqlite, config: {{ database_url: "sqlite://{db}?mode=rwc", table_name: t, column_mapping: auto_map, create_table: true, write_mode: overwrite }} }}
+  state: {{ type: file, config: {{ path: {state} }} }}
+"#,
+        input = s(&dir.path().join("in.csv")),
+        db = s(&db),
+        state = s(&dir.path().join("state")),
+    );
+    let cfg = dir.path().join("ovw.yaml");
+    std::fs::write(&cfg, &text).unwrap();
+    let summary = faucet_cli::run_from_yaml_str(&text).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+
+    let live = format!(
+        "t__faucet_ovw_{}",
+        faucet_core::idempotency::new_overwrite_run_token()
+    );
+    let abandoned = "t__faucet_ovw_10000000aaaaaa";
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", s(&db)))
+        .await
+        .unwrap();
+    for t in [live.as_str(), abandoned] {
+        sqlx::query(&format!("CREATE TABLE {t} (id INTEGER, name TEXT)"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("INSERT INTO {t} VALUES (9, 'other')"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let summary = faucet_cli::run_from_yaml_str(&text).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM t ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(names, ["x", "y"], "the run swapped in only its own rows");
+    let staging: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 't\\_\\_faucet\\_ovw%' ESCAPE '\\' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        staging,
+        [live.clone()],
+        "only the live run's staging is left"
+    );
+    pool.close().await;
+
+    let mut a = args(&cfg);
+    a.probe = true;
+    let r = faucet_cli::commands::status::build(&a).await.unwrap();
+    let sg = r.rows[0].overwrite_staging.as_ref().expect("probed");
+    assert_eq!((sg.state, sg.verified), ("present", true));
+}

@@ -33,6 +33,7 @@ const NON_IDENTITY_KEYS: &[&str] = &[
     "scope",
     "_overwrite_staging",
     "_activate_version",
+    faucet_core::idempotency::OVERWRITE_RUN_KEY,
 ];
 
 /// Whether a node's sink is configured for `write_mode: overwrite`.

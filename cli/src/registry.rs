@@ -422,6 +422,49 @@ where
     Box::pin(async move { Ok(Box::new(fut.await?) as Box<dyn Sink>) })
 }
 
+/// Remove the executor's overwrite run token
+/// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]) from a sink config: no
+/// connector config declares it, so a sink that stages an overwrite is handed
+/// it through its `with_overwrite_run` instead, and every other sink never
+/// sees it.
+fn take_overwrite_run(kind: &str, mut config: Value) -> CliResult<(Value, Option<String>)> {
+    let Some(v) = config
+        .as_object_mut()
+        .and_then(|m| m.remove(faucet_core::idempotency::OVERWRITE_RUN_KEY))
+    else {
+        return Ok((config, None));
+    };
+    match v {
+        Value::String(t) => Ok((config, Some(t))),
+        Value::Null => Ok((config, None)),
+        other => Err(CliError::InvalidConnectorConfig {
+            kind: "sink",
+            name: kind.to_owned(),
+            message: format!(
+                "`{}` must be an overwrite run token string, got {other}",
+                faucet_core::idempotency::OVERWRITE_RUN_KEY
+            ),
+        }),
+    }
+}
+
+/// Build a sink, then join it to the overwrite run `run` when there is one.
+#[allow(dead_code)]
+async fn joined<S, F>(
+    fut: F,
+    run: Option<String>,
+    join: fn(S, &str) -> Result<S, faucet_core::FaucetError>,
+) -> Result<S, faucet_core::FaucetError>
+where
+    F: std::future::Future<Output = Result<S, faucet_core::FaucetError>>,
+{
+    let sink = fut.await?;
+    match run {
+        Some(token) => join(sink, &token),
+        None => Ok(sink),
+    }
+}
+
 /// Build a [`Source`] trait object from a `(kind, config)` pair. When the
 /// config carries `auth: { ref: <name> }`, the named provider is resolved from
 /// `auth` (the catalog) and injected into the connector.
@@ -810,6 +853,9 @@ async fn build_sink_inner(
     auth: &AuthCatalog,
 ) -> CliResult<Box<dyn Sink>> {
     let config = crate::interpolate::unescaped(config);
+    let (config, overwrite_run) = take_overwrite_run(kind, config)?;
+    // Unused when no overwrite-staging sink is compiled in.
+    let _ = &overwrite_run;
     if let Some(entry) = global().sinks.get(kind) {
         reject_unknown_config_keys("sink", kind, kind, &config, &(entry.schema)())?;
         return (entry.factory)(config);
@@ -823,7 +869,12 @@ async fn build_sink_inner(
         "bigquery" => {
             let cfg =
                 decode::<faucet_sink_bigquery::BigQuerySinkConfig>("sink", "bigquery", config)?;
-            boxed_sink(faucet_sink_bigquery::BigQuerySink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_bigquery::BigQuerySink::new(cfg),
+                overwrite_run,
+                faucet_sink_bigquery::BigQuerySink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-iceberg")]
         "iceberg" => {
@@ -839,7 +890,12 @@ async fn build_sink_inner(
         "postgres" => {
             let cfg =
                 decode::<faucet_sink_postgres::PostgresSinkConfig>("sink", "postgres", config)?;
-            boxed_sink(faucet_sink_postgres::PostgresSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_postgres::PostgresSink::new(cfg),
+                overwrite_run,
+                faucet_sink_postgres::PostgresSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-jsonl")]
         "jsonl" => {
@@ -859,17 +915,32 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-mysql")]
         "mysql" => {
             let cfg = decode::<faucet_sink_mysql::MysqlSinkConfig>("sink", "mysql", config)?;
-            boxed_sink(faucet_sink_mysql::MysqlSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_mysql::MysqlSink::new(cfg),
+                overwrite_run,
+                faucet_sink_mysql::MysqlSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-mssql")]
         "mssql" => {
             let cfg = decode::<faucet_sink_mssql::MssqlSinkConfig>("sink", "mssql", config)?;
-            boxed_sink(faucet_sink_mssql::MssqlSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_mssql::MssqlSink::new(cfg),
+                overwrite_run,
+                faucet_sink_mssql::MssqlSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-sqlite")]
         "sqlite" => {
             let cfg = decode::<faucet_sink_sqlite::SqliteSinkConfig>("sink", "sqlite", config)?;
-            boxed_sink(faucet_sink_sqlite::SqliteSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_sqlite::SqliteSink::new(cfg),
+                overwrite_run,
+                faucet_sink_sqlite::SqliteSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-duckdb")]
         "duckdb" => {
@@ -913,7 +984,12 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-mongodb")]
         "mongodb" => {
             let cfg = decode::<faucet_sink_mongodb::MongoSinkConfig>("sink", "mongodb", config)?;
-            boxed_sink(faucet_sink_mongodb::MongoSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_mongodb::MongoSink::new(cfg),
+                overwrite_run,
+                faucet_sink_mongodb::MongoSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-redis")]
         "redis" => {
@@ -1033,7 +1109,12 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-oracle")]
         "oracle" => {
             let cfg = decode::<faucet_sink_oracle::OracleSinkConfig>("sink", "oracle", config)?;
-            boxed_sink(faucet_sink_oracle::OracleSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_oracle::OracleSink::new(cfg),
+                overwrite_run,
+                faucet_sink_oracle::OracleSink::with_overwrite_run,
+            ))
+            .await
         }
         other => Err(unknown(other, "sink", sink_kinds())),
     }
@@ -1594,7 +1675,11 @@ fn builtin_sink_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
 
 /// Keys the executor itself injects into a connector config — hidden from the
 /// schema, so the unknown-key gate must not refuse them (#789 CLI-72).
-const CLI_INJECTED_KEYS: &[&str] = &["_overwrite_staging", "_activate_version"];
+const CLI_INJECTED_KEYS: &[&str] = &[
+    "_overwrite_staging",
+    "_activate_version",
+    faucet_core::idempotency::OVERWRITE_RUN_KEY,
+];
 
 /// Reject connector-config keys the connector does not declare (#654 H9).
 ///
@@ -4135,6 +4220,59 @@ mod tests {
         reject_unknown_config_keys("sink", "bigquery", "row", &cfg, &schema).unwrap();
         let typo = json!({ "project_id": "p", "_overwrite_stagin": true });
         assert!(reject_unknown_config_keys("sink", "bigquery", "row", &typo, &schema).is_err());
+    }
+
+    /// The executor's overwrite run token is taken out of a sink config
+    /// before it is decoded, and only a string (or null) is accepted.
+    #[test]
+    fn the_overwrite_run_token_is_taken_out_of_the_config() {
+        let (cfg, run) = take_overwrite_run(
+            "sqlite",
+            json!({"a": 1, "_overwrite_run": "67000000abcdef"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (cfg, run.as_deref()),
+            (json!({"a": 1}), Some("67000000abcdef"))
+        );
+        let (cfg, run) = take_overwrite_run("sqlite", json!({"_overwrite_run": null})).unwrap();
+        assert_eq!((cfg, run), (json!({}), None));
+        let (cfg, run) = take_overwrite_run("sqlite", json!("x")).unwrap();
+        assert_eq!((cfg, run), (json!("x"), None));
+        assert!(take_overwrite_run("sqlite", json!({"_overwrite_run": 7})).is_err());
+        let schema = json!({"type": "object", "properties": {"a": {}}});
+        reject_unknown_config_keys(
+            "sink",
+            "sqlite",
+            "row",
+            &json!({"a": 1, "_overwrite_run": "67000000abcdef"}),
+            &schema,
+        )
+        .unwrap();
+    }
+
+    /// A sink that stages an overwrite joins the run; a malformed token is
+    /// refused before it can reach a table name.
+    #[cfg(feature = "sink-sqlite")]
+    #[tokio::test]
+    async fn a_staging_sink_is_built_joined_to_its_overwrite_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("t.db").display());
+        let cfg = |token: &str| {
+            json!({
+                "database_url": url, "table_name": "t", "column_mapping": "auto_map",
+                "write_mode": "overwrite", "_overwrite_run": token
+            })
+        };
+        let auth = AuthCatalog::default();
+        build_sink("sqlite", cfg("67000000abcdef"), &auth)
+            .await
+            .unwrap();
+        let err = build_sink("sqlite", cfg("../x"), &auth)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("_overwrite_run"), "{err}");
     }
 
     #[test]

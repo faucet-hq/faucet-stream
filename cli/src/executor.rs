@@ -1054,11 +1054,14 @@ async fn run_expanded_unredacted(
         // panic (surfaced as a JoinError, which doesn't carry the unit) can be
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
-        for unit in units {
+        for mut unit in units {
             if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
                 break;
             }
             let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
+            if let Some(gi) = overwrite_task_group.get(&group_key) {
+                inject_overwrite_run(&mut unit.node.sink.config, &overwrite_groups[*gi].run_token);
+            }
             if let Some(err) = overwrite_task_group
                 .get(&group_key)
                 .and_then(|gi| begin_failed.get(gi))
@@ -1455,6 +1458,20 @@ struct OverwriteGroup {
     /// only safe swap, so the BigQuery sink is told to stage (`_overwrite_staging`)
     /// rather than load directly. A single-member group is a solo overwrite.
     members: usize,
+    /// The group's overwrite run token
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): set in `cfg` and in
+    /// every member's sink config, so the begin, writer and commit instances
+    /// of this run share one staging target that no concurrent run touches.
+    run_token: String,
+}
+
+/// Join a sink config to an overwrite run (see [`OverwriteGroup::run_token`]).
+/// An explicit value already in the config wins.
+fn inject_overwrite_run(cfg: &mut Value, token: &str) {
+    if let Value::Object(map) = cfg {
+        map.entry(faucet_core::idempotency::OVERWRITE_RUN_KEY)
+            .or_insert_with(|| Value::String(token.to_string()));
+    }
 }
 
 /// Inject the internal `_overwrite_staging` flag into a **bigquery** sink config
@@ -1729,11 +1746,15 @@ async fn plan_overwrite_units(
             }
             None => {
                 let gi = groups.len();
+                let run_token = faucet_core::idempotency::new_overwrite_run_token();
+                let mut cfg = cfg;
+                inject_overwrite_run(&mut cfg, &run_token);
                 groups.push(OverwriteGroup {
                     dest: describe_sink_dest(&kind, &cfg),
                     kind: kind.clone(),
                     cfg,
                     members: 1,
+                    run_token,
                 });
                 gi
             }
@@ -7579,6 +7600,48 @@ matrix:
         let mut cfg = json!({"connection_url": "postgres://x"});
         mark_overwrite_staging("postgres", &mut cfg, true);
         assert!(cfg.get("_overwrite_staging").is_none());
+    }
+
+    /// Every overwrite group carries a fresh run token in its lifecycle
+    /// config, and a second plan of the same destination (another run) gets
+    /// another one, so two concurrent runs never share staging.
+    #[tokio::test]
+    async fn overwrite_groups_carry_a_per_run_token() {
+        use faucet_core::idempotency::{OVERWRITE_RUN_KEY, is_overwrite_run_token};
+        let dir = tempfile::tempdir().unwrap();
+        let opts = exec_opts("t");
+        let mk = |node: &ExpandedNode, pid: &str, id: i64| Unit {
+            node: node.clone(),
+            parent_record: Some(std::sync::Arc::new(json!({ "id": id }))),
+            state_key: format!("t::c::{pid}"),
+            parent_record_key: Some(pid.to_string()),
+            product_ctx: None,
+            legacy_state_keys: Vec::new(),
+        };
+        let shared = overwrite_child_node(dir.path(), "orders");
+        let units = vec![mk(&shared, "1", 1), mk(&shared, "2", 2)];
+        let (groups, task_group) = plan_overwrite_groups(&units, &opts).await.unwrap();
+        assert_eq!((groups.len(), task_group.len()), (1, 2));
+        let token = groups[0].run_token.clone();
+        assert!(is_overwrite_run_token(&token), "{token}");
+        assert_eq!(groups[0].cfg[OVERWRITE_RUN_KEY], json!(token));
+        let (again, _) = plan_overwrite_groups(&units, &opts).await.unwrap();
+        assert_ne!(again[0].run_token, token, "each run gets its own token");
+
+        // The members are joined to the same run; an explicit value wins.
+        let mut cfg = shared.sink.config.clone();
+        inject_overwrite_run(&mut cfg, &token);
+        assert_eq!(cfg[OVERWRITE_RUN_KEY], json!(token));
+        inject_overwrite_run(&mut cfg, &again[0].run_token);
+        assert_eq!(cfg[OVERWRITE_RUN_KEY], json!(token));
+        let mut not_object = json!(null);
+        inject_overwrite_run(&mut not_object, &token);
+        assert!(not_object.is_null());
+        // The token is not part of the destination identity.
+        assert_eq!(
+            crate::destination::identity("sqlite", &cfg),
+            crate::destination::identity("sqlite", &shared.sink.config)
+        );
     }
 
     #[tokio::test]
