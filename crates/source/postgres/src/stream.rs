@@ -530,45 +530,46 @@ fn pg_json_text<'r>(raw: &sqlx::postgres::PgValueRef<'r>) -> Option<&'r str> {
 /// is an error rather than a silent `null`.
 fn pg_value_to_json(
     row: &sqlx::postgres::PgRow,
+    idx: usize,
     col_name: &str,
     json: &JsonContext<'_>,
 ) -> Result<Value, FaucetError> {
-    if let Ok(raw) = row.try_get_raw(col_name)
+    if let Ok(raw) = row.try_get_raw(idx)
         && let Some(text) = pg_json_text(&raw)
     {
         return json_text_to_value(text, col_name, json.mode, json.warned);
     }
 
     // Try common scalar types
-    if let Ok(v) = row.try_get::<String, _>(col_name) {
+    if let Ok(v) = row.try_get::<String, _>(idx) {
         if json.decimal.contains(col_name) {
             return faucet_core::fidelity::decimal_text(&v)
                 .map_err(|e| FaucetError::Source(format!("PostgreSQL column {col_name}: {e}")));
         }
         return Ok(Value::String(v));
     }
-    if let Ok(v) = row.try_get::<i64, _>(col_name) {
+    if let Ok(v) = row.try_get::<i64, _>(idx) {
         return Ok(Value::Number(v.into()));
     }
-    if let Ok(v) = row.try_get::<i32, _>(col_name) {
+    if let Ok(v) = row.try_get::<i32, _>(idx) {
         return Ok(Value::Number(v.into()));
     }
-    if let Ok(v) = row.try_get::<i16, _>(col_name) {
+    if let Ok(v) = row.try_get::<i16, _>(idx) {
         return Ok(Value::Number(v.into()));
     }
-    if let Ok(v) = row.try_get::<f64, _>(col_name) {
+    if let Ok(v) = row.try_get::<f64, _>(idx) {
         return Ok(faucet_core::fidelity::float64(v));
     }
-    if let Ok(v) = row.try_get::<f32, _>(col_name) {
+    if let Ok(v) = row.try_get::<f32, _>(idx) {
         return Ok(faucet_core::fidelity::float32(v));
     }
-    if let Ok(v) = row.try_get::<bool, _>(col_name) {
+    if let Ok(v) = row.try_get::<bool, _>(idx) {
         return Ok(Value::Bool(v));
     }
 
     // `infinity` / `-infinity` dates and timestamps would overflow chrono
     // (a panic inside sqlx's decode), so the sentinels are read first.
-    if let Ok(raw) = row.try_get_raw(col_name)
+    if let Ok(raw) = row.try_get_raw(idx)
         && let Some(v) = temporal_infinity(&raw)
     {
         return Ok(v);
@@ -576,27 +577,25 @@ fn pg_value_to_json(
 
     // Richer types that would otherwise silently decode to Null (#78/#43).
     // Timestamps → RFC3339 / ISO-8601 strings.
-    if let Ok(v) =
-        row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(col_name)
-    {
+    if let Ok(v) = row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(idx) {
         return Ok(Value::String(v.to_rfc3339()));
     }
-    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDateTime, _>(col_name) {
+    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDateTime, _>(idx) {
         return Ok(Value::String(v.to_string()));
     }
-    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(col_name) {
+    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(idx) {
         return Ok(Value::String(v.to_string()));
     }
-    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveTime, _>(col_name) {
+    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveTime, _>(idx) {
         return Ok(Value::String(v.to_string()));
     }
     // UUID → canonical hyphenated string.
-    if let Ok(v) = row.try_get::<sqlx::types::Uuid, _>(col_name) {
+    if let Ok(v) = row.try_get::<sqlx::types::Uuid, _>(idx) {
         return Ok(Value::String(v.to_string()));
     }
     // NUMERIC / DECIMAL (read natively when the text cast could not wrap the
     // query) → its exact digits at the declared scale.
-    if let Ok(raw) = row.try_get_raw(col_name)
+    if let Ok(raw) = row.try_get_raw(idx)
         && raw.type_info().name().eq_ignore_ascii_case("NUMERIC")
         && raw.format() == sqlx::postgres::PgValueFormat::Binary
         && let Some(v) = raw
@@ -606,18 +605,18 @@ fn pg_value_to_json(
     {
         return Ok(v);
     }
-    if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
+    if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(idx) {
         return Ok(Value::String(v.to_plain_string()));
     }
     // BYTEA → base64 (so binary survives the JSON round-trip).
-    if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
+    if let Ok(v) = row.try_get::<Vec<u8>, _>(idx) {
         use base64::Engine as _;
         return Ok(Value::String(
             base64::engine::general_purpose::STANDARD.encode(v),
         ));
     }
 
-    match row.try_get_raw(col_name) {
+    match row.try_get_raw(idx) {
         Ok(raw) if raw.is_null() => Ok(Value::Null),
         Ok(raw) => Err(FaucetError::Source(format!(
             "PostgreSQL column {col_name} has type {} which the source cannot decode; \
@@ -904,12 +903,23 @@ struct JsonContext<'a> {
 
 fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::new();
-    for col in row.columns() {
-        let name = col.name().to_string();
-        let value = pg_value_to_json(row, &name, json)?;
-        map.insert(name, value);
+    for (idx, col) in row.columns().iter().enumerate() {
+        let value = pg_value_to_json(row, idx, col.name(), json)?;
+        map.insert(unique_key(&map, col.name()), value);
     }
     Ok(Value::Object(map))
+}
+
+/// `name`, or `name_2`, `name_3`, … when an earlier column already took it, so
+/// a query with repeated output names keeps every column (`a.id, b.id`).
+fn unique_key(map: &serde_json::Map<String, Value>, name: &str) -> String {
+    if !map.contains_key(name) {
+        return name.to_string();
+    }
+    (2..)
+        .map(|n| format!("{name}_{n}"))
+        .find(|k| !map.contains_key(k))
+        .expect("an unused suffix exists")
 }
 
 #[async_trait]
@@ -1167,7 +1177,8 @@ impl faucet_core::Source for PostgresSource {
                     .await?
             }
         };
-        let bounds_sql = pk_bounds_query(&base, &quote_ident(&shard_cfg.key), "BIGINT");
+        let bounds_sql =
+            pk_bounds_query(&for_subquery(&base), &quote_ident(&shard_cfg.key), "BIGINT");
         let query = bind_params(sqlx::query(&bounds_sql), &self.config.params, &binds)?;
         let row = self
             .read("query", query.fetch_one(&self.pool))
@@ -1353,6 +1364,16 @@ mod tests {
             failed.to_string().contains("PostgreSQL query failed"),
             "{failed}"
         );
+    }
+
+    #[test]
+    fn unique_key_suffixes_repeated_names() {
+        let mut map = serde_json::Map::new();
+        assert_eq!(unique_key(&map, "id"), "id");
+        map.insert("id".into(), Value::Null);
+        assert_eq!(unique_key(&map, "id"), "id_2");
+        map.insert("id_2".into(), Value::Null);
+        assert_eq!(unique_key(&map, "id"), "id_3");
     }
 
     #[test]

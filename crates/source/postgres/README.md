@@ -245,6 +245,10 @@ query with duplicate column names, or a data-modifying `WITH` (legal only at top
 such a type fails the run with an error naming the column instead of turning
 into `null` — alias the columns or cast the value in SQL.
 
+Every output column becomes a record field. When a query repeats a column
+name (`SELECT o.id, c.id …`), the later columns get a numeric suffix — `id`,
+`id_2`, `id_3` — so no column's value is dropped; alias them for clearer names.
+
 ## Matrix-context binding
 
 In a parent/child [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline, the query may reference fields from each parent record with `${parent_id.dotted.path}` tokens. At runtime these are rewritten to additional positional bind markers (appended after the static `params`) and filled per parent record, so a single query template fans out into one parameterized execution per parent row — never string-interpolated, so it is SQL-injection safe. A token may also be a whole quoted literal (`'${parent.name}'` binds the same way); a token embedded in a longer literal (`'x-${parent.id}'`), inside a quoted identifier or inside a comment cannot be bound and is refused when the config loads.
