@@ -30,7 +30,7 @@ default = ["observability", "source", "sink", "state", "transforms", "compressio
 # transform, secrets resolver and catalog option. The container image's
 # complete build is exactly this set; `scripts/full-feature-coverage.py`
 # fails CI when a new feature is left out.
-full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "templates-sync", "templates-sync-object-store", "tenants", "cli-dev", "cli-interactive", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats", "secrets", "kafka-schema-registry", "quality-jsonschema", "arrow", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql"]
+full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "templates-sync", "templates-sync-object-store", "tenants", "cli-dev", "cli-interactive", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats", "secrets", "kafka-schema-registry", "quality-jsonschema", "arrow", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql"]
 
 # Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
 # fetches a catalog through the GitHub contents API and caches it locally;
@@ -210,6 +210,9 @@ source-singer = ["dep:faucet-source-singer"]
 
 sink-bigquery = ["dep:faucet-sink-bigquery"]
 sink-iceberg = ["dep:faucet-sink-iceberg"]
+sink-iceberg-glue = ["faucet-sink-iceberg?/catalog-glue"]
+sink-iceberg-sql = ["faucet-sink-iceberg?/catalog-sql"]
+sink-iceberg-hms = ["faucet-sink-iceberg?/catalog-hms"]
 sink-postgres = ["dep:faucet-sink-postgres"]
 sink-jsonl = ["dep:faucet-sink-jsonl"]
 sink-snowflake = ["dep:faucet-sink-snowflake"]
@@ -773,7 +776,8 @@ features = [
     "rabbitmq-tls", "schedule", "secrets", "serve-history-postgres", "serve-history-sqlite",
     "serve-ui", "sink-azure-blob", "sink-bigquery", "sink-clickhouse-staging", "sink-csv",
     "sink-databricks-staging", "sink-delta", "sink-dynamodb", "sink-elasticsearch",
-    "sink-file", "sink-gcs", "sink-http", "sink-iceberg", "sink-jsonl", "sink-kinesis",
+    "sink-file", "sink-gcs", "sink-http", "sink-iceberg", "sink-iceberg-glue",
+    "sink-iceberg-hms", "sink-iceberg-sql", "sink-jsonl", "sink-kinesis",
     "sink-mongodb", "sink-mssql-staging", "sink-mysql", "sink-nats", "sink-parquet",
     "sink-postgres", "sink-pubsub", "sink-rabbitmq", "sink-redis", "sink-redshift", "sink-s3",
     "sink-sftp", "sink-singer", "sink-snowflake", "sink-spanner", "sink-sqlite", "sink-sqs",
