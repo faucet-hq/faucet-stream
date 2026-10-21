@@ -118,6 +118,9 @@ serve:
   or use `auth.token` / `auth.existingSecret`), `none` (`--no-auth --allow-unauthenticated-network`:
   the pod listens on `0.0.0.0`, so anything that can reach the Service can run
   pipelines; never expose it externally), or `rbac` (inline `auth.rbacConfig` principals → mounted file).
+  Changing `auth.token` or `auth.rbacConfig` rolls the serve pods, so a rotated
+  token or a removed principal stops working at once; after rotating a value in
+  `auth.existingSecret`, run `kubectl rollout restart deployment/<release>-faucet-stream`.
 - **History**: `memory` (ephemeral), `sqlite` (needs `persistence.enabled` for
   durability), or `postgres` (required for `cluster.enabled` multi-instance
   failover). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,

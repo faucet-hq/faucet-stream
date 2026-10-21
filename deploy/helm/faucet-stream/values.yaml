@@ -172,6 +172,9 @@ serve:
     # mode=token: provide a token, or point at an existing Secret key. If both
     # are empty and mode=token, the chart generates a random token on first
     # install (kept stable across upgrades) and stores it in a Secret.
+    # Changing `token` or `rbacConfig` restarts the serve pods; after changing
+    # an existingSecret's value, run `kubectl rollout restart` yourself (the
+    # server reads its credentials once at startup).
     token: ""
     existingSecret: ""
     existingSecretKey: FAUCET_SERVE_AUTH_TOKEN

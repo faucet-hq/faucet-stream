@@ -42,6 +42,15 @@ spec:
         {{- if and (eq .Values.serve.history.backend "postgres") .Values.serve.history.url (not .Values.serve.history.existingSecret) }}
         checksum/serve-history: {{ include (print $.Template.BasePath "/secret-serve-history.yaml") . | sha256sum }}
         {{- end }}
+        {{- /* Over the explicit credentials only: a lookup-derived random token
+               is stable and must not restart pods on every render. */}}
+        {{- if not .Values.serve.auth.existingSecret }}
+        {{- if and (eq .Values.serve.auth.mode "token") .Values.serve.auth.token }}
+        checksum/serve-auth: {{ .Values.serve.auth.token | sha256sum }}
+        {{- else if and (eq .Values.serve.auth.mode "rbac") .Values.serve.auth.rbacConfig }}
+        checksum/serve-auth: {{ toYaml .Values.serve.auth.rbacConfig | sha256sum }}
+        {{- end }}
+        {{- end }}
         {{- if .Values.otel.logs.enabled }}
         checksum/otel: {{ include (print $.Template.BasePath "/otel-logs.yaml") . | sha256sum }}
         {{- end }}
