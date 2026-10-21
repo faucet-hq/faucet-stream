@@ -42,8 +42,10 @@ pub struct PrometheusConfig {
     /// `host:port` to bind a `/metrics` HTTP endpoint. Recommended:
     /// `127.0.0.1:9464`.
     pub listen: String,
-    /// Histogram bucket overrides (in seconds). When `None`, sensible defaults
-    /// apply (0.001..300s spanning sub-ms through five-minute durations).
+    /// Histogram bucket overrides (in seconds), applied to every histogram.
+    /// When `None`, 0.001..300 s applies, and the histograms that time whole
+    /// runs (run / invocation duration, schedule lateness, sink flush, verify)
+    /// get 0.1 s..24 h.
     pub buckets: Option<Vec<f64>>,
 }
 
@@ -304,6 +306,49 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
 /// Install the Prometheus recorder + `/metrics` HTTP endpoint as the sole
 /// global recorder. Extracted verbatim from the original metrics arm so the
 /// fanout / otel-only paths can choose a different recorder.
+/// Histogram buckets (seconds) for calls, pages and writes.
+#[cfg(feature = "observability-install")]
+const DEFAULT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0,
+];
+
+/// Buckets for histograms that time whole runs, which last up to hours.
+#[cfg(feature = "observability-install")]
+const LONG_BUCKETS: &[f64] = &[
+    0.1, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 21600.0, 86400.0,
+];
+
+/// Histograms that get [`LONG_BUCKETS`] unless `prometheus.buckets` is set.
+#[cfg(feature = "observability-install")]
+const LONG_RUNNING_HISTOGRAMS: &[&str] = &[
+    "faucet_pipeline_run_duration_seconds",
+    "faucet_pipeline_invocation_duration_seconds",
+    "faucet_schedule_run_lateness_seconds",
+    "faucet_sink_flush_duration_seconds",
+    "faucet_verify_duration_seconds",
+];
+
+/// Apply `p.buckets` to every histogram, or the defaults with longer buckets
+/// for the run-length histograms.
+#[cfg(feature = "observability-install")]
+fn with_buckets(
+    builder: metrics_exporter_prometheus::PrometheusBuilder,
+    p: &PrometheusConfig,
+) -> Result<metrics_exporter_prometheus::PrometheusBuilder, InstallError> {
+    use metrics_exporter_prometheus::Matcher;
+    let err = |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
+    if let Some(buckets) = p.buckets.as_deref() {
+        return builder.set_buckets(buckets).map_err(err);
+    }
+    let mut builder = builder.set_buckets(DEFAULT_BUCKETS).map_err(err)?;
+    for name in LONG_RUNNING_HISTOGRAMS {
+        builder = builder
+            .set_buckets_for_metric(Matcher::Full((*name).to_string()), LONG_BUCKETS)
+            .map_err(err)?;
+    }
+    Ok(builder)
+}
+
 #[cfg(feature = "observability-install")]
 fn install_prometheus_only(
     p: &PrometheusConfig,
@@ -319,15 +364,7 @@ fn install_prometheus_only(
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
             })?;
 
-    const DEFAULT_BUCKETS: &[f64] = &[
-        0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0,
-    ];
-    let buckets = p.buckets.as_deref().unwrap_or(DEFAULT_BUCKETS);
-
-    let builder = PrometheusBuilder::new()
-        .with_http_listener(listen)
-        .set_buckets(buckets)
-        .map_err(|e| InstallError::PrometheusInstall(e.to_string()))?;
+    let builder = with_buckets(PrometheusBuilder::new().with_http_listener(listen), p)?;
 
     match builder.install() {
         Ok(()) => report.prometheus_listen = Some(p.listen.clone()),
@@ -380,17 +417,10 @@ fn install_fanout(
                 listen: p.listen.clone(),
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
             })?;
-    const DEFAULT_BUCKETS: &[f64] = &[
-        0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0,
-    ];
-    let buckets = p.buckets.as_deref().unwrap_or(DEFAULT_BUCKETS);
-
     // build() returns (recorder, /metrics exporter future) WITHOUT setting the
     // global recorder, so we can fan it out.
-    let (prom_recorder, prom_exporter) = PrometheusBuilder::new()
-        .with_http_listener(listen)
-        .set_buckets(buckets)
-        .map_err(|e| InstallError::PrometheusInstall(e.to_string()))?
+    let (prom_recorder, prom_exporter) =
+        with_buckets(PrometheusBuilder::new().with_http_listener(listen), p)?
         .build()
         .map_err(|e| match e {
             BuildError::FailedToCreateHTTPListener(msg) => InstallError::PrometheusBind {
@@ -537,6 +567,36 @@ mod tests {
     use std::sync::Mutex;
 
     static LOCK: Mutex<()> = Mutex::new(());
+
+    fn rendered(buckets: Option<Vec<f64>>) -> String {
+        let p = PrometheusConfig {
+            listen: "127.0.0.1:0".into(),
+            buckets,
+        };
+        let recorder = with_buckets(metrics_exporter_prometheus::PrometheusBuilder::new(), &p)
+            .unwrap()
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("faucet_pipeline_run_duration_seconds").record(2700.0);
+            metrics::histogram!("faucet_source_page_duration_seconds").record(0.2);
+        });
+        handle.render()
+    }
+
+    #[test]
+    fn run_length_histograms_get_buckets_past_five_minutes() {
+        let out = rendered(None);
+        assert!(
+            out.contains("faucet_pipeline_run_duration_seconds_bucket{le=\"3600\"} 1"),
+            "{out}"
+        );
+        assert!(!out.contains("faucet_source_page_duration_seconds_bucket{le=\"3600\"}"));
+        assert!(out.contains("faucet_source_page_duration_seconds_bucket{le=\"300\"} 1"));
+        let custom = rendered(Some(vec![1.0, 10.0]));
+        assert!(!custom.contains("le=\"3600\""), "{custom}");
+        assert!(custom.contains("faucet_pipeline_run_duration_seconds_bucket{le=\"10\"} 0"));
+    }
 
     #[cfg(feature = "otel")]
     #[test]
