@@ -950,3 +950,62 @@ async fn cached_columns_gain_eo_columns_on_first_exactly_once_write() {
             .any(|x| x.contains("ADD COLUMNS (`_faucet_scope` STRING"))
     );
 }
+
+/// A run joined to an overwrite run token stages under its own table; its
+/// begin drops the untokened staging and staging a crashed run abandoned —
+/// never a live concurrent run's — and the untokened status probe sees any
+/// run's staging.
+#[tokio::test]
+async fn tokened_overwrite_stages_apart_and_sweeps_only_abandoned_runs() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let wh = Warehouse::start().await;
+    wh.on(DESCRIBE, columns(&[("id", "bigint")]));
+    let (own, live) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let names = [
+        format!("orders__faucet_ovw_{live}"),
+        "orders__faucet_ovw_10000000aaaaaa".to_string(),
+        "orders__faucet_ovw_10000000aaaaaa_x".to_string(),
+    ];
+    let data: Vec<Vec<Option<&str>>> = names.iter().map(|n| vec![Some(n.as_str())]).collect();
+    let data: Vec<&[Option<&str>]> = data.iter().map(Vec::as_slice).collect();
+    wh.on("information_schema.tables", rows(&data));
+    let s = sink(&wh, |c| c.write.write_mode = WriteMode::Overwrite)
+        .with_overwrite_run(&own)
+        .unwrap();
+    assert!(
+        sink(&wh, |c| c.write.write_mode = WriteMode::Overwrite)
+            .with_overwrite_run("../x")
+            .is_err()
+    );
+    s.begin_overwrite().await.unwrap();
+    s.write_batch(&[json!({"id": 1})]).await.unwrap();
+    s.commit_overwrite().await.unwrap();
+    assert_eq!(
+        wh.writes(),
+        vec![
+            format!("DROP TABLE IF EXISTS `sales`.`orders__faucet_ovw_{own}`"),
+            "DROP TABLE IF EXISTS `sales`.`orders__faucet_ovw`".to_string(),
+            "DROP TABLE IF EXISTS `sales`.`orders__faucet_ovw_10000000aaaaaa`".to_string(),
+            format!("CREATE TABLE `sales`.`orders__faucet_ovw_{own}` LIKE `sales`.`orders`"),
+            format!(
+                "INSERT INTO `sales`.`orders__faucet_ovw_{own}` (`id`) SELECT CAST(v.c0 AS bigint) AS `id` FROM VALUES ('1') AS v(c0)"
+            ),
+            format!(
+                "INSERT OVERWRITE TABLE `sales`.`orders` SELECT * FROM `sales`.`orders__faucet_ovw_{own}`"
+            ),
+            format!("DROP TABLE IF EXISTS `sales`.`orders__faucet_ovw_{own}`"),
+        ]
+    );
+    // The untokened probe: its own (describe) answer is non-empty here, so
+    // check the listing path with an empty describe.
+    let wh = Warehouse::start().await;
+    wh.on(DESCRIBE, rows(&[]));
+    let probe = sink(&wh, |c| c.write.write_mode = WriteMode::Overwrite);
+    assert_eq!(probe.overwrite_staging_exists().await.unwrap(), Some(false));
+    let live_name = format!("orders__faucet_ovw_{live}");
+    wh.on(
+        "information_schema.tables",
+        rows(&[&[Some(live_name.as_str())]]),
+    );
+    assert_eq!(probe.overwrite_staging_exists().await.unwrap(), Some(true));
+}

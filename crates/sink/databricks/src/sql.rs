@@ -252,6 +252,20 @@ pub fn describe_sql(catalog: Option<&str>) -> String {
     )
 }
 
+/// The tables of `:faucet_schema` whose names start with `:faucet_prefix`
+/// (case-insensitively), one `table_name` per row.
+pub fn staging_tables_sql(catalog: Option<&str>) -> String {
+    let src = match catalog {
+        Some(c) => format!("{}.information_schema.tables", quote_ident(c)),
+        None => "information_schema.tables".to_owned(),
+    };
+    format!(
+        "SELECT table_name FROM {src} \
+         WHERE lower(table_schema) = lower(:faucet_schema) \
+         AND startswith(lower(table_name), lower(:faucet_prefix))"
+    )
+}
+
 /// Decode [`describe_sql`] rows.
 pub fn columns_from_rows(rows: Vec<Vec<Option<String>>>) -> Vec<TableColumn> {
     rows.into_iter()

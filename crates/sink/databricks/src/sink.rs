@@ -21,7 +21,7 @@ use faucet_core::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::config::{DatabricksLoadMethod, DatabricksSinkConfig, OVW_SUFFIX};
+use crate::config::{DatabricksLoadMethod, DatabricksSinkConfig};
 use crate::sql::{
     self, Matrix, OP_COL, Relation, TableColumn, TableRef, build_matrix, chunk_ranges,
     missing_eo_columns,
@@ -62,6 +62,9 @@ pub(crate) struct DatabricksDriver {
     stage_seq: AtomicU64,
     columns: tokio::sync::Mutex<Option<Vec<TableColumn>>>,
     token_table_ready: AtomicBool,
+    /// The overwrite run this instance belongs to: staging is then
+    /// `<table>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
 }
 
 impl DatabricksSink {
@@ -76,6 +79,17 @@ impl DatabricksSink {
     pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
         self.inner.driver_mut().auth_provider = Some(provider);
         self
+    }
+
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.inner.driver_mut().overwrite_run = Some(token.to_string());
+        Ok(self)
     }
 
     /// Override the base URL (e.g. a mock server).
@@ -159,6 +173,7 @@ impl DatabricksDriver {
             stage_seq: AtomicU64::new(0),
             columns: tokio::sync::Mutex::new(None),
             token_table_ready: AtomicBool::new(false),
+            overwrite_run: None,
         })
     }
 
@@ -196,13 +211,74 @@ impl DatabricksDriver {
     /// Where this instance's writes land: the overwrite staging table during
     /// an overwrite run, else the target.
     fn target(&self) -> TableRef {
-        let t = self.final_target();
         if self.config.write.is_overwrite() {
-            let name = format!("{}{OVW_SUFFIX}", self.config.table);
-            t.sibling(&name)
+            self.staging_ref(self.overwrite_run.as_deref())
         } else {
-            t
+            self.final_target()
         }
+    }
+
+    /// The staging table of overwrite run `run` (the untokened name without one).
+    fn staging_ref(&self, run: Option<&str>) -> TableRef {
+        self.final_target().sibling(&format!(
+            "{}{}",
+            self.config.table,
+            faucet_core::idempotency::overwrite_staging_suffix(run)
+        ))
+    }
+
+    /// The schema's tables named like any run's tokened staging of the target.
+    async fn tokened_staging(&self, calls: &CallSlot) -> Result<Vec<String>, FaucetError> {
+        let target = self.final_target();
+        let req = StatementRequest::new(sql::staging_tables_sql(target.catalog.as_deref()))
+            .param(StatementParam::string("faucet_schema", &target.schema))
+            .param(StatementParam::string(
+                "faucet_prefix",
+                faucet_core::idempotency::overwrite_staging_prefix(&self.config.table),
+            ));
+        let resp = self.run(calls, req, Replay::Safe).await?;
+        Ok(resp
+            .string_rows()
+            .into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter(|n| {
+                faucet_core::idempotency::overwrite_staging_token(&self.config.table, n).is_some()
+            })
+            .collect())
+    }
+
+    /// At a tokened begin: drop the untokened staging an earlier release (or
+    /// a run without a token) left, and every tokened staging another run
+    /// abandoned ([`faucet_core::idempotency::abandoned_overwrite_staging`]).
+    /// A live run's staging and this run's own are never touched.
+    async fn sweep_staging(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.overwrite_run.is_none() {
+            return Ok(());
+        }
+        self.exec(
+            calls,
+            sql::drop_table_sql(&self.staging_ref(None)),
+            Replay::Safe,
+        )
+        .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for name in self.tokened_staging(calls).await? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                &self.config.table,
+                &name,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                tracing::warn!(staging = %name, "databricks overwrite: dropping staging an earlier run abandoned");
+                let stale = self.final_target().sibling(&name);
+                self.exec(calls, sql::drop_table_sql(&stale), Replay::Safe)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn run(
@@ -960,6 +1036,7 @@ impl StagingDriver for DatabricksDriver {
         let staging = self.target();
         self.exec(calls, sql::drop_table_sql(&staging), Replay::Safe)
             .await?;
+        self.sweep_staging(calls).await?;
         if self.describe(calls, &target).await?.is_empty() {
             if !self.config.create_table {
                 return Err(faucet_core::missing_target_error(
@@ -1019,12 +1096,14 @@ impl StagingDriver for DatabricksDriver {
             .map(|_| ())
     }
 
-    /// Whether the overwrite staging table exists: a read-only describe.
+    /// Whether this run's staging table exists (read-only); without a run
+    /// token (the `faucet status` probe) the untokened staging or any run's.
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
-        let staging = self
-            .final_target()
-            .sibling(&format!("{}{OVW_SUFFIX}", self.config.table));
-        Ok(!self.describe(calls, &staging).await?.is_empty())
+        let staging = self.staging_ref(self.overwrite_run.as_deref());
+        if !self.describe(calls, &staging).await?.is_empty() {
+            return Ok(true);
+        }
+        Ok(self.overwrite_run.is_none() && !self.tokened_staging(calls).await?.is_empty())
     }
 }
 
