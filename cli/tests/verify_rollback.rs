@@ -557,6 +557,53 @@ async fn rollback_is_blocked_by_a_later_run_unless_forced() {
 }
 
 #[tokio::test]
+async fn a_rollback_is_refused_while_a_run_of_the_row_holds_its_lease() {
+    let d = fresh().await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "rollback: {}",
+    ));
+    let first = run(&cfg).await;
+    let run_id = first.invocations[0].run_id.clone().unwrap();
+    let marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    let store: std::sync::Arc<dyn faucet_core::StateStore> =
+        std::sync::Arc::new(faucet_core::FileStateStore::new(&d.state));
+    let live = faucet_cli::pipeline_state::lease::try_acquire(
+        std::sync::Arc::clone(&store),
+        &marker.state_key,
+        "a-live-run",
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("the test takes the lease");
+    let inputs = |dry_run| RollbackInputs {
+        run_id: run_id.clone(),
+        row: None,
+        dry_run,
+        force: false,
+        pipeline_name: "mirror".into(),
+        auth: Default::default(),
+    };
+    let err = faucet_cli::rollback::rollback(&cfg, inputs(false))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, faucet_cli::error::CliError::LeaseHeld(_)), "{err}");
+    assert_eq!(rows(&d.dst).await.len(), 4, "refused: untouched");
+    // A dry run changes nothing, so it needs no lease.
+    faucet_cli::rollback::rollback(&cfg, inputs(true)).await.unwrap();
+    live.release().await;
+    let report = faucet_cli::rollback::rollback(&cfg, inputs(false)).await.unwrap();
+    assert!(report.outcome.applied, "{report:?}");
+}
+
+#[tokio::test]
 async fn append_and_overwrite_runs_are_undone() {
     let d = fresh().await;
     // An append destination has no primary key: the same ids land twice.

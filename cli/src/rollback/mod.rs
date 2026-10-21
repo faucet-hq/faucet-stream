@@ -261,7 +261,37 @@ pub async fn rollback(cfg: &PipelineConfig, inputs: RollbackInputs) -> CliResult
 }
 
 /// Undo a run against an already-expanded node, given its marker.
+///
+/// A real rollback holds the row's run lease while it runs, as a run does:
+/// a run of the row starting meanwhile would read the bookmark the rollback
+/// is about to rewind and persist its own over it, so the undone rows would
+/// never be read again. A live run refuses the rollback.
 pub async fn rollback_node(
+    node: &ExpandedNode,
+    store: Arc<dyn StateStore>,
+    marker: RunMarker,
+    inputs: &RollbackInputs,
+) -> CliResult<RollbackReport> {
+    let lease = if inputs.dry_run {
+        None
+    } else {
+        crate::pipeline_state::lease::try_acquire(
+            Arc::clone(&store),
+            &marker.state_key,
+            &format!("rollback-{}", marker.run_id),
+            false,
+        )
+        .await
+        .map_err(|held| CliError::LeaseHeld(held.message(&marker.state_key)))?
+    };
+    let result = rollback_node_leased(node, store, marker, inputs).await;
+    if let Some(lease) = lease {
+        lease.release().await;
+    }
+    result
+}
+
+async fn rollback_node_leased(
     node: &ExpandedNode,
     store: Arc<dyn StateStore>,
     marker: RunMarker,
