@@ -364,7 +364,29 @@ fn extract_string(body: &Value, path: &str) -> Option<String> {
 /// Extract a single u64 value from a JSON body using a JSONPath expression.
 fn extract_u64(body: &Value, path: &str) -> Option<u64> {
     let results = body.query(path).ok()?;
-    results.first()?.as_u64()
+    let value = results.first()?;
+    let secs = expiry_seconds(value);
+    if secs.is_none() {
+        tracing::warn!(
+            path,
+            "token expiry {value} is not a whole number of seconds; the token is cached until a 401"
+        );
+    }
+    secs
+}
+
+/// A token lifetime in seconds from a JSON number (integral) or a numeric
+/// string, the two shapes identity providers send `expires_in` in.
+pub(crate) fn expiry_seconds(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0 && *f <= u64::MAX as f64)
+                .map(|f| f as u64)
+        }),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +423,15 @@ mod tests {
     fn extract_u64_returns_none_for_string() {
         let body = json!({"expires_in": "not a number"});
         assert_eq!(extract_u64(&body, "$.expires_in"), None);
+    }
+
+    #[test]
+    fn extract_u64_accepts_numeric_strings_and_integral_floats() {
+        assert_eq!(extract_u64(&json!({"e": "3600"}), "$.e"), Some(3600));
+        assert_eq!(extract_u64(&json!({"e": " 60 "}), "$.e"), Some(60));
+        assert_eq!(extract_u64(&json!({"e": 3600.0}), "$.e"), Some(3600));
+        assert_eq!(extract_u64(&json!({"e": "-5"}), "$.e"), None);
+        assert_eq!(extract_u64(&json!({"e": true}), "$.e"), None);
     }
 
     #[test]
