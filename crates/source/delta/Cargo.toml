@@ -32,6 +32,7 @@ futures.workspace = true
 async-stream.workspace = true
 deltalake.workspace = true
 arrow.workspace = true
+chrono.workspace = true
 parquet = { workspace = true }
 object_store.workspace = true
 

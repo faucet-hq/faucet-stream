@@ -6318,6 +6318,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-stream",
  "async-trait",
+ "chrono",
  "deltalake",
  "faucet-common-delta",
  "faucet-conformance",

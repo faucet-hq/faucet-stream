@@ -381,3 +381,42 @@ async fn columnar_batches_carry_the_table_schema_for_an_evolved_table() {
         assert_eq!(ids.values(), &[1, 2]);
     }
 }
+
+/// Timestamp, decimal and binary partition values render like data columns
+/// of the same type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_partition_values_follow_the_value_renderings() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parquet(&dir.path().join("a.parquet"), &ids(1), 1_000);
+    write_log(
+        dir.path(),
+        json!([
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "ts", "type": "timestamp", "nullable": true, "metadata": {}},
+            {"name": "amount", "type": "decimal(10,2)", "nullable": true, "metadata": {}},
+            {"name": "tag", "type": "binary", "nullable": true, "metadata": {}}
+        ]),
+        &["ts", "amount", "tag"],
+        json!({}),
+        &[(
+            "a.parquet".into(),
+            json!({"ts": "2026-01-01 00:00:00", "amount": "1.50", "tag": "\u{1}\u{2}\u{3}"}),
+        )],
+        plain_protocol(),
+    );
+    let rows = DeltaSource::new(source(dir.path()))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![json!({
+            "id": 0,
+            "ts": "2026-01-01T00:00:00.000000Z",
+            "amount": "1.50",
+            "tag": "AQID"
+        })]
+    );
+}
