@@ -563,23 +563,26 @@ async fn mysql_review_862_regressions() {
     sink.write_batch(&[json!({"id": 20, "parent_id": 99})])
         .await
         .unwrap();
-    let err = MysqlSink::new(ovw())
-        .await
-        .unwrap()
-        .commit_overwrite()
-        .await
-        .unwrap_err();
+    let mut one_connection = ovw();
+    one_connection.max_connections = 1;
+    let committer = MysqlSink::new(one_connection).await.unwrap();
+    let err = committer.commit_overwrite().await.unwrap_err();
     assert!(err.to_string().contains("fk_cat_parent"), "{err}");
     assert_eq!(
         texts(&pool, "SELECT CAST(id AS CHAR) FROM cat ORDER BY id").await,
         vec!["10", "11"],
         "a broken key leaves the target as it was"
     );
-    let checks: i64 = sqlx::query_scalar("SELECT @@SESSION.foreign_key_checks")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(checks, 1);
+    // No session the server holds, the committer's included, keeps checks off.
+    let off: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM performance_schema.variables_by_thread \
+         WHERE VARIABLE_NAME = 'foreign_key_checks' AND VARIABLE_VALUE <> 'ON'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(off, 0);
+    drop(committer);
 
     // review 868 sql 4: a key to a same-named table in another database is
     // not self-referencing, and is validated against that database's table.
