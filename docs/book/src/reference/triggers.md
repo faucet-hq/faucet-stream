@@ -85,7 +85,7 @@ store:
   endpoint: null            # S3 only — override endpoint URL for S3-compatible stores
 poll_interval_secs: 30      # how often to list the prefix (default 30)
 mode: per_object            # per_object (one run per new object) | batch (one run for all new objects)
-start_at: now               # now (only objects seen after startup) | beginning (all objects, incl. existing)
+start_at: now               # now (only objects after the first startup) | beginning (all objects, incl. existing)
 lookback_secs: 86400        # how far behind the newest fired object a late-listed one still fires (default 24h)
 ```
 
@@ -136,9 +136,16 @@ string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
 - `mode: batch`: `trig:<name>:<watermark>` where `<watermark>` is the maximum
   `last_modified` timestamp across the batch.
 
-**`start_at: now` behaviour:** on first startup the watcher records the current set of keys as
-its cursor; only keys seen in subsequent polls are treated as new. Set `start_at: beginning` to
+**`start_at: now` behaviour:** on its first startup the watcher ignores every object last
+modified before that moment; only objects after it are treated as new. Set `start_at: beginning` to
 fire for all objects currently in the prefix (use `mode: batch` to coalesce them into one run).
+
+**The cursor survives a restart.** The watcher keeps its cursor (the start point and the objects
+it fired within the look-back window) in the run-history settings store, keyed by trigger name,
+and resumes from it after a restart: an object that landed while the server was down is fired,
+and an object already fired is not fired again. `start_at` applies only when no cursor is stored
+(or the trigger's bucket or prefix changed). With the in-memory history the cursor lasts as long
+as the process.
 
 **A fire that cannot start:** when an object's run is refused for a reason a
 retry cannot fix (its substituted config does not load, a policy or validation

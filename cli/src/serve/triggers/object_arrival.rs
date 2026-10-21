@@ -125,6 +125,49 @@ impl Cursor {
     }
 }
 
+/// The durable form of a [`Cursor`], kept in the history's settings store
+/// so a restart resumes where the watcher stopped.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredCursor {
+    /// The listing this cursor belongs to; a changed bucket or prefix starts
+    /// over.
+    bucket: String,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    floor: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    watermark: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    seen: Vec<(String, chrono::DateTime<chrono::Utc>)>,
+}
+
+impl Cursor {
+    fn to_stored(&self, bucket: &str, prefix: Option<&str>) -> StoredCursor {
+        let mut seen: Vec<_> = self.seen.iter().map(|(k, t)| (k.clone(), *t)).collect();
+        seen.sort();
+        StoredCursor {
+            bucket: bucket.to_string(),
+            prefix: prefix.map(str::to_string),
+            floor: self.floor,
+            watermark: self.watermark,
+            seen,
+        }
+    }
+
+    /// Take the fired state from `stored`, keeping this cursor's look-back.
+    fn restore(&mut self, stored: StoredCursor) {
+        self.floor = stored.floor;
+        self.watermark = stored.watermark;
+        self.seen = stored.seen.into_iter().collect();
+    }
+}
+
+/// The settings-store key of a trigger's cursor.
+fn cursor_key(trigger: &str) -> String {
+    format!("trigger_cursor:{trigger}")
+}
+
 /// A stable digest of a batch's objects, so two batches with the same newest
 /// time but different objects get different idempotency keys.
 fn batch_digest(objects: &[ListedObject]) -> String {
@@ -155,6 +198,8 @@ pub struct ObjectArrivalWatcher {
     mode: ArrivalMode,
     poll: Duration,
     cursor: Cursor,
+    /// Whether the stored cursor has been read (once, on the first poll).
+    resumed: bool,
     compiled: Arc<super::compiled::CompiledTrigger>,
 }
 
@@ -211,7 +256,45 @@ impl ObjectArrivalWatcher {
             mode,
             poll,
             cursor,
+            resumed: false,
             compiled,
+        }
+    }
+
+    /// Resume from the cursor a previous process stored, so objects that
+    /// arrived while the server was down are still fired (`start_at: now`
+    /// applies to the first start only) and fired ones are not fired again.
+    async fn resume(&mut self, state: &ServerState) -> Result<(), String> {
+        if self.resumed {
+            return Ok(());
+        }
+        let stored = state
+            .history()
+            .meta_get(&cursor_key(&self.name))
+            .await
+            .map_err(|e| format!("reading the stored cursor: {e}"))?;
+        match stored.and_then(|s| serde_json::from_str::<StoredCursor>(&s).ok()) {
+            Some(c) if c.bucket == self.bucket && c.prefix == self.prefix => self.cursor.restore(c),
+            _ => self.save(state).await,
+        }
+        self.resumed = true;
+        Ok(())
+    }
+
+    /// Store the cursor. A failure is logged: the cursor is still held in
+    /// memory, and a restart before the next good write re-fires (replay-safe
+    /// through the idempotency keys) rather than skips.
+    async fn save(&self, state: &ServerState) {
+        let stored = self.cursor.to_stored(&self.bucket, self.prefix.as_deref());
+        let Ok(text) = serde_json::to_string(&stored) else {
+            return;
+        };
+        if let Err(e) = state
+            .history()
+            .meta_put(&cursor_key(&self.name), &text)
+            .await
+        {
+            tracing::warn!(trigger = %self.name, error = %e, "could not store the object_arrival cursor");
         }
     }
 
@@ -254,6 +337,7 @@ impl Watcher for ObjectArrivalWatcher {
     }
 
     async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
+        self.resume(state).await?;
         let listing = self.list().await?;
         let mut new = self.cursor.new_objects(&listing);
         if new.is_empty() {
@@ -345,6 +429,9 @@ impl Watcher for ObjectArrivalWatcher {
                     _ => {} // dropped: cursor unchanged, retry next poll
                 }
             }
+        }
+        if fired || problem.is_some() {
+            self.save(state).await;
         }
         match problem {
             Some(e) => Err(e),
