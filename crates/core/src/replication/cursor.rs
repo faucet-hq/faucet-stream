@@ -258,13 +258,124 @@ fn canonical(v: &Value, out: &mut String) {
 /// Whether `token` is compared with a strict `>` (or `<` on its left) anywhere
 /// in `query`. A cursor read must use `>=`: the boundary value is re-read and
 /// deduplicated, and a strict comparison skips rows that share it.
+///
+/// The comparison is the nearest operator on either side of the token within
+/// its predicate, looking through wrappers such as `CAST(… AS t)`, `(…)`,
+/// `TIMESTAMP …`, `to_timestamp(…)` and `…::type`; a match must end on an
+/// identifier boundary (`@bookmark` does not match `@bookmark_old`).
 pub fn strict_comparison(query: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
     query.match_indices(token).any(|(i, _)| {
-        let before = query[..i].trim_end();
-        let after = query[i + token.len()..].trim_start();
-        (before.ends_with('>') && !before.ends_with("<>"))
-            || (after.starts_with('<') && !after.starts_with("<=") && !after.starts_with("<>"))
+        let end = i + token.len();
+        let ident_tail = token.ends_with(is_ident_char);
+        if ident_tail && query[end..].starts_with(is_ident_char) {
+            return false;
+        }
+        nearest_operator_left(&query[..i]).as_deref() == Some(">")
+            || nearest_operator_right(&query[end..]).as_deref() == Some("<")
     })
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_operator_char(c: char) -> bool {
+    matches!(c, '<' | '>' | '=' | '!' | '-')
+}
+
+/// Words that end the predicate the token sits in.
+fn is_boundary_word(w: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "and", "or", "not", "where", "on", "when", "then", "else", "having", "select", "from",
+        "between", "like", "in", "is", "case", "join", "by", "set", "values",
+    ];
+    WORDS.iter().any(|k| w.eq_ignore_ascii_case(k))
+}
+
+/// An operator run that is not a comparison (`->`, `->>`, `=>`, `--`).
+fn non_comparison(op: &str) -> bool {
+    op.contains('-') || op.ends_with("=>")
+}
+
+/// The comparison operator closest before the token, or `None` when the
+/// predicate starts first.
+fn nearest_operator_left(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut j = chars.len();
+    while j > 0 {
+        let c = chars[j - 1];
+        if c == ',' || c == ';' {
+            return None;
+        }
+        if is_operator_char(c) {
+            let mut k = j;
+            while k > 0 && is_operator_char(chars[k - 1]) {
+                k -= 1;
+            }
+            let op: String = chars[k..j].iter().collect();
+            if non_comparison(&op) {
+                j = k;
+                continue;
+            }
+            return Some(op);
+        }
+        if is_ident_char(c) {
+            let mut k = j;
+            while k > 0 && is_ident_char(chars[k - 1]) {
+                k -= 1;
+            }
+            let word: String = chars[k..j].iter().collect();
+            if is_boundary_word(&word) {
+                return None;
+            }
+            j = k;
+            continue;
+        }
+        j -= 1;
+    }
+    None
+}
+
+/// The comparison operator closest after the token, or `None` when the
+/// predicate ends first.
+fn nearest_operator_right(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut j = 0;
+    while j < chars.len() {
+        let c = chars[j];
+        if c == ',' || c == ';' {
+            return None;
+        }
+        if is_operator_char(c) {
+            let mut k = j;
+            while k < chars.len() && is_operator_char(chars[k]) {
+                k += 1;
+            }
+            let op: String = chars[j..k].iter().collect();
+            if non_comparison(&op) {
+                j = k;
+                continue;
+            }
+            return Some(op);
+        }
+        if is_ident_char(c) {
+            let mut k = j;
+            while k < chars.len() && is_ident_char(chars[k]) {
+                k += 1;
+            }
+            let word: String = chars[j..k].iter().collect();
+            if is_boundary_word(&word) {
+                return None;
+            }
+            j = k;
+            continue;
+        }
+        j += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -435,5 +546,35 @@ mod tests {
             "a >= @bookmark AND b > @bookmark",
             "@bookmark"
         ));
+    }
+
+    #[test]
+    fn a_strict_comparison_is_found_through_wrappers() {
+        let t = "${bookmark}";
+        for q in [
+            "WHERE ts > CAST(${bookmark} AS timestamptz)",
+            "WHERE ts > (${bookmark})",
+            "WHERE ts > TIMESTAMP ${bookmark}",
+            "WHERE ts > to_timestamp(${bookmark})",
+            "WHERE ${bookmark}::text < ts",
+            "WHERE CAST(${bookmark} AS timestamp) < ts AND id > 0",
+        ] {
+            assert!(strict_comparison(q, t), "{q}");
+        }
+        for q in [
+            "WHERE ts >= CAST(${bookmark} AS timestamptz)",
+            "WHERE ts >= (${bookmark}) AND id > 0",
+            "WHERE ${bookmark}::text <= ts",
+            "WHERE id > 0 AND ts >= ${bookmark}",
+            "WHERE ts BETWEEN ${bookmark} AND now()",
+            "WHERE greatest(a > 1, ${bookmark}) >= ts",
+            "WHERE data->>'ts' >= ${bookmark}",
+            "WHERE ts >= f(x => ${bookmark})",
+        ] {
+            assert!(!strict_comparison(q, t), "{q}");
+        }
+        // The token matches only on an identifier boundary.
+        assert!(!strict_comparison("WHERE ts > @bookmark_old", "@bookmark"));
+        assert!(strict_comparison("WHERE ts > :bookmark", ":bookmark"));
     }
 }
