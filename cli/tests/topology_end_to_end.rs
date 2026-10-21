@@ -897,6 +897,45 @@ pipeline:
 
 // ── #456: topology mode must not bypass the governance layer ─────────────────
 
+/// A topology dry run never builds the real sink: a SQLite sink would create
+/// its database file (and directory) just to report its dataset URI.
+#[tokio::test]
+async fn a_topology_dry_run_does_not_build_the_sink() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let db = dir.path().join("out").join("prod.db");
+    let cfg = parse(&format!(
+        r#"version: 1
+name: dry_sqlite
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: sqlite, config: {{ database_url: "sqlite:{db}", table_name: t, create_table: true, column_mapping: auto_map }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+        csv = csv.display(),
+        db = db.display()
+    ));
+    let auth = build_auth_catalog(None).unwrap();
+    faucet_cli::topology::run_topology(
+        &cfg,
+        &auth,
+        faucet_cli::topology::TopologyRunOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!db.exists(), "the dry run created the database");
+    assert!(!dir.path().join("out").exists(), "the dry run created its directory");
+}
+
 /// #456 C2: `--dry-run` used to be silently ignored in topology mode, so it
 /// performed real writes. It must now write nothing.
 #[test]

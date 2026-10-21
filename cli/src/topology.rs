@@ -1058,8 +1058,11 @@ async fn build_topology_inner(
                     }
                     Box::new(crate::executor::CountingSink::new())
                 } else if opts.dry_run {
-                    if let Ok(probe) = build_sink(&k, c.clone(), auth).await {
-                        record_identity(&mut identities, id, &k, c.clone(), probe.dataset_uri());
+                    // Building the sink connects to the destination (or
+                    // creates a database file), so the identity comes from
+                    // the config alone, where it can.
+                    if let Some(dest) = crate::registry::sink_shared_destination(&k, &c) {
+                        record_identity(&mut identities, id, &k, c.clone(), dest);
                     }
                     Box::new(crate::executor::CountingSink::new())
                 } else {
