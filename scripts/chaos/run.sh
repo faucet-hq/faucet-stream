@@ -167,11 +167,33 @@ EOF
   k rollout status deploy/pg --timeout=300s >/dev/null
   psql postgres "CREATE DATABASE data"
   psql data "CREATE TABLE slow_out(id int PRIMARY KEY, v text); CREATE TABLE fast_out(id int PRIMARY KEY, v text); CREATE TABLE tick_log(ts text, fired text)"
+  # slow_out is an upsert target, so its row count cannot show a run executing
+  # twice. Every write is also logged with the writing pod's address, and
+  # single_writer checks no two pods wrote it at overlapping times.
+  psql data "CREATE TABLE slow_log(id int, client inet, at timestamptz);
+    CREATE FUNCTION log_slow() RETURNS trigger LANGUAGE plpgsql AS \$\$
+      BEGIN INSERT INTO slow_log VALUES (NEW.id, inet_client_addr(), clock_timestamp()); RETURN NEW; END \$\$;
+    CREATE TRIGGER slow_log AFTER INSERT OR UPDATE ON slow_out FOR EACH ROW EXECUTE FUNCTION log_slow()"
   k create secret generic faucet-creds --from-literal=PGPASSWORD=pw >/dev/null
 }
 
 psql() { k exec deploy/pg -- psql -U postgres -d "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"; }
 sql() { psql data "$1"; }
+
+reset_slow() { sql "TRUNCATE slow_out; TRUNCATE slow_log"; }
+
+# Fails when two pods wrote slow_out over overlapping intervals: a reclaimed
+# run may rewrite rows the dead owner wrote, but only after it stopped.
+single_writer() {
+  local overlap
+  overlap="$(sql "WITH w AS (SELECT client, min(at) AS first, max(at) AS last FROM slow_log GROUP BY client)
+    SELECT coalesce(string_agg(a.client || ' [' || a.first || ', ' || a.last || '] / ' || b.client || ' [' || b.first || ', ' || b.last || ']', '; '), '')
+    FROM w a JOIN w b ON a.client < b.client AND a.first <= b.last AND b.first <= a.last")"
+  [ -z "$overlap" ] || fail "two pods wrote the run at the same time: ${overlap}" || return 1
+  [ "$(sql 'SELECT count(DISTINCT id) FROM slow_log')" = 600 ] || fail "$(sql 'SELECT count(DISTINCT id) FROM slow_log') distinct ids written" || return 1
+}
+
+writers() { sql "SELECT count(DISTINCT client) FROM slow_log"; }
 
 fresh_history_db() {
   psql postgres "DROP DATABASE IF EXISTS faucet_history WITH (FORCE)" >/dev/null
@@ -352,7 +374,7 @@ s_membership() { # #914 too: pods started together must not start degraded
 }
 
 s_kill_owner() {
-  sql "TRUNCATE slow_out"
+  reset_slow
   local port id owner t0 st
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || fail "no owner for ${id}" || return 1
@@ -363,11 +385,12 @@ s_kill_owner() {
   [ "$st" = completed ] || fail "status ${st}" || return 1
   [ "$(field "$port" "$id" attempt)" -ge 1 ] || fail "not reclaimed" || return 1
   [ "$(sql 'SELECT count(*) FROM slow_out')" = 600 ] || fail "rows $(sql 'SELECT count(*) FROM slow_out')" || return 1
-  echo "owner killed; reclaimed and completed $(( $(date +%s) - t0 ))s later, 600 rows"
+  single_writer || return 1
+  echo "owner killed; reclaimed and completed $(( $(date +%s) - t0 ))s later, 600 rows, $(writers) writers never concurrent"
 }
 
 s_cross_cancel() {
-  sql "TRUNCATE slow_out"
+  reset_slow
   local id owner other port st before after
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
@@ -394,7 +417,7 @@ s_idempotency() {
 }
 
 s_node_stop() {
-  sql "TRUNCATE slow_out"
+  reset_slow
   local port id owner node t0 st
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
@@ -413,11 +436,12 @@ s_node_stop() {
   k rollout status deploy/faucet-faucet-stream --timeout=600s >/dev/null
   [ "$st" = completed ] || fail "status ${st}" || return 1
   [ "$(sql 'SELECT count(*) FROM slow_out')" = 600 ] || fail "rows $(sql 'SELECT count(*) FROM slow_out')" || return 1
-  echo "node ${node} stopped; run completed on the survivor $(( $(date +%s) - t0 ))s later, 600 rows"
+  single_writer || return 1
+  echo "node ${node} stopped; run completed on the survivor $(( $(date +%s) - t0 ))s later, 600 rows, $(writers) writers never concurrent"
 }
 
 s_rolling_restart() {
-  sql "TRUNCATE slow_out"
+  reset_slow
   local port id st
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   wait_owner "$id" >/dev/null || return 1
@@ -427,11 +451,12 @@ s_rolling_restart() {
   port="$(any_port)"; st="$(wait_terminal "$port" "$id" 300)"
   [ "$st" = completed ] || fail "status ${st}" || return 1
   [ "$(sql 'SELECT count(*) FROM slow_out')" = 600 ] || fail "rows" || return 1
-  echo "rolled every pod mid-run; run completed with 600 rows"
+  single_writer || return 1
+  echo "rolled every pod mid-run; run completed with 600 rows, $(writers) writers never concurrent"
 }
 
 s_all_pods() {
-  sql "TRUNCATE slow_out; TRUNCATE fast_out"
+  reset_slow; sql "TRUNCATE fast_out"
   local port id q1 q2 st
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"; q1="$(submit "$port" fast | run_id)"; q2="$(submit "$port" fast | run_id)"
   wait_owner "$id" >/dev/null || return 1
@@ -445,7 +470,7 @@ s_all_pods() {
 }
 
 s_history_outage() { # #905: readiness must see it; no run executes twice
-  sql "TRUNCATE slow_out"
+  reset_slow
   local port id owner p st body down=0
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
@@ -469,13 +494,16 @@ s_history_outage() { # #905: readiness must see it; no run executes twice
   st="$(wait_terminal "${ports[0]}" "$id" 360)"
   [ "$st" = completed ] || fail "status ${st}" || return 1
   [ "$(sql 'SELECT count(*) FROM slow_out')" = 600 ] || fail "rows" || return 1
+  single_writer || return 1
   k logs "$owner" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'could not renew run leases' || fail "the owner never fenced itself" || return 1
-  echo "every pod reported history_ok=false within the lease window; owner self-fenced; run completed, 600 rows"
+  echo "every pod reported history_ok=false within the lease window; owner self-fenced; run completed, 600 rows, $(writers) writers never concurrent"
 }
 
 s_burst() {
-  local ports=() p i ids=() ok=0 a=0 b=0 n
+  local ports=() p i ids=() ok=0 a=0 b=0 n start
   for p in $(pods); do ports+=("$(port_for "$p")"); done
+  # Earlier scenarios ran fast runs on these pods too; count only this burst's.
+  start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for i in $(seq 1 40); do ids+=("$(submit "${ports[$((i % ${#ports[@]}))]}" fast | run_id)"); done
   [ "$(printf '%s\n' "${ids[@]}" | grep -c .)" = 40 ] || fail "only $(printf '%s\n' "${ids[@]}" | grep -c .) of 40 accepted" || return 1
   for id in "${ids[@]}"; do
@@ -483,9 +511,10 @@ s_burst() {
   done
   [ "$ok" = 40 ] || fail "${ok} of 40 completed" || return 1
   for p in $(pods); do
-    n="$(k logs "$p" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'invocation completed row=row-0 records_written=100')"
-    if [ "$a" -eq 0 ]; then a=$n; else b=$n; fi
+    n="$(k logs "$p" -c serve --since-time="$start" | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'invocation completed row=row-0 records_written=100' || true)"
+    if [ "$a" -eq 0 ]; then a=$n; else b=$((b + n)); fi
   done
+  [ $((a + b)) = 40 ] || fail "$((a + b)) invocations completed for 40 runs (${a}/${b} across pods)" || return 1
   echo "40 accepted, 40 completed once each; split ${a}/${b} across pods"
 }
 
@@ -520,7 +549,7 @@ s_schedule() { # once per tick across every replica, through everything above
 }
 
 s_single_kill() {
-  sql "TRUNCATE slow_out"
+  reset_slow
   local port id st
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   wait_owner "$id" >/dev/null || return 1
