@@ -62,6 +62,7 @@ pub struct ClickHouseConnection {
     /// [`url`](Self::url); combined with [`http_port`](Self::http_port) and
     /// [`tls`](Self::tls) to build the base URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub host: Option<String>,
     /// HTTP-interface port used with [`host`](Self::host). Defaults to
     /// [`DEFAULT_HTTP_PORT`] (`8123`).

@@ -99,6 +99,7 @@ pub async fn build_storage(
     storage_host: Option<&str>,
 ) -> Result<Storage, FaucetError> {
     refuse_credentials_over_plaintext(creds, storage_host)?;
+    refuse_held_credentials_off_google(creds, storage_host)?;
     let credentials = build_credentials(creds).await?;
     let mut builder = Storage::builder().with_credentials(credentials);
     if let Some(host) = storage_host {
@@ -121,6 +122,7 @@ pub async fn build_storage_control(
     storage_host: Option<&str>,
 ) -> Result<StorageControl, FaucetError> {
     refuse_credentials_over_plaintext(creds, storage_host)?;
+    refuse_held_credentials_off_google(creds, storage_host)?;
     if let Some(host) = storage_host.filter(|h| json_control::is_plaintext_endpoint(h)) {
         return Ok(StorageControl::from_stub(
             json_control::JsonApiControl::new(host),
@@ -158,6 +160,41 @@ pub fn refuse_credentials_over_plaintext(
     }
 }
 
+/// Whether `storage_host` is a Google API endpoint: `googleapis.com` or one
+/// of its subdomains (regional, `restricted.`, Private Service Connect
+/// `*.p.googleapis.com`), or a `*.goog` name.
+pub fn is_google_endpoint(storage_host: &str) -> bool {
+    let hosts = faucet_core::resolve::url_hosts(storage_host);
+    !hosts.is_empty()
+        && hosts.iter().all(|h| {
+            h == "googleapis.com" || h.ends_with(".googleapis.com") || h.ends_with(".goog")
+        })
+}
+
+/// A credential the process holds rather than one the config carries —
+/// Application Default Credentials (the server's own identity) or a key file
+/// on its disk — may only be sent to a Google endpoint: refuse a
+/// `storage_host` override pointing anywhere else, which would receive the
+/// bearer token. Use `anonymous` for an emulator, or an inline key.
+pub fn refuse_held_credentials_off_google(
+    creds: &GcsCredentials,
+    storage_host: Option<&str>,
+) -> Result<(), FaucetError> {
+    let held = matches!(
+        creds,
+        GcsCredentials::ApplicationDefault | GcsCredentials::ServiceAccountJsonFile { .. }
+    );
+    match storage_host {
+        Some(host) if held && !is_google_endpoint(host) => Err(FaucetError::Config(format!(
+            "GCS: storage_host '{}' is not a Google endpoint (googleapis.com), so it may not \
+             receive the process's own credentials (application_default or a key file) — use \
+             `auth: {{ type: anonymous }}` for an emulator, or an inline service-account key",
+            faucet_core::util::redact_uri_credentials(host)
+        ))),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +211,56 @@ mod tests {
         let err = build_storage(&adc, host).await.err().unwrap();
         assert!(err.to_string().contains("plaintext"), "{err}");
         assert!(build_storage_control(&adc, host).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn held_credentials_go_only_to_a_google_endpoint() {
+        let adc = GcsCredentials::ApplicationDefault;
+        let file = GcsCredentials::ServiceAccountJsonFile { path: "/k".into() };
+        let inline = GcsCredentials::ServiceAccountJsonInline { json: "{}".into() };
+        for ok in [
+            "https://storage.googleapis.com",
+            "https://storage-x.p.googleapis.com/",
+            "https://restricted.googleapis.com:443",
+            "https://storage.us-central1.rep.googleapis.com",
+            "https://private.goog",
+        ] {
+            assert!(
+                refuse_held_credentials_off_google(&adc, Some(ok)).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "https://attacker.example",
+            "https://googleapis.com.attacker.example",
+            "https://evilgoogleapis.com",
+            "https://169.254.169.254\\@storage.googleapis.com/",
+            "",
+        ] {
+            assert!(
+                refuse_held_credentials_off_google(&adc, Some(bad)).is_err(),
+                "{bad}"
+            );
+            assert!(
+                refuse_held_credentials_off_google(&file, Some(bad)).is_err(),
+                "{bad}"
+            );
+            assert!(refuse_held_credentials_off_google(&inline, Some(bad)).is_ok());
+            assert!(
+                refuse_held_credentials_off_google(&GcsCredentials::Anonymous, Some(bad)).is_ok()
+            );
+        }
+        assert!(refuse_held_credentials_off_google(&adc, None).is_ok());
+        let err = build_storage(&adc, Some("https://attacker.example"))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("not a Google endpoint"), "{err}");
+        assert!(
+            build_storage_control(&file, Some("https://attacker.example"))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

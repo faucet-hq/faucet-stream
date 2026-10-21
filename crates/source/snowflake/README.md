@@ -70,7 +70,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `account` | string | — *(required)* | Snowflake account identifier (e.g. `"xy12345.us-east-1"`). Used to build the API hostname and to sign the key-pair JWT. |
+| `account` | string | — *(required)* | Snowflake account identifier (e.g. `"xy12345.us-east-1"`). Used to build the API hostname and to sign the key-pair JWT. Letters, digits, `_`, `-` and `.` only — anything else is refused at construction. |
 | `warehouse` | string | — *(required)* | Virtual warehouse to run the statement on. |
 | `database` | string | — *(required)* | Database for the session. |
 | `schema` | string | — *(required)* | Schema for the session. |

@@ -16,9 +16,9 @@ fn cfg_err(msg: impl Into<String>) -> FaucetError {
 
 /// Fetch the endpoint body and select the row objects.
 ///
-/// The blocking request runs on a dedicated `std::thread` so `reqwest::blocking`
-/// never executes inside a tokio runtime (`compile()` is sync but is typically
-/// invoked from async CLI code, where a blocking client would otherwise panic).
+/// The request runs on a dedicated `std::thread` with its own current-thread
+/// runtime, so the sync `compile()` (typically invoked from async CLI code)
+/// never blocks inside the caller's runtime.
 pub(crate) fn fetch_http_rows(
     name: &str,
     url: &str,
@@ -30,6 +30,13 @@ pub(crate) fn fetch_http_rows(
     select_rows(name, &body, records_path)
 }
 
+/// The longest one reference-relation fetch may take.
+pub const HTTP_RELATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The largest body a reference-relation fetch reads: 256 MiB. A relation is
+/// a small lookup table materialized in memory.
+pub const HTTP_RELATION_MAX_BYTES: u64 = 256 << 20;
+
 fn fetch_body(
     name: &str,
     url: &str,
@@ -39,9 +46,23 @@ fn fetch_body(
     let owned_name = name.to_string();
     let url = url.to_string();
     let headers = headers.clone();
+    // The thread below is outside the calling task, so carry the reference
+    // policy a host scoped over the run onto it explicitly.
+    let policy = faucet_core::http::current_reference_policy();
     off_worker(move || {
-        let handle =
-            std::thread::spawn(move || fetch_body_blocking(&owned_name, &url, method, &headers));
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| cfg_err(format!("http relation '{owned_name}': runtime: {e}")))?;
+            runtime.block_on(fetch_body_async(
+                &owned_name,
+                &url,
+                method,
+                &headers,
+                policy,
+            ))
+        });
         match handle.join() {
             Ok(res) => res,
             Err(_) => Err(cfg_err(format!(
@@ -63,34 +84,47 @@ pub(crate) fn off_worker<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-fn fetch_body_blocking(
+/// One fetch through [`faucet_core::http::Client`]: the reference policy
+/// (`policy`, when a host scoped one) is checked on the request and every
+/// redirect hop, a cross-origin redirect drops the headers, a name that
+/// resolves to a link-local / metadata address is never connected to, and
+/// the body is bounded by [`HTTP_RELATION_MAX_BYTES`].
+async fn fetch_body_async(
     name: &str,
     url: &str,
     method: HttpMethod,
     headers: &BTreeMap<String, String>,
+    policy: Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>>,
 ) -> Result<Value, FaucetError> {
-    let client = reqwest::blocking::Client::builder()
+    let shown = faucet_core::util::redact_uri_credentials(url);
+    let mut builder =
+        faucet_core::http::Client::builder().max_response_bytes(Some(HTTP_RELATION_MAX_BYTES));
+    for k in headers.keys() {
+        builder = builder.sensitive_header(k);
+    }
+    if let Some(policy) = policy {
+        builder = builder.reference_policy(policy);
+    }
+    let client = builder
         .build()
         .map_err(|e| cfg_err(format!("http relation '{name}': build client: {e}")))?;
-    let mut req = match method {
-        HttpMethod::Get => client.get(url),
-        HttpMethod::Post => client.post(url),
-    };
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
-    let resp = req
-        .send()
-        .map_err(|e| cfg_err(format!("http relation '{name}': request to '{url}': {e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(cfg_err(format!(
-            "http relation '{name}': '{url}' returned HTTP {status}"
-        )));
-    }
-    resp.json::<Value>().map_err(|e| {
+    let ctx = faucet_core::CallContext::new().with_timeout(HTTP_RELATION_TIMEOUT);
+    let resp = client
+        .execute(&ctx, "relation", || {
+            let mut req = match method {
+                HttpMethod::Get => client.get(url),
+                HttpMethod::Post => client.post(url),
+            };
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            req
+        })
+        .await
+        .map_err(|e| cfg_err(format!("http relation '{name}': request to '{shown}': {e}")))?;
+    client.json_value(resp).await.map_err(|e| {
         cfg_err(format!(
-            "http relation '{name}': decode json from '{url}': {e}"
+            "http relation '{name}': decode json from '{shown}': {e}"
         ))
     })
 }

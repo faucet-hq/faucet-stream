@@ -354,6 +354,7 @@ impl SnowflakeDriver {
 
     fn new(config: SnowflakeSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        faucet_common_snowflake::validate_account(&config.account)?;
         // `bulk_load` (Arrow columnar COPY) only functions with the `arrow`
         // feature compiled in — reject a config that requests it otherwise so
         // the failure is loud at load time, not a silent row-path fallback.
@@ -1323,6 +1324,23 @@ mod tests {
             &sent,
             landed.as_array().unwrap(),
             fidelity::Tolerance::exact(),
+        );
+    }
+
+    #[test]
+    fn new_rejects_an_account_that_would_leave_snowflake() {
+        let config = SnowflakeSinkConfig::new(
+            "evil.example/x?",
+            "wh",
+            "db",
+            "PUBLIC",
+            "events",
+            SnowflakeAuth::OAuth { token: "t".into() },
+        );
+        let err = SnowflakeSink::new(config).err().unwrap();
+        assert!(
+            err.to_string().contains("not an account identifier"),
+            "{err}"
         );
     }
 

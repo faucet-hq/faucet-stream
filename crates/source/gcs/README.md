@@ -90,7 +90,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `compression` | enum | `auto` | *(requires the `compression` feature)* Decompression codec — `none`, `gzip`, `zstd`, or `auto`. `auto` detects `.gz` / `.zst` from the object key. |
-| `storage_host` | string | *(unset)* | Endpoint override (integration tests / emulators only, e.g. `http://localhost:4443`). A plaintext `http://` host lists and stats objects over the JSON API, so `fake-gcs-server` works end to end. Production users leave this unset. |
+| `storage_host` | string | *(unset)* | Endpoint override (integration tests / emulators only, e.g. `http://localhost:4443`). A plaintext `http://` host lists and stats objects over the JSON API, so `fake-gcs-server` works end to end. Production users leave this unset. A host that is not a `googleapis.com` / `.goog` endpoint is refused with `application_default` or key-file credentials (the process's own token); use `auth: { type: anonymous }` or an inline key. |
 
 ## Faucet sinks' unfinished output
 

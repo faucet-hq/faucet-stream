@@ -10,7 +10,13 @@
 //!   [`ClientBuilder::sensitive_header`] (an API-key header). reqwest's own
 //!   policy only knows the standard headers.
 //! - **Redirect targets are checked.** A redirect into a link-local or cloud
-//!   instance-metadata address is always refused. Under a reference policy
+//!   instance-metadata address is always refused. A host *name* is judged by
+//!   the addresses it resolves to, at connection time: the client's resolver
+//!   drops link-local / metadata addresses ([`crate::resolve::screen_resolved`])
+//!   unless the reference policy in effect names that host exactly, so a name
+//!   pointing at the metadata service is never connected to, and the address
+//!   checked is the address dialled. (Through a proxy the proxy resolves the
+//!   target, so this rule cannot apply to it.) Under a reference policy
 //!   ([`ClientBuilder::reference_policy`], or one scoped over a run with
 //!   [`with_reference_policy`]) the first request and every redirect hop must
 //!   pass [`ReferencePolicy::check_url`](crate::resolve::ReferencePolicy::check_url).
@@ -96,6 +102,7 @@ pub struct ClientBuilder {
     max_redirects: usize,
     sensitive: Vec<HeaderName>,
     policy: Option<Arc<ReferencePolicy>>,
+    lookup: Lookup,
     error: Option<FaucetError>,
 }
 
@@ -126,6 +133,7 @@ impl ClientBuilder {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             sensitive: Vec::new(),
             policy: None,
+            lookup: system_lookup(),
             error: None,
         }
     }
@@ -202,6 +210,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Resolve names with `lookup` instead of the system resolver.
+    #[cfg(test)]
+    fn lookup(mut self, lookup: Lookup) -> Self {
+        self.lookup = lookup;
+        self
+    }
+
     /// Drop the header `name` on a redirect to another origin, like
     /// `Authorization`. Name every header that carries a credential (an API
     /// key, a session id). An invalid name fails [`build`](Self::build).
@@ -250,15 +265,87 @@ impl ClientBuilder {
         if let Some(e) = self.error {
             return Err(e);
         }
+        let resolver = GuardedResolver {
+            policy: self.policy.clone(),
+            lookup: self.lookup,
+        };
         Ok(Client {
             inner: self
                 .inner
+                .dns_resolver(resolver)
                 .redirect(same_origin_redirects(self.max_redirects))
                 .build()?,
             max_response_bytes: self.max_response_bytes,
             max_redirects: self.max_redirects,
             sensitive: self.sensitive.into(),
             policy: self.policy,
+        })
+    }
+}
+
+type LookupFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send>,
+>;
+
+/// How a [`Client`] turns a host name into addresses.
+type Lookup = Arc<dyn Fn(String) -> LookupFuture + Send + Sync>;
+
+/// The system resolver (`getaddrinfo` on a blocking thread).
+fn system_lookup() -> Lookup {
+    Arc::new(|host: String| {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host.as_str(), 0)).await?.collect()) })
+    })
+}
+
+/// The resolver every [`Client`] connects through: it resolves a name and
+/// hands reqwest only the addresses [`crate::resolve::screen_resolved`]
+/// keeps, so the address checked is the address connected to. The policy is
+/// the client's own, else the one scoped over the task that started the
+/// connection; a connection started off that task sees no policy, and then
+/// no name may reach a metadata address.
+#[derive(Clone)]
+struct GuardedResolver {
+    policy: Option<Arc<ReferencePolicy>>,
+    lookup: Lookup,
+}
+
+/// The resolver's refusal, recognised in a transport error's source chain.
+#[derive(Debug)]
+struct MetadataRefused(String);
+
+impl fmt::Display for MetadataRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MetadataRefused {}
+
+/// The resolver's refusal behind a transport error, if that is what it was.
+fn metadata_refusal(e: &reqwest::Error) -> Option<String> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(r) = err.downcast_ref::<MetadataRefused>() {
+            return Some(r.0.clone());
+        }
+        cur = err.source();
+    }
+    None
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let policy = self.policy.clone().or_else(current_reference_policy);
+        let lookup = self.lookup.clone();
+        Box::pin(async move {
+            let addrs = lookup(host.clone()).await?;
+            let kept = crate::resolve::screen_resolved(&host, addrs, policy.as_deref()).map_err(
+                |reason| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(MetadataRefused(reason))
+                },
+            )?;
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
@@ -433,7 +520,19 @@ impl Client {
             let method = current.method().clone();
             let url = current.url().clone();
             let headers = current.headers().clone();
-            let resp = self.inner.execute(current).await.map_err(transport_error)?;
+            let resp = match self.inner.execute(current).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return Err(match metadata_refusal(&e) {
+                        Some(reason) => FaucetError::Config(format!(
+                            "{} to {} refused: {reason}",
+                            if hops == 0 { "request" } else { "redirect" },
+                            crate::util::redact_uri_credentials(url.as_str())
+                        )),
+                        None => transport_error(e),
+                    });
+                }
+            };
             let status = resp.status();
             if !status.is_redirection() || self.max_redirects == 0 {
                 return Ok(resp);
@@ -847,6 +946,104 @@ mod tests {
                 "{target}: {err}"
             );
         }
+    }
+
+    /// A lookup that answers `meta.test` with the metadata address,
+    /// `mixed.test` with it and loopback, and anything else with loopback.
+    fn fake_lookup() -> Lookup {
+        Arc::new(|host: String| {
+            Box::pin(async move {
+                let meta: std::net::SocketAddr = "169.254.169.254:0".parse().unwrap();
+                let local: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+                Ok(match host.as_str() {
+                    "meta.test" => vec![meta],
+                    "mixed.test" => vec![meta, local],
+                    "missing.test" => Vec::new(),
+                    _ => vec![local],
+                })
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_name_resolving_to_instance_metadata_is_refused_at_connection_time() {
+        let land = serve(Router::new().route("/land", get(|| async { "landed" }))).await;
+        let port = land.rsplit(':').next().unwrap().to_string();
+        let client = Client::builder().lookup(fake_lookup()).build().unwrap();
+
+        let err = client
+            .send(client.get(format!("http://meta.test:{port}/land")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.starts_with("request to") && m.contains("link-local / metadata endpoint")),
+            "{err}"
+        );
+        // A request sent straight through the inner client fails too.
+        let raw = client
+            .inner()
+            .get(format!("http://meta.test:{port}/land"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(metadata_refusal(&raw).is_some());
+
+        // Only the metadata address is dropped; the name still connects.
+        let resp = client
+            .send(client.get(format!("http://mixed.test:{port}/land")))
+            .await
+            .unwrap();
+        assert_eq!(client.text(resp).await.unwrap(), "landed");
+
+        // A redirect to such a name is refused the same way.
+        let base = serve(redirector(format!("http://meta.test:{port}/land"))).await;
+        let err = client
+            .send(client.get(format!("{base}/go")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.starts_with("redirect to") && m.contains("metadata endpoint")),
+            "{err}"
+        );
+
+        // The scoped policy reaches the resolver, and an exact entry for the
+        // name lets it resolve to the metadata address.
+        let listed = Arc::new(ReferencePolicy::open().with_url_hosts(["meta.test", "127.0.0.1"]));
+        let resolver = GuardedResolver {
+            policy: None,
+            lookup: fake_lookup(),
+        };
+        let name = |h: &str| h.parse::<reqwest::dns::Name>().unwrap();
+        let addrs: Vec<_> = with_reference_policy(listed.clone(), async {
+            reqwest::dns::Resolve::resolve(&resolver, name("meta.test")).await
+        })
+        .await
+        .unwrap()
+        .collect();
+        assert_eq!(addrs, vec!["169.254.169.254:0".parse().unwrap()]);
+        let own = GuardedResolver {
+            policy: Some(Arc::new(ReferencePolicy::open().with_url_hosts(["*"]))),
+            lookup: fake_lookup(),
+        };
+        assert!(
+            reqwest::dns::Resolve::resolve(&own, name("meta.test"))
+                .await
+                .is_err()
+        );
+        let none: Vec<_> = reqwest::dns::Resolve::resolve(&own, name("missing.test"))
+            .await
+            .unwrap()
+            .collect();
+        assert!(none.is_empty());
+        let system = GuardedResolver {
+            policy: None,
+            lookup: system_lookup(),
+        };
+        let local: Vec<_> = reqwest::dns::Resolve::resolve(&system, name("localhost"))
+            .await
+            .unwrap()
+            .collect();
+        assert!(local.iter().all(|a| a.ip().is_loopback()), "{local:?}");
     }
 
     #[tokio::test]

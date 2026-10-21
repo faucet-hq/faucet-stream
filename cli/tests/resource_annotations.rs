@@ -30,6 +30,12 @@ const EXACT: &[&str] = &[
     "location",
     "database",
     "socket",
+    "host",
+    "hosts",
+    "brokers",
+    "servers",
+    "bootstrap_servers",
+    "connect_string",
 ];
 
 const SUFFIXES: &[&str] = &[
@@ -46,6 +52,10 @@ const SUFFIXES: &[&str] = &[
     "_cert",
     "_location",
     "_executable",
+    "_host",
+    "_hosts",
+    "_servers",
+    "_brokers",
 ];
 
 fn looks_like_resource(name: &str) -> bool {
@@ -227,10 +237,21 @@ fn the_heuristic_recognises_resource_names() {
         "connection_uri",
         "tls_cert",
         "executable",
+        "host",
+        "storage_host",
+        "emulator_host",
+        "brokers",
+        "servers",
     ] {
         assert!(looks_like_resource(name), "{name}");
     }
-    for name in ["batch_size", "pathological", "urlish", "file_format"] {
+    for name in [
+        "batch_size",
+        "pathological",
+        "urlish",
+        "file_format",
+        "hostname_case",
+    ] {
         assert!(!looks_like_resource(name), "{name}");
     }
 }

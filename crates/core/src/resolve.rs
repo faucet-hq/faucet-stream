@@ -29,6 +29,41 @@ use std::path::{Component, Path, PathBuf};
 /// resource. Its value is a [`ResourceKind`] (`"path"`, `"url"`, `"command"`).
 pub const RESOURCE_ANNOTATION: &str = "x-faucet-resource";
 
+/// The JSON Schema keyword on a free-form string map (object-store options,
+/// driver properties) naming which of its keys hold a resource: an object of
+/// key pattern → [`ResourceKind`]. A pattern is matched against the key
+/// lower-cased: exact, `PREFIX*`, `*SUFFIX` or `*INFIX*`.
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-resource-keys" = {"*endpoint*": "url", "*_file": "path"}))]
+/// pub storage_options: HashMap<String, String>,
+/// ```
+pub const RESOURCE_KEYS_ANNOTATION: &str = "x-faucet-resource-keys";
+
+/// Whether map key `key` (any case) matches a [`RESOURCE_KEYS_ANNOTATION`]
+/// pattern.
+fn key_pattern_matches(pattern: &str, key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        (Some(rest), _) if rest.ends_with('*') && rest.len() > 1 => {
+            key.contains(&rest[..rest.len() - 1])
+        }
+        (Some(suffix), _) => key.ends_with(suffix),
+        (None, Some(prefix)) => key.starts_with(prefix),
+        (None, None) => key == pattern,
+    }
+}
+
+/// The kind a [`RESOURCE_KEYS_ANNOTATION`] on `node` gives map key `key`.
+fn keyed_annotation(node: &Value, key: &str) -> Option<ResourceKind> {
+    node.get(RESOURCE_KEYS_ANNOTATION)?
+        .as_object()?
+        .iter()
+        .find(|(pattern, _)| key_pattern_matches(pattern, key))
+        .and_then(|(_, kind)| kind.as_str().and_then(ResourceKind::parse))
+}
+
 /// What kind of external resource a config field names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -185,6 +220,38 @@ pub fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// The addresses `host` resolved to that a connection may use: every one
+/// that is not link-local / cloud metadata ([`is_metadata_ip`]), unless
+/// `policy` names the host exactly ([`ReferencePolicy::lists_host_exactly`]).
+/// An error (the reason) when nothing is left — the name points only at a
+/// metadata endpoint. This is the connection-time half of the metadata rule:
+/// [`is_metadata_host`] can only judge a host by how it is written.
+pub fn screen_resolved<I>(
+    host: &str,
+    addrs: I,
+    policy: Option<&ReferencePolicy>,
+) -> Result<Vec<std::net::SocketAddr>, String>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
+    let all: Vec<std::net::SocketAddr> = addrs.into_iter().collect();
+    if policy.is_some_and(|p| p.lists_host_exactly(host)) {
+        return Ok(all);
+    }
+    let kept: Vec<std::net::SocketAddr> = all
+        .iter()
+        .copied()
+        .filter(|a| !is_metadata_ip(a.ip()))
+        .collect();
+    if kept.is_empty() && !all.is_empty() {
+        return Err(format!(
+            "host `{}` resolves to a link-local / metadata endpoint",
+            canonical_host(host)
+        ));
+    }
+    Ok(kept)
+}
+
 /// The canonical, lower-case form of a URL host as a URL parser (and the
 /// system resolver) reads it: numeric IPv4 forms (`2852039166`, `0xa9fea9fe`,
 /// `0251.0376.0251.0376`, `169.254.43518`) become dotted quads, IPv6 is
@@ -267,7 +334,7 @@ fn scheme_of(value: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
     let rest = value[colon + 1..]
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', ','])
         .next()
         .unwrap_or("");
     let port = !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
@@ -304,22 +371,156 @@ fn is_relative_path(value: &str) -> bool {
     }
 }
 
+/// Schemes a WHATWG URL parser (the `url` crate behind reqwest, object_store
+/// and most HTTP clients) treats as special: `\\` ends the authority like `/`.
+const SPECIAL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp", "file"];
+
+/// Keys of an ADO.NET / ODBC style connection string that name the server.
+const CONN_HOST_KEYS: &[&str] = &[
+    "server",
+    "data source",
+    "datasource",
+    "address",
+    "addr",
+    "network address",
+    "host",
+    "hostname",
+    "hostaddr",
+];
+
+/// Keys of an Azure Storage connection string whose value is an endpoint URL.
+const CONN_ENDPOINT_KEYS: &[&str] = &[
+    "blobendpoint",
+    "queueendpoint",
+    "tableendpoint",
+    "fileendpoint",
+    "dfsendpoint",
+];
+
+/// The hosts a `key=value;…` connection string (ADO.NET, ODBC, Azure
+/// Storage) connects to, or `None` when `value` is not one. A string naming
+/// no server connects to the local machine.
+fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
+    let (first_key, _) = value.split(';').next()?.split_once('=')?;
+    let first_key = first_key.trim();
+    if first_key.is_empty()
+        || !first_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
+    {
+        return None;
+    }
+    let unquote = |v: &str| {
+        let v = v.trim();
+        v.strip_prefix('{')
+            .and_then(|v| v.strip_suffix('}'))
+            .or_else(|| v.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+            .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(v)
+            .to_string()
+    };
+    let libpq_style = !value.contains(';')
+        && value.split_whitespace().count() > 1
+        && value.split_whitespace().all(|kv| kv.contains('='));
+    let separators: &[char] = if libpq_style {
+        &[' ', '\t', '\n', '\r']
+    } else {
+        &[';']
+    };
+    let pairs: Vec<(String, String)> = value
+        .split(separators)
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v)))
+        .collect();
+    let get = |key: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let mut hosts = Vec::new();
+    for (k, v) in &pairs {
+        if CONN_HOST_KEYS.contains(&k.as_str()) {
+            let lower = v.to_ascii_lowercase();
+            let bare = ["tcp:", "np:", "lpc:", "admin:"]
+                .iter()
+                .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
+                .unwrap_or(v);
+            let bare = bare.split(',').next().unwrap_or(bare);
+            let bare = bare.split('\\').next().unwrap_or(bare);
+            let host = if bare.contains("://") {
+                url_hosts(bare)
+            } else {
+                url_hosts(&format!("tcp://{bare}"))
+            };
+            hosts.extend(host);
+        } else if CONN_ENDPOINT_KEYS.contains(&k.as_str()) {
+            hosts.extend(url_hosts(v));
+        }
+    }
+    if let Some(account) = get("accountname")
+        && !pairs.iter().any(|(k, _)| k == "blobendpoint")
+    {
+        let suffix = get("endpointsuffix").unwrap_or("core.windows.net");
+        hosts.push(canonical_host(&format!("{account}.blob.{suffix}")));
+    }
+    if get("usedevelopmentstorage").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        hosts.push("127.0.0.1".into());
+    }
+    if hosts.is_empty() {
+        hosts.push("localhost".into());
+    }
+    hosts.retain(|h| !h.is_empty());
+    Some(hosts)
+}
+
 /// The hosts a URL's authority names (several for `h1,h2` connection
-/// strings), in canonical form ([`canonical_host`]), without userinfo or
-/// port. A host taken from a `${…}` token is returned lower-cased as written.
+/// strings and broker lists, and for the servers a `key=value;…` connection
+/// string names), in canonical form ([`canonical_host`]), without userinfo or
+/// port. A URL with a special scheme (`http`, `https`, …) is read by the same
+/// parser HTTP clients use, so `\\` ends its authority as `/` does. A host
+/// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if !value.contains("://")
+        && let Some(hosts) = connection_string_hosts(value)
+    {
+        return hosts;
+    }
+    let scheme = scheme_of(value);
+    let special = scheme
+        .as_deref()
+        .is_none_or(|s| SPECIAL_SCHEMES.contains(&s));
+    if scheme.is_some()
+        && special
+        && !value.contains("${")
+        && let Ok(parsed) = url::Url::parse(value)
+    {
+        return parsed
+            .host_str()
+            .map(canonical_host)
+            .into_iter()
+            .filter(|h| !h.is_empty())
+            .collect();
+    }
     let after = match value.find("://") {
         Some(i) => &value[i + 3..],
-        None => match scheme_of(value) {
+        None => match &scheme {
             Some(s) => &value[s.len() + 1..],
             None => value,
         },
     };
-    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = if special {
+        after.split(['/', '?', '#', '\\']).next()
+    } else {
+        after.split(['/', '?', '#']).next()
+    }
+    .unwrap_or("");
     let hosts = match authority.rfind('@') {
         Some(at) => &authority[at + 1..],
         None => authority,
     };
+    let hosts = hosts.split(';').next().unwrap_or(hosts);
     hosts
         .split(',')
         .map(|h| {
@@ -614,6 +815,57 @@ impl ReferencePolicy {
         Ok(())
     }
 
+    /// Whether the host allow-list names `host` itself — an exact entry, not
+    /// `*` or a `*.suffix` pattern. Only such an entry lets a name reach a
+    /// link-local / metadata address ([`screen_resolved`]).
+    pub fn lists_host_exactly(&self, host: &str) -> bool {
+        let host = canonical_host(host);
+        self.url_hosts.as_ref().is_some_and(|list| {
+            list.iter()
+                .any(|p| !p.contains('*') && canonical_host(p) == host)
+        })
+    }
+
+    /// [`check_url`](Self::check_url), then resolve every host the value names
+    /// that is not an IP literal and refuse one whose addresses are all
+    /// link-local / metadata endpoints ([`screen_resolved`]). For a client
+    /// that does not go through [`crate::http::Client`] (whose resolver
+    /// applies the same rule at connection time); a name that fails to resolve
+    /// passes, since the connection fails too. Resolution blocks — call it off
+    /// the async runtime's worker threads, or accept a short stall. A name
+    /// re-pointed between this check and the client's own lookup is not
+    /// caught here.
+    pub fn check_url_resolved(&self, value: &str) -> Result<(), Refusal> {
+        self.check_url(value)?;
+        if scheme_of(value).is_some_and(|s| s == "file" || s == "sqlite") {
+            return Ok(());
+        }
+        for host in url_hosts(value) {
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            if host.contains("${") || host.contains('*') || bare.parse::<std::net::IpAddr>().is_ok()
+            {
+                continue;
+            }
+            let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(bare, 0)) else {
+                continue;
+            };
+            screen_resolved(&host, addrs, Some(self))
+                .map_err(|reason| Refusal::new(RefusalKind::Url, value, reason))?;
+        }
+        Ok(())
+    }
+
+    /// [`check`](Self::check), resolving URL hosts ([`check_url_resolved`](Self::check_url_resolved)).
+    pub fn check_resolved(&self, r: &ResourceRef) -> Result<(), Refusal> {
+        match r.kind {
+            ResourceKind::Url => self.check_url_resolved(&r.value),
+            ResourceKind::Path if local_part(&r.value).is_none() => {
+                self.check_url_resolved(&r.value)
+            }
+            _ => self.check(r),
+        }
+    }
+
     /// Check a program a connector runs.
     pub fn check_command(&self, value: &str) -> Result<(), Refusal> {
         if self.subprocess {
@@ -722,6 +974,11 @@ fn visit(
         Value::Object(map) => {
             for (k, child) in map {
                 let p = format!("{pointer}/{}", escape_pointer(k));
+                if let (Some(kind), Value::String(s)) =
+                    (alts.iter().find_map(|n| keyed_annotation(n, k)), child)
+                {
+                    out.push(ResourceRef::new(p.clone(), kind, s.clone()));
+                }
                 for alt in &alts {
                     let declared = alt.get("properties").and_then(|props| props.get(k));
                     if let Some(s) = declared {
@@ -768,6 +1025,13 @@ fn collect_fields(
         out.insert((path.to_string(), kind));
     }
     for alt in alts {
+        if let Some(Value::Object(keys)) = alt.get(RESOURCE_KEYS_ANNOTATION) {
+            for (pattern, kind) in keys {
+                if let Some(kind) = kind.as_str().and_then(ResourceKind::parse) {
+                    out.insert((format!("{path}{{{pattern}}}"), kind));
+                }
+            }
+        }
         if let Some(Value::Object(props)) = alt.get("properties") {
             for (k, s) in props {
                 let p = if path.is_empty() {
@@ -1270,6 +1534,169 @@ mod tests {
         let listed = ReferencePolicy::open().with_url_hosts(["api.example.com"]);
         assert!(listed.check_url("https://API.example.com./v1").is_ok());
         assert!(listed.check_url("https://0x7f000001/").is_err());
+    }
+
+    #[test]
+    fn a_backslash_ends_the_authority_of_a_special_url() {
+        assert_eq!(
+            url_hosts("http://169.254.169.254\\@api.example.com/x"),
+            vec!["169.254.169.254"]
+        );
+        assert_eq!(
+            url_hosts("https://user:pw@API.example.com:8443/x"),
+            vec!["api.example.com"]
+        );
+        assert_eq!(url_hosts("http://${host}\\@a.com/"), vec!["${host}"]);
+        // A non-special scheme keeps `\\` in its userinfo, as its parser does.
+        assert_eq!(url_hosts("postgres://u\\@db/x"), vec!["db"]);
+        assert_eq!(url_hosts("postgres://u:a;b@db;x=1/x"), vec!["db"]);
+        let listed = ReferencePolicy::open().with_url_hosts(["api.example.com"]);
+        assert!(
+            listed
+                .check_url("http://169.254.169.254\\@api.example.com/latest/meta-data/")
+                .is_err()
+        );
+        let open = ReferencePolicy::open();
+        assert!(
+            open.check_url("http://169.254.169.254\\@api.example.com/")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn broker_lists_and_connection_strings_name_their_hosts() {
+        assert_eq!(url_hosts("h1:9092,h2:9092"), vec!["h1", "h2"]);
+        assert_eq!(scheme_of("h1:9092,h2:9092"), None);
+        assert_eq!(
+            url_hosts("Server=tcp:10.0.0.9,1433;Database=x;User Id=u;Password=p"),
+            vec!["10.0.0.9"]
+        );
+        assert_eq!(
+            url_hosts("Data Source={SQL01\\INST};Initial Catalog=x"),
+            vec!["sql01"]
+        );
+        assert_eq!(url_hosts("Database=x"), vec!["localhost"]);
+        assert_eq!(url_hosts("host=db.internal port=5432"), vec!["db.internal"]);
+        assert_eq!(
+            url_hosts(
+                "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=k==;\
+                 EndpointSuffix=core.chinacloudapi.cn"
+            ),
+            vec!["acct.blob.core.chinacloudapi.cn"]
+        );
+        assert_eq!(
+            url_hosts("AccountName=a;AccountKey=k;BlobEndpoint=http://169.254.169.254/"),
+            vec!["169.254.169.254"]
+        );
+        assert_eq!(url_hosts("UseDevelopmentStorage=true"), vec!["127.0.0.1"]);
+        assert_eq!(url_hosts("Server=nats://n1:4222"), vec!["n1"]);
+        let p = ReferencePolicy::open().with_url_hosts(["db.internal"]);
+        assert!(p.check_url("Server=tcp:10.0.0.9,1433;Database=x").is_err());
+        assert!(p.check_url("Server=db.internal;Database=x").is_ok());
+        assert!(p.check_url("db.internal:9092,evil:9092").is_err());
+        assert!(
+            ReferencePolicy::open()
+                .check_url("AccountName=a;BlobEndpoint=http://169.254.169.254/")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolved_metadata_addresses_are_dropped_unless_the_name_is_listed() {
+        let meta: std::net::SocketAddr = "169.254.169.254:0".parse().unwrap();
+        let v6: std::net::SocketAddr = "[fd00:ec2::254]:0".parse().unwrap();
+        let ok: std::net::SocketAddr = "10.0.0.1:0".parse().unwrap();
+        assert_eq!(screen_resolved("a.test", [meta, ok], None), Ok(vec![ok]));
+        let err = screen_resolved("A.test.", [meta, v6], None).unwrap_err();
+        assert_eq!(
+            err,
+            "host `a.test` resolves to a link-local / metadata endpoint"
+        );
+        assert_eq!(screen_resolved("a.test", [], None), Ok(vec![]));
+        let listed = ReferencePolicy::open().with_url_hosts(["a.test", "*.wild"]);
+        assert!(listed.lists_host_exactly("A.TEST."));
+        assert!(!listed.lists_host_exactly("x.wild"));
+        assert!(!ReferencePolicy::open().lists_host_exactly("a.test"));
+        assert_eq!(
+            screen_resolved("a.test", [meta], Some(&listed)),
+            Ok(vec![meta])
+        );
+        assert!(screen_resolved("x.wild", [meta], Some(&listed)).is_err());
+    }
+
+    #[test]
+    fn a_resolved_check_judges_names_by_their_addresses() {
+        let open = ReferencePolicy::open();
+        assert!(open.check_url_resolved("http://localhost:1/x").is_ok());
+        assert!(open.check_url_resolved("http://127.0.0.1/x").is_ok());
+        assert!(open.check_url_resolved("https://${h}/x").is_ok());
+        assert!(open.check_url_resolved("file:///tmp/x").is_ok());
+        assert!(
+            open.check_url_resolved("http://faucet-no-such-host.invalid/x")
+                .is_ok()
+        );
+        assert!(open.check_url_resolved("http://169.254.169.254/").is_err());
+        let r = ResourceRef::new("/u", ResourceKind::Url, "http://localhost/");
+        assert!(open.check_resolved(&r).is_ok());
+        let r = ResourceRef::new("/p", ResourceKind::Path, "s3://localhost/x");
+        assert!(open.check_resolved(&r).is_ok());
+        let r = ResourceRef::new("/p", ResourceKind::Path, "/tmp/x");
+        assert!(open.check_resolved(&r).is_ok());
+        let r = ResourceRef::new("/c", ResourceKind::Command, "x");
+        assert!(ReferencePolicy::deny_all().check_resolved(&r).is_err());
+    }
+
+    #[test]
+    fn a_keyed_map_annotation_names_resources_by_key() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "x-faucet-resource-keys": {
+                        "*endpoint*": "url",
+                        "*_file": "path",
+                        "proxy*": "url",
+                        "google_service_account": "path",
+                        "ignored": "bogus"
+                    }
+                }
+            }
+        });
+        let config = json!({"opts": {
+            "AWS_ENDPOINT_URL": "http://169.254.169.254",
+            "aws_web_identity_token_file": "/etc/token",
+            "Proxy_Url": "http://p",
+            "GOOGLE_SERVICE_ACCOUNT": "/k.json",
+            "aws_allow_http": "true",
+            "ignored": "x",
+            "endpoint_n": 3
+        }});
+        let found = annotated_resources(&schema, &config);
+        let mut got: Vec<(&str, ResourceKind)> =
+            found.iter().map(|r| (r.pointer.as_str(), r.kind)).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("/opts/AWS_ENDPOINT_URL", ResourceKind::Url),
+                ("/opts/GOOGLE_SERVICE_ACCOUNT", ResourceKind::Path),
+                ("/opts/Proxy_Url", ResourceKind::Url),
+                ("/opts/aws_web_identity_token_file", ResourceKind::Path),
+            ]
+        );
+        let endpoint = found
+            .iter()
+            .find(|r| r.pointer == "/opts/AWS_ENDPOINT_URL")
+            .unwrap();
+        assert!(ReferencePolicy::open().check(endpoint).is_err());
+        assert!(declares(&schema, ResourceKind::Path));
+        assert!(
+            annotated_fields(&schema).contains(&("opts{*endpoint*}".into(), ResourceKind::Url))
+        );
+        assert!(key_pattern_matches("*mid*", "A_MID_B"));
+        assert!(key_pattern_matches("*", "x"));
     }
 
     #[test]

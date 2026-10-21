@@ -273,7 +273,14 @@ hosts refused unless listed), environment variable names, secret-manager
 schemes and whether a program may run. `ReferencePolicy::deny_all()` is the
 default and `open()` allows everything but metadata hosts. `faucet serve` uses
 it to confine configs a caller submits, so an annotated third-party connector
-is confined without serve changes.
+is confined without serve changes. A free-form string map names the keys
+that hold a resource with `x-faucet-resource-keys` (`{"*endpoint*": "url",
+"*_file": "path"}`). Host-bearing values that are not URLs (`b1:9092,b2:9092`,
+`Server=tcp:host,1433;…`, an Azure Storage connection string) are read for
+their hosts. `check_url` judges a host by how it is written;
+`check_url_resolved` also resolves it, and `faucet_core::http::Client`'s own
+resolver drops link-local / metadata addresses at connection time
+(`resolve::screen_resolved`), unless the policy lists that name exactly.
 
 A connector whose own input can reach host files or the network — a SQL
 engine that can `ATTACH` or `read_csv` — exposes a boolean switch that confines

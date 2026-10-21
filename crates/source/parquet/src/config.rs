@@ -143,7 +143,10 @@ pub enum ParquetLocation {
 
     /// A local glob pattern that expands to zero or more files. All matched
     /// files must share the same Arrow schema.
-    Glob { pattern: String },
+    Glob {
+        #[schemars(extend("x-faucet-resource" = "path"))]
+        pattern: String,
+    },
 
     /// An S3 location — either a single object key, or a prefix that
     /// expands to multiple objects.
@@ -276,6 +279,23 @@ mod tests {
     #[test]
     fn schema_generates_without_panicking() {
         let _ = faucet_core::schema_for!(ParquetSourceConfig);
+    }
+
+    #[test]
+    fn a_glob_pattern_is_a_path_resource() {
+        use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_resources};
+        let schema = serde_json::to_value(faucet_core::schema_for!(ParquetSourceConfig)).unwrap();
+        let config =
+            serde_json::to_value(ParquetSourceConfig::glob("/data/tenants/b/**/*.parquet"))
+                .unwrap();
+        let found = annotated_resources(&schema, &config);
+        let pattern = found
+            .iter()
+            .find(|r| r.value == "/data/tenants/b/**/*.parquet")
+            .expect("the glob pattern is annotated");
+        assert_eq!(pattern.kind, ResourceKind::Path);
+        let confined = ReferencePolicy::open().with_path_roots(["/data/tenants/a"]);
+        assert!(confined.check(pattern).is_err());
     }
 
     #[test]

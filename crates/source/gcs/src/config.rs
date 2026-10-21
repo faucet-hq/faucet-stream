@@ -148,6 +148,10 @@ pub struct GcsSourceConfig {
     pub max_object_bytes: u64,
     /// Optional storage-host override (e.g. `http://localhost:4443` for
     /// fake-gcs-server). Production users should leave this unset.
+    ///
+    /// Process-held credentials (`application_default`, a key file) are sent
+    /// only to a Google endpoint; use `auth: { type: anonymous }` elsewhere.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub storage_host: Option<String>,
     /// Compression codec applied to each downloaded object. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —

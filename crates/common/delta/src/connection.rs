@@ -28,8 +28,23 @@ pub struct DeltaConnection {
     /// Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO
     /// endpoint override, or any object-store key the [`DeltaCredentials`]
     /// enum does not model). Keys set here **win** over credential-derived
-    /// keys.
+    /// keys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an
+    /// authority host) or a local file (`*_file`, `*_path`, a service-account
+    /// or application-credentials file) are checked like the typed fields by a
+    /// host that confines configs (`faucet serve`).
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource-keys" = {
+        "*endpoint*": "url",
+        "*_url": "url",
+        "url": "url",
+        "*proxy": "url",
+        "*authority_host": "url",
+        "*_file": "path",
+        "*_path": "path",
+        "*application_credentials": "path",
+        "google_service_account": "path",
+        "service_account": "path"
+    }))]
     pub storage_options: HashMap<String, String>,
 }
 
@@ -214,6 +229,55 @@ mod tests {
             credentials: DeltaCredentials::default(),
             storage_options: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn endpoint_and_key_file_storage_options_are_resources() {
+        use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_resources};
+        let schema = serde_json::to_value(schemars::schema_for!(DeltaConnection)).unwrap();
+        let config = json!({
+            "table_uri": "s3://bucket/tbl",
+            "storage_options": {
+                "AWS_ENDPOINT_URL": "http://169.254.169.254",
+                "AWS_ALLOW_HTTP": "true",
+                "GOOGLE_SERVICE_ACCOUNT": "/var/run/secrets/other.json",
+                "azure_storage_endpoint": "https://evil.example",
+                "AZURE_FEDERATED_TOKEN_FILE": "/etc/token"
+            }
+        });
+        let mut found: Vec<(String, ResourceKind)> = annotated_resources(&schema, &config)
+            .into_iter()
+            .map(|r| (r.pointer, r.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "/storage_options/AWS_ENDPOINT_URL".into(),
+                    ResourceKind::Url
+                ),
+                (
+                    "/storage_options/AZURE_FEDERATED_TOKEN_FILE".into(),
+                    ResourceKind::Path
+                ),
+                (
+                    "/storage_options/GOOGLE_SERVICE_ACCOUNT".into(),
+                    ResourceKind::Path
+                ),
+                (
+                    "/storage_options/azure_storage_endpoint".into(),
+                    ResourceKind::Url
+                ),
+                ("/table_uri".into(), ResourceKind::Path),
+            ]
+        );
+        let policy = ReferencePolicy::open().with_url_hosts(["bucket"]);
+        let refused = annotated_resources(&schema, &config)
+            .iter()
+            .filter(|r| policy.check(r).is_err())
+            .count();
+        assert_eq!(refused, 2);
     }
 
     #[test]

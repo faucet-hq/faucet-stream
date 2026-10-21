@@ -90,7 +90,7 @@ This uploads each batch of records as one or more `events/{uuidv7}.jsonl` object
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `storage_host` | string | *(unset)* | Endpoint override for the storage host. Integration-test escape hatch (e.g. `http://localhost:4443` for `fake-gcs-server`; a plaintext host uses the JSON API throughout) — leave unset in production. |
+| `storage_host` | string | *(unset)* | Endpoint override for the storage host. Integration-test escape hatch (e.g. `http://localhost:4443` for `fake-gcs-server`; a plaintext host uses the JSON API throughout) — leave unset in production. A host that is not a `googleapis.com` / `.goog` endpoint is refused with `application_default` or key-file credentials (the process's own token); use `auth: { type: anonymous }` or an inline key. |
 
 ## Authentication
 

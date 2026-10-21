@@ -117,6 +117,7 @@ impl std::fmt::Debug for RedshiftCredentials {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RedshiftConnection {
     /// Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub host: String,
     /// Port. Defaults to [`DEFAULT_PORT`] (5439).
     #[serde(default = "default_port")]

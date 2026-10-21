@@ -116,6 +116,7 @@ pub struct SpannerConnection {
     /// parallel pipelines/tests don't race on a process-global env var.
     /// The env var is still honored when this field is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub emulator_host: Option<String>,
 }
 

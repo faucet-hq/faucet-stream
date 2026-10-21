@@ -20,6 +20,7 @@ pub struct NatsConnectionConfig {
     /// client connects to the first reachable server and uses the rest for
     /// failover.
     #[serde(default = "default_servers")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub servers: Vec<String>,
     /// Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).
     #[serde(default)]

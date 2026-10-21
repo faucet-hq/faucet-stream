@@ -39,6 +39,7 @@ pub struct MssqlConnectionConfig {
     /// `Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually
     /// exclusive with [`connection_url`](Self::connection_url).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_string: Option<String>,
     /// TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].
     #[serde(default)]

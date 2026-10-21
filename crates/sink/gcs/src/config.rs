@@ -165,6 +165,10 @@ pub struct GcsSinkConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Optional storage-host override (integration-test escape hatch).
+    ///
+    /// Process-held credentials (`application_default`, a key file) are sent
+    /// only to a Google endpoint; use `auth: { type: anonymous }` elsewhere.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub storage_host: Option<String>,
     /// Compression codec applied to each uploaded object body. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —

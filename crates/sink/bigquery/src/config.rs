@@ -196,7 +196,10 @@ pub struct BigQueryLoadConfig {
     pub write_disposition: String,
     /// Optional GCS storage endpoint override (e.g. a fake-gcs-server host for
     /// tests). `None` uses the real Google endpoint.
+    /// Process-held credentials (`application_default`, a key file) are sent
+    /// only to a Google endpoint; use an anonymous `gcs_auth` elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub storage_host: Option<String>,
 }
 

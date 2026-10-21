@@ -73,7 +73,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `account` | string | — *(required)* | Snowflake account identifier (e.g. `"xy12345.us-east-1"`). Used to build the API host `https://{account}.snowflakecomputing.com`. |
+| `account` | string | — *(required)* | Snowflake account identifier (e.g. `"xy12345.us-east-1"`). Used to build the API host `https://{account}.snowflakecomputing.com`. Letters, digits, `_`, `-` and `.` only — anything else is refused at construction. |
 | `warehouse` | string | — *(required)* | Warehouse used for the session executing the inserts. |
 | `database` | string | — *(required)* | Target database name. |
 | `schema` | string | — *(required)* | Target schema name. |

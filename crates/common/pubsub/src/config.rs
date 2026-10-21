@@ -74,6 +74,7 @@ pub struct PubsubConnection {
     /// skipped and the endpoint is taken from this value — mirrors the
     /// `PUBSUB_EMULATOR_HOST` environment variable the SDK honours.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub emulator_host: Option<String>,
     /// How to authenticate. Defaults to Application Default Credentials.
     #[serde(default)]

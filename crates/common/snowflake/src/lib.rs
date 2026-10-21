@@ -112,6 +112,29 @@ pub fn authorization_header(auth: &SnowflakeAuth, account: &str) -> Result<Strin
     }
 }
 
+/// Check a Snowflake account identifier (`xy12345.us-east-1`, `org-acct`,
+/// `acct.privatelink`): letters, digits, `_`, `-` and `.` only, so the
+/// request URL built from it — `https://{account}.snowflakecomputing.com` —
+/// always names a Snowflake host. Anything else (`/`, `:`, `?`, `#`, `@`,
+/// whitespace) would move the request to another host, port or path.
+pub fn validate_account(account: &str) -> Result<(), FaucetError> {
+    let valid = !account.is_empty()
+        && !account.starts_with(['.', '-'])
+        && !account.ends_with(['.', '-'])
+        && !account.contains("..")
+        && account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(FaucetError::Config(format!(
+            "snowflake: `account` {account:?} is not an account identifier (letters, digits, \
+             `_`, `-` and `.` only, e.g. `xy12345.us-east-1` or `myorg-myaccount`)"
+        )))
+    }
+}
+
 /// The account part of a key-pair JWT's `iss`/`sub` claims.
 ///
 /// Snowflake wants the account locator without its region or cloud suffix
@@ -325,6 +348,36 @@ pub fn credential_to_auth(cred: faucet_core::Credential) -> Result<SnowflakeAuth
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn account_identifiers_cannot_leave_snowflake() {
+        for ok in [
+            "xy12345",
+            "xy12345.us-east-1",
+            "myorg-my_acct",
+            "acct.privatelink",
+        ] {
+            assert!(validate_account(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "internal-admin.svc.cluster.local:8443/admin/export?x=",
+            "evil.example/x",
+            "a@b",
+            "a#",
+            "a b",
+            ".a",
+            "a.",
+            "a..b",
+            "-a",
+        ] {
+            let err = validate_account(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("not an account identifier"),
+                "{bad}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
