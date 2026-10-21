@@ -515,6 +515,28 @@ pipeline:
 }
 
 #[test]
+fn cleanup_on_a_listener_source_is_rejected() {
+    // A webhook / websocket run sees only what is sent during its window.
+    for source in [
+        "type: webhook\n    config: { duration_secs: 60 }",
+        "type: websocket\n    config: { url: \"wss://example.com/feed\", max_messages: 10 }",
+    ] {
+        let err = expand_err(&format!(
+            r#"
+version: 1
+pipeline:
+  source:
+    {source}
+    complete_for:
+      scope: {{ group_id: 1 }}
+      on_missing: delete
+{SQLITE_UPSERT}"#
+        ));
+        assert!(err.contains("arrived since its last run"), "{source}: {err}");
+    }
+}
+
+#[test]
 fn a_child_cleanup_scope_needs_its_parents_token() {
     // #789 CLI-25: a static scope on a fan-out row deletes the siblings' rows.
     let yaml = |scope: &str| {

@@ -1252,10 +1252,12 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
 }
 
 /// Whether a source reads only what arrived since its last run whatever the
-/// config: a queue it consumes from, or a live subscription. Its read is never
-/// a complete fetch (#862 M-022).
+/// config: a queue it consumes from, a live subscription, or a listener that
+/// collects what is sent to it during the run (`webhook`, `websocket`). Its
+/// read is never a complete fetch (#862 M-022).
 pub fn source_reads_a_delta(kind: &str, config: &Value) -> bool {
-    source_kind_consumes_destructively(kind, config) || kind == "nats"
+    source_kind_consumes_destructively(kind, config)
+        || matches!(kind, "nats" | "webhook" | "websocket")
 }
 
 /// Whether a SQL query source reads with `replication: { type: incremental }`.

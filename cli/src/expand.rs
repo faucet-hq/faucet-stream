@@ -2535,8 +2535,9 @@ fn check_cleanup_completeness(
     if crate::registry::source_reads_a_delta(&source.kind, &source.config) {
         return Err(CliError::Config(format!(
             "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
-             but source '{}' reads only the messages that arrived since its last run, so its \
-             cleanup would delete every row in scope that did not arrive again",
+             but source '{}' reads only what arrived since its last run (a queue, a \
+             subscription, a listener), so its cleanup would delete every row in scope that did \
+             not arrive again",
             source.kind
         )));
     }
@@ -4946,7 +4947,7 @@ pipeline:
             "singer",
             &serde_json::json!({})
         ));
-        for kind in ["sqs", "pubsub", "rabbitmq", "nats"] {
+        for kind in ["sqs", "pubsub", "rabbitmq", "nats", "webhook", "websocket"] {
             assert!(
                 crate::registry::source_reads_a_delta(kind, &serde_json::json!({})),
                 "{kind}"
