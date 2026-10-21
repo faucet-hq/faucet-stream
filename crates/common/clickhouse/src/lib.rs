@@ -178,8 +178,13 @@ pub fn http_client(_conn: &ClickHouseConnection) -> Result<faucet_core::http::Cl
     faucet_core::http::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
+        .sensitive_header(USER_HEADER)
+        .sensitive_header(KEY_HEADER)
         .build()
 }
+
+const USER_HEADER: &str = "x-clickhouse-user";
+const KEY_HEADER: &str = "x-clickhouse-key";
 
 /// Build the ordered `(key, value)` query parameters for a ClickHouse HTTP
 /// request: the `database` parameter followed by any extra `settings`
@@ -198,18 +203,36 @@ pub fn query_params(database: &str, settings: &[(&str, &str)]) -> Vec<(String, S
 /// Attach the ClickHouse authentication headers to a request when a user /
 /// password is configured. Uses the `X-ClickHouse-User` / `X-ClickHouse-Key`
 /// headers (never URL query parameters, so credentials do not leak into
-/// request logs).
+/// request logs). Both values are marked sensitive, so they are redacted from
+/// debug output and dropped on a redirect to another origin.
 pub fn apply_auth(
     mut req: reqwest::RequestBuilder,
     conn: &ClickHouseConnection,
 ) -> reqwest::RequestBuilder {
     if let Some(user) = &conn.user {
-        req = req.header("X-ClickHouse-User", user);
+        req = sensitive_header(req, USER_HEADER, user);
     }
     if let Some(password) = &conn.password {
-        req = req.header("X-ClickHouse-Key", password);
+        req = sensitive_header(req, KEY_HEADER, password);
     }
     req
+}
+
+/// Set a header whose value is marked sensitive. A value that is not a valid
+/// header is passed through unchanged, so reqwest fails the request with its
+/// own error rather than sending something else.
+fn sensitive_header(
+    req: reqwest::RequestBuilder,
+    name: &'static str,
+    raw: &str,
+) -> reqwest::RequestBuilder {
+    match reqwest::header::HeaderValue::from_str(raw) {
+        Ok(mut v) => {
+            v.set_sensitive(true);
+            req.header(name, v)
+        }
+        Err(_) => req.header(name, raw),
+    }
 }
 
 /// Parse a `JSONEachRow` response body (one JSON object per line) into records.
@@ -317,6 +340,54 @@ mod tests {
         let conn = ClickHouseConnection::from_url("http://localhost:8123/");
         assert!(build_client(&conn).is_ok());
         assert!(http_client(&conn).is_ok());
+    }
+
+    #[test]
+    fn auth_headers_are_marked_sensitive() {
+        let mut conn = ClickHouseConnection::from_url("http://localhost:8123/");
+        conn.user = Some("alice".into());
+        conn.password = Some("s3cret".into());
+        let client = http_client(&conn).unwrap();
+        let req = apply_auth(client.get("http://localhost:8123/"), &conn)
+            .build()
+            .unwrap();
+        for name in [USER_HEADER, KEY_HEADER] {
+            assert!(req.headers()[name].is_sensitive(), "{name}");
+        }
+        assert!(!format!("{req:?}").contains("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn auth_headers_are_not_replayed_across_origins() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let other = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&other)
+            .await;
+        let front = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/x", other.uri())),
+            )
+            .mount(&front)
+            .await;
+        let mut conn = ClickHouseConnection::from_url(front.uri());
+        conn.user = Some("alice".into());
+        conn.password = Some("s3cret".into());
+        let client = http_client(&conn).unwrap();
+        let resp = client
+            .send(apply_auth(client.get(format!("{}/", front.uri())), &conn))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let reqs = other.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        for name in [USER_HEADER, KEY_HEADER] {
+            assert!(!reqs[0].headers.contains_key(name), "{name} replayed");
+        }
     }
 
     #[test]
