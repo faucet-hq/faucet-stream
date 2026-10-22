@@ -313,7 +313,10 @@ impl GraphqlDriver {
         context: &std::collections::HashMap<String, Value>,
         start: Option<&Value>,
     ) -> Result<Value, FaucetError> {
-        let mut variables = self.config.variables.clone();
+        let mut variables = match &self.config.variables {
+            Value::Null => Value::Object(Default::default()),
+            v => v.clone(),
+        };
         if let Some(start) = start {
             self.bind_bookmark(&mut variables, start)?;
         }

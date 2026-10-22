@@ -548,3 +548,19 @@ async fn config_without_variables_defaults_to_object_and_paginates() {
     );
     assert!(requests.iter().all(|r| request_variables(r).is_object()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn null_variables_still_carry_the_cursor_and_page_size() {
+    let server = MockServer::start().await;
+    mount_multi_page(&server, 5, 2).await;
+    let config = relay_config(&server, 2).variables(Value::Null);
+    let records = GraphqlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 5);
+    let requests = server.received_requests().await.unwrap();
+    let cursors: Vec<Option<String>> = requests.iter().map(request_cursor).collect();
+    assert_eq!(
+        cursors,
+        vec![None, Some("cursor-1".into()), Some("cursor-2".into())]
+    );
+    assert!(requests.iter().all(|r| request_first(r) == Some(2)));
+}

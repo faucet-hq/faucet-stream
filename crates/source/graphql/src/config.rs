@@ -408,6 +408,11 @@ impl GraphqlStreamConfig {
             ));
         }
         validate_batch_size(self.batch_size)?;
+        if !self.variables.is_object() && !self.variables.is_null() {
+            return Err(FaucetError::Config(
+                "GraphQL source needs `variables` to be an object".into(),
+            ));
+        }
         if let Some(GraphqlPaginationSpec::Offset(off)) = &self.pagination
             && off.page_size == 0
         {
@@ -808,6 +813,9 @@ mod tests {
         .unwrap();
         assert_eq!(c.variables, json!({}));
         assert!(c.validate().is_ok());
+        let mut listed = c.clone();
+        listed.variables = json!("x");
+        assert!(listed.validate().is_err());
         let schema = serde_json::to_value(schemars::schema_for!(GraphqlStreamConfig)).unwrap();
         let required = schema["required"].as_array().cloned().unwrap_or_default();
         assert!(!required.contains(&json!("variables")));
