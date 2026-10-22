@@ -37,6 +37,15 @@ fn source_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
 
 use faucet_core::CallExt as _;
 
+/// A catalog without nested namespaces, or a namespace dropped while it was
+/// being listed: nothing below it to discover.
+fn nested_listing_unavailable(e: &iceberg::Error) -> bool {
+    matches!(
+        e.kind(),
+        iceberg::ErrorKind::FeatureUnsupported | iceberg::ErrorKind::NamespaceNotFound
+    )
+}
+
 /// A source that reads an Apache Iceberg table.
 pub struct IcebergSource {
     config: IcebergSourceConfig,
@@ -333,15 +342,24 @@ impl faucet_core::Source for IcebergSource {
         let mut seen: HashSet<NamespaceIdent> = queue.iter().cloned().collect();
         let mut out = Vec::new();
         while let Some(ns) = queue.pop() {
-            if let Ok(children) = catalog
+            match catalog
                 .list_namespaces(Some(&ns))
                 .within(&self.calls, "list")
                 .await?
             {
-                for child in children {
-                    if seen.insert(child.clone()) {
-                        queue.push(child);
+                Ok(children) => {
+                    for child in children {
+                        if seen.insert(child.clone()) {
+                            queue.push(child);
+                        }
                     }
+                }
+                Err(e) if nested_listing_unavailable(&e) => {}
+                Err(e) => {
+                    return Err(source_err(
+                        &format!("could not list the namespaces under {}", ns.to_url_string()),
+                        e,
+                    ));
                 }
             }
             let tables = catalog
@@ -492,5 +510,27 @@ impl faucet_core::Source for IcebergSource {
                 ),
             })
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unsupported_or_vanished_namespace_skips_nested_listing() {
+        use iceberg::{Error, ErrorKind};
+        assert!(nested_listing_unavailable(&Error::new(
+            ErrorKind::FeatureUnsupported,
+            "x"
+        )));
+        assert!(nested_listing_unavailable(&Error::new(
+            ErrorKind::NamespaceNotFound,
+            "x"
+        )));
+        assert!(!nested_listing_unavailable(&Error::new(
+            ErrorKind::Unexpected,
+            "403"
+        )));
     }
 }
