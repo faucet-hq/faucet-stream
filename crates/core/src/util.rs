@@ -45,6 +45,58 @@ pub fn extract_records(body: &Value, path: Option<&str>) -> Result<Vec<Value>, F
     }
 }
 
+/// [`extract_records`] over an owned body: a plain path (`$.a.b`, `$.a.b[*]`)
+/// and the no-path case move the records out of `body` instead of copying
+/// them; any other path is evaluated as JSONPath. The result is the same.
+pub fn extract_records_owned(
+    mut body: Value,
+    path: Option<&str>,
+) -> Result<Vec<Value>, FaucetError> {
+    let Some(p) = path else {
+        return Ok(match body {
+            Value::Array(arr) => arr,
+            other => vec![other],
+        });
+    };
+    let Some((segments, wildcard)) = plain_path(p) else {
+        return extract_records(&body, path);
+    };
+    let mut node = &mut body;
+    for seg in &segments {
+        match node.as_object_mut().and_then(|m| m.get_mut(*seg)) {
+            Some(next) => node = next,
+            None => return extract_records(&body, path),
+        }
+    }
+    if !wildcard {
+        return Ok(vec![std::mem::take(node)]);
+    }
+    match node {
+        Value::Array(arr) => Ok(std::mem::take(arr)),
+        _ => extract_records(&body, path),
+    }
+}
+
+/// `$` + `.name` segments + an optional trailing `[*]`; `None` for anything
+/// else.
+fn plain_path(p: &str) -> Option<(Vec<&str>, bool)> {
+    let rest = p.strip_prefix('$')?;
+    let (rest, wildcard) = match rest.strip_suffix("[*]") {
+        Some(r) => (r, true),
+        None => (rest, false),
+    };
+    if rest.is_empty() {
+        return Some((Vec::new(), wildcard));
+    }
+    let segments: Vec<&str> = rest.strip_prefix('.')?.split('.').collect();
+    let ident = |s: &&str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    segments.iter().all(ident).then_some((segments, wildcard))
+}
+
 // ── HTTP Response Handling ──────────────────────────────────────────────────
 
 /// Check an HTTP response status and return a [`FaucetError::HttpStatus`] on
@@ -950,6 +1002,42 @@ mod tests {
     }
 
     // ── extract_records ─────────────────────────────────────────────────
+
+    #[test]
+    fn extract_records_owned_matches_the_borrowing_form() {
+        let body = json!({
+            "data": [{"id": 1}, {"id": 2}],
+            "meta": {"page": {"items": [3, 4], "n": null}, "obj": {"a": 1, "b": 2}},
+            "scalar": 5
+        });
+        for path in [
+            None,
+            Some("$"),
+            Some("$[*]"),
+            Some("$.data"),
+            Some("$.data[*]"),
+            Some("$.meta.page.items[*]"),
+            Some("$.meta.page.n"),
+            Some("$.meta.obj[*]"),
+            Some("$.missing"),
+            Some("$.missing[*]"),
+            Some("$.scalar[*]"),
+            Some("$.data[0]"),
+            Some("$..id"),
+            Some("$.data[*].id"),
+        ] {
+            assert_eq!(
+                extract_records_owned(body.clone(), path).unwrap(),
+                extract_records(&body, path).unwrap(),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            extract_records_owned(json!([1, 2]), None).unwrap(),
+            vec![json!(1), json!(2)]
+        );
+        assert!(extract_records_owned(body, Some("$[")).is_err());
+    }
 
     #[test]
     fn extract_with_path() {

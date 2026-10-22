@@ -780,7 +780,7 @@ fn serialize_and_extract(
         .map_err(|e| {
             FaucetError::Transform(format!("failed to serialize gRPC response to JSON: {e}"))
         })?;
-    faucet_core::util::extract_records(&json_value, records_path)
+    faucet_core::util::extract_records_owned(json_value, records_path)
 }
 
 /// Reconnect delay after `attempt` consecutive transient failures: the
