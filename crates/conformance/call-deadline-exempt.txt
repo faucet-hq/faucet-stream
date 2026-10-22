@@ -7,3 +7,4 @@ faucet-sink-stdout: writes to the process's own stdout/stderr; no backend
 faucet-source-csv: local file reads only; no backend call can hang
 faucet-source-webhook: an HTTP server that waits for senders; it makes no backend call, and its listening window is bounded by its own timeout and max_payloads
 faucet-source-parquet: local path reads are local file I/O; the deprecated S3 location reads through object_store, whose own request timeouts bound it
+faucet-source-mssql-cdc: assert_source_call_deadline runs in an #[ignore]d test (needs SQL Server CDC); run nightly by integration-heavy.yml

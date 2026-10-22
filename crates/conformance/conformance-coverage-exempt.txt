@@ -43,3 +43,7 @@ faucet-sink-bigquery keyed_write_modes: MERGE semantics are BigQuery's (no emula
 faucet-sink-bigquery replay_safe: a replayed keyed write is one MERGE, which converges by BigQuery's key semantics (no emulator); pinned by src/merge.rs unit tests and tests/upsert.rs
 faucet-sink-bigquery overwrite: the temp-table load and TRUNCATE + INSERT swap run in BigQuery (no emulator); the lifecycle requests are pinned by tests/overwrite.rs
 faucet-sink-redshift atomic_batches: batches are atomic only for write_strategy: copy with batch_size: 0, whose COPY FROM 's3://…' needs a real cluster and bucket; COPY SQL is unit-tested in src/copy.rs
+
+# Proven by #[ignore]d tests that need a SQL Server with CDC enabled; the
+# nightly integration-heavy workflow runs them with --include-ignored.
+faucet-source-mssql-cdc exactly_once: assert_bookmark_roundtrip runs in an #[ignore]d test (needs SQL Server CDC); run nightly by integration-heavy.yml
