@@ -19,9 +19,64 @@ use sqlx::{PgPool, Row};
 
 use crate::config::{RedshiftCopyFormat, RedshiftSinkConfig, RedshiftWriteStrategy};
 use crate::copy::{
-    build_create_table_sql, columns_present, copy_statement, insert_statement, qualified_table_ref,
-    s3_uri, serialize_csv, serialize_jsonl,
+    build_create_table_sql, columns_present, copy_statement, insert_statement, manifest_body,
+    qualified_table_ref, s3_uri, serialize_csv, serialize_jsonl,
 };
+
+/// How long the clean-up of staged objects may take once the load is done;
+/// it runs past the run's deadline so a cut load leaves nothing behind.
+const STAGE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Staged objects not yet deleted. Dropped before [`StagedObjects::delete`]
+/// ran (the load future was abandoned), it deletes them on a spawned task.
+struct StagedObjects {
+    s3: S3Client,
+    bucket: String,
+    keys: Vec<String>,
+}
+
+impl StagedObjects {
+    async fn delete(mut self) {
+        let keys = std::mem::take(&mut self.keys);
+        delete_staged(&self.s3, &self.bucket, keys).await;
+    }
+}
+
+impl Drop for StagedObjects {
+    fn drop(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let (s3, bucket, keys) = (
+            self.s3.clone(),
+            self.bucket.clone(),
+            std::mem::take(&mut self.keys),
+        );
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { delete_staged(&s3, &bucket, keys).await });
+        }
+    }
+}
+
+/// Best-effort delete of staged objects, bounded by its own timeout rather
+/// than the run's call context.
+async fn delete_staged(s3: &S3Client, bucket: &str, keys: Vec<String>) {
+    let ctx = faucet_core::CallContext::new().with_timeout(STAGE_CLEANUP_TIMEOUT);
+    for key in keys {
+        let deleted = faucet_common_redshift::calls::once(&ctx, "stage", async {
+            s3.delete_object()
+                .bucket(bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| FaucetError::Sink(e.to_string()))
+        })
+        .await;
+        if let Err(e) = deleted {
+            tracing::warn!(key = %key, error = %e, "redshift: failed to delete staged S3 object (best-effort)");
+        }
+    }
+}
 
 /// A sink that loads JSON records into an Amazon Redshift table.
 ///
@@ -81,13 +136,19 @@ impl RedshiftDriver {
         };
         let mut total = 0;
         let mut done = 0;
-        for chunk in rows.chunks(chunk_len) {
-            total += match self.config.write_strategy {
-                RedshiftWriteStrategy::Copy => self.copy_chunk(calls, chunk).await,
-                RedshiftWriteStrategy::Insert => self.insert_chunk(calls, chunk).await,
+        if self.config.write_strategy == RedshiftWriteStrategy::Copy {
+            // One `COPY` per group: each `batch_size` chunk is its own staged
+            // object, loaded together through a manifest.
+            let chunks: Vec<&[Value]> = rows.chunks(chunk_len).collect();
+            total = self.copy_chunks(calls, &chunks).await.map_err(|e| (0, e))?;
+        } else {
+            for chunk in rows.chunks(chunk_len) {
+                total += self
+                    .insert_chunk(calls, chunk)
+                    .await
+                    .map_err(|e| (done, e))?;
+                done += chunk.len();
             }
-            .map_err(|e| (done, e))?;
-            done += chunk.len();
         }
         tracing::info!(
             table = %self.config.table_name,
@@ -374,9 +435,15 @@ impl RedshiftDriver {
         Ok(cols)
     }
 
-    /// Load one chunk via the `COPY`-from-S3 fast path.
-    async fn copy_chunk(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
+    /// Load `chunks` via the `COPY`-from-S3 fast path: each chunk is staged
+    /// as one object and a single `COPY` loads them all (through a manifest
+    /// when there are several), so the group lands or fails as a unit.
+    async fn copy_chunks(
+        &self,
+        calls: &CallSlot,
+        chunks: &[&[Value]],
+    ) -> Result<usize, FaucetError> {
+        if chunks.iter().all(|c| c.is_empty()) {
             return Ok(0);
         }
         let s3 = self.s3.as_ref().ok_or_else(|| {
@@ -389,60 +456,64 @@ impl RedshiftDriver {
         let iam_role = copy_cfg.iam_role.as_deref().ok_or_else(|| {
             FaucetError::Sink("redshift: iam_role is required for copy strategy".into())
         })?;
-
-        // A record sharing no column with the table would load as an all-NULL
-        // row, so it is skipped, as on the INSERT path (#862 L-118).
         let table_columns = self.discover_columns(calls).await?;
-        let (records, skipped) = loadable_records(records, &table_columns)?;
-        if skipped > 0 {
-            tracing::warn!(
-                table = %self.config.table_name,
-                skipped,
-                "redshift: skipped record(s) with no column matching the table \
-                 (would have loaded an all-NULL row)"
-            );
-        }
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        // Serialize the page and, for CSV, learn the destination column order.
-        let (body, columns): (Vec<u8>, Option<Vec<String>>) = match copy_cfg.format {
-            RedshiftCopyFormat::Jsonl => (serialize_jsonl(&records)?, None),
-            RedshiftCopyFormat::Csv => (
-                serialize_csv(&records, &table_columns)?,
-                Some(table_columns),
-            ),
-        };
         let ext = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => "jsonl",
             RedshiftCopyFormat::Csv => "csv",
         };
-        let key = self.staging_key(ext);
-
-        // 1. Upload the staged object.
-        self.call(calls, "stage", async {
-            s3.put_object()
-                .bucket(bucket)
-                .key(&key)
-                .body(body.into())
-                .send()
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("redshift: S3 upload failed for key '{key}': {e}"))
-                })
-        })
-        .await?;
-
-        // 2. COPY it into the table.
-        let sql = copy_statement(
+        let mut staged = StagedObjects {
+            s3: s3.clone(),
+            bucket: bucket.to_string(),
+            keys: Vec::new(),
+        };
+        let mut loaded = 0;
+        let mut parts = Vec::new();
+        for chunk in chunks.iter().filter(|c| !c.is_empty()) {
+            // A record sharing no column with the table would load as an
+            // all-NULL row, so it is skipped, as on the INSERT path (#862 L-118).
+            let (records, skipped) = loadable_records(chunk, &table_columns)?;
+            if skipped > 0 {
+                tracing::warn!(
+                    table = %self.config.table_name,
+                    skipped,
+                    "redshift: skipped record(s) with no column matching the table \
+                     (would have loaded an all-NULL row)"
+                );
+            }
+            let body = match copy_cfg.format {
+                RedshiftCopyFormat::Jsonl => serialize_jsonl(&records)?,
+                RedshiftCopyFormat::Csv => serialize_csv(&records, &table_columns)?,
+            };
+            let key = self.staging_key(ext);
+            self.upload(calls, s3, bucket, &key, body).await?;
+            staged.keys.push(key.clone());
+            parts.push(key);
+            loaded += records.len();
+        }
+        let (source, manifest) = if parts.len() == 1 {
+            (s3_uri(bucket, &parts[0]), false)
+        } else {
+            let key = self.staging_key("manifest");
+            self.upload(calls, s3, bucket, &key, manifest_body(bucket, &parts))
+                .await?;
+            staged.keys.push(key.clone());
+            (s3_uri(bucket, &key), true)
+        };
+        let columns = match copy_cfg.format {
+            RedshiftCopyFormat::Jsonl => None,
+            RedshiftCopyFormat::Csv => Some(table_columns.as_slice()),
+        };
+        let mut sql = copy_statement(
             &self.table_ref(),
-            columns.as_deref(),
-            &s3_uri(bucket, &key),
+            columns,
+            &source,
             iam_role,
             copy_cfg.region.as_deref(),
             copy_cfg.format,
         );
+        if manifest {
+            sql.push_str(" MANIFEST");
+        }
         let copy_result = self
             .call(calls, "execute", async {
                 sqlx::query(&sql)
@@ -451,25 +522,34 @@ impl RedshiftDriver {
                     .map_err(|e| FaucetError::Sink(format!("redshift: COPY failed: {e}")))
             })
             .await;
-
-        // 3. Best-effort cleanup of the staged object (regardless of COPY
-        //    outcome — a failed COPY still leaves the object behind).
-        let deleted = self
-            .call(calls, "stage", async {
-                s3.delete_object()
-                    .bucket(bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .map_err(|e| FaucetError::Sink(e.to_string()))
-            })
-            .await;
-        if let Err(e) = deleted {
-            tracing::warn!(key = %key, error = %e, "redshift: failed to delete staged S3 object (best-effort)");
-        }
-
+        // A failed COPY still leaves the objects behind.
+        staged.delete().await;
         copy_result?;
-        Ok(records.len())
+        Ok(loaded)
+    }
+
+    /// Upload one staged object.
+    async fn upload(
+        &self,
+        calls: &CallSlot,
+        s3: &S3Client,
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+    ) -> Result<(), FaucetError> {
+        self.call(calls, "stage", async {
+            s3.put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(body.into())
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    FaucetError::Sink(format!("redshift: S3 upload failed for key '{key}': {e}"))
+                })
+        })
+        .await
     }
 
     /// Load one chunk via multi-row `INSERT`, sub-chunked to respect the bind

@@ -114,8 +114,11 @@ whose commit fails keeps its uncommitted rows, so a retried `flush` (for
 example under a `resilience:` policy) commits them rather than reporting
 success with nothing written.
 
-`batch_size` still bounds an individual request inside a commit group, so a
-very large group is split into reasonably-sized requests.
+`batch_size` still bounds an individual request inside a commit group: under
+`insert` each chunk is one statement; under `copy` each chunk is one staged
+object, and the group's objects load with a single `COPY … MANIFEST`. Staged
+objects are deleted after the load, also when the run's deadline or a cancel
+cut it short.
 
 **Only the append path accumulates.** `delivery: exactly_once` and the DLQ
 path commit per page, because a commit token must land atomically with its own
@@ -127,7 +130,7 @@ repeated.
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** for `write_strategy: copy` with `batch_size: 0`, otherwise **best-effort** — a commit group is one COPY only when unchunked; INSERT splits by bind parameters. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** for `write_strategy: copy` — a commit group is one `COPY`, its `batch_size` chunks staged as separate objects behind one manifest — and **best-effort** for `insert`, which splits by bind parameters. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

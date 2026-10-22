@@ -28735,7 +28735,7 @@
                       "x-faucet-resource": "url"
                     },
                     "batch_size": {
-                      "description": "Rows per load unit. For `insert`, the per-statement multi-row chunk size;\nfor `copy`, the number of rows per staged S3 object. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` = one unit for the whole page.",
+                      "description": "Rows per load unit. For `insert`, the per-statement multi-row chunk size;\nfor `copy`, the number of rows per staged S3 object (a commit group's\nobjects load in one `COPY` through a manifest). Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` = one unit for the whole page.",
                       "type": [
                         "integer",
                         "string"
