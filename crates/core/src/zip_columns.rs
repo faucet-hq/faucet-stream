@@ -157,7 +157,10 @@ impl CompiledZipColumns {
             return self.apply_groups(rec);
         }
         let columns = self.column_names(rec)?;
-        let rows = row_candidates(&extract_records(rec, Some(&self.rows_path))?);
+        let rows = row_candidates(
+            &extract_records(rec, Some(&self.rows_path))?,
+            &self.rows_path,
+        );
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let Value::Array(values) = row else {
@@ -334,8 +337,12 @@ fn column_candidates(matched: &[Value]) -> Vec<Value> {
 /// arrays*) → unwrap to the rows; `rows[*]` yields each row directly. Unwrapping
 /// only when every element is itself an array disambiguates a single-row
 /// `rows[*]` (one array of scalars) from the whole rows container.
-fn row_candidates(matched: &[Value]) -> Vec<Value> {
-    if let [Value::Array(inner)] = matched
+/// The rows `rows_path` selected. A path that ends in `[*]` selects each row
+/// itself; any other path selects the rows container, whose single match is
+/// unwrapped.
+fn row_candidates(matched: &[Value], rows_path: &str) -> Vec<Value> {
+    if !rows_path.trim_end().ends_with("[*]")
+        && let [Value::Array(inner)] = matched
         && inner.iter().all(|v| matches!(v, Value::Array(_)))
     {
         return inner.clone();
@@ -356,6 +363,36 @@ mod tests {
         }
         .compile()
         .unwrap()
+    }
+
+    #[test]
+    fn a_single_row_of_list_cells_is_one_row_under_a_wildcard_path() {
+        let spec = ZipColumnsSpec {
+            columns_path: "columns[*].name".into(),
+            rows_path: "rows[*]".into(),
+            groups: vec![],
+        }
+        .compile()
+        .unwrap();
+        let rec = json!({
+            "columns": [{"name": "tags"}, {"name": "ids"}],
+            "rows": [[["a", "b"], ["c", "d"]]]
+        });
+        assert_eq!(
+            spec.apply(&rec).unwrap(),
+            vec![json!({"tags": ["a", "b"], "ids": ["c", "d"]})]
+        );
+        let container = ZipColumnsSpec {
+            columns_path: "columns[*].name".into(),
+            rows_path: "rows".into(),
+            groups: vec![],
+        }
+        .compile()
+        .unwrap();
+        assert_eq!(
+            container.apply(&rec).unwrap(),
+            vec![json!({"tags": ["a", "b"], "ids": ["c", "d"]})]
+        );
     }
 
     #[test]
