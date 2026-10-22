@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use faucet_common_oracle::{TypeFamily, normalize_datetime_text, typed_text_to_json};
+use faucet_common_oracle::{TypeFamily, normalize_datetime_text, typed_text_to_json_at};
 use faucet_core::FaucetError;
 use serde_json::{Map, Value, json};
 
@@ -100,8 +100,24 @@ impl Assembler {
     }
 }
 
-/// Column type families per `(owner, table)`, for typing redo literals.
-pub type TableMeta = HashMap<(String, String), HashMap<String, TypeFamily>>;
+/// Column types per `(owner, table)`, for typing redo literals.
+pub type TableMeta = HashMap<(String, String), HashMap<String, ColumnType>>;
+
+/// A column's type family and, for a timestamp, its fractional digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnType {
+    pub family: TypeFamily,
+    pub digits: Option<u8>,
+}
+
+impl From<TypeFamily> for ColumnType {
+    fn from(family: TypeFamily) -> Self {
+        Self {
+            family,
+            digits: None,
+        }
+    }
+}
 
 /// The kind of a captured change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,16 +640,17 @@ fn is_mismatch(row: &LogRow) -> bool {
 }
 
 /// Shape an image as JSON, typing each literal by its column's family.
-pub fn image_to_json(image: &Image, families: Option<&HashMap<String, TypeFamily>>) -> Value {
+pub fn image_to_json(image: &Image, families: Option<&HashMap<String, ColumnType>>) -> Value {
     let mut out = Map::with_capacity(image.len());
     for (col, v) in image {
-        let family = families
+        let column = families
             .and_then(|f| f.get(col))
             .copied()
-            .unwrap_or(TypeFamily::Other);
+            .unwrap_or(ColumnType::from(TypeFamily::Other));
+        let family = column.family;
         let json = match v {
             Resolved::Null | Resolved::EmptyLob => Value::Null,
-            Resolved::Text(t) => typed_text_to_json(t, family),
+            Resolved::Text(t) => typed_text_to_json_at(t, family, column.digits),
             Resolved::Bytes(b) => match family {
                 TypeFamily::Clob | TypeFamily::Text | TypeFamily::NationalText => {
                     Value::String(String::from_utf8_lossy(b).into_owned())
@@ -676,6 +693,7 @@ pub fn to_envelope(event: &Event, txn: &Committed, meta: &TableMeta) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faucet_common_oracle::typed_text_to_json;
 
     /// The value-fidelity corpus (#885): the wide row as the literals LogMiner
     /// renders for each column family decodes back unchanged. An Oracle
@@ -805,7 +823,7 @@ mod tests {
 
         let meta: TableMeta = HashMap::from([(
             ("APP".into(), "T".into()),
-            HashMap::from([("ID".to_string(), TypeFamily::Integer)]),
+            HashMap::from([("ID".to_string(), TypeFamily::Integer.into())]),
         )]);
         let env = to_envelope(&c.events[0], &c, &meta);
         assert_eq!(env["op"], "i");
@@ -1058,9 +1076,9 @@ mod tests {
         let meta: TableMeta = HashMap::from([(
             ("APP".into(), "T".into()),
             HashMap::from([
-                ("ID".to_string(), TypeFamily::Integer),
-                ("NOTE".to_string(), TypeFamily::Clob),
-                ("B".to_string(), TypeFamily::Blob),
+                ("ID".to_string(), TypeFamily::Integer.into()),
+                ("NOTE".to_string(), TypeFamily::Clob.into()),
+                ("B".to_string(), TypeFamily::Blob.into()),
             ]),
         )]);
         let env = to_envelope(&c.events[0], &c, &meta);
@@ -1088,8 +1106,8 @@ mod tests {
         let meta: TableMeta = HashMap::from([(
             ("APP".into(), "T".into()),
             HashMap::from([
-                ("ID".to_string(), TypeFamily::Integer),
-                ("NOTE".to_string(), TypeFamily::Clob),
+                ("ID".to_string(), TypeFamily::Integer.into()),
+                ("NOTE".to_string(), TypeFamily::Clob.into()),
             ]),
         )]);
         let mut m = miner();
@@ -1284,10 +1302,44 @@ mod tests {
             ("S".to_string(), Resolved::Bytes(b"hi".to_vec())),
             ("E".to_string(), Resolved::EmptyLob),
         ];
-        let fam = HashMap::from([("S".to_string(), TypeFamily::Text)]);
+        let fam = HashMap::from([("S".to_string(), TypeFamily::Text.into())]);
         assert_eq!(
             image_to_json(&img, Some(&fam)),
             json!({"R": "/w==", "S": "hi", "E": null})
+        );
+    }
+
+    #[test]
+    fn timestamps_render_at_the_columns_declared_precision() {
+        let img = vec![
+            (
+                "T".to_string(),
+                Resolved::Text("2024-01-02 03:04:05.500000000".into()),
+            ),
+            (
+                "Z".to_string(),
+                Resolved::Text("2024-01-02 03:04:05.500000000 +00:00".into()),
+            ),
+        ];
+        let cols: HashMap<String, ColumnType> = HashMap::from([
+            (
+                "T".to_string(),
+                ColumnType {
+                    family: TypeFamily::Timestamp,
+                    digits: Some(6),
+                },
+            ),
+            (
+                "Z".to_string(),
+                ColumnType {
+                    family: TypeFamily::TimestampTz,
+                    digits: Some(3),
+                },
+            ),
+        ]);
+        assert_eq!(
+            image_to_json(&img, Some(&cols)),
+            json!({"T": "2024-01-02T03:04:05.500000", "Z": "2024-01-02T03:04:05.500Z"})
         );
     }
 }

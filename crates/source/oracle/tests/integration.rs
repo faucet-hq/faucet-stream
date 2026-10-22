@@ -75,8 +75,8 @@ async fn oracle_query_source_end_to_end() {
     assert_eq!(r["BIN"], json!("AQI="));
     assert_eq!(r["BLOBV"], json!("/w=="));
     assert_eq!(r["D"], json!("2024-01-02T00:00:00"));
-    assert_eq!(r["TS"], json!("2024-01-02T03:04:05.500"));
-    assert_eq!(r["TSZ"], json!("2024-01-02T03:04:05+05:30"));
+    assert_eq!(r["TS"], json!("2024-01-02T03:04:05.500000"));
+    assert_eq!(r["TSZ"], json!("2024-01-02T03:04:05.000000+05:30"));
     assert_eq!(r["IDS"], json!("P1DT2H3M4.5S"));
     assert_eq!(r["IYM"], json!("P1Y2M"));
     assert_eq!(r["DOC"], json!({"a": 1}));

@@ -35,9 +35,10 @@ pub use sql::{
     shard_bounds_query, shard_wrap, split_table, string_literal, trim_statement,
 };
 pub use types::{
-    Cell, TypeFamily, bytes_to_hex, cell_to_json, format_interval_ds, format_interval_ym,
-    hex_to_bytes, iso_to_oracle_interval, normalize_datetime_text, number_text_to_json,
-    oracle_interval_ds_to_iso, oracle_interval_ym_to_iso, typed_text_to_json,
+    Cell, TypeFamily, bytes_to_hex, cell_to_json, cell_to_json_at, format_interval_ds,
+    format_interval_ym, hex_to_bytes, iso_to_oracle_interval, normalize_datetime_text,
+    normalize_datetime_text_at, number_text_to_json, oracle_interval_ds_to_iso,
+    oracle_interval_ym_to_iso, typed_text_to_json, typed_text_to_json_at,
 };
 
 /// Re-export of the driver so connector crates share one version.
