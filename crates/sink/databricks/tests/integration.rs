@@ -1009,3 +1009,36 @@ async fn tokened_overwrite_stages_apart_and_sweeps_only_abandoned_runs() {
     );
     assert_eq!(probe.overwrite_staging_exists().await.unwrap(), Some(true));
 }
+
+#[tokio::test]
+async fn exactly_once_append_refuses_a_generated_always_column() {
+    let wh = Warehouse::start().await;
+    wh.on(
+        DESCRIBE,
+        rows(&[
+            &[Some("id"), Some("bigint"), Some("NO"), None, Some("YES")],
+            &[
+                Some("amount"),
+                Some("double"),
+                Some("YES"),
+                None,
+                Some("NO"),
+            ],
+        ]),
+    );
+    let s = sink(&wh, |_| {});
+    let err = s
+        .write_batch_idempotent(&[json!({"amount": 1.0})], "p::r", "00000000000000000001")
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GENERATED ALWAYS") && msg.contains("id is"),
+        "{msg}"
+    );
+    assert!(
+        !wh.writes().iter().any(|w| w.contains("REPLACE WHERE")),
+        "{:?}",
+        wh.writes()
+    );
+}

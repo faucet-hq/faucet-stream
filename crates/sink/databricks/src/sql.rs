@@ -111,6 +111,12 @@ pub fn quote_ident(s: &str) -> String {
     Databricks.quote_ident(s)
 }
 
+/// The byte length of [`string_literal`]`(s)`: quotes plus one escape byte
+/// per `\` and `'`.
+pub fn literal_len(s: &str) -> usize {
+    s.len() + 2 + s.bytes().filter(|b| matches!(b, b'\\' | b'\'')).count()
+}
+
 /// A Databricks SQL string literal. Databricks processes backslash escapes
 /// inside literals (and treats `''` as two adjacent literals, not an escaped
 /// quote), so both `\` and `'` are backslash-escaped.
@@ -333,7 +339,7 @@ impl Matrix {
             .iter()
             .map(|r| {
                 r.iter()
-                    .map(|c| c.as_ref().map_or(4, |s| s.len() + 4))
+                    .map(|c| c.as_ref().map_or(4, |s| literal_len(s) + 2))
                     .sum::<usize>()
                     + 4
             })
@@ -714,6 +720,31 @@ fn eo_predicate(scope: &str, seq: u64) -> String {
         string_literal(scope),
         quote_ident(EO_SEQ_COL)
     )
+}
+
+/// `REPLACE WHERE` takes no column list, so the exactly-once append projects
+/// every table column; a `GENERATED ALWAYS` column refuses that value.
+pub fn check_replace_where_columns(
+    table: &TableRef,
+    table_cols: &[TableColumn],
+) -> Result<(), FaucetError> {
+    let generated: Vec<&str> = table_cols
+        .iter()
+        .filter(|c| c.generated_always)
+        .map(|c| c.name.as_str())
+        .collect();
+    if generated.is_empty() {
+        return Ok(());
+    }
+    Err(FaucetError::Config(format!(
+        "databricks sink: delivery: exactly_once appends with INSERT … REPLACE WHERE, which \
+         must give every column of {} a value, but {} {} GENERATED ALWAYS; use \
+         write_mode: upsert with a key (keyed exactly-once) or at-least-once delivery for \
+         this table",
+        table.sql(),
+        generated.join(", "),
+        if generated.len() == 1 { "is" } else { "are" }
+    )))
 }
 
 /// The exactly-once append write: one atomic Delta commit that removes
@@ -1331,6 +1362,18 @@ mod tests {
         );
         assert_eq!(m.row_sizes(), vec![5 + 5 + 4 + 4, 5 + 4 + 9 + 4]);
         assert_eq!(m.estimated_bytes(), 18 + 22);
+    }
+
+    #[test]
+    fn the_size_estimate_counts_literal_escapes() {
+        for s in ["", "plain", r"C:\dir\file", "it's", r#"{"a":"\u0041'"}"#] {
+            assert_eq!(literal_len(s), string_literal(s).len(), "{s}");
+        }
+        let m = Matrix {
+            columns: vec![],
+            rows: vec![vec![Some(r"\\''".into())]],
+        };
+        assert_eq!(m.row_sizes(), vec![string_literal(r"\\''").len() + 2 + 4]);
     }
 
     #[test]
