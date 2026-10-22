@@ -373,6 +373,11 @@ The `faucet dlq` verbs handle sealed files transparently:
 - `replay` — picks the key up **automatically** from the config's own
   `dlq:` block's `encryption` (a JSON Lines `file` sink or a `jsonl` sink);
   `--encryption-key` overrides.
+- With the key, `inspect`, `replay` and `discard` first check the file's
+  whole-file integrity (header, trailers, line order): a file with lines
+  removed, reordered or added is refused rather than read as a subset. Lines
+  after the last trailer — a flush a writer has not finished — are read with a
+  warning.
 - `discard` keeps and archives lines **verbatim** (still sealed) — filtering
   decrypts only in memory; nothing is ever re-written in plaintext.
 - Rows that fail again during a `replay` land in the fresh failure DLQ sealed

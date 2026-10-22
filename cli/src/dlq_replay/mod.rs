@@ -328,6 +328,7 @@ pub fn discard(
     let mut archived_to = Vec::new();
 
     for file in &files {
+        dec.verify_file(file)?;
         let mut already = reader::discarded_lines(file)?;
         let mut ids = String::new();
         let archive = archive_path(file);
@@ -687,6 +688,47 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             format!("{}\n", unbound[1])
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_sealed_dlq_with_a_removed_line_is_not_read() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut body = String::from_utf8(seal.header(&enc)).unwrap();
+        for id in 1..=3 {
+            let line = env_line("quality", "QualityFailure", id, json!({ "id": id }));
+            body.push_str(&String::from_utf8(seal.seal(&enc, line.as_bytes())).unwrap());
+        }
+        body.push_str(&String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, &body).unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 3);
+
+        let mut lines: Vec<&str> = body.lines().collect();
+        lines.remove(2);
+        std::fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+        let err = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap_err();
+        assert!(
+            err.to_string().contains("failed its integrity check"),
+            "{err}"
+        );
+        let loc = file.to_str().unwrap();
+        let err = discard(loc, None, None, false, &dec).unwrap_err();
+        assert!(
+            err.to_string().contains("failed its integrity check"),
+            "{err}"
+        );
+        assert!(!reader::discard_sidecar(&file).exists());
     }
 
     #[test]

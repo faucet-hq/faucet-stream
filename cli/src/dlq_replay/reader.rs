@@ -122,6 +122,58 @@ impl DlqDecryptor {
         None
     }
 
+    /// Verify a sealed DLQ file's whole-file integrity (header, trailers and
+    /// line order) before its lines are read one by one. A file that is not
+    /// sealed, or whose first line the loaded keys cannot open, is not checked
+    /// (its lines are then counted as undecryptable). Only an unfinished last
+    /// flush (lines after the final trailer) is tolerated, with a warning.
+    pub fn verify_file(&self, file: &Path) -> Result<(), FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            if !starts_sealed(file)? {
+                return Ok(());
+            }
+            use faucet_common_file::sealed_lines::{open, open_for_append};
+            use std::io::Read as _;
+            let mut raw = Vec::new();
+            open_lines(file)?.read_to_end(&mut raw).map_err(|e| {
+                FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
+            })?;
+            let first = String::from_utf8_lossy(&raw)
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let opens_with_key = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(&first)
+                    .is_ok_and(|b| enc.open_line(&b).is_ok())
+            };
+            if !opens_with_key {
+                return Ok(());
+            }
+            if let Err(e) = open(&raw, enc) {
+                if open_for_append(&raw, enc).is_err() {
+                    return Err(FaucetError::Source(format!(
+                        "DLQ file '{}' failed its integrity check ({e}) — lines may have been \
+                         removed, reordered or added; it is not read",
+                        file.display()
+                    )));
+                }
+                tracing::warn!(
+                    file = %file.display(),
+                    "DLQ file ends in an unfinished flush (no trailer after its last lines); \
+                     those lines are read without whole-file verification"
+                );
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
+        let _ = file;
+        Ok(())
+    }
+
     /// Whether any key is loaded.
     pub fn is_active(&self) -> bool {
         #[cfg(feature = "encryption")]
@@ -645,6 +697,7 @@ pub fn scan_each(
 ) -> Result<ScanTally, FaucetError> {
     let mut out = ScanTally::default();
     for file in files {
+        dec.verify_file(file)?;
         let discarded = discarded_lines(file)?;
         for_each_line(file, |line| {
             if !discarded.is_empty() && discarded.contains(&line_id(line)) {
