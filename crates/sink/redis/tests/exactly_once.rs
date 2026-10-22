@@ -372,3 +372,44 @@ async fn a_wrongtype_key_writes_neither_rows_nor_the_watermark() {
     assert_eq!(len, 2);
     assert!(get_token(&url, "ok::row").await.is_some());
 }
+
+/// A page the script cannot apply as one bounded unit is refused before
+/// anything is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_exactly_once_page_is_refused_up_front() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let sink = RedisSink::new(RedisSinkConfig::new(
+        &url,
+        RedisSinkType::List { key: "big".into() },
+    ))
+    .await
+    .unwrap();
+    let page: Vec<Value> = (0..10_001).map(|i| json!({"id": i})).collect();
+    let err = sink
+        .write_batch_idempotent(&page, "big::row", "00000000000000000001")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("lower the source's batch_size"),
+        "{err}"
+    );
+
+    let stream = RedisSink::new(RedisSinkConfig::new(
+        &url,
+        RedisSinkType::Stream { key: "wide".into() },
+    ))
+    .await
+    .unwrap();
+    let wide: serde_json::Map<String, Value> =
+        (0..4_000).map(|i| (format!("f{i}"), json!(i))).collect();
+    let err = stream
+        .write_batch_idempotent(&[Value::Object(wide)], "wide::row", "00000000000000000001")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("atomically"), "{err}");
+    assert_eq!(get_token(&url, "big::row").await, None);
+    assert_eq!(get_token(&url, "wide::row").await, None);
+    let len: usize = conn.llen("big").await.unwrap();
+    assert_eq!(len, 0);
+}

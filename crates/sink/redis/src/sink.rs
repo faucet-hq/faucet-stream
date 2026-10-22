@@ -57,6 +57,34 @@ redis.call('SET', KEYS[1], ARGV[2])
 return 1
 "#;
 
+/// The most records one exactly-once page may carry: the page runs as one
+/// script, which blocks the server for its whole duration.
+pub(crate) const MAX_IDEMPOTENT_RECORDS: usize = 10_000;
+
+/// The most arguments one command may have inside the exactly-once script
+/// (Lua's `unpack` is bounded by its stack, about 8000 values).
+const MAX_SCRIPT_COMMAND_ARGS: usize = 7_000;
+
+/// Refuse an exactly-once page the script could not apply as one unit,
+/// before anything is sent.
+fn check_idempotent_page(commands: &[Vec<String>]) -> Result<(), FaucetError> {
+    if commands.len() > MAX_IDEMPOTENT_RECORDS {
+        return Err(FaucetError::Sink(format!(
+            "Redis exactly-once page of {} records exceeds {MAX_IDEMPOTENT_RECORDS}: the page \
+             runs as one script that blocks the server; lower the source's batch_size",
+            commands.len()
+        )));
+    }
+    if let Some(c) = commands.iter().find(|c| c.len() > MAX_SCRIPT_COMMAND_ARGS) {
+        return Err(FaucetError::Sink(format!(
+            "Redis exactly-once write: a record expands to a command of {} arguments, more \
+             than the {MAX_SCRIPT_COMMAND_ARGS} the script can apply atomically",
+            c.len()
+        )));
+    }
+    Ok(())
+}
+
 impl RedisSink {
     /// Create a new Redis sink from the given configuration.
     ///
@@ -313,6 +341,7 @@ impl CommitTokenDriver for RedisDriver {
             .iter()
             .map(|r| self.command(r))
             .collect::<Result<Vec<_>, _>>()?;
+        check_idempotent_page(&commands)?;
         let lua = redis::Script::new(IDEMPOTENT_SCRIPT);
         let mut script = lua.prepare_invoke();
         script.key(commit_token_key(scope));
