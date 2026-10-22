@@ -6,9 +6,11 @@
 //! from the last committed record id.
 
 pub mod config;
+pub mod descriptor;
 pub mod stream;
 
 pub use faucet_core::{FaucetError, Source};
 
 pub use config::AcmeSourceConfig;
+pub use descriptor::DESCRIPTOR;
 pub use stream::AcmeSource;
