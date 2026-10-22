@@ -115,6 +115,15 @@ async fn build_glue(_inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErr
 
 // ── SQL ───────────────────────────────────────────────────────────────────────
 
+/// Whether a SQL catalog URI names a database with `?` placeholders (SQLite,
+/// MySQL, MariaDB); PostgreSQL and anything else use `$N`. The bind style
+/// property, when set, overrides this.
+#[cfg_attr(not(feature = "catalog-sql"), allow(dead_code))]
+fn uses_qmark(uri: &str) -> bool {
+    let scheme = uri.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(scheme.as_str(), "sqlite" | "mysql" | "mariadb")
+}
+
 #[cfg(feature = "catalog-sql")]
 async fn build_sql(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError> {
     use iceberg::CatalogBuilder;
@@ -132,15 +141,12 @@ async fn build_sql(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError
         props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
     }
 
-    // Infer the SQL bind style from the catalog URI when not explicitly
-    // overridden by the user.  SQLite uses `?` placeholders (QMark); other
-    // databases (Postgres, MySQL) use `$N` (DollarNumeric).
     if !props.contains_key(SQL_CATALOG_PROP_BIND_STYLE) {
         let catalog_uri = props
             .get(SQL_CATALOG_PROP_URI)
             .map(String::as_str)
             .unwrap_or("");
-        let bind_style = if catalog_uri.starts_with("sqlite:") {
+        let bind_style = if uses_qmark(catalog_uri) {
             SqlBindStyle::QMark
         } else {
             SqlBindStyle::DollarNumeric
@@ -212,6 +218,21 @@ async fn build_hms(_inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_bind_style_follows_the_uri_scheme() {
+        for uri in [
+            "sqlite::memory:",
+            "SQLITE:/tmp/c.db",
+            "mysql://u:p@h/meta",
+            "MariaDB://h/m",
+        ] {
+            assert!(uses_qmark(uri), "{uri}");
+        }
+        for uri in ["postgres://h/m", "postgresql://h/m", "", "other://h"] {
+            assert!(!uses_qmark(uri), "{uri}");
+        }
+    }
 
     #[allow(dead_code)]
     fn empty_inner() -> CatalogInner {
