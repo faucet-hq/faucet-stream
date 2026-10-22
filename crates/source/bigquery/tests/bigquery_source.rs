@@ -1475,6 +1475,46 @@ async fn a_transient_result_page_failure_is_retried() {
     assert_eq!(results, 3, "two retries, then the page");
 }
 
+/// A transient reason under a non-retryable status (an `internalError`
+/// reported as a 400) is retried as a 503.
+#[tokio::test]
+async fn a_transient_reason_under_a_client_status_is_retried() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_first_page_with_token(&server, "job-internal").await;
+    Mock::given(method("GET"))
+        .and(path(results_path("job-internal")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": 400, "message": "internal", "errors": [{"reason": "internalError"}]}
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(results_path("job-internal")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": schema_two_cols(),
+            "rows": rows(2, 3),
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let (src, _f) = build_source(&server, default_config()).await;
+    let rows = src.fetch_all().await.unwrap();
+    assert_eq!(rows.len(), 5);
+    let results = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == results_path("job-internal"))
+        .count();
+    assert_eq!(results, 2, "one retry, then the page");
+}
+
 #[tokio::test]
 async fn a_permanent_result_page_failure_is_not_retried() {
     let server = MockServer::start().await;
