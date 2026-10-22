@@ -1531,11 +1531,12 @@ impl BigQueryDriver {
             return Ok(());
         }
         if self.table_exists(calls, &self.config.table_id).await? {
+            let table = format!(
+                "{}.{}.{}",
+                self.config.project_id, self.config.dataset_id, self.config.table_id
+            );
             tracing::info!(
-                table = %format!(
-                    "{}.{}.{}",
-                    self.config.project_id, self.config.dataset_id, self.config.table_id
-                ),
+                table = %table,
                 "BigQuery overwrite: the source produced no rows; truncating the target"
             );
             self.run_ddl(calls, format!("TRUNCATE TABLE {}", self.table_ref()))

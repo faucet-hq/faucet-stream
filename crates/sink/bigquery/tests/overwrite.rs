@@ -2516,3 +2516,78 @@ async fn tokened_overwrite_stages_apart_and_sweeps_only_abandoned_runs() {
         "{qs:?}"
     );
 }
+
+/// Mount an `INFORMATION_SCHEMA` staging-listing response.
+async fn mount_staging_listing(server: &MockServer, body: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .and(wiremock::matchers::body_string_contains(
+            "INFORMATION_SCHEMA",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A staging listing BigQuery does not finish inline is skipped: begin still
+/// succeeds and drops no tokened staging.
+#[tokio::test]
+async fn an_unfinished_staging_listing_is_skipped() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_staging_listing(
+        &server,
+        json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": false,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+        }),
+    )
+    .await;
+    mount_query_and_job(&server, "job-o").await;
+    let own = new_overwrite_run_token();
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    let sink = sink.with_overwrite_run(&own).unwrap();
+    sink.begin_overwrite().await.expect("begin");
+    let qs = queries(&server).await;
+    let drops: Vec<&String> = qs.iter().filter(|q| q.starts_with("DROP")).collect();
+    assert_eq!(
+        drops,
+        [&"DROP TABLE IF EXISTS `p.d.t__faucet_ovw`".to_string()],
+        "{qs:?}"
+    );
+}
+
+/// A listing row whose name is not a string fails begin with a decode error.
+#[tokio::test]
+async fn an_undecodable_staging_listing_fails_begin() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_staging_listing(
+        &server,
+        json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+            "schema": {"fields": [{"name": "table_name", "type": "STRING"}]},
+            "totalRows": "1",
+            "rows": [{"f": [{"v": {"not": "a string"}}]}],
+        }),
+    )
+    .await;
+    mount_query_and_job(&server, "job-o").await;
+    let own = new_overwrite_run_token();
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    let sink = sink.with_overwrite_run(&own).unwrap();
+    let err = sink.begin_overwrite().await.expect_err("decode failure");
+    assert!(
+        err.to_string()
+            .contains("BigQuery staging listing decode failed"),
+        "{err}"
+    );
+}

@@ -734,6 +734,39 @@ async fn a_field_missing_from_the_table_fails_instead_of_vanishing() {
     );
 }
 
+/// A value whose JSON shape the typed extraction would turn into NULL (an
+/// object for a scalar column) fails the write before any MERGE runs.
+#[tokio::test]
+async fn a_value_that_does_not_fit_its_column_fails_the_write() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-u").await;
+    mount_job_done(&server, "job-u").await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": {"first": "a"}})])
+        .await
+        .expect_err("a shape mismatch must not be stored as NULL");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`name` (record 0: expected a scalar, got an object)")
+            && msg.contains("do not fit the column type of p.d.t"),
+        "{msg}"
+    );
+    assert!(
+        captured_query_bodies(&server)
+            .await
+            .iter()
+            .all(|b| !b["query"].as_str().unwrap_or("").contains("MERGE INTO")),
+        "nothing is written"
+    );
+}
+
 fn running_query(job_id: &str) -> serde_json::Value {
     json!({
         "kind": "bigquery#queryResponse",
