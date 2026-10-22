@@ -280,6 +280,30 @@ impl StorageBackend for LocalBackend {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn overwrite_runs_join_once_and_surface_listing_and_removal_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), true);
+        let a = faucet_core::idempotency::new_overwrite_run_token();
+        let other = faucet_core::idempotency::new_overwrite_run_token();
+        b.join_overwrite_run(&a).unwrap();
+        b.join_overwrite_run(&a).unwrap();
+        let e = b.join_overwrite_run(&other).unwrap_err();
+        assert!(e.to_string().contains("already joined"), "{e}");
+        // A missing output directory has no swap runs.
+        let missing = backend(&dir.path().join("nope"), false);
+        assert!(missing.swap_runs().await.unwrap().is_empty());
+        // A file where the directory should be fails the listing.
+        std::fs::write(dir.path().join("f"), b"").unwrap();
+        let file = backend(&dir.path().join("f"), false);
+        let e = file.swap_runs().await.unwrap_err();
+        assert!(e.to_string().contains("listing"), "{e}");
+        // A file where a swap area should be fails its removal.
+        let area = dir.path().join(template().swap_run_dir_name(Some(&a)));
+        std::fs::write(&area, b"").unwrap();
+        let e = b.drop_swap_run(Some(&a)).await.unwrap_err();
+        assert!(e.to_string().contains("overwrite swap area"), "{e}");
+    }
     use super::*;
 
     fn template() -> NameTemplate {
