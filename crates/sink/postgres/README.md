@@ -472,7 +472,7 @@ already landed a second time). See
 
 ## Capabilities
 
-Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert, schema evolution with a reported schema, and a scoped `overwrite.scope`. Cleanup and rollback need `column_mapping: auto_map`; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert, schema evolution with a reported schema, and a scoped `overwrite.scope`. Upsert, delete, keyed upsert, schema evolution, cleanup and rollback need `column_mapping: auto_map`; JSONB mode declares `append` / `overwrite` and a schemaless destination. Keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 
