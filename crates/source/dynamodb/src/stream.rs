@@ -276,7 +276,8 @@ impl DynamoDbSource {
         let described = describe_shards_in(&calls, &self.streams, &arn).await?;
         let bm = self
             .start_bookmark()
-            .map(|v| StreamBookmark::from_value(&v))
+            .map(|v| StreamBookmark::parse(&v))
+            .transpose()?
             .unwrap_or_default();
         let mut tracker = LagTracker::default();
         for (shard, start) in probe_starts(&bm, &described, self.config.start_position) {
@@ -309,7 +310,8 @@ impl DynamoDbSource {
             let described = describe_shards_in(&calls, &self.streams, &arn).await?;
             let mut bm = self
                 .start_bookmark()
-                .map(|v| StreamBookmark::from_value(&v))
+                .map(|v| StreamBookmark::parse(&v))
+                .transpose()?
                 .unwrap_or_default();
 
             let mut gaps = detect_gaps(&bm, &arn, &described);

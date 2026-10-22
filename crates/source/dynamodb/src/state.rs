@@ -102,6 +102,20 @@ impl StreamBookmark {
         serde_json::from_value(v.clone()).unwrap_or_default()
     }
 
+    /// Parse a stored bookmark; `null` is absent, anything unparseable is an
+    /// error so a stream never silently restarts at `start_position`.
+    pub fn parse(v: &Value) -> Result<Self, faucet_core::FaucetError> {
+        if v.is_null() {
+            return Ok(Self::default());
+        }
+        serde_json::from_value(v.clone()).map_err(|e| {
+            faucet_core::FaucetError::State(format!(
+                "dynamodb: the stored streams bookmark cannot be read ({e}); fix or delete \
+                 the state entry so the read does not restart at start_position"
+            ))
+        })
+    }
+
     /// Serialize.
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
@@ -216,6 +230,12 @@ mod tests {
             StreamBookmark::from_value(&json!(3)),
             StreamBookmark::default()
         );
+        assert_eq!(
+            StreamBookmark::parse(&Value::Null).unwrap(),
+            StreamBookmark::default()
+        );
+        assert_eq!(StreamBookmark::parse(&v).unwrap(), b);
+        assert!(StreamBookmark::parse(&json!(3)).is_err());
     }
 
     #[test]
