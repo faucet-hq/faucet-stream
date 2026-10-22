@@ -1010,7 +1010,7 @@ else
   hdr "Serve headless smoke test (--no-serve; port ${SERVE_PORT})"
   if command -v curl >/dev/null 2>&1; then
     ( cd "$DEMO_DIR" && exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" --no-auth ) \
-      >/tmp/faucet-serve.log 2>&1 &
+      >"${DEMO_DIR}/serve-smoke.log" 2>&1 &
     SERVE_PID=$!
     for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:${SERVE_PORT}/healthz" >/dev/null 2>&1 && break; sleep 0.5; done
     step "serve /healthz"    curl -sf "http://127.0.0.1:${SERVE_PORT}/healthz"
