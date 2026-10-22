@@ -332,6 +332,16 @@ pub fn quote_ident(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_invalid_sensitive_header_fails_the_request_build() {
+        #[allow(clippy::disallowed_methods)] // test: a bare builder, no request is sent
+        let client = reqwest::Client::new();
+        let ok = sensitive_header(client.get("http://localhost/"), "X-Key", "secret");
+        let req = ok.build().unwrap();
+        assert!(req.headers()["X-Key"].is_sensitive());
+        let bad = sensitive_header(client.get("http://localhost/"), "X-Key", "a\nb");
+        assert!(bad.build().is_err());
+    }
     use super::*;
     use serde_json::json;
 
