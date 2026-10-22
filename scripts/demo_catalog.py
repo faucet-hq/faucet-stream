@@ -141,10 +141,15 @@ def register(tid: str, doc: str, state: str, existing: set[str]) -> str:
     code, resp = request("POST", "/v1/templates", {"id": tid, "config": doc, "config_format": "yaml"})
     if code >= 300:
         return f"failed ({code}: {resp.get('error', {}).get('message', resp)})"
+    steps = []
     if state in ("launched", "deprecated"):
-        request("POST", f"/v1/templates/{quoted(tid)}/launch", {"version": resp.get("version", 1)})
+        steps.append(("launch", {"version": resp.get("version", 1)}))
     if state == "deprecated":
-        request("POST", f"/v1/templates/{quoted(tid)}/deprecate", {"reason": "superseded"})
+        steps.append(("deprecate", {"reason": "superseded"}))
+    for action, body in steps:
+        code, out = request("POST", f"/v1/templates/{quoted(tid)}/{action}", body)
+        if code >= 300:
+            return f"failed ({action} {code}: {out.get('error', {}).get('message', out)})"
     return state
 
 
@@ -178,7 +183,9 @@ def main() -> int:
         outcome = register(f"{owner}/{name}", sink_doc(owner, name, desc, kind, default), state, existing)
         failures += outcome.startswith("failed")
         print(f"  sink   {owner}/{name}: {outcome}")
-    print(f"  faucet-hq/example-csv: {example_csv_v2()}")
+    outcome = example_csv_v2()
+    failures += outcome.startswith("failed")
+    print(f"  faucet-hq/example-csv: {outcome}")
     return 1 if failures else 0
 
 

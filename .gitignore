@@ -51,6 +51,7 @@ docs/superpowers/
 !/scripts/semver-exclude.py
 !/scripts/test_integration_coverage.py
 !/scripts/demo_catalog.py
+!/scripts/test_demo_catalog.py
 !/scripts/vendor-names.py
 !/scripts/test_vendor_names.py
 !/scripts/connector-deps.py
