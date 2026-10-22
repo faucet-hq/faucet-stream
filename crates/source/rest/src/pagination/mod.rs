@@ -825,6 +825,33 @@ mod new_style_tests {
     }
 
     #[test]
+    fn an_absent_token_never_repeats() {
+        let mut state = PaginationState::default();
+        assert!(!state.token_repeats(None));
+        assert!(!state.token_repeats(None));
+        let t = "a".to_string();
+        assert!(!state.token_repeats(Some(&t)));
+        assert!(state.token_repeats(Some(&t)));
+    }
+
+    #[test]
+    fn keyset_page_without_the_cursor_field_keeps_the_page_and_cursor() {
+        let style = PaginationStyle::RecordFieldCursor {
+            field: "updated_at".into(),
+            into: RecordCursorTarget::default(),
+            param: "since".into(),
+            agg: RecordCursorAgg::default(),
+            stop_when_short: true,
+            page_size: 2,
+            inclusive: true,
+        };
+        let mut state = PaginationState::default();
+        let page = vec![json!({"id": 1}), json!({"id": 2})];
+        assert_eq!(style.keyset_page(page.clone(), &mut state), page);
+        assert_eq!(state.record_field_cursor, None);
+    }
+
+    #[test]
     fn offset_in_body_writes_offset_and_limit_and_advances() {
         let style = offset_in_body();
         let mut state = PaginationState::default();

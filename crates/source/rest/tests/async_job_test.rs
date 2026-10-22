@@ -785,3 +785,48 @@ async fn an_async_job_run_counts_its_submit_poll_and_fetch_calls() {
          {counts:?}"
     );
 }
+
+/// A `decode:` chain that cannot stream (a JSON parse) runs on the buffered
+/// fetch page.
+#[tokio::test]
+async fn async_job_buffered_decode_parses_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "job-1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "state": "Complete" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1/result"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "rows": [{"id": 1}, {"id": 2}] })),
+        )
+        .mount(&server)
+        .await;
+    let async_job: AsyncJobConfig = serde_json::from_value(json!({
+        "submit": { "method": "POST", "url": "/jobs", "json": { "query": "SELECT 1" } },
+        "job_id": "$.id",
+        "poll": { "url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 30 },
+        "status": { "path": "$.state", "success": ["Complete"], "failure": ["Failed"] },
+        "fetch": { "method": "GET", "url": "/jobs/${job_id}/result" }
+    }))
+    .unwrap();
+    let mut cfg = RestStreamConfig::new(&server.uri(), "").decode(vec![DecodeStep::Parse {
+        parse: ParseSpec {
+            format: ParseFormat::Json,
+            records_path: Some("$.rows[*]".into()),
+            delimiter: None,
+            has_headers: true,
+            sheet: None,
+            header_row: 0,
+        },
+    }]);
+    cfg.async_job = Some(async_job);
+    let records = RestStream::new(cfg).unwrap().fetch_all().await.unwrap();
+    assert_eq!(records, vec![json!({"id": 1}), json!({"id": 2})]);
+}
