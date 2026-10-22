@@ -596,7 +596,11 @@ mod tests {
             .build()
             .unwrap();
         let ints = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new("n", DataType::Int64, true)])),
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "n",
+                DataType::Int64,
+                true,
+            )])),
             vec![Arc::new(Int64Array::from(vec![1, 2]))],
         )
         .unwrap();
