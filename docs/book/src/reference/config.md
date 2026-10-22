@@ -1153,7 +1153,7 @@ See the [SLA monitoring cookbook](../cookbook/sla.md).
 
 ```yaml
 sla:
-  max_staleness_secs: 7200     # stale when no successful run within 2h
+  max_staleness_secs: 7200     # stale when a run ends 2h+ after the last success
   min_rows_per_run: 1          # a successful run writing fewer records violates
   volume_anomaly:              # learned-baseline anomaly detection
     method: zscore             # zscore | iqr
@@ -1165,7 +1165,7 @@ sla:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_staleness_secs` | int | — | Maximum seconds since the last **successful** run. Evaluated when a run fails (against the previous success) and by `faucet doctor`. Requires a `state:` block. |
+| `max_staleness_secs` | int | — | Maximum seconds since the last **successful** run. Evaluated when a run ends (a failure, or a success arriving later than this after the previous one) and by `faucet doctor`. A pipeline that stops running emits nothing — alert on `faucet_pipeline_sla_last_success_unix_seconds`. Requires a `state:` block. |
 | `min_rows_per_run` | int | — | Static volume floor for a successful run (catches a source silently returning nothing). Stateless — works without a `state:` block. |
 | `volume_anomaly.method` | `zscore` \| `iqr` | `zscore` | How a successful run's volume is compared against the rolling baseline of recent successful runs. |
 | `volume_anomaly.sensitivity` | float | `3.0` / `1.5` | `zscore`: max \|x − mean\| / std. `iqr`: Tukey fence multiplier. Defaults per method. |

@@ -26,9 +26,11 @@ pub use faucet_core::anomaly::DEFAULT_ZSCORE_SENSITIVITY;
 #[serde(deny_unknown_fields)]
 pub struct SlaSpec {
     /// Maximum seconds since the last *successful* run before the pipeline
-    /// counts as stale. Evaluated when a run fails (against the previous
-    /// success) and by `faucet doctor`. Requires a `state:` block to persist
-    /// the last-success timestamp.
+    /// counts as stale. Evaluated when a run ends (a failure, or a success
+    /// arriving later than this after the previous one) and by `faucet
+    /// doctor`. A pipeline that stops running emits nothing: alert on the
+    /// `faucet_pipeline_sla_last_success_unix_seconds` gauge for that. Requires
+    /// a `state:` block to persist the last-success timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_staleness_secs: Option<u64>,
 

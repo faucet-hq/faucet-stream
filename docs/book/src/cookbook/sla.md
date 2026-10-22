@@ -18,7 +18,7 @@ pipeline:
   sink: { type: file, config: { path: ./orders.jsonl } }
   state: { type: file, config: { path: ./state } }
 sla:
-  max_staleness_secs: 7200     # alert when no successful run within 2 hours
+  max_staleness_secs: 7200     # stale when a run ends 2h+ after the last success
   min_rows_per_run: 1          # a successful run writing 0 rows is a violation
   volume_anomaly:
     method: zscore             # zscore | iqr
@@ -31,7 +31,7 @@ A runnable example lives at `cli/examples/csv_to_jsonl_with_sla.yaml`.
 
 | Check | Fires when… | Needs `state:`? |
 |-------|-------------|-----------------|
-| `max_staleness_secs` | a run **fails** and the last successful run is older than the threshold (also probed read-only by `faucet doctor`) | yes |
+| `max_staleness_secs` | a run ends — fails, or succeeds — and the previous successful run is older than the threshold (also probed read-only by `faucet doctor`); a pipeline that does not run at all is caught by alerting on `faucet_pipeline_sla_last_success_unix_seconds` | yes |
 | `min_rows_per_run` | a run **succeeds** but writes fewer records than the floor | no |
 | `volume_anomaly` | a run **succeeds** but its volume is anomalous against the rolling baseline of recent successful runs | yes |
 | `max_lag_bytes` / `max_lag_events` / `max_lag_seconds` | the source reports it is further behind its head than the threshold when a run ends (#733) | no |
@@ -69,7 +69,17 @@ Staleness is measured against the last *successful* run: when a run fails, the
 executor checks how long ago the pipeline last succeeded and fires the
 `staleness` violation once that exceeds `max_staleness_secs`. Under
 `faucet schedule` this means every failing tick past the threshold re-alerts,
-which is exactly what you want a pager rule keyed on.
+which is exactly what you want a pager rule keyed on. A run that succeeds more
+than `max_staleness_secs` after the previous success also counts one
+`staleness` violation: the data was stale until it arrived.
+
+No run means no evaluation, so a pipeline whose scheduler has stopped cannot
+report itself. Alert on the last-success gauge instead:
+
+```yaml
+- alert: FaucetPipelineStale
+  expr: time() - faucet_pipeline_sla_last_success_unix_seconds > 7200
+```
 
 ## Source lag
 
@@ -114,6 +124,7 @@ role; MySQL needs `REPLICATION CLIENT` for `SHOW BINARY LOGS`; SQL Server needs
 | `faucet_pipeline_sla_violations_total` | counter | `pipeline`, `row`, `kind` | One increment per detected violation; `kind` ∈ `staleness` \| `min_rows` \| `volume` \| `lag`. |
 | `faucet_source_lag_bytes` / `_events` / `_seconds` | gauge | `pipeline`, `row`, `connector` | The source's latest lag reading (#733), in the units it reports. |
 | `faucet_pipeline_sla_baseline_runs` | gauge | `pipeline`, `row` | Successful runs currently in the rolling volume baseline (cold-start visibility). |
+| `faucet_pipeline_sla_last_success_unix_seconds` | gauge | `pipeline`, `row` | When the row last succeeded (set by the SLA pass when the block has a `state:` store). |
 
 A minimal Prometheus alert:
 

@@ -82,12 +82,16 @@ pub async fn evaluate_post_run(
 
     let violations = match outcome {
         RunOutcome::Success { rows } => {
-            let violations = eval::evaluate_success(spec, &history, rows);
+            let mut violations = eval::evaluate_success(spec, &history, rows);
+            violations.extend(eval::evaluate_late_success(spec, &history, now_unix));
             if let Some(s) = store {
                 match record_success_cas(s.as_ref(), &key, raw, rows, now_unix, spec.window())
                     .await
                 {
-                    Ok(updated) => metrics::set_baseline_runs(pipeline, row, updated.volumes.len()),
+                    Ok(updated) => {
+                        metrics::set_baseline_runs(pipeline, row, updated.volumes.len());
+                        metrics::set_last_success(pipeline, row, now_unix);
+                    }
                     Err(e) => tracing::warn!(
                         pipeline,
                         row,

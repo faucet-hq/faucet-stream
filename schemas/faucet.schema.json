@@ -2354,7 +2354,7 @@
       "type": "object",
       "properties": {
         "max_staleness_secs": {
-          "description": "Maximum seconds since the last *successful* run before the pipeline\ncounts as stale. Evaluated when a run fails (against the previous\nsuccess) and by `faucet doctor`. Requires a `state:` block to persist\nthe last-success timestamp.",
+          "description": "Maximum seconds since the last *successful* run before the pipeline\ncounts as stale. Evaluated when a run ends (a failure, or a success\narriving later than this after the previous one) and by `faucet\ndoctor`. A pipeline that stops running emits nothing: alert on the\n`faucet_pipeline_sla_last_success_unix_seconds` gauge for that. Requires\na `state:` block to persist the last-success timestamp.",
           "type": [
             "integer",
             "null"
