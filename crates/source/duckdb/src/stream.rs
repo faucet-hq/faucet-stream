@@ -272,9 +272,9 @@ fn describe(conn: &Connection, query: &str, params: &[DuckValue]) -> Option<Vec<
     Some(out)
 }
 
-/// The column types of `query` read with `typeof(COLUMNS(*))` over its first
-/// row: the fallback when `DESCRIBE` cannot plan it (e.g. bound parameters).
-/// An empty result reports no types, which is harmless: no row needs a cast.
+/// The column types of `query` read with `typeof(COLUMNS(*))` over one row of
+/// typed nulls: the fallback when `DESCRIBE` cannot plan it (e.g. bound
+/// parameters). The query itself returns no rows here, so it is not run twice.
 fn describe_by_typeof(
     conn: &Connection,
     query: &str,
@@ -282,7 +282,9 @@ fn describe_by_typeof(
 ) -> Option<Vec<(String, String)>> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT typeof(COLUMNS(*)) FROM (\n{}\n) AS __faucet_t LIMIT 1",
+            "SELECT typeof(COLUMNS(* EXCLUDE (__faucet_one))) FROM \
+             (SELECT * FROM (\n{}\n) AS __faucet_t LIMIT 0) AS __faucet_e \
+             RIGHT JOIN (SELECT 1 AS __faucet_one) AS __faucet_o ON true",
             trimmed(query)
         ))
         .ok()?;
@@ -852,7 +854,13 @@ mod tests {
         );
         let empty =
             describe_by_typeof(&conn, "SELECT 1::UHUGEINT AS u WHERE ? = 2", &params).unwrap();
-        assert_eq!(empty, vec![("u".to_string(), String::new())]);
+        assert_eq!(empty, vec![("u".to_string(), "UHUGEINT".to_string())]);
+        conn.execute_batch("CREATE SEQUENCE seq").unwrap();
+        describe_by_typeof(&conn, "SELECT nextval('seq') AS n WHERE ? = 1", &params).unwrap();
+        let next: i64 = conn
+            .query_row("SELECT nextval('seq')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(next, 1, "the type probe must not run the query");
         assert!(describe_by_typeof(&conn, "PRAGMA version", &[]).is_none());
     }
 

@@ -36,3 +36,23 @@ async fn timestamps_and_times_keep_a_fixed_fraction_width() {
         ]
     );
 }
+
+/// A parameterised query runs once: the column-type probe does not execute it.
+#[tokio::test]
+async fn a_bound_query_is_executed_once() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("s.duckdb");
+    {
+        let conn = duckdb::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE SEQUENCE seq").unwrap();
+    }
+    let source = DuckdbSource::new(DuckdbSourceConfig::new(
+        path.to_string_lossy(),
+        "SELECT nextval('seq') AS n, {tag} AS tag",
+    ))
+    .await
+    .unwrap();
+    let context = std::collections::HashMap::from([("tag".to_string(), json!("a"))]);
+    let rows = source.fetch_with_context(&context).await.unwrap();
+    assert_eq!(rows, vec![json!({"n": 1, "tag": "a"})]);
+}
