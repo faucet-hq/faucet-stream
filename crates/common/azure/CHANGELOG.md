@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.2.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-azure-v1.2.1...faucet-common-azure-v1.2.2) - 2026-10-22
+
+### Bug Fixes
+
+- Harden connectors, serve, CLI flows and core guarantees (#930 medium findings) ([#933](https://github.com/faucet-hq/faucet-stream/pull/933))
+- Harden serve input screening, data-safety flows, incremental cursors and CDC positions (#930 critical + high) ([#931](https://github.com/faucet-hq/faucet-stream/pull/931))
+
 ## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-azure-v1.2.0...faucet-common-azure-v1.2.1) - 2026-10-17
 
 ### Bug Fixes
