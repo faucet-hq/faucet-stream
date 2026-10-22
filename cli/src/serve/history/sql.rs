@@ -836,6 +836,8 @@ pub struct Stmts {
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
     /// One dataset body by id (the merge read + the detail head).
     pub catalog_select_dataset: String,
+    /// Row-lock one dataset before a read-modify-write of its body. Param: id.
+    pub catalog_lock_dataset: String,
     /// Upsert one dataset row (filter columns + body). Params: id, uri, kind,
     /// last_seen, body.
     /// Local-output ledger (#587). Read-modify-write on upsert (the sticky
@@ -1504,6 +1506,7 @@ impl Stmts {
                 WHERE run_id = $1 AND seq <= $2 AND seq <> $3"
                 .into(),
             catalog_select_dataset: "SELECT body FROM faucet_catalog_datasets WHERE id=$1".into(),
+            catalog_lock_dataset: "UPDATE faucet_catalog_datasets SET id=id WHERE id=$1".into(),
             local_output_select: "SELECT body FROM faucet_local_outputs WHERE id=$1".into(),
             local_output_upsert: "INSERT INTO faucet_local_outputs \
                 (id, path, dataset_id, pipeline, last_written_at, deleted_at, body) \
@@ -2062,6 +2065,7 @@ impl Stmts {
                 WHERE run_id = ? AND seq <= ? AND seq <> ?"
                 .into(),
             catalog_select_dataset: "SELECT body FROM faucet_catalog_datasets WHERE id=?".into(),
+            catalog_lock_dataset: "UPDATE faucet_catalog_datasets SET id=id WHERE id=?".into(),
             local_output_select: "SELECT body FROM faucet_local_outputs WHERE id=?".into(),
             local_output_upsert: "INSERT INTO faucet_local_outputs \
                 (id, path, dataset_id, pipeline, last_written_at, deleted_at, body) \
@@ -4507,12 +4511,18 @@ macro_rules! impl_sql_history {
 
                 for obs in update.sources.iter().chain(std::iter::once(&update.sink)) {
                     let id = catalog::dataset_id(&obs.uri);
-                    // Read-merge-write; last-write-wins under cluster concurrency
-                    // (counters may undercount on a race — acceptable for
-                    // operational stats, never for correctness).
+                    // Read-merge-write under a row lock, so a concurrent
+                    // annotation (owners / consumers live in the same body) is
+                    // never overwritten by a body computed before it.
+                    let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                    sqlx::query(&self.stmts.catalog_lock_dataset)
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
                     let existing = sqlx::query(&self.stmts.catalog_select_dataset)
                         .bind(&id)
-                        .fetch_optional(&self.pool)
+                        .fetch_optional(&mut *tx)
                         .await
                         .map_err(backend)?
                         .map(|r| r.try_get::<String, _>("body"))
@@ -4536,9 +4546,10 @@ macro_rules! impl_sql_history {
                         .bind(&ds.kind)
                         .bind(&now_s)
                         .bind(sql::encode_json(&ds, "catalog dataset")?)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await
                         .map_err(backend)?;
+                    tx.commit().await.map_err(backend)?;
                     if let Some(v) = new_version {
                         sqlx::query(&self.stmts.catalog_insert_schema_version)
                             .bind(&v.dataset_id)
@@ -4597,9 +4608,15 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                sqlx::query(&self.stmts.catalog_lock_dataset)
+                    .bind(dataset_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
                 let Some(row) = sqlx::query(&self.stmts.catalog_select_dataset)
                     .bind(dataset_id)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(backend)?
                 else {
@@ -4615,9 +4632,10 @@ macro_rules! impl_sql_history {
                     .bind(&ds.kind)
                     .bind(sql::fmt_ts(ds.last_seen))
                     .bind(sql::encode_json(&ds, "catalog dataset")?)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
                 Ok(true)
             }
 

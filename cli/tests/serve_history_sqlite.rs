@@ -2260,3 +2260,67 @@ async fn a_history_unreachable_at_startup_is_reconnected() {
     assert!(h.trigger_edge_rise("q").await.unwrap().is_some());
     assert!(missing.join("h.db").exists());
 }
+
+/// Run recording and annotation interleave without one overwriting the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_catalog_records_keep_every_annotation() {
+    use faucet_cli::serve::history::catalog::{
+        CatalogAnnotation, CatalogConsumer, CatalogUpdate, DatasetObservation, DatasetRole,
+        dataset_id,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let s = std::sync::Arc::new(store(&dir, "annotate.db").await);
+    fn obs(uri: &str, role: DatasetRole) -> DatasetObservation {
+        DatasetObservation {
+            uri: uri.into(),
+            kind: "csv".into(),
+            role,
+            schema: None,
+            records: 1,
+        }
+    }
+    fn update(run: String) -> CatalogUpdate {
+        CatalogUpdate {
+            run_id: run,
+            pipeline: "p".into(),
+            row: "default".into(),
+            recorded_at: Utc::now(),
+            sources: vec![obs("csv://src", DatasetRole::Source)],
+            sink: obs("csv://dst", DatasetRole::Sink),
+            column_lineage: None,
+        }
+    }
+    s.catalog_record(&update("r0".into())).await.unwrap();
+    let id = dataset_id("csv://dst");
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..20 {
+        let s = s.clone();
+        let id = id.clone();
+        tasks.spawn(async move {
+            s.catalog_record(&update(format!("r{i}"))).await.unwrap();
+            let ann = CatalogAnnotation {
+                owners: None,
+                consumers: vec![CatalogConsumer {
+                    name: format!("c{i}"),
+                    kind: None,
+                    contact: None,
+                    columns: Vec::new(),
+                    registered_by: "t".into(),
+                    registered_at: Utc::now(),
+                }],
+                replace_consumers: false,
+            };
+            assert!(s.catalog_annotate(&id, &ann).await.unwrap());
+        });
+    }
+    while let Some(r) = tasks.join_next().await {
+        r.unwrap();
+    }
+    let detail = s.catalog_get_dataset(&id).await.unwrap().unwrap();
+    assert_eq!(
+        detail.dataset.consumers.len(),
+        20,
+        "{:?}",
+        detail.dataset.consumers
+    );
+}
