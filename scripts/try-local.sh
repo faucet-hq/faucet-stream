@@ -809,15 +809,15 @@ if [ "$SERVE_ONLY" -eq 0 ]; then
 hdr "Introspection commands"
 step "version"                "$FAUCET" --version
 step "list connectors"        "$FAUCET" list
-step "schema source csv"      "$FAUCET" schema source csv
-step "schema sink jsonl"      "$FAUCET" schema sink jsonl
+step "schema source file"     "$FAUCET" schema source file
+step "schema sink file"       "$FAUCET" schema sink file
 step "schema sla"             "$FAUCET" schema sla
 step "schema contract"        "$FAUCET" schema contract
 step "schema masking"         "$FAUCET" schema masking
 [ "$HAVE_TRIGGERS" -eq 1 ] && step "schema triggers"  "$FAUCET" schema triggers
 step "schema catalog"         "$FAUCET" schema catalog
 step "schema test"            "$FAUCET" schema test
-step "init scaffold"          "$FAUCET" init --source csv --sink jsonl --output scaffold_demo.yaml --force scaffold_demo
+step "init scaffold"          "$FAUCET" init --source file --sink file --output scaffold_demo.yaml --force scaffold_demo
 
 hdr "Validate every generated config"
 VALIDATE_CFGS="01_basic 02_transforms 03_quality 04_contract 05_masking \
