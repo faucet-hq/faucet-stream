@@ -3262,19 +3262,10 @@ fn partitioned_truncation(config: &RestStreamConfig) -> Result<(), FaucetError> 
 }
 
 fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
-    match current {
-        None => Some(candidate),
-        Some(cur) => {
-            let take_candidate = match (&cur, &candidate) {
-                (Value::Number(a), Value::Number(b)) => {
-                    b.as_f64().unwrap_or(f64::MIN) > a.as_f64().unwrap_or(f64::MIN)
-                }
-                (Value::String(a), Value::String(b)) => b > a,
-                _ => true,
-            };
-            Some(if take_candidate { candidate } else { cur })
-        }
-    }
+    Some(match current {
+        None => candidate,
+        Some(cur) => faucet_core::replication::max_value(cur, candidate),
+    })
 }
 
 #[async_trait]
@@ -4318,8 +4309,21 @@ mod tests {
         // Numbers compare numerically.
         assert_eq!(value_max(Some(json!(5)), json!(10)), Some(json!(10)));
         assert_eq!(value_max(Some(json!(10)), json!(5)), Some(json!(10)));
-        // Heterogeneous / other → prefer the latest candidate.
-        assert_eq!(value_max(Some(json!("a")), json!(3)), Some(json!(3)));
+        // The same exact ordering the in-pass fold uses.
+        assert_eq!(value_max(Some(json!("9")), json!("10")), Some(json!("10")));
+        assert_eq!(value_max(Some(json!("10")), json!("9")), Some(json!("10")));
+        assert_eq!(
+            value_max(
+                Some(json!(9_007_199_254_740_993_u64)),
+                json!(9_007_199_254_740_992_u64)
+            ),
+            Some(json!(9_007_199_254_740_993_u64))
+        );
+        assert_eq!(
+            value_max(Some(json!("10.5")), json!(3)),
+            Some(json!("10.5"))
+        );
+        assert_eq!(value_max(Some(json!(3)), json!("2.5")), Some(json!(3)));
     }
 
     #[test]
