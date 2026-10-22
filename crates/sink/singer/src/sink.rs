@@ -218,10 +218,11 @@ impl SingerDriver {
         if inner.unconfirmed_pages == 0 {
             return Ok(());
         }
-        let mut process = inner
-            .process
-            .take()
-            .expect("unconfirmed pages imply a running target");
+        let Some(mut process) = inner.process.take() else {
+            return Err(FaucetError::Sink(
+                "singer sink: records are unconfirmed but the target is not running".into(),
+            ));
+        };
         inner.flush_seq += 1;
         let seq = inner.flush_seq;
         let mut buf = Vec::new();
@@ -240,6 +241,27 @@ impl SingerDriver {
         }
         inner.unconfirmed_pages = 0;
         Ok(())
+    }
+
+    /// A write whose future was dropped mid-page left a half-written page in
+    /// the target: stop it rather than confirm that page, and poison the sink
+    /// when fully written pages before it are lost with it.
+    async fn refuse_interrupted(&self, inner: &mut Inner) -> Result<(), FaucetError> {
+        if !inner.interrupted {
+            return Ok(());
+        }
+        let earlier = inner.unconfirmed_pages.saturating_sub(1);
+        self.stop(inner).await;
+        inner.interrupted = false;
+        let err = FaucetError::Sink(
+            "singer sink: a previous write to the target was interrupted mid-page; \
+             the target was stopped"
+                .into(),
+        );
+        if earlier > 0 {
+            inner.poison(&err);
+        }
+        Err(err)
     }
 
     async fn stop(&self, inner: &mut Inner) {
@@ -287,6 +309,7 @@ impl SinkDriver for SingerDriver {
     async fn flush(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
+        self.refuse_interrupted(&mut inner).await?;
         let result = calls.call_once("confirm", self.confirm(&mut inner)).await;
         if let Err(e) = &result {
             inner.sent_schema = None;
@@ -379,6 +402,7 @@ impl StagingDriver for SingerDriver {
     async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
+        self.refuse_interrupted(&mut inner).await?;
         if let Err(e) = calls.call_once("confirm", self.confirm(&mut inner)).await {
             inner.poison(&e);
             return Err(e);
@@ -453,20 +477,7 @@ impl SingerDriver {
         }
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
-        if inner.interrupted {
-            let earlier = inner.unconfirmed_pages.saturating_sub(1);
-            self.stop(&mut inner).await;
-            inner.interrupted = false;
-            let err = FaucetError::Sink(
-                "singer sink: a previous write to the target was interrupted mid-page; \
-                 the target was stopped"
-                    .into(),
-            );
-            if earlier > 0 {
-                inner.poison(&err);
-            }
-            return Err(err);
-        }
+        self.refuse_interrupted(&mut inner).await?;
         let earlier = inner.unconfirmed_pages;
         inner.interrupted = true;
         inner.unconfirmed_pages += 1;
