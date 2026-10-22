@@ -25391,7 +25391,7 @@
                       ]
                     },
                     "batch_size": {
-                      "description": "Max entries per `SendMessageBatch` request (1–10). Default 10.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — `SendMessageBatch` caps a request at\n[`MAX_ENTRIES_PER_REQUEST`](crate::MAX_ENTRIES_PER_REQUEST)\n(10) entries, so an unbatched whole-page request is not expressible.\n`0` (and anything above 10) is rejected at config load; pages larger\nthan `batch_size` are re-chunked into several requests (also\nre-chunked to stay under the 256 KiB per-request payload limit).",
+                      "description": "Max entries per `SendMessageBatch` request (1–10). Default 10.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — `SendMessageBatch` caps a request at\n[`MAX_ENTRIES_PER_REQUEST`](crate::MAX_ENTRIES_PER_REQUEST)\n(10) entries, so an unbatched whole-page request is not expressible.\n`0` (and anything above 10) is rejected at config load; pages larger\nthan `batch_size` are re-chunked into several requests (also\nre-chunked to stay under the 1 MiB per-request payload limit, and\nre-split into 256 KiB requests where a queue still enforces that).",
                       "type": [
                         "integer",
                         "string"
