@@ -39,6 +39,9 @@ pub(crate) struct RedshiftDriver {
     table_ready: std::sync::atomic::AtomicBool,
     /// The target's column names, lower-cased, loaded once.
     known_columns: tokio::sync::Mutex<Option<std::collections::HashSet<String>>>,
+    /// The target's `(column, declared type)` pairs, loaded once and dropped
+    /// when the sink adds a column.
+    typed_columns: tokio::sync::Mutex<Option<Vec<(String, String)>>>,
     /// Records accumulated across `write_batch` calls (#617).
     ///
     /// `COPY` wants millions of rows per load; one `COPY` per 1000-row page
@@ -241,6 +244,7 @@ impl RedshiftDriver {
             }
             cols.insert(name.to_lowercase());
         }
+        *self.typed_columns.lock().await = None;
         Ok(())
     }
 
@@ -249,10 +253,10 @@ impl RedshiftDriver {
         calls: &CallSlot,
     ) -> Result<std::collections::HashSet<String>, FaucetError> {
         Ok(self
-            .discover_columns(calls)
+            .discover_typed_columns(calls)
             .await?
             .into_iter()
-            .map(|c| c.to_lowercase())
+            .map(|(c, _)| c.to_lowercase())
             .collect())
     }
 
@@ -270,6 +274,7 @@ impl RedshiftDriver {
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
             known_columns: tokio::sync::Mutex::new(None),
+            typed_columns: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
@@ -309,11 +314,22 @@ impl RedshiftDriver {
     /// set/order).
     async fn discover_columns(&self, calls: &CallSlot) -> Result<Vec<String>, FaucetError> {
         Ok(self
-            .discover_typed_columns(calls)
+            .table_columns(calls)
             .await?
             .into_iter()
             .map(|(name, _)| name)
             .collect())
+    }
+
+    /// [`discover_typed_columns`](Self::discover_typed_columns), cached.
+    async fn table_columns(&self, calls: &CallSlot) -> Result<Vec<(String, String)>, FaucetError> {
+        let mut cached = self.typed_columns.lock().await;
+        if let Some(cols) = cached.as_ref() {
+            return Ok(cols.clone());
+        }
+        let cols = self.discover_typed_columns(calls).await?;
+        *cached = Some(cols.clone());
+        Ok(cols)
     }
 
     /// The table's `(column, declared type)` pairs in declared order.
@@ -466,7 +482,7 @@ impl RedshiftDriver {
         if records.is_empty() {
             return Ok(0);
         }
-        let typed = self.discover_typed_columns(calls).await?;
+        let typed = self.table_columns(calls).await?;
         let table_columns: Vec<String> = typed.iter().map(|(n, _)| n.clone()).collect();
         let present: Vec<String> = columns_present(records, &table_columns)
             .into_iter()
