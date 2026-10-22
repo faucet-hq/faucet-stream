@@ -331,30 +331,27 @@ async fn auto_map_unions_columns_across_heterogeneous_batch() {
 
 #[tokio::test]
 async fn batch_size_atomicity_per_chunk_preserved() {
-    // Each chunk is wrapped in its own BEGIN/COMMIT transaction. The
-    // implementation guarantees `records.is_empty()` short-circuits before
-    // any I/O; combined with the in-chunk multi-row INSERT this means every
-    // returned row count corresponds to rows visible in the destination
-    // (no half-committed batches).
-    let (_dir, url) = fresh_db("CREATE TABLE events (data TEXT NOT NULL)").await;
-
+    // Each chunk is its own transaction: a failing row in chunk 2 leaves chunk
+    // 1 committed and nothing of chunk 2.
+    let (_dir, url) = fresh_db("CREATE TABLE events (i INTEGER CHECK (i < 1000))").await;
     let config = SqliteSinkConfig::new(&url, "events")
-        .column_mapping(SqliteColumnMapping::Json {
-            column: "data".into(),
-        })
+        .column_mapping(SqliteColumnMapping::AutoMap)
         .with_batch_size(300);
     let sink = SqliteSink::new(config).await.unwrap();
-
-    // Two separate writes — the second's transaction commit must not affect
-    // the first's visibility.
-    let first: Vec<Value> = (0..700).map(|i| json!({"i": i})).collect();
-    let second: Vec<Value> = (0..400).map(|i| json!({"i": i + 1000})).collect();
-
-    sink.write_batch(&first).await.unwrap();
-    assert_eq!(count_rows(&url, "events").await, 700);
-
-    sink.write_batch(&second).await.unwrap();
-    assert_eq!(count_rows(&url, "events").await, 1_100);
+    let mut page: Vec<Value> = (0..700).map(|i| json!({"i": i})).collect();
+    page[400] = json!({"i": 5000});
+    assert!(sink.write_batch(&page).await.is_err());
+    assert_eq!(count_rows(&url, "events").await, 300);
+    let max: i64 = {
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let m = sqlx::query_scalar("SELECT MAX(i) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        m
+    };
+    assert_eq!(max, 299, "only chunk 1 landed");
 }
 
 #[tokio::test]
@@ -441,19 +438,15 @@ async fn wal_pool_writes_correctly_with_concurrent_reader() {
 
 #[tokio::test]
 async fn memory_url_still_writes_correctly() {
-    // The pool-options change must keep `sqlite::memory:` working — WAL on a
-    // memory DB is a no-op but must not error. Round-trip a batch through an
-    // in-memory sink (the table is created on the same single connection so it
-    // is visible to subsequent writes).
+    // WAL on a memory DB is a no-op but must not error; real rows land
+    // (read back on the sink's pool by the crate's unit tests).
     let config = SqliteSinkConfig::new("sqlite::memory:", "events").column_mapping(
         SqliteColumnMapping::Json {
             column: "data".into(),
         },
     );
     let sink = SqliteSink::new(config).await.unwrap();
-
-    // A memory DB started empty — create the table via the sink's own pool so
-    // it lives on the same connection the writes use (max_connections = 1).
-    let n = sink.write_batch(&[]).await.unwrap();
-    assert_eq!(n, 0, "empty write is a no-op even on a memory DB");
+    let rows: Vec<Value> = (0..3).map(|i| json!({"i": i})).collect();
+    assert_eq!(sink.write_batch(&rows).await.unwrap(), 3);
+    assert_eq!(sink.write_batch(&rows).await.unwrap(), 3);
 }
