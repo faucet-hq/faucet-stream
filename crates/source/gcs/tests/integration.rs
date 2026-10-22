@@ -103,6 +103,84 @@ async fn source_reads_json_lines() {
     assert_eq!(sorted, vec![1, 2]);
 }
 
+/// Under `verify_checksum` a JSON Lines object is verified before it is paged.
+#[tokio::test]
+async fn checksummed_json_lines_page_after_verification() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let body: String = (0..5).map(|i| format!("{{\"id\":{i}}}\n")).collect();
+    seed_object(
+        &host,
+        &bucket,
+        "v/rows.jsonl",
+        &body,
+        "application/x-ndjson",
+    )
+    .await;
+    let source = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("v/")
+            .with_batch_size(2)
+            .verify_checksum(true)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<i64> = stream_all(&source)
+        .await
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, (0..5).collect::<Vec<i64>>());
+}
+
+/// Each listing page is metered as one `list` round trip.
+#[tokio::test]
+async fn listing_pages_are_metered() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    for n in 0..3 {
+        seed_object(
+            &host,
+            &bucket,
+            &format!("m/{n}.jsonl"),
+            "{\"id\":1}\n",
+            "application/x-ndjson",
+        )
+        .await;
+    }
+    let source = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("m/")
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "gcs",
+        )
+        .with_meter(meter.clone()),
+    ));
+    assert_eq!(
+        source
+            .fetch_with_context(&HashMap::new())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(meter.snapshot().source_roundtrips.get("list"), Some(&1));
+}
+
 #[tokio::test]
 async fn source_reads_json_array() {
     let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {

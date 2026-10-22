@@ -6,7 +6,7 @@ use faucet_common_gcs::{build_storage, build_storage_control};
 use faucet_core::shard::{HashShard, ShardSpec, parse_hash_shard, plan_hash_shards};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::stream::{self, StreamExt, TryStreamExt};
-use google_cloud_gax::paginator::ItemPaginator;
+use google_cloud_gax::paginator::Paginator as _;
 use google_cloud_storage::client::{Storage, StorageControl};
 use serde_json::Value;
 use std::pin::Pin;
@@ -131,37 +131,39 @@ impl GcsSource {
         }
 
         let effective_prefix = prefix_override.or(self.config.prefix.as_deref());
-        self.roundtrips.record("list");
         let mut req = self.control.list_objects().set_parent(self.bucket_path());
         if let Some(p) = effective_prefix {
             req = req.set_prefix(p.to_string());
         }
         req = req.set_page_size(1000_i32);
 
-        let mut paginator = req.by_item();
+        let mut paginator = req.by_page();
         let mut names: Vec<String> = Vec::new();
-        while let Some(item) = paginator.next().within(&self.calls, "list").await? {
-            let object = item.map_err(|e| {
+        'pages: while let Some(page) = paginator.next().within(&self.calls, "list").await? {
+            self.roundtrips.record("list");
+            let page = page.map_err(|e| {
                 FaucetError::Source(format!(
                     "GCS list error for bucket '{}': {e}",
                     self.config.bucket
                 ))
             })?;
-            if object.name.is_empty()
-                || faucet_common_file::write::is_unfinished_output_key(&object.name)
-                || !self.filter.keep(
-                    &object.name,
-                    u64::try_from(object.size).ok(),
-                    effective_prefix.unwrap_or_default(),
-                )
-            {
-                continue;
-            }
-            names.push(object.name);
-            if let Some(max) = self.config.max_objects
-                && names.len() >= max
-            {
-                break;
+            for object in page.objects {
+                if object.name.is_empty()
+                    || faucet_common_file::write::is_unfinished_output_key(&object.name)
+                    || !self.filter.keep(
+                        &object.name,
+                        u64::try_from(object.size).ok(),
+                        effective_prefix.unwrap_or_default(),
+                    )
+                {
+                    continue;
+                }
+                names.push(object.name);
+                if let Some(max) = self.config.max_objects
+                    && names.len() >= max
+                {
+                    break 'pages;
+                }
             }
         }
         // Shard-filter AFTER the max_objects cap so the cap bounds the run's
@@ -173,6 +175,9 @@ impl GcsSource {
     /// Fetch one object in the shape its configured `file_format` needs.
     async fn fetch(&self, key: &str) -> Result<Fetched, FaucetError> {
         Ok(match self.config.file_format {
+            GcsFileFormat::JsonLines if self.config.verify_checksum => Fetched::Lines(Box::pin(
+                std::io::Cursor::new(self.read_object_all(key).await?),
+            )),
             GcsFileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
             GcsFileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
             GcsFileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),

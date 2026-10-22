@@ -83,7 +83,7 @@ faucet run pipeline.yaml
 | `concurrency` | int | `10` | Maximum concurrent object reads. Higher = faster on many small objects; lower caps peak memory for large `raw_text` / `json_array` objects. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. **`0` = no batching** (one page per object). See [Streaming & batching](#streaming--batching). Validated at config load: an empty `bucket`, or a `batch_size` above `MAX_BATCH_SIZE` (1,000,000), is rejected with `FaucetError::Config`. |
 | `verify_length` | bool | `true` | Verify each object's byte count against the `size` GCS reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. Auto-skipped for a transcoded object (non-empty `Content-Encoding`) or when no size is reported. See [Read-integrity verification](#read-integrity-verification). |
-| `verify_checksum` | bool | `false` | Also verify the body against the CRC-32C (preferred) or MD5 checksum GCS reports. Costs a hash over the full body; skipped for transcoded objects. |
+| `verify_checksum` | bool | `false` | Also verify the body against the CRC-32C (preferred) or MD5 checksum GCS reports. Costs a hash over the full body; skipped for transcoded objects. A JSON Lines object is then read whole (up to `max_object_bytes`) and verified before any record is emitted. |
 
 ### Format & testing
 

@@ -137,7 +137,9 @@ pub struct GcsSourceConfig {
     /// (#161). Stronger than the length check but costs a hash over the full
     /// body, so it defaults to `false`. When the store advertises no usable
     /// checksum for an object, verification is skipped for that object (a
-    /// debug log notes it); the length check still applies.
+    /// debug log notes it); the length check still applies. A JSON Lines
+    /// object is then read whole (up to `max_object_bytes`) and verified
+    /// before any of its records is emitted.
     #[serde(default)]
     pub verify_checksum: bool,
     /// Largest object, once decompressed, that a format read whole (JSON
