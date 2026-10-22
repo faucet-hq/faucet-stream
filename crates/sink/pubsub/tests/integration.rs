@@ -258,6 +258,35 @@ async fn sink_write_batch_partial_reports_row_failures() {
     assert!(got.len() >= 2, "the two valid rows are pullable");
 }
 
+/// A keyed record that cannot be encoded fails alone, and the later messages
+/// of its ordering key are held back so the key's order is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unencodable_keyed_record_holds_back_its_key() {
+    let emu = emulator().await;
+    let host = emu.host.as_str();
+    let client = setup_client().await;
+    let sub = create_topic_sub(&client, "sink-hold-t", "sink-hold-s").await;
+
+    let mut cfg = PubsubSinkConfig::new("sink-hold-t");
+    cfg.connection = conn(host);
+    cfg.ordering_key = OrderingKey::Field { name: "id".into() };
+    cfg.attributes_field = Some("attrs".into());
+    let sink = PubsubSink::new(cfg).await.expect("sink builds");
+    let records = [
+        json!({"id": "a", "n": 1}),
+        json!({"id": "a", "attrs": {"goog-x": "1"}}),
+        json!({"id": "b", "n": 3}),
+        json!({"id": "a", "n": 4}),
+    ];
+    let outcomes = sink.write_batch_partial(&records).await.expect("partial");
+    assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+    let err = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(err.contains("reserved"), "{err}");
+    let held = outcomes[3].as_ref().unwrap_err().to_string();
+    assert!(held.contains("ordering key 'a'"), "{held}");
+    assert_eq!(drain(&sub, 2).await.len(), 2);
+}
+
 /// When every row fails to encode, `write_batch` returns an aggregate error
 /// (rather than a partial success). Covers the `failed > 0` branch of
 /// `write_batch` and its first-error extraction.

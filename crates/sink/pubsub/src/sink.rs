@@ -226,6 +226,40 @@ impl faucet_core::Sink for PubsubSink {
 
 /// Bytes, ordering key and attributes of a message, back from
 /// [`PubsubDriver::encode`]'s [`OutboundMessage`].
+/// The destination of a keyed record `encode` could not build; its payload
+/// is the error text.
+const ENCODE_FAILED: &str = "\0faucet-encode-failed";
+
+/// The group's sendable messages, and a failure for every keyed record that
+/// could not be encoded and for each later message of that ordering key.
+fn split_encode_failures(
+    group: Vec<OutboundMessage>,
+) -> (Vec<(usize, Prepared)>, BTreeMap<usize, FaucetError>) {
+    let mut failed_keys: HashSet<String> = HashSet::new();
+    let mut failures = BTreeMap::new();
+    let mut send = Vec::with_capacity(group.len());
+    for (i, m) in group.into_iter().enumerate() {
+        if m.destination == ENCODE_FAILED {
+            let key = m
+                .key
+                .as_ref()
+                .map(|k| String::from_utf8_lossy(k).into_owned());
+            failed_keys.extend(key);
+            let msg = String::from_utf8_lossy(&m.payload).into_owned();
+            failures.insert(i, FaucetError::Sink(msg));
+            continue;
+        }
+        let (mut keep, held) = hold_failed_keys(vec![(i, prepared_from(m))], &failed_keys);
+        for (i, r) in held {
+            if let Err(e) = r {
+                failures.insert(i, e);
+            }
+        }
+        send.append(&mut keep);
+    }
+    (send, failures)
+}
+
 fn prepared_from(m: OutboundMessage) -> Prepared {
     Prepared {
         data: m.payload,
@@ -374,13 +408,31 @@ impl MessageDriver for PubsubDriver {
 
     /// A record with a bad payload, an unresolvable ordering key or malformed
     /// attributes fails alone.
+    /// A keyed record that cannot be encoded still carries its ordering key
+    /// to `publish`, which fails it and holds back the key's later messages.
     fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
-        let p = prepare(
+        let p = match prepare(
             record,
             self.config.value_format,
             &self.config.ordering_key,
             self.config.attributes_field.as_deref(),
-        )?;
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let key = crate::encode::derive_ordering_key(record, &self.config.ordering_key)
+                    .ok()
+                    .flatten()
+                    .filter(|k| !k.is_empty());
+                return match key {
+                    Some(key) => Ok(OutboundMessage::new(
+                        ENCODE_FAILED,
+                        e.to_string().into_bytes(),
+                    )
+                    .with_key(key.into_bytes())),
+                    None => Err(e),
+                };
+            }
+        };
         let mut m = OutboundMessage::new(self.config.topic.clone(), p.data);
         if !p.ordering_key.is_empty() {
             m = m.with_key(p.ordering_key.into_bytes());
@@ -405,9 +457,9 @@ impl MessageDriver for PubsubDriver {
         group: Vec<OutboundMessage>,
     ) -> Result<Vec<RowOutcome>, FaucetError> {
         let n = group.len();
-        let prepared = group.into_iter().map(prepared_from).enumerate().collect();
+        let (prepared, failures) = split_encode_failures(group);
         let shipped = self.publish_all(calls, prepared).await;
-        let outcomes = assemble_row_outcomes(n, BTreeMap::new(), shipped);
+        let outcomes = assemble_row_outcomes(n, failures, shipped);
         let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
         tracing::info!(
             topic = %self.config.topic,
@@ -495,6 +547,25 @@ mod tests {
         assert_eq!(sizes(&chunks), vec![1, 1]);
         assert_eq!(chunks[1][0].0, 1);
         assert!(chunk_prepared(Vec::new(), 10, 50).is_empty());
+    }
+
+    #[test]
+    fn an_unencodable_keyed_record_holds_back_only_its_later_key_messages() {
+        let ok =
+            |key: &str| OutboundMessage::new("t", b"x".to_vec()).with_key(key.as_bytes().to_vec());
+        let bad = |key: &str| {
+            OutboundMessage::new(ENCODE_FAILED, b"pubsub: bad".to_vec())
+                .with_key(key.as_bytes().to_vec())
+        };
+        let (send, failures) =
+            split_encode_failures(vec![ok("a"), bad("a"), ok("b"), ok("a"), ok("")]);
+        assert_eq!(
+            send.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        assert!(failures[&1].to_string().contains("pubsub: bad"));
+        assert!(failures[&3].to_string().contains("ordering key 'a'"));
+        assert_eq!(failures.len(), 2);
     }
 
     #[test]
