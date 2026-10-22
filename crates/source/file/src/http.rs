@@ -165,13 +165,7 @@ impl HttpFetcher {
                     backoff(attempt),
                     format!("HTTP {}", resp.status()),
                 ),
-                Ok(resp) => {
-                    return Err(FaucetError::HttpStatus {
-                        status: resp.status().as_u16(),
-                        url: url.to_string(),
-                        body: resp.text().await.unwrap_or_default(),
-                    });
-                }
+                Ok(resp) => return Err(faucet_core::http::status_error(resp).await),
                 Err(e) => {
                     let class = match faucet_core::resilience::classify(&e) {
                         Some(RetryClass::Timeout) => RetryClass::Timeout,
@@ -186,8 +180,10 @@ impl HttpFetcher {
             };
             if attempt >= self.retries {
                 return Err(FaucetError::Source(format!(
-                    "file source: {method} {url} failed after {} attempt(s): {detail}",
-                    attempt + 1
+                    "file source: {method} {} failed after {} attempt(s): {}",
+                    faucet_core::util::redact_uri_credentials(url),
+                    attempt + 1,
+                    faucet_core::util::redact_uri_credentials(&detail)
                 )));
             }
             slot.retry(class);
