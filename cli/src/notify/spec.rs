@@ -293,6 +293,26 @@ impl NotificationSpec {
                 )))
             }
             ChannelSpec::Webhook(c) => {
+                let header = |field: &str, name: &str| {
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        CliError::Config(format!(
+                            "notifications rule `{}`: `{field}` `{name}` is not a valid HTTP \
+                             header name",
+                            self.name
+                        ))
+                    })
+                };
+                header("signature_header", &c.signature_header)?;
+                for (k, v) in &c.headers {
+                    header("headers", k)?;
+                    if reqwest::header::HeaderValue::from_str(v).is_err() {
+                        return Err(CliError::Config(format!(
+                            "notifications rule `{}`: the value of header `{k}` is not a valid \
+                             HTTP header value",
+                            self.name
+                        )));
+                    }
+                }
                 // Reject a reserved key rather than silently dropping it at
                 // render time: `extra_fields: { event: "ok" }` would otherwise
                 // look accepted while never reaching the receiver.
@@ -472,6 +492,37 @@ mod tests {
                 extra_fields: extra,
             }),
         }
+    }
+
+    #[test]
+    fn invalid_webhook_headers_are_rejected_at_load_time() {
+        let with = |f: &dyn Fn(&mut WebhookConfig)| {
+            let mut spec = webhook_with_extra("w", "tenant");
+            if let ChannelSpec::Webhook(c) = &mut spec.channel {
+                f(c);
+            }
+            spec.validate()
+        };
+        with(&|c| {
+            c.headers.insert("X-Api-Key".into(), "${env:K}".into());
+        })
+        .unwrap();
+        let err = with(&|c| {
+            c.headers.insert("X Api Key".into(), "k".into());
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`X Api Key` is not a valid HTTP header name"), "{err}");
+        let err = with(&|c| {
+            c.headers.insert("X-Key".into(), "a\nb".into());
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("header `X-Key` is not a valid HTTP header value"), "{err}");
+        let err = with(&|c| c.signature_header = "Bad Header".into())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`signature_header`"), "{err}");
     }
 
     #[test]
