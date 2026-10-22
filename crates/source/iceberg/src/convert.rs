@@ -488,6 +488,171 @@ mod tests {
         assert_eq!(rows[0]["raw"], "EjRWeJASNFZ4kBI0VniQEg==");
     }
 
+    /// A `uuid` map value and a `uuid` large-list item render as text; a
+    /// batch with no `uuid` column, or none the schema marks, is untouched.
+    #[test]
+    fn uuid_in_maps_and_large_lists_renders_as_text_and_others_are_untouched() {
+        use arrow::array::{
+            ArrayRef, FixedSizeBinaryArray, LargeListArray, ListArray, MapArray, StructArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        let p = |t| Type::Primitive(t);
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "m",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::map_key_element(2, p(PrimitiveType::String))),
+                        Arc::new(NestedField::map_value_element(
+                            3,
+                            p(PrimitiveType::Uuid),
+                            false,
+                        )),
+                    )),
+                )),
+                Arc::new(NestedField::optional(
+                    4,
+                    "big",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        5,
+                        p(PrimitiveType::Uuid),
+                        false,
+                    )))),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&schema).unwrap());
+        let bytes: [u8; 16] = [0x12; 16];
+        let bin = || {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some(bytes), None].into_iter(),
+                    16,
+                )
+                .unwrap(),
+            ) as ArrayRef
+        };
+        let DataType::Map(entries_field, sorted) = arrow_schema.field(0).data_type().clone() else {
+            panic!("map")
+        };
+        let DataType::Struct(ef) = entries_field.data_type().clone() else {
+            panic!("entries")
+        };
+        let keys = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let entries = StructArray::new(ef, vec![keys, bin()], None);
+        let map = MapArray::new(
+            entries_field,
+            OffsetBuffer::from_lengths([1, 1]),
+            entries,
+            None,
+            sorted,
+        );
+        let DataType::List(item) = arrow_schema.field(1).data_type().clone() else {
+            panic!("list")
+        };
+        let big = LargeListArray::new(
+            item.clone(),
+            OffsetBuffer::<i64>::from_lengths([1, 1]),
+            bin(),
+            None,
+        );
+        let big_field = arrow_schema
+            .field(1)
+            .clone()
+            .with_data_type(DataType::LargeList(item));
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                arrow_schema.field(0).clone(),
+                big_field,
+            ])),
+            vec![Arc::new(map), Arc::new(big)],
+        )
+        .unwrap();
+        let out = UuidColumns::of(&schema).apply(batch).unwrap();
+        let DataType::Map(entries, _) = out.schema().field(0).data_type().clone() else {
+            panic!("map")
+        };
+        let DataType::Struct(ef) = entries.data_type().clone() else {
+            panic!("entries")
+        };
+        assert_eq!(ef[1].data_type(), &DataType::Utf8);
+        let DataType::LargeList(item) = out.schema().field(1).data_type().clone() else {
+            panic!("large list")
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        let text = "12121212-1212-1212-1212-121212121212";
+        let rows = batch_to_rows(&out).unwrap();
+        assert!(rows[0].to_string().contains(text), "{}", rows[0]);
+        assert_eq!(rows[0]["big"], json!([text]));
+
+        let plain = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "n",
+                p(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let ints = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new("n", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let same = UuidColumns::of(&plain).apply(ints.clone()).unwrap();
+        assert!(Arc::ptr_eq(&same.schema(), &ints.schema()));
+
+        let mixed = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "u", p(PrimitiveType::Uuid))),
+                Arc::new(NestedField::optional(
+                    2,
+                    "st",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                        3,
+                        "n",
+                        p(PrimitiveType::Long),
+                    ))])),
+                )),
+                Arc::new(NestedField::optional(
+                    4,
+                    "ns",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        5,
+                        p(PrimitiveType::Long),
+                        false,
+                    )))),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let mixed_arrow = Arc::new(iceberg::arrow::schema_to_arrow_schema(&mixed).unwrap());
+        let DataType::Struct(sf) = mixed_arrow.field(1).data_type().clone() else {
+            panic!("struct")
+        };
+        let st = StructArray::new(sf, vec![Arc::new(Int64Array::from(vec![1, 2]))], None);
+        let DataType::List(li) = mixed_arrow.field(2).data_type().clone() else {
+            panic!("list")
+        };
+        let ns = ListArray::new(
+            li,
+            OffsetBuffer::from_lengths([1, 1]),
+            Arc::new(Int64Array::from(vec![3, 4])),
+            None,
+        );
+        let only_nested = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                mixed_arrow.field(1).clone(),
+                mixed_arrow.field(2).clone(),
+            ])),
+            vec![Arc::new(st), Arc::new(ns)],
+        )
+        .unwrap();
+        let untouched = UuidColumns::of(&mixed).apply(only_nested.clone()).unwrap();
+        assert!(Arc::ptr_eq(&untouched.schema(), &only_nested.schema()));
+    }
+
     fn table_schema() -> Schema {
         let p = |t| Type::Primitive(t);
         Schema::builder()
