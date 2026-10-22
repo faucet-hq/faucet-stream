@@ -35537,7 +35537,7 @@
           "type": "string"
         },
         "timestamp_header": {
-          "description": "Header carrying the Unix-seconds timestamp the sender signed. When set,\nthe signed content is `<timestamp>.<body>` and a timestamp more than\n`tolerance_secs` from now is rejected (replay protection).",
+          "description": "Header carrying the Unix-seconds timestamp the sender signed. When set,\nthe signed content is `<timestamp>.<body>`, a timestamp more than\n`tolerance_secs` from now is rejected, and a request repeating one\nalready stored in this window is acknowledged without being stored\nagain. Without it, identical signed requests are each stored.",
           "type": [
             "string",
             "null"

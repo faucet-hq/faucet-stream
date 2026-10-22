@@ -76,8 +76,10 @@ pub struct WebhookSignature {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
     /// Header carrying the Unix-seconds timestamp the sender signed. When set,
-    /// the signed content is `<timestamp>.<body>` and a timestamp more than
-    /// `tolerance_secs` from now is rejected (replay protection).
+    /// the signed content is `<timestamp>.<body>`, a timestamp more than
+    /// `tolerance_secs` from now is rejected, and a request repeating one
+    /// already stored in this window is acknowledged without being stored
+    /// again. Without it, identical signed requests are each stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_header: Option<String>,
     /// Accepted clock difference for `timestamp_header`, in seconds (default 300).

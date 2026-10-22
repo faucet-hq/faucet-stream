@@ -100,6 +100,46 @@ async fn signed_requests_are_verified() {
     assert_eq!(records, vec![json!({"id": 1})]);
 }
 
+/// A signed request repeated inside the tolerance window is acknowledged but
+/// stored once.
+#[tokio::test]
+async fn a_repeated_signed_request_is_stored_once() {
+    let addr = free_addr();
+    let cfg = WebhookSourceConfig::new()
+        .listen_addr(addr.clone())
+        .max_payloads(2)
+        .timeout_secs(3)
+        .signature(
+            serde_json::from_value(json!({
+                "header": "X-Signature",
+                "secret": "s3cret",
+                "timestamp_header": "X-Timestamp"
+            }))
+            .unwrap(),
+        );
+    let source = WebhookSource::new(cfg);
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = r#"{"id":7}"#;
+    let signature = sign("s3cret", format!("{now}.{body}").as_bytes());
+    let send = || {
+        client
+            .post(&url)
+            .header("X-Timestamp", now.to_string())
+            .header("X-Signature", signature.clone())
+            .body(body)
+    };
+    assert_eq!(post_until_up(&client, &url, send).await.status(), 200);
+    assert_eq!(send().send().await.unwrap().status(), 200);
+    let records = run.await.unwrap().unwrap();
+    assert_eq!(records, vec![json!({"id": 7})]);
+}
+
 /// API-14: a payload arriving after the window closed is refused with a
 /// retryable status, never acknowledged and dropped.
 #[tokio::test]
