@@ -14437,7 +14437,7 @@
           ]
         },
         "endpoint": {
-          "description": "Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /\nnon-AWS stores. Overrides `region`.",
+          "description": "Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /\nnon-AWS stores. Overrides `region`. An `http://` or `https://` prefix\nis kept; without one the server fetches over `https://`.",
           "type": [
             "string",
             "null"
