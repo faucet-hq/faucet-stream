@@ -401,7 +401,7 @@ fn key_fixture(name: &str) -> (u32, Vec<Value>) {
 
 #[test]
 fn every_key_the_current_scheme_wrote_still_renders_the_same() {
-    let (scheme, keys) = key_fixture("key-renderings-v3.json");
+    let (scheme, keys) = key_fixture("key-renderings-v4.json");
     assert_eq!(scheme, faucet_core::KEY_SCHEME_VERSION);
     for entry in &keys {
         let want = entry["key"].as_str().unwrap();
@@ -431,7 +431,11 @@ fn every_key_the_current_scheme_wrote_still_renders_the_same() {
 
 #[test]
 fn every_key_an_earlier_scheme_wrote_is_migrated_from() {
-    for name in ["key-renderings-v1.json", "key-renderings-v2.json"] {
+    for name in [
+        "key-renderings-v1.json",
+        "key-renderings-v2.json",
+        "key-renderings-v3.json",
+    ] {
         let (scheme, keys) = key_fixture(name);
         assert!(scheme < faucet_core::KEY_SCHEME_VERSION);
         for entry in &keys {
