@@ -43,6 +43,28 @@ async fn missing_exchange_fails_and_the_next_write_reconnects() {
     assert!(second.to_string().contains("rabbitmq"), "{second}");
 }
 
+/// A channel error in a later group keeps the earlier groups' confirmed
+/// outcomes and fails only the rows it left undecided.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_error_in_a_later_group_keeps_earlier_outcomes() {
+    let broker = start_broker_with(Some("-rabbit max_message_size 4096")).await;
+    declare_queue(&broker.url, "big").await;
+    let mut cfg = sink_cfg(&broker.url, "big");
+    cfg.batch_size = 1;
+    let sink = RabbitMqSink::new(cfg).await.unwrap();
+    let rows = [
+        json!({"a": 1}),
+        json!({"blob": "x".repeat(8192)}),
+        json!({"a": 3}),
+    ];
+    let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(outcomes[0].is_ok(), "{outcomes:?}");
+    assert!(outcomes[1].is_err() && outcomes[2].is_err(), "{outcomes:?}");
+    assert_eq!(wait_ready(&broker.url, "big", 1).await, 1);
+    sink.write_batch(&[json!({"a": 4})]).await.unwrap();
+    assert_eq!(wait_ready(&broker.url, "big", 2).await, 2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exchange_kind_mismatch_is_a_config_error() {
     let broker = start_broker().await;

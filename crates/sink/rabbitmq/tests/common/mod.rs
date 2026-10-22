@@ -13,10 +13,20 @@ pub struct Broker {
 }
 
 pub async fn start_broker() -> Broker {
+    start_broker_with(None).await
+}
+
+/// A broker started with extra Erlang arguments (`-rabbit <key> <value>`).
+pub async fn start_broker_with(erl_args: Option<&str>) -> Broker {
+    use testcontainers::ImageExt;
     let container = faucet_conformance::containers::start(|| {
-        GenericImage::new("rabbitmq", "3-management")
+        let image = GenericImage::new("rabbitmq", "3-management")
             .with_exposed_port(5672.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
+            .with_wait_for(WaitFor::message_on_stdout("Server startup complete"));
+        image.with_env_var(
+            "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS",
+            erl_args.unwrap_or_default(),
+        )
     })
     .await;
     let host = container.get_host().await.expect("host");
