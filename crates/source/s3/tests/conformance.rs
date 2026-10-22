@@ -200,15 +200,16 @@ async fn conformance_discover_roundtrips() {
 /// — no MinIO container needed — and the first `ListObjectsV2` / `GetObject`
 /// call fails with a typed `FaucetError` on both the `fetch_all` and
 /// `stream_pages` paths, never a panic. Credentials are supplied via env vars
-/// (the source honours the standard AWS credential chain), matching the
-/// bounded-memory check's approach.
+/// (the source honours the standard AWS credential chain) with the same
+/// values every other test in this binary sets, so a concurrent MinIO test
+/// never loads another test's credentials.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_errors_not_panics() {
     // SAFETY: identical constant credentials across all runs in this test
     // binary; re-applying the same values keeps the thread-unsafe set benign.
     unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "bogus");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "bogus");
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
         std::env::set_var("AWS_DEFAULT_REGION", REGION);
     }
     let config = S3SourceConfig::new("does-not-exist")
