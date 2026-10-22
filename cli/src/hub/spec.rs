@@ -301,9 +301,10 @@ pub struct SourceTemplate {
     #[serde(default = "default_version")]
     pub version: u32,
     /// Short name (`erp`). With `owner`, the hub id is `owner/name`; an
-    /// official template (no owner) is addressed by `name` alone. The id is the
-    /// composed pipeline's `name:`, so per-stream state keys
-    /// (`{id}::{stream}`) stay stable no matter which sink is composed in.
+    /// official template (no owner) is addressed by `name` alone. A composed
+    /// pipeline is named after the pairing (`{id}.{sink id}`), so per-stream
+    /// state keys are scoped to the sink; a deployment overlay with
+    /// `state_scope: source` names it `{id}` so the keys survive a sink swap.
     pub name: String,
     /// Publisher namespace — a GitHub user or org login (#682), equal to the
     /// directory the file lives in (`source-templates/<owner>/<name>.yaml`).

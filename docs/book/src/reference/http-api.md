@@ -1048,8 +1048,9 @@ private hostname is a `422`), and a re-register can never change a template's
 kind under the same id. A trigger on a source template without `sink` is a `422`
 naming the field; `sink` on a pipeline template is a `422`; a trigger on a sink
 template is a `422` pointing at the source side. The composed run's `name` is
-the source template's, so its state keys (`{source}::{stream}`) survive a sink
-swap, and the run is labelled `sink_template` / `sink_template_version` beside
+the pairing (`{source}.{sink}`), so its state keys are scoped to that sink; a
+deployment overlay with `state_scope: source` names it after the source
+template so the keys survive a sink swap. The run is labelled `sink_template` / `sink_template_version` beside
 `template` / `template_version`. Registering a document with no `kind:` still
 works as a pipeline but is deprecated: add `kind: pipeline`.
 
