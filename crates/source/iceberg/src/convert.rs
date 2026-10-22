@@ -490,6 +490,67 @@ mod tests {
 
     /// A `uuid` map value and a `uuid` large-list item render as text; a
     /// batch with no `uuid` column, or none the schema marks, is untouched.
+    /// A batch that breaks its own schema (a null in a required uuid column,
+    /// top level or nested) is refused with a typed error, not rebuilt.
+    #[test]
+    #[allow(unsafe_code)]
+    fn uuid_rendering_refuses_a_batch_that_breaks_its_schema() {
+        use arrow::array::{ArrayRef, FixedSizeBinaryArray, StructArray};
+        let p = |t| Type::Primitive(t);
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(1, "id", p(PrimitiveType::Uuid))),
+                Arc::new(NestedField::required(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                        3,
+                        "owner",
+                        p(PrimitiveType::Uuid),
+                    ))])),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&schema).unwrap());
+        let bin = |v: Vec<Option<[u8; 16]>>| {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(v.into_iter(), 16).unwrap(),
+            ) as ArrayRef
+        };
+        let arrow::datatypes::DataType::Struct(children) =
+            arrow_schema.field(1).data_type().clone()
+        else {
+            panic!("struct");
+        };
+        // SAFETY: deliberately invalid (nulls in required fields) to exercise
+        // the rebuild's validation; only read by the code under test.
+        let st = |owner: ArrayRef| -> ArrayRef {
+            Arc::new(unsafe { StructArray::new_unchecked(children.clone(), vec![owner], None) })
+        };
+        let cols = UuidColumns::of(&schema);
+
+        let top = unsafe {
+            RecordBatch::new_unchecked(
+                arrow_schema.clone(),
+                vec![bin(vec![None]), st(bin(vec![Some([1; 16])]))],
+                1,
+            )
+        };
+        let e = cols.apply(top).unwrap_err().to_string();
+        assert!(e.contains("rendering uuid columns failed"), "{e}");
+
+        let nested = unsafe {
+            RecordBatch::new_unchecked(
+                arrow_schema,
+                vec![bin(vec![Some([1; 16])]), st(bin(vec![None]))],
+                1,
+            )
+        };
+        let e = cols.apply(nested).unwrap_err().to_string();
+        assert!(e.contains("rendering uuid columns failed"), "{e}");
+    }
+
     #[test]
     fn uuid_in_maps_and_large_lists_renders_as_text_and_others_are_untouched() {
         use arrow::array::{

@@ -963,6 +963,19 @@ mod tests {
     }
 
     #[test]
+    fn decimal_key_and_float_strings() {
+        assert_eq!(decimal_key("1x5"), None);
+        assert_eq!(decimal_key("0.000"), Some((false, String::new(), 0)));
+        assert_eq!(decimal_key("-00"), Some((false, String::new(), 0)));
+        let f = datum_for("x", &Literal::Str(" 0.5 ".into()), &PrimitiveType::Float).unwrap();
+        assert_eq!(f, Datum::float(0.5));
+        for bad in ["abc", "inf", "NaN"] {
+            let e = datum_for("x", &Literal::Str(bad.into()), &PrimitiveType::Float).unwrap_err();
+            assert!(e.to_string().contains(&format!("'{bad}'")), "{e}");
+        }
+    }
+
+    #[test]
     fn rescale_decimal_cases() {
         assert_eq!(rescale_decimal("12.3", 2).as_deref(), Some("12.30"));
         assert_eq!(rescale_decimal("-1.500", 2).as_deref(), Some("-1.50"));
