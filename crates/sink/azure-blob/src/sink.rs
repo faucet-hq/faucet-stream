@@ -95,10 +95,10 @@ fn account_name(conn: &faucet_common_azure::AzureConnection) -> Option<String> {
     {
         return Some(account.to_string());
     }
+    let mut dev_storage = false;
     if let faucet_common_azure::AzureCredentials::ConnectionString { connection_string } =
         &conn.auth
     {
-        let mut dev_storage = false;
         for segment in connection_string.split(';') {
             match segment.trim().split_once('=') {
                 Some((k, v)) if k.trim() == "AccountName" && !v.trim().is_empty() => {
@@ -110,11 +110,8 @@ fn account_name(conn: &faucet_common_azure::AzureConnection) -> Option<String> {
                 _ => {}
             }
         }
-        if dev_storage {
-            return Some(EMULATOR_ACCOUNT.to_string());
-        }
     }
-    conn.use_emulator.then(|| EMULATOR_ACCOUNT.to_string())
+    (dev_storage || conn.use_emulator).then(|| EMULATOR_ACCOUNT.to_string())
 }
 
 /// The account name of the Azurite storage emulator.
