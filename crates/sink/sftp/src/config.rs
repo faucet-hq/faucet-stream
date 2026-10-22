@@ -586,6 +586,7 @@ mod object_rules_tests {
         assert_eq!(s.parquet.row_group_size, 5);
     }
 
+    #[cfg(feature = "arrow")]
     #[test]
     fn batch_size_zero_writes_a_parquet_object_per_batch_write() {
         let mut c = SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/o");
