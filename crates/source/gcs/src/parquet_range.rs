@@ -294,4 +294,34 @@ mod tests {
             "the message must say what it means: {msg}"
         );
     }
+
+    /// A server that sends more than the range asked for: the read stops
+    /// instead of buffering the rest, and the oversize is refused.
+    #[test]
+    fn an_overlong_range_response_is_cut_off_and_refused() {
+        faucet_conformance::block_on_large_stack(async {
+            use faucet_conformance::hung::{Reply, StallingBodyServer};
+            let server = StallingBodyServer::start(|_method, _target| {
+                Reply::full("application/octet-stream", vec![7u8; 64])
+                    .header("x-goog-generation", "1")
+                    .header("x-goog-metageneration", "1")
+                    .header("x-goog-stored-content-length", "64")
+                    .header("x-goog-storage-class", "STANDARD")
+            })
+            .await
+            .expect("server");
+            let storage = build_storage(&GcsCredentials::Anonymous, Some(&server.http_url()))
+                .await
+                .expect("storage");
+            let reader =
+                GcsRangeReader::open(&storage, "projects/_/buckets/b", "o.parquet", 1_024, None)
+                    .await
+                    .expect("opens");
+            let msg = reader.fetch(0..10).await.unwrap_err().to_string();
+            assert!(
+                msg.contains("64 bytes") && msg.contains("o.parquet"),
+                "{msg}"
+            );
+        });
+    }
 }
