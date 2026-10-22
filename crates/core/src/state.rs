@@ -800,14 +800,7 @@ impl FileStateStore {
                 }
                 for (key, from) in renames {
                     if let Some(sidecar) = self.key_sidecar(&key) {
-                        tokio::fs::write(&sidecar, key.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                FaucetError::State(format!(
-                                    "failed to write state key file {}: {e}",
-                                    sidecar.display()
-                                ))
-                            })?;
+                        write_synced(&sidecar, key.as_bytes()).await?;
                     }
                     let to = self.entry_path(&key);
                     if tokio::fs::try_exists(&to).await.unwrap_or(false) {
@@ -853,14 +846,7 @@ impl FileStateStore {
         let tmp_path = self.temp_path(key);
 
         if let Some(sidecar) = self.key_sidecar(key) {
-            tokio::fs::write(&sidecar, key.as_bytes())
-                .await
-                .map_err(|e| {
-                    FaucetError::State(format!(
-                        "failed to write state key file {}: {e}",
-                        sidecar.display()
-                    ))
-                })?;
+            write_synced(&sidecar, key.as_bytes()).await?;
         }
 
         // Write the temp file and fsync it BEFORE the rename. `fs::write`
@@ -909,21 +895,7 @@ impl FileStateStore {
         // never flushed. Directory fsync is a POSIX concept; on platforms that
         // don't allow opening a directory as a file (e.g. Windows) it is
         // skipped.
-        #[cfg(unix)]
-        {
-            let dir = tokio::fs::File::open(&self.root).await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to open state dir {} for fsync: {e}",
-                    self.root.display()
-                ))
-            })?;
-            dir.sync_all().await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to fsync state dir {}: {e}",
-                    self.root.display()
-                ))
-            })?;
-        }
+        sync_dir(&self.root).await?;
 
         tracing::debug!(
             key,
@@ -966,6 +938,41 @@ impl FileStateStore {
     }
 }
 
+/// Write `bytes` to `path` and flush them to disk.
+async fn write_synced(path: &std::path::Path, bytes: &[u8]) -> Result<(), FaucetError> {
+    let err = |what: &str, e: std::io::Error| {
+        FaucetError::State(format!(
+            "failed to {what} state key file {}: {e}",
+            path.display()
+        ))
+    };
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| err("write", e))?;
+    file.write_all(bytes).await.map_err(|e| err("write", e))?;
+    file.sync_all().await.map_err(|e| err("fsync", e))
+}
+
+/// Make a rename or removal in `dir` durable. Directory fsync is a POSIX
+/// concept; elsewhere it is skipped.
+async fn sync_dir(dir: &std::path::Path) -> Result<(), FaucetError> {
+    #[cfg(unix)]
+    {
+        let handle = tokio::fs::File::open(dir).await.map_err(|e| {
+            FaucetError::State(format!(
+                "failed to open state dir {} for fsync: {e}",
+                dir.display()
+            ))
+        })?;
+        handle.sync_all().await.map_err(|e| {
+            FaucetError::State(format!("failed to fsync state dir {}: {e}", dir.display()))
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 #[async_trait]
 impl StateStore for FileStateStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
@@ -997,9 +1004,10 @@ impl StateStore for FileStateStore {
         };
         let mut paths = vec![self.entry_path(key)];
         paths.extend(self.key_sidecar(key));
+        let mut removed = false;
         for path in paths {
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
+                Ok(()) => removed = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     return Err(FaucetError::State(format!(
@@ -1008,6 +1016,9 @@ impl StateStore for FileStateStore {
                     )));
                 }
             }
+        }
+        if removed {
+            sync_dir(&self.root).await?;
         }
         if let Some(held) = held {
             held.remove(&lock_path)?;
@@ -1642,6 +1653,22 @@ mod tests {
         s.delete("k").await.unwrap();
         assert!(s.get("k").await.unwrap().is_none());
         assert!(!dir.path().join("k.json").exists());
+    }
+
+    #[tokio::test]
+    async fn synced_writes_and_directory_syncs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("k.key");
+        write_synced(&path, b"key").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"key");
+        sync_dir(dir.path()).await.unwrap();
+        let missing = dir.path().join("missing");
+        assert!(write_synced(&missing.join("x"), b"x").await.is_err());
+        #[cfg(unix)]
+        assert!(matches!(
+            sync_dir(&missing).await,
+            Err(FaucetError::State(m)) if m.contains("for fsync")
+        ));
     }
 
     #[tokio::test]
