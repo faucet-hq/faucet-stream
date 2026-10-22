@@ -318,7 +318,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 | Senders get `405 Method Not Allowed` | Only `POST` is routed. Ensure the client uses `POST` on the configured `path`. |
 | The run blocks indefinitely | `max_payloads` is unset and `timeout_secs` is very large, so the server waits the full window. The window always ends at `timeout_secs`; lower it or set `max_payloads`. |
 | Remote senders can't reach the server | The default `listen_addr` is loopback (`127.0.0.1`). Bind `0.0.0.0` to accept external traffic — and set `auth_token` (and/or front it with a gateway) when you do. |
-| Received more than `max_payloads`? | Won't happen — the cap is exact; surplus concurrent POSTs are accepted with `200` but dropped, never stored. |
+| Received more than `max_payloads`? | Won't happen — the cap is exact; surplus concurrent POSTs are refused with `503 Service Unavailable` and a `Retry-After` header, so the sender retries them later. |
 
 ## See also
 
