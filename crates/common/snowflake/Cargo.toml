@@ -9,6 +9,7 @@ description = "Shared configuration types for the faucet-stream Snowflake source
 readme = "README.md"
 keywords = ["snowflake", "sql", "etl", "pipeline", "faucet"]
 categories.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 faucet-core.workspace = true

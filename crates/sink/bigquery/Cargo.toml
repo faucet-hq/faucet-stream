@@ -9,6 +9,7 @@ description = "BigQuery sink connector for the faucet-stream ecosystem"
 readme = "README.md"
 keywords = ["bigquery", "gcp", "etl", "sink", "pipeline"]
 categories.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 faucet-core.workspace = true

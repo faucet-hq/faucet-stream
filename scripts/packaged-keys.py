@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Fail when a published crate would package a private key (#789 SUPPLY-20).
 
-Test fixtures with key material (`*.pem` holding a PRIVATE KEY, `*.key`,
-`*.p12`, `*.pfx`) must be kept out of the `.crate` with the manifest's
-`exclude` (or `include`) list: a secret scanner flags the published crate
-otherwise. Checks every publishable workspace member without running cargo.
+Test fixtures with key material (a key container — `*.key`, `*.p12`, `*.pfx`,
+`*.der`, `*.jks`, `*.p8`, `id_rsa`… — or any text file, source included,
+holding a PEM `PRIVATE KEY` block) must be kept out of the `.crate` with the
+manifest's `exclude` (or `include`) list, or generated at test time: a secret
+scanner flags the published crate otherwise. Checks every publishable workspace member without running cargo.
 
 Usage: scripts/packaged-keys.py   (run from the repo root)
 """
@@ -15,16 +16,23 @@ import os
 import sys
 import tomllib
 
-KEY_SUFFIXES = (".key", ".p12", ".pfx")
+import re
+
+KEY_SUFFIXES = (".key", ".p12", ".pfx", ".der", ".jks", ".p8", ".keystore")
+KEY_NAMES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+# A PEM private-key block with real key material: the header, then at least
+# 64 base64 characters (newlines raw or written as `\\n` in source).
+PEM_KEY = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\s|\\n)*(?:[A-Za-z0-9+/=]|\s|\\n){64,}")
 
 
 def is_key(path):
-    if path.endswith(KEY_SUFFIXES):
+    if path.endswith(KEY_SUFFIXES) or os.path.basename(path) in KEY_NAMES:
         return True
-    if path.endswith(".pem"):
-        with open(path, "rb") as f:
-            return b"PRIVATE KEY" in f.read()
-    return False
+    with open(path, "rb") as f:
+        head = f.read(4 << 20)
+    if b"\0" in head[:8192]:
+        return False
+    return PEM_KEY.search(head) is not None
 
 
 def matches(rel, patterns):

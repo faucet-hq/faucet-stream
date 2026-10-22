@@ -500,35 +500,7 @@ mod tests {
     }
 
     // Throwaway 2048-bit RSA test key (PKCS#8). Not used anywhere real.
-    const TEST_RSA_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDDmeSF5jD5LMGw
-INB1hExU2Ux9qEQ9DXNUeWxrDv7K3QHA+UkCbdUpHDZdFSbIr/bvwlNn16Hqhqi9
-b8WywAzjagZNg0cReXuQ7nKIr5c9zYl2EJe+RZTo2z2LE21HrSKRhTAmlOk3XJ1N
-xc7ahYcKyw8lchuTcZaYWaNTYvronOpHUAGS0XpT0y8Oggzp1DvZNYOeZbJCPZwf
-mpGGCSilnODNYnwT02Pc4aXXBzJP7TP57+ve/ZzqvsKCBiNJUMLsjUZcGWnqQHnR
-A+8B87ug7CyhhEiYnskp0d1ZlWT/kU7rIZv58KMbMJidAdizA47jRjelsWeoedRf
-JmiA99ZhAgMBAAECggEAAOrybwxm82xZ1k05HSwLPaStXrOQ6mZrQZy2PQRbfrEt
-xm2FAa1pQCGhQauNPIjS1EopoQWafWK3XPguyclr5g9Dy05P4Y2b3lC4GdsVDxWt
-TPAD/kEOU09gCQyEyT7PODaTRMMTGw7ksA47C7xvp0XPouHXrkfsqHdXNFd1DO1Z
-dBCzkX4dg4Y4ffh5tt/ILeSsNlmqqpUQmHQZ/X3JHkP9/+NpAe6i4k9QKsqmLDGD
-7+br/snVYbECBgmN1QIofTSvnlmmRiKgoG9wbZLmGvCiW9xVjbY+ryJs/lsLoM7w
-W1TUuOlk3apoIzQ7OIGznyZzE5RumdQq11rNKB7aaQKBgQDowsceEQz2kLb93f8J
-QaBDcebqbbGTJE6+hq2k8D/GzvZAdBHGuEt7NiDAFKy/GItwzJSGGdjK24iRtZ7G
-2gIloZShu+7mmxX6Ojuxun8EMRZKZzTedMJWQJMwA1Hk1fwzsEM0+9+yZdTcylP9
-wYDMFKbvw+av7sDcySENNEhshQKBgQDXIVX+Zvlf2PoLkRx11mk1CBtPfjqPTMcs
-QVjISwvkgGSi8ihq+mwsIWLXhOZX38+L4iGfdIgqSSnwqB/fgTbjwQsa0Dqkygt6
-IBfb3QmWr7196c+xss5h8eUTFiCMWw/EAa9R+jkWH0cVpJVbyTK7cBJlaXxPcXx3
-xprI10qnLQKBgBl/NKajgYME6Ta3+bb+3FpnAL+PUpNmt8WBJUZbFvFlPG5lCIl3
-KLWPgVjpKt8oBiZOErr529ik4bnsZj8sJG4Q3CI3Xv0d4fNuK5nVbxJ7ehCea5ku
-uxcNrdHlmzPxCNZ0qXgFW0TEiOPCuh6i8sPoQz0ifYOqKLBGy/sRThmtAoGAGTd9
-Hv7vCD8kwCpYTa++UUsL+HtxXc7AIf3e7Etvr28lXLxJ5JBKEbowHdckMPS5HUp6
-anh8ZYiB9AWhBs/coUHFjXUPCrXsNnqAkXMNZq5e5d18TPYKnwx9r4kOc6VQ6cbQ
-yCkue9tat7y9DS8+VR5D6cM9oQpKbrfG+PfTdlkCgYBf/pUWO94VgZvpV5Ui7MHb
-6ZoH11q0gIhmT72FQ+2Erw977qghzs1+C7HO4Q7kNfC8sA9uVS4WiA1EzE6QeJWt
-+FklEinW+AR2azgC/+gEUBvZSWU1v4meYdAQcNEek8L4VtBuGc4ZwbVbho3hiLmx
-68Y3qeoKxOyBKo6j2NiZzg==
------END PRIVATE KEY-----
-";
+    const TEST_RSA_PKCS8_PEM: &str = include_str!("../tests/fixtures/snowflake_test_pkcs8.pem");
 
     #[test]
     fn key_pair_jwt_iss_includes_public_key_fingerprint() {
@@ -559,33 +531,7 @@ yCkue9tat7y9DS8+VR5D6cM9oQpKbrfG+PfTdlkCgYBf/pUWO94VgZvpV5Ui7MHb
         assert_eq!(fp, "SHA256:NiQ5G+9Hr4ZBmdBscIoTOgx2SM6aWPG0/Q9Y6NuFtpI=");
     }
 
-    const TEST_RSA_PKCS1_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
-MIIEogIBAAKCAQEAw5nkheYw+SzBsCDQdYRMVNlMfahEPQ1zVHlsaw7+yt0BwPlJ
-Am3VKRw2XRUmyK/278JTZ9eh6oaovW/FssAM42oGTYNHEXl7kO5yiK+XPc2JdhCX
-vkWU6Ns9ixNtR60ikYUwJpTpN1ydTcXO2oWHCssPJXIbk3GWmFmjU2L66JzqR1AB
-ktF6U9MvDoIM6dQ72TWDnmWyQj2cH5qRhgkopZzgzWJ8E9Nj3OGl1wcyT+0z+e/r
-3v2c6r7CggYjSVDC7I1GXBlp6kB50QPvAfO7oOwsoYRImJ7JKdHdWZVk/5FO6yGb
-+fCjGzCYnQHYswOO40Y3pbFnqHnUXyZogPfWYQIDAQABAoIBAADq8m8MZvNsWdZN
-OR0sCz2krV6zkOpma0Gctj0EW36xLcZthQGtaUAhoUGrjTyI0tRKKaEFmn1it1z4
-LsnJa+YPQ8tOT+GNm95QuBnbFQ8VrUzwA/5BDlNPYAkMhMk+zzg2k0TDExsO5LAO
-Owu8b6dFz6Lh165H7Kh3VzRXdQztWXQQs5F+HYOGOH34ebbfyC3krDZZqqqVEJh0
-Gf19yR5D/f/jaQHuouJPUCrKpiwxg+/m6/7J1WGxAgYJjdUCKH00r55ZpkYioKBv
-cG2S5hrwolvcVY22Pq8ibP5bC6DO8FtU1LjpZN2qaCM0OziBs58mcxOUbpnUKtda
-zSge2mkCgYEA6MLHHhEM9pC2/d3/CUGgQ3Hm6m2xkyROvoatpPA/xs72QHQRxrhL
-ezYgwBSsvxiLcMyUhhnYytuIkbWextoCJaGUobvu5psV+jo7sbp/BDEWSmc03nTC
-VkCTMANR5NX8M7BDNPvfsmXU3MpT/cGAzBSm78Pmr+7A3MkhDTRIbIUCgYEA1yFV
-/mb5X9j6C5EcddZpNQgbT346j0zHLEFYyEsL5IBkovIoavpsLCFi14TmV9/Pi+Ih
-n3SIKkkp8Kgf34E248ELGtA6pMoLeiAX290Jlq+9fenPsbLOYfHlExYgjFsPxAGv
-Ufo5Fh9HFaSVW8kyu3ASZWl8T3F8d8aayNdKpy0CgYAZfzSmo4GDBOk2t/m2/txa
-ZwC/j1KTZrfFgSVGWxbxZTxuZQiJdyi1j4FY6SrfKAYmThK6+dvYpOG57GY/LCRu
-ENwiN179HeHzbiuZ1W8Se3oQnmuZLrsXDa3R5Zsz8QjWdKl4BVtExIjjwroeovLD
-6EM9In2DqiiwRsv7EU4ZrQKBgBk3fR7+7wg/JMAqWE2vvlFLC/h7cV3OwCH93uxL
-b69vJVy8SeSQShG6MB3XJDD0uR1Kemp4fGWIgfQFoQbP3KFBxY11Dwq17DZ6gJFz
-DWauXuXdfEz2Cp8Mfa+JDnOlUOnG0MgpLnvbWre8vQ0vPlUeQ+nDPaEKSm63xvj3
-03ZZAoGAX/6VFjveFYGb6VeVIuzB2+maB9datICIZk+9hUPthK8Pe+6oIc7Nfgux
-zuEO5DXwvLAPblUuFogNRMxOkHiVrfhZJRIp1vgEdms4Av/oBFAb2UllNb+JnmHQ
-EHDRHpPC+FbQbhnOGcG1W4aN4Yi5sevGN6nqCsTsgSqOo9jYmc4=
------END RSA PRIVATE KEY-----";
+    const TEST_RSA_PKCS1_PEM: &str = include_str!("../tests/fixtures/snowflake_test_pkcs1.pem");
 
     #[test]
     fn pkcs1_and_pkcs8_forms_of_one_key_share_a_fingerprint() {
