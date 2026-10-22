@@ -408,11 +408,14 @@ fn inject_sql_predicate(query: &str, predicate: &str) -> String {
     let kw = |t: &str, k: &str| t.eq_ignore_ascii_case(k);
     let mut where_at: Option<usize> = None;
     let mut boundary: Option<usize> = None;
+    let mut seen_from = false;
     let mut i = 0;
     while i < toks.len() {
         let (pos, t) = toks[i];
         let two = |a: &str, b: &str| kw(t, a) && i + 1 < toks.len() && kw(toks[i + 1].1, b);
-        if where_at.is_none() && kw(t, "where") {
+        if !seen_from {
+            seen_from = kw(t, "from");
+        } else if where_at.is_none() && kw(t, "where") {
             where_at = Some(pos);
         } else if two("order", "by")
             || two("group", "by")
@@ -455,11 +458,17 @@ fn sql_literal(v: &Value) -> String {
     match v {
         Value::String(s) if is_sql_datetime(s) => s.clone(),
         Value::String(s) if let Some(t) = offset_datetime_as_rfc3339(s) => t,
-        Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
+        Value::String(s) => quoted_literal(s),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
-        other => format!("'{}'", other.to_string().replace('\'', "\\'")),
+        other => quoted_literal(&other.to_string()),
     }
+}
+
+/// `s` single-quoted with `\` and `'` backslash-escaped, so a value can never
+/// end the literal early.
+fn quoted_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// Fill `{key}` placeholders in a URL path with percent-encoded values, so a
@@ -4982,6 +4991,19 @@ mod patch_edge_tests {
         assert_eq!(sql_literal(&json!(false)), "false");
         // Non-scalars stringify quoted (defensive; bookmarks are scalars).
         assert_eq!(sql_literal(&json!([1, 2])), "'[1,2]'");
+        assert_eq!(
+            sql_literal(&json!(r"a\' OR Name != '")),
+            r"'a\\\' OR Name != \''"
+        );
+        assert_eq!(sql_literal(&json!(r"ends\")), r"'ends\\'");
+    }
+
+    #[test]
+    fn inject_sql_predicate_ignores_clause_words_in_the_select_list() {
+        assert_eq!(
+            inject_sql_predicate("SELECT Id, Offset, Limit FROM T ORDER BY Id", "X > 1"),
+            "SELECT Id, Offset, Limit FROM T WHERE X > 1 ORDER BY Id"
+        );
     }
 
     #[test]

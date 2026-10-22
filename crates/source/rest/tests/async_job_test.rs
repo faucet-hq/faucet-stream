@@ -830,3 +830,44 @@ async fn async_job_buffered_decode_parses_json() {
     let records = RestStream::new(cfg).unwrap().fetch_all().await.unwrap();
     assert_eq!(records, vec![json!({"id": 1}), json!({"id": 2})]);
 }
+
+#[tokio::test]
+async fn async_job_incremental_predicate_escapes_the_bookmark_and_skips_select_list_words() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .and(body_string_contains(
+            r#""SELECT Id, Offset FROM Lead WHERE SystemModstamp > 'a\\\\\\' OR 1=1 --'""#,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "job-1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "state": "Complete" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1/result"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("id,name\n1,alice\n"))
+        .mount(&server)
+        .await;
+
+    let mut cfg = incremental_csv_config(&server);
+    let mut job = incremental_job();
+    job.submit.json = Some(json!({ "operation": "query", "query": "SELECT Id, Offset FROM Lead" }));
+    cfg.async_job = Some(job);
+    let stream = RestStream::new(cfg).unwrap();
+    stream
+        .apply_start_bookmark(json!(r"a\' OR 1=1 --"))
+        .await
+        .unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    while let Some(page) = pages.next().await {
+        page.unwrap();
+    }
+    server.verify().await;
+}
