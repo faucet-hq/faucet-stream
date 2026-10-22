@@ -53,6 +53,8 @@ OUT_DIR="benchmarks/out"
 RES_DIR="benchmarks/results"
 RAW_DIR="$RES_DIR/raw"
 mkdir -p "$DATA_DIR" "$OUT_DIR" "$RAW_DIR"
+# Results from an earlier run must never be read as this run's.
+rm -f "$RAW_DIR"/*.json
 DATA_CSV="$DATA_DIR/bench.csv"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -142,7 +144,7 @@ MELTANO_OUT_DIR="benchmarks/meltano/output"
 hyperfine --warmup 1 --runs "$RUNS" --export-json "$RAW_DIR/faucet_csv.json" \
   --command-name "faucet csv->jsonl" \
   "'$FAUCET_BIN' run benchmarks/faucet/csv_to_jsonl.yaml" \
-  || echo "faucet hyperfine run failed" >&2
+  || { echo "faucet hyperfine run failed" >&2; rm -f "$RAW_DIR/faucet_csv.json"; }
 FAUCET_ROWS=$(count_lines "$FAUCET_OUT")
 log "faucet peak RSS sample"
 FAUCET_RSS=$(peak_rss_mib "$FAUCET_BIN" run benchmarks/faucet/csv_to_jsonl.yaml)
@@ -154,7 +156,7 @@ if [ "$MELTANO_OK" = 1 ]; then
     --command-name "meltano tap-csv->target-jsonl" \
     --prepare "rm -rf '$MELTANO_OUT_DIR'" \
     "cd benchmarks/meltano && '$VENV/bin/meltano' run tap-csv target-jsonl" \
-    || echo "meltano hyperfine run failed" >&2
+    || { echo "meltano hyperfine run failed" >&2; rm -f "$RAW_DIR/meltano_csv.json"; }
   MELTANO_ROWS=$(cat "$MELTANO_OUT_DIR"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
   log "meltano peak RSS sample"
   rm -rf "$MELTANO_OUT_DIR"
@@ -261,7 +263,7 @@ SQL
   hyperfine --warmup 1 --runs "$RUNS" --export-json "$RAW_DIR/faucet_pg_jsonl.json" \
     --command-name "faucet pg->jsonl" \
     "'$FAUCET_BIN' run benchmarks/faucet/postgres_to_jsonl.yaml" \
-    || echo "faucet pg->jsonl run failed" >&2
+    || { echo "faucet pg->jsonl run failed" >&2; rm -f "$RAW_DIR/faucet_pg_jsonl.json"; }
   FB_RSS=$(peak_rss_mib "$FAUCET_BIN" run benchmarks/faucet/postgres_to_jsonl.yaml)
   FB_ROWS=$(count_lines "$OUT_DIR/faucet_pg_out.jsonl")
   MB_RSS="NA"; MB_ROWS=0
@@ -270,7 +272,7 @@ SQL
       --command-name "meltano tap-postgres->target-jsonl" \
       --prepare "rm -rf benchmarks/meltano/output" \
       "cd benchmarks/meltano && '$VENV/bin/meltano' run tap-postgres target-jsonl" \
-      || echo "meltano pg->jsonl run failed" >&2
+      || { echo "meltano pg->jsonl run failed" >&2; rm -f "$RAW_DIR/meltano_pg_jsonl.json"; }
     rm -rf benchmarks/meltano/output
     MB_RSS=$(cd benchmarks/meltano && peak_rss_mib "$VENV/bin/meltano" run tap-postgres target-jsonl)
     MB_ROWS=$(cat benchmarks/meltano/output/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
@@ -282,7 +284,7 @@ SQL
     --command-name "faucet pg->pg" \
     --prepare "docker exec $PG_CONTAINER psql -U postgres -d postgres -c 'TRUNCATE bench_dest'" \
     "'$FAUCET_BIN' run benchmarks/faucet/postgres_to_postgres.yaml" \
-    || echo "faucet pg->pg run failed" >&2
+    || { echo "faucet pg->pg run failed" >&2; rm -f "$RAW_DIR/faucet_pg_pg.json"; }
   docker exec "$PG_CONTAINER" psql -U postgres -d postgres -c 'TRUNCATE bench_dest' >/dev/null 2>&1
   FC_RSS=$(peak_rss_mib "$FAUCET_BIN" run benchmarks/faucet/postgres_to_postgres.yaml)
   FC_ROWS=$(pg_count bench_dest)
@@ -292,7 +294,7 @@ SQL
       --command-name "meltano tap-postgres->target-postgres" \
       --prepare "docker exec $PG_CONTAINER psql -U postgres -d postgres -c 'DROP SCHEMA IF EXISTS bench_meltano CASCADE'" \
       "cd benchmarks/meltano && '$VENV/bin/meltano' run tap-postgres target-postgres" \
-      || echo "meltano pg->pg run failed" >&2
+      || { echo "meltano pg->pg run failed" >&2; rm -f "$RAW_DIR/meltano_pg_pg.json"; }
     docker exec "$PG_CONTAINER" psql -U postgres -d postgres -c 'DROP SCHEMA IF EXISTS bench_meltano CASCADE' >/dev/null 2>&1
     MC_RSS=$(cd benchmarks/meltano && peak_rss_mib "$VENV/bin/meltano" run tap-postgres target-postgres)
     MC_ROWS=$(pg_count bench_meltano.bench)
