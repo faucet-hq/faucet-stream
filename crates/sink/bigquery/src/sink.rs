@@ -582,16 +582,60 @@ fn native_batch_columns(
             let obj = v.as_object()?;
             Some(obj.keys().cloned().collect())
         }
-        faucet_core::NativeFormat::Csv => {
-            let line = std::str::from_utf8(first).ok()?.trim_end_matches('\r');
-            Some(
-                line.split(delimiter as char)
-                    .map(|s| s.to_string())
-                    .collect(),
-            )
-        }
+        faucet_core::NativeFormat::Csv => csv_header(raw, delimiter),
         _ => None,
     }
+}
+
+/// Whether NDJSON ends in a record with no closing newline, after `chunk`
+/// follows a stream whose last line was `open` (non-blank, unterminated).
+fn ends_with_open_line(chunk: &[u8], open: bool) -> bool {
+    match chunk.iter().rposition(|&b| b == b'\n') {
+        Some(i) => chunk[i + 1..].iter().any(|b| !b.is_ascii_whitespace()),
+        None => open || chunk.iter().any(|b| !b.is_ascii_whitespace()),
+    }
+}
+
+/// The header cells of a CSV payload (RFC 4180): a quoted cell may hold the
+/// delimiter, a newline, or `""` for one quote. `None` when the header is not
+/// UTF-8 or a quote never closes.
+fn csv_header(raw: &[u8], delimiter: u8) -> Option<Vec<String>> {
+    let mut cells = Vec::new();
+    let mut cell = Vec::new();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if quoted {
+            if b == b'"' {
+                if raw.get(i + 1) == Some(&b'"') {
+                    cell.push(b'"');
+                    i += 1;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                cell.push(b);
+            }
+        } else if b == b'"' && cell.is_empty() {
+            quoted = true;
+        } else if b == delimiter {
+            cells.push(String::from_utf8(std::mem::take(&mut cell)).ok()?);
+        } else if b == b'\n' {
+            break;
+        } else {
+            cell.push(b);
+        }
+        i += 1;
+    }
+    if quoted {
+        return None;
+    }
+    if cell.last() == Some(&b'\r') {
+        cell.pop();
+    }
+    cells.push(String::from_utf8(cell).ok()?);
+    Some(cells)
 }
 
 /// A `multipart/related` boundary that is guaranteed absent from the payload:
@@ -989,11 +1033,38 @@ pub(crate) fn upload_builder() -> faucet_core::http::ClientBuilder {
         .read_timeout(HTTP_READ_TIMEOUT)
 }
 
-/// The client media and multipart load uploads use.
+/// The client media and multipart load uploads use, built once per process
+/// so every load reuses its connection pool.
 pub(crate) fn upload_client() -> Result<reqwest::Client, FaucetError> {
-    upload_builder()
-        .build_reqwest()
-        .map_err(|e| FaucetError::Sink(format!("BigQuery: cannot build upload client: {e}")))
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    shared_client(&CLIENT, || {
+        upload_builder()
+            .build_reqwest()
+            .map_err(|e| FaucetError::Sink(format!("BigQuery: cannot build upload client: {e}")))
+    })
+}
+
+/// The resumable-session client: redirects disabled, so a 308 "Resume
+/// Incomplete" is not auto-followed. Built once per process.
+pub(crate) fn resumable_client() -> Result<reqwest::Client, FaucetError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    shared_client(&CLIENT, || {
+        upload_builder()
+            .max_redirects(0)
+            .build_reqwest()
+            .map_err(|e| FaucetError::Sink(format!("resumable HTTP client: {e}")))
+    })
+}
+
+fn shared_client(
+    cell: &std::sync::OnceLock<reqwest::Client>,
+    build: impl FnOnce() -> Result<reqwest::Client, FaucetError>,
+) -> Result<reqwest::Client, FaucetError> {
+    if let Some(client) = cell.get() {
+        return Ok(client.clone());
+    }
+    let client = build()?;
+    Ok(cell.get_or_init(|| client).clone())
 }
 
 impl BigQuerySink {
@@ -1076,8 +1147,8 @@ impl faucet_core::Sink for BigQuerySink {
             .await
     }
 
-    /// A Parquet load job whatever the write mode, as before the driver: the
-    /// pipeline only negotiates it for `append` and `overwrite`.
+    /// A Parquet load job for `append`; an `overwrite` batch takes the
+    /// overwrite row path (the pipeline itself never sends one, #883).
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(
         &self,
@@ -1934,11 +2005,7 @@ impl BigQueryDriver {
             self.upload_base(),
             self.config.project_id
         );
-        // Redirects disabled: a 308 "Resume Incomplete" must not be auto-followed.
-        let http = upload_builder()
-            .max_redirects(0)
-            .build_reqwest()
-            .map_err(|e| FaucetError::Sink(format!("resumable HTTP client: {e}")))?;
+        let http = resumable_client()?;
         let calls = calls.get();
         let resp = call_once(&calls, "load", async {
             http.post(&url)
@@ -3087,11 +3154,13 @@ impl BigQueryDriver {
                 }
                 let mut rows = 0usize;
                 let mut first = true;
+                let mut open_line = false;
                 while let Some(chunk) = s.next().await {
                     let chunk = chunk?;
                     if chunk.is_empty() {
                         continue;
                     }
+                    open_line = ends_with_open_line(&chunk, open_line);
                     // The explicit all-STRING schema (from the first chunk) opens the
                     // session; later chunks pass `None` (session already open).
                     let schema = if first {
@@ -3108,7 +3177,7 @@ impl BigQueryDriver {
                         .await?;
                     first = false;
                 }
-                Ok(rows)
+                Ok(rows + usize::from(open_line))
             }
             // NDJSON already buffered — feed the whole batch into the same resumable
             // session (used by tests / any source that emits `Bytes`).
@@ -3138,7 +3207,6 @@ impl BigQueryDriver {
                 if raw.is_empty() {
                     return Ok(0);
                 }
-                let rows = batch.records.unwrap_or(0) as usize;
                 let skip_rows = if csv.has_header { Some(1) } else { None };
                 let header =
                     native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter);
@@ -3163,8 +3231,11 @@ impl BigQueryDriver {
                         autodetect_fallback,
                     ))
                     .to_string();
-                self.load_media(calls, &job_json, &media).await?;
-                Ok(rows)
+                let loaded = self.load_media(calls, &job_json, &media).await?;
+                Ok(match batch.records {
+                    Some(r) if loaded == 0 => r as usize,
+                    _ => loaded as usize,
+                })
             }
             (other, _) => Err(FaucetError::Sink(format!(
                 "bigquery load_native: unsupported format {other:?} for this payload"
@@ -3690,26 +3761,18 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
     /// `load.rs` (pure cloud I/O that cannot run in CI, so `codecov.yml`
     /// excludes that file exactly as it does the GCS connectors).
     ///
-    /// Under `write_mode: overwrite` the **first** batch truncates and the
-    /// rest append, the same single-load-refresh shape the media NDJSON path
-    /// uses: a `WRITE_TRUNCATE` load is atomic on its own, so a mid-run
-    /// failure leaves the prior table intact.
+    /// Under `write_mode: overwrite` a batch is written through the same
+    /// path as an overwrite row page (one resumable `WRITE_TRUNCATE` session
+    /// finalized at flush, or the staging table for a scoped or grouped
+    /// overwrite), so a failure before commit leaves the prior table intact.
     async fn write_columnar(
         &self,
         calls: &CallSlot,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
         self.note_rows(batch.num_rows());
-        let overwrite = self.config.write.write_mode == faucet_core::WriteMode::Overwrite;
-        // `swap` so only the first batch of an overwrite run truncates; every
-        // later batch must append or the run keeps replacing its own output.
-        let disposition = if overwrite && !self.overwrite_setup.swap(true, Ordering::AcqRel) {
-            "WRITE_TRUNCATE"
-        } else {
-            "WRITE_APPEND"
-        };
-        if self.config.bulk_load.is_some() {
-            if overwrite {
+        if self.config.write.write_mode == faucet_core::WriteMode::Overwrite {
+            if self.config.bulk_load.is_some() {
                 return Err(FaucetError::Sink(
                     "BigQuery: `write_mode: overwrite` on the columnar path is bucket-free \
                      only — remove `bulk_load` (the staged path's write disposition is \
@@ -3717,6 +3780,10 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
                         .into(),
                 ));
             }
+            let rows = faucet_core::record_batch_to_values(batch)?;
+            return self.insert_overwrite_page(calls, &rows).await;
+        }
+        if self.config.bulk_load.is_some() {
             self.roundtrips.record("load");
             return crate::load::write_columnar_in(
                 &calls.get(),
@@ -3730,21 +3797,10 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
         // One Parquet load per run; later batches take the row path (SQL-36).
         if self.columnar_loaded.swap(true, Ordering::AcqRel) {
             let rows = faucet_core::record_batch_to_values(batch)?;
-            if overwrite {
-                self.feed_session(calls, &self.config.table_id, "WRITE_APPEND", &rows)
-                    .await?;
-                return Ok(rows.len());
-            }
             return self.append_rows(calls, &rows).await;
         }
         let token = self.access_token().await?;
         self.roundtrips.record("load");
-        let schema = if disposition == "WRITE_TRUNCATE" {
-            self.truncate_schema(calls, &self.config.table_id, || None)
-                .await?
-        } else {
-            None
-        };
         crate::load::write_columnar_media_in(
             &calls.get(),
             &self.client,
@@ -3752,8 +3808,8 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
             self.upload_base(),
             &token,
             &self.config.table_id,
-            disposition,
-            schema,
+            "WRITE_APPEND",
+            None,
             batch,
         )
         .await
@@ -3871,6 +3927,21 @@ mod tests {
     #[test]
     fn upload_client_builds() {
         assert!(super::upload_client().is_ok());
+        assert!(super::resumable_client().is_ok());
+        let cell = std::sync::OnceLock::new();
+        let mut builds = 0;
+        for _ in 0..3 {
+            super::shared_client(&cell, || {
+                builds += 1;
+                super::upload_builder()
+                    .build_reqwest()
+                    .map_err(|e| FaucetError::Sink(e.to_string()))
+            })
+            .unwrap();
+        }
+        assert_eq!(builds, 1, "the client is built once and reused");
+        let failing = std::sync::OnceLock::new();
+        assert!(super::shared_client(&failing, || Err(FaucetError::Sink("x".into()))).is_err());
     }
 
     use super::{
@@ -4400,5 +4471,35 @@ mod tests {
             native_batch_columns(&[0xff, 0xfe, b'\n'], NativeFormat::Csv, b','),
             None
         );
+    }
+
+    #[test]
+    fn an_unterminated_last_ndjson_line_is_counted() {
+        use super::ends_with_open_line;
+        assert!(!ends_with_open_line(b"{}\n", false));
+        assert!(ends_with_open_line(b"{}\n{\"a\"", false));
+        assert!(ends_with_open_line(b":1}", true));
+        assert!(!ends_with_open_line(b"  ", false));
+        assert!(!ends_with_open_line(b"}\n \r", true));
+    }
+
+    #[test]
+    fn a_quoted_csv_header_is_parsed_like_any_csv_reader() {
+        use faucet_core::NativeFormat;
+        let cols = |raw: &[u8]| native_batch_columns(raw, NativeFormat::Csv, b',');
+        assert_eq!(
+            cols(b"\"id\",\"name, full\",\"say \"\"hi\"\"\"\r\n1,2,3\n"),
+            Some(vec![
+                "id".to_string(),
+                "name, full".to_string(),
+                "say \"hi\"".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(b"\"multi\nline\",b\n1,2\n"),
+            Some(vec!["multi\nline".to_string(), "b".to_string()])
+        );
+        assert_eq!(cols(b"a,\"never closed\n"), None);
+        assert_eq!(cols(b"x,y"), Some(vec!["x".to_string(), "y".to_string()]));
     }
 }

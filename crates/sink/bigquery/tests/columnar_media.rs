@@ -238,12 +238,12 @@ async fn uploads(server: &MockServer) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The first batch of an overwrite run truncates with one Parquet load; later
-/// batches join a single `WRITE_APPEND` load finalized on flush rather than one
-/// load job per batch (SQL-36). Previously this asserted a Parquet load per
-/// batch, which is the per-batch quota burn SQL-36 removes.
+/// An overwrite run's batches all join one `WRITE_TRUNCATE` load finalized on
+/// flush, so nothing replaces the table before the run completes. This used
+/// to assert a truncating Parquet load committed by the first batch — the
+/// non-atomic replace being removed.
 #[tokio::test]
-async fn overwrite_truncates_once_then_appends() {
+async fn overwrite_batches_join_one_truncating_load_at_flush() {
     let server = MockServer::start().await;
     mount(&server).await;
     mount_resumable(&server).await;
@@ -282,20 +282,16 @@ async fn overwrite_truncates_once_then_appends() {
     sink.flush().await.expect("flush");
 
     let ups = uploads(&server).await;
-    assert_eq!(
-        ups.len(),
-        2,
-        "one truncating Parquet load, one append load: {ups:?}"
-    );
-    assert_eq!(ups[0].0, "multipart");
-    assert!(ups[0].1.contains("WRITE_TRUNCATE"));
     assert!(
-        ups[0].1.contains("\"mode\":\"REQUIRED\"") && ups[0].1.contains("the key"),
-        "the truncating load keeps the table's schema: {}",
-        ups[0].1
+        ups.iter().all(|(kind, _)| kind == "resumable"),
+        "no discrete load commits mid-run: {ups:?}"
     );
-    assert_eq!(ups[1].0, "resumable");
-    assert!(ups[1].1.contains("WRITE_APPEND"));
+    let opening = &ups[0].1;
+    assert!(opening.contains("WRITE_TRUNCATE"), "{opening}");
+    assert!(
+        !ups.iter().any(|(_, body)| body.contains("WRITE_APPEND")),
+        "one truncating session: {ups:?}"
+    );
 }
 
 /// Append runs load the first columnar batch as Parquet; later batches go
