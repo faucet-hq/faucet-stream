@@ -761,7 +761,12 @@ pub async fn money_fraction_digits(
         .fetch_one(&mut conn)
         .await
         .map_err(|e| pg_err("postgres-cdc money format", e))?;
-    crate::pgoutput::values::fraction_digits_of_money(&one).ok_or_else(|| {
+    money_digits_of(&one)
+}
+
+/// The fraction digits of the server's rendering of `1::money`.
+fn money_digits_of(one: &str) -> Result<u32, FaucetError> {
+    crate::pgoutput::values::fraction_digits_of_money(one).ok_or_else(|| {
         FaucetError::Source(format!(
             "postgres-cdc: cannot read the money format from the server's rendering {one:?}"
         ))
@@ -1140,6 +1145,17 @@ where
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn money_digits_read_the_rendering_or_refuse_it() {
+        assert_eq!(money_digits_of("$1.00").unwrap(), 2);
+        assert_eq!(money_digits_of("￥1").unwrap(), 0);
+        let e = money_digits_of("$2.50").unwrap_err().to_string();
+        assert!(
+            e.contains("cannot read the money format") && e.contains("$2.50"),
+            "{e}"
+        );
+    }
 
     struct FakeSource {
         reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
