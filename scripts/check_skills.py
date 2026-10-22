@@ -11,7 +11,10 @@ Always (no binary needed):
     `kind:`), never a fragment that nothing validates.
 
 With `--faucet PATH`: every quoted `faucet ...` command and flag exists in that
-binary, and every inline pipeline config passes `faucet validate --no-secrets`.
+binary, every inline pipeline config passes `faucet validate --no-secrets`, and
+every skill example hub (`skills/*/examples/` with `source-templates/`), joined
+with the repo's `hub/sink-templates`, passes `faucet hub lint`, `faucet hub
+check` against the sqlite sink template, and `faucet template test` per suite.
 
 With `--emit-yaml DIR`: write every inline faucet document and every skill
 example config to DIR, for a separate `faucet validate` / `faucet hub check`.
@@ -28,6 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -218,6 +222,52 @@ def validate(cli, path):
     return None if r.returncode == 0 else (r.stderr or r.stdout).strip().splitlines()[-1:]
 
 
+HUB_SINK = "faucet-hq/sqlite"
+
+
+def example_hubs():
+    return sorted(p for p in SKILLS.glob("*/examples") if (p / "source-templates").is_dir())
+
+
+def assemble_hub(examples, dest):
+    """A hub at `dest`: the repo's sink templates plus `examples`' own files.
+
+    Returns the source-template ids and the suite paths (relative to `dest`)."""
+    shutil.copytree(ROOT / "hub" / "sink-templates", dest / "sink-templates")
+    for item in examples.iterdir():
+        if item.is_dir():
+            shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest / item.name)
+    sources = dest / "source-templates"
+    ids = sorted(str(p.relative_to(sources).with_suffix("")) for p in sources.rglob("*.yaml"))
+    suites = sorted(str(p.relative_to(dest)) for p in (dest / "tests").rglob("suite.yaml")) if (dest / "tests").is_dir() else []
+    return ids, suites
+
+
+def hub_commands(hub, ids, suites):
+    """(argv tail, cwd) pairs that check one assembled example hub."""
+    cmds = [(["hub", "lint", "--hub", str(hub)], None)]
+    cmds += [(["hub", "check", "--hub", str(hub), "--source", i, "--sink", HUB_SINK], None) for i in ids]
+    cmds += [(["template", "test", s], str(hub)) for s in suites]
+    return cmds
+
+
+def hub_errors(cli, examples):
+    rel = examples.relative_to(ROOT)
+    errs = []
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = Path(tmp) / "hub"
+        hub.mkdir()
+        ids, suites = assemble_hub(examples, hub)
+        for args, cwd in hub_commands(hub, ids, suites):
+            r = subprocess.run([str(Path(cli.path).resolve()), *args], capture_output=True, text=True, cwd=cwd)
+            if r.returncode != 0:
+                last = (r.stderr or r.stdout).strip().splitlines()[-1:]
+                errs.append(f"{rel}: `faucet {' '.join(a if a != str(hub) else '<hub>' for a in args)}` failed: {last}")
+    return errs
+
+
 def skill_errors(skill):
     md = skill / "SKILL.md"
     if not md.exists():
@@ -304,6 +354,11 @@ def main(argv=None):
             err = validate(cli, cfg)
             if err:
                 errors.append(f"{rel}: fails validate: {err}")
+
+    if cli:
+        for examples in example_hubs():
+            checked_cfgs += 1
+            errors += hub_errors(cli, examples)
 
     for e in errors:
         print(f"FAIL {e}")
