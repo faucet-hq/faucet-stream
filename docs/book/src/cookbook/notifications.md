@@ -111,6 +111,9 @@ actually answers — the failure-class one and `sla_breach` — the resolve does
 depend on the process that saw the failure: a success resolves those keys when
 the rule's `on:` admits them (PagerDuty ignores a resolve with nothing open), so
 incidents opened by an earlier `faucet run` or another serve run close too.
+A success that itself reports an SLA breach (a row below `min_rows_per_run`, a
+volume anomaly) leaves the `sla_breach` incident open; the first success without
+a breach resolves it.
 Other kinds (`profile_drift`, `change_requested`, …) are closed by the process
 that opened them or by hand. The resolves for one success go out in parallel. `dedupe_window_secs` coalesces within one process only — PagerDuty
 itself folds repeats on the dedup key into the open incident.
