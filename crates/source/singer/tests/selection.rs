@@ -51,3 +51,18 @@ async fn discovery_selects_child_and_its_parent() {
     // warning.
     assert!(sel.warnings.is_empty(), "warnings: {:?}", sel.warnings);
 }
+
+#[test]
+fn a_target_named_by_its_record_stream_name_is_selected() {
+    let catalog = serde_json::json!({"streams": [
+        {"tap_stream_id": "public-orders", "stream": "orders", "metadata": [
+            {"breadcrumb": [], "metadata": {"parent": "customers"}}
+        ]},
+        {"tap_stream_id": "public-customers", "stream": "customers",
+         "metadata": [{"breadcrumb": [], "metadata": {}}]},
+    ]});
+    let sel = select_streams(&catalog, "orders");
+    assert!(sel.warnings.is_empty(), "warnings: {:?}", sel.warnings);
+    assert!(is_selected(&sel.catalog, "public-orders"));
+    assert!(is_selected(&sel.catalog, "public-customers"));
+}
