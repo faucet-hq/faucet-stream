@@ -88,6 +88,9 @@ pub struct NotifyEvent {
     /// invocation (e.g. `scheduler_stuck`, which is emitted by the scheduler
     /// loop itself rather than by a run).
     pub run: Option<RunContext>,
+    /// Incident kinds a `run_success` must leave open because the same run
+    /// found the condition still present (an SLA breach on a successful run).
+    pub keeps_open: Vec<EventKind>,
 }
 
 impl NotifyEvent {
@@ -119,7 +122,17 @@ impl NotifyEvent {
             message: redact(message.into()),
             details: Map::new(),
             run: None,
+            keeps_open: Vec::new(),
         }
+    }
+
+    /// Leave `kind`'s incident open when this success resolves the row's
+    /// incidents — the run itself reported that condition again.
+    pub fn keeping_open(mut self, kind: EventKind) -> Self {
+        if !self.keeps_open.contains(&kind) {
+            self.keeps_open.push(kind);
+        }
+        self
     }
 
     /// Stamp run identity + timing onto this event (#480). Emit sites build one

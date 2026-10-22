@@ -3477,10 +3477,13 @@ async fn run_one_invocation(
             Ok(r) => {
                 notifier
                     .emit(
-                        NotifyEvent::run_success(
-                            pipeline.clone(),
-                            row.clone(),
-                            r.records_written as u64,
+                        keep_sla_open(
+                            NotifyEvent::run_success(
+                                pipeline.clone(),
+                                row.clone(),
+                                r.records_written as u64,
+                            ),
+                            !sla_violations.is_empty(),
                         )
                         .with_run(run_ctx.clone()),
                     )
@@ -3859,6 +3862,20 @@ type StateStoreCache = Arc<Mutex<HashMap<String, Arc<dyn StateStore>>>>;
 tokio::task_local! {
     static DLQ_SINKS: DlqSinkCache;
     static STATE_STORES: StateStoreCache;
+}
+
+/// A success that also reported an SLA breach must not resolve that breach's
+/// incident only for the same run to reopen it.
+#[cfg(feature = "notify")]
+pub(crate) fn keep_sla_open(
+    event: crate::notify::NotifyEvent,
+    breaching: bool,
+) -> crate::notify::NotifyEvent {
+    if breaching {
+        event.keeping_open(crate::notify::EventKind::SlaBreach)
+    } else {
+        event
+    }
 }
 
 /// Classify a pipeline error into a notification event (#280). A circuit-breaker

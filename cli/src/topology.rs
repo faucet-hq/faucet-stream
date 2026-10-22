@@ -2022,10 +2022,9 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
             match (&node.error, node_failed_by_profile) {
                 (None, false) => {
                     notifier
-                        .emit(NotifyEvent::run_success(
-                            pipeline_name,
-                            row,
-                            node.records as u64,
+                        .emit(crate::executor::keep_sla_open(
+                            NotifyEvent::run_success(pipeline_name, row, node.records as u64),
+                            !violations.is_empty(),
                         ))
                         .await;
                 }

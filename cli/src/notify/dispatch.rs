@@ -168,6 +168,15 @@ impl Notifier {
                 if let Some(tracked) = inc.get(&incident_id(&r.name, event)) {
                     keys.extend(tracked.iter().cloned());
                 }
+                for kind in &event.keeps_open {
+                    keys.remove(
+                        &NotifyEvent {
+                            kind: *kind,
+                            ..event.clone()
+                        }
+                        .pagerduty_key(),
+                    );
+                }
                 open.extend(keys.into_iter().map(|k| (i, k)));
             }
             open
@@ -679,6 +688,48 @@ mod tests {
         assert!(
             stateless_resolve_keys(&drift_only, &NotifyEvent::run_success("p", "r", 1)).is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_success_that_still_breaches_its_sla_keeps_the_sla_incident_open() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let pd = ChannelSpec::Pagerduty(PagerdutyConfig {
+            routing_key: "rk".into(),
+            source: None,
+            endpoint: Some(format!("{}/enqueue", server.uri())),
+        });
+        let on = vec![EventKind::RunFailure, EventKind::SlaBreach];
+        let n = Notifier::from_specs(&[rule("pd", on, pd)])
+            .unwrap()
+            .unwrap();
+        n.emit(NotifyEvent::sla_breach("p", "r1", "min_rows", "m"))
+            .await;
+        let out = n
+            .emit_report(
+                NotifyEvent::run_success("p", "r1", 1).keeping_open(EventKind::SlaBreach),
+            )
+            .await;
+        assert_eq!(out.len(), 1, "only the failure key is resolved: {out:?}");
+        assert_eq!(n.open_incident_count(), 1, "the SLA incident stays open");
+        let resolved: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+            .filter(|b| b["event_action"] == "resolve")
+            .map(|b| b["dedup_key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(resolved, vec!["p:r1".to_string()]);
+
+        n.emit(NotifyEvent::run_success("p", "r1", 1)).await;
+        assert_eq!(n.open_incident_count(), 0, "a clean success closes it");
     }
 
     #[tokio::test]
