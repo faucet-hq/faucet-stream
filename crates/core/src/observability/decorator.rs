@@ -929,7 +929,11 @@ pub(crate) mod source_tests {
     }
 
     /// Counter `name` for `connector` in a [`connector_counters`] map.
-    pub(crate) fn counter_in(m: &HashMap<(String, String), u64>, name: &str, connector: &str) -> u64 {
+    pub(crate) fn counter_in(
+        m: &HashMap<(String, String), u64>,
+        name: &str,
+        connector: &str,
+    ) -> u64 {
         m.get(&(name.to_string(), connector.to_string()))
             .copied()
             .unwrap_or(0)
@@ -1012,7 +1016,11 @@ pub(crate) mod source_tests {
         let ctx = HashMap::new();
         let mut s = wrapped.stream_pages(&ctx, 2);
         while s.next().await.is_some() {}
-        let records = counter_in(&connector_counters(snap), "faucet_source_records_total", "mock");
+        let records = counter_in(
+            &connector_counters(snap),
+            "faucet_source_records_total",
+            "mock",
+        );
         assert_eq!(records, 5, "every record counted exactly once");
     }
 
@@ -1495,7 +1503,11 @@ mod sink_tests {
             .unwrap();
 
         // faucet_sink_records_total reflects the 2 Ok outcomes, not all 3.
-        let records = counter_in(&connector_counters(snap), "faucet_sink_records_total", "mixed");
+        let records = counter_in(
+            &connector_counters(snap),
+            "faucet_sink_records_total",
+            "mixed",
+        );
         assert_eq!(records, 2, "only accepted rows are counted");
     }
 

@@ -186,7 +186,11 @@ impl CompiledEncryption {
 
     /// Re-seal a legacy unbound payload under `context`. Returns `None` when
     /// `data` is already bound (nothing to do); fails when it does not open.
-    pub fn reseal_bound(&self, data: &[u8], context: &[u8]) -> Result<Option<Vec<u8>>, FaucetError> {
+    pub fn reseal_bound(
+        &self,
+        data: &[u8],
+        context: &[u8],
+    ) -> Result<Option<Vec<u8>>, FaucetError> {
         if !is_unbound(data) {
             return Ok(None);
         }
@@ -409,7 +413,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("legacy unbound"), "{err}");
-        assert_eq!(strict.decrypt_bound(&resealed, b"tenant:a").unwrap(), b"old");
+        assert_eq!(
+            strict.decrypt_bound(&resealed, b"tenant:a").unwrap(),
+            b"old"
+        );
         assert!(strict.decrypt_bound(&resealed, b"tenant:b").is_err());
         assert_eq!(strict.decrypt(&legacy).unwrap(), b"old");
         assert!(enc.reseal_bound(b"FCT1\x01short", b"x").is_err());

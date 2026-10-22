@@ -187,8 +187,11 @@ impl InstrumentedStateStore {
         r: Result<T, FaucetError>,
     ) -> Result<T, FaucetError> {
         if let Err(e) = &r {
-            counter!("faucet_state_errors_total", self.error_labels(op, error_kind(e)))
-                .increment(1);
+            counter!(
+                "faucet_state_errors_total",
+                self.error_labels(op, error_kind(e))
+            )
+            .increment(1);
         }
         r
     }
@@ -289,10 +292,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_every_optional_capability_to_the_inner_store() {
-        let wrapped = InstrumentedStateStore::new(
-            Arc::new(Capable(MemoryStateStore::new())),
-            labels(),
-        );
+        let wrapped =
+            InstrumentedStateStore::new(Arc::new(Capable(MemoryStateStore::new())), labels());
         assert!(wrapped.supports_list());
         assert!(wrapped.supports_compare_and_put());
         assert!(wrapped.supports_atomic_batch());
@@ -334,14 +335,22 @@ mod tests {
         let body = &traits[start..];
         let body = &body[..body.find("\n}\n").expect("trait end")];
         let mine = include_str!("state.rs");
-        let impl_start = mine.find("impl StateStore for InstrumentedStateStore").expect("impl");
+        let impl_start = mine
+            .find("impl StateStore for InstrumentedStateStore")
+            .expect("impl");
         let mine = &mine[impl_start..];
         for line in body.lines() {
             let t = line.trim_start();
-            let Some(rest) = t.strip_prefix("async fn ").or_else(|| t.strip_prefix("fn ")) else {
+            let Some(rest) = t
+                .strip_prefix("async fn ")
+                .or_else(|| t.strip_prefix("fn "))
+            else {
                 continue;
             };
-            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
             assert!(
                 mine.contains(&format!("fn {name}(")),
                 "InstrumentedStateStore must forward `{name}`"

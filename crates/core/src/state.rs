@@ -1884,7 +1884,9 @@ mod tests {
             store.put("bk", &json!({"v": 1})).await.unwrap();
             let path = store.entry_path("bk");
             std::fs::write(&path, enc("k1").encrypt(br#"{"v":1}"#)).unwrap();
-            assert!(crate::encryption::is_unbound(&std::fs::read(&path).unwrap()));
+            assert!(crate::encryption::is_unbound(
+                &std::fs::read(&path).unwrap()
+            ));
             assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 1})));
             let after = std::fs::read(&path).unwrap();
             assert!(is_encrypted(&after));

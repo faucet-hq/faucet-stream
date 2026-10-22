@@ -336,7 +336,8 @@ fn with_buckets(
     p: &PrometheusConfig,
 ) -> Result<metrics_exporter_prometheus::PrometheusBuilder, InstallError> {
     use metrics_exporter_prometheus::Matcher;
-    let err = |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
+    let err =
+        |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
     if let Some(buckets) = p.buckets.as_deref() {
         return builder.set_buckets(buckets).map_err(err);
     }
@@ -421,14 +422,14 @@ fn install_fanout(
     // global recorder, so we can fan it out.
     let (prom_recorder, prom_exporter) =
         with_buckets(PrometheusBuilder::new().with_http_listener(listen), p)?
-        .build()
-        .map_err(|e| match e {
-            BuildError::FailedToCreateHTTPListener(msg) => InstallError::PrometheusBind {
-                listen: p.listen.clone(),
-                source: std::io::Error::other(msg),
-            },
-            other => InstallError::PrometheusInstall(other.to_string()),
-        })?;
+            .build()
+            .map_err(|e| match e {
+                BuildError::FailedToCreateHTTPListener(msg) => InstallError::PrometheusBind {
+                    listen: p.listen.clone(),
+                    source: std::io::Error::other(msg),
+                },
+                other => InstallError::PrometheusInstall(other.to_string()),
+            })?;
 
     match crate::observability::otel::build_meter_provider(otel) {
         Ok((mp, otel_recorder)) => {

@@ -1021,7 +1021,11 @@ mod tests {
             })
             .await;
         assert!(matches!(r, Err(FaucetError::RateLimited(_))), "{r:?}");
-        assert_eq!(ctx.rate_limit_retries(), Some(10), "the context is unchanged");
+        assert_eq!(
+            ctx.rate_limit_retries(),
+            Some(10),
+            "the context is unchanged"
+        );
     }
 
     #[tokio::test(start_paused = true)]

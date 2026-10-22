@@ -498,7 +498,11 @@ mod tests {
             DataType::List(Arc::new(Field::new(name, DataType::Utf8, nullable)))
         };
         let strukt = |nullable: bool| {
-            DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, nullable)]))
+            DataType::Struct(Fields::from(vec![Field::new(
+                "x",
+                DataType::Int64,
+                nullable,
+            )]))
         };
         let a = Schema::new(vec![
             Field::new("tags", list("item", true), true),
@@ -510,7 +514,11 @@ mod tests {
         ]);
         assert!(same_shape(&a, &b));
         let c = Schema::new(vec![
-            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
             Field::new("s", strukt(true), true),
         ]);
         assert!(!same_shape(&a, &c), "a different leaf type is a conflict");

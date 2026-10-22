@@ -1511,7 +1511,11 @@ impl MessageDriver for ShortAfterFirst {
         group: Vec<OutboundMessage>,
     ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
         let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let n = if call == 0 { group.len() } else { group.len() + 1 };
+        let n = if call == 0 {
+            group.len()
+        } else {
+            group.len() + 1
+        };
         Ok((0..n).map(|_| Ok(())).collect())
     }
 }
