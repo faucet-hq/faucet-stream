@@ -44,6 +44,17 @@ class DecimalF64Test(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("crates/source/x/src/lib.rs:3", errors[0])
 
+    def test_other_float_conversion_forms_are_caught(self):
+        for line in (
+            "bind(v.as_f64())",
+            "f64::from_str(&text)?",
+            "let x: f64 = text.parse()?",
+            "let x: Option<f32> = text.parse().ok()",
+        ):
+            r = Repo()
+            r.write("crates/sink/x/src/lib.rs", f"fn cell(d: Decimal) {{\n    {line};\n}}\n")
+            self.assertEqual(len(r.check()), 1, line)
+
     def test_a_float_far_from_any_decimal_passes(self):
         r = Repo()
         r.write(
