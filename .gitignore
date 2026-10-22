@@ -47,6 +47,8 @@ docs/superpowers/
 !/scripts/patch-coverage.py
 !/scripts/integration-coverage.py
 !/scripts/retry-on-image-pull.sh
+!/scripts/pull_flake.py
+!/scripts/test_pull_flake.py
 !/scripts/docker-hub-mirror.sh
 !/scripts/semver-exclude.py
 !/scripts/test_integration_coverage.py
@@ -60,6 +62,7 @@ docs/superpowers/
 !/scripts/test_advisory_scope.py
 !/scripts/test_connector_deps.py
 !/scripts/packaged-keys.py
+!/scripts/test_packaged_keys.py
 !/scripts/helm-app-version.py
 !/scripts/test_helm_app_version.py
 !/scripts/full-feature-coverage.py
