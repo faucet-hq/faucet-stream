@@ -99,7 +99,8 @@ impl SingerSink {
         config.validate()?;
         Ok(Self {
             inner: DriverSink::new(SingerDriver {
-                redactor: Redactor::from_config(&config.target_config),
+                redactor: Redactor::from_config(&config.target_config)
+                    .with_values(config.env.values().cloned()),
                 config,
                 inner: Mutex::new(Inner::default()),
                 version: OnceLock::new(),

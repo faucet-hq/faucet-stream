@@ -979,7 +979,11 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-singer")]
         "singer" => {
             let cfg = decode::<faucet_sink_singer::SingerSinkConfig>("sink", "singer", config)?;
-            for secret in faucet_sink_singer::secret_like_values(&cfg.target_config) {
+            let env = serde_json::to_value(&cfg.env).unwrap_or_default();
+            for secret in faucet_sink_singer::secret_like_values(&cfg.target_config)
+                .into_iter()
+                .chain(faucet_sink_singer::secret_like_values(&env))
+            {
                 crate::secrets::registry::register(&secret);
             }
             Ok(Box::new(faucet_sink_singer::SingerSink::new(cfg)?))

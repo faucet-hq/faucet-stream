@@ -11,7 +11,8 @@ Reads Singer messages from stdin. Config (`--config FILE`) keys:
   crash_after  records to accept before crashing (mode crash)
   secret     echoed to stderr by mode crash (the sink must redact it)
   delay_start  seconds to sleep before reading stdin (back-pressure tests)
-Environment: FAKE_TARGET_TAG, when set, is logged on spawn.
+Environment: FAKE_TARGET_TAG, when set, is logged on spawn; FAKE_TARGET_SECRET,
+when set, is echoed to stderr by mode crash too.
 """
 import json
 import os
@@ -66,6 +67,8 @@ def main():
                 for i in range(int(cfg.get("stderr_lines", 0))):
                     sys.stderr.write("noise line %d\n" % i)
                 sys.stderr.write("fatal: cannot load record with key %s\n" % cfg.get("secret"))
+                if os.environ.get("FAKE_TARGET_SECRET"):
+                    sys.stderr.write("env %s\n" % os.environ["FAKE_TARGET_SECRET"])
                 sys.stderr.flush()
                 sys.exit(3)
         elif kind == "STATE":

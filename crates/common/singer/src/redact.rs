@@ -23,6 +23,15 @@ impl Redactor {
         Self { secrets }
     }
 
+    /// This redactor also scrubbing `values` (e.g. the environment handed to
+    /// the subprocess).
+    pub fn with_values(mut self, values: impl IntoIterator<Item = String>) -> Self {
+        self.secrets.extend(values);
+        self.secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        self.secrets.dedup();
+        self
+    }
+
     /// Replace any known secret value in `s` with `***`.
     pub fn redact(&self, s: &str) -> String {
         let mut out = s.to_string();
@@ -127,6 +136,14 @@ mod tests {
             secret_like_values(&cfg),
             vec!["4321".to_string(), "81726354".to_string()]
         );
+    }
+
+    #[test]
+    fn extra_values_are_scrubbed_too() {
+        let r = Redactor::from_config(&json!({"token": "configsecret"}))
+            .with_values(["envsecretvalue".to_string(), "configsecret".to_string()]);
+        let out = r.redact("configsecret then envsecretvalue");
+        assert_eq!(out, "*** then ***");
     }
 
     #[test]
