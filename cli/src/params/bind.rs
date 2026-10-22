@@ -777,6 +777,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn only_strings_are_screened_for_embedding() {
+        assert_eq!(embedded_value_refusal(&json!(42)), None);
+        assert_eq!(embedded_value_refusal(&json!(true)), None);
+        assert_eq!(embedded_value_refusal(&json!("ok")), None);
+        assert_eq!(embedded_value_refusal(&json!("a;b")), Some("`;`".into()));
+    }
+
     fn spec_of(yaml: &str) -> ParamsSpec {
         serde_yaml::from_str(yaml).unwrap()
     }

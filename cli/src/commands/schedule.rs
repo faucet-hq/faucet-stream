@@ -738,24 +738,13 @@ async fn run_loop(
             next_due = match compiled.next_due_after_tick(next_due, Utc::now()) {
                 Some(t) => t,
                 None => {
-                    tracing::info!(pipeline = %pipeline_name, "no further scheduled occurrences; exiting once the in-flight run finishes");
-                    if let Some(rr) = running.take() {
-                        let finished = finish_or_drain(
-                            rr,
-                            shutdown.recv(),
-                            compiled.shutdown_grace,
-                            &pipeline_name,
-                        )
-                        .await;
-                        m::in_flight(&pipeline_name, 0);
-                        if let Err(e) = &finished {
-                            tracing::error!(pipeline = %pipeline_name, detail = %e, "final run failed");
-                        }
-                        if matches!(finished, Err(CliError::Cancelled)) {
-                            return Err(CliError::Cancelled);
-                        }
-                    }
-                    return Ok(());
+                    return finish_last_run(
+                        running.take(),
+                        shutdown.recv(),
+                        compiled.shutdown_grace,
+                        &pipeline_name,
+                    )
+                    .await;
                 }
             };
         }
@@ -961,6 +950,29 @@ async fn wait_for_run(
         Some(rr) => classify((&mut rr.handle).await, breaker_cooldown),
         None => std::future::pending().await,
     }
+}
+
+/// The schedule has no further occurrence: let the in-flight run finish (or
+/// drain it on a stop signal) and exit. Only a stop is an error; a failed
+/// final run is logged.
+async fn finish_last_run(
+    running: Option<RunningRun>,
+    stop: impl std::future::Future<Output = ()>,
+    grace: Duration,
+    pipeline_name: &str,
+) -> CliResult<()> {
+    tracing::info!(pipeline = %pipeline_name, "no further scheduled occurrences; exiting once the in-flight run finishes");
+    if let Some(rr) = running {
+        let finished = finish_or_drain(rr, stop, grace, pipeline_name).await;
+        m::in_flight(pipeline_name, 0);
+        if let Err(e) = &finished {
+            tracing::error!(pipeline = %pipeline_name, detail = %e, "final run failed");
+        }
+        if matches!(finished, Err(CliError::Cancelled)) {
+            return Err(CliError::Cancelled);
+        }
+    }
+    Ok(())
 }
 
 /// Await `run`; when `stop` resolves first, drain it like the shutdown arm
@@ -1241,6 +1253,54 @@ mod tests {
         // The span exists and is enterable; field values are recorded on
         // creation. We assert it has the expected metadata name.
         assert_eq!(span.metadata().unwrap().name(), "faucet.schedule.run");
+    }
+
+    fn running(handle: tokio::task::JoinHandle<CliResult<RunSummary>>) -> RunningRun {
+        RunningRun {
+            handle,
+            started: Instant::now(),
+            cancel: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_finishing_drains_the_run_and_reports_cancelled() {
+        let rr = running(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(summary(0, 1))
+        }));
+        let out = finish_or_drain(rr, async {}, Duration::from_millis(10), "p").await;
+        assert!(matches!(out, Err(CliError::Cancelled)), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn the_last_run_is_awaited_and_only_a_stop_is_an_error() {
+        assert!(
+            finish_last_run(None, std::future::pending(), Duration::ZERO, "p")
+                .await
+                .is_ok()
+        );
+        let ok = running(tokio::spawn(async { Ok(summary(0, 1)) }));
+        assert!(
+            finish_last_run(Some(ok), std::future::pending(), Duration::ZERO, "p")
+                .await
+                .is_ok()
+        );
+        let failed = running(tokio::spawn(async {
+            Err(CliError::Internal("disk full".into()))
+        }));
+        assert!(
+            finish_last_run(Some(failed), std::future::pending(), Duration::ZERO, "p")
+                .await
+                .is_ok(),
+            "a failed final run is logged, not returned"
+        );
+        let slow = running(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(summary(0, 1))
+        }));
+        let out = finish_last_run(Some(slow), async {}, Duration::from_millis(10), "p").await;
+        assert!(matches!(out, Err(CliError::Cancelled)), "{out:?}");
     }
 
     #[tokio::test]

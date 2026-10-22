@@ -565,6 +565,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn a_url_password_is_collected_raw_and_percent_decoded() {
+        let found = embedded_secrets(
+            "FAUCET_SOURCE_URL",
+            "postgres://app:p%40ss%2Fword@db.example:5432/app",
+        );
+        assert!(found.contains(&"p%40ss%2Fword".to_string()), "{found:?}");
+        assert!(found.contains(&"p@ss/word".to_string()), "{found:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_nested_type_field_is_not_a_phantom_template() {

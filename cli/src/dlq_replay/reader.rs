@@ -443,9 +443,7 @@ fn numbered_parts(glob: &str, location: &str) -> Result<Vec<PathBuf>, FaucetErro
 /// digits. Pure.
 fn is_numbered_part(name: &str, pattern: &str) -> bool {
     let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return false;
-    };
+    let first = parts.next().unwrap_or_default();
     let Some(mut rest) = name.strip_prefix(first) else {
         return false;
     };
@@ -703,6 +701,11 @@ impl DlqReaderSource {
     }
 }
 
+/// The error a panicked blocking reader task surfaces as.
+fn reader_panicked(e: tokio::task::JoinError) -> FaucetError {
+    FaucetError::Source(format!("DLQ reader task panicked: {e}"))
+}
+
 #[async_trait]
 impl Source for DlqReaderSource {
     async fn fetch_with_context(
@@ -725,7 +728,7 @@ impl Source for DlqReaderSource {
             .map(|_| out)
         })
         .await
-        .map_err(|e| FaucetError::Source(format!("DLQ reader task panicked: {e}")))?
+        .map_err(reader_panicked)?
     }
 
     /// Reads the files line by line on a blocking thread and yields
@@ -772,7 +775,7 @@ impl Source for DlqReaderSource {
             }
             reader
                 .await
-                .map_err(|e| FaucetError::Source(format!("DLQ reader task panicked: {e}")))?;
+                .map_err(reader_panicked)?;
         })
     }
 
@@ -843,6 +846,49 @@ mod tests {
         assert!(is_numbered_part("a-1-b-22.jsonl", "a-*-b-*.jsonl"));
         assert!(!is_numbered_part("a--b-22.jsonl", "a-*-b-*.jsonl"));
         assert!(!is_numbered_part("a-1.jsonl.bak", "a-*.jsonl"));
+        assert!(!is_numbered_part("b-1.jsonl", "a-*.jsonl"));
+        assert!(!is_numbered_part("a-1-c-2.jsonl", "a-*-b-*.jsonl"));
+        assert!(is_numbered_part("plain.jsonl", "plain.jsonl"));
+    }
+
+    #[test]
+    fn sealed_probe_reads_the_first_non_blank_line() {
+        let (_dir, blank) = write_tmp("blank.jsonl", "\n  \n");
+        assert!(!starts_sealed(&blank).unwrap());
+        let (_dir2, plain) = write_tmp("plain.jsonl", "\n{\"a\":1}\n");
+        assert!(!starts_sealed(&plain).unwrap());
+        let err = starts_sealed(&blank.with_file_name("absent.jsonl"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reading DLQ file") && err.contains("absent.jsonl"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_reader_task_is_a_source_error() {
+        let join = tokio::task::spawn_blocking(|| panic!("boom"))
+            .await
+            .unwrap_err();
+        let err = reader_panicked(join).to_string();
+        assert!(err.contains("DLQ reader task panicked"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn batch_size_zero_streams_one_page() {
+        use futures::StreamExt;
+        let mut body = String::new();
+        for i in 0..3 {
+            body.push_str(&envelope_line("quality", json!({"id": i})));
+            body.push('\n');
+        }
+        let (_dir, path) = write_tmp("dlq.jsonl", &body);
+        let source = DlqReaderSource::new(vec![path], None, DlqDecryptor::default());
+        let ctx = HashMap::new();
+        let pages: Vec<_> = source.stream_pages(&ctx, 0).collect().await;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].as_ref().unwrap().records.len(), 3);
     }
 
     #[test]

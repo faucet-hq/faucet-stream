@@ -435,6 +435,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rewrite_reports_a_missing_file_and_a_failed_temp_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.yaml");
+        let err = write_atomically(&missing, "new\n").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot write") && err.contains("absent.yaml"),
+            "{err}"
+        );
+
+        let path = dir.path().join("c.yaml");
+        std::fs::write(&path, "old").unwrap();
+        let target = std::fs::canonicalize(&path).unwrap();
+        let tmp = target.with_file_name(format!(".c.yaml.{}.fmt-tmp", std::process::id()));
+        std::fs::write(&tmp, "squatter").unwrap();
+        let err = write_atomically(&path, "new\n").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot write") && err.contains("c.yaml"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        assert!(
+            !tmp.exists(),
+            "the temp file is removed after a failed write"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn rewrite_keeps_the_file_mode_and_follows_symlinks() {

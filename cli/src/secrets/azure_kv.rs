@@ -342,6 +342,10 @@ mod tests {
         ] {
             assert!(parse_reference(bad).is_err(), "{bad}");
         }
+        let err = parse_reference("my-vault/db-pass/v1?x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version 'v1?x'"), "{err}");
     }
 
     #[test]

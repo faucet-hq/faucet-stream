@@ -1023,6 +1023,18 @@ mod tests {
     }
 
     #[test]
+    fn file_path_fields_leave_load_time_directives_and_fill_one_name() {
+        let ctx: HashMap<String, Value> =
+            HashMap::from([("p".to_string(), json!({"id": 7, "dir": "a/b"}))]);
+        assert_eq!(
+            interpolate_record_file_path("./out/${env:HOME}-${p.id}.jsonl", &ctx).unwrap(),
+            "./out/${env:HOME}-7.jsonl"
+        );
+        let err = interpolate_record_file_path("./out/${p.dir}.jsonl", &ctx).unwrap_err();
+        assert!(err.to_string().contains("inside a file path"), "{err}");
+    }
+
+    #[test]
     fn path_fields_encode_embedded_tokens_and_keep_a_whole_token_raw() {
         let ctx: HashMap<String, Value> = HashMap::from([(
             "p".to_string(),

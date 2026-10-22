@@ -615,6 +615,101 @@ mod tests {
     }
 
     #[test]
+    fn purge_reports_an_unwritable_temp_and_an_unreadable_sealed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, "secret\nkeep\n").unwrap();
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id("secret")),
+        )
+        .unwrap();
+        let tmp = dir.path().join("dlq.jsonl.faucet-purge");
+        std::fs::create_dir(&tmp).unwrap();
+        let err = purge(file.to_str().unwrap()).unwrap_err().to_string();
+        assert!(
+            err.contains("writing") && err.contains("faucet-purge"),
+            "{err}"
+        );
+        std::fs::remove_dir(&tmp).unwrap();
+
+        let mut sealed = b"RkNUheader\n".to_vec();
+        sealed.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        std::fs::write(&file, &sealed).unwrap();
+        let err = purge(file.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("reading DLQ file"), "{err}");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn purge_reports_an_unwritable_temp_for_a_sealed_file() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut body = String::from_utf8(seal.header(&enc)).unwrap();
+        let mut lines = Vec::new();
+        for text in ["keep", "secret"] {
+            let line = String::from_utf8(seal.seal(&enc, text.as_bytes())).unwrap();
+            lines.push(line.trim_end().to_string());
+            body.push_str(&line);
+        }
+        body.push_str(&String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, &body).unwrap();
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id(&lines[1])),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("dlq.jsonl.faucet-purge")).unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        let err = purge_with(file.to_str().unwrap(), &dec)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("writing") && err.contains("faucet-purge"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "untouched");
+    }
+
+    #[test]
+    fn discard_archives_a_large_match_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let pad = "x".repeat(4096);
+        let mut body = String::new();
+        let n = ARCHIVE_CHUNK_BYTES / 4096 + 8;
+        for i in 0..n {
+            body.push_str(&env_line(
+                "quality",
+                "QualityFailure",
+                i as i64,
+                json!({"id": i, "pad": pad}),
+            ));
+            body.push('\n');
+        }
+        let path = write(dir.path(), "dlq.jsonl", &body);
+        let out = discard(
+            path.to_str().unwrap(),
+            Some("quality"),
+            None,
+            false,
+            &DlqDecryptor::default(),
+        )
+        .unwrap();
+        assert_eq!(out.discarded, n);
+        assert_eq!(out.archived_to.len(), 1);
+        let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
+        assert_eq!(archived.lines().count(), n);
+    }
+
+    #[test]
     fn purge_removes_discarded_lines_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("dlq.jsonl");

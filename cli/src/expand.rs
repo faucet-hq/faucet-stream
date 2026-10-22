@@ -5533,6 +5533,18 @@ pipeline:
         assert!(err.contains("partition") && err.contains("faucet"), "{err}");
     }
 
+    #[test]
+    fn a_fan_out_select_that_is_not_jsonpath_is_refused() {
+        let yaml = format!(
+            "{TWO_ROWS}  - id: regions\n    fan_out: {{ source: {{ type: csv, config: {{ path: r.csv }} }}, select: \"$[?(@.a\", as: name }}\n"
+        );
+        let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+        assert!(
+            err.contains("matrix row 'regions'") && err.contains("not a valid JSONPath"),
+            "{err}"
+        );
+    }
+
     /// #789 CLI-59: a `parent:` naming a `fan_out:` row would run nothing.
     #[test]
     fn parent_naming_a_fan_out_row_is_refused() {

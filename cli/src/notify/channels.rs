@@ -132,6 +132,15 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn other_request_errors_carry_no_detail() {
+        assert_eq!(
+            request_failed(faucet_core::FaucetError::Source("at http://secret".into())),
+            "request failed"
+        );
+        assert!(request_failed(faucet_core::FaucetError::Config("x".into())).contains("policy"));
+    }
+
     #[tokio::test]
     async fn a_transport_error_does_not_carry_the_webhook_url() {
         let cfg = crate::notify::spec::SlackConfig {
