@@ -884,3 +884,38 @@ async fn discovery_list_links_resolve_under_a_versioned_base_url() {
         .collect();
     assert_eq!(names, vec!["a", "b", "c"]);
 }
+
+#[tokio::test]
+async fn key_bounds_probe_waits_out_a_rate_limit_and_sends_only_configured_options() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Ledger"))
+        .and(query_param("$orderby", "RecId asc"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/Ledger"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "RecId": 1 }] })),
+        )
+        .mount(&server)
+        .await;
+    let mut cfg = ledger_partitioned(&server.uri());
+    cfg.max_retries = 3;
+    assert_eq!(drain_records(cfg).await, 1);
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.query().unwrap_or_default().contains("cross-company")),
+        "no request may carry an option the config did not set"
+    );
+    let probes = requests
+        .iter()
+        .filter(|r| r.url.query().unwrap_or_default().contains("%24top=1"))
+        .count();
+    assert_eq!(probes, 3, "the rate-limited probe is retried, not fatal");
+}

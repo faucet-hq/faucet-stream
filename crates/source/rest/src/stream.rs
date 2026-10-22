@@ -3956,31 +3956,23 @@ impl RestDriver {
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{base}/{entity}");
         let mut bounds = [0i64; 2];
-        for (i, dir) in ["asc", "desc"].into_iter().enumerate() {
-            let mut headers = self.static_headers.clone();
-            for (k, v) in self.metadata_headers(&url).await?.iter() {
-                headers.insert(k.clone(), v.clone());
-            }
-            let request = self.client.get(&url).headers(headers).query(&[
-                ("cross-company", "true"),
-                ("$orderby", &format!("{key} {dir}")),
-                ("$top", "1"),
-                ("$select", key),
-                ("$format", "json"),
-            ]);
-            let resp = self.client.send(request).await.map_err(|e| {
-                FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+        let order: Vec<String> = ["asc", "desc"]
+            .iter()
+            .map(|dir| format!("{key} {dir}"))
+            .collect();
+        for (i, orderby) in order.iter().enumerate() {
+            let body = with_matcher_scope(
+                self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+                    .call("discover", || self.key_bounds_probe(&url, key, orderby)),
+            )
+            .await
+            .map_err(|e| match e {
+                FaucetError::Http(e) => {
+                    FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+                }
+                FaucetError::HttpStatus { body, .. } => FaucetError::Source(body),
+                other => other,
             })?;
-            if !resp.status().is_success() {
-                return Err(FaucetError::Source(format!(
-                    "rest: OData key-bounds returned HTTP {}",
-                    resp.status().as_u16()
-                )));
-            }
-            let body: serde_json::Value =
-                self.client.json(resp).await.map_err(|e| {
-                    FaucetError::Source(format!("rest: OData key-bounds body: {e}"))
-                })?;
             let Some(row) = body
                 .get("value")
                 .and_then(|v| v.as_array())
@@ -3993,6 +3985,54 @@ impl RestDriver {
             })?;
         }
         Ok(Some((bounds[0], bounds[1])))
+    }
+
+    /// One key-bounds request (`$top=1` ordered by the key). A `429` or `5xx`
+    /// is returned retriable, so the caller's retry policy covers it like any
+    /// data page.
+    async fn key_bounds_probe(
+        &self,
+        url: &str,
+        key: &str,
+        orderby: &str,
+    ) -> Result<serde_json::Value, FaucetError> {
+        let mut headers = self.static_headers.clone();
+        for (k, v) in self.metadata_headers(url).await?.iter() {
+            headers.insert(k.clone(), v.clone());
+        }
+        let mut query: Vec<(&str, &str)> = Vec::with_capacity(5);
+        if let Some(scope) = self.config.query_params.get("cross-company") {
+            query.push(("cross-company", scope));
+        }
+        query.extend([
+            ("$orderby", orderby),
+            ("$top", "1"),
+            ("$select", key),
+            ("$format", "json"),
+        ]);
+        let request = self.client.get(url).headers(headers).query(&query);
+        self.roundtrip("discover");
+        let resp = self.client.send(request).await?;
+        let status = resp.status().as_u16();
+        if status == 429 {
+            return Err(plain_rate_limit(resp.headers()));
+        }
+        if !(200..300).contains(&status) {
+            let message = format!("rest: OData key-bounds returned HTTP {status}");
+            return Err(if status >= 500 {
+                FaucetError::HttpStatus {
+                    status,
+                    url: faucet_core::redact_uri_credentials(url),
+                    body: message,
+                }
+            } else {
+                FaucetError::Source(message)
+            });
+        }
+        self.client
+            .json(resp)
+            .await
+            .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))
     }
 
     /// Stream an OData entity as concurrent key-range tiles: discover the key's
