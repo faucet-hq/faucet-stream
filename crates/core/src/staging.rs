@@ -477,19 +477,31 @@ mod upload {
     pub struct StageUploader {
         store: Arc<dyn ObjectStore>,
         location: StagingLocation,
+        calls: crate::io::CallContext,
     }
 
     impl StageUploader {
         /// Build an uploader over an explicit store (used in tests) + location.
         pub fn new(store: Arc<dyn ObjectStore>, location: StagingLocation) -> Self {
-            Self { store, location }
+            Self {
+                store,
+                location,
+                calls: crate::io::CallContext::new(),
+            }
+        }
+
+        /// Run every upload and delete as a backend call under `ctx` (attempt
+        /// timeout, run deadline, cancellation, round-trip metering).
+        pub fn with_call_context(mut self, ctx: crate::io::CallContext) -> Self {
+            self.calls = ctx;
+            self
         }
 
         /// Build an uploader whose store is constructed from the location's
         /// scheme + ambient credentials.
         pub fn from_location(location: StagingLocation) -> Result<Self, FaucetError> {
             let store = build_object_store(&location)?;
-            Ok(Self { store, location })
+            Ok(Self::new(store, location))
         }
 
         /// The location this uploader stages into.
@@ -520,10 +532,13 @@ mod upload {
                 .object_key(scope, run_id, seq, spec.format, spec.compression);
             let path = object_store::path::Path::from(key.clone());
             let bytes = body.len();
-            self.store
-                .put(&path, body.into())
-                .await
-                .map_err(|e| FaucetError::Sink(format!("staging: upload `{key}` failed: {e}")))?;
+            self.calls
+                .call_once("stage_put", async {
+                    self.store.put(&path, body.into()).await.map_err(|e| {
+                        FaucetError::Sink(format!("staging: upload `{key}` failed: {e}"))
+                    })
+                })
+                .await?;
             Ok(StagedFile {
                 uri: self.location.uri_for(&key),
                 key,
@@ -546,7 +561,16 @@ mod upload {
             }
             for f in files {
                 let path = object_store::path::Path::from(f.key.clone());
-                if let Err(e) = self.store.delete(&path).await {
+                let deleted = self
+                    .calls
+                    .call("stage_delete", || async {
+                        self.store
+                            .delete(&path)
+                            .await
+                            .map_err(|e| FaucetError::Sink(e.to_string()))
+                    })
+                    .await;
+                if let Err(e) = deleted {
                     tracing::warn!(key = %f.key, error = %e, "staging: cleanup delete failed");
                 }
             }
@@ -782,6 +806,33 @@ mod tests {
         up.cleanup(std::slice::from_ref(&f), StagingCleanup::OnSuccess, true)
             .await;
         assert!(store.get(&path).await.is_err());
+    }
+
+    #[cfg(feature = "staging")]
+    #[tokio::test]
+    async fn uploader_runs_uploads_under_its_call_context() {
+        use object_store::{ObjectStore, ObjectStoreExt};
+        use std::sync::Arc;
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let loc = StagingLocation::parse("s3://b/stage").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let up = StageUploader::new(store.clone(), loc)
+            .with_call_context(crate::io::CallContext::new().with_cancel(cancel));
+        let spec = StagingSpec {
+            location: "s3://b/stage".into(),
+            format: StagingFormat::Jsonl,
+            compression: StagingCompression::None,
+            cleanup: StagingCleanup::Always,
+            copy_options: None,
+        };
+        let err = up
+            .stage_page(&spec, "p", "r", 0, &[json!({"a": 1})], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Cancelled { .. }), "{err}");
+        let path = object_store::path::Path::from("stage/p/r/part-00000.jsonl");
+        assert!(store.get(&path).await.is_err(), "nothing was uploaded");
     }
 
     #[cfg(feature = "staging")]

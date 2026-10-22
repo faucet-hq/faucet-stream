@@ -29,7 +29,7 @@ impl MssqlDriver {
         let loc = staging
             .spec
             .validate(&[StagingScheme::Azure], &[StagingFormat::Csv])?;
-        let uploader = StageUploader::from_location(loc)?;
+        let uploader = StageUploader::from_location(loc)?.with_call_context(self.calls.get());
         let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
         let (staged, sql) = crate::staged::build_staged_copy_sql(
             &uploader,
