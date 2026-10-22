@@ -2324,7 +2324,16 @@ impl RestDriver {
                     poll_json.as_ref(),
                 )
                 .await?;
-            let status = jsonpath_first_string(&body, &job.status.path).unwrap_or_default();
+            let Some(status) = jsonpath_first_string(&body, &job.status.path) else {
+                let text = body.to_string();
+                let end = text.floor_char_boundary(512.min(text.len()));
+                return Err(FaucetError::Source(format!(
+                    "async_job: `status.path` {:?} matched no string, number or boolean in the \
+                     poll response: {}",
+                    job.status.path,
+                    faucet_core::redact::redact(&text[..end])
+                )));
+            };
             match job.status.classify(&status) {
                 JobOutcome::Success => break body,
                 JobOutcome::Failure => {

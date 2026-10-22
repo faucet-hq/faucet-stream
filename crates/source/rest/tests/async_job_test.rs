@@ -871,3 +871,36 @@ async fn async_job_incremental_predicate_escapes_the_bookmark_and_skips_select_l
     }
     server.verify().await;
 }
+
+#[tokio::test]
+async fn async_job_poll_fails_fast_when_the_status_path_matches_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "job-1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "Complete" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(incremental_csv_config(&server)).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let started = std::time::Instant::now();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    let err = loop {
+        match pages.next().await {
+            Some(Err(e)) => break e.to_string(),
+            Some(Ok(_)) => continue,
+            None => panic!("the run must fail"),
+        }
+    };
+    assert!(
+        err.contains("`status.path`") && err.contains("Complete"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    server.verify().await;
+}
