@@ -520,3 +520,17 @@ async fn a_page_of_hits_without_source_fails_the_read() {
     let err = source.fetch_all().await.unwrap_err().to_string();
     assert!(err.contains("nosrc/b") && err.contains("_source"), "{err}");
 }
+
+/// A search response with no `hits` envelope reads as an empty result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_without_hits_reads_as_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"took": 1})))
+        .mount(&server)
+        .await;
+    let source =
+        ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test")).unwrap();
+    assert!(source.fetch_all().await.unwrap().is_empty());
+}
