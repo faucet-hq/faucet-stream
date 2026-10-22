@@ -300,6 +300,11 @@ impl faucet_core::Source for SqsSource {
                             .queue_url(&self.config.queue_url)
                             .max_number_of_messages(want)
                             .wait_time_seconds(self.config.wait_time_seconds);
+                        // Start each lease at the renewed window, so a queue whose own
+                        // timeout is shorter than the renewal interval cannot redeliver.
+                        if renew_secs > 0 {
+                            receive = receive.visibility_timeout(renew_secs as i32);
+                        }
                         if self.config.include_metadata {
                             receive = receive.message_attribute_names("All");
                         }

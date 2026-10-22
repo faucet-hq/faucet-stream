@@ -51,8 +51,10 @@ pub struct SqsSourceConfig {
     /// Visibility timeout, in seconds, the source keeps renewing on every
     /// message it has received but not yet deleted (while a page is assembled
     /// and while the sink writes it), so a slow page is not redelivered into
-    /// the same run. Renewed every third of this window. `0` disables renewal
-    /// and leaves the queue's own visibility timeout in charge. Default 60.
+    /// the same run. Each receive requests this window and it is renewed every
+    /// third of it, so a queue whose own visibility timeout is shorter still
+    /// holds the messages. `0` disables renewal and leaves the queue's own
+    /// visibility timeout in charge. Default 60.
     #[serde(default = "default_visibility_extension_secs")]
     pub visibility_extension_secs: u32,
     /// Wrap each record as `{ message_id, attributes, payload }`: the SQS

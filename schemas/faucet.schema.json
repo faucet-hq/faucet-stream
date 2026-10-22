@@ -17027,7 +17027,7 @@
                       "default": 1000
                     },
                     "visibility_extension_secs": {
-                      "description": "Visibility timeout, in seconds, the source keeps renewing on every\nmessage it has received but not yet deleted (while a page is assembled\nand while the sink writes it), so a slow page is not redelivered into\nthe same run. Renewed every third of this window. `0` disables renewal\nand leaves the queue's own visibility timeout in charge. Default 60.",
+                      "description": "Visibility timeout, in seconds, the source keeps renewing on every\nmessage it has received but not yet deleted (while a page is assembled\nand while the sink writes it), so a slow page is not redelivered into\nthe same run. Each receive requests this window and it is renewed every\nthird of it, so a queue whose own visibility timeout is shorter still\nholds the messages. `0` disables renewal and leaves the queue's own\nvisibility timeout in charge. Default 60.",
                       "type": [
                         "integer",
                         "string"
