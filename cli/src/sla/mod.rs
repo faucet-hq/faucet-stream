@@ -56,13 +56,17 @@ pub async fn evaluate_post_run(
     now_unix: i64,
 ) -> Vec<SlaViolation> {
     let key = sla_state_key(base_state_key);
-    let (mut history, store) = match store {
+    let (history, raw, store) = match store {
         // No state store: only the stateless floor check can run (the expand
         // gate guarantees staleness/volume checks come with a `state:` block;
         // this is the defensive path).
-        None => (SlaState::default(), None),
+        None => (SlaState::default(), None, None),
         Some(s) => match s.get(&key).await {
-            Ok(v) => (v.map(SlaState::from_value).unwrap_or_default(), Some(s)),
+            Ok(v) => (
+                v.clone().map(SlaState::from_value).unwrap_or_default(),
+                v,
+                Some(s),
+            ),
             Err(e) => {
                 tracing::warn!(
                     pipeline,
@@ -80,17 +84,17 @@ pub async fn evaluate_post_run(
         RunOutcome::Success { rows } => {
             let violations = eval::evaluate_success(spec, &history, rows);
             if let Some(s) = store {
-                history.record_success(rows, now_unix, spec.window());
-                if let Err(e) = s.put(&key, &history.to_value()).await {
-                    tracing::warn!(
+                match record_success_cas(s.as_ref(), &key, raw, rows, now_unix, spec.window())
+                    .await
+                {
+                    Ok(updated) => metrics::set_baseline_runs(pipeline, row, updated.volumes.len()),
+                    Err(e) => tracing::warn!(
                         pipeline,
                         row,
                         key,
                         error = %e,
                         "persisting SLA state failed — baseline not updated"
-                    );
-                } else {
-                    metrics::set_baseline_runs(pipeline, row, history.volumes.len());
+                    ),
                 }
             }
             violations
@@ -103,6 +107,38 @@ pub async fn evaluate_post_run(
         tracing::warn!(pipeline, row, kind = v.kind(), "SLA violation: {v}");
     }
     violations
+}
+
+/// Attempts at folding a success into the stored history before giving up.
+const CAS_ATTEMPTS: usize = 8;
+
+/// Fold a success into the stored history with compare-and-put, re-reading on
+/// a conflict so a concurrent run of the same row never loses its sample.
+async fn record_success_cas(
+    store: &dyn StateStore,
+    key: &str,
+    mut current: Option<serde_json::Value>,
+    rows: u64,
+    now_unix: i64,
+    window: usize,
+) -> Result<SlaState, faucet_core::FaucetError> {
+    for _ in 0..CAS_ATTEMPTS {
+        let mut next = current
+            .clone()
+            .map(SlaState::from_value)
+            .unwrap_or_default();
+        next.record_success(rows, now_unix, window);
+        if store
+            .compare_and_put(key, current.as_ref(), &next.to_value())
+            .await?
+        {
+            return Ok(next);
+        }
+        current = store.get(key).await?;
+    }
+    Err(faucet_core::FaucetError::State(format!(
+        "SLA state for `{key}` kept changing under {CAS_ATTEMPTS} concurrent updates"
+    )))
 }
 
 /// Post-run lag check (#733): the lag the source reported when the run ended
@@ -217,6 +253,61 @@ mod tests {
 
     fn mem() -> Arc<dyn StateStore> {
         Arc::new(MemoryStateStore::new())
+    }
+
+    /// A store where another run writes its success between our read and our
+    /// first compare-and-put.
+    struct RacingStore {
+        inner: MemoryStateStore,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    #[faucet_core::async_trait]
+    impl StateStore for RacingStore {
+        async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, faucet_core::FaucetError> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &serde_json::Value) -> Result<(), faucet_core::FaucetError> {
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), faucet_core::FaucetError> {
+            self.inner.delete(key).await
+        }
+        async fn compare_and_put(
+            &self,
+            key: &str,
+            expected: Option<&serde_json::Value>,
+            value: &serde_json::Value,
+        ) -> Result<bool, faucet_core::FaucetError> {
+            if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let mut other = SlaState::default();
+                other.record_success(7, 50, 10);
+                self.inner.put(key, &other.to_value()).await?;
+            }
+            self.inner.compare_and_put(key, expected, value).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_success_of_the_same_row_keeps_both_samples() {
+        let store: Arc<dyn StateStore> = Arc::new(RacingStore {
+            inner: MemoryStateStore::new(),
+            raced: Default::default(),
+        });
+        evaluate_post_run(
+            &full_spec(),
+            Some(&store),
+            "p::r",
+            "p",
+            "r",
+            RunOutcome::Success { rows: 9 },
+            100,
+        )
+        .await;
+        let raw = store.get(&sla_state_key("p::r")).await.unwrap().unwrap();
+        let state = SlaState::from_value(raw);
+        assert_eq!(state.volumes, vec![7, 9]);
+        assert_eq!(state.last_success_unix, Some(100));
     }
 
     #[tokio::test]
