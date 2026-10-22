@@ -275,8 +275,8 @@ pub use window::{
     WindowSpec, enumerate_windows, parse_step,
 };
 pub use write_mode::{
-    DeleteMarker, KeyTuple, OverwriteScope, WriteMode, WritePlan, WriteSpec, key_to_doc_id,
-    key_to_filter, plan_writes, plan_writes_exact, plan_writes_ordered, sql_literal,
+    DeleteMarker, KeyTuple, OverwriteScope, WriteMode, WritePlan, WriteSpec, key_failures,
+    key_to_doc_id, key_to_filter, plan_writes, plan_writes_exact, plan_writes_ordered, sql_literal,
 };
 #[cfg(feature = "transform-zip-columns")]
 pub use zip_columns::{ColumnGroupSpec, CompiledZipColumns, ZipColumnsSpec};

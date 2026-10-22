@@ -213,8 +213,8 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
     /// The page's keyed write groups in page order, failing on the first row
     /// whose key could not be read.
     pub fn plan_keyed(&self, records: &[Value]) -> Result<Vec<WritePlan>, FaucetError> {
-        let plan = faucet_core::plan_writes(records, &self.write);
-        if let Some((idx, msg)) = plan.failed.first() {
+        let failed = faucet_core::key_failures(records, &self.write);
+        if let Some((idx, msg)) = failed.first() {
             return Err(FaucetError::Sink(format!(
                 "{} {}: row {idx}: {msg}",
                 self.dialect.name(),
@@ -230,13 +230,11 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         &self,
         records: &[Value],
     ) -> (Vec<WritePlan>, Vec<(usize, FaucetError)>) {
-        let plan = faucet_core::plan_writes(records, &self.write);
-        let failed = plan
-            .failed
-            .iter()
+        let failed = faucet_core::key_failures(records, &self.write)
+            .into_iter()
             .map(|(idx, msg)| {
                 (
-                    *idx,
+                    idx,
                     FaucetError::Sink(format!(
                         "{} {}: {msg}",
                         self.dialect.name(),
