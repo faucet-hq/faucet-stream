@@ -150,11 +150,60 @@ pub(crate) fn prepare(
     let ordering = derive_ordering_key(record, ordering_key)?.unwrap_or_default();
     let (attributes, payload) = extract_attributes(record, attributes_field)?;
     let data = encode_payload(payload.as_ref(), value_format)?;
-    Ok(Prepared {
+    let p = Prepared {
         data,
         attributes,
         ordering_key: ordering,
-    })
+    };
+    check_limits(&p)?;
+    Ok(p)
+}
+
+/// Pub/Sub's per-message limits.
+pub(crate) const MAX_ATTRIBUTES: usize = 100;
+pub(crate) const MAX_ATTRIBUTE_KEY_BYTES: usize = 256;
+pub(crate) const MAX_ATTRIBUTE_VALUE_BYTES: usize = 1024;
+pub(crate) const MAX_ORDERING_KEY_BYTES: usize = 1024;
+
+/// Refuse a message the service would reject, so it fails alone rather than
+/// failing the request it is bundled into.
+pub(crate) fn check_limits(p: &Prepared) -> Result<(), FaucetError> {
+    let refuse = |why: String| Err(FaucetError::Sink(format!("pubsub: {why}")));
+    if p.data.is_empty() && p.attributes.is_empty() {
+        return refuse("a message needs data or at least one attribute".into());
+    }
+    if p.attributes.len() > MAX_ATTRIBUTES {
+        return refuse(format!(
+            "{} attributes exceed the limit of {MAX_ATTRIBUTES}",
+            p.attributes.len()
+        ));
+    }
+    for (k, v) in &p.attributes {
+        if k.len() > MAX_ATTRIBUTE_KEY_BYTES {
+            return refuse(format!(
+                "attribute key of {} bytes exceeds {MAX_ATTRIBUTE_KEY_BYTES}",
+                k.len()
+            ));
+        }
+        if k.starts_with("goog") {
+            return refuse(format!(
+                "attribute key '{k}' uses the reserved 'goog' prefix"
+            ));
+        }
+        if v.len() > MAX_ATTRIBUTE_VALUE_BYTES {
+            return refuse(format!(
+                "attribute '{k}' value of {} bytes exceeds {MAX_ATTRIBUTE_VALUE_BYTES}",
+                v.len()
+            ));
+        }
+    }
+    if p.ordering_key.len() > MAX_ORDERING_KEY_BYTES {
+        return refuse(format!(
+            "ordering key of {} bytes exceeds {MAX_ORDERING_KEY_BYTES}",
+            p.ordering_key.len()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,6 +224,30 @@ mod tests {
     }
 
     use serde_json::json;
+
+    #[test]
+    fn messages_over_the_service_limits_are_refused() {
+        let msg = |data: &[u8], attrs: Vec<(String, String)>, key: &str| Prepared {
+            data: data.to_vec(),
+            attributes: attrs.into_iter().collect(),
+            ordering_key: key.into(),
+        };
+        let err = |p: Prepared| check_limits(&p).unwrap_err().to_string();
+        assert!(check_limits(&msg(b"x", vec![], "")).is_ok());
+        assert!(check_limits(&msg(b"", vec![("a".into(), "b".into())], "")).is_ok());
+        assert!(err(msg(b"", vec![], "")).contains("needs data"));
+        let many = (0..=MAX_ATTRIBUTES)
+            .map(|i| (format!("k{i}"), "v".into()))
+            .collect();
+        assert!(err(msg(b"x", many, "")).contains("attributes exceed"));
+        let long_key = vec![("k".repeat(MAX_ATTRIBUTE_KEY_BYTES + 1), "v".into())];
+        assert!(err(msg(b"x", long_key, "")).contains("attribute key of"));
+        let long_value = vec![("k".into(), "v".repeat(MAX_ATTRIBUTE_VALUE_BYTES + 1))];
+        assert!(err(msg(b"x", long_value, "")).contains("value of"));
+        assert!(err(msg(b"x", vec![("goog-x".into(), "v".into())], "")).contains("reserved"));
+        let key = "k".repeat(MAX_ORDERING_KEY_BYTES + 1);
+        assert!(err(msg(b"x", vec![], &key)).contains("ordering key of"));
+    }
 
     #[test]
     fn ordering_key_strategies() {
