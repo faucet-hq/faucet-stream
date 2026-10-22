@@ -235,7 +235,9 @@ mod key_tests {
     #[tokio::test]
     async fn sync_parent_dir_syncs_and_reports_a_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
-        sync_parent_dir(&dir.path().join("entry.json")).await.unwrap();
+        sync_parent_dir(&dir.path().join("entry.json"))
+            .await
+            .unwrap();
         let missing = dir.path().join("gone").join("entry.json");
         assert!(sync_parent_dir(&missing).await.is_err());
     }

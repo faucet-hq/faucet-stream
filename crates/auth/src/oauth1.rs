@@ -411,9 +411,14 @@ mod tests {
             "HTTPS://api.example.com:443/v1/x",
             "https://api.example.com/v1/x#frag",
         ] {
-            assert_eq!(p.authorization_header("GET", variant, &q, "n", 1), canonical, "{variant}");
+            assert_eq!(
+                p.authorization_header("GET", variant, &q, "n", 1),
+                canonical,
+                "{variant}"
+            );
         }
-        let other_port = p.authorization_header("GET", "https://api.example.com:8443/v1/x", &q, "n", 1);
+        let other_port =
+            p.authorization_header("GET", "https://api.example.com:8443/v1/x", &q, "n", 1);
         assert_ne!(other_port, canonical);
         let path_case = p.authorization_header("GET", "https://api.example.com/V1/x", &q, "n", 1);
         assert_ne!(path_case, canonical, "the path keeps its case");
@@ -422,7 +427,10 @@ mod tests {
     #[test]
     fn normalized_base_uri_keeps_non_default_port() {
         let u = reqwest::Url::parse("http://Host.Example:8080/a/b?c=d").unwrap();
-        assert_eq!(normalized_base_uri(&u).unwrap(), "http://host.example:8080/a/b");
+        assert_eq!(
+            normalized_base_uri(&u).unwrap(),
+            "http://host.example:8080/a/b"
+        );
         let u = reqwest::Url::parse("http://host.example:80/").unwrap();
         assert_eq!(normalized_base_uri(&u).unwrap(), "http://host.example/");
     }

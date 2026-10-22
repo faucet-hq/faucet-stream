@@ -676,7 +676,10 @@ impl FlowProvider {
             .unwrap_or(0);
         let mut ctx = HashMap::new();
         ctx.insert("ts".to_owned(), now.to_string());
-        ctx.insert("nonce".to_owned(), uuid::Uuid::new_v4().simple().to_string());
+        ctx.insert(
+            "nonce".to_owned(),
+            uuid::Uuid::new_v4().simple().to_string(),
+        );
         ctx
     }
 
@@ -1351,9 +1354,12 @@ mod tests {
         assert!(matches!(&second, Credential::Header { value, .. } if value == "S2"));
         p.invalidate(&second).await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 3);
-        p.invalidate(&Credential::Header { name: "X".into(), value: "unknown".into() })
-            .await
-            .unwrap();
+        p.invalidate(&Credential::Header {
+            name: "X".into(),
+            value: "unknown".into(),
+        })
+        .await
+        .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
