@@ -392,8 +392,11 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
             '0'..='9' => num.push(c),
             'Y' => years = std::mem::take(&mut num).parse().ok()?,
             'M' => months = std::mem::take(&mut num).parse().ok()?,
-            'W' => days += 7 * std::mem::take(&mut num).parse::<i64>().ok()?,
-            'D' => days += std::mem::take(&mut num).parse::<i64>().ok()?,
+            'W' => {
+                let weeks = std::mem::take(&mut num).parse::<i64>().ok()?;
+                days = days.checked_add(weeks.checked_mul(7)?)?;
+            }
+            'D' => days = days.checked_add(std::mem::take(&mut num).parse::<i64>().ok()?)?,
             _ => return None,
         }
     }
@@ -428,7 +431,13 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
         if years != 0 || months != 0 {
             return None;
         }
-        let total_secs = ((days * 24 + hours) * 60 + minutes) * 60 + seconds;
+        let total_secs = days
+            .checked_mul(24)?
+            .checked_add(hours)?
+            .checked_mul(60)?
+            .checked_add(minutes)?
+            .checked_mul(60)?
+            .checked_add(seconds)?;
         let (d, rem) = (total_secs / 86_400, total_secs % 86_400);
         Some(format!(
             "{sign}{d} {:02}:{:02}:{:02}.{nanos:09}",
@@ -440,7 +449,7 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
         if days != 0 || hours != 0 || minutes != 0 || seconds != 0 || nanos != 0 {
             return None;
         }
-        let total = years * 12 + months;
+        let total = years.checked_mul(12)?.checked_add(months)?;
         Some(format!("{sign}{}-{}", total / 12, total % 12))
     }
 }
@@ -685,6 +694,21 @@ mod tests {
             Some("P1DT2H3M4S".into())
         );
         assert_eq!(oracle_interval_ym_to_iso("12"), None);
+    }
+
+    #[test]
+    fn iso_intervals_too_large_for_i64_are_refused() {
+        assert_eq!(
+            iso_to_oracle_interval("P1DT9223372036854775807S", true),
+            None
+        );
+        assert_eq!(iso_to_oracle_interval("P1067519911673565W", true), None);
+        assert_eq!(iso_to_oracle_interval("P999999999999999D", true), None);
+        assert_eq!(iso_to_oracle_interval("P9223372036854775807Y", false), None);
+        assert_eq!(
+            iso_to_oracle_interval("P1W1D", true).as_deref(),
+            Some("+8 00:00:00.000000000")
+        );
     }
 
     #[test]
