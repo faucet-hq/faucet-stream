@@ -17,7 +17,7 @@ mod objects;
 mod parts;
 
 pub use backend::{S3Backend, S3BackendBuilder};
-pub use objects::{MAX_COPY_BYTES, MAX_PARTS, PART_BYTES};
+pub use objects::{MAX_COPY_BYTES, MAX_PARTS, MIN_PART_BYTES, PART_BYTES};
 
 /// An S3 client from the default AWS credential chain, in `region` (else the
 /// chain's region) and against `endpoint_url` (an S3-compatible store) when

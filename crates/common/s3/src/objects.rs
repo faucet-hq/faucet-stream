@@ -43,6 +43,87 @@ const COPY_PART_BYTES: u64 = 512 * 1024 * 1024;
 /// S3's limit on the parts of one multipart upload.
 pub const MAX_PARTS: u64 = 10_000;
 
+/// S3's minimum size of every multipart part but the last.
+pub const MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+
+/// How long discarding a multipart upload may take.
+const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The part size of a whole-file multipart upload of `len` bytes: `part`,
+/// grown so the upload never needs more than [`MAX_PARTS`] parts.
+pub(crate) fn upload_part_size(part: usize, len: usize) -> usize {
+    part.max(len.div_ceil(MAX_PARTS as usize))
+}
+
+/// Discard a multipart upload under its own short timeout, apart from the
+/// run's context: the run's deadline or cancel has often fired by the time an
+/// upload is discarded. A failure is logged with the upload id and returned.
+pub(crate) async fn abort_multipart(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<(), FaucetError> {
+    let ctx = faucet_core::io::CallContext::new().with_timeout(ABORT_TIMEOUT);
+    let result = client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .within_ctx(&ctx, "abort")
+        .await
+        .and_then(|r| {
+            r.map(|_| ()).map_err(|e| {
+                err(
+                    "abort multipart",
+                    key,
+                    aws_sdk_s3::error::DisplayErrorContext(&e),
+                )
+            })
+        });
+    if let Err(e) = &result {
+        tracing::warn!(
+            bucket,
+            key,
+            upload_id,
+            error = %e,
+            "S3: discarding a multipart upload failed; its parts stay stored until a bucket \
+             lifecycle rule removes them"
+        );
+    }
+    result
+}
+
+/// Discards a whole-file multipart upload whose future is dropped before it
+/// completes or aborts.
+struct AbortOnDrop {
+    client: Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let (client, bucket, key, id) = (
+                self.client.clone(),
+                std::mem::take(&mut self.bucket),
+                std::mem::take(&mut self.key),
+                std::mem::take(&mut self.upload_id),
+            );
+            handle.spawn(async move {
+                let _ = abort_multipart(&client, &bucket, &key, &id).await;
+            });
+        }
+    }
+}
+
 /// S3's limit on the keys of one `DeleteObjects` request.
 const MAX_DELETE_KEYS: usize = 1_000;
 
@@ -146,8 +227,18 @@ impl S3Objects {
             .upload_id()
             .ok_or_else(|| err("start multipart", key, "no upload id"))?
             .to_string();
-        let parts = self.upload_parts(from, key, &upload_id, len).await;
-        self.finish_multipart(key, &upload_id, parts).await
+        let mut guard = AbortOnDrop {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key: key.to_string(),
+            upload_id: upload_id.clone(),
+            armed: true,
+        };
+        let part = upload_part_size(self.part_bytes, len);
+        let parts = self.upload_parts(from, key, &upload_id, len, part).await;
+        let result = self.finish_multipart(key, &upload_id, parts).await;
+        guard.armed = false;
+        result
     }
 
     async fn upload_parts(
@@ -156,8 +247,9 @@ impl S3Objects {
         key: &str,
         upload_id: &str,
         len: usize,
+        part: usize,
     ) -> Result<Vec<CompletedPart>, FaucetError> {
-        let count = len.div_ceil(self.part_bytes);
+        let count = len.div_ceil(part);
         let parts: Vec<CompletedPart> = futures::stream::iter(0..count)
             .map(|i| async move {
                 let _slot = self
@@ -165,8 +257,8 @@ impl S3Objects {
                     .acquire()
                     .await
                     .map_err(|e| err("upload part", key, e))?;
-                let offset = i * self.part_bytes;
-                let size = self.part_bytes.min(len - offset);
+                let offset = i * part;
+                let size = part.min(len - offset);
                 let body = ByteStream::read_from()
                     .path(from)
                     .offset(offset as u64)
@@ -510,15 +602,8 @@ impl S3Objects {
                 Ok(())
             }
             Err(e) => {
-                let _ = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .send()
-                    .within(&self.calls, "abort")
-                    .await;
+                self.roundtrips.record("abort");
+                let _ = abort_multipart(&self.client, &self.bucket, key, upload_id).await;
                 Err(e)
             }
         }
@@ -586,6 +671,80 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("S3 create local copy error for key 'k'"), "{e}");
+    }
+
+    #[test]
+    fn whole_file_parts_never_exceed_the_part_limit() {
+        assert_eq!(upload_part_size(PART_BYTES, 10 * PART_BYTES), PART_BYTES);
+        let big = 90 * 1024 * 1024 * 1024_usize;
+        let part = upload_part_size(PART_BYTES, big);
+        assert!(part > PART_BYTES);
+        assert!(big.div_ceil(part) as u64 <= MAX_PARTS);
+    }
+
+    #[tokio::test]
+    async fn an_abort_runs_after_the_run_context_is_spent() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "u1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        o.calls
+            .install(faucet_core::io::CallContext::new().with_cancel(token));
+        let parts = Err(FaucetError::Sink("a part failed".into()));
+        let e = o.finish_multipart("k", "u1", parts).await.unwrap_err();
+        assert!(e.to_string().contains("a part failed"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_abort_is_reported() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let e = abort_multipart(&o.client, "b", "k", "u2")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("abort multipart"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_whole_file_upload_is_discarded() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "u3"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        drop(AbortOnDrop {
+            client: o.client.clone(),
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: "u3".into(),
+            armed: true,
+        });
+        drop(AbortOnDrop {
+            client: o.client.clone(),
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: "not-sent".into(),
+            armed: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        server.verify().await;
     }
 
     #[test]
