@@ -2435,6 +2435,16 @@ fn classified(message: String, e: &sqlx::Error) -> HistoryError {
     }
 }
 
+/// Pure pool-state test behind `RunHistory::pool_saturated`.
+pub fn saturated(size: u32, idle: usize, max: u32) -> bool {
+    size >= max && idle == 0
+}
+
+/// Pool size of the SQL history backends: one per background loop (claim,
+/// lease, log persist, log export, change expiry, trigger watchers) plus room
+/// for request handlers.
+pub const POOL_MAX_CONNECTIONS: u32 = 16;
+
 /// Whether a driver error means the database could not be reached, as opposed
 /// to the database answering with an error.
 pub fn unreachable_of(e: &sqlx::Error) -> bool {
@@ -6355,6 +6365,14 @@ macro_rules! impl_sql_history {
                 }))
             }
 
+            fn pool_saturated(&self) -> bool {
+                $crate::serve::history::sql::saturated(
+                    self.pool.size(),
+                    self.pool.num_idle(),
+                    self.pool.options().get_max_connections(),
+                )
+            }
+
             fn degraded(&self) -> bool {
                 // A live SQL backend is never self-degraded; the FallbackHistory
                 // wrapper owns degradation when the backend becomes unreachable.
@@ -6392,6 +6410,13 @@ pub(crate) use impl_sql_history;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pool_is_saturated_only_when_full_and_nothing_is_idle() {
+        assert!(super::saturated(16, 0, 16));
+        assert!(!super::saturated(16, 1, 16));
+        assert!(!super::saturated(3, 0, 16));
+    }
+
     use super::*;
 
     #[test]

@@ -1962,6 +1962,12 @@ pub trait RunHistory: Send + Sync {
     /// True when the backend is in fallback mode (drives `/readyz`). Always false
     /// for memory.
     fn degraded(&self) -> bool;
+
+    /// True when every pooled connection is open and checked out: an acquire
+    /// timeout then means local saturation, not an unreachable database.
+    fn pool_saturated(&self) -> bool {
+        false
+    }
 }
 
 /// Build the configured run-history backend. `Memory` is always available; the

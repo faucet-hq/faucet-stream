@@ -29,7 +29,7 @@ impl SqliteHistory {
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(super::sql::POOL_MAX_CONNECTIONS)
             .connect_with(opts)
             .await
             .map_err(|e| classify_backend_error_with_context("SQLite connection failed", e))?;

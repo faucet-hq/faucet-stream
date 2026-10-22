@@ -152,6 +152,13 @@ impl FallbackHistory {
         true
     }
 
+    /// Whether `err` means the primary is down. An acquire timeout while every
+    /// pooled connection is checked out is saturation, which the caller sees
+    /// as an ordinary error instead of moving the server to degraded mode.
+    fn should_trip(&self, err: &HistoryError) -> bool {
+        err.is_unreachable() && !self.primary.get().is_some_and(|p| p.pool_saturated())
+    }
+
     /// Record a primary-backend failure and flip to degraded (log + metric once).
     fn trip(&self, err: &HistoryError) {
         if !self.degraded.swap(true, Ordering::AcqRel) {
@@ -195,7 +202,7 @@ macro_rules! via {
         if !$self.is_degraded() && $self.primary.get().is_some() {
             match primary!($self, $primary => $pcall) {
                 Ok(v) => return Ok(v),
-                Err(e) if e.is_unreachable() => $self.trip(&e),
+                Err(e) if $self.should_trip(&e) => $self.trip(&e),
                 Err(e) => return Err(e),
             }
         }
@@ -222,7 +229,7 @@ macro_rules! strict {
         }
         match primary!($self, $primary => $pcall) {
             Ok(v) => Ok(v),
-            Err(e) if e.is_unreachable() => {
+            Err(e) if $self.should_trip(&e) => {
                 $self.trip(&e);
                 Err($self.unavailable())
             }
@@ -246,7 +253,7 @@ impl RunHistory for FallbackHistory {
         if !self.is_degraded() && self.primary.get().is_some() {
             match primary!(self, p => p.claim_idempotency(key, fingerprint, run_id, window)) {
                 Ok(v) => return Ok(v),
-                Err(e) if e.is_unreachable() => self.trip(&e),
+                Err(e) if self.should_trip(&e) => self.trip(&e),
                 Err(e) => return Err(e),
             }
         }
@@ -959,6 +966,68 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    /// Every call times out acquiring a connection while the pool is full.
+    struct Saturated;
+
+    #[async_trait]
+    impl RunHistory for Saturated {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: Duration,
+        ) -> Result<Claim, HistoryError> {
+            AlwaysFail.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError> {
+            AlwaysFail.upsert(rec).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError> {
+            AlwaysFail.get(id).await
+        }
+        async fn list(&self, f: &ListFilter) -> Result<ListPage, HistoryError> {
+            AlwaysFail.list(f).await
+        }
+        async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError> {
+            AlwaysFail.delete(id).await
+        }
+        async fn purge_expired(&self, d: Duration) -> Result<usize, HistoryError> {
+            AlwaysFail.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            AlwaysFail.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        fn pool_saturated(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saturated_pool_is_an_error_not_a_degraded_server() {
+        let h = FallbackHistory::healthy(Box::new(Saturated), Duration::from_secs(60), "test");
+        let rec = RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(h.upsert(&rec).await.is_err());
+        assert!(
+            h.claim_idempotency("k", "f", "r", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            !h.degraded(),
+            "saturation must not move the server to degraded mode"
+        );
     }
 
     fn change(id: &str) -> crate::serve::changes::ChangeRequest {
