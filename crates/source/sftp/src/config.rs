@@ -233,13 +233,13 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     let (mut star, mut star_n) = (None, 0usize);
 
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             star_n = ni;
             pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
         } else if let Some(s) = star {
             pi = s + 1;
             star_n += 1;
@@ -257,6 +257,15 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn glob_wildcards_match_names_holding_wildcard_characters() {
+        assert!(glob_match("*.jsonl", "*daily.jsonl"));
+        assert!(glob_match("*.jsonl", "a*b.jsonl"));
+        assert!(glob_match("?x", "?x"));
+        assert!(glob_match("a*", "a*"));
+        assert!(!glob_match("*.jsonl", "*daily.csv"));
+    }
+
     use super::*;
     use faucet_common_sftp::SftpConnectionConfig;
 
