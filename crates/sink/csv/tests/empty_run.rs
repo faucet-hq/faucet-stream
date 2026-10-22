@@ -1,7 +1,8 @@
 #![allow(deprecated)]
 //! #753 (csv): with `append: false` the file reflects the latest successful run,
-//! including a run that wrote zero records; failed and cancelled runs keep the
-//! previous file.
+//! including a run that wrote zero records; a run that fails or is cancelled
+//! before its first write keeps the previous file. The first write truncates
+//! in place, so a run failing after it leaves only its own rows.
 
 use faucet_core::{CancellationToken, FaucetError, Pipeline, Source, Value, async_trait, json};
 use faucet_sink_csv::{CsvSink, CsvSinkConfig};
@@ -57,7 +58,7 @@ async fn an_empty_run_creates_the_file_when_it_does_not_exist() {
 }
 
 #[tokio::test]
-async fn failed_and_cancelled_runs_keep_the_previous_file() {
+async fn runs_failing_or_cancelled_before_any_write_keep_the_previous_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.csv");
     assert!(run(&path, false, rows(3), None).await);
@@ -106,4 +107,55 @@ async fn an_empty_compressed_run_is_a_valid_empty_stream() {
             .unwrap();
         assert!(out.is_empty(), "{name}: {out:?}");
     }
+}
+
+/// Page one, then a source failure.
+struct FailsAfterFirstPage;
+
+#[async_trait]
+impl Source for FailsAfterFirstPage {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        unreachable!("the pipeline streams pages")
+    }
+
+    fn stream_pages<'a>(
+        &'a self,
+        _context: &'a HashMap<String, Value>,
+        _batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::StreamPage, FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(faucet_core::async_stream::stream! {
+            yield Ok(faucet_core::StreamPage {
+                records: vec![json!({"id": 100}), json!({"id": 101})],
+                bookmark: None,
+            });
+            yield Err(FaucetError::Source("upstream 503".into()));
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_run_failing_after_its_first_write_leaves_only_its_own_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.csv");
+    assert!(run(&path, false, rows(3), None).await);
+    assert_eq!(lines(&path), 4);
+
+    let sink = CsvSink::new(CsvSinkConfig::new(path.to_string_lossy()).append(false));
+    assert!(
+        Pipeline::new(&FailsAfterFirstPage, &sink)
+            .run()
+            .await
+            .is_err()
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().collect::<Vec<_>>(), vec!["id", "100", "101"]);
 }
