@@ -18,7 +18,7 @@ discrete `host` / `port` / `vhost` fields — not both.
 |------------------------|---------------------|--------------------------|-------------|
 | `url`                  | `Option<String>`    | —                        | `amqp://user:pass@host:5672/%2f` (vhost URL-encoded; `amqps://` selects TLS) |
 | `host`                 | `Option<String>`    | `127.0.0.1`              | broker host |
-| `port`                 | `Option<u16>`       | `5672` (`5671` with TLS) | broker port |
+| `port`                 | `Option<u16>`       | `5672` (`5671` with TLS) | broker port; with `tls.enabled`, an `amqp://` `url` without a port also connects to `5671` |
 | `vhost`                | `Option<String>`    | `/`                      | virtual host |
 | `auth`                 | `RabbitMqAuth`      | `none`                   | see below |
 | `tls`                  | `RabbitMqTls`       | disabled                 | see below |
