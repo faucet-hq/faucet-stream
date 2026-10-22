@@ -243,3 +243,49 @@ async fn a_zero_batch_size_keeps_the_file_in_one_page() {
     }
     assert_eq!(sizes, vec![2]);
 }
+
+#[tokio::test]
+async fn a_repeated_csv_header_fails_instead_of_dropping_a_column() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dup.csv"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Id,Name,Name\n1,Alice,Smith\n"))
+        .mount(&server)
+        .await;
+    let mut c = cfg(&server, "/dup.csv");
+    c.response_format = ResponseFormat::Csv;
+    let err = RestStream::new(c)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("\"Name\" repeats"), "{err}");
+}
+
+#[cfg(feature = "excel")]
+#[tokio::test]
+async fn a_repeated_excel_header_fails_instead_of_dropping_a_column() {
+    use rust_xlsxwriter::Workbook;
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    for (col, v) in ["id", "amount", "amount"].iter().enumerate() {
+        ws.write_string(0, col as u16, *v).unwrap();
+        ws.write_string(1, col as u16, "1").unwrap();
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dup.xlsx"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wb.save_to_buffer().unwrap()))
+        .mount(&server)
+        .await;
+    let mut c = cfg(&server, "/dup.xlsx");
+    c.response_format = ResponseFormat::Excel;
+    let err = RestStream::new(c)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Excel header \"amount\" repeats"), "{err}");
+}
