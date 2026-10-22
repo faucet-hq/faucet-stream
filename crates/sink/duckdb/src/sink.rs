@@ -504,53 +504,98 @@ fn write_all_blocking(
     }
 }
 
+/// Confirm or create the target table; `Ok(false)` when an `auto_map` page
+/// had nothing to infer a table from, so the next page can try.
+fn prepare_table_blocking(
+    conn: &Connection,
+    config: &DuckdbSinkConfig,
+    records: &[Value],
+) -> Result<bool, FaucetError> {
+    let json_column = match &config.column_mapping {
+        DuckdbColumnMapping::AutoMap => None,
+        DuckdbColumnMapping::Json { column } => Some(column.as_str()),
+    };
+    if !config.create_table {
+        if !table_exists(conn, &config.table_name)? {
+            return Err(faucet_core::missing_target_error(
+                "duckdb sink",
+                &config.table_name,
+            ));
+        }
+        return Ok(true);
+    }
+    let mut columns = match (json_column, faucet_core::plan_columns(records)) {
+        (Some(_), _) => Vec::new(),
+        (None, Some(c)) => c,
+        (None, None) => return Ok(false),
+    };
+    let mut seen = HashSet::new();
+    columns.retain(|c| seen.insert(c.name.to_ascii_lowercase()));
+    let sql = build_create_table_sql(&config.table_name, &columns, json_column)?;
+    conn.execute_batch(&sql)
+        .map_err(|e| FaucetError::Sink(format!("duckdb CREATE TABLE failed: {e}")))?;
+    Ok(true)
+}
+
 impl DuckdbDriver {
-    /// Make sure the target table exists before the first write (#580).
-    ///
-    /// Synchronous: the DuckDB connection is already behind a `Mutex` and the
-    /// DDL is one statement, so hopping to `spawn_blocking` for it would cost
-    /// more than it saves.
-    fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+    /// Make sure the target table exists before the first write (#580), on
+    /// the blocking pool as one `ddl` call: the connection mutex may be held
+    /// by another page's transaction.
+    async fn ensure_table_ready(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
         use std::sync::atomic::Ordering;
         if self.table_ready.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let json_column = match &self.config.column_mapping {
-            DuckdbColumnMapping::AutoMap => None,
-            DuckdbColumnMapping::Json { column } => Some(column.as_str()),
-        };
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| FaucetError::Sink(format!("duckdb connection mutex poisoned: {e}")))?;
-
-        if !self.config.create_table {
-            if !table_exists(&guard, &self.config.table_name)? {
-                return Err(faucet_core::missing_target_error(
-                    "duckdb sink",
-                    &self.config.table_name,
-                ));
-            }
+        let config = self.config.clone();
+        let owned = records.to_vec();
+        let ready = self
+            .blocking(calls, "ddl", move |conn| {
+                prepare_table_blocking(conn, &config, &owned)
+            })
+            .await?;
+        if ready {
             self.table_ready.store(true, Ordering::Relaxed);
-            return Ok(());
         }
-
-        // AutoMap needs a page to infer from; a page with nothing inferable
-        // leaves the table uncreated so the next page can try.
-        let mut columns = match (json_column, faucet_core::plan_columns(records)) {
-            (Some(_), _) => Vec::new(),
-            (None, Some(c)) => c,
-            (None, None) => return Ok(()),
-        };
-        let mut seen = HashSet::new();
-        columns.retain(|c| seen.insert(c.name.to_ascii_lowercase()));
-        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column)?;
-        guard
-            .execute_batch(&sql)
-            .map_err(|e| FaucetError::Sink(format!("duckdb CREATE TABLE failed: {e}")))?;
-        drop(guard);
-        self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Run `f` on the connection on the blocking pool as one backend call; a
+    /// call the context cuts short interrupts the connection.
+    async fn blocking<T, F>(
+        &self,
+        calls: &CallSlot,
+        op: &'static str,
+        f: F,
+    ) -> Result<T, FaucetError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, FaucetError> + Send + 'static,
+    {
+        let conn = self.conn.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|e| FaucetError::Sink(format!("duckdb connection mutex poisoned: {e}")))?;
+            f(&guard)
+        });
+        calls
+            .call_once(op, async {
+                task.await
+                    .map_err(|e| FaucetError::Sink(format!("duckdb {op} task panicked: {e}")))?
+            })
+            .await
+            .inspect_err(|e| {
+                if matches!(
+                    e,
+                    FaucetError::Timeout { .. } | FaucetError::Cancelled { .. }
+                ) {
+                    self.interrupt.interrupt();
+                }
+            })
     }
 
     /// Write the whole page in one transaction on the blocking pool, as one
@@ -560,7 +605,7 @@ impl DuckdbDriver {
         if records.is_empty() {
             return Ok(0);
         }
-        self.ensure_table_ready(records)?;
+        self.ensure_table_ready(calls, records).await?;
         let conn = self.conn.clone();
         let config = self.config.clone();
         let owned = records.to_vec();
@@ -601,14 +646,13 @@ impl DuckdbDriver {
             self.write_all(calls, records).await?;
             return Ok(records.iter().map(|_| Ok(())).collect());
         }
-        self.ensure_table_ready(records)?;
-        let cols = {
-            let guard = self
-                .conn
-                .lock()
-                .map_err(|_| FaucetError::Sink("duckdb connection mutex poisoned".into()))?;
-            table_columns(&guard, &self.config.table_name)?.0
-        };
+        self.ensure_table_ready(calls, records).await?;
+        let table = self.config.table_name.clone();
+        let cols = self
+            .blocking(calls, "columns", move |conn| {
+                Ok(table_columns(conn, &table)?.0)
+            })
+            .await?;
         let (outcomes, writable) = split_unmatched(
             records,
             &self.config.table_name,
