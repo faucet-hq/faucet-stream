@@ -459,11 +459,17 @@ impl S3Source {
         // `response`), so a cleanly-truncated/corrupted transfer is rejected
         // rather than silently parsed as a complete object (#161).
         let mut checks: Vec<Box<dyn faucet_core::IntegrityCheck>> = Vec::new();
-        match crate::verify::length_check(response.content_length(), self.config.verify_length) {
+        match crate::verify::length_check_for(
+            response.content_length(),
+            response.content_encoding(),
+            self.config.verify_length,
+        ) {
             Some(check) => checks.push(check),
             None if self.config.verify_length => tracing::debug!(
                 key = %key,
-                "S3 object reports no Content-Length; length verification skipped"
+                content_encoding = ?response.content_encoding(),
+                "S3 object reports no Content-Length or a transcoded body; length verification \
+                 skipped"
             ),
             None => {}
         }
