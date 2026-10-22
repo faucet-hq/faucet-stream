@@ -6769,7 +6769,7 @@
           "type": "string"
         },
         "value": {
-          "description": "Metadata value, sent verbatim. Use `${env:…}` / `${secret:…}` for\ncredentials rather than inlining them.",
+          "description": "Metadata value, sent verbatim; for a `-bin` key, the base64 of the\nbytes to send. Use `${env:…}` / `${secret:…}` for credentials rather\nthan inlining them.",
           "type": "string"
         }
       },

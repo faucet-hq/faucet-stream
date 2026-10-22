@@ -745,6 +745,27 @@ fn apply_grpc_auth(
         }
         GrpcAuth::Metadata { entries } => {
             for entry in entries {
+                if entry.key.to_ascii_lowercase().ends_with("-bin") {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(entry.value.trim())
+                        .or_else(|_| {
+                            base64::engine::general_purpose::STANDARD_NO_PAD
+                                .decode(entry.value.trim())
+                        })
+                        .map_err(|e| {
+                            FaucetError::Auth(format!(
+                                "metadata key {:?} is binary, so its value must be base64: {e}",
+                                entry.key
+                            ))
+                        })?;
+                    let key = tonic::metadata::BinaryMetadataKey::from_bytes(entry.key.as_bytes())
+                        .map_err(|e| FaucetError::Auth(format!("invalid metadata key: {e}")))?;
+                    request.metadata_mut().append_bin(
+                        key,
+                        tonic::metadata::BinaryMetadataValue::from_bytes(&bytes),
+                    );
+                    continue;
+                }
                 let val: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = entry
                     .value
                     .parse()
@@ -754,7 +775,7 @@ fn apply_grpc_auth(
                         .key
                         .parse()
                         .map_err(|e| FaucetError::Auth(format!("invalid metadata key: {e}")))?;
-                request.metadata_mut().insert(key, val);
+                request.metadata_mut().append(key, val);
             }
         }
     }
@@ -943,6 +964,37 @@ impl Decoder for DynamicDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_metadata_must_be_base64() {
+        let auth = GrpcAuth::Metadata {
+            entries: vec![crate::config::MetadataEntry {
+                key: "trace-bin".into(),
+                value: "not base64!".into(),
+            }],
+        };
+        let mut request = tonic::Request::new(Vec::new());
+        let err = apply_grpc_auth(&auth, &mut request)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("base64"), "{err}");
+        let unpadded = GrpcAuth::Metadata {
+            entries: vec![crate::config::MetadataEntry {
+                key: "trace-bin".into(),
+                value: "AQ".into(),
+            }],
+        };
+        apply_grpc_auth(&unpadded, &mut request).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get_bin("trace-bin")
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            vec![1u8]
+        );
+    }
     use faucet_core::{AuthProvider, AuthReference, AuthSpec, Credential, FaucetError};
     use std::sync::Arc;
 

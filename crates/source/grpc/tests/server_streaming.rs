@@ -578,3 +578,31 @@ async fn an_empty_unary_response_yields_no_records() {
     let records = GrpcStream::new(config).unwrap().fetch_all().await.unwrap();
     assert!(records.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_keeps_repeated_keys_and_sends_binary_values() {
+    use faucet_source_grpc::config::{GrpcAuth, MetadataEntry};
+    let server = common::start_server().await;
+    let entry = |key: &str, value: &str| MetadataEntry {
+        key: key.into(),
+        value: value.into(),
+    };
+    let config = GrpcStreamConfig::new(
+        &server.endpoint,
+        "faucet.test.echo.EchoService",
+        "List",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 1 }))
+    .records_path("$.items[*]")
+    .auth(GrpcAuth::Metadata {
+        entries: vec![
+            entry("x-expect", "1"),
+            entry("x-tag", "a"),
+            entry("x-tag", "b"),
+            entry("trace-bin", "AQID"),
+        ],
+    });
+    let records = GrpcStream::new(config).unwrap().fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+}
