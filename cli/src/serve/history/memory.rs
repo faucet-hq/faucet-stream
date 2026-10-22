@@ -1435,11 +1435,16 @@ impl RunHistory for MemoryHistory {
                 tests.remove(id);
             }
         }
+        let mut proofs = self
+            .template_tag_evidence
+            .lock()
+            .map_err(|_| HistoryError::Backend("template evidence lock poisoned".into()))?;
         match version {
             None => {
                 tags.remove(id);
                 launches.remove(id);
                 retired.remove(id);
+                proofs.remove(id);
                 self.template_deprecations
                     .lock()
                     .map_err(|_| {
@@ -1460,10 +1465,25 @@ impl RunHistory for MemoryHistory {
                     }
                 }
                 if versions.is_empty() {
+                    // The last version: cascade exactly as a whole-template delete.
                     store.remove(id);
                     tags.remove(id);
                     launches.remove(id);
+                    proofs.remove(id);
+                    tests.remove(id);
+                    self.template_deprecations
+                        .lock()
+                        .map_err(|_| {
+                            HistoryError::Backend("template deprecation lock poisoned".into())
+                        })?
+                        .remove(id);
                 } else {
+                    if let Some(p) = proofs.get_mut(id) {
+                        p.retain(|_, (pointed, _)| *pointed != v);
+                        if p.is_empty() {
+                            proofs.remove(id);
+                        }
+                    }
                     if let Some(t) = tags.get_mut(id) {
                         // A channel must never dangle at a deleted version.
                         t.retain(|_, pointed| *pointed != v);
@@ -1860,6 +1880,48 @@ mod tests {
         assert_eq!(h.template_register(&draft).await.unwrap().version, 3);
         h.template_delete("orders", None).await.unwrap();
         assert_eq!(h.template_register(&draft).await.unwrap().version, 4);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_last_version_cascades_like_a_whole_delete() {
+        use crate::serve::history::templates::{
+            DeprecationRecord, TemplateDraft, TemplateId, TemplateStatus,
+        };
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        let draft = TemplateDraft {
+            id: TemplateId::parse("gone").unwrap(),
+            name: None,
+            description: None,
+            body: "version: 1\n".into(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+            kind: crate::hub::TemplateKind::Pipeline,
+        };
+        h.template_register(&draft).await.unwrap();
+        h.template_set_tag("gone", "dev", 1, None).await.unwrap();
+        h.template_tag_evidence
+            .lock()
+            .unwrap()
+            .entry("gone".into())
+            .or_default()
+            .insert("dev".into(), (1, "r1".into()));
+        let marker = DeprecationRecord {
+            deprecated_at: Utc::now(),
+            deprecated_by: None,
+            reason: None,
+        };
+        h.template_set_deprecation("gone", Some(&marker))
+            .await
+            .unwrap();
+        h.template_delete("gone", Some(1)).await.unwrap();
+        assert!(h.template_deprecation("gone").await.unwrap().is_none());
+        assert!(!h.template_tag_evidence.lock().unwrap().contains_key("gone"));
+        h.template_register(&draft).await.unwrap();
+        assert_ne!(
+            h.template_state("gone").await.unwrap().status,
+            TemplateStatus::Deprecated
+        );
     }
 
     use super::*;

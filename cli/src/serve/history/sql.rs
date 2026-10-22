@@ -5725,11 +5725,25 @@ macro_rules! impl_sql_history {
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_version)
+                        let deleted = sqlx::query(&self.stmts.template_delete_version)
                             .bind(id)
                             .bind(v.to_string())
                             .execute(&self.pool)
                             .await
+                            .map_err(backend)?;
+                        // The last version: the template-level deprecation goes too,
+                        // as a whole-template delete would remove it.
+                        if <Self as $crate::serve::history::RunHistory>::template_versions(self, id)
+                            .await?
+                            .is_empty()
+                        {
+                            sqlx::query(&self.stmts.template_delete_deprecation)
+                                .bind(id)
+                                .execute(&self.pool)
+                                .await
+                                .map_err(backend)?;
+                        }
+                        Ok(deleted)
                     }
                     None => {
                         for stmt in [

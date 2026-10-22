@@ -1059,6 +1059,28 @@ mod templates {
     }
 
     #[tokio::test]
+    async fn deleting_the_last_version_clears_the_deprecation_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-last-version.db").await;
+        s.template_register(&draft("gone", None)).await.unwrap();
+        let marker = DeprecationRecord {
+            deprecated_at: Utc::now(),
+            deprecated_by: None,
+            reason: None,
+        };
+        s.template_set_deprecation("gone", Some(&marker))
+            .await
+            .unwrap();
+        s.template_delete("gone", Some(1)).await.unwrap();
+        assert!(s.template_deprecation("gone").await.unwrap().is_none());
+        s.template_register(&draft("gone", None)).await.unwrap();
+        assert_ne!(
+            s.template_state("gone").await.unwrap().status,
+            TemplateStatus::Deprecated
+        );
+    }
+
+    #[tokio::test]
     async fn a_version_deprecation_round_trips_skips_newest_and_cascades_on_delete() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir, "tpl-version-deprecate.db").await;
