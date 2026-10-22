@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify};
 struct AppState {
     inbox: Mutex<Inbox>,
     max_payloads: Option<usize>,
+    max_buffered_bytes: usize,
     done: Notify,
     /// Optional shared secret required in the `Authorization` header.
     auth_token: Option<String>,
@@ -26,6 +27,7 @@ struct AppState {
 #[derive(Default)]
 struct Inbox {
     records: Vec<Value>,
+    bytes: usize,
     closed: bool,
 }
 
@@ -40,6 +42,7 @@ impl WebhookDriver {
         Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: self.config.max_payloads,
+            max_buffered_bytes: self.config.max_buffered_bytes,
             done: Notify::new(),
             auth_token: self.config.auth_token.clone(),
             signature: self.config.signature.clone(),
@@ -353,16 +356,19 @@ async fn webhook_handler(
     // — is refused with a retryable status rather than a `200` the sender
     // would read as delivered (API-14).
     let decision = decide_payload(inbox.records.len(), state.max_payloads);
-    if decision.done {
+    let over_bytes = state.max_buffered_bytes > 0
+        && inbox.bytes.saturating_add(body.len()) > state.max_buffered_bytes;
+    if decision.done || over_bytes {
         state.done.notify_one();
     }
-    if inbox.closed || !decision.accept {
+    if inbox.closed || !decision.accept || over_bytes {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS)],
         )
             .into_response();
     }
+    inbox.bytes += body.len();
     inbox.records.push(value);
     StatusCode::OK.into_response()
 }
@@ -481,9 +487,11 @@ mod tests {
         std::sync::Arc::new(super::AppState {
             inbox: tokio::sync::Mutex::new(super::Inbox {
                 records: Vec::new(),
+                bytes: 0,
                 closed,
             }),
             max_payloads,
+            max_buffered_bytes: 0,
             done: tokio::sync::Notify::new(),
             auth_token: None,
             signature: None,
@@ -653,6 +661,7 @@ mod tests {
         let state = Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: Some(max),
+            max_buffered_bytes: 0,
             done: Notify::new(),
             auth_token: None,
             signature: None,
@@ -700,6 +709,7 @@ mod tests {
         let state = Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: config.max_payloads,
+            max_buffered_bytes: config.max_buffered_bytes,
             done: Notify::new(),
             auth_token: config.auth_token.clone(),
             signature: None,
@@ -809,6 +819,7 @@ mod tests {
         let state = Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: Some(1),
+            max_buffered_bytes: 0,
             done: Notify::new(),
             auth_token: None,
             signature: None,

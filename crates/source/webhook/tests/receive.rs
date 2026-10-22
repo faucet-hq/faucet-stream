@@ -125,6 +125,37 @@ async fn payloads_over_the_cap_are_refused_not_acknowledged() {
     assert_eq!(records, vec![json!({"n": 1})]);
 }
 
+/// The window's buffered bytes are bounded: a POST that would cross
+/// `max_buffered_bytes` closes the window and is refused with a retryable
+/// status, and the payloads already stored are emitted.
+#[tokio::test]
+async fn buffered_bytes_are_bounded_per_window() {
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .max_buffered_bytes(30)
+            .timeout_secs(30),
+    );
+    let started = std::time::Instant::now();
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let body = r#"{"n":1,"pad":"xxxxxxxx"}"#;
+    let first = post_until_up(&client, &url, || client.post(&url).body(body)).await;
+    assert_eq!(first.status(), 200);
+    if let Ok(resp) = client.post(&url).body(body).send().await {
+        assert_eq!(resp.status(), 503);
+        assert!(resp.headers().contains_key("retry-after"));
+    }
+    let records = run.await.unwrap().unwrap();
+    assert_eq!(records, vec![json!({"n": 1, "pad": "xxxxxxxx"})]);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the bound ends the window"
+    );
+}
+
 /// API-49: an invalid path is a config error, not a router panic, and a
 /// substituted parent value is percent-encoded into one segment.
 #[tokio::test]

@@ -4,6 +4,9 @@ use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Default [`WebhookSourceConfig::max_buffered_bytes`]: 256 MiB.
+pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 256 * 1024 * 1024;
+
 /// Configuration for the webhook receiver source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -26,6 +29,11 @@ pub struct WebhookSourceConfig {
     /// POSTs are rejected with `413 Payload Too Large` so a single huge
     /// request can't exhaust memory.
     pub max_body_bytes: usize,
+    /// Most request-body bytes held in memory for one window (default:
+    /// 256 MiB). Once a POST would cross it the window closes, the payloads
+    /// already stored are emitted, and that POST and later ones are refused
+    /// with `503 Service Unavailable` + `Retry-After`. `0` removes the bound.
+    pub max_buffered_bytes: usize,
     /// Optional shared secret. When set, every request must carry it in the
     /// `Authorization` header (either the raw token or `Bearer <token>`);
     /// requests without it are rejected with `401 Unauthorized`. When `None`
@@ -156,6 +164,7 @@ impl Default for WebhookSourceConfig {
             max_payloads: None,
             timeout_secs: 30,
             max_body_bytes: 1024 * 1024,
+            max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
             auth_token: None,
             batch_size: DEFAULT_BATCH_SIZE,
             signature: None,
@@ -204,6 +213,12 @@ impl WebhookSourceConfig {
     /// Stop after receiving this many payloads.
     pub fn max_payloads(mut self, max: usize) -> Self {
         self.max_payloads = Some(max);
+        self
+    }
+
+    /// Set the most request-body bytes held in memory for one window.
+    pub fn max_buffered_bytes(mut self, bytes: usize) -> Self {
+        self.max_buffered_bytes = bytes;
         self
     }
 
