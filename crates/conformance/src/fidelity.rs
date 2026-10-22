@@ -380,6 +380,15 @@ pub fn assert_round_trip(sent: &[Value], landed: &[Value], tol: Tolerance) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integer_agrees_compares_large_unsigned_integers() {
+        let big = |v: u64| serde_json::Number::from(v);
+        assert!(integer_agrees(&big(u64::MAX), &big(u64::MAX)));
+        assert!(!integer_agrees(&big(u64::MAX), &big(u64::MAX - 1)));
+        // Past i64, a float landing is never an exact match.
+        let f = serde_json::Number::from_f64(1.8e19).unwrap();
+        assert!(!integer_agrees(&big(u64::MAX), &f));
+    }
     use super::*;
 
     #[test]
