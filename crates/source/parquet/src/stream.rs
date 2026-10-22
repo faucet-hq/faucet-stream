@@ -890,9 +890,11 @@ mod tests {
         let names = |targets: Vec<FileTarget>| -> Vec<String> {
             targets
                 .into_iter()
-                .map(|t| match t {
-                    FileTarget::S3(p) => p.to_string(),
-                    other => panic!("unexpected {other:?}"),
+                .map(|t| {
+                    t.display()
+                        .strip_prefix("s3://")
+                        .expect("an s3 target")
+                        .to_string()
                 })
                 .collect()
         };
