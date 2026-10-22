@@ -282,11 +282,20 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
             ctime_ns: ctime_ns(&meta),
         }]);
     }
-    walk(root, recursive, &mut out)?;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(std::fs::canonicalize(root).map_err(|e| io_err(root, e))?);
+    walk(root, recursive, &mut seen, &mut out)?;
     Ok(out)
 }
 
-fn walk(dir: &Path, recursive: bool, out: &mut Vec<Candidate>) -> Result<(), FaucetError> {
+/// List `dir`, descending into each real directory once: a symlink back to a
+/// directory already listed (an ancestor or a sibling) is skipped.
+fn walk(
+    dir: &Path,
+    recursive: bool,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    out: &mut Vec<Candidate>,
+) -> Result<(), FaucetError> {
     for entry in std::fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
         let entry = entry.map_err(|e| io_err(dir, e))?;
         let p = entry.path();
@@ -295,8 +304,8 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<Candidate>) -> Result<(), Fau
         }
         let meta = std::fs::metadata(&p).map_err(|e| io_err(&p, e))?;
         if meta.is_dir() {
-            if recursive {
-                walk(&p, recursive, out)?;
+            if recursive && seen.insert(std::fs::canonicalize(&p).map_err(|e| io_err(&p, e))?) {
+                walk(&p, recursive, seen, out)?;
             }
         } else if meta.is_file() {
             out.push(Candidate {
