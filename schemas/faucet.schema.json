@@ -20335,7 +20335,10 @@
                       "type": "string"
                     },
                     "query": {
-                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
+                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`.",
+                      "default": {
+                        "match_all": {}
+                      }
                     },
                     "scroll_timeout": {
                       "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",

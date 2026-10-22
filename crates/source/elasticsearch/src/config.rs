@@ -17,6 +17,7 @@ pub struct ElasticsearchSourceConfig {
     /// Index name to search.
     pub index: String,
     /// Elasticsearch query DSL. Defaults to `{"match_all": {}}`.
+    #[serde(default = "default_query")]
     pub query: Value,
     /// Scroll context keep-alive (e.g. `"5m"`), renewed by every scroll
     /// request — so it must outlast the slowest page *write* between two
@@ -49,6 +50,10 @@ pub struct ElasticsearchSourceConfig {
     /// half-open connection or a wedged node cannot hang a run forever.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+}
+
+fn default_query() -> Value {
+    json!({"match_all": {}})
 }
 
 fn default_batch_size() -> usize {
@@ -146,6 +151,21 @@ impl ElasticsearchSourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_defaults_to_match_all_when_omitted() {
+        let config: ElasticsearchSourceConfig = serde_json::from_value(json!({
+            "base_url": "http://localhost:9200",
+            "index": "i",
+            "auth": {"type": "none"}
+        }))
+        .unwrap();
+        assert_eq!(config.query, json!({"match_all": {}}));
+        let schema =
+            serde_json::to_value(schemars::schema_for!(ElasticsearchSourceConfig)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("query")), "{required:?}");
+    }
 
     #[test]
     fn default_config() {
