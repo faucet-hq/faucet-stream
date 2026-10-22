@@ -1355,7 +1355,7 @@ impl RunHistory for MemoryHistory {
             let all: Vec<u32> = versions.keys().copied().collect();
             (record, all)
         };
-        self.prune_template_versions(&record.id, all).await?;
+        self.prune_after_register(&record.id, all).await;
         Ok(record)
     }
 

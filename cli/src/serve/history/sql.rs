@@ -5596,8 +5596,13 @@ macro_rules! impl_sql_history {
                             }
                             // Bound the version history so a template
                             // re-registered on every deploy can't grow forever.
-                            let keep = self.template_versions(&id).await?;
-                            self.prune_template_versions(&id, keep).await?;
+                            match self.template_versions(&id).await {
+                                Ok(keep) => self.prune_after_register(&id, keep).await,
+                                Err(e) => tracing::warn!(
+                                    template = %id, error = %e,
+                                    "listing template versions for pruning failed; pruning skipped"
+                                ),
+                            }
                             return Ok(record);
                         }
                         Err(e) if attempt < sql::CLAIM_ATTEMPTS => {

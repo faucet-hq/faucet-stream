@@ -1898,6 +1898,17 @@ pub trait RunHistory: Send + Sync {
     /// Delete the versions of `id` past [`templates::VERSION_RETAIN`], keeping the
     /// launched version, the rollback target and every channel target, through
     /// the same cascade as [`template_delete`](Self::template_delete).
+    /// Prune after a registration that already committed: a failure skips
+    /// pruning this time (logged) rather than failing the registration.
+    async fn prune_after_register(&self, id: &str, versions: Vec<u32>) {
+        if let Err(e) = self.prune_template_versions(id, versions).await {
+            tracing::warn!(
+                template = %id, error = %e,
+                "pruning old template versions failed; they are kept until the next registration"
+            );
+        }
+    }
+
     async fn prune_template_versions(
         &self,
         id: &str,
@@ -1931,8 +1942,7 @@ pub trait RunHistory: Send + Sync {
                 kind: Some(crate::serve::changes::ChangeKind::TemplateLaunch),
                 ..Default::default()
             })
-            .await
-            .unwrap_or_default();
+            .await?;
         protected.extend(templates::launch_request_pins(
             pending.iter().map(|c| &c.payload),
             id,
@@ -2182,6 +2192,66 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    /// `Bare`, but its change list fails and template deletes are counted.
+    struct UnreadableChanges(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl RunHistory for UnreadableChanges {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: Duration,
+        ) -> Result<Claim, HistoryError> {
+            Bare.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError> {
+            Bare.upsert(rec).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError> {
+            Bare.get(id).await
+        }
+        async fn list(&self, filter: &ListFilter) -> Result<ListPage, HistoryError> {
+            Bare.list(filter).await
+        }
+        async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError> {
+            Bare.delete(id).await
+        }
+        async fn purge_expired(&self, r: Duration) -> Result<usize, HistoryError> {
+            Bare.purge_expired(r).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn change_list(
+            &self,
+            _filter: &crate::serve::changes::ChangeListFilter,
+        ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
+            Err(HistoryError::Backend("busy".into()))
+        }
+        async fn template_delete(&self, _id: &str, _v: Option<u32>) -> Result<usize, HistoryError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_never_runs_on_an_unreadable_change_list() {
+        let h = UnreadableChanges(std::sync::atomic::AtomicUsize::new(0));
+        let versions: Vec<u32> = (1..=(templates::VERSION_RETAIN as u32 + 5)).collect();
+        assert!(
+            h.prune_template_versions("t", versions.clone())
+                .await
+                .is_err()
+        );
+        h.prune_after_register("t", versions).await;
+        assert_eq!(h.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Only the required methods, over a memory store, so the default
