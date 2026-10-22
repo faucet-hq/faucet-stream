@@ -126,10 +126,10 @@ pub(crate) fn build_auto_map_payload(
 pub(crate) fn build_jsonb_payload(records: &[Value]) -> CopyPayload {
     let mut data = String::with_capacity(records.len() * 64);
     for record in records {
-        // `pg_bind_text` with a jsonb udt always yields the JSON text for
-        // non-null values; a JSON `null` record ships SQL NULL.
+        // A JSON `null` record is the JSON text `null`, as the INSERT path
+        // stores it.
         match pg_bind_text(Some(record), "jsonb") {
-            None => data.push_str("\\N"),
+            None => data.push_str("null"),
             Some(text) => encode_copy_text_field(&mut data, &text),
         }
         data.push('\n');
@@ -318,7 +318,7 @@ mod tests {
         // two-char sequences); COPY escaping then doubles those backslashes.
         assert_eq!(
             payload.data,
-            "{\"s\":\"tab\\\\there and back\\\\\\\\slash and\\\\nnewline\"}\n\\N\n\"bare string\"\n"
+            "{\"s\":\"tab\\\\there and back\\\\\\\\slash and\\\\nnewline\"}\nnull\n\"bare string\"\n"
         );
         assert_eq!(payload.rows, 3);
     }
