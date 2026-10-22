@@ -413,6 +413,8 @@ mod tests {
             .unwrap();
         metrics::with_local_recorder(&recorder, || {
             rt.block_on(em.emit(EventType::Start, &lifecycle()));
+            // An enabled event records a histogram beside the counters.
+            rt.block_on(em.emit(EventType::Complete, &lifecycle()));
         });
         let counters: Vec<(String, Vec<String>, u64)> = snap
             .snapshot()
