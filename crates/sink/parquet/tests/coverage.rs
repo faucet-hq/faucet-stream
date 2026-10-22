@@ -240,17 +240,10 @@ async fn doctor_check_probes_an_s3_destination_with_head_bucket() {
 }
 
 #[tokio::test]
-async fn doctor_check_skips_object_store_url_in_local_path() {
-    // An `s3://` URL that slipped into a LocalPath destination is treated as an
-    // object-store target and skipped, not mis-probed on the local FS.
+async fn a_url_in_a_local_path_is_refused() {
     let cfg = ParquetSinkConfig::local("s3://bucket/key.parquet");
-    let sink = ParquetSink::new(cfg).await.unwrap();
-    let report = sink.check(&CheckContext::default()).await.unwrap();
-    assert!(
-        matches!(report.probes[0].status, ProbeStatus::Skip { .. }),
-        "s3:// in a local path must be skipped, got {:?}",
-        report.probes[0].status
-    );
+    let err = ParquetSink::new(cfg).await.err().unwrap().to_string();
+    assert!(err.contains("is a URL"), "{err}");
 }
 
 #[tokio::test]
