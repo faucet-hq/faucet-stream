@@ -377,6 +377,7 @@ impl GraphqlDriver {
         let body: Value = faucet_core::send_with_reauth(self.auth_provider.as_ref(), |cred| {
             let payload = &payload;
             async move {
+                let shared = cred.is_some();
                 let mut req = self
                     .client
                     .post(&self.config.endpoint)
@@ -458,6 +459,14 @@ impl GraphqlDriver {
                         }
                     })
                     .await
+                    .and_then(|body| match unauthenticated_error(&body) {
+                        Some(message) if shared => Err(FaucetError::HttpStatus {
+                            status: 401,
+                            url: faucet_core::util::redact_uri_credentials(&self.config.endpoint),
+                            body: message,
+                        }),
+                        _ => Ok(body),
+                    })
             }
         })
         .await?;
@@ -1122,6 +1131,21 @@ impl CursorGuard {
         self.order.push_back(cursor.to_string());
         false
     }
+}
+
+/// The message of a GraphQL error reporting the request's credential as
+/// rejected (`extensions.code: UNAUTHENTICATED`), which a server answers with
+/// HTTP 200.
+fn unauthenticated_error(body: &Value) -> Option<String> {
+    body.get("errors")?.as_array()?.iter().find_map(|e| {
+        let code = e.pointer("/extensions/code")?.as_str()?;
+        code.eq_ignore_ascii_case("UNAUTHENTICATED").then(|| {
+            e.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("UNAUTHENTICATED")
+                .to_string()
+        })
+    })
 }
 
 #[cfg(test)]
