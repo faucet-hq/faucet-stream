@@ -1054,9 +1054,17 @@ async fn run_expanded_unredacted(
         // panic (surfaced as a JoinError, which doesn't carry the unit) can be
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
+        let mut not_run: HashSet<String> = HashSet::new();
         for mut unit in units {
             if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
-                break;
+                not_run.insert(unit.node.id.clone());
+                outcomes.push(synthetic_outcome(
+                    &unit.node.id,
+                    unit.parent_record_key.clone(),
+                    STOPPED_BEFORE_START.to_string(),
+                    InvocationErrorKind::Skipped,
+                ));
+                continue;
             }
             let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
             if let Some(gi) = overwrite_task_group.get(&group_key) {
@@ -1154,8 +1162,18 @@ async fn run_expanded_unredacted(
             let outcome = match joined {
                 Ok((_id, outcome)) => outcome,
                 Err(e) if e.is_cancelled() => {
-                    // Expected after abort_all() — cancelled before/at an await.
-                    // Not counted as a failure or a success.
+                    // Aborted after the flush grace: reported skipped, not failed.
+                    let (row_id, parent_record_key) = task_meta
+                        .get(&e.id())
+                        .cloned()
+                        .unwrap_or_else(|| ("<unknown>".to_string(), None));
+                    not_run.insert(row_id.clone());
+                    outcomes.push(synthetic_outcome(
+                        &row_id,
+                        parent_record_key,
+                        "skipped: aborted by `on_error: stop` before it finished".to_string(),
+                        InvocationErrorKind::Skipped,
+                    ));
                     continue;
                 }
                 Err(e) => {
@@ -1331,7 +1349,7 @@ async fn run_expanded_unredacted(
         // as "failed" overall if any of its invocations failed).
         for id in ready {
             remaining.remove(&id);
-            if nodes_with_any_failure.contains(&id) {
+            if nodes_with_any_failure.contains(&id) || not_run.contains(&id) {
                 skipped_subtrees.insert(id.clone());
                 // Cascade to descendants in case we have multi-level chains.
                 if let Some(children) = children_of.get(&id) {
@@ -1346,7 +1364,14 @@ async fn run_expanded_unredacted(
 
         if had_level_failure && matches!(on_error, OnError::Stop) {
             tracing::error!("on_error: stop — aborting after first failure");
-            // Any unfinished work surfaces as "skipped"; we just break here.
+            for id in bfs_order.iter().filter(|id| remaining.contains(*id)) {
+                outcomes.push(synthetic_outcome(
+                    id,
+                    None,
+                    STOPPED_BEFORE_START.to_string(),
+                    InvocationErrorKind::Skipped,
+                ));
+            }
             break;
         }
     }
@@ -1355,6 +1380,9 @@ async fn run_expanded_unredacted(
         invocations: outcomes,
     })
 }
+
+const STOPPED_BEFORE_START: &str =
+    "skipped: `on_error: stop` ended the run before this row started";
 
 /// One scheduled invocation — a root runs once, a child runs once per parent
 /// record. Built by the level loop, consumed by [`run_unit`].
@@ -6366,6 +6394,54 @@ execution:
                 "a good that wrote records must have produced its output file"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn on_error_stop_reports_every_row_that_did_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let good_csv = dir.path().join("good.csv");
+        std::fs::write(&good_csv, "x\n1\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {good_csv} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}, append: true }} }}
+matrix:
+  - id: bad
+    sink: {{ config: {{ path: {bad_dir} }} }}
+  - id: good
+  - id: next
+    depends_on: [good]
+  - id: child
+    parent: good
+execution:
+  max_concurrent: 1
+  on_error: stop
+"#,
+            good_csv = good_csv.display(),
+            out = dir.path().join("out.jsonl").display(),
+            bad_dir = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut opts = ExecuteOptions::for_tests("stopall");
+        opts.execution = cfg.execution.clone();
+        let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+        let mut ids: Vec<&str> = summary
+            .invocations
+            .iter()
+            .map(|o| o.row_id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["bad", "child", "good", "next"], "{summary:?}");
+        for row in ["next", "child"] {
+            let o = summary
+                .invocations
+                .iter()
+                .find(|o| o.row_id == row)
+                .unwrap();
+            assert_eq!(o.error_kind, Some(InvocationErrorKind::Skipped), "{o:?}");
+        }
+        assert!(summary.skipped_count() >= 2);
     }
 
     #[tokio::test]
