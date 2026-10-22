@@ -17,7 +17,7 @@ transform <name>` lists every key.
 
 | Kind | Purpose | Shape |
 |---|---|---|
-| `flatten` | Collapse nested objects to a flat record | `separator` |
+| `flatten` | Collapse nested objects to a flat record (an empty nested object stays as `{}` under its key) | `separator` |
 | `rename_keys` | Regex rename of every key, recursively | `pattern`, `replacement` |
 | `keys_case` | Re-case every key (snake / camel / pascal / kebab / screaming_snake / dot) | `mode` |
 | `spell_symbols` | Spell out symbols in keys (`%` → `percent`, `#` → `number`, …) | `extra`, `separator` |

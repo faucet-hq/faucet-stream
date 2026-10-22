@@ -1558,7 +1558,7 @@ fn flatten_into(
     out: &mut Map<String, Value>,
 ) -> Result<(), FaucetError> {
     match value {
-        Value::Object(map) => {
+        Value::Object(map) if !map.is_empty() || prefix.is_empty() => {
             for (k, v) in map {
                 let key = if prefix.is_empty() {
                     k
@@ -2614,6 +2614,26 @@ mod tests {
         );
         assert_eq!(result["tags"], json!(["rust", "api"]));
         assert_eq!(result["meta.count"], 2);
+    }
+
+    #[cfg(feature = "transform-flatten")]
+    #[test]
+    fn test_flatten_keeps_empty_nested_objects() {
+        let record = json!({"id": 1, "meta": {}, "a": {"b": {}, "c": 1}});
+        let result = apply_all(
+            record,
+            &compiled(&[RecordTransform::Flatten {
+                separator: ".".into(),
+            }]),
+        );
+        assert_eq!(result, json!({"id": 1, "meta": {}, "a.b": {}, "a.c": 1}));
+        let empty = apply_all(
+            json!({}),
+            &compiled(&[RecordTransform::Flatten {
+                separator: ".".into(),
+            }]),
+        );
+        assert_eq!(empty, json!({}));
     }
 
     #[cfg(feature = "transform-flatten")]
