@@ -443,6 +443,7 @@ mod tests {
         assert_eq!(canonical_number("100").as_deref(), Some("1e2"));
         assert_eq!(canonical_number("-0.0").as_deref(), Some("0"));
         assert_eq!(canonical_number("-2.").as_deref(), Some("-2e0"));
+        assert_eq!(canonical_number("+2.50").as_deref(), Some("25e-1"));
         assert!(canonical_number("x").is_none());
         assert!(canonical_number(".").is_none());
         // A request DynamoDB hands back with the number re-rendered still
