@@ -122,6 +122,61 @@ impl RedisDriver {
         }
         Ok(())
     }
+
+    /// Pipeline `commands` in `batch_size` chunks, reporting each command's
+    /// error. A chunk whose call fails leaves its outcome unknown, so it and
+    /// every later command fail; when that is the first chunk nothing was
+    /// applied and the call's error is returned.
+    async fn run_commands_partial(
+        &self,
+        calls: &CallSlot,
+        commands: &[Vec<String>],
+    ) -> Result<Vec<Option<FaucetError>>, FaucetError> {
+        let mut conn = self.conn.clone();
+        let chunk = if self.config.batch_size == 0 {
+            commands.len().max(1)
+        } else {
+            self.config.batch_size
+        };
+        let mut out: Vec<Option<FaucetError>> = Vec::with_capacity(commands.len());
+        for (n, group) in commands.chunks(chunk).enumerate() {
+            let mut pipe = redis::pipe();
+            pipe.ignore_errors();
+            for args in group {
+                let mut cmd = redis::Cmd::new();
+                for a in args {
+                    cmd.arg(a);
+                }
+                pipe.add_command(cmd);
+            }
+            let results = calls
+                .call_once("pipeline", async {
+                    pipe.query_async::<Vec<redis::RedisResult<redis::Value>>>(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("Redis pipeline execution failed: {e}"))
+                        })
+                })
+                .await;
+            match results {
+                Ok(results) => out.extend(results.into_iter().map(|r| {
+                    r.err()
+                        .map(|e| FaucetError::Sink(format!("Redis command failed: {e}")))
+                })),
+                Err(e) if n == 0 => return Err(e),
+                Err(e) => {
+                    let msg = e.to_string();
+                    out.resize_with(commands.len(), || {
+                        Some(FaucetError::Sink(format!(
+                            "{msg} (the command may have been applied)"
+                        )))
+                    });
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -203,17 +258,29 @@ impl SinkDriver for RedisDriver {
             return Ok(PageWrite::accepted(records.len()));
         }
         let mut failed = Vec::new();
+        let mut positions = Vec::with_capacity(records.len());
         let mut commands = Vec::with_capacity(records.len());
         for (i, r) in records.iter().enumerate() {
             match self.command(r) {
-                Ok(c) => commands.push(c),
+                Ok(c) => {
+                    positions.push(i);
+                    commands.push(c);
+                }
                 Err(e) => failed.push((i, e)),
             }
         }
+        let mut written = 0;
         if !commands.is_empty() {
-            self.run_commands(calls, &commands).await?;
+            let errors = self.run_commands_partial(calls, &commands).await?;
+            for (pos, e) in positions.into_iter().zip(errors) {
+                match e {
+                    None => written += 1,
+                    Some(e) => failed.push((pos, e)),
+                }
+            }
         }
-        Ok(PageWrite::accepted(commands.len()).with_failures(failed))
+        failed.sort_by_key(|(i, _)| *i);
+        Ok(PageWrite::accepted(written).with_failures(failed))
     }
 
     fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {

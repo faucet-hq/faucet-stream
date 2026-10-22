@@ -386,3 +386,30 @@ async fn a_pipeline_the_server_rejects_names_the_failure() {
         .to_string();
     assert!(err.contains("Redis pipeline execution failed"), "{err}");
 }
+
+/// Per-row: a command the server rejects fails its row; the call still
+/// returns per-row outcomes rather than failing the whole page.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_command_fails_only_its_row() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let _: () = conn.set("taken-pr", "a string").await.unwrap();
+    let mut cfg = RedisSinkConfig::new(
+        &url,
+        RedisSinkType::List {
+            key: "taken-pr".into(),
+        },
+    );
+    cfg.batch_size = 1;
+    let sink = RedisSink::new(cfg).await.expect("sink build");
+    let outcomes = sink
+        .write_batch_partial(&[json!({"a": 1}), json!({"a": 2})])
+        .await
+        .expect("per-row outcomes");
+    for o in &outcomes {
+        let err = o.as_ref().unwrap_err().to_string();
+        assert!(err.contains("WRONGTYPE"), "{err}");
+    }
+    let still: String = conn.get("taken-pr").await.unwrap();
+    assert_eq!(still, "a string");
+}
