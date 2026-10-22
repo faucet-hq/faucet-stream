@@ -652,6 +652,33 @@ mod tests {
         ]))
     }
 
+    /// A file column whose physical type cannot become the table's is
+    /// refused, naming the column, the file and both types.
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn a_file_column_that_cannot_cast_to_the_table_type_is_refused() {
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
+        let inner = Arc::new(Field::new("x", DataType::Int64, true));
+        let st = StructArray::from(vec![(
+            inner.clone(),
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        )]);
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Struct(vec![inner].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(file_schema, vec![Arc::new(st) as ArrayRef]).unwrap();
+        let table = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let e = conform_to_table(batch, &table, None, &"part-0.parquet")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("column 'id'") && e.contains("part-0.parquet") && e.contains("Int64"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn partition_values_come_from_the_log_typed_by_the_schema() {
         let s = schema();
