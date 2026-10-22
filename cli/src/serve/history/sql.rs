@@ -855,6 +855,8 @@ pub struct Stmts {
     pub change_select: String,
     pub change_transition: String,
     pub change_transition_from: String,
+    /// Row-lock one change request for a compare-and-set. Param: id.
+    pub change_lock: String,
     pub change_delete: String,
     pub usage_delete_run: String,
     pub usage_delete_tenant: String,
@@ -1531,6 +1533,7 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body, tenant=excluded.tenant"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
+            change_lock: "UPDATE faucet_serve_changes SET id=id WHERE id=$1".into(),
             change_transition: "UPDATE faucet_serve_changes SET status=$1, expires_at=$2, \
                 body=$3 WHERE id=$4 AND status=$5"
                 .into(),
@@ -2090,6 +2093,7 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body, tenant=excluded.tenant"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
+            change_lock: "UPDATE faucet_serve_changes SET id=id WHERE id=?".into(),
             change_transition: "UPDATE faucet_serve_changes SET status=?, expires_at=?, \
                 body=? WHERE id=? AND status=?"
                 .into(),
@@ -5364,18 +5368,40 @@ macro_rules! impl_sql_history {
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                // The stored body is the encoding of the version the caller
-                // read, so comparing it is a compare-and-set on the whole row.
-                let done = sqlx::query(&self.stmts.change_transition_from)
+                use sqlx::Row as _;
+                // Compare-and-set on what identifies the version the caller
+                // read (status + `updated_at`), not on the encoded body text,
+                // which another binary version may render differently.
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                sqlx::query(&self.stmts.change_lock)
+                    .bind(&change.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = sqlx::query(&self.stmts.change_select)
+                    .bind(&change.id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                else {
+                    return Ok(false);
+                };
+                let body: String = row.try_get("body").map_err(backend)?;
+                let stored: $crate::serve::changes::ChangeRequest =
+                    sql::decode_json(&body, "change request")?;
+                if stored.status != before.status || stored.updated_at != before.updated_at {
+                    return Ok(false);
+                }
+                let done = sqlx::query(&self.stmts.change_transition)
                     .bind(change.status.as_str())
                     .bind(sql::fmt_ts(change.expires_at))
                     .bind(sql::encode_json(change, "change request")?)
                     .bind(&change.id)
                     .bind(before.status.as_str())
-                    .bind(sql::encode_json(before, "change request")?)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
                 Ok(done.rows_affected() == 1)
             }
 

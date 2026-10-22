@@ -1637,6 +1637,27 @@ async fn change_requests_round_trip_and_filter() {
     second.reason = Some("carol approved".into());
     assert!(!store.change_transition_from(&second, &read).await.unwrap());
     assert!(store.change_transition_from(&second, &first).await.unwrap());
+    // A body another binary version rendered differently (an extra field this
+    // one does not know) still matches the version the caller read.
+    {
+        use sqlx::Connection as _;
+        let url = format!("sqlite:{}", dir.path().join("changes.db").display());
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        let body: String = sqlx::query_scalar("SELECT body FROM faucet_serve_changes WHERE id='p'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        doc["from_a_newer_binary"] = serde_json::json!(true);
+        sqlx::query("UPDATE faucet_serve_changes SET body=? WHERE id='p'")
+            .bind(doc.to_string())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let mut third = second.clone();
+    third.reason = Some("dave approved".into());
+    assert!(store.change_transition_from(&third, &second).await.unwrap());
     assert!(store.change_delete("p").await.unwrap());
     store
         .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
