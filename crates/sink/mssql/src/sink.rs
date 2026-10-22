@@ -527,7 +527,12 @@ impl MssqlDriver {
     /// the connection closes (SQL-37). Swap in a fresh connection so the stale
     /// one closes now and the server rolls its transaction back.
     async fn recover_desynced(&self, conn: &mut MssqlPooledConnection<'_>) {
-        if let Err(e) = faucet_common_mssql::replace_connection(&self.config.connection, conn).await
+        if let Err(e) = faucet_common_mssql::replace_connection_within(
+            &self.config.connection,
+            conn,
+            &self.calls.get(),
+        )
+        .await
         {
             tracing::error!(error = %e, "MSSQL: could not replace a timed-out connection");
             self.poisoned

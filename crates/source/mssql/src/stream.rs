@@ -85,7 +85,12 @@ impl MssqlSource {
     /// Replace a connection a cut-short statement left desynced, so the pool
     /// never hands it out again.
     async fn recover(&self, conn: &mut faucet_common_mssql::MssqlPooledConnection<'_>) {
-        if let Err(e) = faucet_common_mssql::replace_connection(&self.config.connection, conn).await
+        if let Err(e) = faucet_common_mssql::replace_connection_within(
+            &self.config.connection,
+            conn,
+            &self.calls.get(),
+        )
+        .await
         {
             tracing::warn!(error = %e, "MSSQL: could not replace a desynced connection");
         }
