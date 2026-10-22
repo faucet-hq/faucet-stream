@@ -540,6 +540,16 @@ pub async fn migrate_state_key(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_parent_keys_tag_null_and_arrays() {
+        let inv = || StateKey::invocation("p", "r");
+        let null = inv().with_parent_value(&json!(null)).render();
+        assert!(null.starts_with("p::r::_z."), "{null}");
+        let arr = inv().with_parent_value(&json!([1])).render();
+        assert!(arr.starts_with("p::r::_a."), "{arr}");
+        assert_ne!(null, arr);
+        crate::state::validate_state_key(&arr).unwrap();
+    }
     use super::*;
     use crate::state::MemoryStateStore;
     use serde_json::json;

@@ -799,17 +799,25 @@ mod tests {
         assert_eq!(path_get(&v, "Header.ColData[9].value"), None);
     }
 
+    fn page_fn(stage: TransformStage) -> Option<crate::stage::PageFnBox> {
+        match stage {
+            TransformStage::PageFn(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn page_fn_is_none_for_a_record_stage() {
+        let custom = TransformStage::Custom(Arc::new(|v| vec![v]));
+        assert!(page_fn(custom).is_none());
+    }
+
     #[test]
     fn into_stage_fails_the_page_instead_of_passing_an_unflattenable_record_through() {
-        let stage = spec().into_stage().unwrap();
-        let TransformStage::PageFn(f) = stage else {
-            panic!("expected a page stage")
-        };
+        let f = page_fn(spec().into_stage().unwrap()).expect("a page stage");
         let mut shallow = spec();
         shallow.max_depth = 1;
-        let TransformStage::PageFn(g) = shallow.into_stage().unwrap() else {
-            panic!("expected a page stage")
-        };
+        let g = page_fn(shallow.into_stage().unwrap()).expect("a page stage");
         assert!(f(vec![nested_rows_report()]).is_ok());
         let err = g(vec![nested_rows_report()]).unwrap_err().to_string();
         assert!(err.contains("max_depth") || err.contains("deeper"), "{err}");

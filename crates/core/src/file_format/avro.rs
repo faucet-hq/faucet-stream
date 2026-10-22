@@ -1378,6 +1378,12 @@ pub(crate) fn read_batches_checked<R: std::io::Read>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn union_branch_rank_matches_an_array_to_an_array_branch() {
+        let arr = Schema::parse_str(r#"{"type":"array","items":"long"}"#).unwrap();
+        assert_eq!(union_branch_rank(&serde_json::json!([1]), &arr), 0);
+        assert_eq!(union_branch_rank(&serde_json::json!(true), &arr), 1);
+    }
     use super::*;
 
     /// #862 L-034: a complex-union value stringified for an Arrow column is

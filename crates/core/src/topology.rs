@@ -3714,13 +3714,19 @@ mod tests {
             trip.cancel();
         });
         let (sink, store) = CollectSink::new();
+        let source = DrainingSource {
+            token: Mutex::new(None),
+        };
+        // The buffered read is empty: only the stream carries records.
+        assert!(
+            source
+                .fetch_with_context(&std::collections::HashMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let topo = Topology::builder()
-            .source(
-                "s",
-                Box::new(DrainingSource {
-                    token: Mutex::new(None),
-                }),
-            )
+            .source("s", Box::new(source))
             .transform("t", Vec::new())
             .sink("k", Box::new(sink))
             .edge("s", "t")

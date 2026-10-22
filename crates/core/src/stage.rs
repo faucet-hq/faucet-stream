@@ -1267,6 +1267,12 @@ fn apply_one_stage(rec: Value, stage: &CompiledStage) -> Result<Vec<Value>, Fauc
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "transform-filter")]
+    #[test]
+    fn json_eq_compares_two_non_integers_by_value() {
+        assert!(json_eq(&json!(1.5), &json!(1.5)));
+        assert!(!json_eq(&json!(1.5), &json!(2.5)));
+    }
     use super::*;
     use crate::transform::KeyCaseMode;
     use serde_json::json;

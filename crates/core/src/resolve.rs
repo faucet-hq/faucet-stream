@@ -1127,6 +1127,14 @@ pub fn sandbox_fields(schema: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_part_reads_bare_and_relative_file_authorities() {
+        assert_eq!(local_part("file://localhost"), Some(""));
+        assert_eq!(local_part("file://"), Some(""));
+        assert_eq!(local_part("file://./data/x"), Some("./data/x"));
+        assert_eq!(local_part("file://../x"), Some("../x"));
+        assert_eq!(local_part("file://host/x"), None);
+    }
     use super::*;
     use serde_json::json;
 

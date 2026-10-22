@@ -380,6 +380,17 @@ fn nearest_operator_right(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strict_comparison_handles_an_empty_token_a_leading_token_and_non_comparisons() {
+        let t = "${bookmark}";
+        assert!(!strict_comparison("ts > 1", ""));
+        // Nothing precedes the token: the left side has no operator.
+        assert!(strict_comparison("${bookmark} < ts", t));
+        assert!(!strict_comparison("(${bookmark}) <= ts", t));
+        // `->>` and `--` after the token are not comparisons.
+        assert!(strict_comparison("WHERE ${bookmark}->>'a' < 5", t));
+        assert!(!strict_comparison("WHERE ts >= ${bookmark} -- note", t));
+    }
     use super::*;
     use serde_json::json;
 
