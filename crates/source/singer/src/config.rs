@@ -125,25 +125,34 @@ impl SingerSourceConfig {
     /// The derived key is sanitized so a path-style `executable` (e.g.
     /// `/opt/taps/tap-csv`) still yields a valid state key — `validate_state_key`
     /// only permits `[A-Za-z0-9_\-:.]`, so any other character (notably `/`) is
-    /// replaced with `_`.
+    /// replaced with `_`. The stream name is sanitized the same way (keeping
+    /// `:`), so `Sheet 1` or `public/orders` derive a usable key while every
+    /// already-valid name keeps its key.
     pub fn effective_state_key(&self) -> String {
-        self.state_key
-            .clone()
-            .unwrap_or_else(|| format!("singer:{}:{}", sanitize(&self.executable), self.stream))
+        self.state_key.clone().unwrap_or_else(|| {
+            format!(
+                "singer:{}:{}",
+                sanitize(&self.executable),
+                self.stream
+                    .chars()
+                    .map(|c| if c == ':' { c } else { sanitize_char(c) })
+                    .collect::<String>()
+            )
+        })
     }
 }
 
 /// Replace characters not allowed in a state key with `_`.
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    s.chars().map(sanitize_char).collect()
+}
+
+fn sanitize_char(c: char) -> char {
+    if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+        c
+    } else {
+        '_'
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +190,19 @@ mod tests {
         assert_eq!(key, "singer:_opt_taps_tap-csv:s");
         // must satisfy the core state-key validator
         faucet_core::state::validate_state_key(&key).expect("derived key must be valid");
+    }
+
+    #[test]
+    fn derived_state_key_is_valid_for_any_stream_name() {
+        for (stream, key) in [
+            ("Sheet 1", "singer:tap-x:Sheet_1"),
+            ("public/orders", "singer:tap-x:public_orders"),
+            ("a:b.c-d_e", "singer:tap-x:a:b.c-d_e"),
+        ] {
+            let got = SingerSourceConfig::new("tap-x", stream).effective_state_key();
+            assert_eq!(got, key);
+            faucet_core::state::validate_state_key(&got).expect("derived key must be valid");
+        }
     }
 
     #[test]
