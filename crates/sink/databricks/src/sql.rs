@@ -1241,6 +1241,8 @@ mod tests {
     #[test]
     fn describe_and_decode() {
         assert!(describe_sql(Some("main")).contains("FROM `main`.information_schema.columns"));
+        assert!(staging_tables_sql(Some("main")).contains("FROM `main`.information_schema.tables"));
+        assert!(staging_tables_sql(None).contains("FROM information_schema.tables"));
         assert!(describe_sql(None).contains("FROM information_schema.columns"));
         let got = columns_from_rows(vec![
             vec![
