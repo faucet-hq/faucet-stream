@@ -43,7 +43,10 @@ fn thousandths(metric: &'static str, r: &UsageRecord, amount: f64) -> u64 {
         r.cost.currency.clone(),
     );
     let mut guard = CARRY.lock().unwrap_or_else(|e| e.into_inner());
-    let carry = guard.get_or_insert_with(HashMap::new).entry(key).or_insert(0.0);
+    let carry = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert(0.0);
     take_thousandths(carry, amount)
 }
 
@@ -139,7 +142,10 @@ mod tests {
         for _ in 0..100 {
             total += super::take_thousandths(&mut carry, 0.00004);
         }
-        assert!(total >= 3, "100 runs of 0.04 thousandths add up, got {total}");
+        assert!(
+            total >= 3,
+            "100 runs of 0.04 thousandths add up, got {total}"
+        );
         assert!((total as f64 + carry - 4.0).abs() < 1e-9);
     }
 
@@ -149,7 +155,10 @@ mod tests {
         let counted: u64 = (0..5)
             .map(|_| super::take_thousandths(&mut carry, 0.0014))
             .sum();
-        assert!(counted >= 6, "rounding per run would count 5, got {counted}");
+        assert!(
+            counted >= 6,
+            "rounding per run would count 5, got {counted}"
+        );
         assert!((counted as f64 + carry - 7.0).abs() < 1e-9);
     }
 

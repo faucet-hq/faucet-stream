@@ -90,11 +90,7 @@ pub fn evaluate_failure(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<
 /// Staleness for a **successful** run that arrives more than
 /// `max_staleness_secs` after the previous success: the data was stale until
 /// now, even though this run succeeded.
-pub fn evaluate_late_success(
-    spec: &SlaSpec,
-    prior: &SlaState,
-    now_unix: i64,
-) -> Vec<SlaViolation> {
+pub fn evaluate_late_success(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<SlaViolation> {
     staleness(spec, prior, now_unix)
 }
 

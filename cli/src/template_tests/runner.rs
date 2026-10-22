@@ -298,8 +298,7 @@ pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
         return name == pat;
     }
     let (first, last) = (parts[0], parts[parts.len() - 1]);
-    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last)
-    {
+    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last) {
         return false;
     }
     let mut rest = &name[first.len()..name.len() - last.len()];

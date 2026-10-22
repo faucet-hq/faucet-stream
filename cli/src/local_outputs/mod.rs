@@ -62,8 +62,8 @@ pub mod spec;
 pub mod sweep;
 
 pub use ledger::{
-    FileIdentity, LocalOutputFilter, LocalOutputObservation, LocalOutputRecord, LocalOutputState, SkipReason,
-    SweepOutcome, SweepReport, SweepScope,
+    FileIdentity, LocalOutputFilter, LocalOutputObservation, LocalOutputRecord, LocalOutputState,
+    SkipReason, SweepOutcome, SweepReport, SweepScope,
 };
 pub use record::{RecordContext, record};
 pub use spec::LocalOutputsSpec;
@@ -88,7 +88,10 @@ pub fn local_host() -> Option<String> {
         .clone()
 }
 
-fn resolve_host(configured: Option<String>, system: impl FnOnce() -> Option<String>) -> Option<String> {
+fn resolve_host(
+    configured: Option<String>,
+    system: impl FnOnce() -> Option<String>,
+) -> Option<String> {
     match configured.map(|v| v.trim().to_string()) {
         Some(id) if !id.is_empty() => Some(id),
         _ => system(),
@@ -127,8 +130,14 @@ mod tests {
 
     #[test]
     fn an_empty_or_missing_host_id_falls_back_to_the_host_name() {
-        assert_eq!(resolve_host(Some("  ".into()), || Some("pod".into())), Some("pod".into()));
-        assert_eq!(resolve_host(None, || Some("pod".into())), Some("pod".into()));
+        assert_eq!(
+            resolve_host(Some("  ".into()), || Some("pod".into())),
+            Some("pod".into())
+        );
+        assert_eq!(
+            resolve_host(None, || Some("pod".into())),
+            Some("pod".into())
+        );
         assert_eq!(resolve_host(None, || None), None);
     }
 }

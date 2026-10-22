@@ -172,8 +172,7 @@ mod tests {
             .local_output_list(&LocalOutputFilter::default())
             .await
             .unwrap();
-        let expected =
-            crate::local_outputs::FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        let expected = crate::local_outputs::FileIdentity::of(&std::fs::metadata(&path).unwrap());
         assert!(expected.is_some());
         assert_eq!(rows[0].file_id, expected);
     }

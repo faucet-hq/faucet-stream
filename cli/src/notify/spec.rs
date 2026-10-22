@@ -512,13 +512,19 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("`X Api Key` is not a valid HTTP header name"), "{err}");
+        assert!(
+            err.contains("`X Api Key` is not a valid HTTP header name"),
+            "{err}"
+        );
         let err = with(&|c| {
             c.headers.insert("X-Key".into(), "a\nb".into());
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("header `X-Key` is not a valid HTTP header value"), "{err}");
+        assert!(
+            err.contains("header `X-Key` is not a valid HTTP header value"),
+            "{err}"
+        );
         let err = with(&|c| c.signature_header = "Bad Header".into())
             .unwrap_err()
             .to_string();

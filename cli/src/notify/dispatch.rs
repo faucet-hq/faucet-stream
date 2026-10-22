@@ -711,9 +711,7 @@ mod tests {
         n.emit(NotifyEvent::sla_breach("p", "r1", "min_rows", "m"))
             .await;
         let out = n
-            .emit_report(
-                NotifyEvent::run_success("p", "r1", 1).keeping_open(EventKind::SlaBreach),
-            )
+            .emit_report(NotifyEvent::run_success("p", "r1", 1).keeping_open(EventKind::SlaBreach))
             .await;
         assert_eq!(out.len(), 1, "only the failure key is resolved: {out:?}");
         assert_eq!(n.open_incident_count(), 1, "the SLA incident stays open");

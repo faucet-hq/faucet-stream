@@ -85,8 +85,7 @@ pub async fn evaluate_post_run(
             let mut violations = eval::evaluate_success(spec, &history, rows);
             violations.extend(eval::evaluate_late_success(spec, &history, now_unix));
             if let Some(s) = store {
-                match record_success_cas(s.as_ref(), &key, raw, rows, now_unix, spec.window())
-                    .await
+                match record_success_cas(s.as_ref(), &key, raw, rows, now_unix, spec.window()).await
                 {
                     Ok(updated) => {
                         metrics::set_baseline_runs(pipeline, row, updated.volumes.len());
@@ -268,10 +267,17 @@ mod tests {
 
     #[faucet_core::async_trait]
     impl StateStore for RacingStore {
-        async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, faucet_core::FaucetError> {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<serde_json::Value>, faucet_core::FaucetError> {
             self.inner.get(key).await
         }
-        async fn put(&self, key: &str, value: &serde_json::Value) -> Result<(), faucet_core::FaucetError> {
+        async fn put(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> Result<(), faucet_core::FaucetError> {
             self.inner.put(key, value).await
         }
         async fn delete(&self, key: &str) -> Result<(), faucet_core::FaucetError> {

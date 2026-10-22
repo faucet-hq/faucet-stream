@@ -631,8 +631,7 @@ mod tests {
             resp.extend_from_slice(&body);
             resp
         });
-        let endpoint =
-            scripted_collector(std::sync::Arc::new(respond), Default::default()).await;
+        let endpoint = scripted_collector(std::sync::Arc::new(respond), Default::default()).await;
         let ex = OtlpLogExporter::new(&OtelConfig {
             endpoint,
             protocol: OtelProtocol::Http,
