@@ -79,10 +79,13 @@ sink writes item by item (still `concurrency`-bounded). A failed condition is
 skipped by default, which makes re-delivery idempotent with conditions like
 `attribute_not_exists(pk)` or `attribute_not_exists(pk) OR #v < :v`.
 
-With `on_condition_failure: fail`, a condition that fails on a retry after an
-attempt whose response was lost (a transport failure or an unreadable reply) is
-checked with a consistent `GetItem`: when the item already equals the put item
-(or a deleted key is gone), the earlier attempt landed and the row succeeds.
+A conditional write is retried only by the sink's own retry loop (the AWS SDK's
+built-in retries are turned off for it), so the sink always knows when an
+earlier attempt's outcome was unknown: a transport failure, an unreadable reply,
+or an internal server error. With `on_condition_failure: fail`, a condition
+that then fails on the retry is checked with a consistent `GetItem`: when the
+item already equals the put item (or a deleted key is gone), the earlier
+attempt landed and the row succeeds; otherwise the row fails.
 
 ## Preflight
 

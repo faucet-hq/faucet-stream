@@ -212,6 +212,7 @@ impl DynamoDbDriver {
         let table = &self.config.table_name;
         let what = format!("write to '{table}'");
         let on_fail = self.config.on_condition_failure;
+        let conditional = self.config.condition_expression.is_some();
         let ambiguous = std::sync::atomic::AtomicBool::new(false);
         let ambiguous = &ambiguous;
         self.config
@@ -231,6 +232,8 @@ impl DynamoDbDriver {
                             .set_condition_expression(self.config.condition_expression.clone())
                             .set_expression_attribute_names(self.names.clone())
                             .set_expression_attribute_values(self.values.clone())
+                            .customize()
+                            .config_override(sdk_retries(!conditional))
                             .send()
                             .await
                             .map(|_| ())
@@ -243,12 +246,14 @@ impl DynamoDbDriver {
                             .set_condition_expression(self.config.condition_expression.clone())
                             .set_expression_attribute_names(self.names.clone())
                             .set_expression_attribute_values(self.values.clone())
+                            .customize()
+                            .config_override(sdk_retries(!conditional))
                             .send()
                             .await
                             .map(|_| ())
                             .map_err(|e| sdk_error_parts(&e)),
                     };
-                    if matches!(&sent, Err((None, _))) {
+                    if matches!(&sent, Err((code, _)) if outcome_unknown(code.as_deref())) {
                         ambiguous.store(true, std::sync::atomic::Ordering::Relaxed);
                     } else if on_fail == OnConditionFailure::Fail
                         && is_condition_failure(&sent)
@@ -446,6 +451,24 @@ pub(crate) fn classify_single(
         }
         Err(other) => Err(other),
     }
+}
+
+/// A per-request override: a conditional write gets no SDK-level retries, so
+/// only `classify_single` decides whether it is resent.
+fn sdk_retries(enabled: bool) -> aws_sdk_dynamodb::config::Builder {
+    let builder = aws_sdk_dynamodb::config::Builder::default();
+    if enabled {
+        builder
+    } else {
+        builder.retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+    }
+}
+
+/// Whether a failed request may still have been applied: a transport failure
+/// with no service answer, or an internal server error. A retry of such a
+/// conditional write is read back when its condition then fails.
+fn outcome_unknown(code: Option<&str>) -> bool {
+    matches!(code, None | Some("InternalServerError" | "InternalFailure"))
 }
 
 #[faucet_core::async_trait]
@@ -669,6 +692,13 @@ mod tests {
             Ok(Err(m)) if m.contains("rejected")
         ));
         assert!(classify_single(c("ThrottlingException"), OnConditionFailure::Skip).is_err());
+        let transport = || Err((None, "connection reset".to_string()));
+        assert!(classify_single(transport(), OnConditionFailure::Fail).is_err());
+        assert!(classify_single(c("InternalServerError"), OnConditionFailure::Skip).is_err());
+        assert!(outcome_unknown(None));
+        assert!(outcome_unknown(Some("InternalServerError")));
+        assert!(outcome_unknown(Some("InternalFailure")));
+        assert!(!outcome_unknown(Some("ThrottlingException")));
     }
 
     async fn offline(mut config: DynamoDbSinkConfig) -> DynamoDbSink {
