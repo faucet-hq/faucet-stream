@@ -139,6 +139,24 @@ impl KafkaAuth {
                 }
             }
             KafkaAuth::SaslSsl { sasl, ssl } => {
+                if !matches!(
+                    sasl.as_ref(),
+                    KafkaAuth::SaslPlain { .. } | KafkaAuth::SaslScram { .. }
+                ) {
+                    return Err(faucet_core::FaucetError::Config(format!(
+                        "kafka auth: `sasl_ssl.sasl` must be `sasl_plain` or `sasl_scram`, got `{}`",
+                        sasl.type_name()
+                    )));
+                }
+                if !matches!(
+                    ssl.as_ref(),
+                    KafkaAuth::None | KafkaAuth::Tls { .. } | KafkaAuth::Ssl { .. }
+                ) {
+                    return Err(faucet_core::FaucetError::Config(format!(
+                        "kafka auth: `sasl_ssl.ssl` must be `tls`, `ssl` or `none`, got `{}`",
+                        ssl.type_name()
+                    )));
+                }
                 // Apply SSL settings first, then SASL settings, then override
                 // security.protocol to SASL_SSL.
                 ssl.apply(config)?;
@@ -147,6 +165,17 @@ impl KafkaAuth {
             }
         }
         Ok(())
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            KafkaAuth::None => "none",
+            KafkaAuth::SaslPlain { .. } => "sasl_plain",
+            KafkaAuth::SaslScram { .. } => "sasl_scram",
+            KafkaAuth::Ssl { .. } => "ssl",
+            KafkaAuth::SaslSsl { .. } => "sasl_ssl",
+            KafkaAuth::Tls { .. } => "tls",
+        }
     }
 
     fn require_nonempty(field: &str, value: &str) -> Result<(), faucet_core::FaucetError> {
@@ -338,6 +367,45 @@ mod tests {
         assert!(cfg.get("ssl.ca.location").is_some());
         assert!(cfg.get("ssl.certificate.location").is_some());
         assert!(cfg.get("ssl.key.location").is_some());
+    }
+
+    #[test]
+    fn sasl_ssl_refuses_a_non_sasl_inner_layer() {
+        let plain = || {
+            Box::new(KafkaAuth::SaslPlain {
+                username: "u".into(),
+                password: "p".into(),
+            })
+        };
+        for (sasl, ssl, needle) in [
+            (
+                Box::new(KafkaAuth::None),
+                Box::new(KafkaAuth::None),
+                "`sasl_ssl.sasl`",
+            ),
+            (
+                Box::new(KafkaAuth::Tls { ca_path: None }),
+                Box::new(KafkaAuth::None),
+                "got `tls`",
+            ),
+            (plain(), plain(), "`sasl_ssl.ssl` must be"),
+        ] {
+            let mut cfg = ClientConfig::new();
+            let err = KafkaAuth::SaslSsl { sasl, ssl }
+                .apply(&mut cfg)
+                .unwrap_err();
+            assert!(matches!(err, faucet_core::FaucetError::Config(_)));
+            assert!(err.to_string().contains(needle), "{err}");
+            assert_eq!(cfg.get("security.protocol"), None);
+        }
+        let mut cfg = ClientConfig::new();
+        KafkaAuth::SaslSsl {
+            sasl: plain(),
+            ssl: Box::new(KafkaAuth::None),
+        }
+        .apply(&mut cfg)
+        .unwrap();
+        assert_eq!(cfg.get("security.protocol"), Some("SASL_SSL"));
     }
 
     #[test]
