@@ -577,7 +577,7 @@ records facts that help you choose, in `index.json` under each entry's `trust`:
 
 | Signal | What it is |
 |---|---|
-| `stars` | distinct GitHub accounts that reacted 👍, ❤️ or 🚀 on the template's discussion in the catalog (**Discussions → Templates**). Each account counts once however many of the three it uses; upvotes (↑) are not counted. |
+| `stars` | upvotes (↑) on the template's discussion in the catalog (**Discussions → Templates**). GitHub keeps one upvote per account; emoji reactions are not counted. |
 | `updated` / `stable_since` | when the newest version landed, and when the stable one did |
 | `open_issues` | open catalog issues labelled `template:<id>` |
 | `compatible_sinks` | how many sink templates the source composes with in full |
@@ -598,8 +598,7 @@ faucet run --source erp --sink faucet-hq/bigquery
 
 Variants are ranked official first, then by stars, then by recency. The
 [hub page](https://faucet-hq.github.io/hub) shows the same signals on every
-card and sorts by them. To star a template, react 👍, ❤️ or 🚀 on its discussion
-(the hub page's comment widget does this for you); to report a
+card and sorts by them. To star a template, upvote (↑) its discussion; to report a
 problem, open an issue with its `template:<id>` label.
 
 ### Mirror the hub into your server
