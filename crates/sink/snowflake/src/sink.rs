@@ -375,6 +375,7 @@ impl SnowflakeDriver {
         if names.is_empty() {
             return Ok(records.to_vec());
         }
+        let index = fold_index(&names);
         records
             .iter()
             .map(|r| {
@@ -383,7 +384,7 @@ impl SnowflakeDriver {
                 };
                 let mut out = serde_json::Map::with_capacity(obj.len());
                 for (key, value) in obj {
-                    let column = match resolve_column(key, &names) {
+                    let column = match resolve_in(key, &names, &index) {
                         ColumnMatch::Folded(column) => column,
                         _ => key.clone(),
                     };
@@ -832,20 +833,38 @@ enum ColumnMatch {
     Missing,
 }
 
+#[cfg(test)]
 fn resolve_column(key: &str, names: &std::collections::HashSet<String>) -> ColumnMatch {
+    resolve_in(key, names, &fold_index(names))
+}
+
+/// The table's column names by their ASCII-lower-cased form, sorted.
+fn fold_index(
+    names: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, Vec<&String>> {
+    let mut index: std::collections::HashMap<String, Vec<&String>> =
+        std::collections::HashMap::new();
+    for n in names {
+        index.entry(n.to_ascii_lowercase()).or_default().push(n);
+    }
+    for columns in index.values_mut() {
+        columns.sort();
+    }
+    index
+}
+
+fn resolve_in(
+    key: &str,
+    names: &std::collections::HashSet<String>,
+    index: &std::collections::HashMap<String, Vec<&String>>,
+) -> ColumnMatch {
     if names.contains(key) {
         return ColumnMatch::Exact;
     }
-    let mut folded: Vec<String> = names
-        .iter()
-        .filter(|n| n.eq_ignore_ascii_case(key))
-        .cloned()
-        .collect();
-    folded.sort();
-    match folded.len() {
-        0 => ColumnMatch::Missing,
-        1 => ColumnMatch::Folded(folded.remove(0)),
-        _ => ColumnMatch::Ambiguous(folded),
+    match index.get(&key.to_ascii_lowercase()).map(Vec::as_slice) {
+        None | Some([]) => ColumnMatch::Missing,
+        Some([one]) => ColumnMatch::Folded((*one).clone()),
+        Some(many) => ColumnMatch::Ambiguous(many.iter().map(|c| (*c).clone()).collect()),
     }
 }
 
@@ -857,12 +876,15 @@ fn missing_columns(
     names: &std::collections::HashSet<String>,
 ) -> Result<Vec<String>, FaucetError> {
     let mut missing: Vec<String> = Vec::new();
+    let index = fold_index(names);
+    let mut seen = std::collections::HashSet::new();
     for key in records
         .iter()
         .filter_map(Value::as_object)
         .flat_map(|o| o.keys())
+        .filter(|k| seen.insert(k.as_str()))
     {
-        match resolve_column(key, names) {
+        match resolve_in(key, names, &index) {
             ColumnMatch::Missing if !missing.contains(key) => missing.push(key.clone()),
             ColumnMatch::Ambiguous(columns) => {
                 return Err(FaucetError::Sink(format!(
