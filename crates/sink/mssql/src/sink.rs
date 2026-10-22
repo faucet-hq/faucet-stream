@@ -113,7 +113,7 @@ pub(crate) struct MssqlDriver {
     /// round-trip recorder. Every statement runs on its own connection call
     /// (`on_conn`), so the driver keeps the run's context here, installed by
     /// the adapter's `set_call_context`.
-    calls: faucet_core::CallSlot,
+    pub(crate) calls: faucet_core::CallSlot,
 }
 
 impl MssqlDriver {
