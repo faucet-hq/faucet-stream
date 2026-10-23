@@ -311,12 +311,12 @@ mod tests {
 
     #[test]
     fn start_positions_parse() {
-        let p: StartPosition = serde_yaml::from_str("type: trim_horizon").unwrap();
+        let p: StartPosition = serde_yaml_bw::from_str("type: trim_horizon").unwrap();
         assert_eq!(p, StartPosition::TrimHorizon);
-        let p: StartPosition = serde_yaml::from_str("type: latest").unwrap();
+        let p: StartPosition = serde_yaml_bw::from_str("type: latest").unwrap();
         assert_eq!(p, StartPosition::Latest);
         let p: StartPosition =
-            serde_yaml::from_str("type: at_timestamp\ntimestamp_secs: 1716700000").unwrap();
+            serde_yaml_bw::from_str("type: at_timestamp\ntimestamp_secs: 1716700000").unwrap();
         assert_eq!(
             p,
             StartPosition::AtTimestamp {
@@ -324,7 +324,7 @@ mod tests {
             }
         );
         let p: StartPosition =
-            serde_yaml::from_str("type: after_sequence_number\nsequence: '49'").unwrap();
+            serde_yaml_bw::from_str("type: after_sequence_number\nsequence: '49'").unwrap();
         assert_eq!(
             p,
             StartPosition::AfterSequenceNumber {
@@ -351,7 +351,7 @@ max_messages: 250
 value_format: string
 batch_size: 100
 "#;
-        let c: KinesisSourceConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisSourceConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.start_position, StartPosition::Latest);
         assert_eq!(c.value_format, ValueFormat::String);

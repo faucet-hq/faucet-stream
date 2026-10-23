@@ -1050,7 +1050,7 @@ pub fn parse_state_target(raw: &str) -> CliResult<StateStoreSpec> {
         return Err(CliError::Config("--to-state must not be empty".into()));
     }
     if raw.starts_with('{') {
-        return serde_yaml::from_str::<StateStoreSpec>(raw)
+        return serde_yaml_bw::from_str::<StateStoreSpec>(raw)
             .map_err(|e| CliError::Config(format!("--to-state: {e}")));
     }
     let lower = raw.to_ascii_lowercase();

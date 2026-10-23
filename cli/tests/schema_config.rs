@@ -39,7 +39,7 @@ fn shipped_examples_validate_against_composed_schema() {
         if text.contains("!include") {
             continue;
         }
-        let value: Value = match serde_yaml::from_str(&text) {
+        let value: Value = match serde_yaml_bw::from_str(&text) {
             Ok(v) => v,
             Err(_) => continue,
         };

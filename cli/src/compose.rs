@@ -139,8 +139,8 @@ fn load_value(path: &Path, visited: &mut Vec<PathBuf>, depth: usize) -> CliResul
     })?;
     match format_of(path)? {
         Format::Yaml => {
-            let mut yv: serde_yaml::Value =
-                serde_yaml::from_str(&text).map_err(|e| CliError::ParseConfig {
+            let mut yv: serde_yaml_bw::Value =
+                serde_yaml_bw::from_str(&text).map_err(|e| CliError::ParseConfig {
                     path: path.to_path_buf(),
                     message: e.to_string(),
                 })?;
@@ -156,7 +156,7 @@ fn load_value(path: &Path, visited: &mut Vec<PathBuf>, depth: usize) -> CliResul
 
 /// Convert a (fully include-resolved) YAML value to JSON. Non-string map keys
 /// or leftover unsupported tags surface as a parse error against `path`.
-fn yaml_to_json(yv: serde_yaml::Value, path: &Path) -> CliResult<JsonValue> {
+fn yaml_to_json(yv: serde_yaml_bw::Value, path: &Path) -> CliResult<JsonValue> {
     serde_json::to_value(yv).map_err(|e| CliError::ParseConfig {
         path: path.to_path_buf(),
         message: format!(
@@ -222,7 +222,7 @@ fn apply_profile(merged: &mut JsonValue, profile: Option<&str>) -> CliResult<()>
 /// path keeps non-composed configs byte-identical.
 fn serialize_for(entry: &Path, merged: &JsonValue) -> CliResult<String> {
     match format_of(entry)? {
-        Format::Yaml => serde_yaml::to_string(merged)
+        Format::Yaml => serde_yaml_bw::to_string(merged)
             .map_err(|e| CliError::Internal(format!("re-serialize composed config to YAML: {e}"))),
         Format::Json => serde_json::to_string_pretty(merged)
             .map_err(|e| CliError::Internal(format!("re-serialize composed config to JSON: {e}"))),
@@ -233,16 +233,16 @@ fn serialize_for(entry: &Path, merged: &JsonValue) -> CliResult<String> {
 /// payload must be a string path, resolved relative to `including`'s directory.
 /// Recurses into the included fragment (which may itself contain `!include`s).
 fn resolve_includes(
-    yv: &mut serde_yaml::Value,
+    yv: &mut serde_yaml_bw::Value,
     including: &Path,
     visited: &mut Vec<PathBuf>,
     depth: usize,
 ) -> CliResult<()> {
-    use serde_yaml::Value as Y;
+    use serde_yaml_bw::Value as Y;
     match yv {
         Y::Tagged(tagged) => {
             if tagged.tag == "include" {
-                let Y::String(rel) = &tagged.value else {
+                let Y::String(rel, _) = &tagged.value else {
                     return Err(CliError::BadInclude {
                         path: including.to_path_buf(),
                         reason: "`!include` payload must be a string path".into(),
@@ -292,7 +292,7 @@ fn load_fragment(
     path: &Path,
     visited: &mut Vec<PathBuf>,
     depth: usize,
-) -> CliResult<serde_yaml::Value> {
+) -> CliResult<serde_yaml_bw::Value> {
     if depth > MAX_COMPOSE_DEPTH {
         return Err(CliError::CompositionDepthExceeded {
             max: MAX_COMPOSE_DEPTH,
@@ -310,8 +310,8 @@ fn load_fragment(
         path: path.to_path_buf(),
         source,
     })?;
-    let mut yv: serde_yaml::Value = match format_of(path)? {
-        Format::Yaml => serde_yaml::from_str(&text).map_err(|e| CliError::ParseConfig {
+    let mut yv: serde_yaml_bw::Value = match format_of(path)? {
+        Format::Yaml => serde_yaml_bw::from_str(&text).map_err(|e| CliError::ParseConfig {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?,
@@ -320,7 +320,7 @@ fn load_fragment(
                 path: path.to_path_buf(),
                 message: e.to_string(),
             })?;
-            serde_yaml::to_value(jv).map_err(|e| CliError::ParseConfig {
+            serde_yaml_bw::to_value(jv).map_err(|e| CliError::ParseConfig {
                 path: path.to_path_buf(),
                 message: format!("could not convert JSON fragment to YAML: {e}"),
             })?
@@ -369,7 +369,7 @@ mod tests {
             "extends: ./base.yaml\npipeline:\n  source: { config: { path: APP.csv } }\n",
         );
         let text = compose(&app, None).unwrap();
-        let v: JsonValue = serde_yaml::from_str(&text).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&text).unwrap();
         assert_eq!(v["pipeline"]["source"]["config"]["path"], "APP.csv"); // child wins
         assert_eq!(v["pipeline"]["sink"]["config"]["path"], "base.jsonl"); // base survives
         assert!(v.get("extends").is_none(), "extends must be stripped");
@@ -389,7 +389,7 @@ mod tests {
             "app.yaml",
             "extends: [./a.yaml, ./b.yaml]\nshared: { c: 3 }\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, None).unwrap()).unwrap();
         assert_eq!(v["shared"]["a"], 1);
         assert_eq!(v["shared"]["b"], 2);
         assert_eq!(v["shared"]["c"], 3);
@@ -412,7 +412,7 @@ mod tests {
             "app.yaml",
             "extends: ./base.yaml\nprofiles:\n  prod:\n    pipeline:\n      sink: { config: { path: prod.jsonl } }\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, Some("prod")).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, Some("prod")).unwrap()).unwrap();
         assert_eq!(v["pipeline"]["sink"]["config"]["path"], "prod.jsonl");
         assert!(v.get("profiles").is_none(), "profiles must be stripped");
     }
@@ -425,7 +425,7 @@ mod tests {
             "p.yaml",
             "version: 1\npipeline:\n  sink: { type: jsonl, config: { path: base.jsonl } }\nprofiles:\n  prod: { pipeline: { sink: { config: { path: prod.jsonl } } } }\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&p, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&p, None).unwrap()).unwrap();
         assert_eq!(v["pipeline"]["sink"]["config"]["path"], "base.jsonl");
         assert!(v.get("profiles").is_none());
     }
@@ -494,7 +494,7 @@ mod tests {
             "app.yaml",
             "extends: [./b.yaml, ./c.yaml]\nshared: { from_app: true }\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, None).unwrap()).unwrap();
         assert_eq!(v["shared"]["from_d"], true);
         assert_eq!(v["shared"]["from_b"], true);
         assert_eq!(v["shared"]["from_c"], true);
@@ -539,7 +539,7 @@ mod tests {
             "app.yaml",
             "extends: ./base.json\npipeline:\n  source: { type: csv, config: { path: a.csv } }\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, None).unwrap()).unwrap();
         assert_eq!(v["pipeline"]["sink"]["config"]["path"], "base.jsonl");
         assert_eq!(v["pipeline"]["source"]["config"]["path"], "a.csv");
     }
@@ -557,7 +557,7 @@ mod tests {
             "app.yaml",
             "version: 1\npipeline:\n  source:\n    type: rest\n    config: { base_url: https://x }\n    auth: !include ./auth.yaml\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, None).unwrap()).unwrap();
         assert_eq!(v["pipeline"]["source"]["auth"]["type"], "bearer");
         assert_eq!(v["pipeline"]["source"]["auth"]["config"]["token"], "T");
     }
@@ -575,7 +575,7 @@ mod tests {
             "app.yaml",
             "version: 1\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n  transforms: !include ./tx.yaml\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, None).unwrap()).unwrap();
         assert_eq!(v["pipeline"]["transforms"][0]["type"], "flatten");
         assert_eq!(v["pipeline"]["transforms"][1]["type"], "redact");
     }
@@ -598,7 +598,7 @@ mod tests {
             "app.yaml",
             "extends: ./base.yaml\npipeline:\n  source: !include ./src.yaml\n",
         );
-        let v: JsonValue = serde_yaml::from_str(&compose(&app, None).unwrap()).unwrap();
+        let v: JsonValue = serde_yaml_bw::from_str(&compose(&app, None).unwrap()).unwrap();
         assert_eq!(
             v["pipeline"]["source"]["config"]["path"],
             "from-include.csv"

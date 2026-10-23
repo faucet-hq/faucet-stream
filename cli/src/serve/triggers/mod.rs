@@ -60,7 +60,7 @@ pub async fn load_triggers(path: &std::path::Path) -> CliResult<CompiledTriggers
         serde_json::from_str(&text)
             .map_err(|e| CliError::Serve(format!("parsing triggers JSON: {e}")))?
     } else {
-        serde_yaml::from_str(&text)
+        serde_yaml_bw::from_str(&text)
             .map_err(|e| CliError::Serve(format!("parsing triggers YAML: {e}")))?
     };
 
@@ -72,7 +72,7 @@ pub async fn load_triggers(path: &std::path::Path) -> CliResult<CompiledTriggers
         serde_json::from_str(&text)
             .map_err(|e| CliError::Serve(format!("parsing triggers JSON: {e}")))?
     } else {
-        serde_yaml::from_str(&text)
+        serde_yaml_bw::from_str(&text)
             .map_err(|e| CliError::Serve(format!("parsing triggers YAML: {e}")))?
     };
     if let Some((trigger, field)) = spec::unknown_trigger_fields(&raw, &file).into_iter().next() {

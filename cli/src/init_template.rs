@@ -7,7 +7,7 @@
 //! values and a `# REQUIRED` comment; optional fields are commented out so
 //! users can opt in by uncommenting and editing.
 //!
-//! The emitter is intentionally a string builder rather than a `serde_yaml`
+//! The emitter is intentionally a string builder rather than a `serde_yaml_bw`
 //! round-trip: comments and required/optional distinctions matter to the
 //! reader and would be lost by any round-trip through a generic YAML value.
 

@@ -173,7 +173,7 @@ pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
                 out.push(RemoteTemplate::unusable(stem, why));
                 continue;
             }
-            Some((name, text, None)) => match serde_yaml::from_str::<Sidecar>(&text) {
+            Some((name, text, None)) => match serde_yaml_bw::from_str::<Sidecar>(&text) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     let why =

@@ -36,7 +36,7 @@ pub fn load_file(path: &Path) -> CliResult<PolicySpec> {
     let spec: PolicySpec = match path.extension().and_then(|e| e.to_str()) {
         Some("json") => serde_json::from_str(&text)
             .map_err(|e| CliError::Config(format!("policy: {}: {e}", path.display())))?,
-        _ => serde_yaml::from_str(&text)
+        _ => serde_yaml_bw::from_str(&text)
             .map_err(|e| CliError::Config(format!("policy: {}: {e}", path.display())))?,
     };
     spec.validate()

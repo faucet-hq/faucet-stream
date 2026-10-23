@@ -232,7 +232,7 @@ async fn tenant_scope(
 /// Whether a submitted body is a topology config (`pipeline.nodes`).
 fn is_topology_body(body: &str, format: ConfigFormat) -> bool {
     let doc: Option<Value> = match format {
-        ConfigFormat::Yaml => serde_yaml::from_str(body).ok(),
+        ConfigFormat::Yaml => serde_yaml_bw::from_str(body).ok(),
         ConfigFormat::Json => serde_json::from_str(body).ok(),
     };
     doc.and_then(|d| d.pointer("/pipeline/nodes").cloned())

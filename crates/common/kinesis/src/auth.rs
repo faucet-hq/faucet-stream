@@ -138,16 +138,16 @@ mod tests {
     #[test]
     fn credentials_parse_the_consistent_wire_shape() {
         let yaml = "type: default\n";
-        let c: KinesisCredentials = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisCredentials = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(matches!(c, KinesisCredentials::Default));
 
         let yaml = "type: profile\nconfig: { name: prod }\n";
-        let c: KinesisCredentials = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisCredentials = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(matches!(c, KinesisCredentials::Profile { name } if name == "prod"));
 
         let yaml =
             "type: access_key\nconfig:\n  access_key_id: AKIA\n  secret_access_key: s3cr3t\n";
-        let c: KinesisCredentials = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisCredentials = serde_yaml_bw::from_str(yaml).unwrap();
         match &c {
             KinesisCredentials::AccessKey {
                 access_key_id,
@@ -164,11 +164,11 @@ mod tests {
         assert!(!dbg.contains("s3cr3t"), "{dbg}");
 
         let yaml = "type: assume_role\nconfig: { role_arn: 'arn:aws:iam::1:role/x' }\n";
-        let c: KinesisCredentials = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisCredentials = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(matches!(c, KinesisCredentials::AssumeRole { .. }));
 
         let yaml = "type: web_identity\n";
-        let c: KinesisCredentials = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisCredentials = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(matches!(c, KinesisCredentials::WebIdentity));
     }
 

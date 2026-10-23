@@ -561,7 +561,7 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
                 Some(hub::TemplateKind::TestSuite) => {
                     let text = std::fs::read_to_string(f)
                         .map_err(|e| CliError::Config(format!("reading {}: {e}", f.display())))?;
-                    let value: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
+                    let value: serde_json::Value = serde_yaml_bw::from_str(&text).map_err(|e| {
                         CliError::Config(format!("{}: invalid YAML: {e}", f.display()))
                     })?;
                     crate::template_tests::bundle::parse_test_suite(value)
@@ -678,7 +678,7 @@ async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
         }
         let text = std::fs::read_to_string(as_path)
             .map_err(|e| CliError::Config(format!("reading {}: {e}", as_path.display())))?;
-        let doc: serde_json::Value = serde_yaml::from_str(&text)
+        let doc: serde_json::Value = serde_yaml_bw::from_str(&text)
             .map_err(|e| CliError::Config(format!("parsing {}: {e}", as_path.display())))?;
         let name = as_path
             .file_stem()

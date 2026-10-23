@@ -21,7 +21,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-serde_yaml = "0.9"
+serde_yaml_bw = "2"
 
 [package.metadata.docs.rs]
 all-features = true

@@ -224,7 +224,7 @@ attributes_field: __attributes
 batch_size: 250
 concurrency: 8
 "#;
-        let c: PubsubSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: PubsubSinkConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(
             c.ordering_key,

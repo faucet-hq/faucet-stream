@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn empty_block_tracks_and_inherits_the_default_window() {
-        let spec: LocalOutputsSpec = serde_yaml::from_str("{}").unwrap();
+        let spec: LocalOutputsSpec = serde_yaml_bw::from_str("{}").unwrap();
         assert!(spec.track);
         assert_eq!(spec.retention_days, None);
         assert_eq!(spec, LocalOutputsSpec::default());
@@ -69,20 +69,20 @@ mod tests {
 
     #[test]
     fn parses_a_retention_override() {
-        let spec: LocalOutputsSpec = serde_yaml::from_str("retention_days: 3").unwrap();
+        let spec: LocalOutputsSpec = serde_yaml_bw::from_str("retention_days: 3").unwrap();
         assert_eq!(spec.retention_days, Some(3));
         assert!(spec.track, "tracking stays on unless explicitly disabled");
     }
 
     #[test]
     fn parses_an_opt_out() {
-        let spec: LocalOutputsSpec = serde_yaml::from_str("track: false").unwrap();
+        let spec: LocalOutputsSpec = serde_yaml_bw::from_str("track: false").unwrap();
         assert!(!spec.track);
     }
 
     #[test]
     fn zero_days_parses_as_keep_forever() {
-        let spec: LocalOutputsSpec = serde_yaml::from_str("retention_days: 0").unwrap();
+        let spec: LocalOutputsSpec = serde_yaml_bw::from_str("retention_days: 0").unwrap();
         assert_eq!(spec.retention_days, Some(0));
     }
 
@@ -90,7 +90,7 @@ mod tests {
     fn rejects_unknown_fields() {
         // A typo'd retention knob must fail loudly, not silently keep files
         // forever.
-        let err = serde_yaml::from_str::<LocalOutputsSpec>("retention_dayz: 3").unwrap_err();
+        let err = serde_yaml_bw::from_str::<LocalOutputsSpec>("retention_dayz: 3").unwrap_err();
         assert!(err.to_string().contains("retention_dayz"), "{err}");
     }
 
@@ -108,9 +108,9 @@ mod tests {
             track: false,
             retention_days: Some(14),
         };
-        let yaml = serde_yaml::to_string(&spec).unwrap();
+        let yaml = serde_yaml_bw::to_string(&spec).unwrap();
         assert_eq!(
-            serde_yaml::from_str::<LocalOutputsSpec>(&yaml).unwrap(),
+            serde_yaml_bw::from_str::<LocalOutputsSpec>(&yaml).unwrap(),
             spec
         );
     }

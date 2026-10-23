@@ -255,7 +255,7 @@ async fn submit(
                 PipelineRef, RunTemplate, TemplateTrigger, TriggerKind, TriggerSpec,
             };
             let (config, template) = if adapter == Adapter::Trigger {
-                let doc: Value = serde_yaml::from_str(body).unwrap();
+                let doc: Value = serde_yaml_bw::from_str(body).unwrap();
                 (Some(PipelineRef::Inline(doc)), None)
             } else {
                 register(state, body).await;

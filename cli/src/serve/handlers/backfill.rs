@@ -255,7 +255,7 @@ pub async fn submit_backfill(
     // Parse the RAW submitted document once; each unit rewrites a copy. The
     // raw body (not the default-merged config) is submitted so the runner's
     // own merge/validate path applies per unit.
-    let doc: Value = serde_yaml::from_str(&req.config)
+    let doc: Value = serde_yaml_bw::from_str(&req.config)
         .map_err(|e| ServeError::BadConfig(format!("config is not valid YAML/JSON: {e}")))?;
 
     crate::serve::audit::write(
@@ -464,7 +464,7 @@ fn rewrite_unit_doc(
         map.insert("name".into(), Value::String(unit_name.to_string()));
         map.insert("delivery".into(), Value::String("at_least_once".into()));
     }
-    serde_yaml::to_string(&d)
+    serde_yaml_bw::to_string(&d)
         .map_err(|e| crate::error::CliError::Internal(format!("unit config render: {e}")))
 }
 
@@ -499,7 +499,7 @@ mod tests {
             }
         });
         let out = rewrite_unit_doc(&doc, &unit, "orders-backfill-20260601T000000Z").unwrap();
-        let back: Value = serde_yaml::from_str(&out).unwrap();
+        let back: Value = serde_yaml_bw::from_str(&out).unwrap();
         assert_eq!(back["name"], "orders-backfill-20260601T000000Z");
         assert_eq!(back["delivery"], "at_least_once");
         let url = back["pipeline"]["source"]["config"]["url"]

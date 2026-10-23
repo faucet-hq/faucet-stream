@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn deserializes_from_yaml_with_defaults() {
         let s: SlaSpec =
-            serde_yaml::from_str("max_staleness_secs: 900\nvolume_anomaly:\n  method: iqr\n")
+            serde_yaml_bw::from_str("max_staleness_secs: 900\nvolume_anomaly:\n  method: iqr\n")
                 .unwrap();
         assert_eq!(s.max_staleness_secs, Some(900));
         let va = s.volume_anomaly.unwrap();
@@ -331,22 +331,22 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_rejected() {
-        let r: Result<SlaSpec, _> = serde_yaml::from_str("max_staleness: 900\n");
+        let r: Result<SlaSpec, _> = serde_yaml_bw::from_str("max_staleness: 900\n");
         assert!(r.is_err());
     }
 
     #[test]
     fn lag_thresholds_alone_are_a_valid_sla() {
-        let lag_only: SlaSpec = serde_yaml::from_str("max_lag_bytes: 1048576\n").unwrap();
+        let lag_only: SlaSpec = serde_yaml_bw::from_str("max_lag_bytes: 1048576\n").unwrap();
         assert!(lag_only.has_lag_checks());
         assert!(!lag_only.needs_state());
         lag_only.validate().unwrap();
         for field in ["max_lag_bytes", "max_lag_events", "max_lag_seconds"] {
-            let zero: SlaSpec = serde_yaml::from_str(&format!("{field}: 0\n")).unwrap();
+            let zero: SlaSpec = serde_yaml_bw::from_str(&format!("{field}: 0\n")).unwrap();
             let err = zero.validate().unwrap_err();
             assert!(err.contains(field), "{err}");
         }
-        let none: SlaSpec = serde_yaml::from_str("{}").unwrap();
+        let none: SlaSpec = serde_yaml_bw::from_str("{}").unwrap();
         assert!(none.validate().unwrap_err().contains("max_lag_*"));
     }
 }

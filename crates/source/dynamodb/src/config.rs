@@ -436,17 +436,19 @@ page_limit: 100
 retry: { max_retries: 3 }
 batch_size: 500
 "##;
-        let c: DynamoDbSourceConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: DynamoDbSourceConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.mode, ReadMode::Query);
         assert!(!c.scan_index_forward);
         assert_eq!(c.retry.max_retries, 3);
 
         let yaml = "table_name: t\nmode: streams\non_gap: resnapshot\nstart_position: latest\nmax_messages: 10\n";
-        let c: DynamoDbSourceConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: DynamoDbSourceConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.on_gap, OnGap::Resnapshot);
         assert_eq!(c.start_position, StreamStart::Latest);
-        assert!(serde_yaml::from_str::<DynamoDbSourceConfig>("table_name: t\nbogus: 1\n").is_err());
+        assert!(
+            serde_yaml_bw::from_str::<DynamoDbSourceConfig>("table_name: t\nbogus: 1\n").is_err()
+        );
     }
 }

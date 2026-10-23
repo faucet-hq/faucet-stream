@@ -22,7 +22,7 @@ gcloud-googleapis = { version = "1.3", features = ["pubsub"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
-serde_yaml = "0.9"
+serde_yaml_bw = "2"
 
 [package.metadata.docs.rs]
 all-features = true

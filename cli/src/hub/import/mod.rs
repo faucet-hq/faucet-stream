@@ -66,8 +66,8 @@ impl ImportOutput {
             suite_path: String,
             written: Vec<String>,
             report: &'a ImportReport,
-            template: serde_yaml::Value,
-            suite: serde_yaml::Value,
+            template: serde_yaml_bw::Value,
+            suite: serde_yaml_bw::Value,
         }
         let out = Out {
             template_path: self.template_path.display().to_string(),
@@ -256,7 +256,7 @@ pub fn parse_document(text: &str, url: &Url) -> CliResult<Value> {
         serde_json::from_str(t)
             .map_err(|e| CliError::Config(format!("spec {url}: invalid JSON: {e}")))
     } else {
-        serde_yaml::from_str(text)
+        serde_yaml_bw::from_str(text)
             .map_err(|e| CliError::Config(format!("spec {url}: invalid YAML: {e}")))
     }
 }
@@ -455,23 +455,23 @@ fn rank(k: &str) -> (usize, &str) {
 }
 
 /// `v` as YAML with the fixed key order at every structural level.
-pub fn ordered(v: &Value) -> serde_yaml::Value {
+pub fn ordered(v: &Value) -> serde_yaml_bw::Value {
     ordered_as(v, Keys::Ranked)
 }
 
-fn ordered_as(v: &Value, mode: Keys) -> serde_yaml::Value {
+fn ordered_as(v: &Value, mode: Keys) -> serde_yaml_bw::Value {
     match v {
-        Value::Null => serde_yaml::Value::Null,
-        Value::Bool(b) => serde_yaml::Value::Bool(*b),
+        Value::Null => serde_yaml_bw::Value::Null,
+        Value::Bool(b) => serde_yaml_bw::Value::Bool(*b),
         Value::Number(n) => match (n.as_u64(), n.as_i64(), n.as_f64()) {
-            (Some(u), _, _) => serde_yaml::Value::Number(u.into()),
-            (_, Some(i), _) => serde_yaml::Value::Number(i.into()),
-            (_, _, Some(f)) => serde_yaml::Value::Number(f.into()),
-            _ => serde_yaml::Value::String(n.to_string()),
+            (Some(u), _, _) => serde_yaml_bw::Value::Number(u.into()),
+            (_, Some(i), _) => serde_yaml_bw::Value::Number(i.into()),
+            (_, _, Some(f)) => serde_yaml_bw::Value::Number(f.into()),
+            _ => serde_yaml_bw::Value::String(n.to_string()),
         },
-        Value::String(s) => serde_yaml::Value::String(s.clone()),
+        Value::String(s) => serde_yaml_bw::Value::String(s.clone()),
         Value::Array(a) => {
-            serde_yaml::Value::Sequence(a.iter().map(|x| ordered_as(x, mode)).collect())
+            serde_yaml_bw::Value::Sequence(a.iter().map(|x| ordered_as(x, mode)).collect())
         }
         Value::Object(m) => {
             let mut keys: Vec<&String> = m.keys().collect();
@@ -480,7 +480,7 @@ fn ordered_as(v: &Value, mode: Keys) -> serde_yaml::Value {
             } else {
                 keys.sort();
             }
-            let mut out = serde_yaml::Mapping::new();
+            let mut out = serde_yaml_bw::Mapping::new();
             for k in keys {
                 let child = match (mode, k.as_str()) {
                     (Keys::Data, _) => Keys::Data,
@@ -489,11 +489,11 @@ fn ordered_as(v: &Value, mode: Keys) -> serde_yaml::Value {
                     _ => Keys::Ranked,
                 };
                 out.insert(
-                    serde_yaml::Value::String(k.clone()),
+                    serde_yaml_bw::Value::String(k.clone()),
                     ordered_as(&m[k], child),
                 );
             }
-            serde_yaml::Value::Mapping(out)
+            serde_yaml_bw::Value::Mapping(out)
         }
     }
 }
@@ -504,7 +504,7 @@ fn json_of<T: Serialize>(v: &T) -> CliResult<Value> {
 
 /// The template as a document, without the connector fields that only
 /// restate their defaults.
-fn template_value(t: &SourceTemplate) -> CliResult<serde_yaml::Value> {
+fn template_value(t: &SourceTemplate) -> CliResult<serde_yaml_bw::Value> {
     let mut v = json_of(t)?;
     let prune = |spec: &mut Value| {
         if let Some(o) = spec.as_object_mut() {
@@ -534,8 +534,8 @@ fn template_value(t: &SourceTemplate) -> CliResult<serde_yaml::Value> {
     Ok(ordered(&v))
 }
 
-fn yaml_text(v: &serde_yaml::Value) -> CliResult<String> {
-    serde_yaml::to_string(v)
+fn yaml_text(v: &serde_yaml_bw::Value) -> CliResult<String> {
+    serde_yaml_bw::to_string(v)
         .map_err(|e| CliError::Internal(format!("hub import: rendering YAML: {e}")))
 }
 
@@ -681,14 +681,14 @@ mod tests {
     #[test]
     fn keys_render_in_a_fixed_order() {
         let v = json!({"zeta": 1, "config": {"b": -2, "a": 1.5, "type": "x"}, "kind": "k", "n": null, "t": true});
-        let y = serde_yaml::to_string(&ordered(&v)).unwrap();
+        let y = serde_yaml_bw::to_string(&ordered(&v)).unwrap();
         assert_eq!(
             y,
             "kind: k\nconfig:\n  type: x\n  a: 1.5\n  b: -2\nn: null\nt: true\nzeta: 1\n"
         );
         let names = json!({"params": {"type": {"type": "string", "default": "x"}, "a": {}}, "input": [{"name": {"type": 1, "a": 2}}]});
         assert_eq!(
-            serde_yaml::to_string(&ordered(&names)).unwrap(),
+            serde_yaml_bw::to_string(&ordered(&names)).unwrap(),
             "params:\n  a: {}\n  type:\n    type: string\n    default: x\ninput:\n- name:\n    a: 2\n    type: 1\n"
         );
     }

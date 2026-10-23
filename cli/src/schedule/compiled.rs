@@ -142,7 +142,7 @@ mod tests {
     use chrono::TimeZone;
 
     fn spec(cron: &str, tz: &str) -> ScheduleSpec {
-        serde_yaml::from_str(&format!("cron: \"{cron}\"\ntimezone: \"{tz}\"\n")).unwrap()
+        serde_yaml_bw::from_str(&format!("cron: \"{cron}\"\ntimezone: \"{tz}\"\n")).unwrap()
     }
 
     #[test]

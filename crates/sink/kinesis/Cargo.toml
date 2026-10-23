@@ -31,7 +31,7 @@ faucet-conformance = { workspace = true, features = ["containers"] }
 serde_json.workspace = true
 schemars.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-serde_yaml = "0.9"
+serde_yaml_bw = "2"
 # LocalStack-backed integration tests (Docker), mirroring the kafka pair.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["localstack"] }

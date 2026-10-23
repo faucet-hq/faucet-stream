@@ -617,13 +617,13 @@ pub fn with_tests(
             serde_json::to_string_pretty(&doc).map_err(|e| emit_err(e.to_string()))
         }
         crate::serve::load::ConfigFormat::Yaml => {
-            let block = serde_yaml::to_string(&serde_json::json!({ "tests": tests }))
+            let block = serde_yaml_bw::to_string(&serde_json::json!({ "tests": tests }))
                 .map_err(|e| emit_err(e.to_string()))?;
             let appended = format!("{}\n{block}", without_top_level(body, "tests").trim_end());
             if parse_body(&appended, format).ok().as_ref() == Some(&doc) {
                 Ok(appended)
             } else {
-                serde_yaml::to_string(&doc).map_err(|e| emit_err(e.to_string()))
+                serde_yaml_bw::to_string(&doc).map_err(|e| emit_err(e.to_string()))
             }
         }
     }
@@ -634,7 +634,7 @@ pub fn with_tests(
 /// behaviour can launch it.
 #[cfg(test)]
 pub(crate) fn smoke(body: &str) -> String {
-    let doc: serde_json::Value = serde_yaml::from_str(body).unwrap_or_default();
+    let doc: serde_json::Value = serde_yaml_bw::from_str(body).unwrap_or_default();
     let pipeline = doc.get("pipeline").is_some()
         && doc
             .get("kind")

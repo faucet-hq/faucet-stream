@@ -162,7 +162,7 @@ central contract registry is out of scope for v1.
 use faucet_core::{CompiledContract, ContractSpec, Pipeline};
 use std::sync::Arc;
 
-let spec: ContractSpec = serde_yaml::from_str(yaml)?;   // or serde_json
+let spec: ContractSpec = serde_yaml_bw::from_str(yaml)?;   // or serde_json
 let compiled = Arc::new(CompiledContract::compile(&spec)?);
 
 let result = Pipeline::new(&source, &sink)

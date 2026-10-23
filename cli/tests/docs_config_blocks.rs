@@ -73,8 +73,8 @@ fn yaml_blocks(markdown: &str) -> Vec<Block> {
 }
 
 fn is_full_config(text: &str) -> bool {
-    match serde_yaml::from_str::<serde_yaml::Value>(text) {
-        Ok(serde_yaml::Value::Mapping(m)) => {
+    match serde_yaml_bw::from_str::<serde_yaml_bw::Value>(text) {
+        Ok(serde_yaml_bw::Value::Mapping(m)) => {
             m.contains_key("version") && m.contains_key("pipeline")
         }
         _ => false,

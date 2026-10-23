@@ -147,11 +147,11 @@ mod tests {
     use super::*;
 
     fn source(yaml: &str) -> SourceTemplate {
-        serde_yaml::from_str(yaml).expect("source template")
+        serde_yaml_bw::from_str(yaml).expect("source template")
     }
 
     fn sink(yaml: &str) -> SinkTemplate {
-        serde_yaml::from_str(yaml).expect("sink template")
+        serde_yaml_bw::from_str(yaml).expect("sink template")
     }
 
     /// The #823 shape: an `int` param as a whole `query_params` value.

@@ -243,7 +243,7 @@ pipeline:
 
     #[tokio::test]
     async fn a_bundle_runs_its_suite_fixtures_and_shared_suites() {
-        let bundle: TestBundle = serde_yaml::from_str(
+        let bundle: TestBundle = serde_yaml_bw::from_str(
             r#"
 suite:
   auto: { defaults_baseline: true }
@@ -274,7 +274,7 @@ fixtures:
     /// template materializes, expands and compiles.
     #[tokio::test]
     async fn inline_only_fixtures_add_an_implicit_structural_case() {
-        let bundle: TestBundle = serde_yaml::from_str(
+        let bundle: TestBundle = serde_yaml_bw::from_str(
             r#"
 fixtures:
   - name: inline
@@ -301,7 +301,7 @@ fixtures:
             "a template that does not load fails: {out:#?}"
         );
 
-        let through: TestBundle = serde_yaml::from_str(
+        let through: TestBundle = serde_yaml_bw::from_str(
             "fixtures:\n  - name: t\n    input: [{ \"id\": 1 }]\n    expect: { records_written: 1 }\n",
         )
         .unwrap();
@@ -311,7 +311,7 @@ fixtures:
 
     #[tokio::test]
     async fn a_failing_fixture_is_retried_then_reported() {
-        let bundle: TestBundle = serde_yaml::from_str(
+        let bundle: TestBundle = serde_yaml_bw::from_str(
             r#"
 fixtures:
   - name: wrong
@@ -329,7 +329,7 @@ fixtures:
 
     #[tokio::test]
     async fn a_setup_error_and_an_empty_filter_are_recorded_failures() {
-        let bundle: TestBundle = serde_yaml::from_str(
+        let bundle: TestBundle = serde_yaml_bw::from_str(
             "suite:\n  combine:\n    params: { nope: [1] }\n    exclude: [{ other: 2 }]\n",
         )
         .unwrap();
@@ -338,11 +338,11 @@ fixtures:
         assert!(!out.passed());
 
         let ok: TestBundle =
-            serde_yaml::from_str("suite: { auto: { defaults_baseline: true } }\n").unwrap();
+            serde_yaml_bw::from_str("suite: { auto: { defaults_baseline: true } }\n").unwrap();
         let out = run_bundle(&ok, &doc_target(), &[], Some("missing")).await;
         assert!(out.error.unwrap().contains("no case matches"));
         let empty: TestBundle =
-            serde_yaml::from_str("requires_suites: [{ name: c, version: '1' }]\n").unwrap();
+            serde_yaml_bw::from_str("requires_suites: [{ name: c, version: '1' }]\n").unwrap();
         let out = run_bundle(&empty, &doc_target(), &[], None).await;
         assert!(out.error.unwrap().contains("produced no cases"));
     }
@@ -363,7 +363,7 @@ fixtures:
             suite: broken,
         }];
         let bundle: TestBundle =
-            serde_yaml::from_str("requires_suites: [{ name: conf, version: '1' }]\n").unwrap();
+            serde_yaml_bw::from_str("requires_suites: [{ name: conf, version: '1' }]\n").unwrap();
         let out = run_bundle(&bundle, &doc_target(), &shared, None).await;
         assert!(out.error.unwrap().contains("suite:conf@1.0.0"));
     }

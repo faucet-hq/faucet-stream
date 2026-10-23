@@ -323,7 +323,7 @@ impl ConfigFormat {
     fn parse(self, text: &str, path: &Path) -> CliResult<Value> {
         let err = |e: String| CliError::Config(format!("cannot parse '{}': {e}", path.display()));
         match self {
-            ConfigFormat::Yaml => serde_yaml::from_str(text).map_err(|e| err(e.to_string())),
+            ConfigFormat::Yaml => serde_yaml_bw::from_str(text).map_err(|e| err(e.to_string())),
             ConfigFormat::Json => serde_json::from_str(text).map_err(|e| err(e.to_string())),
         }
     }
@@ -332,7 +332,7 @@ impl ConfigFormat {
         let err =
             |e: String| CliError::Config(format!("cannot serialize '{}': {e}", path.display()));
         match self {
-            ConfigFormat::Yaml => serde_yaml::to_string(value).map_err(|e| err(e.to_string())),
+            ConfigFormat::Yaml => serde_yaml_bw::to_string(value).map_err(|e| err(e.to_string())),
             ConfigFormat::Json => {
                 let mut s = serde_json::to_string_pretty(value).map_err(|e| err(e.to_string()))?;
                 s.push('\n');

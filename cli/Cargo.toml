@@ -658,7 +658,7 @@ serde.workspace = true
 # `preserve_order`: `faucet fmt` (and every rendered config) keeps insertion
 # order whatever else the build enables, so slim and full binaries agree.
 serde_json = { workspace = true, features = ["preserve_order"] }
-serde_yaml = "0.9"
+serde_yaml_bw = "2"
 semver = "1"
 toml_edit = "0.25"
 thiserror.workspace = true
@@ -742,7 +742,7 @@ predicates = "3"
 wiremock = "0.6"
 serial_test = "3"
 metrics-util.workspace = true
-serde_yaml = "0.9"
+serde_yaml_bw = "2"
 async-stream.workspace = true
 futures-core.workspace = true
 # Columnar panic-isolation test (#872) builds Arrow batches.

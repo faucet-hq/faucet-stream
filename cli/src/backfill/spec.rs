@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn parses_full_block() {
         let yaml = "window: 1d\nconcurrency: 4\ntimezone: America/New_York\n";
-        let spec: BackfillSpec = serde_yaml::from_str(yaml).unwrap();
+        let spec: BackfillSpec = serde_yaml_bw::from_str(yaml).unwrap();
         assert_eq!(spec.window.as_deref(), Some("1d"));
         assert_eq!(spec.concurrency, Some(4));
         spec.validate(&["${backfill.start}".into()]).unwrap();
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field() {
-        assert!(serde_yaml::from_str::<BackfillSpec>("bogus: 1\n").is_err());
+        assert!(serde_yaml_bw::from_str::<BackfillSpec>("bogus: 1\n").is_err());
     }
 
     #[test]

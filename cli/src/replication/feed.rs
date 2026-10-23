@@ -520,7 +520,7 @@ mod tests {
             active: set.clone(),
             known: set,
             qualifier: None,
-            follow: follow.then(|| serde_yaml::from_str("{}").unwrap()),
+            follow: follow.then(|| serde_yaml_bw::from_str("{}").unwrap()),
         }
     }
 

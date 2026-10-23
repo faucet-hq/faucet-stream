@@ -224,7 +224,7 @@ pub const MAX_CASES: usize = 512;
 impl SuiteFile {
     /// Parse a suite from YAML or JSON text.
     pub fn parse(text: &str) -> CliResult<Self> {
-        let file: SuiteFile = serde_yaml::from_str(text)
+        let file: SuiteFile = serde_yaml_bw::from_str(text)
             .map_err(|e| CliError::Config(format!("template test suite: {e}")))?;
         file.validate()?;
         Ok(file)

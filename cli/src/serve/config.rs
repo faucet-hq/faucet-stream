@@ -489,7 +489,8 @@ impl ServeConfig {
 pub fn load_otel_config(path: &std::path::Path) -> CliResult<faucet_core::OtelConfig> {
     let bad = |e: String| CliError::Config(format!("--otel-config {}: {e}", path.display()));
     let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
-    let mut doc: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| bad(e.to_string()))?;
+    let mut doc: serde_json::Value =
+        serde_yaml_bw::from_str(&text).map_err(|e| bad(e.to_string()))?;
     crate::serve::load::protect_input(path, &doc);
     crate::interpolate::interpolate_value(&mut doc)?;
     crate::interpolate::unescape_value(&mut doc);

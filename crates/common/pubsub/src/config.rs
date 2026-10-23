@@ -188,7 +188,7 @@ project_id: my-proj
 emulator_host: "localhost:8085"
 credentials: { type: anonymous }
 "#;
-        let c: PubsubConnection = serde_yaml::from_str(yaml).unwrap();
+        let c: PubsubConnection = serde_yaml_bw::from_str(yaml).unwrap();
         assert_eq!(c.project_id.as_deref(), Some("my-proj"));
         assert_eq!(c.emulator_host.as_deref(), Some("localhost:8085"));
         assert_eq!(c.credentials, PubsubCredentials::Anonymous);

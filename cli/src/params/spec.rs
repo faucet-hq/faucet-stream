@@ -340,20 +340,21 @@ mod tests {
             "a: { computed: \"${param.x}\", default: y }\n",
             "a: { computed: \"${param.x}\", secret: true }\n",
         ] {
-            let spec: ParamsSpec = serde_yaml::from_str(yaml).unwrap();
+            let spec: ParamsSpec = serde_yaml_bw::from_str(yaml).unwrap();
             assert!(
                 matches!(validate(&spec), Err(CliError::Config(m)) if m.contains("computed")),
                 "expected a computed-conflict error for: {yaml}"
             );
         }
         // A plain computed param validates.
-        let spec: ParamsSpec = serde_yaml::from_str("a: { computed: \"${param.x}\" }\n").unwrap();
+        let spec: ParamsSpec =
+            serde_yaml_bw::from_str("a: { computed: \"${param.x}\" }\n").unwrap();
         assert!(validate(&spec).is_ok());
     }
 
     #[test]
     fn parses_block_with_defaults() {
-        let spec: ParamsSpec = serde_yaml::from_str(
+        let spec: ParamsSpec = serde_yaml_bw::from_str(
             "tenant_id: { type: string, required: true, description: Tenant }\n\
              since: { default: \"1970-01-01\" }\n\
              page_size: { type: int, default: 500 }\n\
@@ -372,7 +373,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field() {
-        let err = serde_yaml::from_str::<ParamsSpec>("a: { typo: 1 }").unwrap_err();
+        let err = serde_yaml_bw::from_str::<ParamsSpec>("a: { typo: 1 }").unwrap_err();
         assert!(err.to_string().contains("typo"), "{err}");
     }
 

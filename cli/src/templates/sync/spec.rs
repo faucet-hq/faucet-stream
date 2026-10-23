@@ -337,7 +337,7 @@ origins:
     prefix: partner-
     launch: follow
 "#;
-        let f: SyncFile = serde_yaml::from_str(yaml).expect("parse");
+        let f: SyncFile = serde_yaml_bw::from_str(yaml).expect("parse");
         f.validate().expect("valid");
         assert_eq!(f.origins.len(), 2);
         assert_eq!(f.origins[0].source.kind(), "github");
@@ -450,10 +450,10 @@ origins:
 
     #[test]
     fn sidecar_defaults_are_inert() {
-        let s: Sidecar = serde_yaml::from_str("{}").unwrap();
+        let s: Sidecar = serde_yaml_bw::from_str("{}").unwrap();
         assert_eq!(s, Sidecar::default());
         assert!(!s.launch);
-        let s: Sidecar = serde_yaml::from_str("launch: true\ntags: [dev]").unwrap();
+        let s: Sidecar = serde_yaml_bw::from_str("launch: true\ntags: [dev]").unwrap();
         assert!(s.launch);
         assert_eq!(s.tags, vec!["dev"]);
     }
@@ -463,12 +463,12 @@ origins:
         // #682 / #691: a catalog sidecar used to be rejected as unknown keys,
         // which made the sync skip the template entirely.
         let s: Sidecar =
-            serde_yaml::from_str("launch: false\nstable: 4\ndeprecated:\n  2: \"use v3+\"\n")
+            serde_yaml_bw::from_str("launch: false\nstable: 4\ndeprecated:\n  2: \"use v3+\"\n")
                 .unwrap();
         assert_eq!(s.stable, Some(4));
         assert_eq!(s.deprecated.get(&2).map(String::as_str), Some("use v3+"));
         assert!(
-            serde_yaml::from_str::<Sidecar>("stabel: 1").is_err(),
+            serde_yaml_bw::from_str::<Sidecar>("stabel: 1").is_err(),
             "typos still fail"
         );
     }

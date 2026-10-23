@@ -420,7 +420,7 @@ pub async fn run_from_yaml_str_selected(
     // (post-parse) so a resolved value can never alter the document's structure
     // (F43) — mirroring the binary's `from_path` path.
     let mut value: serde_json::Value =
-        serde_yaml::from_str(yaml).map_err(|e| CliError::ParseConfig {
+        serde_yaml_bw::from_str(yaml).map_err(|e| CliError::ParseConfig {
             path: std::path::PathBuf::from("<yaml-string>"),
             message: e.to_string(),
         })?;
@@ -430,12 +430,12 @@ pub async fn run_from_yaml_str_selected(
     // clear error rather than a token leaking into a connector config.
     params::bind_document(&mut value, &Default::default(), params::BindMode::Strict)?;
     interpolate::unescape_document(&mut value);
-    let interpolated = serde_yaml::to_string(&value).map_err(|e| CliError::ParseConfig {
+    let interpolated = serde_yaml_bw::to_string(&value).map_err(|e| CliError::ParseConfig {
         path: std::path::PathBuf::from("<yaml-string>"),
         message: e.to_string(),
     })?;
     let mut cfg: config::PipelineConfig =
-        serde_yaml::from_str(&interpolated).map_err(|e| CliError::ParseConfig {
+        serde_yaml_bw::from_str(&interpolated).map_err(|e| CliError::ParseConfig {
             path: std::path::PathBuf::from("<yaml-string>"),
             message: e.to_string(),
         })?;

@@ -241,10 +241,12 @@ pub fn load_spec(path: &std::path::Path) -> crate::error::CliResult<TestSpecFile
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
     let spec: TestSpecFile = match ext.as_deref() {
-        Some("yaml" | "yml") => serde_yaml::from_str(&text).map_err(|e| CliError::ParseConfig {
-            path: path.to_path_buf(),
-            message: e.to_string(),
-        })?,
+        Some("yaml" | "yml") => {
+            serde_yaml_bw::from_str(&text).map_err(|e| CliError::ParseConfig {
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            })?
+        }
         Some("json") => serde_json::from_str(&text).map_err(|e| CliError::ParseConfig {
             path: path.to_path_buf(),
             message: e.to_string(),

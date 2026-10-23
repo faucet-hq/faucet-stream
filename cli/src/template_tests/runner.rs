@@ -328,7 +328,7 @@ async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::Params
 }
 
 fn parse_template_text(text: &str, what: &str) -> CliResult<Value> {
-    serde_yaml::from_str(text)
+    serde_yaml_bw::from_str(text)
         .map_err(|e| CliError::Config(format!("template test: parsing the {what}: {e}")))
 }
 
@@ -731,7 +731,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
             .await?
             .body;
             let mut doc: Value = serde_json::from_str(&body)
-                .or_else(|_| serde_yaml::from_str(&body))
+                .or_else(|_| serde_yaml_bw::from_str(&body))
                 .map_err(|e| CliError::Internal(format!("template test: {e}")))?;
             super::trust::screen(&doc)?;
             crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;

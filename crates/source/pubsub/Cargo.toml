@@ -29,7 +29,7 @@ faucet-conformance = { workspace = true, features = ["containers"] }
 schemars.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
-serde_yaml = "0.9"
+serde_yaml_bw = "2"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["google_cloud_sdk_emulators"] }
 

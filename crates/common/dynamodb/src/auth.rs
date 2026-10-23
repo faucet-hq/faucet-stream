@@ -158,16 +158,16 @@ mod tests {
 
     #[test]
     fn credentials_parse_the_consistent_wire_shape() {
-        let c: DynamoDbCredentials = serde_yaml::from_str("type: default\n").unwrap();
+        let c: DynamoDbCredentials = serde_yaml_bw::from_str("type: default\n").unwrap();
         assert!(matches!(c, DynamoDbCredentials::Default));
 
         let c: DynamoDbCredentials =
-            serde_yaml::from_str("type: profile\nconfig: { name: prod }\n").unwrap();
+            serde_yaml_bw::from_str("type: profile\nconfig: { name: prod }\n").unwrap();
         assert!(matches!(c, DynamoDbCredentials::Profile { name } if name == "prod"));
 
         let yaml =
             "type: access_key\nconfig:\n  access_key_id: AKIA\n  secret_access_key: s3cr3t\n";
-        let c: DynamoDbCredentials = serde_yaml::from_str(yaml).unwrap();
+        let c: DynamoDbCredentials = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(matches!(
             &c,
             DynamoDbCredentials::AccessKey { access_key_id, session_token: None, .. }
@@ -176,13 +176,13 @@ mod tests {
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("s3cr3t") && dbg.contains("AKIA"), "{dbg}");
 
-        let c: DynamoDbCredentials = serde_yaml::from_str(
+        let c: DynamoDbCredentials = serde_yaml_bw::from_str(
             "type: assume_role\nconfig: { role_arn: 'arn:aws:iam::1:role/x' }\n",
         )
         .unwrap();
         assert!(format!("{c:?}").contains("arn:aws:iam::1:role/x"));
 
-        let c: DynamoDbCredentials = serde_yaml::from_str("type: web_identity\n").unwrap();
+        let c: DynamoDbCredentials = serde_yaml_bw::from_str("type: web_identity\n").unwrap();
         assert_eq!(format!("{c:?}"), "WebIdentity");
         assert_eq!(format!("{:?}", DynamoDbCredentials::default()), "Default");
         let p = DynamoDbCredentials::Profile { name: "p".into() };

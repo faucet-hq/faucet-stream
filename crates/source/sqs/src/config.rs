@@ -217,7 +217,7 @@ max_messages: 250
 wait_time_seconds: 5
 batch_size: 100
 "#;
-        let c: SqsSourceConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: SqsSourceConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.wait_time_seconds, 5);
         assert_eq!(c.batch_size, 100);

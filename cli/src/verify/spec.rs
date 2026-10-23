@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn defaults_and_validation() {
-        let spec: VerifySpec = serde_yaml::from_str("{}").unwrap();
+        let spec: VerifySpec = serde_yaml_bw::from_str("{}").unwrap();
         assert_eq!(spec, VerifySpec::default());
         assert_eq!(spec.exclude, vec!["_faucet_*".to_string()]);
         assert!(spec.after_run && spec.fail_on_difference && !spec.repair);
@@ -200,7 +200,7 @@ mod tests {
         };
         assert!(bad.validate().unwrap_err().to_string().contains("key"));
         let bad: VerifySpec =
-            serde_yaml::from_str("destination: { type: '', config: {} }").unwrap();
+            serde_yaml_bw::from_str("destination: { type: '', config: {} }").unwrap();
         assert!(
             bad.validate()
                 .unwrap_err()
@@ -211,6 +211,6 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_rejected() {
-        assert!(serde_yaml::from_str::<VerifySpec>("leaf: 5").is_err());
+        assert!(serde_yaml_bw::from_str::<VerifySpec>("leaf: 5").is_err());
     }
 }

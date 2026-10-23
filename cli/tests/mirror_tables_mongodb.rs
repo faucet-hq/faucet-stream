@@ -126,7 +126,7 @@ pipeline:
         state.join("verify").display()
     );
     let cfg = PipelineConfig::from_text(&yaml, Path::new("v.yaml")).unwrap();
-    let spec: VerifySpec = serde_yaml::from_str(&format!(
+    let spec: VerifySpec = serde_yaml_bw::from_str(&format!(
         "key: [_id]\nexclude: [\"_faucet_*\", \"__op\"]\ndestination: {{ type: mongodb, config: {{ connection_uri: \"{uri}\", database: mirror, collection: {coll} }} }}"
     ))
     .unwrap();

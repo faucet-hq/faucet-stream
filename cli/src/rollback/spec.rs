@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn defaults_and_validation() {
-        let spec: RollbackSpec = serde_yaml::from_str("{}").unwrap();
+        let spec: RollbackSpec = serde_yaml_bw::from_str("{}").unwrap();
         assert_eq!(spec, RollbackSpec::default());
         assert!(spec.enabled && spec.journal && spec.keep_previous);
         assert_eq!(spec.retain, 10);
@@ -78,6 +78,6 @@ mod tests {
             ..RollbackSpec::default()
         };
         assert!(bad.validate().unwrap_err().to_string().contains("retain"));
-        assert!(serde_yaml::from_str::<RollbackSpec>("journals: true").is_err());
+        assert!(serde_yaml_bw::from_str::<RollbackSpec>("journals: true").is_err());
     }
 }

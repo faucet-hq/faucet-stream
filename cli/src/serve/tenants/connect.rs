@@ -178,7 +178,7 @@ impl ConnectProviders {
         // Parse first, then resolve directives inside each value (#789
         // SERVE-54): a resolved secret holding ` #`, `: ` or a leading quote
         // must stay one string instead of reshaping the YAML around it.
-        let mut doc: serde_json::Value = serde_yaml::from_str(&raw)
+        let mut doc: serde_json::Value = serde_yaml_bw::from_str(&raw)
             .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
         crate::serve::load::protect_input(path, &doc);
         crate::interpolate::interpolate_value(&mut doc)

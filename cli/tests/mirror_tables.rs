@@ -202,7 +202,7 @@ pipeline:
         state.join("verify").display()
     );
     let cfg = PipelineConfig::from_text(&yaml, Path::new("v.yaml")).unwrap();
-    let spec: VerifySpec = serde_yaml::from_str(&format!(
+    let spec: VerifySpec = serde_yaml_bw::from_str(&format!(
         "key: [{key}]\nranges: 4\nleaf_rows: 16\nexclude: [\"_faucet_*\", \"__op\"]"
     ))
     .unwrap();

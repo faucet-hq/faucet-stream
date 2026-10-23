@@ -410,7 +410,7 @@ mod tests {
     use crate::replication::spec::NewTables;
 
     fn spec() -> TablesSpec {
-        serde_yaml::from_str("include: [\"public.*\"]\nexclude: [\"public.audit_*\"]").unwrap()
+        serde_yaml_bw::from_str("include: [\"public.*\"]\nexclude: [\"public.audit_*\"]").unwrap()
     }
 
     fn desc(name: &str, pk: &[&str]) -> DatasetDescriptor {
@@ -429,7 +429,7 @@ mod tests {
         assert!(selected(&s, "public.orders"));
         assert!(!selected(&s, "public.audit_log"));
         assert!(!selected(&s, "sales.leads"));
-        let all: TablesSpec = serde_yaml::from_str("{}").unwrap();
+        let all: TablesSpec = serde_yaml_bw::from_str("{}").unwrap();
         assert!(selected(&all, "anything"));
         assert_eq!(all.new_tables, NewTables::Follow);
     }
@@ -560,7 +560,7 @@ mod tests {
             write_mode: Some("upsert".into()),
             sink: Some(json!({"table_name": "orders_mirror"})),
             snapshot: Some(json!({"query": "SELECT * FROM {table} WHERE live"})),
-            schema_drift: Some(serde_yaml::from_str("on_drift: evolve").unwrap()),
+            schema_drift: Some(serde_yaml_bw::from_str("on_drift: evolve").unwrap()),
         };
         let mut s = spec();
         s.destination = Some(json!({"table_name": "{schema}_{table_name}"}));
@@ -741,7 +741,7 @@ mod tests {
             active: ["orders".to_string()].into(),
             known: ["orders".to_string()].into(),
             qualifier: Some("shop".into()),
-            follow: Some(serde_yaml::from_str("{}").unwrap()),
+            follow: Some(serde_yaml_bw::from_str("{}").unwrap()),
         };
         assert_eq!(q.route("shop.orders"), Route::Active("orders".into()));
         assert_eq!(q.route("shop.fresh"), Route::New("fresh".into()));

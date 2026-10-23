@@ -136,7 +136,7 @@ async fn webhook_trigger_enqueues_exactly_one_run() {
     let out = dir.path().join("out.jsonl");
 
     let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    dedupe_header: Idempotency-Key\n    config: {}\n",
         serde_json::to_string(&inline).unwrap()
     ))
@@ -211,7 +211,7 @@ async fn webhook_trigger_enqueues_exactly_one_run() {
     // trigger's pipeline too: keys are namespaced by trigger (#789 SERVE-37).
     let out2 = dir.path().join("out2.jsonl");
     let inline2 = inline_pipeline(csv.to_str().unwrap(), out2.to_str().unwrap());
-    let file2: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file2: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: hook2\n    type: webhook\n    dedupe_header: Idempotency-Key\n    config: {}\n",
         serde_json::to_string(&inline2).unwrap()
     ))
@@ -296,7 +296,7 @@ pipeline:
     )
     .await
     .unwrap();
-    let v: serde_json::Value = serde_yaml::from_str(&text).unwrap();
+    let v: serde_json::Value = serde_yaml_bw::from_str(&text).unwrap();
     assert_eq!(v["pipeline"]["source"]["config"]["bucket"], "my-bucket");
     assert_eq!(
         v["pipeline"]["source"]["config"]["prefix"],
@@ -332,7 +332,7 @@ pipeline:
     )
     .await
     .unwrap();
-    let v: serde_json::Value = serde_yaml::from_str(&text).unwrap();
+    let v: serde_json::Value = serde_yaml_bw::from_str(&text).unwrap();
     assert_eq!(
         v["pipeline"]["source"]["config"]["url"],
         "https://api.example.com/orders?dataset=orders"
@@ -355,7 +355,7 @@ async fn a_webhook_fire_with_quoted_and_embedded_tokens_runs() {
         "version: 1\nname: sync\npipeline:\n  source:\n    type: csv\n    config:\n      path: \"${trigger.query.dir}/in.csv\"\n  sink:\n    type: jsonl\n    config:\n      path: ${trigger.query.dir}/out-${trigger.query.dataset}.jsonl\n",
     )
     .unwrap();
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: sync-hook\n    type: webhook\n    config: {}\n",
         pipeline.display()
     ))
@@ -457,7 +457,7 @@ async fn object_arrival_enqueues_one_run_per_object_and_dedupes() {
     // ${trigger.object_key} here — we're testing enqueue count not data flow.
     let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
 
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
         serde_json::to_string(&inline).unwrap()
     ))
@@ -562,7 +562,7 @@ async fn queue_depth_fires_once_on_rising_edge() {
         std::fs::write(&csv, "a\n1\n").unwrap();
         let out = dir.path().join("out.jsonl");
         let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
-        let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
             "version: 1\ntriggers:\n  - name: drain\n    type: queue_depth\n    threshold: 5\n    queue: {{ type: redis, url: \"redis://x\", key: jobs }}\n    config: {}\n",
             serde_json::to_string(&inline).unwrap()
         ))
@@ -749,7 +749,7 @@ async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
     std::fs::write(&csv, "a\n1\n").unwrap();
     let out = dir.path().join("out.jsonl");
     let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: drain\n    type: queue_depth\n    threshold: 5\n    queue: {{ type: redis, url: \"redis://x\", key: jobs }}\n    config: {}\n",
         serde_json::to_string(&inline).unwrap()
     ))
@@ -1200,7 +1200,7 @@ async fn a_bad_object_is_skipped_and_reported_instead_of_blocking_the_prefix() {
     // The object key is the delivery mode: `bogus` does not parse.
     let mut inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
     inline["delivery"] = serde_json::json!("${trigger.object_key}");
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
         serde_json::to_string(&inline).unwrap()
     ))
@@ -1255,7 +1255,7 @@ async fn an_object_whose_reference_is_briefly_unreadable_is_retried() {
     let mut inline = inline_pipeline(csv.to_str().unwrap(), "unused");
     inline["pipeline"]["sink"]["config"]["path"] =
         serde_json::json!(format!("${{file:{}}}", pointer.display()));
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(&format!(
         "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
         serde_json::to_string(&inline).unwrap()
     ))
@@ -1294,7 +1294,7 @@ async fn an_object_whose_reference_is_briefly_unreadable_is_retried() {
 /// unhealthy with the reason instead of staying green.
 #[tokio::test]
 async fn an_unbuildable_watcher_is_reported_unhealthy() {
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml_bw::from_str(
         "version: 1\ntriggers:\n  - name: broken\n    type: webhook\n    config: { version: 1 }\n",
     )
     .unwrap();

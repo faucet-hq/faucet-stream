@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn first_matching_rule_wins_and_principals_bypass_roles() {
-        let p: ApprovalPolicy = serde_yaml::from_str(
+        let p: ApprovalPolicy = serde_yaml_bw::from_str(
             "expire_secs: 60\nrules:\n  - kinds: [run]\n    roles: [operator]\n    self_approve: true\n  - principals: [alice]\n    min_approvers: 2\n",
         )
         .unwrap();
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn a_delete_or_deprecation_takes_the_launch_rule_unless_named() {
-        let p: ApprovalPolicy = serde_yaml::from_str(
+        let p: ApprovalPolicy = serde_yaml_bw::from_str(
             "rules:\n  - kinds: [run]\n    roles: [operator]\n  - kinds: [template_launch]\n    min_approvers: 2\n  - kinds: [template_deprecate]\n    roles: [operator]\n",
         )
         .unwrap();
@@ -298,12 +298,14 @@ mod tests {
 
     #[test]
     fn validate_refuses_zero_quorum_and_empty_names() {
-        let bad: ApprovalPolicy = serde_yaml::from_str("rules:\n  - min_approvers: 0\n").unwrap();
+        let bad: ApprovalPolicy =
+            serde_yaml_bw::from_str("rules:\n  - min_approvers: 0\n").unwrap();
         assert!(bad.validate().unwrap_err().contains("min_approvers"));
-        let bad: ApprovalPolicy = serde_yaml::from_str("rules:\n  - principals: [' ']\n").unwrap();
+        let bad: ApprovalPolicy =
+            serde_yaml_bw::from_str("rules:\n  - principals: [' ']\n").unwrap();
         assert!(bad.validate().unwrap_err().contains("empty name"));
-        let bad: ApprovalPolicy = serde_yaml::from_str("expire_secs: 0\n").unwrap();
+        let bad: ApprovalPolicy = serde_yaml_bw::from_str("expire_secs: 0\n").unwrap();
         assert!(bad.validate().is_err());
-        assert!(serde_yaml::from_str::<ApprovalPolicy>("nope: 1\n").is_err());
+        assert!(serde_yaml_bw::from_str::<ApprovalPolicy>("nope: 1\n").is_err());
     }
 }

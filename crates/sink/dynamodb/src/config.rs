@@ -256,7 +256,7 @@ expression_attribute_values: { ":v": 3 }
 on_condition_failure: fail
 retry: { max_retries: 2, initial_backoff_ms: 10 }
 "##;
-        let c: DynamoDbSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: DynamoDbSinkConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.write.write_mode, WriteMode::Upsert);
         assert_eq!(c.write.key, vec!["pk", "sk"]);

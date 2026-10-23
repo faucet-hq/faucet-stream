@@ -47,7 +47,7 @@ fn load_fixture_file(path: &Path) -> CliResult<Vec<Value>> {
             path,
         ),
         Some("yaml" | "yml") => as_array(
-            serde_yaml::from_str(&text).map_err(|e| CliError::ParseConfig {
+            serde_yaml_bw::from_str(&text).map_err(|e| CliError::ParseConfig {
                 path: path.to_path_buf(),
                 message: e.to_string(),
             })?,

@@ -1417,13 +1417,13 @@ fn resolve_document(text: &str, path: &Path, inputs: &RunInputs) -> CliResult<St
     match ext.as_deref() {
         Some("yaml" | "yml") => {
             let mut value: serde_json::Value =
-                serde_yaml::from_str(text).map_err(|e| CliError::ParseConfig {
+                serde_yaml_bw::from_str(text).map_err(|e| CliError::ParseConfig {
                     path: path.to_path_buf(),
                     message: friendly_parse_error(&e.to_string()),
                 })?;
             crate::requires::check_document(&value, "pipeline")?;
             resolve(&mut value)?;
-            serde_yaml::to_string(&value).map_err(|e| CliError::ParseConfig {
+            serde_yaml_bw::to_string(&value).map_err(|e| CliError::ParseConfig {
                 path: path.to_path_buf(),
                 message: e.to_string(),
             })
@@ -1560,7 +1560,7 @@ impl PipelineConfig {
             .map(str::to_ascii_lowercase);
         // Deprecated spellings are visible only in the raw document (#670).
         let raw: Option<serde_json::Value> = match ext.as_deref() {
-            Some("yaml" | "yml") => serde_yaml::from_str(text).ok(),
+            Some("yaml" | "yml") => serde_yaml_bw::from_str(text).ok(),
             Some("json") => serde_json::from_str(text).ok(),
             _ => None,
         };
@@ -1571,7 +1571,7 @@ impl PipelineConfig {
         // Typed parse first: its errors carry the document's line numbers.
         let cfg: PipelineConfig = match ext.as_deref() {
             Some("yaml" | "yml") => {
-                serde_yaml::from_str(text).map_err(|e| CliError::ParseConfig {
+                serde_yaml_bw::from_str(text).map_err(|e| CliError::ParseConfig {
                     path: path.to_path_buf(),
                     message: friendly_parse_error(&e.to_string()),
                 })?
@@ -1953,7 +1953,7 @@ pipeline:
     config:
       path: "/tmp/faucet-test.jsonl"
 "#;
-        let cfg: PipelineConfig = serde_yaml::from_str(y).unwrap();
+        let cfg: PipelineConfig = serde_yaml_bw::from_str(y).unwrap();
         let obs = cfg.observability.expect("observability block parsed");
         let p = obs.prometheus.expect("prometheus parsed");
         assert_eq!(p.listen, "127.0.0.1:9464");

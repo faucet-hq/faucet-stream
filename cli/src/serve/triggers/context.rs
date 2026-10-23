@@ -128,33 +128,33 @@ pub fn substitute(
     if !text.contains("${trigger.") {
         return Ok(text.to_string());
     }
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(text)
+    let mut doc: serde_yaml_bw::Value = serde_yaml_bw::from_str(text)
         .map_err(|e| format!("pipeline config is not valid YAML: {e}"))?;
     substitute_value(&mut doc, event, name, fired_at)?;
-    serde_yaml::to_string(&doc).map_err(|e| format!("re-rendering pipeline config: {e}"))
+    serde_yaml_bw::to_string(&doc).map_err(|e| format!("re-rendering pipeline config: {e}"))
 }
 
 fn substitute_value(
-    v: &mut serde_yaml::Value,
+    v: &mut serde_yaml_bw::Value,
     event: &TriggerEvent,
     name: &str,
     fired_at: &str,
 ) -> Result<(), String> {
     match v {
-        serde_yaml::Value::String(s) if s.contains("${trigger.") => {
+        serde_yaml_bw::Value::String(s) if s.contains("${trigger.") => {
             *s = substitute_with(s, event, name, fired_at, true)?;
         }
-        serde_yaml::Value::Sequence(items) => {
+        serde_yaml_bw::Value::Sequence(items) => {
             for item in items {
                 substitute_value(item, event, name, fired_at)?;
             }
         }
-        serde_yaml::Value::Mapping(map) => {
+        serde_yaml_bw::Value::Mapping(map) => {
             for (_, item) in map.iter_mut() {
                 substitute_value(item, event, name, fired_at)?;
             }
         }
-        serde_yaml::Value::Tagged(tagged) => {
+        serde_yaml_bw::Value::Tagged(tagged) => {
             substitute_value(&mut tagged.value, event, name, fired_at)?;
         }
         _ => {}
@@ -385,7 +385,7 @@ mod tests {
     }
 
     fn parsed(text: &str) -> serde_json::Value {
-        serde_yaml::from_str(text).unwrap()
+        serde_yaml_bw::from_str(text).unwrap()
     }
 
     #[test]

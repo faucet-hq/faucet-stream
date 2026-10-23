@@ -206,8 +206,8 @@ impl PartitionSpec {
 mod tests {
     use super::*;
 
-    fn parse(yaml: &str) -> Result<PartitionSpec, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    fn parse(yaml: &str) -> Result<PartitionSpec, serde_yaml_bw::Error> {
+        serde_yaml_bw::from_str(yaml)
     }
 
     #[test]

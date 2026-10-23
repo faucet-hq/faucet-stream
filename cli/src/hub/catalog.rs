@@ -197,7 +197,7 @@ pub fn load_test_suites(
     for (p, owner) in list_dir(&root.join(TEST_SUITE_DIR))? {
         let text = std::fs::read_to_string(&p)
             .map_err(|e| CliError::Config(format!("reading {}: {e}", p.display())))?;
-        let value: serde_json::Value = serde_yaml::from_str(&text)
+        let value: serde_json::Value = serde_yaml_bw::from_str(&text)
             .map_err(|e| CliError::Config(format!("{}: invalid YAML: {e}", p.display())))?;
         let t = crate::template_tests::bundle::parse_test_suite(value)
             .map_err(|e| CliError::Config(format!("{}: {e}", p.display())))?;
@@ -1456,7 +1456,7 @@ per_stream:
     #[test]
     fn a_deployment_lint_flags_literal_credentials_only() {
         let d = |y: &str| {
-            crate::hub::DeploymentTemplate::from_value(serde_yaml::from_str(y).unwrap()).unwrap()
+            crate::hub::DeploymentTemplate::from_value(serde_yaml_bw::from_str(y).unwrap()).unwrap()
         };
         let ok = d(r#"
 kind: deployment

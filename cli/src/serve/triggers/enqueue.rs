@@ -53,7 +53,7 @@ pub async fn resolve_config_text(
             .await
             .map_err(|e| format!("reading pipeline config '{p}': {e}"))?,
         PipelineRef::Inline(v) => {
-            serde_yaml::to_string(v).map_err(|e| format!("serializing inline pipeline: {e}"))?
+            serde_yaml_bw::to_string(v).map_err(|e| format!("serializing inline pipeline: {e}"))?
         }
     };
     context::substitute(&raw, event, name, fired_at)

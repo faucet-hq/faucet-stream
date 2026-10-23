@@ -519,7 +519,7 @@ fn parse_untyped(text: &str, path: &Path) -> CliResult<Value> {
         serde_json::from_str(text)
             .map_err(|e| CliError::Config(format!("{}: invalid JSON: {e}", path.display())))
     } else {
-        serde_yaml::from_str(text)
+        serde_yaml_bw::from_str(text)
             .map_err(|e| CliError::Config(format!("{}: invalid YAML: {e}", path.display())))
     }
 }

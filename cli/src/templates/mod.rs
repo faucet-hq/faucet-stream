@@ -71,13 +71,13 @@ pub use store::{
 use crate::error::{CliError, CliResult};
 
 /// Strip comments from a stored template body and re-emit it as canonical YAML.
-/// `serde_yaml` parses JSON too (JSON ⊂ YAML), so a JSON-format template
+/// `serde_yaml_bw` parses JSON too (JSON ⊂ YAML), so a JSON-format template
 /// normalizes to YAML as well; `${param.*}` tokens are plain strings and pass
 /// through unchanged. A pure view transform — it never mutates the stored body.
 /// Shared by `faucet template show --clean` and the serve `?clean=true` endpoint.
 pub fn clean_config_yaml(body: &str) -> CliResult<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(body)
+    let value: serde_yaml_bw::Value = serde_yaml_bw::from_str(body)
         .map_err(|e| CliError::Internal(format!("clean-config: parse template body: {e}")))?;
-    serde_yaml::to_string(&value)
+    serde_yaml_bw::to_string(&value)
         .map_err(|e| CliError::Internal(format!("clean-config: re-emit YAML: {e}")))
 }

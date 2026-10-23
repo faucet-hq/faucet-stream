@@ -258,7 +258,7 @@ idle_termination_secs: 5
 max_messages: 500
 batch_size: 100
 "#;
-        let c: PubsubSourceConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: PubsubSourceConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.value_format, ValueFormat::String);
         assert_eq!(c.attributes_key, "attrs");

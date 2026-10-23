@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn parses_minimal_block_with_defaults() {
-        let spec: CatalogSpec = serde_yaml::from_str("url: sqlite:./cat.db").unwrap();
+        let spec: CatalogSpec = serde_yaml_bw::from_str("url: sqlite:./cat.db").unwrap();
         assert_eq!(spec.url, "sqlite:./cat.db");
         assert_eq!(spec.sample_records, 100);
         assert!(spec.datasets.is_empty());
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields() {
-        let err = serde_yaml::from_str::<CatalogSpec>("url: memory\nnope: 1").unwrap_err();
+        let err = serde_yaml_bw::from_str::<CatalogSpec>("url: memory\nnope: 1").unwrap_err();
         assert!(err.to_string().contains("nope"));
     }
 

@@ -280,7 +280,7 @@ use faucet_core::masking::{CompiledMasking, MaskingSpec};
 use faucet_core::Pipeline;
 use std::sync::Arc;
 
-let spec: MaskingSpec = serde_yaml::from_str(yaml)?;   // or serde_json
+let spec: MaskingSpec = serde_yaml_bw::from_str(yaml)?;   // or serde_json
 let compiled = Arc::new(CompiledMasking::compile(&spec)?);   // requires the `masking` feature
 
 // or scope to one destination sink by its template name / connector kind:

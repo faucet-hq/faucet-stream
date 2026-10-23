@@ -207,7 +207,7 @@ pub(crate) fn apply_request_budget(mut req: SubmitRequest) -> Result<SubmitReque
     };
     extra.validate().map_err(ServeError::BadConfig)?;
     let mut doc: serde_json::Value = match req.config_format {
-        ConfigFormatWire::Yaml => serde_yaml::from_str(&req.config)
+        ConfigFormatWire::Yaml => serde_yaml_bw::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
         ConfigFormatWire::Json => serde_json::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,

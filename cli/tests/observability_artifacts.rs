@@ -93,8 +93,8 @@ fn referenced_metrics(path: &Path) -> BTreeSet<String> {
 fn artifacts_exist_and_parse() {
     let root = repo_root();
     let alerts = root.join("observability/prometheus/alerts.yml");
-    let parsed: serde_yaml::Value =
-        serde_yaml::from_str(&std::fs::read_to_string(&alerts).expect("alerts.yml exists"))
+    let parsed: serde_yaml_bw::Value =
+        serde_yaml_bw::from_str(&std::fs::read_to_string(&alerts).expect("alerts.yml exists"))
             .expect("alerts.yml parses as YAML");
     let groups = parsed["groups"].as_sequence().expect("alert groups");
     assert!(groups.len() >= 3, "alert groups present");

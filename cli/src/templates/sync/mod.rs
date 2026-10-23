@@ -200,7 +200,7 @@ fn interpolate_scalars(v: &mut serde_json::Value) -> CliResult<()> {
             let t = s.trim();
             let whole = t.starts_with("${") && t.ends_with('}') && t.matches("${").count() == 1;
             let out = crate::interpolate::interpolate(s)?;
-            *v = match serde_yaml::from_str::<Value>(&out) {
+            *v = match serde_yaml_bw::from_str::<Value>(&out) {
                 Ok(typed @ (Value::Number(_) | Value::Bool(_))) if whole => typed,
                 _ => Value::String(crate::interpolate::unescape(&out)),
             };
@@ -232,7 +232,7 @@ fn parse_sync_file(text: &str, path: &Path) -> CliResult<SyncFile> {
         serde_json::from_str(text)
             .map_err(|e| CliError::Config(format!("parsing templates-sync JSON: {e}")))?
     } else {
-        serde_yaml::from_str(text)
+        serde_yaml_bw::from_str(text)
             .map_err(|e| CliError::Config(format!("parsing templates-sync YAML: {e}")))?
     };
     #[cfg(feature = "serve")]

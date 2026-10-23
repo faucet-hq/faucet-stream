@@ -93,15 +93,15 @@ impl ConfigFormat {
         }
     }
 
-    /// Parse, canonicalize and re-render. YAML goes through `serde_yaml`'s
+    /// Parse, canonicalize and re-render. YAML goes through `serde_yaml_bw`'s
     /// own value so tags (`!include path`) survive.
     fn format(self, text: &str, path: &Path) -> CliResult<String> {
         match self {
             ConfigFormat::Yaml => {
-                let value: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| {
+                let value: serde_yaml_bw::Value = serde_yaml_bw::from_str(text).map_err(|e| {
                     CliError::Config(format!("cannot parse '{}': {e}", path.display()))
                 })?;
-                serde_yaml::to_string(&canonicalize_yaml(value)).map_err(|e| {
+                serde_yaml_bw::to_string(&canonicalize_yaml(value)).map_err(|e| {
                     CliError::Config(format!("cannot serialize '{}': {e}", path.display()))
                 })
             }
@@ -112,7 +112,7 @@ impl ConfigFormat {
     fn parse(self, text: &str, path: &Path) -> CliResult<Value> {
         let err = |e: String| CliError::Config(format!("cannot parse '{}': {e}", path.display()));
         match self {
-            ConfigFormat::Yaml => serde_yaml::from_str(text).map_err(|e| err(e.to_string())),
+            ConfigFormat::Yaml => serde_yaml_bw::from_str(text).map_err(|e| err(e.to_string())),
             ConfigFormat::Json => serde_json::from_str(text).map_err(|e| err(e.to_string())),
         }
     }
@@ -121,7 +121,7 @@ impl ConfigFormat {
         let err =
             |e: String| CliError::Config(format!("cannot serialize '{}': {e}", path.display()));
         match self {
-            ConfigFormat::Yaml => serde_yaml::to_string(value).map_err(|e| err(e.to_string())),
+            ConfigFormat::Yaml => serde_yaml_bw::to_string(value).map_err(|e| err(e.to_string())),
             ConfigFormat::Json => {
                 let mut s = serde_json::to_string_pretty(value).map_err(|e| err(e.to_string()))?;
                 s.push('\n');
@@ -218,8 +218,8 @@ pub fn canonicalize(value: Value) -> Value {
 }
 
 /// [`canonicalize`] over a YAML document, keeping tags (`!include`) intact.
-fn canonicalize_yaml(value: serde_yaml::Value) -> serde_yaml::Value {
-    use serde_yaml::Value as Y;
+fn canonicalize_yaml(value: serde_yaml_bw::Value) -> serde_yaml_bw::Value {
+    use serde_yaml_bw::Value as Y;
     match value {
         Y::Mapping(map) => {
             let mut entries: Vec<(Y, Y)> = map
@@ -233,7 +233,7 @@ fn canonicalize_yaml(value: serde_yaml::Value) -> serde_yaml::Value {
             });
             Y::Mapping(entries.into_iter().collect())
         }
-        Y::Sequence(items) => Y::Sequence(items.into_iter().map(canonicalize_yaml).collect()),
+        Y::Sequence(items) => items.into_iter().map(canonicalize_yaml).collect(),
         Y::Tagged(mut tagged) => {
             tagged.value = canonicalize_yaml(tagged.value);
             Y::Tagged(tagged)

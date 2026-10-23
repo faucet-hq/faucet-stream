@@ -340,7 +340,7 @@ triggers:
     config: ./pipelines/load.yaml
     store: { type: s3, bucket: b, prefix: incoming/ }
 "#;
-        let f: TriggersFile = serde_yaml::from_str(yaml).unwrap();
+        let f: TriggersFile = serde_yaml_bw::from_str(yaml).unwrap();
         assert_eq!(f.version, 1);
         assert_eq!(f.triggers.len(), 1);
         let t = &f.triggers[0];
@@ -378,7 +378,7 @@ triggers:
     queue: { type: redis, url: "redis://x", key: jobs, kind: stream }
     threshold: 5
 "#;
-        let f: TriggersFile = serde_yaml::from_str(yaml).unwrap();
+        let f: TriggersFile = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(matches!(f.triggers[0].config, Some(PipelineRef::Inline(_))));
         match &f.triggers[0].kind {
             TriggerKind::Webhook {
@@ -412,13 +412,13 @@ triggers:
     #[test]
     fn rejects_unknown_top_level_field() {
         let yaml = "version: 1\ntriggers: []\nbogus: 1\n";
-        assert!(serde_yaml::from_str::<TriggersFile>(yaml).is_err());
+        assert!(serde_yaml_bw::from_str::<TriggersFile>(yaml).is_err());
     }
 
     /// Parse the same text both ways: the typed form and a raw JSON `Value`.
     fn parse_both(yaml: &str) -> (TriggersFile, serde_json::Value) {
-        let file: TriggersFile = serde_yaml::from_str(yaml).expect("typed parse");
-        let raw: serde_json::Value = serde_yaml::from_str(yaml).expect("raw parse");
+        let file: TriggersFile = serde_yaml_bw::from_str(yaml).expect("typed parse");
+        let raw: serde_json::Value = serde_yaml_bw::from_str(yaml).expect("raw parse");
         (file, raw)
     }
 

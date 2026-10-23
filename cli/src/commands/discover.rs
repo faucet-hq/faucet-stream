@@ -337,7 +337,7 @@ fn schema_summary(schema: &Value, max_cols: usize) -> Option<String> {
 
 /// Render a serde value as a YAML sequence item indented under `matrix:`.
 fn yaml_seq_item(value: &Value) -> CliResult<String> {
-    let body = serde_yaml::to_string(value)
+    let body = serde_yaml_bw::to_string(value)
         .map_err(|e| CliError::Internal(format!("yaml render: {e}")))?;
     let mut out = String::new();
     for (i, line) in body.trim_end().lines().enumerate() {
@@ -421,16 +421,16 @@ fn render_discovered_config(
     sink_template: Option<&str>,
     datasets: &[DatasetDescriptor],
 ) -> CliResult<String> {
-    let mut root: serde_yaml::Value = serde_yaml::from_str(raw_composed)
+    let mut root: serde_yaml_bw::Value = serde_yaml_bw::from_str(raw_composed)
         .map_err(|e| CliError::Config(format!("could not re-parse composed config: {e}")))?;
     let map = root
         .as_mapping_mut()
         .ok_or_else(|| CliError::Config("composed config is not a mapping".into()))?;
     let replaced_matrix = map
-        .remove(serde_yaml::Value::String("matrix".into()))
+        .remove(serde_yaml_bw::Value::String("matrix".into(), None))
         .is_some();
 
-    let head = serde_yaml::to_string(&root)
+    let head = serde_yaml_bw::to_string(&root)
         .map_err(|e| CliError::Internal(format!("yaml render: {e}")))?;
 
     let row_ids = unique_row_ids(datasets);
@@ -557,7 +557,7 @@ fn inert_directives(v: Value) -> Value {
 /// The sink template a generated row writes through — the `--sink` template,
 /// else `pipeline.sink` / `pipeline.sinks.default` — as `(kind, config)`.
 fn shared_sink_spec(
-    root: &serde_yaml::Value,
+    root: &serde_yaml_bw::Value,
     sink_template: Option<&str>,
 ) -> Option<(String, Value)> {
     let root: Value = serde_json::to_value(root).ok()?;

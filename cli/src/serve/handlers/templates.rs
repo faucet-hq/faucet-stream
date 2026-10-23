@@ -215,7 +215,7 @@ pub async fn register_template(
     {
         let parsed: Result<serde_json::Value, String> = match record.format {
             crate::serve::load::ConfigFormat::Yaml => {
-                serde_yaml::from_str(&record.body).map_err(|e| e.to_string())
+                serde_yaml_bw::from_str(&record.body).map_err(|e| e.to_string())
             }
             crate::serve::load::ConfigFormat::Json => {
                 serde_json::from_str(&record.body).map_err(|e| e.to_string())

@@ -121,7 +121,7 @@ pipeline:
         auth: Default::default(),
         clock: chrono::Utc::now().fixed_offset(),
     };
-    let spec: VerifySpec = serde_yaml::from_str("ranges: 4\nleaf_rows: 8").unwrap();
+    let spec: VerifySpec = serde_yaml_bw::from_str("ranges: 4\nleaf_rows: 8").unwrap();
 
     // Equal: the whole-dataset server digests agree and no row is fetched.
     let equal = faucet_cli::verify::verify(&cfg, &spec, inputs())

@@ -212,7 +212,7 @@ snapshot:
     type: postgres
     config: { connection_url: "postgres://x", query: "SELECT * FROM orders" }
 "#;
-        let spec: ReplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let spec: ReplicationSpec = serde_yaml_bw::from_str(yaml).unwrap();
         assert_eq!(spec.mode, ReplicationMode::SnapshotThenCdc);
         assert_eq!(spec.snapshot.source.kind, "postgres");
         assert!(spec.continuous, "continuous defaults to true");
@@ -226,7 +226,7 @@ continuous: false
 snapshot:
   source: { type: postgres, config: {} }
 "#;
-        let spec: ReplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let spec: ReplicationSpec = serde_yaml_bw::from_str(yaml).unwrap();
         assert!(!spec.continuous);
     }
 
@@ -237,6 +237,6 @@ mode: snapshot_then_cdc
 snapshot: { source: { type: postgres, config: {} } }
 bogus: true
 "#;
-        assert!(serde_yaml::from_str::<ReplicationSpec>(yaml).is_err());
+        assert!(serde_yaml_bw::from_str::<ReplicationSpec>(yaml).is_err());
     }
 }

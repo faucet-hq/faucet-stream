@@ -252,7 +252,7 @@ batch_size: 5
 concurrency: 2
 retry_max_attempts: 3
 "#;
-        let c: SqsSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: SqsSinkConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(c.message_group_id.as_deref(), Some("orders"));
         assert_eq!(

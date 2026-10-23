@@ -335,7 +335,7 @@ batch_size: 100
 concurrency: 2
 retry_max_attempts: 3
 "#;
-        let c: KinesisSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let c: KinesisSinkConfig = serde_yaml_bw::from_str(yaml).unwrap();
         c.validate().unwrap();
         assert_eq!(
             c.partition_key,

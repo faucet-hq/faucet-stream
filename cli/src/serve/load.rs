@@ -1553,7 +1553,7 @@ pub async fn load_submission_with(
     let refs = references.for_origin(origin, tenant.as_deref().map(|t| t.values.id.as_str()));
     // 1. Parse to a Value per the declared format.
     let mut submitted: Value = match format {
-        ConfigFormat::Yaml => serde_yaml::from_str(body)
+        ConfigFormat::Yaml => serde_yaml_bw::from_str(body)
             .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
         ConfigFormat::Json => serde_json::from_str(body)
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
@@ -2467,7 +2467,7 @@ schedule:
     }
 
     fn cfg_of(yaml: &str) -> PipelineConfig {
-        PipelineConfig::from_value(serde_yaml::from_str(yaml).unwrap()).unwrap()
+        PipelineConfig::from_value(serde_yaml_bw::from_str(yaml).unwrap()).unwrap()
     }
 
     #[test]

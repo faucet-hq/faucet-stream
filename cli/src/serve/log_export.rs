@@ -591,7 +591,7 @@ pub fn run_attrs(run_id: &str, rec: Option<&RunRecord>) -> BTreeMap<String, Stri
 /// for a run shipped by an instance that did not execute it.
 #[cfg(feature = "notify")]
 pub fn notifier_from_body(body: &str) -> Option<Arc<crate::notify::Notifier>> {
-    let mut v: serde_json::Value = serde_yaml::from_str(body).ok()?;
+    let mut v: serde_json::Value = serde_yaml_bw::from_str(body).ok()?;
     let mut n = v.get_mut("notifications")?.take();
     crate::interpolate::interpolate_value(&mut n).ok()?;
     let specs: Vec<crate::notify::NotificationSpec> = serde_json::from_value(n).ok()?;

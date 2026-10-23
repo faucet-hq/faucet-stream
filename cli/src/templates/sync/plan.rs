@@ -142,7 +142,7 @@ impl SyncPlan {
 /// keys re-emitted in canonical YAML), so a formatting-only edit upstream does
 /// not register a new version. JSON bodies canonicalize the same way.
 pub fn body_hash(body: &str) -> CliResult<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(body)
+    let value: serde_yaml_bw::Value = serde_yaml_bw::from_str(body)
         .map_err(|e| CliError::Config(format!("body is not valid YAML/JSON: {e}")))?;
     canonical_hash(&value)
 }
@@ -152,7 +152,7 @@ pub fn body_hash(body: &str) -> CliResult<String> {
 /// suites. An origin's body never carries those (registration refuses them),
 /// so without this an origin body would never match its stored version.
 pub fn stored_body_hash(body: &str) -> CliResult<String> {
-    let mut value: serde_yaml::Value = serde_yaml::from_str(body)
+    let mut value: serde_yaml_bw::Value = serde_yaml_bw::from_str(body)
         .map_err(|e| CliError::Config(format!("body is not valid YAML/JSON: {e}")))?;
     if let Some(map) = value.as_mapping_mut() {
         let inherited = map
@@ -168,8 +168,8 @@ pub fn stored_body_hash(body: &str) -> CliResult<String> {
     canonical_hash(&value)
 }
 
-fn canonical_hash(value: &serde_yaml::Value) -> CliResult<String> {
-    let canonical = serde_yaml::to_string(value)
+fn canonical_hash(value: &serde_yaml_bw::Value) -> CliResult<String> {
+    let canonical = serde_yaml_bw::to_string(value)
         .map_err(|e| CliError::Config(format!("body could not be canonicalized: {e}")))?;
     let digest = Sha256::digest(canonical.as_bytes());
     Ok(format!("{digest:x}"))

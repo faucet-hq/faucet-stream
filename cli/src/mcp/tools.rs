@@ -625,7 +625,7 @@ fn parse_config_with(
     mode: crate::params::BindMode,
     screen: Option<crate::serve::load::BodyOrigin>,
 ) -> Result<PipelineConfig, String> {
-    let mut doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let mut doc: Value = serde_yaml_bw::from_str(text).map_err(|e| e.to_string())?;
     crate::interpolate::interpolate_value(&mut doc).map_err(|e| e.to_string())?;
     crate::params::bind_document(&mut doc, &Default::default(), mode).map_err(|e| e.to_string())?;
     if let Some(origin) = screen {
@@ -660,7 +660,7 @@ fn screen_config(ctx: &McpContext, text: &str) -> Result<(), String> {
     let Some(origin) = ctx.submitted else {
         return Ok(());
     };
-    let doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let doc: Value = serde_yaml_bw::from_str(text).map_err(|e| e.to_string())?;
     crate::serve::load::screen_document(&doc, origin).map_err(|e| e.api_error().error.message)
 }
 
