@@ -5961,7 +5961,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-pubsub"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6839,7 +6839,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-pubsub"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-stream",
  "async-trait",
