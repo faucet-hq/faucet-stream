@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-pubsub-v1.2.0...faucet-sink-pubsub-v1.2.1) - 2026-10-23
+
+### Bug Fixes
+
+- Republish with `gcloud-pubsub`'s `jwt-aws-lc-rs` feature: 1.2.0 was published with `jwt-rust-crypto`, which conflicts with `faucet-common-pubsub` 1.2.1 (`gcloud-auth` refuses both features) and broke every fresh build depending on this crate
+
 ## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-pubsub-v1.1.1...faucet-sink-pubsub-v1.2.0) - 2026-10-15
 
 ### Bug Fixes
