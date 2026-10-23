@@ -48,19 +48,16 @@ cosign verify ghcr.io/faucet-hq/faucet-stream:full \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-The prebuilt binary includes the CLI **default** feature set (every first-party
-connector, transforms, quality checks, contracts, masking, compression) plus
-`serve` with the embedded web console (`serve-ui`), `schedule`, `lineage`, `templates`
-(the pipeline template registry), `mcp` (the `faucet mcp` server for AI
-agents), `notify` (Slack / PagerDuty / webhook notifications), `secrets`
-(`${vault:…}`, `${aws-sm:…}`, `${gcp-sm:…}`, `${azure-kv:…}`), `catalog` (the
-Data Movement Catalog), and the `serve-history-sqlite` /
-`serve-history-postgres` backends (so run history, the template registry and
-the catalog survive a restart). Not included — build from source for these:
-`transform-sql` (embedded DuckDB), `transform-wasm`, `otel`, `triggers`,
-`tenants`, `encryption`, and the Oracle connectors (`source-oracle`,
-`source-oracle-cdc`, `sink-oracle`), which need Oracle Instant Client at runtime
-(see [Oracle Instant Client](#oracle-instant-client)).
+The prebuilt binary includes every feature: it is the CLI's `full` build, the
+same set as the `:latest` / `-full` container image. That is every first-party
+connector, `serve` with the web console and its SQLite / Postgres history,
+`schedule`, `triggers` (webhook, object-arrival, Redis and Kafka watchers),
+`templates` and template sync, `mcp`, `notify`, `secrets` (`${vault:…}`,
+`${aws-sm:…}`, `${gcp-sm:…}`, `${azure-kv:…}`), `catalog`, `lineage`, `otel`,
+`tenants`, `encryption`, and the `sql` / `wasm` transforms. The Oracle
+connectors are included too; using them needs Oracle Instant Client installed
+(see [Oracle Instant Client](#oracle-instant-client)) — every other connector
+runs without it.
 
 ### Container images
 

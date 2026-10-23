@@ -228,9 +228,10 @@ Unity Catalog table, keyed upserts, or exactly-once → `databricks`.
 - **`sink-oracle`** — array DML with `upsert` / `delete` / `overwrite`,
   exactly-once, and schema evolution.
 
-All three load **Oracle Instant Client** at runtime, so they are not in the
-default build or the prebuilt binaries — enable them with
-`--features "source-oracle,source-oracle-cdc,sink-oracle"` (or `full`) and see
+All three load **Oracle Instant Client** at runtime. The prebuilt binaries and
+the `full` image include them; from crates.io enable them with
+`--features "source-oracle,source-oracle-cdc,sink-oracle"` (or `full`). Either
+way, install Instant Client to use them — see
 [Installation](../getting-started/installation.md#oracle-instant-client).
 
 ## Amazon DynamoDB

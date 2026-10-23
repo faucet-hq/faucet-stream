@@ -1002,8 +1002,8 @@ dataset.
 
 ## `usage`
 
-*(requires the `catalog` build feature — included in `full`, not in the
-default build or the prebuilt binaries)*
+*(requires the `catalog` build feature — included in `full` and the prebuilt
+binaries, not in the default `cargo install` build)*
 
 ```bash
 faucet usage [--config PATH] [--since WHEN] [--until WHEN] [--pipeline NAME] \

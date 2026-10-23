@@ -53,6 +53,19 @@ class Dockerfile(unittest.TestCase):
         self.assertIsNone(ffc.dockerfile_default_features("FROM scratch\n"))
 
 
+class Dist(unittest.TestCase):
+    def test_reads_the_dist_features(self):
+        text = '[workspace]\nmembers = []\n\n[dist]\nfeatures = ["full"]\n'
+        self.assertEqual(ffc.dist_features(text), ["full"])
+
+    def test_a_hand_picked_list_is_returned_as_is(self):
+        text = '[dist]\nfeatures = ["serve", "mcp"]\n'
+        self.assertEqual(ffc.dist_features(text), ["serve", "mcp"])
+
+    def test_no_features_is_none(self):
+        self.assertIsNone(ffc.dist_features("[dist]\nci = \"github\"\n"))
+
+
 class Repository(unittest.TestCase):
     def test_the_checked_in_manifests_pass(self):
         import os
