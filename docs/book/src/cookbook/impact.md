@@ -60,6 +60,12 @@ added pair that the row's own `rename_field` / `rename_keys` maps is
 reported as a **rename** (`email→mail`) — a rename breaks readers of the old
 name just like a drop, but the report says what happened.
 
+A type the current schema already allows is not a retype (`integer` against
+`integer|null` is a sample without nulls). With a `--sample`, a column the
+sample has no value for is `removed` only when the row's transforms drop it
+(`drop`, `select`, a rename away); otherwise the report names it in `notes`
+and leaves it out of the delta.
+
 **The walk** follows source → sink edges up to `--depth` hops (default 5).
 Each edge's recorded column lineage (`{out: [in…]}`, the same derivation
 OpenLineage emission uses) says which downstream columns read an affected

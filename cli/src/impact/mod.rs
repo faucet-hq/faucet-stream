@@ -340,6 +340,17 @@ pub async fn analyze(store: &dyn RunHistory, inputs: ImpactInputs<'_>) -> CliRes
         );
     }
     let delta = match (&current, &planned) {
+        (Some(cur), Some(plan)) if planned_from == PlannedFrom::Sample => {
+            let (delta, unobserved) = sample_delta(cur, plan, &ops);
+            if !unobserved.is_empty() {
+                notes.push(format!(
+                    "the sample has no value for {} — not counted as removed (the transform \
+                     chain does not drop them); use a larger sample to check",
+                    unobserved.join(", ")
+                ));
+            }
+            delta
+        }
         (Some(cur), Some(plan)) => schema_delta(cur, plan, &ops),
         _ => SchemaDelta::default(),
     };
@@ -482,6 +493,36 @@ async fn load_datasets(
     Ok(out)
 }
 
+/// Whether every type in `planned` is one `current` already allows (e.g.
+/// `integer` against `integer|null`): a sample without nulls, not a change.
+fn narrows(planned: &str, current: &str) -> bool {
+    let cur: Vec<&str> = current.split('|').collect();
+    planned.split('|').all(|t| cur.contains(&t))
+}
+
+/// [`schema_delta`] for a planned schema inferred from a sample: a current
+/// column the sample has no value for is only `removed` when the row's ops
+/// provably drop it; otherwise it is returned as unobserved.
+pub fn sample_delta(
+    current: &Value,
+    planned: &Value,
+    ops: &[ColumnOp],
+) -> (SchemaDelta, Vec<String>) {
+    let mut delta = schema_delta(current, planned, ops);
+    let dropped = |col: &str| {
+        ops.iter().any(|op| match op {
+            ColumnOp::Drop(cols) => cols.iter().any(|c| c == col),
+            ColumnOp::Select(cols) => !cols.iter().any(|c| c == col),
+            ColumnOp::Rename(pairs) => pairs.iter().any(|(from, _)| from == col),
+            _ => false,
+        })
+    };
+    let (removed, unobserved): (Vec<String>, Vec<String>) =
+        delta.removed.drain(..).partition(|c| dropped(c));
+    delta.removed = removed;
+    (delta, unobserved)
+}
+
 /// Column names + type strings of an `infer_schema`-shaped object.
 fn columns_of(schema: &Value) -> BTreeMap<String, String> {
     schema
@@ -547,6 +588,7 @@ pub fn schema_delta(current: &Value, planned: &Value, ops: &[ColumnOp]) -> Schem
         if let Some(plan_ty) = plan.get(name)
             && plan_ty != cur_ty
             && plan_ty != "unknown"
+            && !narrows(plan_ty, cur_ty)
         {
             retyped.push(RetypedColumn {
                 column: name.clone(),
@@ -1345,6 +1387,32 @@ mod tests {
         assert_eq!(Severity::Additive.as_str(), "additive");
         assert_eq!(Severity::Unknown.as_str(), "unknown");
         assert_eq!(Severity::None.as_str(), "none");
+    }
+
+    #[test]
+    fn a_sample_without_nulls_or_optional_fields_is_not_a_breaking_change() {
+        let cur = schema(&[
+            ("phone", "integer|null"),
+            ("nick", "string"),
+            ("gone", "string"),
+            ("id", "integer"),
+        ]);
+        let plan = schema(&[("phone", "integer"), ("id", "string")]);
+        let (d, unobserved) = sample_delta(&cur, &plan, &[ColumnOp::Drop(vec!["gone".into()])]);
+        assert!(
+            !d.retyped.iter().any(|r| r.column == "phone"),
+            "{:?}",
+            d.retyped
+        );
+        assert_eq!(d.retyped[0].column, "id", "a real type change still counts");
+        assert_eq!(d.removed, vec!["gone".to_string()]);
+        assert_eq!(unobserved, vec!["nick".to_string()]);
+
+        let (d, unobserved) = sample_delta(&cur, &plan, &[ColumnOp::Select(vec!["id".into()])]);
+        assert!(unobserved.is_empty());
+        assert_eq!(d.removed, vec!["gone".to_string(), "nick".to_string()]);
+        assert!(narrows("integer", "integer|null"));
+        assert!(!narrows("integer|null", "integer"));
     }
 
     #[test]
