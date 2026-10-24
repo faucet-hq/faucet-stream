@@ -1830,6 +1830,7 @@ async fn run_unit(
             discovered,
             collected,
             opts,
+            &cancel,
         )
         .await;
     }
@@ -2173,6 +2174,7 @@ async fn run_discovery(
     discovered: &DiscoveredDims,
     collected: &CollectedDims,
     opts: &ExecuteOptions,
+    cancel: &CancellationToken,
 ) -> InvocationOutcome {
     let started = std::time::Instant::now();
     let source_kind = node.source.kind.clone();
@@ -2188,6 +2190,8 @@ async fn run_discovery(
             binds = crate::sql_bind::bind_source_query(&source_kind, &mut cfg, pc)?;
             resolve_inplace(&mut cfg, pc)?;
         }
+        reject_unresolved_backfill_tokens(&cfg, "source")?;
+        crate::tenant_tokens::reject_unbound(&cfg, "source")?;
         let source = build_source(
             &source_kind,
             cfg,
@@ -2196,14 +2200,32 @@ async fn run_discovery(
         )
         .await?;
         source.set_run_clock(opts.clock.to_utc());
-        let records = source.fetch_with_context(&binds).await?;
-        let projection = crate::discovery_matrix::project_dedup_counted(&records, select);
+        let mut acc = crate::discovery_matrix::ProjectionAcc::new(select);
+        {
+            use futures::StreamExt as _;
+            let mut pages = source.stream_pages(&binds, faucet_core::DEFAULT_BATCH_SIZE);
+            loop {
+                let page = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(CliError::from(faucet_core::FaucetError::Cancelled {
+                            operation: "fan_out discovery".into(),
+                        }));
+                    }
+                    page = pages.next() => page,
+                };
+                let Some(page) = page else { break };
+                acc.push(&page?.records);
+            }
+        }
+        let records = acc.records();
+        let projection = acc.finish();
         if projection.skipped > 0 {
             if projection.values.is_empty() {
                 tracing::warn!(
                     row = %node.id,
                     select,
-                    records = records.len(),
+                    records,
                     "fan_out.select matched no value in any record: the rows that fan out \
                      over it run zero times"
                 );
@@ -2212,7 +2234,7 @@ async fn run_discovery(
                     row = %node.id,
                     select,
                     skipped = projection.skipped,
-                    records = records.len(),
+                    records,
                     "fan_out.select was missing or null in some records; they were skipped"
                 );
             }
@@ -3047,18 +3069,21 @@ async fn run_one_invocation(
     // profiling → [lineage sampler] → metadata → [--limit, fan-out capture] →
     // budget → destination. The budget is innermost so its ceilings count what
     // the destination accepts; a duration ceiling cancels the cooperative token.
-    let limit = opts.limit;
+    let limit_left = opts.limit.map(|n| Arc::new(AtomicUsize::new(n)));
     let capture_sink = capture
         .as_ref()
         .map(|p| (Arc::clone(&captured), Arc::clone(p)));
+    let tap_limit = limit_left.clone();
     #[allow(unused_mut)]
     let mut builder = governance.sink_builder().inner_tap(move |s| {
-        let s: Box<dyn Sink> = match limit {
-            Some(n) => Box::new(LimitedSink::wrap(s, n)),
+        let s: Box<dyn Sink> = match &tap_limit {
+            Some(left) => Box::new(LimitedSink::sharing(s, Arc::clone(left))),
             None => s,
         };
         match capture_sink {
-            Some((buf, projection)) => Box::new(CapturingSink::wrap(s, buf, projection)),
+            Some((buf, projection)) => {
+                Box::new(CapturingSink::wrap(s, buf, projection).with_limit(tap_limit))
+            }
             None => s,
         }
     });
@@ -3162,6 +3187,17 @@ async fn run_one_invocation(
     let result = match (&result, budget_state.as_ref().and_then(|s| s.verdict())) {
         (Ok(_), Some(verdict)) => Err(verdict.error()),
         _ => result,
+    };
+    // The per-row path counts rows past the `--limit` cap as written; the cap
+    // knows how many really landed.
+    let result = match (result, opts.limit.zip(limit_left.as_ref())) {
+        (Ok(mut r), Some((cap, left))) => {
+            r.records_written = r
+                .records_written
+                .min(cap.saturating_sub(left.load(Ordering::Relaxed)));
+            Ok(r)
+        }
+        (other, _) => other,
     };
 
     // ── Completeness reconciliation (#502) ───────────────────────────────────
@@ -4252,12 +4288,22 @@ struct CapturingSink {
     inner: Box<dyn Sink>,
     captured: Arc<Mutex<Vec<Value>>>,
     projection: Arc<Projection>,
+    limit: Option<Arc<AtomicUsize>>,
 }
 
 impl CapturingSink {
-    /// Record the rows `report` says landed (a capped inner sink may drop some).
-    async fn capture(&self, records: &[Value], report: &faucet_core::WriteReport) {
-        let n = (report.accepted + report.coalesced).min(records.len());
+    /// How many leading rows of a `len`-row page fit under the `--limit` cap
+    /// the wrapped [`LimitedSink`] shares; read before the write.
+    fn within_cap(&self, len: usize) -> usize {
+        self.limit
+            .as_ref()
+            .map_or(len, |left| left.load(Ordering::Relaxed).min(len))
+    }
+
+    /// Record the page's rows within the cap. A sink that succeeds wrote or
+    /// deliberately declined each of them, so every one is a parent record.
+    async fn capture(&self, records: &[Value], take: usize) {
+        let n = take.min(records.len());
         let mut buf = self.captured.lock().await;
         buf.extend(
             records
@@ -4276,7 +4322,13 @@ impl CapturingSink {
             inner,
             captured,
             projection,
+            limit: None,
         }
+    }
+
+    fn with_limit(mut self, limit: Option<Arc<AtomicUsize>>) -> Self {
+        self.limit = limit;
+        self
     }
 }
 
@@ -4294,8 +4346,9 @@ impl Sink for CapturingSink {
         &self,
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let take = self.within_cap(records.len());
         let report = self.inner.write_batch_reported(records).await?;
-        self.capture(records, &report).await;
+        self.capture(records, take).await;
         Ok(report)
     }
 
@@ -4303,8 +4356,9 @@ impl Sink for CapturingSink {
         &self,
         page: &faucet_core::governance::GovernedPage<'_>,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let take = self.within_cap(page.len());
         let report = self.inner.write_governed(page).await?;
-        self.capture(page.records(), &report).await;
+        self.capture(page.records(), take).await;
         Ok(report)
     }
 
@@ -4328,12 +4382,14 @@ impl Sink for CapturingSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let take = self.within_cap(records.len());
         let outcomes = self.inner.write_batch_partial(records).await?;
         let mut buf = self.captured.lock().await;
         buf.extend(
             records
                 .iter()
                 .zip(&outcomes)
+                .take(take)
                 .filter(|(_, o)| o.is_ok())
                 .map(|(r, _)| project_record(r, &self.projection)),
         );
@@ -4367,18 +4423,12 @@ impl Sink for CapturingSink {
         scope: &str,
         token: &str,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let take = self.within_cap(records.len());
         let report = self
             .inner
             .write_batch_idempotent_reported(records, scope, token)
             .await?;
-        let n = (report.accepted + report.coalesced).min(records.len());
-        let mut buf = self.captured.lock().await;
-        buf.extend(
-            records
-                .iter()
-                .take(n)
-                .map(|r| project_record(r, &self.projection)),
-        );
+        self.capture(records, take).await;
         Ok(report)
     }
 }
@@ -4387,7 +4437,7 @@ impl Sink for CapturingSink {
 /// remaining budget before delegating.
 pub(crate) struct LimitedSink {
     inner: Box<dyn Sink>,
-    remaining: AtomicUsize,
+    remaining: Arc<AtomicUsize>,
 }
 
 impl LimitedSink {
@@ -4415,10 +4465,12 @@ impl LimitedSink {
     }
 
     pub(crate) fn wrap(inner: Box<dyn Sink>, cap: usize) -> Self {
-        Self {
-            inner,
-            remaining: AtomicUsize::new(cap),
-        }
+        Self::sharing(inner, Arc::new(AtomicUsize::new(cap)))
+    }
+
+    /// A cap whose remaining budget other layers can read.
+    pub(crate) fn sharing(inner: Box<dyn Sink>, remaining: Arc<AtomicUsize>) -> Self {
+        Self { inner, remaining }
     }
 }
 
@@ -4433,8 +4485,7 @@ impl Sink for LimitedSink {
         write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
 
-    // The per-row path keeps the DLQ routing of the inner sink (#789 CLI-21);
-    // rows past the cap are dropped by design and reported as accepted.
+    // Rows past the cap read as accepted; the executor clamps the count and the capture skips them.
     async fn write_batch_partial(
         &self,
         records: &[Value],
@@ -5965,6 +6016,86 @@ matrix:
             Some(json!({"cursor": 7}))
         );
         assert_eq!(store.get("adopt::child::1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_discovery_row_stops_on_cancel_and_refuses_leftover_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("ids.csv");
+        std::fs::write(&csv, "id\n1\n2\n1\n").unwrap();
+        let yaml = |path: &str| {
+            format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {csv} }} }}\n  \
+                 sink: {{ type: jsonl, config: {{ path: '{out}' }} }}\nmatrix:\n  - id: r\n    \
+                 fan_out:\n      source: {{ type: csv, config: {{ path: '{path}' }} }}\n      \
+                 select: id\n      as: v\n",
+                csv = csv.display(),
+                out = dir.path().join("out-${r.v}.jsonl").display(),
+            )
+        };
+        let run = |yaml: String, cancelled: bool| async move {
+            let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+            let nodes = expand(&cfg).unwrap();
+            let node = nodes
+                .iter()
+                .find(|n| matches!(n.role, NodeRole::Discovery { .. }))
+                .expect("a discovery node")
+                .clone();
+            let NodeRole::Discovery {
+                select,
+                as_alias,
+                collect,
+                dims,
+            } = &node.role
+            else {
+                unreachable!()
+            };
+            let discovered: DiscoveredDims = Default::default();
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let out = run_discovery(
+                &node,
+                select,
+                as_alias,
+                *collect,
+                dims,
+                None,
+                &discovered,
+                &Default::default(),
+                &ExecuteOptions::for_tests("disc"),
+                &token,
+            )
+            .await;
+            let values = discovered
+                .lock()
+                .await
+                .values()
+                .next()
+                .map(|d| d.values.len());
+            (out, values)
+        };
+        let path = csv.display().to_string();
+        let (ok, values) = run(yaml(&path), false).await;
+        assert!(ok.error.is_none(), "{ok:?}");
+        assert_eq!(values, Some(2));
+        let (stopped, _) = run(yaml(&path), true).await;
+        assert!(
+            stopped
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("fan_out discovery")),
+            "{stopped:?}"
+        );
+        let (refused, _) = run(yaml("${backfill.start}"), false).await;
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("backfill")),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]
@@ -7576,6 +7707,36 @@ matrix:
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(*captured.lock().await, vec![json!({"id": 7})]);
+    }
+
+    #[tokio::test]
+    async fn the_capture_skips_rows_past_the_limit_on_the_per_row_path() {
+        struct Plain;
+        #[async_trait]
+        impl Sink for Plain {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+        }
+        let left = Arc::new(AtomicUsize::new(2));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink::wrap(
+            Box::new(LimitedSink::sharing(Box::new(Plain), Arc::clone(&left))),
+            Arc::clone(&captured),
+            Arc::new(Projection::Full),
+        )
+        .with_limit(Some(Arc::clone(&left)));
+        let page: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
+        let outcomes = sink.write_batch_partial(&page).await.unwrap();
+        assert_eq!(outcomes.len(), 5);
+        assert_eq!(
+            *captured.lock().await,
+            vec![json!({"id": 1}), json!({"id": 2})]
+        );
+        assert_eq!(left.load(Ordering::Relaxed), 0);
+        let report = sink.write_batch_reported(&page).await.unwrap();
+        assert_eq!(report.skipped, 5);
+        assert_eq!(captured.lock().await.len(), 2);
     }
 
     #[tokio::test]
