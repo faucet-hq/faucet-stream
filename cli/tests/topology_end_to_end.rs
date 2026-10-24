@@ -1822,3 +1822,66 @@ pipeline:
     assert!(!dlq.exists(), "a preview must not write the DLQ");
     assert!(!out.exists());
 }
+
+/// A preview emits no lineage; a cancelled run ends each sink node's lineage
+/// run with ABORT instead of leaving it RUNNING.
+#[tokio::test]
+#[cfg(feature = "lineage")]
+async fn lineage_skips_previews_and_aborts_cancelled_runs() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let out = dir.path().join("out.jsonl");
+    let events = dir.path().join("lineage.jsonl");
+    let cfg = parse(&format!(
+        r#"version: 1
+name: linear
+lineage:
+  namespace: ns
+  transport: {{ type: file, config: {{ path: {ev} }} }}
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out} }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+        csv = csv.display(),
+        out = out.display(),
+        ev = events.display()
+    ));
+    let auth = build_auth_catalog(None).unwrap();
+    faucet_cli::topology::run_topology(
+        &cfg,
+        &auth,
+        faucet_cli::topology::TopologyRunOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!events.exists(), "a preview emits no lineage");
+
+    let cancel = faucet_core::CancellationToken::new();
+    cancel.cancel();
+    let _ = faucet_cli::topology::run_topology(
+        &cfg,
+        &auth,
+        faucet_cli::topology::TopologyRunOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        },
+    )
+    .await;
+    let kinds: Vec<String> = fs::read_to_string(&events)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["eventType"].to_string())
+        .collect();
+    assert_eq!(kinds, vec!["\"START\"", "\"ABORT\""], "{kinds:?}");
+}

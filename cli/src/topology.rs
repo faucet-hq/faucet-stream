@@ -1470,7 +1470,9 @@ pub async fn run_topology(
     #[cfg(feature = "lineage")]
     let reaching_for_lineage = reaching_sources(cfg);
     #[cfg(feature = "lineage")]
-    if let (Some(em), Some(lc)) = (lineage.as_ref(), cfg.lineage.as_ref()) {
+    if !run.is_preview()
+        && let (Some(em), Some(lc)) = (lineage.as_ref(), cfg.lineage.as_ref())
+    {
         for (node_id, _) in cfg
             .pipeline
             .nodes
@@ -1563,7 +1565,10 @@ pub async fn run_topology(
             if node.error.is_some() || verdicts.iter().any(|(id, _)| *id == node.node_id) {
                 continue;
             }
-            if let Err(e) = crate::reconcile::run(spec, auth, node.records as u64).await {
+            if let Err(e) =
+                crate::reconcile::run_with(spec, auth, node.records as u64, run.cancel.as_ref())
+                    .await
+            {
                 verdicts.push((node.node_id.clone(), e.to_string()));
             }
         }
@@ -1574,6 +1579,39 @@ pub async fn run_topology(
         {
             node.error = Some(message.clone());
             node.error_kind = Some(faucet_core::topology::NodeErrorKind::Other);
+        }
+    }
+
+    // A cancelled run ends each sink node's lineage run with ABORT.
+    #[cfg(feature = "lineage")]
+    if cancelled
+        && !run.is_preview()
+        && let (Some(em), Some(lc)) = (lineage.as_ref(), cfg.lineage.as_ref())
+    {
+        for (node_id, _) in cfg
+            .pipeline
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, NodeSpec::Sink { .. }))
+        {
+            let records = reported
+                .nodes
+                .iter()
+                .find(|n| &n.node_id == node_id)
+                .map_or(0, |n| n.records as u64);
+            if let Some(ctx) = lineage_ctx(
+                cfg,
+                &pipeline_name,
+                &run_id,
+                node_id,
+                &identities,
+                &reaching_for_lineage,
+                lc,
+                records,
+                None,
+            ) {
+                em.emit(faucet_lineage::EventType::Abort, &ctx).await;
+            }
         }
     }
 
