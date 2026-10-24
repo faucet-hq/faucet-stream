@@ -117,6 +117,50 @@ pub async fn sample(
     Ok(Sample { records, timed_out })
 }
 
+/// How long a single-row probe (a partition bound, a reconcile count) may read.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Read the first record of a probe source, streaming one-record pages so a
+/// probe that returns many rows never loads them all. Refuses a source that
+/// consumes destructively, and stops at `timeout` or when `cancel` fires.
+pub async fn probe_first_record(
+    source: &dyn Source,
+    operation: &str,
+    timeout: Duration,
+    cancel: Option<&faucet_core::CancellationToken>,
+) -> Result<Option<Value>, faucet_core::FaucetError> {
+    use faucet_core::FaucetError;
+    if source.consumes_destructively() {
+        return Err(FaucetError::Config(destructive_read_refusal(
+            source.connector_name(),
+            operation,
+        )));
+    }
+    let context = HashMap::new();
+    let read = async {
+        let mut pages = source.stream_pages(&context, 1);
+        while let Some(page) = pages.next().await {
+            if let Some(first) = page?.records.into_iter().next() {
+                return Ok(Some(first));
+            }
+        }
+        Ok(None)
+    };
+    let cancelled = async {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancelled => Err(FaucetError::Cancelled { operation: operation.to_string() }),
+        read = tokio::time::timeout(timeout, read) => read.unwrap_or_else(|_| {
+            Err(FaucetError::Timeout { operation: operation.to_string(), after: timeout })
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +316,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_probe_reads_only_the_first_page() {
+        let (src, pages) = endless(None, false);
+        let first = probe_first_record(&src, "probe", PROBE_TIMEOUT, None)
+            .await
+            .unwrap();
+        assert_eq!(first, Some(json!({ "i": 1 })));
+        assert_eq!(pages.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_probe_stops_at_its_deadline_or_on_cancel() {
+        let (src, _) = endless(Some(0), false);
+        let err = probe_first_record(&src, "probe", Duration::from_millis(20), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err}");
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        let (src, _) = endless(Some(0), false);
+        let err = probe_first_record(&src, "probe", PROBE_TIMEOUT, Some(&token))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::Cancelled { .. }), "{err}");
+        let (src, _) = endless(None, true);
+        assert!(
+            probe_first_record(&src, "probe", PROBE_TIMEOUT, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_probe_returns_none() {
+        struct Empty;
+        #[faucet_core::async_trait]
+        impl Source for Empty {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+        }
+        assert_eq!(
+            probe_first_record(&Empty, "probe", PROBE_TIMEOUT, None)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn a_source_that_consumes_destructively_is_refused_before_any_read() {
         struct Queue(std::sync::atomic::AtomicUsize);
         #[faucet_core::async_trait]
@@ -298,6 +394,11 @@ mod tests {
         );
         let reads = || queue.0.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(reads(), 0, "a refused preview must not read");
+        let err = probe_first_record(&queue, "a probe", PROBE_TIMEOUT, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("removes messages"), "{err}");
+        assert_eq!(reads(), 0, "a refused probe must not read");
         queue.fetch_all().await.unwrap();
         assert_eq!(reads(), 1);
     }

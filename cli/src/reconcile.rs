@@ -76,13 +76,6 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
     let first = records
         .first()
         .ok_or_else(|| "reconcile: the count probe returned no rows".to_string())?;
-    let as_u64 = |v: &Value| -> Option<u64> {
-        match v {
-            Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
-            Value::String(s) => s.trim().parse::<u64>().ok(),
-            _ => None,
-        }
-    };
     match field {
         Some(f) => {
             let v = first.get(f).ok_or_else(|| {
@@ -90,21 +83,23 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
             })?;
             // Name the JSON type, never the value: a probe's row is not the
             // run's output and must not leak through the run's error.
-            as_u64(v).ok_or_else(|| {
-                format!(
+            match as_count(v) {
+                Some(n) => n.map_err(|why| format!("reconcile: count_field '{f}' {why}")),
+                None => Err(format!(
                     "reconcile: count_field '{f}' is not a number (got {})",
                     json_type(v)
-                )
-            })
+                )),
+            }
         }
         None => match first.as_object() {
             Some(m) => {
-                let numeric: Vec<(&String, u64)> = m
+                let numeric: Vec<(&String, Result<u64, &'static str>)> = m
                     .iter()
-                    .filter_map(|(k, v)| as_u64(v).map(|n| (k, n)))
+                    .filter_map(|(k, v)| as_count(v).map(|n| (k, n)))
                     .collect();
                 match numeric.as_slice() {
-                    [(_, n)] => Ok(*n),
+                    [(k, n)] => (*n)
+                        .map_err(|why| format!("reconcile: the count probe's field '{k}' {why}")),
                     [] => Err("reconcile: the count probe's first row has no numeric field".into()),
                     many => {
                         let mut names: Vec<&str> = many.iter().map(|(k, _)| k.as_str()).collect();
@@ -118,10 +113,33 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
                 }
             }
             // A bare scalar probe row (not an object) is also accepted.
-            None => as_u64(first).ok_or_else(|| {
-                "reconcile: the count probe's first row has no numeric field".to_string()
-            }),
+            None => match as_count(first) {
+                Some(n) => n.map_err(|why| format!("reconcile: the count probe's value {why}")),
+                None => Err("reconcile: the count probe's first row has no numeric field".into()),
+            },
         },
+    }
+}
+
+/// A count read from a numeric value or numeric string: `None` when the value
+/// is not numeric, `Err` when it is but is negative or fractional.
+fn as_count(v: &Value) -> Option<Result<u64, &'static str>> {
+    let (whole, number) = match v {
+        Value::Number(n) => (n.as_u64(), n.as_f64()),
+        Value::String(s) => {
+            let s = s.trim();
+            (
+                s.parse::<u64>().ok(),
+                s.parse::<f64>().ok().filter(|f| f.is_finite()),
+            )
+        }
+        _ => return None,
+    };
+    match (whole, number) {
+        (Some(n), _) => Some(Ok(n)),
+        (None, Some(f)) if f < 0.0 => Some(Err("is negative")),
+        (None, Some(_)) => Some(Err("is not a whole number")),
+        (None, None) => None,
     }
 }
 
@@ -140,11 +158,11 @@ fn json_type(v: &Value) -> &'static str {
 /// `written >= authoritative * (1 - tolerance_pct/100)`, else `Err` with a
 /// message naming the shortfall. Pure.
 pub fn evaluate(written: u64, authoritative: u64, tolerance_pct: f64) -> Result<(), String> {
-    let threshold = (authoritative as f64) * (1.0 - tolerance_pct / 100.0);
-    if (written as f64) + f64::EPSILON >= threshold {
+    let allowed = ((authoritative as f64) * tolerance_pct / 100.0).floor() as u64;
+    let shortfall = authoritative.saturating_sub(written);
+    if shortfall <= allowed {
         return Ok(());
     }
-    let shortfall = authoritative.saturating_sub(written);
     Err(format!(
         "completeness reconciliation failed: wrote {written} rows but the authoritative count is \
          {authoritative} (short by {shortfall}; tolerance {tolerance_pct}%). Refusing to report a \
@@ -161,14 +179,31 @@ pub async fn run(
     auth: &crate::auth_catalog::AuthCatalog,
     written: u64,
 ) -> Result<(), FaucetError> {
+    run_with(spec, auth, written, None).await
+}
+
+/// [`run`] that stops when `cancel` fires. The probe reads only its first
+/// record, under [`crate::preview_sample::PROBE_TIMEOUT`].
+pub async fn run_with(
+    spec: &ReconcileSpec,
+    auth: &crate::auth_catalog::AuthCatalog,
+    written: u64,
+    cancel: Option<&faucet_core::CancellationToken>,
+) -> Result<(), FaucetError> {
     spec.validate()?;
-    let source =
-        crate::registry::build_source(&spec.count.kind, spec.count.config.clone(), auth, None)
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!("reconcile: building the count probe: {e}"))
-            })?;
-    let records = source.fetch_all().await?;
+    let mut config = spec.count.config.clone();
+    crate::preview_sample::bound_batch_size(&spec.count.kind, &mut config, 1);
+    let source = crate::registry::build_source(&spec.count.kind, config, auth, None)
+        .await
+        .map_err(|e| FaucetError::Source(format!("reconcile: building the count probe: {e}")))?;
+    let first = crate::preview_sample::probe_first_record(
+        &*source,
+        "the reconcile count probe",
+        crate::preview_sample::PROBE_TIMEOUT,
+        cancel,
+    )
+    .await?;
+    let records: Vec<Value> = first.into_iter().collect();
     let authoritative =
         extract_count(&records, spec.count.count_field.as_deref()).map_err(FaucetError::Source)?;
     evaluate(written, authoritative, spec.tolerance_pct).map_err(FaucetError::Source)
@@ -191,6 +226,32 @@ mod tests {
             let err = extract_count(&[json!({ "c": v })], Some("c")).unwrap_err();
             assert!(err.contains(ty) && !err.contains("s3cr3t"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_negative_or_fractional_count_is_refused() {
+        for (v, why) in [
+            (json!(-1), "is negative"),
+            (json!("-3"), "is negative"),
+            (json!(2.5), "is not a whole number"),
+            (json!("2.5"), "is not a whole number"),
+        ] {
+            let named = extract_count(&[json!({ "n": v })], Some("n")).unwrap_err();
+            assert!(named.contains("'n'") && named.contains(why), "{named}");
+            let found = extract_count(&[json!({ "n": v, "s": "x" })], None).unwrap_err();
+            assert!(found.contains("'n'") && found.contains(why), "{found}");
+            let bare = extract_count(std::slice::from_ref(&v), None).unwrap_err();
+            assert!(bare.contains(why), "{bare}");
+        }
+        assert_eq!(extract_count(&[json!(7)], None).unwrap(), 7);
+        assert!(extract_count(&[json!(true)], None).is_err());
+    }
+
+    #[test]
+    fn evaluate_counts_exactly_above_float_precision() {
+        let big = (1u64 << 60) + 7;
+        assert!(evaluate(big - 3, big, 0.0).is_err());
+        assert!(evaluate(big, big, 0.0).is_ok());
     }
 
     #[test]

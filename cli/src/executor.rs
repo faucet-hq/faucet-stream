@@ -3215,7 +3215,14 @@ async fn run_one_invocation(
                 && !cancel.is_cancelled() =>
         {
             let written = r.records_written as u64;
-            match Box::pin(crate::reconcile::run(spec, &opts.auth, written)).await {
+            match Box::pin(crate::reconcile::run_with(
+                spec,
+                &opts.auth,
+                written,
+                Some(&cancel),
+            ))
+            .await
+            {
                 Ok(()) => result,
                 Err(e) => Err(e),
             }

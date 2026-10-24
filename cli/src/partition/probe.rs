@@ -152,20 +152,24 @@ pub fn probe_implies_unbounded(spec: &PartitionSpec) -> bool {
 
 /// Run the probe source and pull `value_path` out of its first record.
 async fn probe_value(p: &BoundProbe, auth: &AuthCatalog) -> CliResult<Value> {
-    let source = crate::registry::build_source(
-        &p.from_source.kind,
-        p.from_source.config.clone(),
-        auth,
+    let mut config = p.from_source.config.clone();
+    crate::preview_sample::bound_batch_size(&p.from_source.kind, &mut config, 1);
+    let source = crate::registry::build_source(&p.from_source.kind, config, auth, None)
+        .await
+        .map_err(|e| {
+            CliError::Config(format!(
+                "partition bound probe: building source failed: {e}"
+            ))
+        })?;
+
+    let first = crate::preview_sample::probe_first_record(
+        &*source,
+        "a partition bound probe",
+        crate::preview_sample::PROBE_TIMEOUT,
         None,
     )
     .await
     .map_err(|e| {
-        CliError::Config(format!(
-            "partition bound probe: building source failed: {e}"
-        ))
-    })?;
-
-    let records = source.fetch_all().await.map_err(|e| {
         CliError::Config(format!(
             "partition bound probe: fetching the bound failed: {e}"
         ))
@@ -173,7 +177,7 @@ async fn probe_value(p: &BoundProbe, auth: &AuthCatalog) -> CliResult<Value> {
 
     // Empty is a distinct, actionable outcome — not "assume zero". Zero would
     // silently plan nothing and the run would read no data at all.
-    let first = records.first().ok_or_else(|| {
+    let first = first.ok_or_else(|| {
         CliError::Config(format!(
             "partition bound probe: source '{}' returned no records, so the bound could not \
              be determined. A `MAX(id)` over an empty table returns NULL rather than a row — \
@@ -184,7 +188,7 @@ async fn probe_value(p: &BoundProbe, auth: &AuthCatalog) -> CliResult<Value> {
 
     // Reuse core's JSONPath helper so the path grammar matches `records_path`
     // and every other JSONPath surface in the project.
-    let found = faucet_core::util::extract_records(first, Some(&p.value_path)).map_err(|e| {
+    let found = faucet_core::util::extract_records(&first, Some(&p.value_path)).map_err(|e| {
         CliError::Config(format!(
             "partition bound probe: value_path '{}' is not valid JSONPath: {e}",
             p.value_path
@@ -195,7 +199,7 @@ async fn probe_value(p: &BoundProbe, auth: &AuthCatalog) -> CliResult<Value> {
             "partition bound probe: value_path '{}' matched nothing in the probe's first \
              record (fields: {})",
             p.value_path,
-            field_names(first)
+            field_names(&first)
         ))),
         [one] => Ok(one.clone()),
         many => Err(CliError::Config(format!(
