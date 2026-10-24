@@ -500,6 +500,9 @@ impl SourceDriver for WebsocketDriver {
                     }
 
                     if let Some(e) = fatal {
+                        if !buffer.is_empty() {
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                        }
                         Err(e)?;
                     }
 
@@ -525,7 +528,11 @@ impl SourceDriver for WebsocketDriver {
                             tracing::warn!(attempt = reconnect_attempts, delay_ms = delay.as_millis() as u64, "websocket source: reconnecting");
                             sleep_or_cancel(delay, &cancel).await;
                             continue 'outer;
-                        } else if reconnect {
+                        }
+                        if !buffer.is_empty() {
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                        }
+                        if reconnect {
                             Err(FaucetError::Source(format!(
                                 "websocket source: exceeded max_reconnect_attempts ({})",
                                 max_attempts.unwrap_or(0)

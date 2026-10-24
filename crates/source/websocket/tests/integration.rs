@@ -739,3 +739,37 @@ async fn a_cancel_before_streaming_yields_nothing() {
         .expect("ends at once");
     assert!(next.is_none());
 }
+
+/// Messages received before the connection ends in an error are emitted
+/// before the error, as they are on a cancel.
+#[tokio::test]
+async fn buffered_messages_are_emitted_before_a_closing_error() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for i in 0..3 {
+                ws.send(Message::Text(format!("{{\"n\":{i}}}").into()))
+                    .await
+                    .unwrap();
+            }
+            let _ = ws
+                .close(Some(CloseFrame {
+                    code: 1001u16.into(),
+                    reason: "going away".into(),
+                }))
+                .await;
+        }
+    });
+    let mut cfg = base_config(&format!("ws://{addr}"));
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    let source = WebsocketSource::new(cfg).unwrap();
+    let ctx = std::collections::HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let first = pages.next().await.expect("a page").expect("buffered page");
+    assert_eq!(first.records.len(), 3);
+    let err = pages.next().await.expect("then the error").unwrap_err();
+    assert!(err.to_string().contains("reconnect=false"), "{err}");
+}
