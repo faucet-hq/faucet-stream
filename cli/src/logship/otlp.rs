@@ -535,7 +535,7 @@ mod tests {
         reject: fn(&[u8]) -> bool,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> String {
-        let respond: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(move |buf| {
+        let respond: Respond = Box::new(move |buf| {
             if reject(buf) {
                 b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 7\r\n\r\nbad req"
                     .to_vec()
@@ -546,9 +546,11 @@ mod tests {
         scripted_collector(std::sync::Arc::new(respond), hits).await
     }
 
+    type Respond = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
     /// A collector that answers each request body with `respond`'s raw bytes.
     async fn scripted_collector(
-        respond: std::sync::Arc<Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>>,
+        respond: std::sync::Arc<Respond>,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -615,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn records_the_collector_rejects_in_a_partial_success_count_as_dropped() {
         use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess;
-        let respond: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(|_| {
+        let respond: Respond = Box::new(|_| {
             let body = ExportLogsServiceResponse {
                 partial_success: Some(ExportLogsPartialSuccess {
                     rejected_log_records: 2,
