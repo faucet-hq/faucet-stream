@@ -1326,6 +1326,15 @@ impl RunHistory for MemoryHistory {
                 .lock()
                 .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
             let versions = store.entry(id.clone()).or_default();
+            if let Some((_, latest)) = versions.iter().next_back()
+                && latest.kind != draft.kind
+            {
+                return Err(HistoryError::TemplateKindConflict {
+                    id,
+                    existing: latest.kind,
+                    requested: draft.kind,
+                });
+            }
             let high = hwm.entry(id.clone()).or_default();
             let next = versions.keys().copied().max().unwrap_or(0).max(*high) + 1;
             *high = next;

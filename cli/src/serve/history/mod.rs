@@ -397,6 +397,17 @@ pub enum HistoryError {
     /// and the write (#856); the move was not made.
     #[error("{0}")]
     StaleEvidence(String),
+    /// A template version was refused because the id already holds versions
+    /// of another kind (checked where the version is assigned).
+    #[error(
+        "template '{id}' is a {existing} — a {requested} cannot be registered under the same id \
+         (use another id, or delete it first)"
+    )]
+    TemplateKindConflict {
+        id: String,
+        existing: crate::hub::TemplateKind,
+        requested: crate::hub::TemplateKind,
+    },
 }
 
 impl HistoryError {

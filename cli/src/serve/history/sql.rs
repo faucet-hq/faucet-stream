@@ -5502,6 +5502,38 @@ macro_rules! impl_sql_history {
                         }
                     };
                     let max: i64 = row.try_get("v").map_err(backend)?;
+                    let latest = match sqlx::query(&self.stmts.template_select_latest)
+                        .bind(&id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    {
+                        Ok(latest) => latest,
+                        Err(e) if attempt < sql::CLAIM_ATTEMPTS => {
+                            let _ = tx.rollback().await;
+                            tracing::debug!(
+                                template = %id, attempt, error = %e,
+                                "template kind read lost a race; retrying"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = tx.rollback().await;
+                            return Err(backend(e));
+                        }
+                    };
+                    if let Some(latest) = latest {
+                        let body: String = latest.try_get("body").map_err(backend)?;
+                        let existing: templates::TemplateRecord =
+                            sql::decode_json(&body, "pipeline template")?;
+                        if existing.kind != draft.kind {
+                            let _ = tx.rollback().await;
+                            return Err(HistoryError::TemplateKindConflict {
+                                id,
+                                existing: existing.kind,
+                                requested: draft.kind,
+                            });
+                        }
+                    }
                     let next = (max as u32).saturating_add(1);
                     let record = templates::TemplateRecord {
                         id: id.clone(),

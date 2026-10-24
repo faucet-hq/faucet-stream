@@ -914,6 +914,22 @@ mod templates {
         assert_eq!(again.version, 4);
     }
 
+    /// An id keeps one kind: a version of another kind is refused where the
+    /// version is assigned, and nothing is stored.
+    #[tokio::test]
+    async fn a_version_of_another_kind_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-kind.db").await;
+        s.template_register(&draft("orders", None)).await.unwrap();
+        let mut other = draft("orders", None);
+        other.kind = faucet_cli::hub::TemplateKind::SourceTemplate;
+        let err = s.template_register(&other).await.unwrap_err();
+        assert!(err.to_string().contains("is a pipeline"), "{err}");
+        assert_eq!(s.template_versions("orders").await.unwrap(), vec![1]);
+        s.template_delete("orders", None).await.unwrap();
+        s.template_register(&other).await.unwrap();
+    }
+
     #[tokio::test]
     async fn launch_log_drives_stable_previous_and_status() {
         let dir = tempfile::tempdir().unwrap();
