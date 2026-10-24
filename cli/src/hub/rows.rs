@@ -278,17 +278,11 @@ pub fn narrow_source_template(
     Ok((narrowed, effective))
 }
 
-fn replication_of(config: &Value) -> Replication {
-    let method = match config.get("replication_method") {
-        Some(Value::String(s)) if s.eq_ignore_ascii_case("incremental") => "incremental",
-        Some(Value::Object(o))
-            if o.get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|t| t.eq_ignore_ascii_case("incremental")) =>
-        {
-            "incremental"
-        }
-        _ => "full",
+fn replication_of(kind: &str, config: &Value) -> Replication {
+    let method = if crate::registry::source_resumes_from_bookmark(kind, config) {
+        "incremental"
+    } else {
+        "full"
     };
     let field = ["replication_key", "bookmark_field", "cursor_field"]
         .iter()
@@ -299,13 +293,19 @@ fn replication_of(config: &Value) -> Replication {
                 .and_then(|m| m.get("key").or_else(|| m.get("field")))
                 .and_then(Value::as_str)
         })
+        .or_else(|| {
+            config
+                .get("replication")
+                .and_then(|r| r.get("column"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_string);
     Replication { method, field }
 }
 
 fn read_of(node: &ExpandedNode) -> RowRead {
     let kind = node.source.kind.as_str();
-    let replication = replication_of(&node.source.config);
+    let replication = replication_of(kind, &node.source.config);
     let kind_caps = crate::registry::source_kind_capabilities(kind);
     let bookmarks =
         replication.method == "incremental" || kind_caps.exactly_once() || kind_caps.reports_lag();
@@ -1479,9 +1479,30 @@ pipeline:
 
     #[test]
     fn replication_and_names() {
-        assert_eq!(replication_of(&json!({})).method, "full");
-        let r = replication_of(&json!({"replication_method": {"type": "Incremental", "key": "k"}}));
+        assert_eq!(replication_of("rest", &json!({})).method, "full");
+        let r = replication_of(
+            "rest",
+            &json!({"replication_method": {"type": "Incremental", "key": "k"}}),
+        );
         assert_eq!((r.method, r.field.as_deref()), ("incremental", Some("k")));
+        let r = replication_of(
+            "postgres",
+            &json!({"replication": {"type": "incremental", "column": "updated_at"}}),
+        );
+        assert_eq!(
+            (r.method, r.field.as_deref()),
+            ("incremental", Some("updated_at"))
+        );
+        let r = replication_of("file", &json!({"incremental": {"by": "mtime"}}));
+        assert_eq!((r.method, r.field), ("incremental", None));
+        assert_eq!(
+            replication_of("iceberg", &json!({"mode": "incremental"})).method,
+            "incremental"
+        );
+        assert_eq!(
+            replication_of("iceberg", &json!({"mode": "snapshot"})).method,
+            "full"
+        );
         assert_eq!(pipeline_name(&json!({"name": "a"}), "b"), "a");
         assert_eq!(pipeline_name(&json!({}), "b"), "b");
         assert_eq!(string_list(Some(&json!("k"))), vec!["k"]);
