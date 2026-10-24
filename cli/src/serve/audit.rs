@@ -55,6 +55,18 @@ pub async fn write_target_detail(
     .await;
 }
 
+/// [`write()`] with a detail line.
+pub async fn write_detail(
+    state: &ServerState,
+    ctx: &AuthContext,
+    action: &str,
+    run_id: Option<String>,
+    detail: String,
+    result: &str,
+) {
+    persist(state, ctx, action, run_id, None, None, Some(detail), result).await;
+}
+
 /// [`write()`] with every field (run id, fingerprint and target).
 pub async fn record(
     state: &ServerState,

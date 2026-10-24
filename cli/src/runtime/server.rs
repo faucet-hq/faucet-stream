@@ -870,18 +870,35 @@ pub async fn rollback(
     let nodes = loaded.nodes.clone();
     // A rollback undoes the destination and then rewinds the bookmark: it
     // finishes even if the client goes away, so it never stops between them.
-    let report = detached(None, async move {
+    let outcome = detached(None, async move {
         let _permit = permit;
         super::local::rollback_nodes(&run_as, &nodes, &inputs).await
     })
-    .await?
-    .map_err(cli_to_serve)?;
+    .await
+    .and_then(|r| r.map_err(cli_to_serve));
+    let report = match outcome {
+        Ok(report) => report,
+        Err(e) => {
+            crate::serve::audit::write_detail(
+                state,
+                &principal.actor(),
+                "run.rollback",
+                Some(id.to_string()),
+                crate::secrets::registry::redact_message(&e.to_string()),
+                "error",
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let result = if req.dry_run {
         "dry_run"
     } else if report.outcome.applied {
         "ok"
-    } else {
+    } else if report.blocked() {
         "blocked"
+    } else {
+        "not_applied"
     };
     crate::serve::audit::write(
         state,
