@@ -545,7 +545,7 @@ s_schedule() { # once per tick across every replica, through everything above
   local window minutes expected actual dupes missing excused="false" o
   window="ts > to_char(date_trunc('minute', to_timestamp(${INSTALLED_AT})), 'HH24:MI') AND ts < to_char(date_trunc('minute', now()), 'HH24:MI')"
   minutes="generate_series(date_trunc('minute', to_timestamp(${INSTALLED_AT})) + interval '1 minute', date_trunc('minute', now()) - interval '1 minute', interval '1 minute') m"
-  for o in "${OUTAGES[@]}"; do
+  for o in ${OUTAGES[@]+"${OUTAGES[@]}"}; do
     excused="${excused} OR m BETWEEN to_timestamp(${o% *}) - interval '1 minute' AND to_timestamp(${o#* }) + interval '1 minute'"
   done
   expected="$(sql "SELECT count(*) FROM ${minutes}")"
