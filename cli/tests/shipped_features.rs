@@ -52,28 +52,28 @@ fn cli_features() -> BTreeMap<String, Vec<String>> {
     let mut current: Option<(String, String)> = None;
     for line in table.lines().skip(1) {
         let line = line.split('#').next().unwrap_or("").trim();
-        if current.is_none() {
-            if line.starts_with('[') {
-                break;
+        let (name, body) = match current.take() {
+            Some((name, mut body)) => {
+                body.push_str(line);
+                (name, body)
             }
-            let Some((name, rest)) = line.split_once('=') else {
-                continue;
-            };
-            current = Some((name.trim().to_string(), String::new()));
-            current.as_mut().unwrap().1.push_str(rest);
-        } else {
-            current.as_mut().unwrap().1.push_str(line);
+            None if line.starts_with('[') => break,
+            None => match line.split_once('=') {
+                Some((name, rest)) => (name.trim().to_string(), rest.to_string()),
+                None => continue,
+            },
+        };
+        if !body.contains(']') {
+            current = Some((name, body));
+            continue;
         }
-        if current.as_ref().is_some_and(|(_, body)| body.contains(']')) {
-            let (name, body) = current.take().unwrap();
-            let inner = &body[body.find('[').expect("[") + 1..body.rfind(']').expect("]")];
-            let enables = inner
-                .split(',')
-                .map(|e| e.trim().trim_matches('"').to_string())
-                .filter(|e| !e.is_empty() && !e.contains('/') && !e.starts_with("dep:"))
-                .collect();
-            out.insert(name, enables);
-        }
+        let inner = &body[body.find('[').expect("[") + 1..body.rfind(']').expect("]")];
+        let enables = inner
+            .split(',')
+            .map(|e| e.trim().trim_matches('"').to_string())
+            .filter(|e| !e.is_empty() && !e.contains('/') && !e.starts_with("dep:"))
+            .collect();
+        out.insert(name, enables);
     }
     out
 }
@@ -82,10 +82,10 @@ fn reachable(features: &BTreeMap<String, Vec<String>>, roots: &[String]) -> BTre
     let mut seen = BTreeSet::new();
     let mut stack: Vec<String> = roots.to_vec();
     while let Some(name) = stack.pop() {
-        if let Some(enables) = features.get(&name) {
-            if seen.insert(name) {
-                stack.extend(enables.iter().cloned());
-            }
+        if let Some(enables) = features.get(&name)
+            && seen.insert(name)
+        {
+            stack.extend(enables.iter().cloned());
         }
     }
     seen
