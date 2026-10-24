@@ -530,8 +530,28 @@ impl MongoCdcSource {
         }
     }
 
-    /// Open the change stream and drain it with an idle-timeout terminator.
+    /// Drain the change stream, remembering each emitted bookmark so a later
+    /// read on the same instance resumes after it.
     fn stream_pages_impl<'a>(
+        &'a self,
+        ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+        use futures::TryStreamExt as _;
+        Box::pin(
+            self.stream_pages_raw(ctx, batch_size)
+                .and_then(move |page| async move {
+                    if let Some(b) = &page.bookmark {
+                        *self.pending_bookmark.lock().await =
+                            Some(Bookmark::from_value(b.clone())?);
+                    }
+                    Ok(page)
+                }),
+        )
+    }
+
+    /// Open the change stream and drain it with an idle-timeout terminator.
+    fn stream_pages_raw<'a>(
         &'a self,
         _ctx: &'a HashMap<String, Value>,
         batch_size: usize,
@@ -543,7 +563,7 @@ impl MongoCdcSource {
 
         Box::pin(async_stream::try_stream! {
 
-            let pending = self.pending_bookmark.lock().await.take();
+            let pending = self.pending_bookmark.lock().await.clone();
             let mut start = resolve_start(&self.config.start_from, pending.as_ref())?;
             // A fresh `now` start opens the real stream at the present and
             // anchors at its initial post-batch token; a separate capture

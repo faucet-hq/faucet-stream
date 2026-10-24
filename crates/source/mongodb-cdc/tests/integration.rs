@@ -174,6 +174,20 @@ async fn cdc_captures_crud_then_resumes_without_replay() {
         );
     }
     assert!(records2.iter().any(|r| r["op"] == "c"));
+
+    // A change made between two reads on the same instance is delivered by
+    // the next read: it resumes where the previous one ended, not at `now`.
+    Client::with_uri_str(&uri)
+        .await
+        .expect("writer3 client")
+        .database(DB)
+        .collection::<Document>(COLL)
+        .insert_one(doc! { "_id": 3, "name": "dave" })
+        .await
+        .expect("insert3");
+    let (records3, _) = drain(&source).await;
+    let keys: Vec<&Value> = records3.iter().map(|r| &r["document_key"]["_id"]).collect();
+    assert_eq!(keys, vec![&json!(3)], "{records3:?}");
 }
 
 // --- instance trait methods (require a live replica set via new()) ---
