@@ -53,6 +53,45 @@ pub struct JsonLinesConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// Longest line read, in bytes; a longer one fails the read instead of
+    /// being buffered whole. Defaults to the preview response budget.
+    #[serde(default = "default_max_line_bytes")]
+    pub max_line_bytes: usize,
+}
+
+fn default_max_line_bytes() -> usize {
+    super::engine::PREVIEW_MAX_BYTES
+}
+
+/// Read one `\n`-terminated line into `buf` (cleared first), refusing one
+/// longer than `max`. `Ok(false)` at end of input.
+async fn read_line_bounded<R>(r: &mut R, buf: &mut Vec<u8>, max: usize) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncBufRead + Unpin + ?Sized,
+{
+    use tokio::io::AsyncBufReadExt;
+    buf.clear();
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+        let (take, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if buf.len() + take > max.saturating_add(1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("a line is longer than {max} bytes"),
+            ));
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        r.consume(take);
+        if done {
+            return Ok(true);
+        }
+    }
 }
 
 impl JsonLinesConfig {
@@ -64,7 +103,14 @@ impl JsonLinesConfig {
             limit: None,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
+            max_line_bytes: default_max_line_bytes(),
         }
+    }
+
+    /// Set the longest line the reader accepts.
+    pub fn max_line_bytes(mut self, max: usize) -> Self {
+        self.max_line_bytes = max;
+        self
     }
 
     /// Cap the number of records read.
@@ -134,28 +180,32 @@ impl Source for JsonLinesSource {
         };
         #[cfg(feature = "compression")]
         let codec = self.config.compression.resolve(&path);
+        let max_line = self.config.max_line_bytes;
 
         Box::pin(async_stream::try_stream! {
-            use tokio::io::AsyncBufReadExt;
-
             let file = tokio::fs::File::open(&path).await.map_err(|e| {
                 FaucetError::Source(format!("failed to open JSON Lines file '{path}': {e}"))
             })?;
             let reader = tokio::io::BufReader::new(file);
             #[cfg(feature = "compression")]
             let reader = faucet_core::compression::wrap_async_reader(reader, codec);
-            let mut lines = reader.lines();
+            let mut reader = reader;
+            let mut buf = Vec::new();
 
             let mut batch: Vec<Value> = Vec::new();
             let mut emitted = 0usize;
             let mut lineno = 0usize;
             while emitted < limit {
-                let Some(line) = lines.next_line().await.map_err(|e| {
-                    FaucetError::Source(format!("reading '{path}': {e}"))
-                })? else {
+                let more = read_line_bounded(&mut reader, &mut buf, max_line).await.map_err(|e| {
+                    FaucetError::Source(format!("reading '{path}' line {}: {e}", lineno + 1))
+                })?;
+                if !more {
                     break;
-                };
+                }
                 lineno += 1;
+                let line = std::str::from_utf8(&buf).map_err(|e| {
+                    FaucetError::Source(format!("'{path}' line {lineno} is not UTF-8: {e}"))
+                })?;
                 // Blank lines are not records. The jsonl sink never writes one,
                 // but a hand-edited or concatenated file has them and refusing
                 // to read such a file would be pedantry.
@@ -230,6 +280,23 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("line 2"), "{msg}");
         assert!(msg.contains("out.jsonl"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_cap_fails_instead_of_buffering() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!("{{\"s\":\"{}\"}}", "x".repeat(200));
+        let path = write(dir.path(), "out.jsonl", &format!("{{\"a\":1}}\n{long}"));
+        let src = JsonLinesSource::new(JsonLinesConfig::new(path).max_line_bytes(64));
+        let msg = src.fetch_all().await.unwrap_err().to_string();
+        assert!(
+            msg.contains("line 2") && msg.contains("longer than 64 bytes"),
+            "{msg}"
+        );
+        // A last line with no newline, and CRLF endings, read normally.
+        let path = write(dir.path(), "ok.jsonl", "{\"a\":1}\r\n{\"a\":2}");
+        let src = JsonLinesSource::new(JsonLinesConfig::new(path).max_line_bytes(64));
+        assert_eq!(src.fetch_all().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
