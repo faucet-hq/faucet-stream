@@ -2685,7 +2685,15 @@ fn check_deferred_scope(
 ) -> CliResult<()> {
     for r in deferred {
         let id = r.referenced_id.as_str();
-        if id == row_id || !row_ids.contains(id) {
+        if id == row_id {
+            return Err(CliError::Config(format!(
+                "row '{row_id}' references its own id in `{}`; a row's tokens resolve only \
+                 from its parent's records or its `for_each` dimensions, so this one would \
+                 reach the connector unresolved",
+                r.token
+            )));
+        }
+        if !row_ids.contains(id) {
             continue;
         }
         let resolvable = match role {
@@ -3865,6 +3873,24 @@ matrix:
 "#);
         let err = expand(&c).unwrap_err().to_string();
         assert!(err.contains("not its parent"), "{err}");
+    }
+
+    #[test]
+    fn a_row_referencing_its_own_id_is_refused() {
+        let c = cfg(r#"
+version: 1
+pipeline:
+  source: { type: rest, config: {} }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
+matrix:
+  - id: orders
+    sink: { config: { path: "./t_${orders.region}.jsonl" } }
+"#);
+        let err = expand(&c).unwrap_err().to_string();
+        assert!(
+            err.contains("row 'orders' references its own id") && err.contains("${orders.region}"),
+            "{err}"
+        );
     }
 
     #[test]
