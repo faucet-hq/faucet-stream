@@ -97,6 +97,12 @@ last modified within `lookback_secs` of the newest fired one is still fired. A
 late `batch` gets its own idempotency key, so it is not taken for the earlier
 batch that shares its newest time.
 
+Every poll lists the whole prefix — object stores have no "changed since"
+listing — so its request cost grows with the number of objects under it; only
+objects not yet fired are kept in memory. Point the trigger at a landing prefix
+that is cleaned up or archived, and size `poll_interval_secs` to its listing
+cost.
+
 **`${trigger.*}` tokens injected into the run config:**
 
 Tokens are substituted inside each string value of the parsed config, with the
