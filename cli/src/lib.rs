@@ -416,39 +416,13 @@ pub async fn run_from_yaml_str_selected(
     yaml: &str,
     selection: Option<&select::SelectionRequest>,
 ) -> CliResult<executor::RunSummary> {
-    // Parse first, then resolve ${env}/${file}/${secret} INTO the parsed tree
-    // (post-parse) so a resolved value can never alter the document's structure
-    // (F43) — mirroring the binary's `from_path` path.
-    let mut value: serde_json::Value =
-        serde_yaml::from_str(yaml).map_err(|e| CliError::ParseConfig {
-            path: std::path::PathBuf::from("<yaml-string>"),
-            message: e.to_string(),
-        })?;
-    interpolate::interpolate_value(&mut value)?;
-    // Bind `${param.*}` from the config's own `params:` defaults (#444). No
-    // caller-supplied values on this convenience path, so a required param is a
-    // clear error rather than a token leaking into a connector config.
-    params::bind_document(&mut value, &Default::default(), params::BindMode::Strict)?;
-    interpolate::unescape_document(&mut value);
-    let interpolated = serde_yaml::to_string(&value).map_err(|e| CliError::ParseConfig {
-        path: std::path::PathBuf::from("<yaml-string>"),
-        message: e.to_string(),
-    })?;
-    let mut cfg: config::PipelineConfig =
-        serde_yaml::from_str(&interpolated).map_err(|e| CliError::ParseConfig {
-            path: std::path::PathBuf::from("<yaml-string>"),
-            message: e.to_string(),
-        })?;
-    if cfg.version != 1 {
-        return Err(CliError::ParseConfig {
-            path: std::path::PathBuf::from("<yaml-string>"),
-            message: format!(
-                "unsupported pipeline version {}, only version 1 is recognised",
-                cfg.version
-            ),
-        });
-    }
-    crate::secrets::resolve_secrets(&mut cfg).await?;
+    // The same load a YAML file goes through.
+    let cfg = config::PipelineConfig::from_text_async_with(
+        yaml,
+        std::path::Path::new("<yaml-string>.yaml"),
+        &config::RunInputs::default(),
+    )
+    .await?;
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| "unnamed".to_string());
     let auth = auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
     let resilience = match &cfg.resilience {
