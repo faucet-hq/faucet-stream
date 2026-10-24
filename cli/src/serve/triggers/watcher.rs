@@ -12,6 +12,64 @@ use tokio_util::sync::CancellationToken;
 pub const UNHEALTHY_THRESHOLD: u64 = 3;
 /// Backoff ceiling so a persistently-failing watcher still retries periodically.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Shortest time one poll may take before it counts as failed.
+pub const POLL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+
+/// Run one poll, bounded by `limit` and stopped by `shutdown` (`None`). A
+/// poll that hangs on an unresponsive backend becomes an error the
+/// supervisor records, instead of freezing the watcher while it reads healthy.
+pub async fn poll_bounded<W: Watcher + ?Sized>(
+    watcher: &mut W,
+    state: &ServerState,
+    limit: Duration,
+    shutdown: &CancellationToken,
+) -> Option<Result<bool, PollError>> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        r = tokio::time::timeout(limit, watcher.poll(state)) => Some(match r {
+            Ok(r) => r,
+            Err(_) => Err(PollError::from(format!(
+                "poll did not finish within {}s",
+                limit.as_secs()
+            ))),
+        }),
+    }
+}
+
+/// Why a poll failed. `counted` is set when the failure is a fire the fire
+/// path already counted in `faucet_serve_trigger_errors_total`, so the
+/// supervisor does not count it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollError {
+    pub message: String,
+    pub counted: bool,
+}
+
+impl PollError {
+    /// A failed fire, already counted by the fire path.
+    pub fn fired(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            counted: true,
+        }
+    }
+}
+
+impl From<String> for PollError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            counted: false,
+        }
+    }
+}
+
+impl std::fmt::Display for PollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// One pollable watcher (object_arrival / queue_depth). Webhook is push, not
 /// polled, so it does not implement this.
@@ -21,7 +79,7 @@ pub trait Watcher: Send + Sync {
     fn kind(&self) -> &'static str;
     fn poll_interval(&self) -> Duration;
     /// Do one cycle. `Ok(true)` = something fired; `Ok(false)` = idle.
-    async fn poll(&mut self, state: &ServerState) -> Result<bool, String>;
+    async fn poll(&mut self, state: &ServerState) -> Result<bool, PollError>;
 }
 
 /// Exponential backoff doubling from `base` (the poll interval) to `MAX_BACKOFF`.
@@ -54,7 +112,12 @@ pub async fn run_supervised<W: Watcher>(
                 break;
             }
             _ = tokio::time::sleep(wait) => {
-                match watcher.poll(&state).await {
+                let limit = watcher.poll_interval().max(POLL_TIMEOUT_FLOOR);
+                let Some(outcome) = poll_bounded(&mut watcher, &state, limit, &shutdown).await else {
+                    tracing::info!(trigger = watcher.name(), "trigger watcher stopping");
+                    break;
+                };
+                match outcome {
                     Ok(fired) => {
                         failures = 0;
                         let stamp = if fired {
@@ -71,8 +134,10 @@ pub async fn run_supervised<W: Watcher>(
                     Err(e) => {
                         failures += 1;
                         tracing::warn!(trigger = watcher.name(), error = %e, "trigger poll failed");
-                        metrics::error(watcher.name(), watcher.kind());
-                        health.record_err(watcher.name(), e, UNHEALTHY_THRESHOLD);
+                        if !e.counted {
+                            metrics::error(watcher.name(), watcher.kind());
+                        }
+                        health.record_err(watcher.name(), e.message, UNHEALTHY_THRESHOLD);
                         if failures >= UNHEALTHY_THRESHOLD {
                             metrics::healthy(watcher.name(), false);
                         }
@@ -86,6 +151,46 @@ pub async fn run_supervised<W: Watcher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Hangs;
+
+    #[async_trait]
+    impl Watcher for Hangs {
+        fn name(&self) -> &str {
+            "hangs"
+        }
+        fn kind(&self) -> &'static str {
+            "queue_depth"
+        }
+        fn poll_interval(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+        async fn poll(&mut self, _state: &ServerState) -> Result<bool, PollError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_poll_times_out_and_shutdown_stops_it() {
+        let state = crate::serve::test_support::test_state();
+        let token = CancellationToken::new();
+        let out = poll_bounded(&mut Hangs, &state, POLL_TIMEOUT_FLOOR, &token).await;
+        let err = out.expect("not shut down").unwrap_err();
+        assert!(err.message.contains("did not finish within 60s"), "{err}");
+        assert!(!err.counted);
+        token.cancel();
+        assert!(
+            poll_bounded(&mut Hangs, &state, POLL_TIMEOUT_FLOOR, &token)
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_fired_poll_error_is_marked_counted() {
+        assert!(PollError::fired("x").counted);
+        assert!(!PollError::from("x".to_string()).counted);
+    }
 
     #[test]
     fn backoff_starts_at_base_and_caps() {

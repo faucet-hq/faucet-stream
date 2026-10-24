@@ -1229,7 +1229,7 @@ async fn a_bad_object_is_skipped_and_reported_instead_of_blocking_the_prefix() {
         chrono::Utc::now(),
     );
     let err = watcher.poll(&state).await.unwrap_err();
-    assert!(err.contains("'bogus' skipped"), "{err}");
+    assert!(err.message.contains("'bogus' skipped"), "{err}");
     wait_for_runs(&state, 1).await;
     assert!(out.exists(), "the object after the bad one still ran");
     assert!(!watcher.poll(&state).await.unwrap(), "nothing left to fire");
@@ -1279,7 +1279,7 @@ async fn an_object_whose_reference_is_briefly_unreadable_is_retried() {
         chrono::Utc::now(),
     );
     let err = watcher.poll(&state).await.unwrap_err();
-    assert!(!err.contains("skipped"), "{err}");
+    assert!(!err.message.contains("skipped"), "{err}");
     std::fs::write(&pointer, out.to_str().unwrap()).unwrap();
     assert!(
         watcher.poll(&state).await.unwrap(),

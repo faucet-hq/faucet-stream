@@ -336,7 +336,7 @@ impl Watcher for ObjectArrivalWatcher {
         self.poll
     }
 
-    async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
+    async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {
         self.resume(state).await?;
         let listing = self.list().await?;
         let mut new = self.cursor.new_objects(&listing);
@@ -434,7 +434,7 @@ impl Watcher for ObjectArrivalWatcher {
             self.save(state).await;
         }
         match problem {
-            Some(e) => Err(e),
+            Some(e) => Err(super::watcher::PollError::fired(e)),
             None => Ok(fired),
         }
     }

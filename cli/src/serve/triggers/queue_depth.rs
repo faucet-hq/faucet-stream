@@ -65,7 +65,7 @@ impl Watcher for QueueDepthWatcher {
         self.poll
     }
 
-    async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
+    async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {
         let depth = self.probe.depth().await?;
         let history = state.history();
         if depth < self.threshold {
@@ -126,10 +126,13 @@ impl Watcher for QueueDepthWatcher {
 /// fire (backpressure) is retried quietly, a failed or erroring one is an
 /// error, so the watcher backs off and turns unhealthy instead of refiring a
 /// run that cannot start on every poll while reporting healthy.
-fn uncommitted_result(outcome: FireOutcome) -> Result<bool, String> {
+fn uncommitted_result(outcome: FireOutcome) -> Result<bool, super::watcher::PollError> {
+    use super::watcher::PollError;
     match outcome {
-        FireOutcome::Failed(e) => Err(format!("queue_depth run cannot start: {e}")),
-        FireOutcome::Error(e) => Err(format!("queue_depth fire failed: {e}")),
+        FireOutcome::Failed(e) => Err(PollError::fired(format!(
+            "queue_depth run cannot start: {e}"
+        ))),
+        FireOutcome::Error(e) => Err(PollError::fired(format!("queue_depth fire failed: {e}"))),
         _ => Ok(false),
     }
 }
@@ -358,7 +361,14 @@ mod tests {
         assert!(
             uncommitted_result(FireOutcome::Failed("no such source".into()))
                 .unwrap_err()
+                .message
                 .contains("no such source")
+        );
+        assert!(
+            uncommitted_result(FireOutcome::Error("db".into()))
+                .unwrap_err()
+                .counted,
+            "the fire path already counted it"
         );
         assert!(uncommitted_result(FireOutcome::Error("db".into())).is_err());
         assert_eq!(

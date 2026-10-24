@@ -232,7 +232,7 @@ impl Watcher for ScheduleWatcher {
         CHECK_INTERVAL
     }
 
-    async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
+    async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {
         let now = Utc::now();
         if !self.resumed {
             self.resume_from(&*state.history(), now).await?;
@@ -252,9 +252,11 @@ impl Watcher for ScheduleWatcher {
         }
         match outcome {
             FireOutcome::Dropped(reason) => {
-                Err(format!("tick {tick} dropped ({reason}); retrying"))
+                Err(format!("tick {tick} dropped ({reason}); retrying").into())
             }
-            FireOutcome::Error(e) | FireOutcome::Failed(e) => Err(format!("tick {tick}: {e}")),
+            FireOutcome::Error(e) | FireOutcome::Failed(e) => Err(
+                super::watcher::PollError::fired(format!("tick {tick}: {e}")),
+            ),
             FireOutcome::Enqueued(_) | FireOutcome::Coalesced => unreachable!("committed above"),
         }
     }
