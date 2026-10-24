@@ -221,6 +221,28 @@ mod kafka_probe {
     use rdkafka::{ClientConfig, Offset, TopicPartitionList};
     use std::time::Duration;
 
+    /// One partition's lag. A group with no commit on it starts at the low
+    /// watermark (what is still retained), not at offset 0.
+    pub(super) fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
+        let from = match committed {
+            Offset::Offset(n) => n.max(low),
+            Offset::End => high,
+            _ => low,
+        };
+        (high - from).max(0)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn lag_starts_at_the_low_watermark_without_a_commit() {
+        assert_eq!(partition_lag(9_000_000, 9_000_010, Offset::Invalid), 10);
+        assert_eq!(partition_lag(9_000_000, 9_000_010, Offset::Beginning), 10);
+        assert_eq!(partition_lag(0, 50, Offset::Offset(20)), 30);
+        assert_eq!(partition_lag(40, 50, Offset::Offset(20)), 10);
+        assert_eq!(partition_lag(0, 50, Offset::End), 0);
+        assert_eq!(partition_lag(0, 50, Offset::Offset(60)), 0);
+    }
+
     pub struct KafkaProbe {
         brokers: String,
         topic: String,
@@ -273,18 +295,14 @@ mod kafka_probe {
                     .map_err(|e| format!("kafka committed: {e}"))?;
                 let mut lag: i64 = 0;
                 for p in &parts {
-                    let (_low, high) = consumer
+                    let (low, high) = consumer
                         .fetch_watermarks(&topic, *p, Duration::from_secs(10))
                         .map_err(|e| format!("kafka watermarks: {e}"))?;
                     let committed_off = committed
                         .find_partition(&topic, *p)
                         .map(|e| e.offset())
                         .unwrap_or(Offset::Invalid);
-                    let c = match committed_off {
-                        Offset::Offset(n) => n,
-                        _ => 0,
-                    };
-                    lag += (high - c).max(0);
+                    lag += partition_lag(low, high, committed_off);
                 }
                 Ok(lag.max(0) as u64)
             })
