@@ -713,9 +713,9 @@ fn lookup<'a>(path: &str, token: &str, bound: &'a BTreeMap<String, Value>) -> Cl
 /// Parse a `--param key=value` CLI argument. The value is kept as a JSON string;
 /// [`spec::coerce`] converts it to the declared type at bind time.
 pub fn parse_cli_param(arg: &str) -> CliResult<(String, Value)> {
-    let (key, value) = arg.split_once('=').ok_or_else(|| {
-        CliError::Config(format!("invalid --param '{arg}' — expected `name=value`"))
-    })?;
+    let Some((key, value)) = arg.split_once('=') else {
+        return param_from_env(arg);
+    };
     let key = key.trim();
     if key.is_empty() {
         return Err(CliError::Config(format!(
@@ -723,6 +723,31 @@ pub fn parse_cli_param(arg: &str) -> CliResult<(String, Value)> {
         )));
     }
     Ok((key.to_string(), Value::String(value.to_string())))
+}
+
+/// A bare `--param name`: the value comes from the environment variable named
+/// after the param in upper case (`api_token` → `API_TOKEN`), so a credential
+/// never appears in the process arguments.
+fn param_from_env(arg: &str) -> CliResult<(String, Value)> {
+    let key = arg.trim();
+    if key.is_empty() {
+        return Err(CliError::Config(
+            "invalid --param '' — expected `name=value` or a bare `name`".to_string(),
+        ));
+    }
+    let var = env_var_for(key);
+    let value = std::env::var(&var).map_err(|_| {
+        CliError::Config(format!(
+            "--param '{key}' has no value and '{var}' is not set in the environment — pass \
+             `--param {key}=VALUE` or export {var}"
+        ))
+    })?;
+    Ok((key.to_string(), Value::String(value)))
+}
+
+/// The environment variable a bare `--param name` reads.
+pub fn env_var_for(param: &str) -> String {
+    param.to_ascii_uppercase()
 }
 
 /// Collect a `--param name=value` list into a [`SuppliedParams`] map, rejecting
@@ -1441,6 +1466,15 @@ mod tests {
         let (_, v) = parse_cli_param("q=").unwrap();
         assert_eq!(v, json!(""));
         assert!(parse_cli_param("noequals").is_err());
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("FAUCET_BARE_PARAM_TEST", "s3cr3t") };
+        let (k, v) = parse_cli_param("faucet_bare_param_test").unwrap();
+        assert_eq!((k.as_str(), v), ("faucet_bare_param_test", json!("s3cr3t")));
+        unsafe { std::env::remove_var("FAUCET_BARE_PARAM_TEST") };
+        let err = parse_cli_param("faucet_bare_param_test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FAUCET_BARE_PARAM_TEST"), "{err}");
         assert!(parse_cli_param("=v").is_err());
 
         let map = collect_cli_params(&["a=1".into(), "b=2".into()]).unwrap();

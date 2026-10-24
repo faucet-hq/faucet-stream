@@ -19,7 +19,7 @@ Any source × any sink composes into an ordinary pipeline at run time:
 
 ```bash
 faucet run --source acme/billing --sink faucet-hq/bigquery \
-  --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
+  --param api_token --param bq_project=my-project --param bq_sa_key   # secrets from $API_TOKEN / $BQ_SA_KEY
 
 faucet run --source acme/billing --sink faucet-hq/jsonl     # the same source, validated locally first
 faucet run --source acme/billing --sink faucet-hq/postgres  # real upsert/overwrite semantics

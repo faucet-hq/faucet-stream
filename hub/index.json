@@ -1,7 +1,7 @@
 {
   "matrix": [
     {
-      "command": "faucet run --source faucet-hq/example-csv --sink faucet-hq/bigquery \\\n  --param bq_project=<bq_project> \\\n  --param bq_sa_key=\"$BQ_SA_KEY\"",
+      "command": "faucet run --source faucet-hq/example-csv --sink faucet-hq/bigquery \\\n  --param bq_project=<bq_project> \\\n  --param bq_sa_key",
       "compatible": true,
       "incompatible": [],
       "sink": "faucet-hq/bigquery",
@@ -39,7 +39,7 @@
       ]
     },
     {
-      "command": "faucet run --source faucet-hq/example-csv --sink faucet-hq/postgres \\\n  --param pg_url=\"$PG_URL\"",
+      "command": "faucet run --source faucet-hq/example-csv --sink faucet-hq/postgres \\\n  --param pg_url",
       "compatible": true,
       "incompatible": [],
       "sink": "faucet-hq/postgres",
@@ -77,7 +77,7 @@
       ]
     },
     {
-      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/bigquery \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url> \\\n  --param bq_project=<bq_project> \\\n  --param bq_sa_key=\"$BQ_SA_KEY\"",
+      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/bigquery \\\n  --param api_token \\\n  --param base_url=<base_url> \\\n  --param bq_project=<bq_project> \\\n  --param bq_sa_key",
       "compatible": true,
       "incompatible": [],
       "sink": "faucet-hq/bigquery",
@@ -96,7 +96,7 @@
       ]
     },
     {
-      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/jsonl \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url>",
+      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/jsonl \\\n  --param api_token \\\n  --param base_url=<base_url>",
       "compatible": true,
       "incompatible": [],
       "sink": "faucet-hq/jsonl",
@@ -115,7 +115,7 @@
       ]
     },
     {
-      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/postgres \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url> \\\n  --param pg_url=\"$PG_URL\"",
+      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/postgres \\\n  --param api_token \\\n  --param base_url=<base_url> \\\n  --param pg_url",
       "compatible": true,
       "incompatible": [],
       "sink": "faucet-hq/postgres",
@@ -134,7 +134,7 @@
       ]
     },
     {
-      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/sqlite \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url>",
+      "command": "faucet run --source faucet-hq/example-rest-api --sink faucet-hq/sqlite \\\n  --param api_token \\\n  --param base_url=<base_url>",
       "compatible": true,
       "incompatible": [],
       "sink": "faucet-hq/sqlite",

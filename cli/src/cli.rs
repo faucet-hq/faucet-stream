@@ -927,7 +927,8 @@ pub struct TemplateRunArgs {
     /// been launched. Use `newest` to run the most recent build regardless.
     #[arg(long, default_value = "stable")]
     pub version: String,
-    /// Supply a declared param: `--param tenant_id=acme`. Repeatable.
+    /// Supply a declared param: `--param tenant_id=acme`, or bare `--param
+    /// api_token` to read it from `$API_TOKEN`. Repeatable.
     #[arg(long = "param", value_name = "NAME=VALUE")]
     pub param: Vec<String>,
     /// Override an environment variable for this materialization only:
@@ -1922,7 +1923,8 @@ pub struct DoctorArgs {
     /// a labelled column may reach. Violations are reported and refuse a run.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<PathBuf>,
-    /// Supply a declared param: `--param tenant_id=acme`. Repeatable. With
+    /// Supply a declared param: `--param tenant_id=acme`, or bare `--param
+    /// api_token` to read it from `$API_TOKEN`. Repeatable. With
     /// `--offline` an unsupplied required param gets a placeholder.
     #[arg(long = "param", value_name = "NAME=VALUE")]
     pub param: Vec<String>,
@@ -3152,7 +3154,8 @@ pub struct PlanArgs {
     /// Skip loading any dotenv file.
     #[arg(long)]
     pub no_env_file: bool,
-    /// Supply a declared param: `--param tenant_id=acme`. Repeatable. Without
+    /// Supply a declared param: `--param tenant_id=acme`, or bare `--param
+    /// api_token` to read it from `$API_TOKEN`. Repeatable. Without
     /// `--live`, an unsupplied required param gets a placeholder.
     #[arg(long = "param", value_name = "NAME=VALUE")]
     pub param: Vec<String>,

@@ -169,7 +169,7 @@ faucet template register hub/source-templates/acme/billing.yaml --launch    # id
 faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch  # id = faucet-hq/bigquery
 faucet template list --kind sink-template
 faucet template run acme/billing --sink faucet-hq/bigquery \
-  --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
+  --param api_token --param bq_project=my-project --param bq_sa_key   # secrets from $API_TOKEN / $BQ_SA_KEY
 # → composes the two, prints the per-stream plan (bills: overwrite, transactions: upsert[id], …), runs
 faucet template register ops/prod.yaml --launch                               # kind: deployment
 faucet template run acme/billing --sink faucet-hq/bigquery --overlay prod …   # + state / DLQ / SLA

@@ -638,10 +638,7 @@ pub fn run_command(source: &SourceTemplate, sink: &SinkTemplate) -> String {
             continue;
         }
         if p.secret {
-            cmd.push_str(&format!(
-                " \\\n  --param {name}=\"${}\"",
-                name.to_ascii_uppercase()
-            ));
+            cmd.push_str(&format!(" \\\n  --param {name}"));
         } else {
             cmd.push_str(&format!(" \\\n  --param {name}=<{name}>"));
         }
@@ -1081,7 +1078,11 @@ per_stream:
             cmd.starts_with("faucet run --source acme --sink bigquery"),
             "{cmd}"
         );
-        assert!(cmd.contains("--param api_token=\"$API_TOKEN\""), "{cmd}");
+        assert!(cmd.contains("--param api_token \\"), "{cmd}");
+        assert!(
+            !cmd.contains("$API_TOKEN"),
+            "a secret never lands in argv: {cmd}"
+        );
         assert!(cmd.contains("--param bq_project=<bq_project>"), "{cmd}");
         assert!(
             !cmd.contains("out_dir"),
