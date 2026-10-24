@@ -85,7 +85,9 @@ earlier attempt's outcome was unknown: a transport failure, an unreadable reply,
 or an internal server error. With `on_condition_failure: fail`, a condition
 that then fails on the retry is checked with a consistent `GetItem`: when the
 item already equals the put item (or a deleted key is gone), the earlier
-attempt landed and the row succeeds; otherwise the row fails.
+attempt landed and the row succeeds; otherwise the row fails. The comparison
+follows how DynamoDB stores values: numbers by value (`2.0` matches the stored
+`2`), sets in any order, lists and maps element by element.
 
 ## Preflight
 

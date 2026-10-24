@@ -19,11 +19,7 @@ fn internal_error() -> ResponseTemplate {
         }))
 }
 
-async fn put_attempts(
-    condition: Option<&str>,
-    target: &str,
-) -> (usize, Vec<faucet_core::RowOutcome>) {
-    let server = MockServer::start().await;
+async fn mount_describe(server: &MockServer) {
     Mock::given(method("POST"))
         .and(header("x-amz-target", "DynamoDB_20120810.DescribeTable"))
         .respond_with(
@@ -35,8 +31,16 @@ async fn put_attempts(
                     "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
                 }})),
         )
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+async fn put_attempts(
+    condition: Option<&str>,
+    target: &str,
+) -> (usize, Vec<faucet_core::RowOutcome>) {
+    let server = MockServer::start().await;
+    mount_describe(&server).await;
     for op in ["PutItem", "BatchWriteItem"] {
         Mock::given(method("POST"))
             .and(header(
@@ -87,4 +91,54 @@ async fn an_unconditional_write_is_retried() {
     let (puts, out) = put_attempts(None, "BatchWriteItem").await;
     assert!(puts > 1, "{puts}");
     assert!(out[0].is_err());
+}
+
+#[tokio::test]
+async fn a_landed_write_whose_number_dynamodb_re_rendered_is_success() {
+    let server = MockServer::start().await;
+    mount_describe(&server).await;
+    let reply = |status: u16, body: serde_json::Value| {
+        ResponseTemplate::new(status)
+            .insert_header("content-type", "application/x-amz-json-1.0")
+            .set_body_json(body)
+    };
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "DynamoDB_20120810.PutItem"))
+        .respond_with(internal_error())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "DynamoDB_20120810.PutItem"))
+        .respond_with(reply(
+            400,
+            json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                "message": "The conditional request failed"
+            }),
+        ))
+        .mount(&server)
+        .await;
+    // DynamoDB stores `2.0` as `2` and returns sets in its own order.
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "DynamoDB_20120810.GetItem"))
+        .respond_with(reply(
+            200,
+            json!({"Item": {"pk": {"S": "a"}, "price": {"N": "2"}}}),
+        ))
+        .mount(&server)
+        .await;
+    let mut cfg = common::config(&server.uri(), "orders");
+    cfg.retry.max_retries = 2;
+    cfg.retry.initial_backoff_ms = 1;
+    cfg.condition_expression = Some("attribute_not_exists(#p)".into());
+    cfg.expression_attribute_names
+        .insert("#p".into(), "pk".into());
+    cfg.on_condition_failure = faucet_sink_dynamodb::OnConditionFailure::Fail;
+    let sink = DynamoDbSink::new(cfg).await.unwrap();
+    let out = sink
+        .write_batch_partial(&[json!({"pk": "a", "price": 2.0})])
+        .await
+        .unwrap();
+    assert!(out[0].is_ok(), "{out:?}");
 }

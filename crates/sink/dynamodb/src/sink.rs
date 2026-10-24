@@ -3,7 +3,7 @@
 //! conditional item-by-item writes.
 
 use crate::config::{DynamoDbSinkConfig, OnConditionFailure};
-use crate::plan::{Item, Op, OpKind, chunk_ops, plan_as, request_canon};
+use crate::plan::{Item, Op, OpKind, canonical_number, chunk_ops, plan_as, request_canon};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use faucet_common_dynamodb::{
@@ -427,9 +427,46 @@ fn is_condition_failure(sent: &Result<(), (Option<String>, String)>) -> bool {
 /// Whether the item read back shows an earlier attempt of `kind` landed.
 pub(crate) fn applied_by_earlier_attempt(kind: &OpKind, found: Option<&Item>) -> bool {
     match kind {
-        OpKind::Put(item) => found == Some(item),
+        OpKind::Put(item) => found.is_some_and(|f| items_equal(item, f)),
         OpKind::Delete(_) => found.is_none(),
     }
+}
+
+/// Item equality as DynamoDB stores it: numbers by value (it re-renders
+/// `2.0` as `2`), sets without order, lists and maps recursively.
+fn items_equal(a: &Item, b: &Item) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .all(|(k, v)| b.get(k).is_some_and(|w| attr_equal(v, w)))
+}
+
+fn attr_equal(a: &AttributeValue, b: &AttributeValue) -> bool {
+    use AttributeValue as A;
+    match (a, b) {
+        (A::N(x), A::N(y)) => number_key(x) == number_key(y),
+        (A::Ns(x), A::Ns(y)) => same_set(
+            x.iter().map(|n| number_key(n)),
+            y.iter().map(|n| number_key(n)),
+        ),
+        (A::Ss(x), A::Ss(y)) => same_set(x.iter().cloned(), y.iter().cloned()),
+        (A::Bs(x), A::Bs(y)) => same_set(
+            x.iter().map(|b| b.as_ref().to_vec()),
+            y.iter().map(|b| b.as_ref().to_vec()),
+        ),
+        (A::L(x), A::L(y)) => x.len() == y.len() && x.iter().zip(y).all(|(v, w)| attr_equal(v, w)),
+        (A::M(x), A::M(y)) => items_equal(x, y),
+        _ => a == b,
+    }
+}
+
+fn number_key(raw: &str) -> String {
+    canonical_number(raw).unwrap_or_else(|| raw.to_string())
+}
+
+fn same_set<T: Ord>(x: impl Iterator<Item = T>, y: impl Iterator<Item = T>) -> bool {
+    let x: std::collections::BTreeSet<T> = x.collect();
+    let y: std::collections::BTreeSet<T> = y.collect();
+    x == y
 }
 
 pub(crate) fn classify_single(
@@ -1020,6 +1057,83 @@ mod tests {
         assert!(!applied_by_earlier_attempt(
             &OpKind::Delete(item),
             Some(&other)
+        ));
+    }
+
+    #[test]
+    fn earlier_attempt_detection_compares_as_dynamodb_stores() {
+        use AttributeValue as A;
+        let item = |pairs: Vec<(&str, AttributeValue)>| -> Item {
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+        };
+        let landed = |sent: Item, stored: Item| {
+            applied_by_earlier_attempt(&OpKind::Put(sent), Some(&stored))
+        };
+        assert!(landed(
+            item(vec![
+                ("pk", A::S("a".into())),
+                ("price", A::N("2.0".into()))
+            ]),
+            item(vec![("pk", A::S("a".into())), ("price", A::N("2".into()))]),
+        ));
+        assert!(landed(
+            item(vec![("n", A::N("1e300".into()))]),
+            item(vec![("n", A::N("1E+300".into()))]),
+        ));
+        assert!(landed(
+            item(vec![("tags", A::Ss(vec!["x".into(), "y".into()]))]),
+            item(vec![("tags", A::Ss(vec!["y".into(), "x".into()]))]),
+        ));
+        assert!(landed(
+            item(vec![("ns", A::Ns(vec!["1.50".into(), "2".into()]))]),
+            item(vec![("ns", A::Ns(vec!["2".into(), "1.5".into()]))]),
+        ));
+        assert!(landed(
+            item(vec![(
+                "bs",
+                A::Bs(vec![
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![1]),
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![2]),
+                ])
+            )]),
+            item(vec![(
+                "bs",
+                A::Bs(vec![
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![2]),
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![1]),
+                ])
+            )]),
+        ));
+        assert!(landed(
+            item(vec![(
+                "nested",
+                A::M(item(vec![("l", A::L(vec![A::N("10.0".into())]))]))
+            )]),
+            item(vec![(
+                "nested",
+                A::M(item(vec![("l", A::L(vec![A::N("10".into())]))]))
+            )]),
+        ));
+        // Different values, list order and extra attributes still differ.
+        assert!(!landed(
+            item(vec![("price", A::N("2.0".into()))]),
+            item(vec![("price", A::N("2.01".into()))]),
+        ));
+        assert!(!landed(
+            item(vec![("l", A::L(vec![A::N("1".into()), A::N("2".into())]))]),
+            item(vec![("l", A::L(vec![A::N("2".into()), A::N("1".into())]))]),
+        ));
+        assert!(!landed(
+            item(vec![("a", A::S("1".into()))]),
+            item(vec![("a", A::S("1".into())), ("b", A::S("2".into()))]),
+        ));
+        assert!(!landed(
+            item(vec![("a", A::S("2".into()))]),
+            item(vec![("a", A::N("2".into()))]),
+        ));
+        assert!(!landed(
+            item(vec![("ss", A::Ss(vec!["x".into()]))]),
+            item(vec![("ss", A::Ss(vec!["x".into(), "y".into()]))]),
         ));
     }
 
