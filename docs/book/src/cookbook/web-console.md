@@ -63,6 +63,11 @@ the next refused call makes the console re-read it and redraw.
 > (see the [security model](./serve.md#️-security-model--read-before-exposing)).
 > Serve the console only over localhost or a TLS-terminating proxy; never paste
 > a production token into a browser tab on a shared machine.
+>
+> The shell and its assets carry a `Content-Security-Policy` that allows only
+> the console's own scripts and forbids framing (`frame-ancestors 'none'`,
+> `X-Frame-Options: DENY`), plus `X-Content-Type-Options: nosniff` and
+> `Referrer-Policy: no-referrer`. A proxy in front must not strip them.
 
 ## Views
 
