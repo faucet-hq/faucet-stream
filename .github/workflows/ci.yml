@@ -399,6 +399,8 @@ jobs:
   reliability:
     name: Reliability guarantees
     runs-on: ubuntu-latest
+    # ~5 min normally; a hung test fails here instead of holding the runner 6 h.
+    timeout-minutes: 45
     needs: changes
     # Required check → the job ALWAYS runs so it always reports, and the heavy
     # steps are gated instead (the same shape `clippy` uses). A job-level `if`
@@ -1009,6 +1011,8 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    # ~120 min normally; a hung test fails here instead of holding the runner 6 h.
+    timeout-minutes: 180
     needs: changes
     env:
       # Same backends as `test`: a skipped integration suite must fail (#789 SUPPLY-09).

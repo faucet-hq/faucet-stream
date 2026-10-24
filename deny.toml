@@ -40,6 +40,13 @@ ignore = [
     # ^0.26; drop this when they move to webpki-roots 1.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 shim re-exports the patched 1.0.10 (2026-10-21)" },
     { id = "RUSTSEC-2026-0349", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
+    # 2026-10-24 — crypto-bigint timing branches (RUSTSEC-2026-0387). The 0.7
+    # line is on the patched 0.7.6; only 0.5.5 remains, via aws-sigv4 (SigV4a
+    # request signing) -> ecdsa 0.16 -> elliptic-curve 0.13, with no fixed 0.5.x.
+    # An attacker needs precise timing of many signatures on the signing host.
+    # Scoped to 0.5.5 by scripts/advisory-scope.py; drop when aws-sigv4 moves to
+    # elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "only crypto-bigint 0.5.5 via aws-sigv4 remains; no 0.5.x fix (2026-10-24)" },
     # 2026-10-07 — quick-xml: faucet's own parsers and calamine are on >= 0.41
     # (RUSTSEC-2026-0194/0195 fixed). Two older copies remain transitively and
     # cannot move until their parents do: 0.39 from object_store 0.13 (pinned by
