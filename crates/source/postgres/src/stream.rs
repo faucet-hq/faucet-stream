@@ -902,24 +902,29 @@ struct JsonContext<'a> {
 }
 
 fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Value, FaucetError> {
-    let mut map = serde_json::Map::new();
+    let mut map = serde_json::Map::with_capacity(row.columns().len());
     for (idx, col) in row.columns().iter().enumerate() {
-        let value = pg_value_to_json(row, idx, col.name(), json)?;
-        map.insert(unique_key(&map, col.name()), value);
+        if row.columns()[..idx].iter().any(|c| c.name() == col.name()) {
+            return Err(duplicate_column(col.name()));
+        }
+    }
+    for (idx, col) in row.columns().iter().enumerate() {
+        map.insert(
+            col.name().to_string(),
+            pg_value_to_json(row, idx, col.name(), json)?,
+        );
     }
     Ok(Value::Object(map))
 }
 
-/// `name`, or `name_2`, `name_3`, … when an earlier column already took it, so
-/// a query with repeated output names keeps every column (`a.id, b.id`).
-fn unique_key(map: &serde_json::Map<String, Value>, name: &str) -> String {
-    if !map.contains_key(name) {
-        return name.to_string();
-    }
-    (2..)
-        .map(|n| format!("{name}_{n}"))
-        .find(|k| !map.contains_key(k))
-        .expect("an unused suffix exists")
+/// A result with two columns of the same name is refused, as the sqlite and
+/// mssql sources do: a record keeps only one value per field, so the other
+/// column would vanish, and a suffixed name could collide with a real column.
+fn duplicate_column(name: &str) -> FaucetError {
+    FaucetError::Source(format!(
+        "PostgreSQL query returns two columns named {name:?}; alias them \
+         (`SELECT a.{name} AS a_{name}, b.{name} AS b_{name} …`) so neither is lost"
+    ))
 }
 
 #[async_trait]
@@ -1367,13 +1372,10 @@ mod tests {
     }
 
     #[test]
-    fn unique_key_suffixes_repeated_names() {
-        let mut map = serde_json::Map::new();
-        assert_eq!(unique_key(&map, "id"), "id");
-        map.insert("id".into(), Value::Null);
-        assert_eq!(unique_key(&map, "id"), "id_2");
-        map.insert("id_2".into(), Value::Null);
-        assert_eq!(unique_key(&map, "id"), "id_3");
+    fn duplicate_column_names_are_refused_with_an_alias_hint() {
+        let err = duplicate_column("id").to_string();
+        assert!(err.contains("two columns named \"id\""), "{err}");
+        assert!(err.contains("AS a_id"), "{err}");
     }
 
     #[test]

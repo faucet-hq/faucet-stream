@@ -241,13 +241,14 @@ Columns are converted to JSON values by probing the row's value with each candid
 Types without an exact native decode are read through their text output: the
 source describes the query first and wraps it, casting only those columns. A
 trailing `;` or `--` comment is fine (the source strips the semicolon and ends the comment before wrapping); a
-query with duplicate column names, or a data-modifying `WITH` (legal only at top level), cannot be wrapped; there, a non-NULL value of
+data-modifying `WITH` (legal only at top level) cannot be wrapped; there, a non-NULL value of
 such a type fails the run with an error naming the column instead of turning
 into `null` — alias the columns or cast the value in SQL.
 
-Every output column becomes a record field. When a query repeats a column
-name (`SELECT o.id, c.id …`), the later columns get a numeric suffix — `id`,
-`id_2`, `id_3` — so no column's value is dropped; alias them for clearer names.
+Every output column becomes a record field. A query that returns two columns
+of the same name (`SELECT o.id, c.id …`) is refused with an error naming the
+column, as the sqlite and mssql sources do: a record keeps one value per field,
+so one column would be lost. Alias them (`o.id AS order_id, c.id AS customer_id`).
 
 ## Matrix-context binding
 
@@ -357,7 +358,8 @@ This crate has no optional features of its own. Enable it in the CLI or umbrella
 | `FaucetError::Config: batch_size must be …` | `batch_size` exceeds `MAX_BATCH_SIZE` (1,000,000). Lower it, or use `0` for a single un-chunked page. |
 | Run uses too much memory on a huge table | Lower `batch_size` so each page is smaller, and ensure the sink flushes per page. Avoid `batch_size: 0` for very large result sets — it materializes everything in one page. |
 | A `numeric`/`timestamp`/`uuid` arrives as a string | Intentional — these are encoded as strings to preserve exact precision / format. Cast downstream (e.g. a `cast` transform) if you need a JSON number. |
-| A run fails with "has type … which the source cannot decode" | The query has duplicate column names, so a type without a native decode could not be read as text. Alias the duplicate columns (or cast the value to `text` in SQL). |
+| A run fails with "has type … which the source cannot decode" | The query is a data-modifying `WITH`, so a type without a native decode could not be read as text. Cast the value to `text` in SQL. |
+| A run fails with "query returns two columns named …" | Two output columns share a name. Alias them so each becomes its own field. |
 | Connection-pool exhaustion under high matrix fan-out | Many matrix children share the pool. Raise `max_connections`, or lower the pipeline's `execution.max_concurrent`. |
 | Credentials appear in logs | The DSN is masked in `Debug` and stripped from the lineage URI, but never run a connector config holding a resolved secret with `FAUCET_LOG=debug` — third-party `sqlx` logging is outside faucet's redaction boundary. |
 
