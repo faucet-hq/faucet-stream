@@ -965,6 +965,10 @@ pub(crate) async fn enqueue(
             })?;
     }
 
+    // A malformed `clock` is the submission's error, not a run that fails
+    // once it is queued or claimed.
+    resolve_clock(req.clock.as_deref(), Utc::now())?;
+
     // Reserve a queue slot first, so a Fresh idempotency claim is always followed
     // by a spawned run (no orphaned claims — spec §20.2).
     if !state.registry().try_reserve() {
@@ -991,8 +995,10 @@ pub(crate) async fn enqueue(
 
     // Config fingerprint (sha256) — the idempotency identity AND the value
     // recorded on the `run.submit` audit entry (#205).
-    let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
-    let fp_config = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
+    let fp_config = idempotency::fingerprint(
+        &submitted_document(&req, state.default_base().as_ref())?,
+        loaded.cfg.name.as_deref(),
+    );
 
     // Idempotency claim (if a key was supplied).
     if let Some(key) = &req.idempotency_key {
@@ -1559,6 +1565,30 @@ fn classify_run(result: crate::error::CliResult<RunSummary>) -> Terminal {
             invs: Vec::new(),
         },
     }
+}
+
+/// The submitted document as the caller sent it, merged onto the server's
+/// default config but before any reference resolves: what an idempotency key
+/// identifies, so a retry still matches after a resolved secret rotates or a
+/// discovered dataset list changes.
+fn submitted_document(
+    req: &SubmitRequest,
+    default_base: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, ServeError> {
+    let submitted: serde_json::Value = match req.config_format {
+        ConfigFormatWire::Yaml => serde_yaml::from_str(&req.config)
+            .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
+        ConfigFormatWire::Json => serde_json::from_str(&req.config)
+            .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
+    };
+    Ok(match default_base {
+        Some(base) => {
+            let mut merged = base.clone();
+            crate::merge::merge_value(&mut merged, submitted);
+            merged
+        }
+        None => submitted,
+    })
 }
 
 /// Parse the optional request `clock` (RFC3339), defaulting to `submitted_at`.
@@ -2343,6 +2373,27 @@ mod tests {
     }
 
     #[test]
+    fn the_idempotency_document_is_the_unresolved_submission() {
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "version: 1\nname: n\npipeline:\n  source: { type: csv, config: { path: \"${env:IN}\" } }\n"
+        }))
+        .unwrap();
+        let base = serde_json::json!({"execution": {"max_concurrent": 2}});
+        let doc = submitted_document(&req, Some(&base)).unwrap();
+        assert_eq!(doc["pipeline"]["source"]["config"]["path"], "${env:IN}");
+        assert_eq!(doc["execution"]["max_concurrent"], 2);
+        let bad: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "{",
+            "config_format": "json"
+        }))
+        .unwrap();
+        assert!(matches!(
+            submitted_document(&bad, None),
+            Err(ServeError::BadConfig(_))
+        ));
+    }
+
+    #[test]
     fn resolve_clock_defaults_and_parses() {
         let default = Utc::now();
         assert_eq!(
@@ -2446,6 +2497,24 @@ mod tests {
         );
         // The reservation taken before the claim must have been released by the guard.
         assert_eq!(state.registry().queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_clock_is_refused_at_submit() {
+        let state = crate::serve::test_support::test_state();
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "version: 1\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+            "clock": "2026-10-01"
+        }))
+        .unwrap();
+        let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
+        assert!(
+            matches!(&err, ServeError::BadConfig(m) if m.contains("not RFC3339")),
+            "{err:?}"
+        );
+        assert_eq!(state.registry().queued(), 0);
+        let page = state.history().list(&Default::default()).await.unwrap();
+        assert!(page.runs.is_empty(), "no run is recorded");
     }
 
     #[tokio::test]
