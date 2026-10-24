@@ -257,6 +257,7 @@ button { font-family: inherit; }
    layout
    ========================================================================== */
 .view { display: block; }
+.view-host { display: contents; }
 .page {
   max-width: 1080px;
   margin: 0 auto;

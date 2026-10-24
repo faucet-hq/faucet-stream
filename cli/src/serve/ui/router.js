@@ -29,6 +29,13 @@ async function dispatch(container) {
     try { teardown(); } catch { /* ignore */ }
     teardown = null;
   }
+  // Each dispatch renders into its own host. A newer dispatch swaps its host
+  // in, so a superseded render that resolves late paints a detached element
+  // instead of the current page. The host is attached before rendering so
+  // views can still measure layout.
+  const host = document.createElement("div");
+  host.className = "view-host";
+  container.replaceChildren(host);
   const hash = window.location.hash || "#/runs";
   // `#/path?k=v` — the query never takes part in matching; views read it as
   // `params.query` (a URLSearchParams).
@@ -42,20 +49,21 @@ async function dispatch(container) {
       r.names.forEach((n, i) => (params[n] = decodeURIComponent(m[i + 1])));
       let td = null;
       try {
-        td = (await r.render(container, params)) || null;
+        td = (await r.render(host, params)) || null;
       } catch (e) {
         if (gen === generation) throw e;
         return;
       }
       if (gen !== generation) {
         if (td) { try { td(); } catch { /* ignore */ } }
+        host.remove();
         return;
       }
       teardown = td;
       return;
     }
   }
-  container.innerHTML = `<div class="empty">Not found</div>`;
+  host.innerHTML = `<div class="empty">Not found</div>`;
 }
 
 export function startRouter(container) {
