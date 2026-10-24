@@ -29,7 +29,9 @@ pub async fn parse_csv(
     while let Some(rec) = records.next().await {
         let rec = rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
         if has_headers && headers.is_none() {
-            headers = Some(rec.iter().map(str::to_string).collect());
+            let names: Vec<String> = rec.iter().map(str::to_string).collect();
+            check_unique_headers(&names, "CSV")?;
+            headers = Some(names);
             continue;
         }
         let mut obj = Map::new();
@@ -43,6 +45,22 @@ pub async fn parse_csv(
         out.push(Value::Object(obj));
     }
     Ok(out)
+}
+
+/// Refuse a header row that repeats a name: rows are keyed by header, so the
+/// later column would silently replace the earlier one.
+fn check_unique_headers(names: &[String], what: &str) -> Result<(), FaucetError> {
+    let mut seen = std::collections::HashMap::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        if let Some(first) = seen.insert(name.as_str(), i) {
+            let shown = if name.is_empty() { "(empty)" } else { name };
+            return Err(FaucetError::Source(format!(
+                "decode `parse`: {what} header {shown:?} repeats at columns {first} and {i}; rows \
+                 are keyed by header name, so one column would be lost — rename one of them"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parse Excel bytes into records. Requires the `excel` feature.
@@ -85,7 +103,16 @@ pub fn parse_excel(
             rows.len()
         ))
     })?;
-    let headers: Vec<String> = header.iter().map(cell_to_string).collect();
+    let headers: Vec<String> = header
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            Some(cell_to_string(cell))
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| format!("column_{i}"))
+        })
+        .collect();
+    check_unique_headers(&headers, "Excel")?;
     let mut out = Vec::new();
     for row in rows.iter().skip(header_row + 1) {
         let mut obj = Map::new();
@@ -93,7 +120,6 @@ pub fn parse_excel(
             let key = headers
                 .get(i)
                 .cloned()
-                .filter(|k| !k.is_empty())
                 .unwrap_or_else(|| format!("column_{i}"));
             obj.insert(key, cell_to_value(cell));
         }
@@ -164,6 +190,21 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "excel")]
+    #[test]
+    fn a_repeated_excel_header_is_refused() {
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        for (col, v) in ["id", "amount", "amount"].iter().enumerate() {
+            ws.write_string(0, col as u16, *v).unwrap();
+            ws.write_string(1, col as u16, "1").unwrap();
+        }
+        let err = parse_excel(&wb.save_to_buffer().unwrap(), None, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Excel header \"amount\" repeats"), "{err}");
+    }
 
     #[tokio::test]
     async fn csv_with_headers() {

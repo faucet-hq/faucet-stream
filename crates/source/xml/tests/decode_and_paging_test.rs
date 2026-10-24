@@ -529,3 +529,35 @@ fn a_step_after_parse_is_refused() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn a_repeated_csv_header_fails_instead_of_dropping_a_column() {
+    let server = MockServer::start().await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"id,amount,amount\n1,10,20\n");
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<Envelope><reportBytes>{b64}</reportBytes></Envelope>"
+        )))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            csv_parse(),
+        ]);
+    let err = XmlStream::new(config)
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("\"amount\" repeats at columns 1 and 2"),
+        "{err}"
+    );
+}
