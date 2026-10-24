@@ -278,8 +278,8 @@ pub struct StatusInputs<'a> {
     pub auth: &'a AuthCatalog,
     /// Runs from a run-history store, newest first.
     pub history: Vec<HistoryRun>,
-    /// Run ids a run-history store reports as in flight.
-    pub active_runs: Vec<String>,
+    /// Runs a run-history store reports as in flight.
+    pub active_runs: Vec<history::ActiveRun>,
 }
 
 fn latest(a: Option<RunRef>, b: Option<RunRef>) -> Option<RunRef> {
@@ -1051,8 +1051,8 @@ fn finish(mut st: RowStatus, failing: bool, inputs: &StatusInputs<'_>) -> RowSta
         }
     };
     if st.running.is_none()
-        && let Some(run) = inputs.active_runs.first()
-        && health < Health::Degraded
+        && let Some(run) = inputs.active_runs.iter().find(|r| r.may_include(&st.row))
+        && health < Health::Unknown
     {
         st.reasons.push(format!("run {run} is in flight"));
         health = Health::Running;

@@ -64,10 +64,13 @@ async fn history(
     store: &TemplateStore,
     name: &str,
     tenant: Option<&str>,
-) -> (Vec<crate::status::HistoryRun>, Vec<String>) {
+) -> CliResult<(
+    Vec<crate::status::HistoryRun>,
+    Vec<crate::status::history::ActiveRun>,
+)> {
     crate::status::history::read_scoped(store.as_ref(), name, tenant)
         .await
-        .unwrap_or_default()
+        .map_err(|e| CliError::HistoryUnavailable(format!("reading run history: {e}")))
 }
 
 /// List a registered template's rows.
@@ -84,7 +87,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
             }
             let name = pipeline_name(&doc, q.id);
             let history = if q.state {
-                history(store, &name, q.tenant.map(|t| t.id.as_str())).await
+                history(store, &name, q.tenant.map(|t| t.id.as_str())).await?
             } else {
                 Default::default()
             };
@@ -126,7 +129,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
                 None => None,
             };
             let history = if q.state {
-                history(store, &src.id(), q.tenant.map(|t| t.id.as_str())).await
+                history(store, &src.id(), q.tenant.map(|t| t.id.as_str())).await?
             } else {
                 Default::default()
             };
@@ -156,4 +159,62 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
     report.template = rec.id;
     report.version = Some(rec.version);
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::CliError;
+    use crate::serve::history::{
+        Claim, DeleteOutcome, HistoryError, ListFilter, ListPage, RunHistory, RunRecord,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct ListFails;
+
+    #[faucet_core::async_trait]
+    impl RunHistory for ListFails {
+        async fn claim_idempotency(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Duration,
+        ) -> Result<Claim, HistoryError> {
+            unreachable!("not exercised")
+        }
+        async fn upsert(&self, _: &RunRecord) -> Result<(), HistoryError> {
+            unreachable!("not exercised")
+        }
+        async fn get(&self, _: &str) -> Result<Option<RunRecord>, HistoryError> {
+            unreachable!("not exercised")
+        }
+        async fn list(&self, _: &ListFilter) -> Result<ListPage, HistoryError> {
+            Err(HistoryError::Backend("query timed out".into()))
+        }
+        async fn delete(&self, _: &str) -> Result<DeleteOutcome, HistoryError> {
+            unreachable!("not exercised")
+        }
+        async fn purge_expired(&self, _: Duration) -> Result<usize, HistoryError> {
+            unreachable!("not exercised")
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            unreachable!("not exercised")
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_run_history_is_reported_not_shown_as_never_run() {
+        let store: super::TemplateStore = Arc::new(ListFails);
+        match super::history(&store, "p", None).await {
+            Err(CliError::HistoryUnavailable(m)) => {
+                assert!(m.contains("reading run history"), "{m}");
+                assert!(m.contains("query timed out"), "{m}");
+            }
+            other => panic!("expected HistoryUnavailable, got {other:?}"),
+        }
+    }
 }

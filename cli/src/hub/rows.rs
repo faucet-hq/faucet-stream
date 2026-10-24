@@ -817,7 +817,10 @@ pub fn attach_state(report: &mut RowsReport, status: &crate::status::StatusRepor
 pub async fn read_state(
     doc: &Value,
     fallback_name: &str,
-    history: (Vec<crate::status::HistoryRun>, Vec<String>),
+    history: (
+        Vec<crate::status::HistoryRun>,
+        Vec<crate::status::history::ActiveRun>,
+    ),
     tenant: Option<&crate::tenant_tokens::TenantValues>,
 ) -> Result<crate::status::StatusReport, String> {
     let mut doc = doc.clone();
@@ -878,7 +881,10 @@ pub struct ListOptions<'a> {
     pub state: bool,
     /// Runs a run-history store recorded for the pipeline (newest first) and
     /// the ids still in flight — the status report's history input.
-    pub history: (Vec<crate::status::HistoryRun>, Vec<String>),
+    pub history: (
+        Vec<crate::status::HistoryRun>,
+        Vec<crate::status::history::ActiveRun>,
+    ),
     /// Read the state a tenant's runs keep (#709) instead of the shared one.
     pub tenant: Option<&'a crate::tenant_tokens::TenantValues>,
 }

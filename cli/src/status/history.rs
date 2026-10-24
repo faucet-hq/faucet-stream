@@ -7,14 +7,61 @@ use crate::serve::history::{ListFilter, RunHistory, RunRecord};
 /// How many recent runs to read.
 pub const HISTORY_LIMIT: usize = 200;
 
-/// Flatten run records (newest first) into per-row runs, plus the ids of the
-/// runs still in flight.
-pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<String>) {
+/// A run still in flight, with the row selection it was submitted with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveRun {
+    pub run_id: String,
+    /// `None` = every row.
+    pub selection: Option<crate::select::SelectionRequest>,
+}
+
+impl ActiveRun {
+    /// Whether the run may be running `row`. A selection that filters by tag
+    /// or status cannot be decided from the row id, so it counts as included.
+    pub fn may_include(&self, row: &str) -> bool {
+        let Some(sel) = &self.selection else {
+            return true;
+        };
+        let named = |pats: &[String]| {
+            pats.iter()
+                .any(|p| p == row || crate::select::glob_match(p, row))
+        };
+        if named(&sel.skip) {
+            return false;
+        }
+        if sel.select.is_empty() && sel.only.is_empty() {
+            return true;
+        }
+        named(&sel.select) || named(&sel.only) || !sel.tags.is_empty() || !sel.status.is_empty()
+    }
+}
+
+impl From<&str> for ActiveRun {
+    fn from(run_id: &str) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            selection: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ActiveRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.run_id)
+    }
+}
+
+/// Flatten run records (newest first) into per-row runs, plus the runs still
+/// in flight.
+pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<ActiveRun>) {
     let mut runs = Vec::new();
     let mut active = Vec::new();
     for r in records {
         if !r.status.is_terminal() {
-            active.push(r.run_id.clone());
+            active.push(ActiveRun {
+                run_id: r.run_id.clone(),
+                selection: r.selection.clone(),
+            });
             continue;
         }
         let at = r.finished_at.or(r.started_at).unwrap_or(r.submitted_at);
@@ -54,7 +101,7 @@ pub fn belongs_to(r: &RunRecord, pipeline: &str) -> bool {
 pub async fn read(
     store: &dyn RunHistory,
     pipeline: &str,
-) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
+) -> Result<(Vec<HistoryRun>, Vec<ActiveRun>), String> {
     read_scoped(store, pipeline, None).await
 }
 
@@ -64,7 +111,7 @@ pub async fn read_scoped(
     store: &dyn RunHistory,
     pipeline: &str,
     tenant: Option<&str>,
-) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
+) -> Result<(Vec<HistoryRun>, Vec<ActiveRun>), String> {
     // Page through the server's runs (newest first) until this pipeline's
     // recent history is collected: on a busy server its runs can sit far
     // behind other pipelines' (#789 CLI-167).
@@ -162,7 +209,8 @@ mod tests {
             record("r1", RunStatus::Completed, vec![inv("a", None, None)]),
         ];
         let (runs, active) = from_records(&recs);
-        assert_eq!(active, vec!["r3"]);
+        let ids: Vec<&str> = active.iter().map(|a| a.run_id.as_str()).collect();
+        assert_eq!(ids, vec!["r3"]);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].error.as_deref(), Some("boom"));
         assert_eq!(runs[1].run_id, "r1");
