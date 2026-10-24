@@ -890,12 +890,13 @@ impl SourceDriver for XmlDriver {
         )
     }
 
-    /// Stream records from the XML response without materialising the whole
-    /// document tree. The event-driven parser only builds JSON values for
-    /// elements matching [`XmlStreamConfig::records_element_path`]; other
-    /// elements are observed and discarded, so client-side memory is bounded
-    /// at `O(batch_size * record_size)` regardless of how large the document
-    /// is.
+    /// Stream records from the XML responses, one response at a time. Each
+    /// response body is read whole (bounded by the HTTP client's response cap)
+    /// and its matching records are collected before they are paged out, so
+    /// peak memory is one response plus its records — not one page. The
+    /// event-driven parser builds JSON values only for elements matching
+    /// [`XmlStreamConfig::records_element_path`]; other elements are
+    /// discarded. Pages from different responses are never held together.
     ///
     /// Records are accumulated into a buffer of
     /// [`XmlStreamConfig::batch_size`] entries and yielded as a
