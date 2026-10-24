@@ -17,6 +17,8 @@ export const can = (perm) => {
   // A tenant-scoped principal runs registered templates only: the server
   // refuses a config of its own (403), so config submit controls are hidden.
   if (perm === "config_submit") return me.permissions.includes("run_write") && !me.tenant;
+  // Every template-admin route refuses a tenant-scoped principal.
+  if (perm === "template_admin") return me.permissions.includes(perm) && !me.tenant;
   return me.permissions.includes(perm);
 };
 

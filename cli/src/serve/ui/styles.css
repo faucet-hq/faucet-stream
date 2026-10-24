@@ -1448,6 +1448,7 @@ select {
   tab-size: 2;
   white-space: pre;
 }
+.tpl-body.tpl-body-withheld { font-style: italic; white-space: normal; }
 
 .tpl-trigger {
   display: flex;

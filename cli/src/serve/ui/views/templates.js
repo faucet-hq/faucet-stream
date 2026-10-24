@@ -668,6 +668,10 @@ export async function renderTemplateDetail(container, { id, query }) {
     let seed = "";
     try {
       const rec = await api(`/v1/templates/${encodeURIComponent(id)}?version=${st.newest}`);
+      if (rec.body_withheld) {
+        toast(`v${st.newest} config is withheld: only an unscoped admin can read stored template configs`, "error");
+        return;
+      }
       seed = rec.body || "";
     } catch (e) { toast(`could not load v${st.newest} config: ${e.message}`, "error"); }
     newverHost.innerHTML = "";
@@ -954,7 +958,10 @@ function renderVersions(host, id, st, d, reload) {
       try {
         const q = clean ? `?version=${v}&clean=true` : `?version=${v}`;
         const rec = await api(`/v1/templates/${encodeURIComponent(id)}${q}`);
-        body.textContent = rec.body;
+        body.textContent = rec.body_withheld
+          ? "Config withheld: only an unscoped admin can read a template's stored config."
+          : rec.body;
+        body.classList.toggle("tpl-body-withheld", !!rec.body_withheld);
         body.dataset.mode = mode;
         body.hidden = false;
       } catch (e) {
