@@ -13023,8 +13023,7 @@
           "type": [
             "boolean",
             "string"
-          ],
-          "default": false
+          ]
         }
       },
       "additionalProperties": true
@@ -25033,7 +25032,7 @@
                       ]
                     },
                     "staging": {
-                      "description": "Staged bulk load (#528): stage each page to Azure Blob / ADLS and have\nSQL Server / Synapse pull it with `COPY INTO` instead of parameterized\n`INSERT`s. Absent ⇒ the ordinary insert path. Requires the crate's\n`staging` feature at build time to execute.",
+                      "description": "Staged bulk load (#528): stage each page to Azure Blob / ADLS and have\nSQL Server / Synapse pull it with `COPY INTO` instead of parameterized\n`INSERT`s. Absent ⇒ the ordinary insert path. Requires the crate's\n`staging` feature at build time to execute. A staged page loads whole,\nalso under a DLQ, and the sink then declares no exactly-once writes.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_mssql__MssqlStagingConfig"

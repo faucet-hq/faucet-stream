@@ -237,7 +237,7 @@ async fn an_active_run_marks_only_the_rows_it_selected_and_never_hides_unknown()
     put_outcome(store.as_ref(), "orders::a", vec![ev(60, None)]).await;
     put_outcome(store.as_ref(), "orders::b", vec![ev(60, None)]).await;
     let mut inp = inputs(&auth);
-    inp.active_runs = vec![history::ActiveRun {
+    inp.active_runs = vec![ActiveRun {
         run_id: "srv-1".into(),
         selection: Some(crate::select::SelectionRequest {
             only: vec!["a".into()],
@@ -262,11 +262,11 @@ async fn an_active_run_marks_only_the_rows_it_selected_and_never_hides_unknown()
 #[test]
 fn active_run_selection_membership() {
     use crate::select::SelectionRequest;
-    let run = |sel: SelectionRequest| history::ActiveRun {
+    let run = |sel: SelectionRequest| ActiveRun {
         run_id: "r".into(),
         selection: Some(sel),
     };
-    assert!(history::ActiveRun::from("r").may_include("x"));
+    assert!(ActiveRun::from("r").may_include("x"));
     let skip = run(SelectionRequest {
         skip: vec!["b*".into()],
         ..Default::default()
