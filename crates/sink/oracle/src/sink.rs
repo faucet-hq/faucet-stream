@@ -108,6 +108,67 @@ fn is_unique_violation(code: Option<i32>) -> bool {
     code == Some(ORA_UNIQUE_VIOLATION)
 }
 
+/// [`run_merge`] returning the rows the server rejected as `(row index,
+/// message)` while the rest apply. A rejected row is run once more, which
+/// settles a concurrent insert of the same key (ORA-00001).
+fn run_merge_partial(
+    conn: &Connection,
+    sql: &str,
+    kinds: &[BindKind],
+    rows: &[Vec<Option<String>>],
+) -> Result<Vec<(usize, String)>, FaucetError> {
+    let first = run_batch(conn, sql, kinds, rows, true)?;
+    if first.is_empty() {
+        return Ok(first);
+    }
+    let retry: Vec<Vec<Option<String>>> = first.iter().map(|(i, _)| rows[*i].clone()).collect();
+    Ok(run_batch(conn, sql, kinds, &retry, true)?
+        .into_iter()
+        .filter_map(|(offset, msg)| first.get(offset).map(|(i, _)| (*i, msg)))
+        .collect())
+}
+
+/// What a keyed page write did: rows written, upsert rows skipped under
+/// `on_unknown_field: drop`, and (per-row mode) the keys it could not apply.
+#[derive(Default)]
+struct KeyedApply {
+    affected: usize,
+    skipped: usize,
+    failed: Vec<(Option<faucet_core::KeyTuple>, String)>,
+}
+
+/// The rows an append wrote, skipped and (per-row mode) failed.
+struct AppendOutcome {
+    messages: Vec<Option<String>>,
+    skipped: usize,
+}
+
+/// The page outcome of a keyed per-row write: each row whose key `failed`
+/// names fails with that message; the rest succeed.
+fn keyed_messages(
+    records: &[Value],
+    key: &[String],
+    plan_failed: Vec<(usize, String)>,
+    failed: &[(Option<faucet_core::KeyTuple>, String)],
+) -> Vec<Option<String>> {
+    let by_key: std::collections::HashMap<String, &String> = failed
+        .iter()
+        .filter_map(|(k, m)| k.as_ref().map(|k| (faucet_core::key_to_doc_id(k, ""), m)))
+        .collect();
+    let mut out: Vec<Option<String>> = records
+        .iter()
+        .map(|r| {
+            faucet_core::write_mode::record_key(r, key)
+                .and_then(|k| by_key.get(&faucet_core::key_to_doc_id(&k, "")))
+                .map(|m| (*m).clone())
+        })
+        .collect();
+    for (idx, msg) in plan_failed {
+        out[idx] = Some(msg);
+    }
+    out
+}
+
 /// [`run_batch`] keeping the execution error, so a caller can inspect its code.
 fn execute_batch(
     conn: &Connection,
@@ -381,8 +442,9 @@ impl Inner {
         conn: &Connection,
         records: &[Value],
         partial: bool,
-    ) -> Result<Vec<Option<String>>, FaucetError> {
+    ) -> Result<AppendOutcome, FaucetError> {
         let mut outcomes = vec![None; records.len()];
+        let mut skipped = 0;
         let mut base = 0;
         for chunk in self.chunks(records) {
             let (cols, kinds, rows) = self.prepare(conn, chunk)?;
@@ -390,6 +452,7 @@ impl Inner {
                 if !self.drops_unknown() {
                     return Err(no_columns_error(self.effective().1, chunk));
                 }
+                skipped += chunk.len();
                 base += chunk.len();
                 continue;
             }
@@ -415,15 +478,25 @@ impl Inner {
             }
             base += chunk.len();
         }
-        Ok(outcomes)
+        Ok(AppendOutcome {
+            messages: outcomes,
+            skipped,
+        })
     }
 
     /// Apply a planned upsert/delete batch (no commit).
-    fn apply_plan(&self, conn: &Connection, plan: &WritePlan) -> Result<usize, FaucetError> {
+    /// In `partial` mode a row that cannot be encoded or that the server
+    /// rejects is reported by key and the rest apply.
+    fn apply_plan(
+        &self,
+        conn: &Connection,
+        plan: &WritePlan,
+        partial: bool,
+    ) -> Result<KeyedApply, FaucetError> {
         let info = self.columns(conn)?;
         let names: Vec<String> = info.iter().map(|c| c.name.clone()).collect();
         let key = &fold_names(&self.config.write.key, &names);
-        let mut affected = 0;
+        let mut out = KeyedApply::default();
         // One MERGE per set of carried columns, so an absent column is left
         // untouched rather than set to NULL (SQL-10).
         let groups = upsert_groups(&self.chunks(&plan.upserts), &insertable_names(&info));
@@ -433,17 +506,35 @@ impl Inner {
                 if !self.drops_unknown() {
                     return Err(no_columns_error(&self.target_quoted, chunk));
                 }
+                out.skipped += chunk.len();
                 continue;
             }
-            let rows = rows
-                .into_iter()
-                .map(|(i, r)| {
-                    r.map_err(|m| FaucetError::Sink(format!("oracle upsert row {i}: {m}")))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let row_key = |i: usize| faucet_core::write_mode::record_key(&chunk[i], key);
+            let mut positions = Vec::with_capacity(rows.len());
+            let mut good = Vec::with_capacity(rows.len());
+            for (i, r) in rows {
+                match r {
+                    Ok(v) => {
+                        positions.push(i);
+                        good.push(v);
+                    }
+                    Err(m) if partial => out.failed.push((row_key(i), m)),
+                    Err(m) => {
+                        return Err(FaucetError::Sink(format!("oracle upsert row {i}: {m}")));
+                    }
+                }
+            }
             let sql = merge_sql(&self.target_quoted, key, &cols)?;
-            run_merge(conn, &sql, &kinds, &rows)?;
-            affected += rows.len();
+            if partial {
+                let rejected = run_merge_partial(conn, &sql, &kinds, &good)?;
+                out.affected += good.len() - rejected.len();
+                for (offset, msg) in rejected {
+                    out.failed.push((row_key(positions[offset]), msg));
+                }
+            } else {
+                run_merge(conn, &sql, &kinds, &good)?;
+                out.affected += good.len();
+            }
         }
         if !plan.deletes.is_empty() {
             let info = self.columns(conn)?;
@@ -467,21 +558,37 @@ impl Inner {
                 self.config.batch_size
             };
             for chunk in plan.deletes.chunks(per) {
-                let rows = chunk
-                    .iter()
-                    .map(|kt| {
+                let mut positions = Vec::with_capacity(chunk.len());
+                let mut good = Vec::with_capacity(chunk.len());
+                for (i, kt) in chunk.iter().enumerate() {
+                    let encoded =
                         kt.0.iter()
                             .zip(&kinds)
                             .map(|((_, v), k)| crate::plan::value_to_text(v, *k))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|m| FaucetError::Sink(format!("oracle delete key: {m}")))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                run_batch(conn, &sql, &kinds, &rows, false)?;
-                affected += rows.len();
+                            .collect::<Result<Vec<_>, _>>();
+                    match encoded {
+                        Ok(v) => {
+                            positions.push(i);
+                            good.push(v);
+                        }
+                        Err(m) if partial => {
+                            out.failed
+                                .push((Some(kt.clone()), format!("delete key: {m}")));
+                        }
+                        Err(m) => {
+                            return Err(FaucetError::Sink(format!("oracle delete key: {m}")));
+                        }
+                    }
+                }
+                let rejected = run_batch(conn, &sql, &kinds, &good, partial)?;
+                out.affected += good.len() - rejected.len();
+                for (offset, msg) in rejected {
+                    out.failed
+                        .push((Some(chunk[positions[offset]].clone()), msg));
+                }
             }
         }
-        Ok(affected)
+        Ok(out)
     }
 
     fn drops_unknown(&self) -> bool {
@@ -681,9 +788,14 @@ impl OracleDriver {
         case_records(records, upper).into_owned()
     }
 
-    async fn write_page(&self, calls: &CallSlot, records: &[Value]) -> Result<usize, FaucetError> {
+    /// The rows written and the rows skipped under `on_unknown_field: drop`.
+    async fn write_page(
+        &self,
+        calls: &CallSlot,
+        records: &[Value],
+    ) -> Result<(usize, usize), FaucetError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let records = self.cased(records);
         self.run(calls, "write_batch", move |i| {
@@ -692,22 +804,25 @@ impl OracleDriver {
             let (records, spec) = i.fold_page(&conn, &records)?;
             if i.is_keyed() {
                 let plan = i.plan(&records, &spec)?;
-                return in_transaction(&conn, |c| i.apply_plan(c, &plan));
+                return in_transaction(&conn, |c| i.apply_plan(c, &plan, false))
+                    .map(|o| (o.affected, o.skipped));
             }
             in_transaction(&conn, |c| {
-                i.append(c, &records, false).map(|_| records.len())
+                i.append(c, &records, false)
+                    .map(|o| (records.len() - o.skipped, o.skipped))
             })
         })
         .await
     }
 
+    /// Per-row outcomes and the rows skipped under `on_unknown_field: drop`.
     async fn write_partial(
         &self,
         calls: &CallSlot,
         records: &[Value],
-    ) -> Result<Vec<RowOutcome>, FaucetError> {
+    ) -> Result<(Vec<RowOutcome>, usize), FaucetError> {
         if records.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let records = self.cased(records);
         let mode = self.inner.config.write.write_mode.as_str();
@@ -718,31 +833,33 @@ impl OracleDriver {
                 let (records, spec) = i.fold_page(&conn, &records)?;
                 if i.is_keyed() {
                     let plan = faucet_core::plan_writes(&records, &spec);
-                    in_transaction(&conn, |c| i.apply_plan(c, &plan))?;
-                    let mut out = vec![None; records.len()];
-                    for (idx, msg) in plan.failed {
-                        out[idx] = Some(msg);
-                    }
-                    return Ok(out);
+                    let applied = in_transaction(&conn, |c| i.apply_plan(c, &plan, true))?;
+                    let messages =
+                        keyed_messages(&records, &spec.key, plan.failed, &applied.failed);
+                    return Ok((messages, applied.skipped));
                 }
                 in_transaction(&conn, |c| i.append(c, &records, true))
+                    .map(|o| (o.messages, o.skipped))
             })
             .await?;
-        Ok(messages
+        let (messages, skipped) = messages;
+        let outcomes = messages
             .into_iter()
             .map(|m| match m {
                 None => Ok(()),
                 Some(msg) => Err(FaucetError::Sink(format!("oracle {mode}: {msg}"))),
             })
-            .collect())
+            .collect();
+        Ok((outcomes, skipped))
     }
 
-    /// A keyed page accepts one row per planned write and coalesces the rest.
-    fn report(&self, offered: usize, written: usize) -> WriteReport {
+    /// A keyed page accepts one row per planned write and coalesces the rest;
+    /// rows dropped under `on_unknown_field: drop` are skipped.
+    fn report(&self, offered: usize, written: usize, skipped: usize) -> WriteReport {
         if self.inner.config.write.dedups_by_key() {
-            WriteReport::keyed(offered, written)
+            WriteReport::keyed(offered - skipped, written).with_skipped(skipped)
         } else {
-            WriteReport::accepted(written)
+            WriteReport::accepted(written).with_skipped(skipped)
         }
     }
 }
@@ -815,12 +932,16 @@ impl SinkDriver for OracleDriver {
         policy: RowPolicy,
     ) -> Result<PageWrite, FaucetError> {
         match policy {
-            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
-                self.write_partial(calls, rows).await?,
-            )),
+            RowPolicy::PerRow => {
+                let (outcomes, skipped) = self.write_partial(calls, rows).await?;
+                let mut page = PageWrite::from_outcomes(outcomes);
+                page.report =
+                    WriteReport::accepted(page.report.accepted - skipped).with_skipped(skipped);
+                Ok(page)
+            }
             _ => {
-                let n = self.write_page(calls, rows).await?;
-                Ok(PageWrite::reported(self.report(rows.len(), n)))
+                let (n, skipped) = self.write_page(calls, rows).await?;
+                Ok(PageWrite::reported(self.report(rows.len(), n, skipped)))
             }
         }
     }
@@ -997,16 +1118,18 @@ impl CommitTokenDriver for OracleDriver {
                 };
                 in_transaction(&conn, |c| {
                     let n = match &plan {
-                        Some(p) => i.apply_plan(c, p)?,
-                        None if records.is_empty() => 0,
-                        None => i.append(c, &records, false).map(|_| records.len())?,
+                        Some(p) => i.apply_plan(c, p, false).map(|o| (o.affected, o.skipped))?,
+                        None if records.is_empty() => (0, 0),
+                        None => i
+                            .append(c, &records, false)
+                            .map(|o| (records.len() - o.skipped, o.skipped))?,
                     };
                     i.write_token(c, &scope, &token)?;
                     Ok(n)
                 })
             })
             .await?;
-        Ok(self.report(offered, n))
+        Ok(self.report(offered, n.0, n.1))
     }
 }
 
