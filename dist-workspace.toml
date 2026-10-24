@@ -23,9 +23,6 @@ create-release = false
 # Features to pass to cargo build. The binaries are the CLI's `full` build, like
 # the container image (#941, #845); scripts/full-feature-coverage.py enforces it.
 features = ["full"]
-# TEMPORARY (#941): build every target's archive on this PR to prove `full`
-# builds and links on all four release runners. Remove before merging.
-pr-run-mode = "upload"
 # Skip checking whether the specified configuration files are up to date
 allow-dirty = ["ci"]
 # Whether to install an updater program
