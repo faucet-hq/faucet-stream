@@ -734,11 +734,21 @@ impl XmlDriver {
         // header + cookie placements.
         let mut header_map = reqwest::header::HeaderMap::new();
         for (name, value) in self.config.headers.iter() {
-            let sv = substitute_captured(value.to_str().unwrap_or_default(), &captured);
-            match reqwest::header::HeaderValue::from_str(&sv) {
-                Ok(hv) => header_map.insert(name.clone(), hv),
-                Err(_) => header_map.insert(name.clone(), value.clone()),
-            };
+            // Only a visible-ASCII value can carry a placeholder; any other
+            // value (opaque bytes) is sent as configured.
+            let resolved = value
+                .to_str()
+                .ok()
+                .and_then(|text| {
+                    reqwest::header::HeaderValue::from_str(&substitute_captured(text, &captured))
+                        .ok()
+                })
+                .map(|mut hv| {
+                    hv.set_sensitive(value.is_sensitive());
+                    hv
+                })
+                .unwrap_or_else(|| value.clone());
+            header_map.append(name.clone(), resolved);
         }
         for (name, value) in &ra_headers {
             if let (Ok(n), Ok(v)) = (
