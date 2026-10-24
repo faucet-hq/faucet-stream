@@ -141,6 +141,10 @@ impl ConnectorScaffold {
                 contents: self.common_cargo_toml(),
             });
             files.push(GeneratedFile {
+                path: format!("{cbase}/README.md"),
+                contents: self.common_readme(),
+            });
+            files.push(GeneratedFile {
                 path: format!("{cbase}/src/lib.rs"),
                 contents: self.common_lib_rs(),
             });
@@ -553,6 +557,22 @@ rustdoc-args = ["--cfg", "docsrs"]
         )
     }
 
+    fn common_readme(&self) -> String {
+        let common = self.common_crate_name();
+        let name = &self.name;
+        format!(
+            r#"# {common}
+
+Shared config types for the {name} source/sink pair of the
+[faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Generated
+by `faucet new connector --with-common`.
+
+Put the types both connector crates need here (auth, value formats, TLS) and
+re-export them from each, so end-user imports do not change.
+"#
+        )
+    }
+
     fn common_lib_rs(&self) -> String {
         let name = &self.name;
         format!(
@@ -581,6 +601,9 @@ pub struct {prefix}Connection {{
     }
 }
 
+/// The longest crates.io keyword; the system name is the crate's first keyword.
+const MAX_NAME_LEN: usize = 20;
+
 /// Validate a connector system name: lowercase, starts with a letter, then
 /// letters/digits/hyphens (the `faucet-<kind>-<name>` convention).
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -600,6 +623,12 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     {
         return Err(format!(
             "connector name `{name}` may only contain lowercase letters, digits, and hyphens"
+        ));
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(format!(
+            "connector name `{name}` is longer than {MAX_NAME_LEN} characters, the crates.io \
+             limit for the keyword the generated crate carries"
         ));
     }
     if name.ends_with('-') || name.contains("--") {
@@ -638,6 +667,9 @@ mod tests {
         assert!(validate_name("1acme").is_err());
         assert!(validate_name("acme_widgets").is_err());
         assert!(validate_name("acme-").is_err());
+        assert!(validate_name(&"a".repeat(20)).is_ok());
+        let long = validate_name("acme-enterprise-widgets").unwrap_err();
+        assert!(long.contains("20 characters"), "{long}");
         assert!(validate_name("acme--x").is_err());
     }
 
@@ -767,5 +799,6 @@ mod tests {
         let paths: Vec<String> = s.files().into_iter().map(|f| f.path).collect();
         assert!(paths.iter().any(|p| p == "faucet-common-acme/Cargo.toml"));
         assert!(paths.iter().any(|p| p == "faucet-common-acme/src/lib.rs"));
+        assert!(paths.iter().any(|p| p == "faucet-common-acme/README.md"));
     }
 }
