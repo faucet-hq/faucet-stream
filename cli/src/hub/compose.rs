@@ -615,23 +615,15 @@ fn stream_is_incremental(source: &SourceTemplate, stream: &Stream) -> bool {
     crate::registry::source_resumes_from_bookmark(kind, &merged)
 }
 
-/// Whether any stream reads incrementally (`replication_method: Incremental`
-/// in the shared source config or a stream override) — such a stream only
-/// bookmarks across runs when the run has a state store.
+/// Whether any stream resumes from a bookmark (the registry's definition:
+/// `replication_method`, SQL `replication`, CDC, logs, file / iceberg /
+/// dynamodb modes) — such a stream only bookmarks across runs when the run has
+/// a state store.
 pub fn has_incremental_stream(source: &SourceTemplate) -> bool {
-    fn incremental(v: &Value) -> bool {
-        match v.get("replication_method") {
-            Some(Value::String(s)) => s.eq_ignore_ascii_case("incremental"),
-            Some(Value::Object(o)) => o
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|t| t.eq_ignore_ascii_case("incremental")),
-            _ => false,
-        }
-    }
-    incremental(&source.source.config)
-        || source.sources.values().any(|s| incremental(&s.config))
-        || source.streams.iter().any(|s| incremental(&s.source.config))
+    source
+        .streams
+        .iter()
+        .any(|s| stream_is_incremental(source, s))
 }
 
 impl Composition {
@@ -1458,9 +1450,22 @@ streams:
             "other".into(),
             serde_json::from_value(json!({ "type": "rest", "config": { "replication_method": { "type": "INCREMENTAL" } } })).unwrap(),
         );
+        assert!(
+            !has_incremental_stream(&s),
+            "a named source no stream reads does not count"
+        );
+        s.streams[0].source.r#ref = Some("other".into());
         assert!(has_incremental_stream(&s));
         let mut s = src();
         s.source.config = json!({ "replication_method": { "type": "FullTable" } });
         assert!(!has_incremental_stream(&s));
+        let mut s = src();
+        s.source.kind = "postgres".into();
+        s.source.config =
+            json!({ "replication": { "type": "incremental", "column": "updated_at" } });
+        assert!(has_incremental_stream(&s));
+        s.source.kind = "postgres-cdc".into();
+        s.source.config = json!({});
+        assert!(has_incremental_stream(&s));
     }
 }
