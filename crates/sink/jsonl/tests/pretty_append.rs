@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! A pretty append run repairs a torn multi-line record left by an earlier
 //! interrupted run, reading only the end of the file.
 
