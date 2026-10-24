@@ -2583,6 +2583,28 @@ schedule:
         );
     }
 
+    /// A `wasm` transform's module path is screened like any other file a
+    /// caller's config names.
+    #[cfg(feature = "transform-wasm")]
+    #[tokio::test]
+    async fn a_wasm_module_outside_the_caller_roots_is_refused() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        for path in ["/var/faucet-not-a-root/t.wasm", "/proc/self/environ"] {
+            let body = format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  transforms:\n    - {{ type: wasm, config: {{ module: \"{path}\" }} }}\n"
+            );
+            let err = load_submission(&body, ConfigFormat::Yaml, None, None, caller)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains(path)),
+                "{path}: {err:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_reconcile_probe_reading_a_protected_path_is_refused() {
         let caller = BodyOrigin::Caller {
