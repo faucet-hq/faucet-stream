@@ -395,9 +395,9 @@ README for the exact config field and feature flag.
 
 ## Platform support
 
-Every connector in the default build runs on Linux, macOS and Windows (x86_64; the
-prebuilt binaries cover all three — see
-[Installation](../getting-started/installation.md#windows-notes)), with two
+Every connector in the default build runs on Linux, macOS and Windows (x86_64).
+The prebuilt binaries cover Linux and macOS; on Windows build from source — see
+[Installation](../getting-started/installation.md#windows). Two
 exceptions on Windows:
 
 - **Kafka** (source, sink, the lineage transport and the queue-depth trigger):

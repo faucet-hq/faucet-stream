@@ -649,10 +649,8 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CallReader<R> {
         if let Some(c) = self.cancel.as_mut()
             && c.as_mut().poll(cx).is_ready()
         {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                cancelled_error("read"),
-            )));
+            // Not `Interrupted`: read_to_end / read_exact / copy retry that kind forever.
+            return Poll::Ready(Err(std::io::Error::other(cancelled_error("read"))));
         }
         if let Some(d) = self.deadline.as_mut()
             && d.as_mut().poll(cx).is_ready()
@@ -839,8 +837,13 @@ mod tests {
         let mut stalled = CallContext::new().with_cancel(cancel.clone()).reader(rx);
         cancel.cancel();
         let err = stalled.read_to_end(&mut buf).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(err.to_string().contains("cancelled"), "{err}");
+        let (_tx, rx) = tokio::io::duplex(8);
+        let mut stalled = CallContext::new().with_cancel(cancel.clone()).reader(rx);
+        let mut one = [0u8; 1];
+        let err = stalled.read_exact(&mut one).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 
     #[tokio::test]

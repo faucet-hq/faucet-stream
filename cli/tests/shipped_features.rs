@@ -1,6 +1,8 @@
 //! The prebuilt binaries' feature set (`dist-workspace.toml`) stays a real set
-//! of CLI features and matches what the installation page promises (#820).
+//! of CLI features, reaches every one of them (#941) and matches what the
+//! installation page promises (#820).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 fn repo_file(rel: &str) -> String {
@@ -41,15 +43,79 @@ fn shipped_features_are_declared_cli_features() {
     }
 }
 
-#[test]
-fn advertised_runtime_features_ship_prebuilt() {
-    let shipped = shipped();
-    for f in ["mcp", "notify", "secrets", "catalog", "serve", "templates"] {
-        assert!(
-            shipped.iter().any(|s| s == f),
-            "`{f}` is advertised but missing from the prebuilt binaries: {shipped:?}"
-        );
+/// `cli/Cargo.toml`'s `[features]` table: name → the features it enables
+/// (dependency forwards and `dep:` entries dropped).
+fn cli_features() -> BTreeMap<String, Vec<String>> {
+    let cargo = repo_file("cli/Cargo.toml");
+    let table = &cargo[cargo.find("\n[features]").expect("[features]") + 1..];
+    let mut out = BTreeMap::new();
+    let mut current: Option<(String, String)> = None;
+    for line in table.lines().skip(1) {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let (name, body) = match current.take() {
+            Some((name, mut body)) => {
+                body.push_str(line);
+                (name, body)
+            }
+            None if line.starts_with('[') => break,
+            None => match line.split_once('=') {
+                Some((name, rest)) => (name.trim().to_string(), rest.to_string()),
+                None => continue,
+            },
+        };
+        if !body.contains(']') {
+            current = Some((name, body));
+            continue;
+        }
+        let inner = &body[body.find('[').expect("[") + 1..body.rfind(']').expect("]")];
+        let enables = inner
+            .split(',')
+            .map(|e| e.trim().trim_matches('"').to_string())
+            .filter(|e| !e.is_empty() && !e.contains('/') && !e.starts_with("dep:"))
+            .collect();
+        out.insert(name, enables);
     }
+    out
+}
+
+fn reachable(features: &BTreeMap<String, Vec<String>>, roots: &[String]) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<String> = roots.to_vec();
+    while let Some(name) = stack.pop() {
+        if let Some(enables) = features.get(&name)
+            && seen.insert(name)
+        {
+            stack.extend(enables.iter().cloned());
+        }
+    }
+    seen
+}
+
+#[test]
+fn every_cli_feature_ships_prebuilt() {
+    let features = cli_features();
+    assert!(
+        features.len() > 50,
+        "parsed only {} features",
+        features.len()
+    );
+    // cargo-dist builds the default features on top of the listed ones.
+    let mut roots = shipped();
+    roots.push("default".to_string());
+    let shipped = reachable(&features, &roots);
+    let missing: Vec<_> = features.keys().filter(|f| !shipped.contains(*f)).collect();
+    assert!(
+        missing.is_empty(),
+        "the prebuilt binaries miss CLI features: {missing:?}"
+    );
+}
+
+#[test]
+fn the_feature_walk_reports_what_a_hand_picked_set_misses() {
+    let features = cli_features();
+    let picked = reachable(&features, &["serve".to_string(), "mcp".to_string()]);
+    assert!(picked.contains("serve") && picked.contains("mcp"));
+    assert!(!picked.contains("triggers") && !picked.contains("source-oracle"));
 }
 
 #[test]

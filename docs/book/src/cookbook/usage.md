@@ -48,8 +48,8 @@ A run that was rate limited appends what it cost in time:
 and a `faucet serve` run record does the same under each invocation.
 
 `faucet usage` aggregates what the catalog store holds. It is part of the
-`catalog` build feature, which the prebuilt binaries and the default
-`cargo install faucet-cli` leave out — install with
+`catalog` build feature. The prebuilt binaries include it; the default
+`cargo install faucet-cli` leaves it out — install with
 `cargo install faucet-cli --features catalog` (or `full`) to get it:
 
 ```bash

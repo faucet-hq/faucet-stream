@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Fail when a cargo feature is left out of `full`, or the image drifts from it (#845).
+"""Fail when a cargo feature is left out of `full`, or a shipped build drifts from it.
 
 The published `full` container image is built from the Dockerfile's
-`DEFAULT_FEATURES`, which must be exactly the CLI's `full` feature. `full` in
+`DEFAULT_FEATURES` (#845), and the prebuilt installer / Homebrew binaries from
+`dist-workspace.toml`'s `features` (#941); both must be exactly the CLI's
+`full` feature. `full` in
 turn must reach every feature the CLI manifest declares, so "full" never quietly
 means "most". The umbrella `faucet-stream` crate's `full` gets the same check,
 minus `default` and the per-transform `transform-*` features, which are subsets
@@ -22,6 +24,7 @@ CHECKS = (
     ("faucet-stream/Cargo.toml", ("default", "transform-*")),
 )
 DOCKERFILE = "Dockerfile"
+DIST = "dist-workspace.toml"
 # Features left out of the docs.rs build: their native builds (bundled DuckDB,
 # librdkafka, Oracle) overran the docs.rs sandbox (#794).
 DOCS_RS_EXCLUDED = {
@@ -92,6 +95,10 @@ def dockerfile_default_features(text):
     return found.group(1) if found else None
 
 
+def dist_features(text):
+    return tomllib.loads(text).get("dist", {}).get("features")
+
+
 def main():
     failed = False
     for path, exemptions in CHECKS:
@@ -118,9 +125,15 @@ def main():
         failed = True
         print(f'{DOCKERFILE}: ARG DEFAULT_FEATURES must be "full", found {image!r}.')
         print("  The complete image is the CLI's `full` feature; extend `full` instead.")
+    with open(DIST, "rb") as f:
+        binaries = dist_features(f.read().decode())
+    if binaries != ["full"]:
+        failed = True
+        print(f'{DIST}: [dist] features must be ["full"], found {binaries!r}.')
+        print("  The prebuilt binaries are the CLI's `full` feature; extend `full` instead.")
     if failed:
         return 1
-    print("full-feature-coverage: `full` enables every feature and the image builds it")
+    print("full-feature-coverage: `full` enables every feature; the image and binaries build it")
     return 0
 
 

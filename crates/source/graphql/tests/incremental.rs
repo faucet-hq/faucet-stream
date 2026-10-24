@@ -3,95 +3,17 @@
 //! cursor paging. The first run reads everything and stores a bookmark; the
 //! second binds the bookmark into the variable and gets only newer rows.
 
+mod support;
+
 use faucet_conformance::doubles::TestSink;
 use faucet_core::{MemoryStateStore, Pipeline, Source, StateStore};
-use faucet_source_graphql::config::{GraphqlPagination, GraphqlReplicationBind};
 use faucet_source_graphql::{GraphqlStream, GraphqlStreamConfig};
 use futures::StreamExt;
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use support::{Api, config, rows};
 use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-const QUERY: &str = "query($after: String, $first: Int, $filter: OrderFilter) { \
-    orders(first: $first, after: $after, filter: $filter) { \
-    edges { node { id updatedAt } } pageInfo { hasNextPage endCursor } } }";
-
-#[derive(Clone, Default)]
-struct Api {
-    rows: Arc<Mutex<Vec<(u64, String)>>>,
-    filters: Arc<Mutex<Vec<Value>>>,
-    /// Ignore the filter and return every row (a server that drops the bind).
-    ignore_filter: bool,
-}
-
-impl wiremock::Respond for Api {
-    fn respond(&self, req: &Request) -> ResponseTemplate {
-        let body: Value = serde_json::from_slice(&req.body).unwrap();
-        let vars = &body["variables"];
-        let filter = vars
-            .pointer("/filter/query")
-            .cloned()
-            .unwrap_or(Value::Null);
-        self.filters.lock().unwrap().push(filter.clone());
-        let since = filter
-            .as_str()
-            .and_then(|q| q.strip_prefix("updated_at:>"))
-            .unwrap_or("")
-            .to_string();
-        let after: usize = vars["after"].as_str().map_or(0, |c| c.parse().unwrap());
-        let first = vars["first"].as_u64().unwrap() as usize;
-        let rows: Vec<(u64, String)> = self
-            .rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, u)| self.ignore_filter || u.as_str() > since.as_str())
-            .cloned()
-            .collect();
-        let page: Vec<Value> = rows
-            .iter()
-            .skip(after)
-            .take(first)
-            .map(|(id, u)| json!({ "node": { "id": id, "updatedAt": u } }))
-            .collect();
-        let end = after + page.len();
-        ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "orders": {
-                "edges": page,
-                "pageInfo": { "hasNextPage": end < rows.len(), "endCursor": end.to_string() }
-            } }
-        }))
-    }
-}
-
-fn config(server: &MockServer) -> GraphqlStreamConfig {
-    let mut c = GraphqlStreamConfig::new(server.uri(), QUERY)
-        .records_path("$.data.orders.edges[*].node")
-        .variables(json!({ "filter": { "query": "updated_at:>2000-01-01T00:00:00Z" } }))
-        .pagination(GraphqlPagination {
-            has_next_page_path: "$.data.orders.pageInfo.hasNextPage".into(),
-            cursor_path: "$.data.orders.pageInfo.endCursor".into(),
-            cursor_variable: "after".into(),
-            page_size_variable: "first".into(),
-        })
-        .with_batch_size(2);
-    c.replication_method = faucet_core::ReplicationMethod::Incremental;
-    c.replication_key = Some("updatedAt".into());
-    c.replication_bind = Some(GraphqlReplicationBind {
-        variable: "/filter/query".into(),
-        template: "updated_at:>${bookmark}".into(),
-        format: faucet_core::BindFormat::Iso8601,
-        value_type: faucet_core::BindValueType::String,
-    });
-    c
-}
-
-fn rows(n: u64) -> Vec<(u64, String)> {
-    (1..=n)
-        .map(|i| (i, format!("2026-01-0{i}T00:00:00Z")))
-        .collect()
-}
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn second_run_binds_the_stored_bookmark_and_reads_only_newer_rows() {
@@ -307,57 +229,4 @@ async fn a_truncated_run_advances_the_bookmark_only_for_ordered_results() {
             .expect("a bookmark is emitted");
         assert_eq!(last, expected, "ordered = {ordered}");
     }
-}
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Captured;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// Holding the bookmark back on a truncated unordered run says why.
-#[tokio::test(flavor = "current_thread")]
-async fn a_truncated_unordered_run_warns_that_the_bookmark_is_held() {
-    let logs = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let server = MockServer::start().await;
-    let api = Api::default();
-    *api.rows.lock().unwrap() = vec![
-        (1, "2026-01-09T00:00:00Z".into()),
-        (2, "2026-01-02T00:00:00Z".into()),
-        (3, "2026-01-03T00:00:00Z".into()),
-    ];
-    Mock::given(method("POST"))
-        .respond_with(api.clone())
-        .mount(&server)
-        .await;
-    let start = json!("2026-01-01T00:00:00Z");
-    let source = GraphqlStream::new(config(&server).max_pages(1));
-    source.apply_start_bookmark(start.clone()).await.unwrap();
-    let ctx = std::collections::HashMap::new();
-    let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
-    let last = pages.into_iter().filter_map(|p| p.unwrap().bookmark).last();
-    assert_eq!(last, Some(start));
-    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    assert!(text.contains("bookmark is not advanced"), "{text}");
 }
