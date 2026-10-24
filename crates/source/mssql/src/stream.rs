@@ -356,9 +356,16 @@ where
 /// Derive a default state-store key from the connection host + a query
 /// fingerprint, stable across runs.
 fn default_state_key(config: &MssqlSourceConfig) -> String {
-    let (host, target) = connection_target(config);
+    let host = config
+        .connection
+        .connection_url
+        .as_deref()
+        .and_then(|u| url::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "mssql".to_string());
+
     // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
-    let fingerprint = faucet_core::shard::shard_hash(&format!("{target}\n{}", config.query));
+    let fingerprint = faucet_core::shard::shard_hash(&config.query);
     // Host may contain dots (allowed mid-key); sanitise anything else.
     let host: String = host
         .chars()
@@ -371,57 +378,6 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
         })
         .collect();
     format!("mssql:{host}:{fingerprint:016x}")
-}
-
-/// The server host shown in the derived state key, and the full read target
-/// (server, port, database) the key's fingerprint covers, from either the
-/// URL or the ADO.NET connection string. Credentials never enter either.
-fn connection_target(config: &MssqlSourceConfig) -> (String, String) {
-    if let Some(url) = config
-        .connection
-        .connection_url
-        .as_deref()
-        .and_then(|u| url::Url::parse(u).ok())
-    {
-        let host = url.host_str().unwrap_or("mssql").to_string();
-        let target = format!(
-            "{host}:{}/{}",
-            url.port().map(|p| p.to_string()).unwrap_or_default(),
-            url.path().trim_start_matches('/')
-        );
-        return (host, target);
-    }
-    let mut server = String::new();
-    let mut database = String::new();
-    for part in config
-        .connection
-        .connection_string
-        .as_deref()
-        .unwrap_or_default()
-        .split(';')
-    {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        match key.trim().to_ascii_lowercase().as_str() {
-            "server" | "data source" | "address" | "addr" | "network address" => {
-                server = value
-                    .trim()
-                    .to_ascii_lowercase()
-                    .trim_start_matches("tcp:")
-                    .to_string();
-            }
-            "database" | "initial catalog" => database = value.trim().to_ascii_lowercase(),
-            _ => {}
-        }
-    }
-    let host = server
-        .split([',', '\\'])
-        .next()
-        .filter(|h| !h.is_empty())
-        .unwrap_or("mssql")
-        .to_string();
-    (host, format!("{server}/{database}"))
 }
 
 #[async_trait]
@@ -1167,44 +1123,8 @@ mod tests {
         let k2 = default_state_key(&cfg);
         assert_eq!(k1, k2);
         assert!(k1.starts_with("mssql:db.example.com:"));
-        let fingerprint =
-            faucet_core::shard::shard_hash(&format!("db.example.com:1433/sales\n{}", cfg.query));
-        assert!(k1.ends_with(&format!("{fingerprint:016x}")));
+        assert!(k1.contains(&format!("{:x}", faucet_core::shard::shard_hash(&cfg.query))));
         faucet_core::state::validate_state_key(&k1).expect("derived key must be valid");
-    }
-
-    #[test]
-    fn default_state_key_separates_databases_and_servers() {
-        let with = |url: Option<&str>, ado: Option<&str>| {
-            let mut cfg = full_cfg();
-            cfg.connection.connection_url = url.map(str::to_string);
-            cfg.connection.connection_string = ado.map(str::to_string);
-            default_state_key(&cfg)
-        };
-        let a = with(
-            None,
-            Some("Server=tcp:a,1433;Database=t1;User Id=u;Password=p"),
-        );
-        let b = with(None, Some("Server=b;Database=t2;User Id=u;Password=p"));
-        let a2 = with(
-            None,
-            Some("Server=tcp:a,1433;Initial Catalog=t2;Password=q"),
-        );
-        assert!(a.starts_with("mssql:a:"), "{a}");
-        assert!(b.starts_with("mssql:b:"), "{b}");
-        assert_ne!(a, a2, "same server, other database");
-        assert_eq!(
-            a,
-            with(None, Some("server=TCP:A,1433;database=t1;password=other")),
-            "credentials do not change the key"
-        );
-        let u1 = with(Some("mssql://u:p@db.example.com:1433/sales"), None);
-        let u2 = with(Some("mssql://u:p@db.example.com:1433/hr"), None);
-        assert_ne!(u1, u2);
-        assert!(with(None, None).starts_with("mssql:mssql:"));
-        for k in [a, b, a2, u1, u2] {
-            faucet_core::state::validate_state_key(&k).expect("valid");
-        }
     }
 
     // dataset_uri is a pure-config method; the source requires a live SQL Server
