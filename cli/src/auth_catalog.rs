@@ -25,6 +25,7 @@ pub fn build_auth_catalog(specs: Option<&HashMap<String, Value>>) -> CliResult<A
         return Ok(catalog);
     };
     for (name, spec) in specs {
+        let spec = &crate::interpolate::unescaped(spec.clone());
         register_key_material(spec);
         let provider =
             faucet_auth::build_provider(spec).map_err(|e| CliError::AuthProviderBuild {
@@ -217,6 +218,25 @@ mod tests {
         assert!(resolve(&catalog, "tok").is_ok());
         let err = resolve(&catalog, "missing").unwrap_err();
         assert!(matches!(err, CliError::UnknownAuthProvider { .. }));
+    }
+
+    #[tokio::test]
+    async fn escaped_token_is_built_literal() {
+        let mut specs = HashMap::new();
+        specs.insert(
+            "tok".to_string(),
+            serde_json::json!({"type": "static", "config": {"token": "$${vars.literal}"}}),
+        );
+        let catalog = build_auth_catalog(Some(&specs)).unwrap();
+        let cred = resolve(&catalog, "tok")
+            .unwrap()
+            .credential()
+            .await
+            .unwrap();
+        assert_eq!(
+            cred.authorization_value().as_deref(),
+            Some("Bearer ${vars.literal}")
+        );
     }
 
     #[test]
