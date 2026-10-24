@@ -163,3 +163,63 @@ async fn conformance_driver_truthful() {
     sink.flush().await.expect("flush");
     assert_eq!(capture.line_count(), 12);
 }
+
+/// A writer whose flush reports a closed pipe.
+struct ClosedOnFlush;
+
+impl AsyncWrite for ClosedOnFlush {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A pipe the consumer closed ends output cleanly at flush too.
+#[tokio::test]
+async fn a_closed_pipe_at_flush_is_clean_termination() {
+    let sink = StdoutSink::with_writer(StdoutSinkConfig::new(), Box::new(ClosedOnFlush));
+    sink.write_batch(&[serde_json::json!({"id": 1})])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    sink.flush().await.unwrap();
+    let mut per_record = StdoutSinkConfig::new();
+    per_record.flush_per_record = true;
+    let sink = StdoutSink::with_writer(per_record, Box::new(ClosedOnFlush));
+    let report = sink
+        .write_batch_reported(&[serde_json::json!({"id": 1}), serde_json::json!({"id": 2})])
+        .await
+        .unwrap();
+    assert_eq!((report.accepted, report.skipped), (0, 2), "{report:?}");
+}
+
+/// In TSV, a non-object record fails alone on the per-row path; the
+/// whole-page path refuses the page before printing anything.
+#[tokio::test]
+async fn a_non_object_tsv_record_fails_alone_or_prints_nothing() {
+    let rows = [
+        serde_json::json!({"a": 1}),
+        serde_json::json!(7),
+        serde_json::json!({"a": 3}),
+    ];
+    let capture = CaptureWriter::default();
+    let config = StdoutSinkConfig::new().format(faucet_sink_stdout::StdoutFormat::Tsv);
+    let sink = StdoutSink::with_writer(config.clone(), Box::new(capture.clone()));
+    let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+    assert_eq!(capture.line_count(), 2);
+
+    let capture = CaptureWriter::default();
+    let sink = StdoutSink::with_writer(config, Box::new(capture.clone()));
+    assert!(sink.write_batch(&rows).await.is_err());
+    assert_eq!(capture.line_count(), 0);
+}

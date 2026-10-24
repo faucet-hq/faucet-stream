@@ -182,21 +182,29 @@ impl SinkDriver for StdoutDriver {
         &self,
         _calls: &CallSlot,
         records: &[Value],
-        _policy: RowPolicy,
+        policy: RowPolicy,
     ) -> Result<PageWrite, FaucetError> {
-        let n = self.write_records(records).await?;
-        Ok(PageWrite::reported(
-            faucet_core::WriteReport::accepted(n).with_skipped(records.len().saturating_sub(n)),
-        ))
+        let (n, failed) = self.write_records(records, policy).await?;
+        let skipped = records.len().saturating_sub(n + failed.len());
+        Ok(
+            PageWrite::reported(faucet_core::WriteReport::accepted(n).with_skipped(skipped))
+                .with_failures(failed),
+        )
     }
 
+    /// A consumer that closed the pipe ends output cleanly, here as on write.
     async fn flush(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
         let mut state = self.state.lock().await;
-        state
-            .writer
-            .flush()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))
+        if state.closed {
+            return Ok(());
+        }
+        match state.writer.flush().await {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                state.closed = true;
+                Ok(())
+            }
+            other => other.map_err(|e| FaucetError::Sink(format!("flush failed: {e}"))),
+        }
     }
 
     /// Preflight probe for `faucet doctor`. The standard streams are always
@@ -216,14 +224,21 @@ impl SinkDriver for StdoutDriver {
 }
 
 impl StdoutDriver {
-    async fn write_records(&self, records: &[Value]) -> Result<usize, FaucetError> {
+    /// The rows written and, per row, those that could not be encoded. A
+    /// whole-page write encodes every row before printing any, so a bad row
+    /// fails the page without having printed the rows before it.
+    async fn write_records(
+        &self,
+        records: &[Value],
+        policy: RowPolicy,
+    ) -> Result<(usize, Vec<(usize, FaucetError)>), FaucetError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let mut state = self.state.lock().await;
         if state.closed {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let remaining = match self.config.max_records {
@@ -231,33 +246,40 @@ impl StdoutDriver {
             None => usize::MAX,
         };
         if remaining == 0 {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
-        let take = records.len().min(remaining);
+        let mut failed = Vec::new();
+        let mut encoded = Vec::with_capacity(records.len().min(remaining));
+        for (i, record) in records.iter().enumerate() {
+            if encoded.len() == remaining {
+                break;
+            }
+            match self.encode(record) {
+                Ok(bytes) => encoded.push(bytes),
+                Err(e) if policy == RowPolicy::PerRow => failed.push((i, e)),
+                Err(e) => return Err(e),
+            }
+        }
         let mut written_this_call = 0usize;
-        for record in records.iter().take(take) {
-            let bytes = self.encode(record)?;
-            match state.writer.write_all(&bytes).await {
+        for bytes in encoded {
+            let mut wrote = state.writer.write_all(&bytes).await;
+            if wrote.is_ok() && self.config.flush_per_record {
+                wrote = state.writer.flush().await;
+            }
+            match wrote {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                     state.closed = true;
                     tracing::debug!("stdout consumer closed pipe; stopping writes");
-                    return Ok(written_this_call);
+                    return Ok((written_this_call, failed));
                 }
                 Err(e) => return Err(FaucetError::Sink(format!("write failed: {e}"))),
-            }
-            if self.config.flush_per_record {
-                state
-                    .writer
-                    .flush()
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))?;
             }
             state.written += 1;
             written_this_call += 1;
         }
-        Ok(written_this_call)
+        Ok((written_this_call, failed))
     }
 }
 
