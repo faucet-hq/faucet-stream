@@ -66,7 +66,7 @@ async fn history(
     tenant: Option<&str>,
 ) -> CliResult<(
     Vec<crate::status::HistoryRun>,
-    Vec<crate::status::history::ActiveRun>,
+    Vec<crate::status::ActiveRun>,
 )> {
     crate::status::history::read_scoped(store.as_ref(), name, tenant)
         .await

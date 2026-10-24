@@ -5,9 +5,12 @@
 //! running anything. Every field is read independently: an unreadable one is
 //! reported on its row, never failing the whole command.
 
+pub mod active;
 pub mod dlq;
 #[cfg(feature = "serve")]
 pub mod history;
+
+pub use active::ActiveRun;
 pub mod render;
 
 use crate::auth_catalog::AuthCatalog;
@@ -279,7 +282,7 @@ pub struct StatusInputs<'a> {
     /// Runs from a run-history store, newest first.
     pub history: Vec<HistoryRun>,
     /// Runs a run-history store reports as in flight.
-    pub active_runs: Vec<history::ActiveRun>,
+    pub active_runs: Vec<ActiveRun>,
 }
 
 fn latest(a: Option<RunRef>, b: Option<RunRef>) -> Option<RunRef> {

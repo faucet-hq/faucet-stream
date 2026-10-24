@@ -819,7 +819,7 @@ pub async fn read_state(
     fallback_name: &str,
     history: (
         Vec<crate::status::HistoryRun>,
-        Vec<crate::status::history::ActiveRun>,
+        Vec<crate::status::ActiveRun>,
     ),
     tenant: Option<&crate::tenant_tokens::TenantValues>,
 ) -> Result<crate::status::StatusReport, String> {
@@ -883,7 +883,7 @@ pub struct ListOptions<'a> {
     /// the ids still in flight — the status report's history input.
     pub history: (
         Vec<crate::status::HistoryRun>,
-        Vec<crate::status::history::ActiveRun>,
+        Vec<crate::status::ActiveRun>,
     ),
     /// Read the state a tenant's runs keep (#709) instead of the shared one.
     pub tenant: Option<&'a crate::tenant_tokens::TenantValues>,
