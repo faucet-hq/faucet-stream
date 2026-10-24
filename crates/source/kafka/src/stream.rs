@@ -726,10 +726,6 @@ impl Source for KafkaSource {
 
             tokio::select! {
                 biased;
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("kafka source: ctrl_c received, stopping cleanly");
-                    break;
-                }
                 end = call_end(&calls) => return Err(end),
                 recv = tokio::time::timeout(poll_budget, self.consumer.recv()) => {
                     match recv {
@@ -870,10 +866,6 @@ impl Source for KafkaSource {
                 let mut fatal: Option<FaucetError> = None;
                 tokio::select! {
                     biased;
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("kafka source: ctrl_c received, stopping cleanly");
-                        stop = true;
-                    }
                     // The run's deadline and cancel token end the stream with
                     // an error (#880); the pipeline has already stopped reading.
                     end = call_end(&calls) => fatal = Some(end),

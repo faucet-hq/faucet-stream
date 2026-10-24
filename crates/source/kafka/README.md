@@ -13,7 +13,7 @@ Reach for it when you want to land a Kafka topic into any faucet-stream sink —
 
 - **Native streaming** — overrides `Source::stream_pages`, draining the consumer into `batch_size`-sized pages so memory stays `O(batch_size)` no matter the topic volume; the sink writes (and the bookmark advances) incrementally rather than once at the end of the run.
 - **Durable offset resume** — persists a per-partition offset bookmark through any `StateStore` (file, memory, Redis, Postgres). On restart the bookmark seeds the partition assignment *before* the first poll, so a resume never produces a duplicate or skips a record.
-- **Two stop conditions** — `max_messages` and/or `idle_timeout`; the loop exits on whichever fires first (at least one is required). `Ctrl+C` exits cleanly, persisting everything consumed so far.
+- **Two stop conditions** — `max_messages` and/or `idle_timeout`; the loop exits on whichever fires first (at least one is required). A run cancelled by its runtime (Ctrl+C on `faucet run`, a serve cancel) stops at the next page boundary and keeps everything already written.
 - **Five authentication modes** — plaintext, SASL/PLAIN, SASL/SCRAM (SHA-256 / SHA-512), SSL client certificates, and SASL+SSL — via the shared `KafkaAuth` enum from [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka).
 - **Six value formats** — JSON, raw string, raw bytes (base64), plus Confluent Avro / Protobuf / JSON Schema behind the `schema-registry` feature.
 - **Structured records** — each message becomes a JSON object with `key`, `value`, `topic`, `partition`, `offset`, `timestamp`, and `headers`.
@@ -283,7 +283,7 @@ The source overrides `Source::stream_pages`. Messages drained from the `StreamCo
 
 1. **The buffer reaches `batch_size`** — yield a full page, reset the buffer, keep polling.
 2. **The idle window flushes a partial buffer** — when the `idle_timeout` deadline fires with a non-empty buffer, emit it as a trailing page and continue.
-3. **`max_messages` is reached or `Ctrl+C` is received** — emit the final partial page (if any) and exit.
+3. **`max_messages` is reached** — emit the final partial page (if any) and exit. A cancelled run (Ctrl+C on `faucet run`, a serve cancel) ends through the run's cancellation instead.
 
 Each emitted page carries a snapshot of the cumulative `(topic, partition) → next_offset` bookmark. The pipeline persists it through the configured `StateStore` **after** the sink confirms the write, so memory is bounded at one page and a crash between pages re-reads only the uncommitted page on resume.
 
@@ -441,7 +441,7 @@ For durable resume and incremental sink writes, drive it through `faucet_core::P
 
 1. `new()` validates the config, builds the state key, and constructs the `StreamConsumer` **once** with the resolved librdkafka client config (auth + typed fields + `extra_client_config` overrides).
 2. A rebalance callback seeds the partition assignment with bookmarked offsets before the first poll.
-3. The consume loop polls with `poll_timeout`, decodes each message per `value_format` / `key_format`, and buffers it; it exits on `max_messages`, `idle_timeout`, or SIGINT.
+3. The consume loop polls with `poll_timeout`, decodes each message per `value_format` / `key_format`, and buffers it; it exits on `max_messages`, `idle_timeout`, or the run's cancellation.
 4. Decoded messages are framed into `batch_size` pages and streamed to the pipeline, each page carrying the cumulative offset bookmark.
 
 The v1 consume loop is single-threaded — one task polls one `StreamConsumer`. For higher throughput, partition the topic and run multiple `faucet` instances with the same `group_id`; Kafka assigns disjoint partition sets and they scale linearly. The downstream sink (database writes, object-store uploads) is usually the bottleneck, not the consume loop.
