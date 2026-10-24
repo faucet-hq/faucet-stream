@@ -75,6 +75,7 @@ docs/superpowers/
 !/scripts/test_example_coverage.py
 !/scripts/plugin-version.py
 !/scripts/test_plugin_version.py
+!/scripts/test_console_secret_field.py
 !/scripts/conformance-coverage.py
 !/scripts/test_conformance_coverage.py
 !/scripts/fidelity-coverage.py

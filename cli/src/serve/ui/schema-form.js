@@ -5,6 +5,7 @@
 // back to a raw-JSON textarea so no config is ever unreachable.
 
 import { escapeHtml, mdInline } from "./utils.js";
+import { isSecretField } from "./secret-field.js";
 
 function resolveRef(schema, root) {
   if (schema && schema.$ref) {
@@ -216,15 +217,15 @@ function buildNumber(schema, value, type, desc) {
   return withHelp(inp, desc, () => (inp.value === "" ? undefined : Number(inp.value)));
 }
 
-const SECRET_FIELD = /password|passwd|secret|token|credential|(^|_)(api|access|private|signing|account)_?key$/i;
-
-export function isSecretField(name, title) {
-  return SECRET_FIELD.test(name || "") || SECRET_FIELD.test(title || "");
-}
-
 function buildString(schema, value, desc, name) {
   const inp = document.createElement("input");
-  inp.type = isSecretField(name, schema.title) ? "password" : "text";
+  if (isSecretField(name, schema.title)) {
+    inp.type = "password";
+    // Keeps browsers from saving or autofilling a login password here.
+    inp.autocomplete = "new-password";
+  } else {
+    inp.type = "text";
+  }
   if (value !== undefined) inp.value = value;
   else if (schema.default !== undefined) inp.value = schema.default;
   if (schema.description) inp.placeholder = plain(firstSentence(schema.description));
