@@ -602,7 +602,7 @@ fn check_schema(
     key: &str,
 ) -> Result<(), FaucetError> {
     match reference {
-        Some(first) if first != schema => Err(FaucetError::Source(format!(
+        Some(first) if first.fields() != schema.fields() => Err(FaucetError::Source(format!(
             "GCS source: parquet schema mismatch — object '{key}' diverges from the first \
              object's schema"
         ))),
