@@ -228,11 +228,13 @@ pub(crate) fn unmatched_row_error(index: usize) -> FaucetError {
 /// `insertable` is the set of writable table columns (IDENTITY columns already
 /// excluded), in table order. The column list is the insertable columns present
 /// in the first record. Record keys that match no insertable column are
-/// "unknown" and handled per `on_unknown`.
+/// "unknown" and handled per `on_unknown`; under `Warn` the warning is logged
+/// only the first time unknown keys are seen (`warned` records that).
 pub(crate) fn resolve_insert_columns(
     insertable: &[String],
     records: &[Value],
     on_unknown: OnUnknownField,
+    warned: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<String>, FaucetError> {
     let insertable_set: std::collections::HashSet<&str> =
         insertable.iter().map(|s| s.as_str()).collect();
@@ -256,10 +258,12 @@ pub(crate) fn resolve_insert_columns(
                 )));
             }
             OnUnknownField::Warn => {
-                tracing::warn!(
-                    ?unknown,
-                    "auto_columns: dropping record keys with no matching column"
-                );
+                if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        ?unknown,
+                        "auto_columns: dropping record keys with no matching column"
+                    );
+                }
             }
             OnUnknownField::Drop => {}
         }
@@ -544,11 +548,52 @@ mod tests {
         );
     }
 
+    fn unwarned() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
+    #[test]
+    fn the_unknown_field_warning_waits_for_a_chunk_with_unknown_keys() {
+        use std::sync::atomic::Ordering;
+        let insertable = vec!["id".to_string()];
+        let warned = unwarned();
+        // A chunk that matches the table does not use up the one warning.
+        resolve_insert_columns(
+            &insertable,
+            &[json!({"id": 1})],
+            OnUnknownField::Warn,
+            &warned,
+        )
+        .unwrap();
+        assert!(!warned.load(Ordering::Relaxed));
+        // The first chunk with an unknown key logs it.
+        let cols = resolve_insert_columns(
+            &insertable,
+            &[json!({"id": 2, "discount": 5})],
+            OnUnknownField::Warn,
+            &warned,
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["id".to_string()]);
+        assert!(warned.load(Ordering::Relaxed));
+        // `drop` and `error` never log.
+        let quiet = unwarned();
+        resolve_insert_columns(
+            &insertable,
+            &[json!({"x": 1})],
+            OnUnknownField::Drop,
+            &quiet,
+        )
+        .unwrap();
+        assert!(!quiet.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn resolve_columns_fixes_from_first_record() {
         let insertable = vec!["id".to_string(), "name".to_string(), "age".to_string()];
         let records = vec![json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})];
-        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn).unwrap();
+        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn, &unwarned())
+            .unwrap();
         assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
     }
 
@@ -556,9 +601,15 @@ mod tests {
     fn resolve_columns_errors_on_unknown_when_configured() {
         let insertable = vec!["id".to_string()];
         let records = vec![json!({"id": 1, "extra": "x"})];
-        assert!(resolve_insert_columns(&insertable, &records, OnUnknownField::Error).is_err());
+        assert!(
+            resolve_insert_columns(&insertable, &records, OnUnknownField::Error, &unwarned())
+                .is_err()
+        );
         // Warn/Drop tolerate it.
-        assert!(resolve_insert_columns(&insertable, &records, OnUnknownField::Drop).is_ok());
+        assert!(
+            resolve_insert_columns(&insertable, &records, OnUnknownField::Drop, &unwarned())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -572,7 +623,8 @@ mod tests {
             json!({ "id": 1 }),
             json!({ "id": 2, "name": "b", "email": "x@y" }),
         ];
-        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn).unwrap();
+        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn, &unwarned())
+            .unwrap();
         assert_eq!(
             cols,
             vec!["id".to_string(), "name".to_string(), "email".to_string()],

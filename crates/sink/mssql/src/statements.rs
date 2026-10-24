@@ -3,6 +3,7 @@
 //! the keyed and cleanup paths, and the timeout contract. Pure — no I/O.
 
 use std::future::Future;
+use std::sync::atomic::AtomicBool;
 
 use faucet_common_mssql::quote_ident_mssql;
 use faucet_core::{FaucetError, KeyTuple};
@@ -166,10 +167,12 @@ pub(crate) fn poison_check(poisoned: bool) -> Result<(), FaucetError> {
 
 /// The column list and per-row parameters for one chunk. `infos` is only read
 /// in `auto_columns` mode. `None` when no record key matches a column.
+/// `warned` is the sink's one-shot `on_unknown_field: warn` flag.
 pub(crate) fn prepare_rows(
     mapping: &MssqlColumnMapping,
     infos: &[ColumnInfo],
     chunk: &[Value],
+    warned: &AtomicBool,
 ) -> Result<Option<Prepared>, FaucetError> {
     match mapping {
         MssqlColumnMapping::JsonColumn { column } => {
@@ -197,7 +200,7 @@ pub(crate) fn prepare_rows(
             if let Some(&index) = unmatched_rows(&writable, &chunk).first() {
                 return Err(unmatched_row_error(index));
             }
-            let cols = resolve_insert_columns(&writable, &chunk, *on_unknown_field)?;
+            let cols = resolve_insert_columns(&writable, &chunk, *on_unknown_field, warned)?;
             if cols.is_empty() {
                 return Ok(None);
             }
@@ -244,11 +247,12 @@ pub(crate) fn merge_statements(
     key: &[String],
     infos: &[ColumnInfo],
     on_unknown: OnUnknownField,
+    warned: &AtomicBool,
     upserts: &[Value],
 ) -> Result<Vec<Statement>, FaucetError> {
     let writable = insertable(infos);
     let upserts = fold_to_columns(&writable, upserts);
-    let cols = resolve_insert_columns(&writable, &upserts, on_unknown)?;
+    let cols = resolve_insert_columns(&writable, &upserts, on_unknown, warned)?;
     let mut out = Vec::new();
     for (cols, rows) in group_by_present_columns(&upserts, &cols) {
         if cols.is_empty() {
@@ -467,7 +471,7 @@ mod tests {
         let json_mode = MssqlColumnMapping::JsonColumn {
             column: "doc".into(),
         };
-        let p = prepare_rows(&json_mode, &[], &[json!({"x": 1})])
+        let p = prepare_rows(&json_mode, &[], &[json!({"x": 1})], &AtomicBool::new(false))
             .unwrap()
             .unwrap();
         assert_eq!(p.cols, vec!["doc"]);
@@ -477,24 +481,47 @@ mod tests {
         let auto = MssqlColumnMapping::AutoColumns {
             on_unknown_field: OnUnknownField::Warn,
         };
-        let p = prepare_rows(&auto, &table(), &[json!({"id": 1, "blob": null, "zz": 2})])
-            .unwrap()
-            .unwrap();
+        let p = prepare_rows(
+            &auto,
+            &table(),
+            &[json!({"id": 1, "blob": null, "zz": 2})],
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(p.cols, vec!["id", "blob"]);
         assert_eq!(p.casts, vec![Some("int".to_string()), None]);
         assert!(matches!(p.rows[0][1], BoundParam::NullBinary(None)));
-        let err = prepare_rows(&auto, &table(), &[json!({"id": 1}), json!({"zz": 1})])
-            .err()
-            .expect("a record matching no column is an error");
+        let err = prepare_rows(
+            &auto,
+            &table(),
+            &[json!({"id": 1}), json!({"zz": 1})],
+            &AtomicBool::new(false),
+        )
+        .err()
+        .expect("a record matching no column is an error");
         assert!(err.to_string().contains("record 1 has no field"), "{err}");
-        let p = prepare_rows(&auto, &table(), &[json!({"ID": 4})])
-            .unwrap()
-            .unwrap();
+        let p = prepare_rows(
+            &auto,
+            &table(),
+            &[json!({"ID": 4})],
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(p.cols, vec!["id"], "fields match columns ignoring case");
         let strict = MssqlColumnMapping::AutoColumns {
             on_unknown_field: OnUnknownField::Error,
         };
-        assert!(prepare_rows(&strict, &table(), &[json!({"zz": 1})]).is_err());
+        assert!(
+            prepare_rows(
+                &strict,
+                &table(),
+                &[json!({"zz": 1})],
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -517,6 +544,7 @@ mod tests {
             &key,
             &table(),
             OnUnknownField::Warn,
+            &AtomicBool::new(false),
             &[
                 json!({"id": 1, "a": "x"}),
                 json!({"id": 2}),
@@ -529,8 +557,15 @@ mod tests {
         assert_eq!(stmts[0].params.len(), 4);
         assert!(!stmts[1].sql.contains("UPDATE SET"), "{}", stmts[1].sql);
         assert_eq!(stmts[1].params.len(), 1);
-        let none =
-            merge_statements("[t]", &key, &table(), OnUnknownField::Warn, &[json!(1)]).unwrap();
+        let none = merge_statements(
+            "[t]",
+            &key,
+            &table(),
+            OnUnknownField::Warn,
+            &AtomicBool::new(false),
+            &[json!(1)],
+        )
+        .unwrap();
         assert!(none.is_empty());
         assert!(
             merge_statements(
@@ -538,6 +573,7 @@ mod tests {
                 &key,
                 &table(),
                 OnUnknownField::Error,
+                &AtomicBool::new(false),
                 &[json!({"q": 1})]
             )
             .is_err()
