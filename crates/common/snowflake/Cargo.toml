@@ -41,3 +41,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = "0.6"

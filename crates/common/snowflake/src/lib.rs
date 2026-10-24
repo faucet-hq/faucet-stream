@@ -171,7 +171,9 @@ pub fn http_client() -> Result<reqwest::Client, FaucetError> {
 
 /// Best-effort `POST {statements_url}/{handle}/cancel`, so an abandoned
 /// statement stops running (and billing) on the warehouse. `statements_url`
-/// is the `…/api/v2/statements` endpoint. A failure is logged, never returned.
+/// is the `…/api/v2/statements` endpoint. A failure — a transport error or a
+/// non-success status such as an expired token's `401` — is logged with the
+/// status, never returned.
 pub async fn cancel_statement(
     client: &reqwest::Client,
     statements_url: &str,
@@ -187,9 +189,29 @@ pub async fn cancel_statement(
         .header("X-Snowflake-Authorization-Token-Type", token_type)
         .send()
         .await;
-    if let Err(e) = result {
-        tracing::warn!(statement = handle, error = %e, "Snowflake statement cancel failed");
+    match result {
+        Err(e) => {
+            tracing::warn!(statement = handle, error = %e, "Snowflake statement cancel failed");
+        }
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                statement = handle,
+                status,
+                body = %cancel_body_excerpt(&body),
+                "Snowflake refused the statement cancel; the statement may keep running"
+            );
+        }
+        Ok(_) => {}
     }
+}
+
+/// The start of a refused cancel's response body, for the log line.
+fn cancel_body_excerpt(body: &str) -> &str {
+    const MAX: usize = 512;
+    let body = body.trim();
+    &body[..body.floor_char_boundary(MAX.min(body.len()))]
 }
 
 /// Cancels a still-running statement when the future polling it is dropped
@@ -604,6 +626,37 @@ EHDRHpPC+FbQbhnOGcG1W4aN4Yi5sevGN6nqCsTsgSqOo9jYmc4=
         ));
         g.set_auth("Bearer t".into(), "OAUTH");
         drop(g);
+    }
+
+    #[test]
+    fn a_refused_cancel_logs_a_bounded_body_excerpt() {
+        assert_eq!(cancel_body_excerpt("  expired token \n"), "expired token");
+        let long = "é".repeat(400);
+        let cut = cancel_body_excerpt(&long);
+        assert!(cut.len() <= 512 && long.starts_with(cut));
+    }
+
+    #[tokio::test]
+    async fn a_refused_cancel_is_sent_and_only_logged() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/statements/h1/cancel"))
+            .and(header("Authorization", "Bearer old"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        cancel_statement(
+            &http_client().unwrap(),
+            &format!("{}/api/v2/statements/", server.uri()),
+            "h1",
+            "Bearer old",
+            "OAUTH",
+        )
+        .await;
+        server.verify().await;
     }
 
     #[test]
