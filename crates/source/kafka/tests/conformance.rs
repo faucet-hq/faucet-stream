@@ -153,7 +153,9 @@ async fn produce_raw(brokers: &str, topic: &str, payload: &[u8], count: usize) {
 /// and re-drives. We produce **no new messages** between the drains, so the
 /// second run consumes zero — strictly fewer than the first. (The consumer has
 /// already advanced past all N after the first drain, so the second drain reads
-/// 0 regardless of whether a rebalance re-applies the seek.)
+/// 0 regardless of whether a rebalance re-applies the seek, so the test then
+/// resumes a fresh consumer group from a bookmark and checks it reads exactly
+/// the messages produced after it.)
 ///
 /// Both drains terminate on `idle_timeout` — no `max_messages` cap, so the
 /// second (empty) drain also ends promptly rather than waiting for more
@@ -183,7 +185,48 @@ async fn conformance_bookmark_roundtrip() {
     // First drain consumes the N messages and emits an offsets bookmark; the
     // battery applies it and re-drives with no new messages, expecting 0.
     assert_bookmark_roundtrip(&source).await;
+
+    // The battery's second drain reuses a consumer already past every
+    // message, so prove the bookmark itself: a fresh consumer in a new group
+    // (which would otherwise start at `earliest`) resumes exactly at it.
+    let mut first_cfg = source_config(&brokers, topic, "g-conformance-bookmark-first", 0, 250);
+    first_cfg.max_messages = None;
+    first_cfg.idle_timeout = Some(Duration::from_secs(20));
+    let first = KafkaSource::new(first_cfg).await.expect("first source");
+    let bookmark = last_bookmark(&first).await;
+    const M: usize = 37;
+    produce_json(&brokers, topic, M).await;
+    let mut fresh_cfg = source_config(&brokers, topic, "g-conformance-bookmark-fresh", 0, 250);
+    fresh_cfg.max_messages = None;
+    fresh_cfg.idle_timeout = Some(Duration::from_secs(20));
+    let fresh = KafkaSource::new(fresh_cfg).await.expect("fresh source");
+    use faucet_core::Source as _;
+    fresh
+        .apply_start_bookmark(bookmark)
+        .await
+        .expect("apply bookmark");
+    let resumed = fresh.fetch_all().await.expect("resumed drain");
+    assert_eq!(
+        resumed.len(),
+        M,
+        "a fresh consumer must resume at the bookmark, not at `earliest`"
+    );
     // _container stays alive to here
+}
+
+/// Drain `source` and return the last bookmark it emits.
+async fn last_bookmark(source: &KafkaSource) -> serde_json::Value {
+    use faucet_core::Source as _;
+    use futures::StreamExt as _;
+    let ctx = std::collections::HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 250);
+    let mut last = None;
+    while let Some(page) = pages.next().await {
+        if let Some(b) = page.expect("page").bookmark {
+            last = Some(b);
+        }
+    }
+    last.expect("the drain emits a bookmark")
 }
 
 // ── Check 6: errors are typed, not panics (Docker) ───────────────────────────
