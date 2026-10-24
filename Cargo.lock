@@ -4700,7 +4700,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "aho-corasick",
  "arrow 58.3.0",
@@ -5299,7 +5299,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-core"
-version = "1.14.1"
+version = "1.14.2"
 dependencies = [
  "aes-gcm 0.11.0",
  "apache-avro 0.22.0",
@@ -6454,7 +6454,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-graphql"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "async-stream",
  "async-trait",
