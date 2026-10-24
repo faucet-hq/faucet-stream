@@ -181,7 +181,11 @@ curl -X POST localhost:8080/v1/tenants/acme/templates/crm-contacts/runs \
   connection shadows a config `auth:` entry of the same name); a reference
   to a connection the tenant does not have is a `409`;
 - binds `${tenant.id}`, `${tenant.name}` (the id when unnamed) and
-  `${tenant.labels.<key>}` anywhere in the document;
+  `${tenant.labels.<key>}` anywhere in the document, as literal text (a value
+  is never read as another `${…}` directive); in a SQL source's query and in a
+  `table` / `table_name` / `collection` / `index` / `schema` / `dataset` field
+  the value must be a plain identifier (letters, digits, `_`, `.`, `-`, `$`),
+  otherwise the run is refused;
 - keeps its bookmarks at `acme::crm-contacts::<row>` (and its SLA, profiling
   and rollback markers beside them), so tenants never share a bookmark;
 - carries `tenant` on its run record, usage records, audit entries and change
