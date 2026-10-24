@@ -310,6 +310,14 @@ async fn rollback_node_leased(
             crate::registry::sink_kinds_where(|c| c.rollback()).join(", ")
         )));
     }
+    let addressed = sink.dataset_uri();
+    if addressed != marker.sink_uri {
+        return Err(CliError::Config(format!(
+            "rollback: run {} wrote to {}, but the sink config now addresses {addressed}; load \
+             the config with the parameters and profile the run used",
+            marker.run_id, marker.sink_uri
+        )));
+    }
     let ik = state::index_key(&marker.state_key);
     let later_runs = RunIndex::decode(store.get(&ik).await?.as_ref()).later(&marker.run_id);
     let base = |outcome: RollbackOutcome, blocked: bool| RollbackReport {

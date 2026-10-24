@@ -1585,3 +1585,29 @@ rollback: {{}}
         "the upserts are reverted and the cleaned-up rows are back"
     );
 }
+
+#[tokio::test]
+async fn a_rollback_against_another_destination_is_refused() {
+    let d = fresh().await;
+    let yaml = config_yaml(&d.src, &d.dst, &d.state, "upsert", "rollback: {}");
+    let cfg = load(&yaml);
+    let summary = run(&cfg).await;
+    assert!(!summary.had_failures(), "{summary:?}");
+    let run_id = summary.invocations[0].run_id.clone().expect("run id");
+    let moved = load(&yaml.replace("table_name: dst", "table_name: dst_eu"));
+    let err = faucet_cli::rollback::rollback(
+        &moved,
+        RollbackInputs {
+            run_id,
+            row: None,
+            dry_run: false,
+            force: true,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("now addresses"), "{err}");
+    assert_eq!(rows(&d.dst).await.len(), 4, "nothing was undone");
+}
