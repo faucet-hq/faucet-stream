@@ -490,8 +490,11 @@ mod upload {
             }
         }
 
-        /// Run every upload and delete as a backend call under `ctx` (attempt
-        /// timeout, run deadline, cancellation, round-trip metering).
+        /// Run every upload and delete as a backend call under `ctx` (run
+        /// deadline, cancellation, round-trip metering). A delete is also bound
+        /// by the context's attempt timeout; an upload is not, since its
+        /// duration grows with the page and a timeout would fail a large page
+        /// that is still making progress.
         pub fn with_call_context(mut self, ctx: crate::io::CallContext) -> Self {
             self.calls = ctx;
             self
@@ -533,6 +536,8 @@ mod upload {
             let path = object_store::path::Path::from(key.clone());
             let bytes = body.len();
             self.calls
+                .clone()
+                .without_timeout()
                 .call_once("stage_put", async {
                     self.store.put(&path, body.into()).await.map_err(|e| {
                         FaucetError::Sink(format!("staging: upload `{key}` failed: {e}"))
@@ -833,6 +838,40 @@ mod tests {
         assert!(matches!(err, FaucetError::Cancelled { .. }), "{err}");
         let path = object_store::path::Path::from("stage/p/r/part-00000.jsonl");
         assert!(store.get(&path).await.is_err(), "nothing was uploaded");
+    }
+
+    #[cfg(feature = "staging")]
+    #[tokio::test]
+    async fn an_upload_is_not_cut_by_the_attempt_timeout() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        use object_store::{ObjectStore, ObjectStoreExt};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let slow = ThrottledStore::new(
+            object_store::memory::InMemory::new(),
+            ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(200),
+                ..ThrottleConfig::default()
+            },
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(slow);
+        let loc = StagingLocation::parse("s3://b/stage").unwrap();
+        let up = StageUploader::new(store.clone(), loc).with_call_context(
+            crate::io::CallContext::new().with_timeout(Duration::from_millis(20)),
+        );
+        let spec = StagingSpec {
+            location: "s3://b/stage".into(),
+            format: StagingFormat::Jsonl,
+            compression: StagingCompression::None,
+            cleanup: StagingCleanup::Always,
+            copy_options: None,
+        };
+        let f = up
+            .stage_page(&spec, "p", "r", 0, &[json!({"a": 1})], None)
+            .await
+            .expect("an upload slower than the attempt timeout still lands");
+        let path = object_store::path::Path::from(f.key.clone());
+        assert!(store.get(&path).await.is_ok());
     }
 
     #[cfg(feature = "staging")]
