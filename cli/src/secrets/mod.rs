@@ -149,15 +149,27 @@ pub fn collect_refs(value: &Value, out: &mut BTreeSet<SecretRef>) {
 /// Substitute every secret directive in a `Value` from `cache`. Non-secret
 /// directives (`${users.id}`) pass through verbatim.
 pub fn substitute(value: &mut Value, cache: &HashMap<SecretRef, String>) -> CliResult<()> {
+    substitute_with(value, cache, false)
+}
+
+/// [`substitute`], escaping each resolved value (`${` → `$${`) when the
+/// location is unescaped later, so the value comes out as stored.
+fn substitute_with(
+    value: &mut Value,
+    cache: &HashMap<SecretRef, String>,
+    escape: bool,
+) -> CliResult<()> {
     for_each_string_mut(value, &mut |s| {
         let new = interpolate::rewrite(s, |body| match interpolate::classify_directive(body) {
             Directive::LoadTime { prefix, body: b } if SECRET_SCHEMES.contains(&prefix) => {
-                Ok(Some(
-                    cache
-                        .get(&(prefix.to_owned(), b.to_owned()))
-                        .cloned()
-                        .expect("scan collected every secret ref before fetch"),
-                ))
+                let resolved = cache
+                    .get(&(prefix.to_owned(), b.to_owned()))
+                    .expect("scan collected every secret ref before fetch");
+                Ok(Some(if escape {
+                    resolved.replace("${", "$${")
+                } else {
+                    resolved.clone()
+                }))
             }
             _ => Ok(None),
         })?;
@@ -339,7 +351,9 @@ pub fn unescape_typed_blocks(cfg: &mut PipelineConfig) -> CliResult<()> {
 }
 
 /// Apply a mutating, fallible closure to every config `Value` location.
-fn visit_config_values_mut<F: FnMut(&mut Value) -> CliResult<()>>(
+/// The flag says whether the location still holds `$${` escapes (it is
+/// unescaped later, when built or by [`unescape_typed_blocks`]).
+fn visit_config_values_mut<F: FnMut(&mut Value, bool) -> CliResult<()>>(
     cfg: &mut PipelineConfig,
     mut f: F,
 ) -> CliResult<()> {
@@ -347,77 +361,99 @@ fn visit_config_values_mut<F: FnMut(&mut Value) -> CliResult<()>>(
     // walked too so secrets resolve there before they are consumed (#134).
     if let Some(auth) = cfg.auth.as_mut() {
         for spec in auth.values_mut() {
-            f(spec)?;
+            f(spec, true)?;
         }
     }
     if let Some(vars) = cfg.vars.as_mut() {
         for v in vars.values_mut() {
-            f(v)?;
+            f(v, true)?;
         }
     }
     // The replication snapshot source config is a first-class connector config
     // (like `pipeline.source.config`); secrets placed there must resolve too.
     if let Some(r) = cfg.replication.as_mut() {
-        f(&mut r.snapshot.source.config)?;
+        f(&mut r.snapshot.source.config, true)?;
     }
     for spec in cfg.pipeline.sources.values_mut() {
-        f(&mut spec.config)?;
+        f(&mut spec.config, true)?;
     }
     for spec in cfg.pipeline.sinks.values_mut() {
-        f(&mut spec.config)?;
+        f(&mut spec.config, true)?;
     }
     if let Some(spec) = cfg.pipeline.source.as_mut() {
-        f(&mut spec.config)?;
+        f(&mut spec.config, true)?;
     }
     if let Some(spec) = cfg.pipeline.sink.as_mut() {
-        f(&mut spec.config)?;
+        f(&mut spec.config, true)?;
     }
     for t in cfg.pipeline.transforms.iter_mut() {
-        f(&mut t.config)?;
+        f(&mut t.config, true)?;
     }
     if let Some(s) = cfg.pipeline.state.as_mut() {
-        f(&mut s.config)?;
+        f(&mut s.config, true)?;
     }
     if let Some(d) = cfg.pipeline.dlq.as_mut() {
-        f(&mut d.sink.config)?;
+        f(&mut d.sink.config, true)?;
     }
     for row in cfg.matrix.iter_mut() {
         if let Some(p) = row.source.as_mut()
             && let Some(c) = p.config.as_mut()
         {
-            f(c)?;
+            f(c, true)?;
         }
         if let Some(p) = row.sink.as_mut()
             && let Some(c) = p.config.as_mut()
         {
-            f(c)?;
+            f(c, true)?;
         }
         if let Some(ts) = row.transforms.as_mut() {
             for t in ts.iter_mut() {
-                f(&mut t.config)?;
+                f(&mut t.config, true)?;
             }
         }
         if let Some(s) = row.state.as_mut() {
-            f(&mut s.config)?;
+            f(&mut s.config, true)?;
         }
         if let Some(Some(d)) = row.dlq.as_mut() {
-            f(&mut d.sink.config)?;
+            f(&mut d.sink.config, true)?;
         }
     }
-    walk_typed(&mut cfg.pipeline.nodes, "pipeline.nodes", &mut f)?;
-    walk_typed(&mut cfg.observability, "observability", &mut f)?;
-    walk_typed(&mut cfg.replication, "mirror", &mut f)?;
-    walk_typed(&mut cfg.verify, "verify", &mut f)?;
-    walk_typed(&mut cfg.reconcile, "reconcile", &mut f)?;
+    walk_typed(&mut cfg.pipeline.nodes, "pipeline.nodes", &mut |v| {
+        f(v, true)
+    })?;
+    walk_typed(&mut cfg.observability, "observability", &mut |v| f(v, true))?;
+    walk_typed(&mut cfg.replication, "mirror", &mut |v| f(v, false))?;
+    walk_typed(&mut cfg.verify, "verify", &mut |v| f(v, true))?;
+    walk_typed(&mut cfg.reconcile, "reconcile", &mut |v| f(v, true))?;
     #[cfg(feature = "masking")]
-    walk_typed(&mut cfg.pipeline.masking, "pipeline.masking", &mut f)?;
+    walk_typed(&mut cfg.pipeline.masking, "pipeline.masking", &mut |v| {
+        f(v, true)
+    })?;
     #[cfg(feature = "lineage")]
-    walk_typed(&mut cfg.lineage, "lineage", &mut f)?;
+    walk_typed(&mut cfg.lineage, "lineage", &mut |v| f(v, true))?;
     #[cfg(feature = "catalog")]
-    walk_typed(&mut cfg.catalog, "catalog", &mut f)?;
+    walk_typed(&mut cfg.catalog, "catalog", &mut |v| f(v, true))?;
     #[cfg(feature = "notify")]
-    walk_typed(&mut cfg.notifications, "notifications", &mut f)?;
+    walk_typed(&mut cfg.notifications, "notifications", &mut |v| f(v, true))?;
     Ok(())
+}
+
+/// [`refuse_unresolved`] on the config as written: a directive the resolver
+/// reaches is blanked first, so resolved values are never scanned.
+fn refuse_outside_resolved(cfg: &PipelineConfig) -> CliResult<()> {
+    let mut probe = cfg.clone();
+    visit_config_values_mut(&mut probe, |v, _| {
+        for_each_string_mut(v, &mut |s| {
+            *s = interpolate::rewrite(s, |body| match interpolate::classify_directive(body) {
+                Directive::LoadTime { prefix, .. } if SECRET_SCHEMES.contains(&prefix) => {
+                    Ok(Some(String::new()))
+                }
+                _ => Ok(None),
+            })?;
+            Ok(())
+        })
+    })?;
+    refuse_unresolved(&probe)
 }
 
 /// Refuse a config that still holds a secret-manager directive after
@@ -486,8 +522,8 @@ pub fn ensure_no_secret_directives(cfg: &PipelineConfig) -> CliResult<()> {
 /// Builds resolvers only for the schemes actually referenced.
 pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
     let refs = scan_config(cfg);
+    refuse_outside_resolved(cfg)?;
     if refs.is_empty() {
-        refuse_unresolved(cfg)?;
         return unescape_typed_blocks(cfg);
     }
     let mut set = ResolverSet::default();
@@ -502,13 +538,12 @@ pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
 /// seam used by tests to inject fakes).
 pub async fn resolve_secrets_with(cfg: &mut PipelineConfig, set: &ResolverSet) -> CliResult<()> {
     let refs = scan_config(cfg);
+    refuse_outside_resolved(cfg)?;
     if refs.is_empty() {
-        refuse_unresolved(cfg)?;
         return unescape_typed_blocks(cfg);
     }
     let cache = fetch_all(&refs, set).await?;
-    visit_config_values_mut(cfg, |v| substitute(v, &cache))?;
-    refuse_unresolved(cfg)?;
+    visit_config_values_mut(cfg, |v, escaped| substitute_with(v, &cache, escaped))?;
     unescape_typed_blocks(cfg)
 }
 
@@ -710,6 +745,34 @@ matrix:
         assert!(err.contains("not resolved in"), "{err}");
         let err = resolve_secrets(&mut cfg).await.unwrap_err().to_string();
         assert!(err.contains("not resolved in"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolved_values_come_out_as_stored() {
+        let stored = "ab$${cd ${aws-sm:x} ${now.date}";
+        let mut set = ResolverSet::default();
+        set.insert(Arc::new(FakeResolver {
+            scheme: "vault",
+            value: stored.into(),
+        }));
+        let cfg_yaml = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: https://x, token: "${vault:secret/data/app#token}" } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+  masking:
+    key: "${vault:secret/data/mask#k}"
+    rules: [ { name: e, match: { fields: [email] }, action: { type: hash } } ]
+"#;
+        let mut cfg = PipelineConfig::from_text(cfg_yaml, std::path::Path::new("p.yaml")).unwrap();
+        resolve_secrets_with(&mut cfg, &set).await.unwrap();
+        assert_eq!(
+            cfg.pipeline.masking.as_ref().unwrap().key.as_deref(),
+            Some(stored)
+        );
+        let built =
+            crate::interpolate::unescaped(cfg.pipeline.source.as_ref().unwrap().config.clone());
+        assert_eq!(built["token"], stored);
     }
 
     #[test]
