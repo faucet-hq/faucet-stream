@@ -905,33 +905,6 @@ impl FileStateStore {
         Ok(())
     }
 
-    /// Rewrite a state file still sealed in the legacy unbound format bound to
-    /// its key, so it can no longer be read under another key. Best effort: a
-    /// failure leaves the file as it was.
-    #[cfg(feature = "encryption")]
-    async fn reseal_legacy(&self, key: &str, path: &Path) {
-        let Some(enc) = &self.encryption else { return };
-        let Ok(bytes) = tokio::fs::read(path).await else {
-            return;
-        };
-        if !crate::encryption::is_unbound(&bytes) {
-            return;
-        }
-        let _guard = self.write_lock.lock().await;
-        match tokio::fs::read(path).await {
-            Ok(now) if now == bytes => {}
-            _ => return,
-        }
-        let resealed = match enc.decrypt(&bytes) {
-            Ok(plain) => serde_json::from_slice::<Value>(&plain),
-            Err(_) => return,
-        };
-        let Ok(value) = resealed else { return };
-        if let Err(e) = self.put_unlocked(key, &value).await {
-            tracing::warn!(key, error = %e, "could not re-seal a legacy state file");
-        }
-    }
-
     /// Returns the root directory this store writes into.
     pub fn root(&self) -> &Path {
         &self.root
@@ -979,12 +952,7 @@ impl StateStore for FileStateStore {
         validate_state_key(key)?;
         self.migrate_legacy_names().await?;
         let path = self.entry_path(key);
-        let value = self.read_entry(key, &path).await?;
-        #[cfg(feature = "encryption")]
-        if value.is_some() {
-            self.reseal_legacy(key, &path).await;
-        }
-        Ok(value)
+        self.read_entry(key, &path).await
     }
 
     async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
@@ -1905,20 +1873,41 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_legacy_unbound_file_is_resealed_bound_on_read() {
+        async fn a_legacy_unbound_file_is_read_unchanged_and_bound_on_next_write() {
             let dir = tempfile::tempdir().unwrap();
             let store = FileStateStore::new(dir.path()).with_encryption(enc("k1"));
             store.put("bk", &json!({"v": 1})).await.unwrap();
             let path = store.entry_path("bk");
-            std::fs::write(&path, enc("k1").encrypt(br#"{"v":1}"#)).unwrap();
-            assert!(crate::encryption::is_unbound(
-                &std::fs::read(&path).unwrap()
-            ));
+            let legacy = enc("k1").encrypt(br#"{"v":1}"#);
+            std::fs::write(&path, &legacy).unwrap();
+            assert!(crate::encryption::is_unbound(&legacy));
+            // A read never writes: a concurrent writer in another process
+            // could otherwise be overwritten with the value read.
             assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 1})));
+            assert_eq!(std::fs::read(&path).unwrap(), legacy);
+            store.put("bk", &json!({"v": 2})).await.unwrap();
             let after = std::fs::read(&path).unwrap();
             assert!(is_encrypted(&after));
             assert!(!crate::encryption::is_unbound(&after));
-            assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 1})));
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 2})));
+        }
+
+        #[tokio::test]
+        async fn a_legacy_unbound_file_is_bound_by_compare_and_put() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileStateStore::new(dir.path()).with_encryption(enc("k1"));
+            store.put("bk", &json!(1)).await.unwrap();
+            let path = store.entry_path("bk");
+            std::fs::write(&path, enc("k1").encrypt(b"1")).unwrap();
+            assert!(
+                store
+                    .compare_and_put("bk", Some(&json!(1)), &json!(2))
+                    .await
+                    .unwrap()
+            );
+            let after = std::fs::read(&path).unwrap();
+            assert!(!crate::encryption::is_unbound(&after));
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!(2)));
         }
 
         #[tokio::test]
