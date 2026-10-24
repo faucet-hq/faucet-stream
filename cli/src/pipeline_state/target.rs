@@ -153,6 +153,75 @@ impl PipelineTarget {
         })
     }
 
+    /// [`Self::resolve`], with a multi-table mirror's rows read from its
+    /// marker: one row per table, keyed `{name}::{table id}` as the mirror
+    /// keys them, in place of `cdc` / `snapshot`.
+    pub async fn resolve_live(cfg: &PipelineConfig, pipeline: &str) -> CliResult<Self> {
+        let mut target = Self::resolve(cfg, pipeline)?;
+        let (Some(rep), Some(state)) = (cfg.replication.as_ref(), target.state.as_ref()) else {
+            return Ok(target);
+        };
+        let Some(spec) = rep.tables.as_ref() else {
+            return Ok(target);
+        };
+        let Some(template) = target.rows.iter().find(|r| r.id == "cdc").cloned() else {
+            return Ok(target);
+        };
+        let store = crate::state::build_state_store(state).await?;
+        let marker = match store
+            .get(&crate::replication::state::marker_key(pipeline))
+            .await?
+        {
+            Some(v) => crate::replication::multi_state::MirrorState::from_value(v)?,
+            None => crate::replication::multi_state::MirrorState::new(chrono::Utc::now()),
+        };
+        target.rows.retain(|r| r.id != "cdc" && r.id != "snapshot");
+        let sink_template = cfg
+            .pipeline
+            .sink
+            .as_ref()
+            .map(|s| s.config.clone())
+            .unwrap_or(Value::Null);
+        let upsert_capable = crate::registry::sink_kind_capabilities(&template.sink_kind)
+            .supports_write_mode(faucet_core::WriteMode::Upsert);
+        for (name, table) in &marker.tables {
+            use crate::replication::tables;
+            let descriptor =
+                faucet_core::DatasetDescriptor::new(name.as_str(), "table", serde_json::json!({}))
+                    .with_primary_key(table.key.clone());
+            let sink_config = match tables::resolve(
+                spec,
+                &template.sink_kind,
+                &sink_template,
+                &serde_json::json!({}),
+                upsert_capable,
+                rep.per_table.get(name),
+                &descriptor,
+            ) {
+                tables::Resolution::Mirror(plan) => plan.sink_config,
+                tables::Resolution::Refused(_) => template.sink_config.clone(),
+            };
+            let source = template.source.as_ref().map(|(kind, base)| {
+                (
+                    kind.clone(),
+                    tables::cdc_config_for(kind, base, std::slice::from_ref(name)),
+                )
+            });
+            target.rows.push(RowTarget {
+                id: if table.id.is_empty() {
+                    tables::node_id(name)
+                } else {
+                    table.id.clone()
+                },
+                overwrite: is_overwrite(&sink_config),
+                sink_config,
+                source,
+                ..template.clone()
+            });
+        }
+        Ok(target)
+    }
+
     /// The row named `id`, or an error listing the rows there are.
     pub fn row(&self, id: &str) -> CliResult<&RowTarget> {
         self.rows.iter().find(|r| r.id == id).ok_or_else(|| {
@@ -297,6 +366,74 @@ mirror:
         );
         let t = PipelineTarget::resolve(&cfg, "m").unwrap();
         let ids: Vec<_> = t.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["cdc", "snapshot"]);
+    }
+
+    #[tokio::test]
+    async fn a_multi_table_mirror_has_one_row_per_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"version: 1
+name: m
+pipeline:
+  source: {{ type: postgres-cdc, config: {{ connection_url: "postgres://u@h/d", slot_name: s, publication: p }} }}
+  sink: {{ type: sqlite, config: {{ database_url: "sqlite://x.db", table_name: unused }} }}
+  state: {{ type: file, config: {{ path: "{}" }} }}
+mirror:
+  mode: snapshot_then_cdc
+  tables: {{ include: ["public.*"] }}
+  snapshot:
+    source: {{ type: postgres, config: {{ connection_url: "postgres://u@h/d", query: "SELECT 1" }} }}
+"#,
+            dir.path().display()
+        );
+        let cfg = parse(&text);
+        let fresh = PipelineTarget::resolve_live(&cfg, "m").await.unwrap();
+        assert!(fresh.rows.is_empty(), "no table mirrored yet");
+
+        let store = crate::state::build_state_store(cfg.pipeline.state.as_ref().unwrap())
+            .await
+            .unwrap();
+        let mut marker = crate::replication::multi_state::MirrorState::new(chrono::Utc::now());
+        marker.tables.insert(
+            "public.orders".into(),
+            serde_json::from_value(serde_json::json!({
+                "id": "public.orders", "phase": "active", "since": chrono::Utc::now(),
+                "key": ["id"], "write_mode": "upsert"
+            }))
+            .unwrap(),
+        );
+        marker.tables.insert(
+            "public.users".into(),
+            serde_json::from_value(serde_json::json!({
+                "phase": "pending", "since": chrono::Utc::now()
+            }))
+            .unwrap(),
+        );
+        store
+            .put(
+                &crate::replication::state::marker_key("m"),
+                &marker.to_value().unwrap(),
+            )
+            .await
+            .unwrap();
+        let t = PipelineTarget::resolve_live(&cfg, "m").await.unwrap();
+        let ids: Vec<_> = t.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["public.orders", "public.users"]);
+        let orders = t.row("public.orders").unwrap();
+        assert_eq!(orders.sink_config["table_name"], "orders");
+        assert_eq!(orders.sink_config["key"], serde_json::json!(["id"]));
+        assert_eq!(t.base_key(&orders.id), "m::public.orders");
+        assert_eq!(orders.source.as_ref().unwrap().0, "postgres-cdc");
+
+        let single = parse(&text.replace("  tables: { include: [\"public.*\"] }\n", ""));
+        let ids: Vec<_> = PipelineTarget::resolve_live(&single, "m")
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
         assert_eq!(ids, vec!["cdc", "snapshot"]);
     }
 

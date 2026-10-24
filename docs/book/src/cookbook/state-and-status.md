@@ -148,6 +148,11 @@ Both refuse while a run holds the row — its lease is live, or the config's
 never moved under a running pipeline. `--force` overrides it when that run is
 known to be gone.
 
+A `faucet mirror` config has two rows, `cdc` and `snapshot`. A multi-table
+mirror (`mirror.tables`) has one row per table it has discovered, named by the
+table's id (`public.orders`), so `--row public.orders` shows, sets or resets
+that table's position alone.
+
 ### Exactly-once rows
 
 A row under `delivery: exactly_once` stores its bookmark inside an envelope

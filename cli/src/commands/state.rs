@@ -177,7 +177,7 @@ pub async fn load(
     };
     let cfg = PipelineConfig::from_path_async(&path, load.profile.as_deref()).await?;
     let name = cli_pipeline_name(&cfg, &path);
-    let target = PipelineTarget::resolve(&cfg, &name)?;
+    let target = PipelineTarget::resolve_live(&cfg, &name).await?;
     Ok((cfg, target, path))
 }
 
