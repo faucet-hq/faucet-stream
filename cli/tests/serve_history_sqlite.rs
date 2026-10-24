@@ -2345,3 +2345,49 @@ async fn concurrent_catalog_records_keep_every_annotation() {
         detail.dataset.consumers
     );
 }
+
+#[cfg(feature = "templates")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launches_and_channels_never_point_at_a_missing_version() {
+    use faucet_cli::serve::history::HistoryError;
+    use faucet_cli::serve::history::templates::{TemplateDraft, TemplateId};
+    let dir = tempfile::tempdir().unwrap();
+    let s = std::sync::Arc::new(store(&dir, "tpl-race.db").await);
+    let draft = TemplateDraft {
+        id: TemplateId::parse("race").unwrap(),
+        name: None,
+        description: None,
+        body: "version: 1\nname: race\n".into(),
+        format: faucet_cli::serve::load::ConfigFormat::Yaml,
+        params: Default::default(),
+        created_by: None,
+        kind: faucet_cli::hub::TemplateKind::Pipeline,
+    };
+    for _ in 0..2 {
+        s.template_register(&draft).await.unwrap();
+    }
+    assert!(matches!(
+        s.template_launch("race", 9, None, None).await,
+        Err(HistoryError::VersionNotFound { version: 9, .. })
+    ));
+    assert!(matches!(
+        s.template_set_tag("race", "dev", 9, None).await,
+        Err(HistoryError::VersionNotFound { version: 9, .. })
+    ));
+    s.template_launch("race", 1, None, None).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        tasks.spawn(async move { s.template_launch("race", 2, None, None).await.unwrap() });
+    }
+    let mut appended = 0;
+    while let Some(r) = tasks.join_next().await {
+        appended += r.unwrap().is_some() as usize;
+    }
+    assert_eq!(
+        appended, 1,
+        "concurrent launches of one version append once"
+    );
+    let st = s.template_state("race").await.unwrap();
+    assert_eq!((st.stable, st.previous), (Some(2), Some(1)));
+}

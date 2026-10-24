@@ -5758,50 +5758,52 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let result = match version {
                     Some(v) => {
-                        // Drop channels + launch entries aimed at this version
-                        // first, so no pointer can outlive what it points at.
-                        sqlx::query(&self.stmts.template_delete_tags_for_version)
+                        // One write transaction behind the version's row lock, so
+                        // a launch or channel move cannot land between the
+                        // cascade and the version delete and leave a pointer at a
+                        // version that no longer exists.
+                        let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                        let vs = v.to_string();
+                        sqlx::query(&self.stmts.template_lock_version)
                             .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
+                            .bind(&vs)
+                            .execute(&mut *tx)
                             .await
                             .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_launches_for_version)
-                            .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
-                            .await
-                            .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_version_deprecation)
-                            .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
-                            .await
-                            .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_tests_version)
-                            .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
-                            .await
-                            .map_err(backend)?;
+                        for stmt in [
+                            &self.stmts.template_delete_tags_for_version,
+                            &self.stmts.template_delete_launches_for_version,
+                            &self.stmts.template_delete_version_deprecation,
+                            &self.stmts.template_delete_tests_version,
+                        ] {
+                            sqlx::query(stmt)
+                                .bind(id)
+                                .bind(&vs)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(backend)?;
+                        }
                         let deleted = sqlx::query(&self.stmts.template_delete_version)
                             .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
+                            .bind(&vs)
+                            .execute(&mut *tx)
                             .await
                             .map_err(backend)?;
                         // The last version: the template-level deprecation goes too,
                         // as a whole-template delete would remove it.
-                        if <Self as $crate::serve::history::RunHistory>::template_versions(self, id)
-                            .await?
-                            .is_empty()
-                        {
+                        let remaining = sqlx::query(&self.stmts.template_versions)
+                            .bind(id)
+                            .fetch_all(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                        if remaining.is_empty() {
                             sqlx::query(&self.stmts.template_delete_deprecation)
                                 .bind(id)
-                                .execute(&self.pool)
+                                .execute(&mut *tx)
                                 .await
                                 .map_err(backend)?;
                         }
+                        tx.commit().await.map_err(backend)?;
                         Ok(deleted)
                     }
                     None => {
@@ -5839,12 +5841,18 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 let v = version.to_string();
-                sqlx::query(&self.stmts.template_lock_version)
+                let locked = sqlx::query(&self.stmts.template_lock_version)
                     .bind(id)
                     .bind(&v)
                     .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                if locked.rows_affected() == 0 {
+                    return Err($crate::serve::history::HistoryError::VersionNotFound {
+                        id: id.to_string(),
+                        version,
+                    });
+                }
                 if let Some(claim) = evidence {
                     let rows = sqlx::query(&self.stmts.template_select_tests_version)
                         .bind(id)
@@ -6038,16 +6046,38 @@ macro_rules! impl_sql_history {
                     };
                     // The version's row lock serializes this move with a new
                     // test result for the same version (#856).
-                    if let Err(e) = sqlx::query(&self.stmts.template_lock_version)
+                    match sqlx::query(&self.stmts.template_lock_version)
                         .bind(id)
                         .bind(version.to_string())
                         .execute(&mut *tx)
                         .await
                     {
-                        if attempt < sql::CLAIM_ATTEMPTS {
-                            continue;
+                        Ok(r) if r.rows_affected() == 0 => {
+                            return Err(HistoryError::VersionNotFound {
+                                id: id.to_string(),
+                                version,
+                            });
                         }
-                        return Err(backend(e));
+                        Ok(_) => {}
+                        Err(_) if attempt < sql::CLAIM_ATTEMPTS => continue,
+                        Err(e) => return Err(backend(e)),
+                    }
+                    // Re-check under the lock: a concurrent launch of the same
+                    // version may have committed since the read above.
+                    let newest: Option<String> = match sqlx::query(&self.stmts.template_select_launches)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    {
+                        Ok(row) => row
+                            .map(|r| r.try_get::<String, _>("version"))
+                            .transpose()
+                            .map_err(backend)?,
+                        Err(_) if attempt < sql::CLAIM_ATTEMPTS => continue,
+                        Err(e) => return Err(backend(e)),
+                    };
+                    if newest.as_deref() == Some(version.to_string().as_str()) {
+                        return Ok(None);
                     }
                     if let Some(claim) = evidence {
                         let rows = sqlx::query(&self.stmts.template_select_tests_version)

@@ -426,6 +426,10 @@ pub enum HistoryError {
         existing: crate::hub::TemplateKind,
         requested: crate::hub::TemplateKind,
     },
+    /// A launch or channel move named a template version that does not exist
+    /// (deleted or pruned meanwhile); nothing was written.
+    #[error("template '{id}' has no version {version}")]
+    VersionNotFound { id: String, version: u32 },
 }
 
 impl HistoryError {

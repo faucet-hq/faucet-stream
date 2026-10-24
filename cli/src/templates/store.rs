@@ -33,6 +33,12 @@ fn label_write_err(
         history::HistoryError::StaleEvidence(why) => {
             crate::templates::bundle::stale_evidence(id, version, action, why)
         }
+        history::HistoryError::VersionNotFound { id, version } => {
+            CliError::UnknownPipelineTemplate {
+                id,
+                version: Some(version),
+            }
+        }
         other => registry_err(what, other),
     }
 }

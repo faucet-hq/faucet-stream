@@ -1512,6 +1512,11 @@ impl RunHistory for MemoryHistory {
         version: u32,
         evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
+        let store = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        version_exists(&store, id, version)?;
         let mut tags = self
             .template_tags
             .lock()
@@ -1636,6 +1641,11 @@ impl RunHistory for MemoryHistory {
         launched_by: Option<&str>,
         evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
+        let store = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        version_exists(&store, id, version)?;
         let mut launches = self
             .template_launches
             .lock()
@@ -1840,6 +1850,22 @@ fn missing_version(id: &str, version: u32) -> HistoryError {
 /// The evidence of one template's channels: tag → (version, result id).
 type TagEvidence = BTreeMap<String, (u32, String)>;
 
+/// A launch or channel move may only name a stored version.
+fn version_exists<V>(
+    store: &std::collections::HashMap<String, BTreeMap<u32, V>>,
+    id: &str,
+    version: u32,
+) -> Result<(), HistoryError> {
+    if store.get(id).is_some_and(|v| v.contains_key(&version)) {
+        Ok(())
+    } else {
+        Err(HistoryError::VersionNotFound {
+            id: id.to_string(),
+            version,
+        })
+    }
+}
+
 /// One version's recorded results, newest first.
 fn version_results(
     tests: &std::collections::HashMap<String, Vec<templates::TemplateTestResult>>,
@@ -1880,6 +1906,19 @@ mod tests {
         assert_eq!(h.template_register(&draft).await.unwrap().version, 3);
         h.template_delete("orders", None).await.unwrap();
         assert_eq!(h.template_register(&draft).await.unwrap().version, 4);
+    }
+
+    #[tokio::test]
+    async fn launches_and_channels_refuse_a_missing_version() {
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        assert!(matches!(
+            h.template_launch("none", 1, None, None).await,
+            Err(HistoryError::VersionNotFound { version: 1, .. })
+        ));
+        assert!(matches!(
+            h.template_set_tag("none", "dev", 1, None).await,
+            Err(HistoryError::VersionNotFound { version: 1, .. })
+        ));
     }
 
     #[tokio::test]
