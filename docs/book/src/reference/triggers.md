@@ -168,7 +168,9 @@ it — and the objects after it still fire. A transient failure (the queue is
 full, the history store is unreachable) stops the poll and retries the same
 object next time. Either way the poll counts as failed: the watcher backs off,
 `faucet_serve_trigger_errors_total` counts it, and after repeated failures the
-watcher reports `healthy: false` with the `last_error`.
+watcher reports `healthy: false` (with `consecutive_failures`); the reason is
+in the server log (`trigger poll failed`) — `/readyz` is unauthenticated, so it
+carries no error text.
 
 ### `webhook`
 
@@ -381,8 +383,8 @@ See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-s
 ```
 
 A watcher whose client cannot be built at startup (an object-store or queue
-client error) is reported `healthy: false` with the reason in `last_error`
-straight away — it never polls. A degraded watcher (crashed and backing off) sets its `healthy` flag to `false`
+client error) is reported `healthy: false` straight away, with the reason in
+the server log — it never polls. A degraded watcher (crashed and backing off) sets its `healthy` flag to `false`
 but does **not** flip the top-level `status` to `not_ready` — the server keeps
 accepting runs from the other trigger paths.
 
