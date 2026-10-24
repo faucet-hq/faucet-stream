@@ -78,6 +78,10 @@ use super::RowCap;
 /// past the point where a person is still waiting for a table.
 pub const PREVIEW_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long the engine waits, past the deadline, to learn whether the stream
+/// has ended (a complete answer) or has more (a time-capped one).
+const END_PROBE: Duration = Duration::from_millis(100);
+
 /// Absolute ceiling on one read, after which the request fails.
 ///
 /// [`PREVIEW_DEADLINE`] is checked between pages, so it cannot interrupt a
@@ -277,7 +281,13 @@ async fn read_inner(
             // page completes is still a bound, and it keeps the check off the
             // per-record path.
             if started.elapsed() >= bounds.deadline {
-                capped_by = Some(Capped::Time);
+                // Only a capped read if more was actually coming: a stream that
+                // ends right after its last page returned the whole dataset.
+                match tokio::time::timeout(END_PROBE, pages.next()).await {
+                    Ok(None) => {}
+                    Ok(Some(Err(e))) => return Err(e.into()),
+                    Ok(Some(Ok(_))) | Err(_) => capped_by = Some(Capped::Time),
+                }
                 break;
             }
         }
@@ -664,6 +674,22 @@ mod tests {
         // One page's worth, not zero rows and not the file: the deadline is
         // checked *after* a page, so the caller always gets something back.
         assert_eq!(page.rows.len(), PREVIEW_UNLIMITED_PAGE_ROWS);
+    }
+
+    #[tokio::test]
+    async fn a_dataset_that_ends_on_the_deadline_page_is_not_reported_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_jsonl(dir.path(), 10);
+        let bounds = Bounds {
+            deadline: Duration::ZERO,
+            ..Bounds::default()
+        };
+        let page = read_capped_with(&unlimited_request(&path), &AuthCatalog::new(), bounds)
+            .await
+            .unwrap();
+        assert_eq!(page.capped_by, None);
+        assert!(!page.truncated());
+        assert_eq!(page.rows.len(), 10);
     }
 
     // The hard timeout itself (the `tokio::time::timeout` wrapper) has no unit
