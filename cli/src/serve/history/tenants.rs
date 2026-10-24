@@ -237,7 +237,17 @@ impl TenantSelector {
             TenantSelector::Named(ids) if ids.is_empty() => {
                 Err("tenants must name at least one tenant".into())
             }
-            TenantSelector::Named(ids) => ids.iter().try_for_each(|id| validate_tenant_id(id)),
+            TenantSelector::Named(ids) => {
+                let mut seen = std::collections::HashSet::new();
+                ids.iter().try_for_each(|id| {
+                    validate_tenant_id(id)?;
+                    if seen.insert(id.as_str()) {
+                        Ok(())
+                    } else {
+                        Err(format!("tenant '{id}' is listed more than once"))
+                    }
+                })
+            }
         }
     }
 }
@@ -245,6 +255,14 @@ impl TenantSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tenant_listed_twice_is_refused() {
+        let dup: TenantSelector =
+            serde_json::from_value(serde_json::json!(["acme", "beta", "acme"])).unwrap();
+        let err = dup.validate().unwrap_err();
+        assert!(err.contains("'acme' is listed more than once"), "{err}");
+    }
 
     #[test]
     fn selector_shapes_validate() {
