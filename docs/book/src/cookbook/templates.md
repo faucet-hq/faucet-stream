@@ -79,6 +79,11 @@ A param spliced into a longer string becomes plain text of that string — it is
 for a param without a `values:` set may not carry a quote (`'`, `"`, `` ` ``),
 `;`, a backslash or a control character when it is spliced into a longer string
 (`query: "… WHERE account = '${param.account}'"`); such a trigger is refused.
+In a SQL field (`query`, `sql`, `statement`, `*_query`) a splice that is not
+enclosed in quotes (`WHERE id = ${param.id}`) takes only identifier-like text
+(letters, digits, `_ . : @ + -`, no `--`), and in a URL field (`url`, `*_url`,
+`path`, `endpoint`) a spliced value may not carry `?`, `#`, `&`, whitespace or
+a `..` segment.
 For a param a lower-trust caller fills into a query, declare a closed `values:`
 set. A whole-value reference (`table: ${param.table}`) and a `default` are not
 restricted.
@@ -1113,9 +1118,13 @@ Metrics: `faucet_serve_template_sync_runs_total{origin,outcome=ok|partial|error}
 
 - **Structure safety.** Params are substituted per JSON/YAML scalar, before the
   typed parse — a value containing `:`, a newline, or `-` stays the single scalar
-  it replaced and can never inject a key or an array element. SQL-bound and
-  JSON-safe substitution paths downstream are untouched, so the existing
-  SQL/JSON-injection guarantees hold for param-derived text too.
+  it replaced and can never inject a key or an array element. That is a
+  guarantee about the config's structure, not about the text a param lands
+  in: params are **not** bound as SQL parameters or URL-encoded (record
+  fan-out tokens are). A caller-supplied free-text value spliced into a longer
+  string is checked instead — see [Declaring parameters](#declaring-parameters) — and
+  for a value a lower-trust caller fills into a query, a closed `values:` set
+  or an `int` / `float` type is the reliable guard.
 - **No re-interpolation of caller input.** Env/file/secret directives resolve
   *before* params bind, so a supplied value is never itself scanned for
   directives. A supplied value containing `${` is rejected outright: params are
