@@ -84,13 +84,15 @@ async fn seed(endpoint: &str) -> Client {
 }
 
 fn creds() {
-    // SAFETY: every test boots its own container with the same default MinIO
-    // credentials, so overlapping writes set an identical value.
-    unsafe {
+    static CREDS: std::sync::Once = std::sync::Once::new();
+    // SAFETY: written once per process, before any test in this binary builds
+    // an AWS client (every caller blocks on the `Once` until the writes are
+    // done); std's own environment reads take the same lock as these writes.
+    CREDS.call_once(|| unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
         std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
         std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    });
 }
 
 async fn build_sink(endpoint: &str, config: S3SinkConfig) -> S3Sink {

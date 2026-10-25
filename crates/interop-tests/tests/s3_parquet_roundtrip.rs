@@ -73,12 +73,15 @@ async fn create_bucket(endpoint: &str) {
 }
 
 fn set_creds_env() {
-    // SAFETY: identical constants across all MinIO runs, re-applied on entry.
-    unsafe {
+    static CREDS: std::sync::Once = std::sync::Once::new();
+    // SAFETY: written once per process, before any test in this binary builds
+    // an AWS client (every caller blocks on the `Once` until the writes are
+    // done); std's own environment reads take the same lock as these writes.
+    CREDS.call_once(|| unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
         std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
         std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    });
 }
 
 fn sample_rows() -> Vec<Value> {
