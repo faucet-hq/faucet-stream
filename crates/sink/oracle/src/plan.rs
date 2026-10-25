@@ -417,11 +417,15 @@ pub(crate) fn staging_table_name(target: &str, run: Option<&str>) -> String {
 /// Tables other than the target whose enabled foreign keys reference it
 /// (`:1` owner or NULL for the current schema, `:2` table), as `OWNER.TABLE`.
 /// Self-references are excluded: the swap replaces every row of the table at
-/// once, so they cannot cascade elsewhere.
+/// once, so they cannot cascade elsewhere. So is an `INITIALLY DEFERRED`
+/// `NO ACTION` key: the swap's `DELETE` + `INSERT` run in one transaction, so
+/// the key is checked at commit against the replaced rows (a refresh that
+/// drops a referenced key fails the commit and rolls the swap back).
 pub(crate) const REFERENCING_TABLES_SQL: &str = "SELECT DISTINCT c.OWNER || '.' || c.TABLE_NAME \
     FROM ALL_CONSTRAINTS c JOIN ALL_CONSTRAINTS p \
       ON p.OWNER = c.R_OWNER AND p.CONSTRAINT_NAME = c.R_CONSTRAINT_NAME \
     WHERE c.CONSTRAINT_TYPE = 'R' AND c.STATUS = 'ENABLED' \
+      AND NOT (c.DEFERRED = 'DEFERRED' AND c.DELETE_RULE = 'NO ACTION') \
       AND p.OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND p.TABLE_NAME = :2 \
       AND NOT (c.OWNER = p.OWNER AND c.TABLE_NAME = p.TABLE_NAME) \
     ORDER BY 1";
@@ -865,6 +869,10 @@ mod tests {
         );
         assert!(REFERENCING_TABLES_SQL.contains("CONSTRAINT_TYPE = 'R'"));
         assert!(REFERENCING_TABLES_SQL.contains("STATUS = 'ENABLED'"));
+        assert!(
+            REFERENCING_TABLES_SQL
+                .contains("NOT (c.DEFERRED = 'DEFERRED' AND c.DELETE_RULE = 'NO ACTION')")
+        );
     }
 
     use super::*;

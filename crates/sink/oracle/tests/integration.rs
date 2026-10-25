@@ -337,6 +337,42 @@ async fn oracle_sink_end_to_end() {
     .unwrap();
     selfref.begin_overwrite().await.unwrap();
     selfref.abort_overwrite().await.unwrap();
+    // An INITIALLY DEFERRED NO ACTION key is checked at the swap's commit
+    // (#934): a refresh that keeps the referenced key succeeds; one that drops
+    // it fails and leaves the old rows.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE FK_DEF (ID NUMBER(19) PRIMARY KEY)",
+            "INSERT INTO FK_DEF (ID) VALUES (1)",
+            "CREATE TABLE FK_DEF_CHILD (ID NUMBER(19), PID NUMBER(19) \
+             REFERENCES FK_DEF (ID) DEFERRABLE INITIALLY DEFERRED)",
+            "INSERT INTO FK_DEF_CHILD (ID, PID) VALUES (1, 1)",
+        ],
+    )
+    .await;
+    let deferred = || async {
+        OracleSink::new(OracleSinkConfig {
+            table: "FK_DEF".into(),
+            ..ow_cfg.clone()
+        })
+        .await
+        .unwrap()
+    };
+    let keep = deferred().await;
+    keep.begin_overwrite().await.unwrap();
+    keep.write_batch(&[json!({"ID": 1}), json!({"ID": 2})])
+        .await
+        .unwrap();
+    keep.commit_overwrite().await.unwrap();
+    assert_eq!(count(&conn, "FK_DEF").await, 2);
+    let drop_key = deferred().await;
+    drop_key.begin_overwrite().await.unwrap();
+    drop_key.write_batch(&[json!({"ID": 3})]).await.unwrap();
+    assert!(drop_key.commit_overwrite().await.is_err());
+    drop_key.abort_overwrite().await.unwrap();
+    assert_eq!(count(&conn, "FK_DEF").await, 2, "the swap rolled back");
+    assert_eq!(count(&conn, "FK_DEF_CHILD").await, 1);
 
     // Schema drift: live schema, add / widen / relax.
     common::exec(
