@@ -30,6 +30,11 @@ pub struct RecordContext {
     /// The pipeline's `local_outputs.retention_days`, if it set one.
     pub retention_days: Option<u32>,
     pub observed_at: DateTime<Utc>,
+    /// Whether the file at each path is the one this run leaves behind. False
+    /// for a `write_mode: overwrite` output, which a later commit swaps into
+    /// place: its identity is then not recorded, so the sweep does not take the
+    /// swapped-in file for one somebody replaced.
+    pub final_file: bool,
 }
 
 /// Record every local file a sink reported. Returns how many rows were written
@@ -64,10 +69,14 @@ pub async fn record(
                 }
             }
         };
-        let file_id = tokio::fs::metadata(&path)
-            .await
-            .ok()
-            .and_then(|m| super::ledger::FileIdentity::of(&m));
+        let file_id = if ctx.final_file {
+            tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|m| super::ledger::FileIdentity::of(&m))
+        } else {
+            None
+        };
         let obs = LocalOutputObservation {
             path,
             dataset_uri: ctx.dataset_uri.clone(),
@@ -119,6 +128,7 @@ mod tests {
             run_id: "run-1".into(),
             retention_days: None,
             observed_at: Utc::now(),
+            final_file: true,
         }
     }
 

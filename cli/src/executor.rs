@@ -3727,6 +3727,9 @@ async fn run_one_invocation(
                     .as_ref()
                     .and_then(|spec| spec.retention_days),
                 observed_at: chrono::Utc::now(),
+                // An overwrite group commits (swaps the staged file in) after
+                // this invocation returns.
+                final_file: !suppress_overwrite,
             };
             crate::local_outputs::record(handle.store.as_ref(), &outputs, &ctx).await;
         }
